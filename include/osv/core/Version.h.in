@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 The OpenOSV Contributors
+//
+// Version.h is generated from Version.h.in by CMake so the library, the CLI
+// and the plug-ins all report the same number as project(openosv VERSION ...).
+#pragma once
+
+#include <cstdint>
+
+namespace osv {
+
+/// Semantic version of the library this header was generated for.
+struct Version {
+    static constexpr std::uint32_t major = @PROJECT_VERSION_MAJOR@;   ///< Breaking API changes.
+    static constexpr std::uint32_t minor = @PROJECT_VERSION_MINOR@;   ///< Backwards compatible features.
+    static constexpr std::uint32_t patch = @PROJECT_VERSION_PATCH@;   ///< Bug fixes only.
+
+    /// Full version string, e.g. "0.1.0".
+    static constexpr const char* string() noexcept { return "@PROJECT_VERSION@"; }
+
+    /// Human readable product name used in CLI banners and plug-in resources.
+    static constexpr const char* productName() noexcept { return "OpenOSV"; }
+};
+
+}  // namespace osv

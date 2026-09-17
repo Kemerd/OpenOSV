@@ -1,0 +1,45 @@
+OpenOSV
+Copyright 2026 The OpenOSV Contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+================================================================================
+Clean-room statement
+================================================================================
+OpenOSV was written without access to DJI source code.  The .OSV container
+layout, the protobuf field numbering of the per-frame metadata and the lens
+calibration model were determined by inspecting recorded files and publicly
+documented interfaces.  No DJI binaries, resources (masks, remap tables, neural
+network models, LUT images) or SDK headers are included in this repository or
+in the distributed binaries.
+
+================================================================================
+Colour science provenance
+================================================================================
+* BT.2100 HLG / PQ transfer functions, BT.2020 and BT.709 primaries and the
+  BT.2408 signal-level anchors are implemented from the public ITU-R
+  Recommendations BT.2100-2, BT.2020-2, BT.709-6, BT.2408-5 and BT.2390-8.
+* The "DJI-matched" D-Log M decoding curve is an analytic 7-parameter fit
+  produced by scripts/fit_dlogm.py from 64 neutral-axis measurements of DJI's
+  publicly distributed D-Log M to HLG rendering.  Only the fitted constants and
+  the measurement table are shipped; no DJI LUT data is redistributed.
+* The "Pocket 3" D-Log M curve reproduces the numeric constants of the publicly
+  published community fit by Thatcher Freeman (github.com/thatcherfreeman/
+  dwg-transforms).  The constants are facts about a transfer function; no source
+  code from that repository is included.
+
+================================================================================
+Third-party components (dynamically linked or header-only)
+================================================================================
+* FFmpeg (libavcodec, libavformat, libavutil, libswscale, libswresample)
+  LGPL-2.1-or-later, dynamically linked, built without GPL components.
+  https://ffmpeg.org
+* nv-codec-headers (ffnvcodec)      MIT                https://github.com/FFmpeg/nv-codec-headers
+* Khronos OpenCL headers + ICD      Apache-2.0         https://github.com/KhronosGroup/OpenCL-SDK
+* Catch2                            BSL-1.0            https://github.com/catchorg/Catch2
+* CLI11                             BSD-3-Clause       https://github.com/CLIUtils/CLI11
+* nlohmann/json                     MIT                https://github.com/nlohmann/json
+* spdlog                            MIT                https://github.com/gabime/spdlog
+* fmt                               MIT                https://github.com/fmtlib/fmt
+* tinyexr                           BSD-3-Clause       https://github.com/syoyo/tinyexr
+* NVIDIA CUDA Runtime               NVIDIA EULA        (statically linked cudart in osvtool)

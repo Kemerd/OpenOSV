@@ -1,0 +1,470 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 The OpenOSV Contributors
+//
+// Clean-room transcription of the "dvtm" metadata schema carried by the
+// 'djmd' tracks of DJI Osmo 360 .OSV / .LRF files (proto file name reported
+// by the camera: "dvtm_oq101.proto", library version 02.01.15).
+//
+// This file documents the wire layout that src/osv/meta/DjmdDecoder.cpp
+// decodes by hand; the library does not depend on protoc.  Field numbers and
+// scalar types were established by observation of recorded clips, so:
+//   * every field is optional (proto3 semantics),
+//   * repeated scalars may appear packed or unpacked in the files,
+//   * fields marked "unknown" have been seen but their meaning is not
+//     established; names are descriptive placeholders,
+//   * message and field names follow the ones printed in ClipMetaHeader and
+//     the library's public JSON key names where no better name is known.
+//
+// Compile check: protoc --cpp_out=/tmp proto/dvtm_osmo360.proto
+syntax = "proto3";
+
+package osv.dvtm;
+
+option optimize_for = LITE_RUNTIME;
+
+// ---------------------------------------------------------------------------
+//  Shared
+// ---------------------------------------------------------------------------
+
+// Unit quaternion as written by the camera.  Component order in the file is
+// (w, x, y, z); the interpretation of the rotation (body->world or
+// world->body, Y-up or Z-up world) is a runtime convention, see
+// docs/GEOMETRY.md.
+message Quaternion {
+  float w = 1;
+  float x = 2;
+  float y = 3;
+  float z = 4;
+}
+
+// Device descriptor that prefixes the per-device frame messages.
+message DeviceHeader {
+  uint32 device_id = 1;
+  int32 device_type = 2;            // enum, values not catalogued
+  int32 device_state = 3;           // enum, values not catalogued
+  string device_name = 4;           // "Osmo OQ001" in gimbal_frame_meta
+  float device_frequency = 5;       // 59.94
+  uint64 device_reserved = 6;       // unknown
+}
+
+// ---------------------------------------------------------------------------
+//  ClipMeta (djmd sample 0 only)
+// ---------------------------------------------------------------------------
+
+message ClipMetaHeader {
+  string proto_file_name = 1;           // "dvtm_oq101.proto"
+  string library_proto_version = 2;     // "02.01.15"
+  string product_proto_version = 3;     // "2.0.8"
+  string product_sn = 5;                // camera serial number
+  string product_firmware_version = 6;  // "10.00.25.29"
+  int32 header_enum_7 = 7;              // enum, unknown
+  int32 header_enum_8 = 8;              // enum, unknown
+  uint64 clip_timestamp = 9;            // microseconds since power-up at the first frame
+  string product_name = 10;             // "Osmo 360"
+}
+
+message ClipStreamsMeta {
+  uint32 video_stream_num = 1;
+  uint32 audio_stream_num = 2;
+}
+
+message DistortionCoefficients {
+  repeated float value = 1;             // flat-lens OpenCV fisheye k1..k4
+}
+
+message SensorReadoutTime {
+  uint64 value = 1;                     // ~17282160, unit unverified
+}
+
+enum SensorReadDirection {
+  SENSOR_READ_DIRECTION_UNKNOWN = 0;
+  SENSOR_READ_DIRECTION_1 = 1;
+  SENSOR_READ_DIRECTION_2 = 2;
+  SENSOR_READ_DIRECTION_3 = 3;
+  SENSOR_READ_DIRECTION_LEFT_TOP = 4;   // value seen on the Osmo 360
+}
+
+message SensorReadDirectionMeta {
+  SensorReadDirection value = 1;
+}
+
+message DigitalFocalLength {
+  float value = 1;                      // stream-space focal length in pixels (829.3612 at 6K)
+}
+
+enum EisStatus {
+  EIS_OFF = 0;
+  EIS_ROCK_STEADY = 1;
+  EIS_HORIZON_STEADY = 2;
+  EIS_HYPER = 3;
+  EIS_TRADEOFF = 4;
+  EIS_HORIZON_BALANCING = 5;
+  EIS_DEEP_SPACE = 6;
+  EIS_OFF_WITH_CROP = 7;
+  EIS_HORIZON_CORRECTION = 8;
+  EIS_RS_AUTO = 9;
+}
+
+message EisStatusMeta {
+  EisStatus value = 1;
+}
+
+message ImuSamplingRate {
+  uint32 value = 1;                     // Hz (1000)
+}
+
+message SensorFps {
+  float value = 1;                      // 59.939388
+}
+
+message ItdValue {
+  int32 value = 1;                      // -136 on the sample clip
+}
+
+message LroValue {
+  uint32 value = 1;                     // 3429 on the sample clip
+}
+
+message SensorResolution {
+  uint32 width = 1;                     // 3840 (calibration frame)
+  uint32 height = 2;                    // 3840
+}
+
+message FNumber {
+  repeated uint32 value = 1;            // rational [19, 10] = f/1.9
+}
+
+message StyleFilterMode {
+  uint32 value = 1;
+}
+
+message YltmEnable {
+  uint32 value = 1;
+}
+
+message ClipMeta {
+  ClipMetaHeader clip_meta_header = 1;
+  ClipStreamsMeta clip_streams_meta = 2;
+  DistortionCoefficients distortion_coefficients = 3;
+  SensorReadoutTime sensor_readout_time = 4;
+  SensorReadDirectionMeta sensor_read_direction = 5;
+  DigitalFocalLength digital_focal_length = 8;
+  EisStatusMeta eis_status = 9;
+  ImuSamplingRate imu_sampling_rate = 10;
+  SensorFps sensor_fps = 11;
+  ItdValue ITD_value = 12;
+  LroValue LRO_value = 13;
+  SensorResolution sensor_res = 14;
+  FNumber f_number = 15;
+  StyleFilterMode style_filter_mode = 16;
+  YltmEnable yltm_enable = 17;
+}
+
+// ---------------------------------------------------------------------------
+//  StreamMeta (djmd sample 0 only)
+// ---------------------------------------------------------------------------
+
+enum StreamType {
+  STREAM_TYPE_VIDEO = 0;
+  STREAM_TYPE_AUDIO = 1;
+}
+
+message StreamMetaHeader {
+  uint32 stream_id = 1;
+  StreamType stream_type = 2;
+  string stream_name = 3;               // "video"
+}
+
+enum BitFormat {
+  BIT_FORMAT_UNKNOWN = 0;
+  BIT_FORMAT_1 = 1;
+  BIT_FORMAT_2 = 2;
+  BIT_FORMAT_3 = 3;
+  BIT_FORMAT_YUV420 = 4;                // value seen on the Osmo 360
+}
+
+enum VideoCodecType {
+  VIDEO_CODEC_H264 = 0;
+  VIDEO_CODEC_H265 = 1;
+}
+
+message VideoStreamMeta {
+  uint32 width = 1;
+  uint32 height = 2;
+  float framerate = 3;
+  bool is_bit_depth_valid = 4;
+  uint32 bit_depth = 5;
+  BitFormat bit_format = 6;
+  int32 video_stream_type = 7;          // enum, unknown
+  VideoCodecType video_codec_type = 8;
+}
+
+enum ColorModeType {
+  COLOR_MODE_DEFAULT = 0;
+  COLOR_MODE_CAM_MLGLIKE = 1;           // D-Cinelike
+  COLOR_MODE_CAM_MLG = 2;               // D-Log
+  COLOR_MODE_HLG = 9;
+  COLOR_MODE_VIVID = 12;
+  COLOR_MODE_CAM_MLG_M = 19;            // D-Log M
+  COLOR_MODE_CAM_MLG2 = 22;             // D-Log 2
+}
+
+message ColorMode {
+  ColorModeType value = 1;
+}
+
+message FovType {
+  int32 value = 1;                      // 3 = WIDE on the Osmo 360
+}
+
+enum ExtriLensMode {
+  EXTRI_LENS_MODE_NATIVE_REFINE = 0;
+  EXTRI_LENS_MODE_LENS_GUARDS = 1;
+  EXTRI_LENS_MODE_WATER_PROOF_UNDER_WATER = 2;
+}
+
+message ExtriLensModeMeta {
+  ExtriLensMode value = 1;
+}
+
+message ShadingCalibModeNum {
+  uint32 value = 1;
+}
+
+// Structure not established; kept opaque.
+message GimbalSelfCalibParam {
+}
+
+// One lens calibration record.  Intrinsics are in calibration-frame pixels
+// (3840 x 3840).  Lens model: r = f * theta * (1 + k1 th^2 + k2 th^4 +
+// k3 th^6 + k4 th^8 + k5 th^10) (Kannala-Brandt with a fifth term).
+message DewarpParams {
+  float fx = 1;
+  float fy = 2;
+  float cx = 3;
+  float cy = 4;
+  float k1 = 5;
+  float k2 = 6;
+  float k3 = 7;
+  float k4 = 8;
+  float xi = 9;                         // unified-model parameter, 0 on the Osmo 360
+  float width = 10;                     // 3840.0 - a pixel count, but written as a fixed32 float
+  float height = 11;                    // 3840.0 (the decoder rounds both to integers)
+  float yaw = 12;                       // Euler angles in degrees (informational)
+  float pitch = 13;
+  float roll = 14;
+  float k5 = 15;
+  float k6 = 16;
+  float k7 = 17;
+  float k8 = 18;
+  float k9 = 19;
+  repeated float p = 20;                // tangential terms p1, p2
+  repeated float q = 21;                // copy of cam_extri_q as (w, x, y, z)
+  repeated float occlusion_pt_x = 22;   // 14-point occlusion polygon (calibration px)
+  repeated float occlusion_pt_y = 23;
+  float lens_model = 24;                // 8.0 on the Osmo 360
+  float temperature = 25;               // -1000 = unset
+  Quaternion cam_imu_extri_q = 26;      // absent on the Osmo 360
+  repeated float tangent_coeff = 27;    // duplicate of p
+  Quaternion cam_extri_q = 28;          // body -> lens rotation
+  bool cam_imu_cali_enable = 29;
+  bool temp_compen_enable = 30;
+  float temp_compen_k = 31;
+  float gimbal_yaw_h1 = 32;
+  float gimbal_yaw_h2 = 33;
+  GimbalSelfCalibParam gimbal_self_cail_param = 34;
+  repeated float temp_compen_k_order = 35;
+}
+
+// 24 calibration slots.  Unused slots are written as all-zero records.
+// "slave" = video track 1 / stream 0 (optical axis -Y body),
+// "master" = video track 2 / stream 1 (optical axis +Y body).
+message PanoDewarpParams {
+  DewarpParams native_refine_slave = 1;
+  DewarpParams native_refine_master = 2;
+  DewarpParams native_refine_far_slave = 3;
+  DewarpParams native_refine_far_master = 4;
+  DewarpParams lens_guards_slave = 5;
+  DewarpParams lens_guards_master = 6;
+  DewarpParams water_above_slave = 7;
+  DewarpParams water_above_master = 8;
+  DewarpParams water_under_slave = 9;
+  DewarpParams water_under_master = 10;
+  DewarpParams native_slave = 11;
+  DewarpParams native_master = 12;
+  DewarpParams far_07_slave = 13;       // stitching distance 0.7 m
+  DewarpParams far_07_master = 14;
+  DewarpParams far_09_slave = 15;       // 0.9 m
+  DewarpParams far_09_master = 16;
+  DewarpParams far_11_slave = 17;       // 1.1 m
+  DewarpParams far_11_master = 18;
+  DewarpParams far_12_5_slave = 19;     // 1.25 m
+  DewarpParams far_12_5_master = 20;
+  DewarpParams far_14_slave = 21;       // 1.4 m
+  DewarpParams far_14_master = 22;
+  DewarpParams far_16_slave = 23;       // 1.6 m
+  DewarpParams far_16_master = 24;
+}
+
+message StreamMeta {
+  StreamMetaHeader stream_meta_header = 1;
+  VideoStreamMeta video_stream_meta = 3;
+  ColorMode color_mode = 4;
+  FovType fov_type = 5;
+  PanoDewarpParams pano_dewarp_params = 6;
+  ExtriLensModeMeta extri_lens_mode = 7;
+  ShadingCalibModeNum shading_calib_mode_num = 8;
+}
+
+// ---------------------------------------------------------------------------
+//  FrameMeta (every djmd sample)
+// ---------------------------------------------------------------------------
+
+message FrameMetaHeader {
+  uint64 frame_seq_num = 1;             // +2 per frame on the OSV
+  uint64 frame_timestamp = 2;           // microseconds since power-up
+  uint32 stream_id = 3;
+}
+
+message ExposureIndex {
+  float value = 1;
+}
+
+message Iso {
+  float value = 1;
+}
+
+message ExposureTime {
+  repeated int32 value = 1;             // rational [num, den] seconds, e.g. [1, 208]
+}
+
+message DigitalZoomRatio {
+  float value = 1;
+}
+
+message WhiteBalanceCct {
+  uint32 value = 1;                     // Kelvin
+}
+
+message Orientation {
+  int32 value = 1;                      // enum, unknown
+}
+
+message UnderwaterConfidence {
+  uint32 value = 1;
+}
+
+// Motion vector reported with each frame (units not established).  Field 1
+// is unused in the files seen.
+message CameraAcc {
+  float x = 2;
+  float y = 3;
+  float z = 4;
+}
+
+message Sharpness {
+  float value = 1;
+}
+
+message Denoising {
+  float value = 1;
+}
+
+// Subject tracking result; structure not established.
+message TrackRet {
+}
+
+message AecAe {
+  float lv = 1;                         // light value
+  float lux_idx = 2;
+  float gain_3 = 3;                     // per-channel gains, meaning unverified
+  float gain_4 = 4;
+  float gain_5 = 5;
+  float adrc_gain = 6;
+  float dark_boost = 7;
+  int32 ae_mode = 8;                    // enum, unknown
+  uint32 aec_reserved = 9;
+}
+
+message SensorTemperature {
+  float value = 1;
+}
+
+message EquivalentFocalLength {
+  repeated int32 value = 1;             // e.g. [100, 1000]
+}
+
+message FrameMetaOfCamera {
+  DeviceHeader dev_header = 1;
+  ExposureIndex exposure_index = 2;
+  Iso iso = 3;
+  ExposureTime exposure_time = 4;
+  DigitalZoomRatio digital_zoom_ratio = 5;
+  WhiteBalanceCct white_balance_cct = 6;
+  Orientation orientation = 7;
+  UnderwaterConfidence underwater_confidence = 8;
+  Quaternion camera_attitude = 9;       // equals IMU_attitude_after_fusion.current.attitude[4]
+  CameraAcc camera_acc = 10;
+  Sharpness sharpness = 11;
+  Denoising denoising = 12;
+  TrackRet track_ret = 14;
+  AecAe aec_ae = 15;
+  SensorTemperature sensor_temperature = 16;
+  EquivalentFocalLength equivalent_focal_length = 17;
+}
+
+// One batch of fused IMU attitude samples (~16-17 per 59.94 fps frame at
+// ~995 Hz).  `timestamp` is on the attitude clock (1006 ticks per sample).
+message DeviceAttitude {
+  uint32 timestamp = 1;
+  uint32 vsync = 2;                     // sensor frame counter
+  repeated Quaternion attitude = 3;
+  float offset = 4;                     // -0.9025 on the sample clip
+}
+
+message ImuAttitudeAfterFusion {
+  DeviceAttitude current = 1;
+  DeviceAttitude prev = 2;              // absent on the Osmo 360
+  DeviceAttitude next = 3;              // absent on the Osmo 360
+}
+
+message ImuVsyncPos {
+  uint32 value = 1;                     // 0..7 cycling phase
+}
+
+message FrameMetaOfIMU {
+  DeviceHeader dev_header = 1;
+  ImuAttitudeAfterFusion IMU_attitude_after_fusion = 2;
+  ImuVsyncPos IMU_vsync_pos = 3;
+}
+
+// Not present on the Osmo 360 clips seen; structure not established.
+message GpsBasic {
+}
+
+message Velocity {
+}
+
+message FrameMetaOfGimbal {
+  DeviceHeader dev_header = 1;          // device_name "Osmo OQ001", frequency 59.94
+  GpsBasic gps_basic = 2;
+  Velocity velocity = 3;
+}
+
+message FrameMeta {
+  FrameMetaHeader frame_meta_header = 1;
+  FrameMetaOfCamera camera_frame_meta = 2;
+  FrameMetaOfIMU imu_frame_meta = 3;    // only on the primary djmd track
+  FrameMetaOfGimbal gimbal_frame_meta = 4;
+}
+
+// ---------------------------------------------------------------------------
+//  ProductMeta: one djmd sample.  Sample 0 carries all three parts, every
+//  later sample only frame_meta.
+// ---------------------------------------------------------------------------
+
+message ProductMeta {
+  ClipMeta clip_meta = 1;
+  StreamMeta stream_meta = 2;
+  FrameMeta frame_meta = 3;
+}

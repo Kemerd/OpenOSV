@@ -1,0 +1,31 @@
+# ---- sample footage and vendor material (never committed) ----
+*.OSV
+*.osv
+*.LRF
+*.lrf
+*.pkg
+1786677614599-DJI_Reframe_for_Adobe_Premiere/
+Payload~~/
+
+# ---- build outputs ----
+build/
+out/
+vcpkg_installed/
+*.user
+*.suo
+.vs/
+.vscode/
+CMakeUserPresets.json
+compile_commands.json
+
+# ---- test scratch ----
+tests/output/
+*.log
+
+# ---- python ----
+__pycache__/
+*.pyc
+
+# Ad-hoc compiler check scratch and vcpkg logs
+build_check/
+vcpkg_install.err
