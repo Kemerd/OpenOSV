@@ -166,6 +166,37 @@ struct EffectRef {
     /// PF_CustomEFlag_COMP (the Program Monitor).
     PF_CustomUIInfo customUi{};
     bool customUiRegistered = false;
+
+    // ---- PF Source Settings Suite -------------------------------------------
+
+    /// Whether the effect called SetIsSourceSettingsEffect, and with what.
+    ///
+    /// In a real host this is the declaration that makes Premiere attach the
+    /// effect to a master clip rather than offering it as a timeline filter,
+    /// and there is no other way to observe it - the flag lives entirely in
+    /// the host.  So the mock records it and a test reads it back, which is
+    /// the only way to prove the effect made the call at all.
+    bool isSourceSettingsEffect = false;
+    bool sourceSettingsFlagSet = false;
+
+    /// What the mock's PerformSourceSettingsCommand does with the effect's
+    /// buffer, standing in for the importer at the other end of the private
+    /// channel.
+    ///
+    /// `sourceSettingsReply` is written INTO the buffer when
+    /// `sourceSettingsReplies` is true, which is how a test drives the
+    /// "importer reports different settings than the controls hold" path
+    /// without loading the .prm as well.  When false the buffer is left
+    /// exactly as the effect passed it - the real behaviour when no live clip
+    /// instance exists.
+    std::vector<char> sourceSettingsReply;
+    bool sourceSettingsReplies = false;
+    /// Forced return code; PF_Err_NONE means "succeed".
+    PF_Err sourceSettingsError = PF_Err_NONE;
+    /// A copy of what the effect last sent, and how many bytes it declared.
+    std::vector<char> sourceSettingsSent;
+    csSDK_uint32 sourceSettingsSentSize = 0;
+    std::size_t sourceSettingsCallCount = 0;
 };
 
 /// The surface translation the mock tracks.
@@ -268,6 +299,7 @@ struct MockHost::Impl {
     PrSDKGPUDeviceSuite gpu{};
     PF_PixelFormatSuite1 pfPixelFormat{};
     PF_UtilitySuite4 pfUtility{};
+    PF_SourceSettingsSuite pfSourceSettings{};
 
     // Custom UI / DrawBot (MockDrawbot.cpp).
     PF_EffectCustomUISuite2 pfCustomUi{};

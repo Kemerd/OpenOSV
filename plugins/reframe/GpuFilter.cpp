@@ -57,6 +57,7 @@
 
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <new>
 #include <string>
 
@@ -267,6 +268,14 @@ struct Instance {
     /// refuses GetParamCount, an exception on the way in).
     HostParamMap paramMap{};
 
+    /// False until probeParams() has positively identified the host's index
+    /// space.  The probe reads parameters through GetParam, which fails
+    /// intermittently on a freshly created node, so a single failed attempt
+    /// at CreateInstance must not condemn the instance to the static mapping
+    /// for its whole life: Render retries while this is false.  Rendering a
+    /// frame proves the node is ready, which is exactly when a retry works.
+    bool paramMapProbed = false;
+
     Instance() noexcept { paramMap.setStatic(); }
 
     [[nodiscard]] bool alive() const noexcept { return magic == kMagic; }
@@ -385,8 +394,28 @@ void probeParams(Instance& inst) noexcept {
     dump.reserve(256);
     for (int i = 0; i < probeCount; ++i) {
         PrParam p{};
-        std::memset(&p, 0, sizeof(p));
-        if (inst.segment->GetParam(inst.nodeId, i, 0, &p) != suiteError_NoError) {
+        // GetParam on a freshly created node fails INTERMITTENTLY: observed
+        // on a live host (26.2.2) failing for a different subset of indices
+        // on every CreateInstance, most often the angle controls, while the
+        // same indices read fine moments later.  Treating one failure as a
+        // type would poison the signature and send the whole effect back to
+        // the static mapping - which is exactly what happened in the field:
+        // playback (a lucky instance) animated while scrubbing (an unlucky
+        // one) did not.  A few immediate retries cost nothing and turn an
+        // intermittent read into a reliable one.
+        constexpr int kReadAttempts = 8;
+        prSuiteError readErr = suiteError_Fail;
+        for (int attempt = 0; attempt < kReadAttempts; ++attempt) {
+            std::memset(&p, 0, sizeof(p));
+            readErr = inst.segment->GetParam(inst.nodeId, i, 0, &p);
+            if (readErr == suiteError_NoError && kindOf(p) != HostParamKind::Unknown) {
+                break;
+            }
+            // Yield rather than spin: whatever the host is still finishing
+            // needs a moment, not CPU contention from this thread.
+            std::this_thread::yield();
+        }
+        if (readErr != suiteError_NoError) {
             kinds[i] = HostParamKind::Unknown;
             dump += std::format("[{}]=<err> ", i);
             continue;
@@ -422,6 +451,7 @@ void probeParams(Instance& inst) noexcept {
     }
 
     inst.paramMap = probed;
+    inst.paramMapProbed = true;
     PluginLog::oncef("reframe/gpu/probe-ok", PluginLog::Level::Info,
                      "reframe/gpu: probed the host parameter mapping from {} entries - "
                      "aspect={} preset={} pan={} tilt={} roll={} fov={} distortion={} "
@@ -846,6 +876,16 @@ prSuiteError render(PrGPUFilterInstance* instanceData, const PrGPUFilterRenderPa
         }
 
         // ---- parameters --------------------------------------------------
+        // Retry the probe if CreateInstance could not identify the host's
+        // index space.  GetParam fails intermittently on a node the host has
+        // only just built, and an instance that gave up at creation would
+        // read the wrong controls for as long as it lived - the field
+        // symptom being that playback animated (an instance whose probe had
+        // got lucky) while scrubbing did not.  Reaching Render proves the
+        // node is ready, so this is the moment a retry succeeds.
+        if (!inst->paramMapProbed) {
+            probeParams(*inst);
+        }
         const Settings settings = readSettings(*inst, renderParams->inClipTime, renderParams->inRenderTicksPerFrame);
 
         // The frame we render into is the one the host allocated; its size

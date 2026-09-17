@@ -325,4 +325,80 @@ csSDK_int32 handleGetInstancePrefs(imStdParms* stdParms, imFileAccessRec8* fileA
     return handlePrefsCommon(stdParms, &rec->prefsRec, instance);
 }
 
+// ---------------------------------------------------------------------------
+//  imPerformSourceSettingsCommand (selector 66)
+// ---------------------------------------------------------------------------
+//
+// The private exchange with OpenOSVSourceSettings.aex.  See the declaration
+// in ImporterPlugin.h for the protocol; the rules this implementation obeys
+// are all about not trusting the buffer:
+//
+//   * a null record, a null ioData or a buffer shorter than a PrefsBlob is
+//     answered with imOtherErr and NOT written to.  The effect treats any
+//     non-success as "keep the stored control values", which is the correct
+//     degradation, whereas a partial write would hand it a blob whose magic
+//     is half-formed.
+//   * a buffer LARGER than a PrefsBlob is fine; only the first kSize bytes
+//     are ours and the tail is left alone, because it is not our memory to
+//     define.
+//   * whatever the effect sent is validated before it is used.  A blob that
+//     is not ours becomes the defaults rather than being trusted, so a stale
+//     payload from an older build cannot poison a live clip's settings.
+//
+// This selector never shows a dialog and never blocks: it may arrive on any
+// thread during project load, and a modal window there would deadlock the
+// load.
+csSDK_int32 handlePerformSourceSettingsCommand(imStdParms* stdParms, imFileAccessRec8* fileAccess,
+                                               imSourceSettingsCommandRec* rec) {
+    if (!rec || !rec->ioData) {
+        PluginLog::oncef("ss-cmd-null", PluginLog::Level::Warn,
+                         "imPerformSourceSettingsCommand: no data buffer");
+        return imOtherErr;
+    }
+    if (rec->inDataSize < static_cast<csSDK_int32>(PrefsBlob::kSize)) {
+        PluginLog::oncef("ss-cmd-small", PluginLog::Level::Error,
+                         "imPerformSourceSettingsCommand: the buffer is {} bytes, {} are needed",
+                         rec->inDataSize, static_cast<int>(PrefsBlob::kSize));
+        return imOtherErr;
+    }
+
+    // What the effect's controls currently say.  fromBytes() sanitises and
+    // falls back to the defaults for anything that is not one of our blobs.
+    PrefsBlob incoming = PrefsBlob::fromBytes(rec->ioData, static_cast<std::size_t>(rec->inDataSize));
+
+    // The instance, when the host has one for this clip.  It is reached
+    // through the record's own privateData rather than through fileAccess:
+    // the SDK documents param1 as an imFileAccessRec8* for this selector, but
+    // the record carries the instance pointer directly and that is the field
+    // every other prefs path uses, so using it keeps one convention.
+    ImporterInstance* instance =
+        instanceFromHandle(rec->inPrivateData, stdParms && stdParms->piSuites ? stdParms->piSuites->memFuncs : nullptr);
+    (void)fileAccess;
+
+    if (!instance) {
+        // No live clip to consult - which is normal during project load and
+        // before imOpenFile8.  The effect's own values are then the best
+        // available truth, so they are echoed back sanitised.  Echoing rather
+        // than writing defaults matters: overwriting with defaults here would
+        // reset every control of every clip on every project open.
+        std::memcpy(rec->ioData, &incoming, PrefsBlob::kSize);
+        PluginLog::oncef("ss-cmd-noinstance", PluginLog::Level::Debug,
+                         "imPerformSourceSettingsCommand: no live instance; echoing the effect's own settings");
+        return imNoErr;
+    }
+
+    // There IS a live clip, and it is the only party that knows what the
+    // media is actually being decoded with, so its blob wins.  This is what
+    // makes the panel show "as shot" after a project reopen.
+    const PrefsBlob current = instance->prefs();
+    std::memcpy(rec->ioData, &current, PrefsBlob::kSize);
+
+    PluginLog::debug("imPerformSourceSettingsCommand: '{}' reports colour {}, size {}, stab {}, seam {}, "
+                     "gain {}, calib {}, fit {}, exposure {:+.2f}, device {}",
+                     instance->path().filename().string(), current.colorOutput, current.outputSize,
+                     current.stabilization, current.seamSearch, current.gainMatch, current.calibration,
+                     current.dlogmFit, static_cast<double>(current.exposureStops), current.renderDevice);
+    return imNoErr;
+}
+
 }  // namespace osv::premiere

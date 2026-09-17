@@ -451,6 +451,40 @@ public:
     /// stay valid until the next call on the same effect ref.
     [[nodiscard]] std::vector<PF_ParamDef*> renderParams(PF_ProgPtr ref);
 
+    // ---- PF Source Settings Suite ------------------------------------------
+    //
+    //  A source settings effect declares itself to the host and exchanges an
+    //  opaque prefs buffer with its matching importer through this suite
+    //  (PrSDKAESupport.h:1620-1637).  Both sides of that are invisible from
+    //  outside the host, so the mock records them and a test reads them back:
+    //  it is the only way to prove OpenOSVSourceSettings.aex made the calls.
+
+    /// Whether the effect called SetIsSourceSettingsEffect on `ref`, and what
+    /// it passed.  nullopt means it never called it at all - which for a
+    /// source settings effect is a bug, because the host would then treat the
+    /// module as an ordinary video filter.
+    [[nodiscard]] std::optional<bool> isSourceSettingsEffect(PF_ProgPtr ref) const;
+
+    /// A copy of the buffer the effect last handed
+    /// PerformSourceSettingsCommand, and the size it declared.  Empty before
+    /// the first call.
+    [[nodiscard]] std::vector<char> sourceSettingsSentData(PF_ProgPtr ref) const;
+    [[nodiscard]] csSDK_uint32 sourceSettingsSentSize(PF_ProgPtr ref) const;
+    /// How many times PerformSourceSettingsCommand was called on `ref`.
+    [[nodiscard]] std::size_t sourceSettingsCallCount(PF_ProgPtr ref) const;
+
+    /// Stand in for the importer: make the next
+    /// PerformSourceSettingsCommand write `reply` into the effect's buffer
+    /// (truncated to the buffer size the effect declared).  Passing an empty
+    /// vector restores the default, which is to leave the buffer untouched -
+    /// what a real host does when there is no live clip instance to consult.
+    void setSourceSettingsReply(PF_ProgPtr ref, const std::vector<char>& reply);
+
+    /// Force PerformSourceSettingsCommand to fail with `err`, so a test can
+    /// prove the effect degrades to its stored control values rather than
+    /// using whatever happened to be in the buffer.
+    void setSourceSettingsError(PF_ProgPtr ref, PF_Err err);
+
     // ---- custom UI / DrawBot -----------------------------------------------
     /// The PF_CustomUIInfo the effect registered through register_ui during
     /// PF_Cmd_PARAMS_SETUP, or nullopt when it registered none.

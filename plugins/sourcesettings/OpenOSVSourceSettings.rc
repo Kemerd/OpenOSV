@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 The OpenOSV Contributors
+//
+// OpenOSVSourceSettings.rc - the resources compiled into
+// OpenOSVSourceSettings.aex.
+//
+// Two of them:
+//
+//   * the PiPL, generated from OpenOSVSourceSettings.r by the three-step AE
+//     pipeline (see that file) and included here as a .rcp fragment.  The
+//     generated file lives in the build tree and is found through the include
+//     directory osv_add_pipl() adds to the target;
+//   * a standard VERSIONINFO block, so the file properties dialog, the
+//     installer and Premiere's Plugin Loading.log all show a real version and
+//     publisher instead of "0.0.0.0" and a blank name.
+//
+// The numbers here are the same ones SourceSettingsParams.h carries, written
+// out literally because rc.exe cannot evaluate the packed PF_VERSION word.
+
+#include "OpenOSVSourceSettings.rcp"
+
+#include <winver.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ // A plug-in is a DLL as far as the version resource is concerned; the .aex
+ // extension is Adobe's convention, not a Windows file type.
+ FILETYPE VFT_DLL
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 040904b0 = US English, Unicode.
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "The OpenOSV Contributors"
+            VALUE "FileDescription",  "OpenOSV Source Settings - master clip stitch options for Adobe Premiere Pro"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "OpenOSVSourceSettings"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 The OpenOSV Contributors. Apache-2.0."
+            VALUE "OriginalFilename", "OpenOSVSourceSettings.aex"
+            VALUE "ProductName",      "OpenOSV"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

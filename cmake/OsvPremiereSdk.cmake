@@ -387,11 +387,19 @@ endfunction()
 #  target include directories) so the plug-in's .rc can simply
 #  `#include "<name>.rcp"`.  When RC_FILE is given, the .rc source is marked
 #  as depending on the .rcp so it is recompiled after regeneration.
+#
+#  INCLUDES adds extra directories to step 1's search path, AFTER the .r's own
+#  directory and before the SDKs.  It exists because step 1 is a standalone
+#  cl /EP invocation and does NOT read the target's include directories: a .r
+#  that includes a header from a shared directory (as the source settings
+#  effect's does, for the match name in plugins/common) has no other way to
+#  find it, and copying the header next to every .r that needs it is exactly
+#  the duplication these single-source-of-truth headers exist to prevent.
 # =============================================================================
 function(osv_add_pipl TARGET)
   set(_options)
   set(_one R_FILE OUT_VAR RC_FILE)
-  set(_multi DEPENDS)
+  set(_multi DEPENDS INCLUDES)
   cmake_parse_arguments(ARG "${_options}" "${_one}" "${_multi}" ${ARGN})
 
   if(NOT ARG_R_FILE)
@@ -422,8 +430,11 @@ function(osv_add_pipl TARGET)
   set(_depfile "${_gen_dir}/${_r_name}.rr.d")
 
   # Include search path for step 1: the plug-in's own directory first (so a
-  # ReframeParams.h next to the .r is found), then the SDKs.
-  set(_includes "${_r_dir}" "${OSV_AE_SDK_HEADERS}" "${OSV_AE_SDK_RESOURCES}" "${OSV_PREMIERE_SDK_HEADERS}")
+  # ReframeParams.h next to the .r is found), then any caller-supplied shared
+  # directories, then the SDKs.  Ours come before Adobe's on purpose - a
+  # project header must never be shadowed by a same-named SDK one.
+  set(_includes "${_r_dir}" ${ARG_INCLUDES} "${OSV_AE_SDK_HEADERS}" "${OSV_AE_SDK_RESOURCES}"
+                "${OSV_PREMIERE_SDK_HEADERS}")
   string(REPLACE ";" "|" _includes_joined "${_includes}")
 
   # Step 1: preprocess the .r (macros from AE_EffectVers.h and our own

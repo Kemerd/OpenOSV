@@ -87,6 +87,7 @@ ImporterGlobals& globalsImpl() noexcept {
     case imGetAudioChannelLayout:   return "imGetAudioChannelLayout";
     case imGetPrefs8:               return "imGetPrefs8";
     case imGetInstancePrefs:        return "imGetInstancePrefs";
+    case imPerformSourceSettingsCommand: return "imPerformSourceSettingsCommand";
     case imAnalysis:                return "imAnalysis";
     case imGetTimeInfo8:            return "imGetTimeInfo8";
     case imGetFileAttributes:       return "imGetFileAttributes";
@@ -127,7 +128,11 @@ csSDK_int32 doInit(imStdParms* stdParms, imImportInfoRec* info) {
     info->canDoContinuousTime = kPrFalse;
     info->noFile = kPrFalse;
     info->addToMenu = imMenuNone;
-    // A modal Source Settings dialog is the whole prefs UI in v1.
+    // The modal Source Settings dialog stays available (right-click > Source
+    // Settings) alongside the effect below.  Two routes to the same PrefsBlob
+    // on purpose: the dialog is muscle memory for existing users, and a
+    // machine where OpenOSVSourceSettings.aex failed to install still needs a
+    // way to reach the options.
     info->hasSetup = kPrTrue;
     info->setupOnDblClk = kPrFalse;
     info->dontCache = kPrFalse;
@@ -150,8 +155,13 @@ csSDK_int32 doInit(imStdParms* stdParms, imImportInfoRec* info) {
     info->canProvidePeakAudio = kPrFalse;
     info->canProvideFileList = kPrFalse;
     info->canProvideClosedCaptions = kPrFalse;
-    // No source-settings effect in v1 (decision D10, phase 2).
-    info->hasSourceSettingsEffect = kPrFalse;
+    // The master clip Source Settings effect (OpenOSVSourceSettings.aex).
+    // This flag is what makes Premiere look at
+    // imFileInfoRec8::sourceSettingsMatchName at all; without it the field is
+    // ignored and the effect is never attached, so the two must be set
+    // together.  imGetInfo8 fills the name from
+    // plugins/common/SourceSettingsIdentity.h.
+    info->hasSourceSettingsEffect = kPrTrue;
     info->hasPersistentData = kPrFalse;
 
     // imIsCacheable tells the host it may skip loading us on later launches.
@@ -592,6 +602,12 @@ extern "C" PREMPLUGENTRY DllExport xImportEntry(csSDK_int32 selector, imStdParms
         case imGetInstancePrefs:
             return handleGetInstancePrefs(stdParms, static_cast<imFileAccessRec8*>(param1),
                                           static_cast<imGetInstancePrefsRec*>(param2));
+        case imPerformSourceSettingsCommand:
+            // The private channel to OpenOSVSourceSettings.aex.  param1 is an
+            // imFileAccessRec8*, param2 an imSourceSettingsCommandRec*
+            // (PrSDKImport.h:1729-1734).
+            return handlePerformSourceSettingsCommand(stdParms, static_cast<imFileAccessRec8*>(param1),
+                                                      static_cast<imSourceSettingsCommandRec*>(param2));
 
         default:
             break;
