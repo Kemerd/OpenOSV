@@ -3,14 +3,20 @@
 #
 #    common/     osv_premiere_common   static: host suites, log, delay-load,
 #                                      pixel copy, host context, prefs blob
-#    importer/   OpenOSVImporter.prm   (OSV_PREMIERE_IMPORTER)
-#    reframe/    Open360Reframe.aex    (OSV_PREMIERE_REFRAME)
+#    importer/       OpenOSVImporter.prm         (OSV_PREMIERE_IMPORTER)
+#    reframe/        Open360Reframe.aex          (OSV_PREMIERE_REFRAME)
+#    sourcesettings/ OpenOSVSourceSettings.aex   (OSV_PREMIERE_SOURCE_SETTINGS)
 #
 #  Only reached when OSV_BUILD_PREMIERE=ON; cmake/OsvPremiereSdk.cmake has
 #  already validated the SDK paths and created osv_premiere_sdk / osv_ae_sdk.
 # =============================================================================
 option(OSV_PREMIERE_IMPORTER "Build the OpenOSV importer (.prm)"        ON)
 option(OSV_PREMIERE_REFRAME  "Build the Open 360 Reframe effect (.aex)" ON)
+# The master clip Source Settings effect.  A third module rather than a second
+# PiPL in the reframe .aex: the AE SDK lists "multiple PiPLs in a single
+# plug-in" among the features Premiere does not support, and the two effects
+# are different kinds anyway (see plugins/sourcesettings/SourceSettingsParams.h).
+option(OSV_PREMIERE_SOURCE_SETTINGS "Build the OpenOSV Source Settings effect (.aex)" ON)
 
 if(NOT TARGET osv_premiere_sdk)
   message(FATAL_ERROR "plugins/ requires OSV_BUILD_PREMIERE=ON (cmake/OsvPremiereSdk.cmake defines osv_premiere_sdk)")
@@ -48,6 +54,18 @@ else()
   set(_osv_reframe_status "OFF")
 endif()
 
+if(OSV_PREMIERE_SOURCE_SETTINGS)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sourcesettings/CMakeLists.txt")
+    add_subdirectory(sourcesettings)
+    set(_osv_ss_status "ON")
+  else()
+    message(STATUS "plugins/sourcesettings not present yet - source settings target skipped")
+    set(_osv_ss_status "ON (directory missing, skipped)")
+  endif()
+else()
+  set(_osv_ss_status "OFF")
+endif()
+
 # Mock-host test harness for the plug-ins.  It lives under tests/premiere so
 # the test tree mirrors the plug-in tree; it is added from here because it
 # only makes sense together with the SDK targets.
@@ -64,4 +82,5 @@ message(STATUS "  Premiere SDK    : IMPORTMOD_VERSION ${OSV_PREMIERE_SDK_IMPORTM
 message(STATUS "  AE SDK          : effect spec ${OSV_AE_SDK_SPEC_VERSION}")
 message(STATUS "  Importer (.prm) : ${_osv_importer_status}")
 message(STATUS "  Reframe (.aex)  : ${_osv_reframe_status}")
+message(STATUS "  SourceSet(.aex) : ${_osv_ss_status}")
 message(STATUS "  Mock-host tests : ${OSV_BUILD_TESTS}")

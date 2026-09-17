@@ -25,6 +25,9 @@
 // ---- our layers -----------------------------------------------------------
 #include "HostSuites.h"
 #include "PrefsBlob.h"
+// kSourceSettingsMatchName / kSourceSettingsMatchNameW: the one spelling of
+// the Source Settings effect's match name, shared with that effect's PiPL.
+#include "SourceSettingsIdentity.h"
 
 #include <atomic>
 #include <cstdint>
@@ -189,6 +192,30 @@ csSDK_int32 handleGetAudioChannelLayout(imStdParms* stdParms, imGetAudioChannelL
 // SourceSettingsDialog.cpp
 csSDK_int32 handleGetPrefs8(imStdParms* stdParms, imFileAccessRec8* fileAccess, imGetPrefsRec* rec);
 csSDK_int32 handleGetInstancePrefs(imStdParms* stdParms, imFileAccessRec8* fileAccess, imGetInstancePrefsRec* rec);
+
+/// imPerformSourceSettingsCommand (selector 66, Premiere 9.0).
+///
+/// The private channel between this importer and OpenOSVSourceSettings.aex.
+/// The effect calls PF_SourceSettingsSuite::PerformSourceSettingsCommand with
+/// a buffer; the host routes it here, and the SDK's only rule about the
+/// payload is that both halves agree on it (PrSDKImport.h:996 - "the data can
+/// be anything as long as both the importer and the source settings effect
+/// both know what it is").  Ours is a PrefsBlob, so the exchange is:
+///
+///   * the effect passes the blob its controls currently describe;
+///   * this handler replaces it with the blob the live clip is actually being
+///     decoded with, when there is a live instance to ask;
+///   * the effect seeds its controls from the result.
+///
+/// That is what makes opening Source Settings on a clip show what that clip
+/// is really doing ("as shot") rather than snapping every control back to the
+/// global default.
+///
+/// `fileAccess` is param1 and `rec` param2.  Both may be null and both are
+/// treated as "no instance to consult", which is a valid state - the host
+/// sends this selector during project load before privateData exists.
+csSDK_int32 handlePerformSourceSettingsCommand(imStdParms* stdParms, imFileAccessRec8* fileAccess,
+                                               imSourceSettingsCommandRec* rec);
 
 /// The pure mapping the dialog uses, exposed so it can be unit-tested without
 /// ever creating a window.  `controls` is the state of the dialog's widgets.

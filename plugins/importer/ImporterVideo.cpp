@@ -397,9 +397,22 @@ csSDK_int32 handleGetInfo8(imStdParms* stdParms, imFileAccessRec8* fileAccess, i
 
     copyUtf16(info->filePath, 2048, instance->path().wstring());
     copyUtf16(info->streamName, 256, L"");
-    // No source-settings effect in v1 (decision D10); the modal dialog is the
-    // whole prefs UI, so this field stays empty.
-    copyUtf16(info->sourceSettingsMatchName, 256, L"");
+
+    // ---- the Source Settings effect ----------------------------------------
+    // This string is the ENTIRE binding between the importer and
+    // OpenOSVSourceSettings.aex: Premiere looks for an installed effect whose
+    // PiPL match name is byte-identical to it and attaches that effect to the
+    // master clip, which is what puts the stitch options in the Effect
+    // Controls panel instead of behind the modal dialog.  There is no
+    // handshake and no diagnostic on a mismatch, so it comes from the same
+    // header the effect's PiPL is generated from (plugins/common/
+    // SourceSettingsIdentity.h) and a test compares the two.
+    //
+    // The modal dialog (imGetPrefs8) is deliberately left working alongside
+    // it: right-click > Source Settings is muscle memory for a lot of users,
+    // and a machine where the .aex failed to install still needs a way to
+    // reach the options.  Both paths write the same PrefsBlob.
+    copyUtf16(info->sourceSettingsMatchName, 256, kSourceSettingsMatchNameW);
 
     PluginLog::info("imGetInfo8: {} x {} equirect, {} frames, {} ticks/frame, audio {} ch", geometry.width,
                     geometry.height, instance->frameCount(), static_cast<long long>(vid.frameRate),
