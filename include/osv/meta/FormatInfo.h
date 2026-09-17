@@ -46,6 +46,38 @@ struct FormatInfo {
     float digitalFocalLength = 0.0f;               ///< Stream-space focal length from ClipMeta.
     bool sideBySideProxy = false;                  ///< True for the LRF layout.
     std::vector<std::string> notes;                ///< Everything that was assumed or could not be verified.
+
+    /// Width of ONE LENS image, which is what the geometry is built from.
+    ///
+    /// For every dual-track mode this is `streamW`, because each track holds
+    /// one fisheye circle.  For the LRF proxy it is HALF of `streamW`: that
+    /// clip carries a single 2048 x 1024 side-by-side track holding two
+    /// 1024 x 1024 fisheye halves, which `video::DualStreamReader` already
+    /// splits before handing frames out (DualStreamReader.cpp, `sideBySide`
+    /// branch: `lensWidth = width / 2`).
+    ///
+    /// Everything downstream of the decoder - `geom::StreamScaling::derive`,
+    /// `geom::LensRig` and therefore `render::RenderParamsBuilder` - describes
+    /// ONE LENS and must be given this size, not the track size.  Feeding it
+    /// `streamW` is what produced the "frame size does not match the rig
+    /// (1024x1024 vs 2048x1024)" rejection on every LRF frame: the reader
+    /// delivered halves while the rig had been built for the whole track.
+    ///
+    /// Defensive: an odd or degenerate `streamW` is passed through unhalved
+    /// rather than silently truncated, so a malformed clip fails in the rig
+    /// builder (which reports what it saw) instead of being reinterpreted here.
+    [[nodiscard]] std::uint32_t lensW() const noexcept {
+        if (sideBySideProxy && streamW >= 2 && (streamW % 2) == 0) {
+            return streamW / 2;
+        }
+        return streamW;
+    }
+
+    /// Height of one lens image.  The LRF halves are stacked side by side, so
+    /// only the width is divided; this exists as a named counterpart to
+    /// lensW() so call sites read symmetrically and never divide the wrong
+    /// axis by hand.
+    [[nodiscard]] std::uint32_t lensH() const noexcept { return streamH; }
 };
 
 }  // namespace osv::meta

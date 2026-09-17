@@ -1,0 +1,617 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 The OpenOSV Contributors
+//
+// xImportEntry: the one exported symbol of OpenOSVImporter.prm, and the
+// lifetime selectors that do not deserve a file of their own (imInit,
+// imShutdown, imGetIndFormat, imOpenFile8, imQuietFile, imCloseFile, the
+// imGetSupports* trio).
+//
+// Three rules the whole dispatcher obeys:
+//
+//   1. Every extern "C" entry point catches (...) and returns an error code.
+//      An exception escaping into Premiere's C call stack is undefined
+//      behaviour and in practice takes the host down; a C++ library that
+//      allocates (which this one does, on every frame) can throw.
+//   2. Unknown selectors return imUnsupported - a NON-ERROR code per
+//      PrImporterReturnValueIsError() - and are logged exactly once each, so
+//      a support log shows what the host asked for without a million lines.
+//   3. Nothing hardware-specific happens in imInit or DllMain.  The GPU is
+//      probed the first time a frame is rendered, and torn down from
+//      imShutdown, never from DllMain (by then CUDA may already be unloaded
+//      and freeing device memory would crash the host).
+
+#include "ImporterPlugin.h"
+
+#include "ImporterInstance.h"
+
+#include "DelayLoad.h"
+#include "HostContext.h"
+#include "PluginLog.h"
+
+#include "PrSDKEntry.h"
+#include "PrSDKMALErrors.h"
+
+#include <cstring>
+#include <new>
+#include <string>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+namespace osv::premiere {
+
+namespace {
+
+/// Captured in DllMain; used by the Source Settings dialog to find its own
+/// resources.  A plain HINSTANCE store from DllMain is one of the very few
+/// things that is safe under the loader lock.
+HINSTANCE g_module = nullptr;
+
+/// The process-wide plug-in state.  A function-local static rather than a
+/// namespace-scope object so its construction order is defined and so it is
+/// never constructed before DllMain has run.
+ImporterGlobals& globalsImpl() noexcept {
+    static ImporterGlobals instance;
+    return instance;
+}
+
+/// Name of a selector, for the log.  Only the ones this importer cares about
+/// are named; everything else is reported by number.
+[[nodiscard]] const char* selectorName(csSDK_int32 selector) noexcept {
+    switch (selector) {
+    case imInit:                    return "imInit";
+    case imShutdown:                return "imShutdown";
+    case imGetIndFormat:            return "imGetIndFormat";
+    case imGetSupports7:            return "imGetSupports7";
+    case imGetSupports8:            return "imGetSupports8";
+    case imGetSupportsPerInstancePrefs: return "imGetSupportsPerInstancePrefs";
+    case imOpenFile8:               return "imOpenFile8";
+    case imQuietFile:               return "imQuietFile";
+    case imCloseFile:               return "imCloseFile";
+    case imGetInfo8:                return "imGetInfo8";
+    case imGetInfo9:                return "imGetInfo9";
+    case imGetIndPixelFormat:       return "imGetIndPixelFormat";
+    case imGetPreferredFrameSize:   return "imGetPreferredFrameSize";
+    case imSelectClipFrameDescriptor:  return "imSelectClipFrameDescriptor";
+    case imSelectClipFrameDescriptor2: return "imSelectClipFrameDescriptor2";
+    case imGetIndColorSpace:        return "imGetIndColorSpace";
+    case imGetSourceVideo:          return "imGetSourceVideo";
+    case imImportAudio7:            return "imImportAudio7";
+    case imResetSequentialAudio:    return "imResetSequentialAudio";
+    case imGetSequentialAudio:      return "imGetSequentialAudio";
+    case imGetAudioChannelLayout:   return "imGetAudioChannelLayout";
+    case imGetPrefs8:               return "imGetPrefs8";
+    case imGetInstancePrefs:        return "imGetInstancePrefs";
+    case imAnalysis:                return "imAnalysis";
+    case imGetTimeInfo8:            return "imGetTimeInfo8";
+    case imGetFileAttributes:       return "imGetFileAttributes";
+    case imCreateAsyncImporter:     return "imCreateAsyncImporter";
+    case imGetColorSpaceFromOpaqueData: return "imGetColorSpaceFromOpaqueData";
+    default:                        return nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  imInit
+// ---------------------------------------------------------------------------
+
+csSDK_int32 doInit(imStdParms* stdParms, imImportInfoRec* info) {
+    if (!info) {
+        return imOtherErr;
+    }
+
+    PluginLog::init(kLogName);
+    // Copy the version struct under the lock that publishes it: ensureSuites()
+    // has already run for this selector, but on another thread it may be
+    // running for a different one right now.
+    HostVersion host;
+    {
+        ImporterGlobals& g = globals();
+        std::lock_guard<std::mutex> guard(g.mutex);
+        host = g.host;
+    }
+    PluginLog::info("OpenOSV importer imInit: host {} {}, importer interface version {}", host.appName(),
+                    host.toString(), stdParms ? stdParms->imInterfaceVer : 0);
+
+    // The whole capability declaration in one place (decision D12 and the
+    // design doc's "Registration and lifetime").
+    info->canSave = kPrFalse;
+    info->canDelete = kPrFalse;
+    info->canResize = kPrFalse;
+    info->canDoSubsize = kPrFalse;
+    info->canDoContinuousTime = kPrFalse;
+    info->noFile = kPrFalse;
+    info->addToMenu = imMenuNone;
+    // A modal Source Settings dialog is the whole prefs UI in v1.
+    info->hasSetup = kPrTrue;
+    info->setupOnDblClk = kPrFalse;
+    info->dontCache = kPrFalse;
+    // The module is unloaded when no clip needs it; nothing here is
+    // expensive to set up again.
+    info->keepLoaded = kPrFalse;
+    // Nobody else claims .osv, so there is no need to outrank another
+    // importer.
+    info->priority = 0;
+    info->canAsync = kPrFalse;
+    info->canCreate = kPrFalse;
+    info->canCalcSizes = kPrFalse;
+    info->canTrim = kPrFalse;
+    // AAC is compressed; let the host conform it once rather than claiming
+    // random access we would have to fake (decision D11).
+    info->avoidAudioConform = kPrFalse;
+    info->canCopy = kPrFalse;
+    info->canSupplyMetadataClipName = kPrFalse;
+    info->canValidatePrefs = kPrFalse;
+    info->canProvidePeakAudio = kPrFalse;
+    info->canProvideFileList = kPrFalse;
+    info->canProvideClosedCaptions = kPrFalse;
+    // No source-settings effect in v1 (decision D10, phase 2).
+    info->hasSourceSettingsEffect = kPrFalse;
+    info->hasPersistentData = kPrFalse;
+
+    // imIsCacheable tells the host it may skip loading us on later launches.
+    // That is only honest because imInit probes no hardware: the GPU is
+    // found lazily on the first frame, so a machine that gains or loses a
+    // CUDA device between sessions still behaves correctly.
+    return imIsCacheable;
+}
+
+// ---------------------------------------------------------------------------
+//  imGetIndFormat
+// ---------------------------------------------------------------------------
+
+csSDK_int32 doGetIndFormat(csSDK_int32 index, imIndFormatRec* rec) {
+    if (!rec) {
+        return imOtherErr;
+    }
+    if (index != 0) {
+        return imBadFormatIndex;
+    }
+
+    rec->filetype = kOsvFileType;
+    rec->canWriteTimecode = kPrFalse;
+    rec->canWriteMetaData = kPrFalse;
+    rec->hasAlternateTypes = kPrFalse;
+
+    // xfIsMovie is documented as obsolete but is still required for the
+    // filetype to appear in Proxy > Attach Proxies (SDK guide, 7.3.19).
+    rec->flags = xfCanOpen | xfCanImport | xfIsMovie;
+
+    std::memset(rec->FormatName, 0, sizeof(rec->FormatName));
+    std::memset(rec->FormatShortName, 0, sizeof(rec->FormatShortName));
+    std::memset(rec->PlatformExtension, 0, sizeof(rec->PlatformExtension));
+    ::strncpy_s(rec->FormatName, sizeof(rec->FormatName), kFormatName, _TRUNCATE);
+    ::strncpy_s(rec->FormatShortName, sizeof(rec->FormatShortName), kFormatShortName, _TRUNCATE);
+
+    // Extensions are NUL separated and the LIST is NUL terminated, so the
+    // bytes on the wire must be: o s v \0 l r f \0 \0.
+    //
+    // The literal below spells all nine out, including the final terminator,
+    // rather than relying on sizeof() silently contributing it: the value has
+    // embedded NULs, so `sizeof` is the only correct length and strncpy_s
+    // (which the two fields above legitimately use) would truncate it to
+    // "osv" and quietly lose .lrf proxy recognition.  memcpy with an explicit
+    // sizeof of an explicitly terminated literal makes both facts local.
+    static const char kExtensions[] = "osv\0lrf\0\0";
+    static_assert(sizeof(kExtensions) == 10,
+                  "the extension list must be o s v NUL l r f NUL NUL plus the literal's own terminator");
+    // Copy nine bytes: the list and its terminator.  The tenth (the literal's
+    // own implicit NUL) is redundant here because the field was memset above,
+    // but copying it costs nothing and removes the dependency on that memset.
+    std::memcpy(rec->PlatformExtension, kExtensions, sizeof(kExtensions) - 1u);
+    return imNoErr;
+}
+
+// ---------------------------------------------------------------------------
+//  imOpenFile8
+// ---------------------------------------------------------------------------
+
+csSDK_int32 doOpenFile8(imStdParms* stdParms, imFileRef* fileRef, imFileOpenRec8* rec) {
+    if (!stdParms || !rec) {
+        return imOtherErr;
+    }
+    PlugMemoryFuncsPtr memFuncs = stdParms->piSuites ? stdParms->piSuites->memFuncs : nullptr;
+
+    if (!rec->fileinfo.filepath) {
+        return imBadFile;
+    }
+    // prUTF16Char is a 16-bit code unit; on Windows that is exactly wchar_t.
+    const std::wstring path(reinterpret_cast<const wchar_t*>(rec->fileinfo.filepath));
+    if (path.empty()) {
+        return imBadFile;
+    }
+
+    // An existing privateData means this is an unquiet of a clip we already
+    // parsed; reuse the instance so the metadata is not read again.
+    ImporterInstance* instance = instanceFromHandle(rec->privatedata, memFuncs);
+    bool created = false;
+    if (!instance) {
+        instance = new (std::nothrow) ImporterInstance(std::filesystem::path(path));
+        if (!instance) {
+            return imMemErr;
+        }
+        created = true;
+    }
+
+    const Status st = instance->open();
+    if (!st.ok()) {
+        // The design doc and the SDK are both explicit: close the handle
+        // before returning imBadFile or no lower-priority importer can open
+        // the file.  ImporterInstance::open() already did that on failure.
+        PluginLog::debug("imOpenFile8: '{}' is not an OpenOSV clip: {}",
+                         std::filesystem::path(path).filename().string(), st.error().message);
+        if (created) {
+            delete instance;
+        }
+        return st.error().code == ErrorCode::Io ? imFileOpenFailed : imBadFile;
+    }
+
+    // Publish the OS handle: the host stores it and hands it back as param1
+    // of the selectors that take an imFileRef.
+    if (fileRef) {
+        *fileRef = instance->fileHandle();
+    }
+    rec->fileinfo.fileref = instance->fileHandle();
+    rec->fileinfo.filetype = kOsvFileType;
+
+    // The importer id keys the PPix cache for this clip.
+    instance->setImporterId(static_cast<std::uint32_t>(rec->inImporterID));
+
+    // Tell the host roughly what we cost while open so its media-cache
+    // accounting is not blind to our decoders.
+    rec->outExtraMemoryUsage = static_cast<csSDK_size_t>(instance->extraMemoryUsage());
+
+    if (created) {
+        void* handle = allocateHandleFor(memFuncs, instance);
+        if (!handle) {
+            delete instance;
+            return imMemErr;
+        }
+        rec->privatedata = handle;
+
+        // Everything the open discovered, once per clip.
+        for (const std::string& note : instance->notes()) {
+            PluginLog::debug("open '{}': {}", instance->path().filename().string(), note);
+        }
+        PluginLog::info("imOpenFile8: '{}' opened - {} x {} per lens, {} frames, {:.3f} fps, audio {} ch",
+                        instance->path().filename().string(), instance->format().lensW(),
+                        instance->format().lensH(), instance->frameCount(), instance->fps(),
+                        instance->audioChannels());
+    }
+    return imNoErr;
+}
+
+// ---------------------------------------------------------------------------
+//  imQuietFile / imCloseFile
+// ---------------------------------------------------------------------------
+
+csSDK_int32 doQuietFile(imStdParms* stdParms, imFileRef* fileRef, void* privateData) {
+    PlugMemoryFuncsPtr memFuncs = stdParms && stdParms->piSuites ? stdParms->piSuites->memFuncs : nullptr;
+    ImporterInstance* instance = instanceFromHandle(privateData, memFuncs);
+    if (instance) {
+        // Decoders, renderer lease, audio decoder and the OS handle go; the
+        // parsed metadata stays so the next unquiet is nearly free.
+        instance->releaseHeavy();
+    }
+    // The handle is closed, so the host's copy must be invalidated too.
+    if (fileRef) {
+        *fileRef = imInvalidHandleValue;
+    }
+    return imNoErr;
+}
+
+csSDK_int32 doCloseFile(imStdParms* stdParms, imFileRef* fileRef, void* privateData) {
+    PlugMemoryFuncsPtr memFuncs = stdParms && stdParms->piSuites ? stdParms->piSuites->memFuncs : nullptr;
+    ImporterInstance* instance = instanceFromHandle(privateData, memFuncs);
+    if (instance) {
+        PluginLog::debug("imCloseFile: '{}'", instance->path().filename().string());
+        delete instance;
+        // Clear the pointer in the handle so a second imCloseFile (which the
+        // host does send in some teardown paths) is a no-op instead of a
+        // double free.
+        storeInstanceInHandle(privateData, memFuncs, nullptr);
+    }
+    if (privateData && memFuncs && memFuncs->disposeHandle) {
+        memFuncs->disposeHandle(static_cast<PrMemoryHandle>(privateData));
+    }
+    if (fileRef) {
+        *fileRef = imInvalidHandleValue;
+    }
+    return imNoErr;
+}
+
+// ---------------------------------------------------------------------------
+//  imShutdown
+// ---------------------------------------------------------------------------
+
+csSDK_int32 doShutdown() {
+    PluginLog::info("imShutdown: releasing the renderer pool and the host suites");
+    // Destroy the renderers (and with them any CUDA / OpenCL context) here,
+    // where the runtimes are still loaded.  Never from DllMain.
+    HostContext::shutdown();
+
+    // Same lock the acquisition uses.  imShutdown arrives on one thread while
+    // nothing else should still be in flight, but "should" is not a
+    // guarantee, and releasing the table under the lock at least makes the
+    // release atomic with respect to a concurrent ensureSuites().
+    ImporterGlobals& g = globals();
+    {
+        std::lock_guard<std::mutex> guard(g.mutex);
+        // Clear the flag FIRST so no thread can start using a table that is
+        // about to be released; the release store pairs with the acquire
+        // load in ensureSuites().
+        g.suitesAcquired.store(false, std::memory_order_release);
+        g.suites.release();
+        g.basic = nullptr;
+    }
+
+    PluginLog::shutdown();
+    return imNoErr;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+//  Shared helpers declared in ImporterPlugin.h
+// ---------------------------------------------------------------------------
+
+ImporterGlobals& globals() noexcept { return globalsImpl(); }
+
+void* importerModuleHandle() noexcept { return g_module; }
+
+void ensureSuites(imStdParms* stdParms) noexcept {
+    ImporterGlobals& g = globalsImpl();
+    if (!stdParms) {
+        return;
+    }
+    // Plain atomic store: it tracks the last call and takes part in no
+    // invariant, so it needs no ordering with respect to the suite table.
+    g.interfaceVersion.store(stdParms->imInterfaceVer, std::memory_order_relaxed);
+
+    // Fast path.  An ACQUIRE load, so a thread that sees true also sees every
+    // write the acquiring thread made to g.suites before its release store.
+    if (g.suitesAcquired.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!stdParms->piSuites || !stdParms->piSuites->utilFuncs || !stdParms->piSuites->utilFuncs->getSPBasicSuite) {
+        return;
+    }
+    SPBasicSuite* basic = stdParms->piSuites->utilFuncs->getSPBasicSuite();
+    if (!basic) {
+        return;
+    }
+
+    // Slow path under the lock, then RE-TEST: between the fast-path load and
+    // taking the mutex another thread may have finished the acquisition.
+    // Without this second test both threads would run acquire(), whose first
+    // act is release() - dropping the host's refcounts on suite pointers the
+    // first thread has already published to an in-flight render.
+    std::lock_guard<std::mutex> guard(g.mutex);
+    if (g.suitesAcquired.load(std::memory_order_relaxed)) {
+        return;
+    }
+    g.basic = basic;
+    const int acquired = g.suites.acquire(basic);
+    g.host = g.suites.hostVersion();
+    // RELEASE store, and last: it publishes everything written above to any
+    // thread that later reads the flag with acquire semantics.
+    g.suitesAcquired.store(true, std::memory_order_release);
+    PluginLog::info("suites: {} acquired - {}", acquired, g.suites.describe());
+}
+
+ImporterInstance* instanceFromHandle(void* privateData, PlugMemoryFuncsPtr memFuncs) noexcept {
+    if (!privateData) {
+        return nullptr;
+    }
+    // A PrMemoryHandle is a "pointer to a master pointer" (PrSDKTypes.h:196),
+    // so the payload block is *handle and our single pointer lives at its
+    // start.  lockHandle/unlockHandle pin the block around the access; they
+    // return void, they only mark it non-relocatable.
+    PrMemoryHandle handle = static_cast<PrMemoryHandle>(privateData);
+    if (memFuncs && memFuncs->lockHandle) {
+        memFuncs->lockHandle(handle);
+    }
+    ImporterInstance* instance = nullptr;
+    if (*handle) {
+        std::memcpy(&instance, *handle, sizeof(instance));
+    }
+    if (memFuncs && memFuncs->unlockHandle) {
+        memFuncs->unlockHandle(handle);
+    }
+    return instance;
+}
+
+bool storeInstanceInHandle(void* privateData, PlugMemoryFuncsPtr memFuncs, ImporterInstance* instance) noexcept {
+    if (!privateData) {
+        return false;
+    }
+    PrMemoryHandle handle = static_cast<PrMemoryHandle>(privateData);
+    if (memFuncs && memFuncs->lockHandle) {
+        memFuncs->lockHandle(handle);
+    }
+    const bool ok = (*handle != nullptr);
+    if (ok) {
+        std::memcpy(*handle, &instance, sizeof(instance));
+    }
+    if (memFuncs && memFuncs->unlockHandle) {
+        memFuncs->unlockHandle(handle);
+    }
+    return ok;
+}
+
+void* allocateHandleFor(PlugMemoryFuncsPtr memFuncs, ImporterInstance* instance) noexcept {
+    if (!memFuncs || !memFuncs->newHandleClear) {
+        return nullptr;
+    }
+    PrMemoryHandle handle = memFuncs->newHandleClear(kPrivateDataSize);
+    if (!handle) {
+        return nullptr;
+    }
+    if (!storeInstanceInHandle(handle, memFuncs, instance)) {
+        if (memFuncs->disposeHandle) {
+            memFuncs->disposeHandle(handle);
+        }
+        return nullptr;
+    }
+    return handle;
+}
+
+}  // namespace osv::premiere
+
+// ---------------------------------------------------------------------------
+//  DllMain
+// ---------------------------------------------------------------------------
+//
+// Only two things happen here, both of which are safe under the loader lock:
+// the module handle is stored, and the delay-load hook pointer is set (which
+// is a single atomic store - see plugins/common/DelayLoad.h).  No CUDA, no
+// FFmpeg, no logging, no allocation.
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID /*reserved*/) {
+    switch (reason) {
+    case DLL_PROCESS_ATTACH:
+        osv::premiere::g_module = static_cast<HINSTANCE>(module);
+        // Resolve our own FFmpeg / OpenCL DLLs from the plug-in's folder
+        // rather than from Premiere's application directory, which ships its
+        // own (older) FFmpeg.
+        osv::premiere::delayload::installHook();
+        // Thread notifications cost a callback per thread and this module
+        // needs none; Premiere creates a lot of threads.
+        ::DisableThreadLibraryCalls(module);
+        break;
+    case DLL_PROCESS_DETACH:
+        // Deliberately nothing.  imShutdown has already torn the renderers
+        // down; if it did not, the process is exiting and touching CUDA here
+        // would be worse than leaking.
+        break;
+    default:
+        break;
+    }
+    return TRUE;
+}
+
+// ---------------------------------------------------------------------------
+//  xImportEntry
+// ---------------------------------------------------------------------------
+
+extern "C" PREMPLUGENTRY DllExport xImportEntry(csSDK_int32 selector, imStdParms* stdParms, void* param1,
+                                                void* param2) {
+    using namespace osv::premiere;
+
+    // Every path out of here is a plain integer: no exception may cross back
+    // into the host's C stack.
+    try {
+        ensureSuites(stdParms);
+
+        switch (selector) {
+        // ---- lifetime -----------------------------------------------------
+        case imInit:
+            return doInit(stdParms, static_cast<imImportInfoRec*>(param1));
+        case imShutdown:
+            return doShutdown();
+        case imGetIndFormat:
+            // param1 is the index, passed by value in the pointer.
+            return doGetIndFormat(static_cast<csSDK_int32>(reinterpret_cast<std::intptr_t>(param1)),
+                                  static_cast<imIndFormatRec*>(param2));
+
+        // ---- capability declarations --------------------------------------
+        case imGetSupports7:
+            return malSupports7;
+        case imGetSupports8:
+            return malSupports8;
+        case imGetSupportsPerInstancePrefs:
+            return malSupportsPerInstancePrefs;
+
+        // ---- file lifetime -------------------------------------------------
+        case imOpenFile8:
+            return doOpenFile8(stdParms, static_cast<imFileRef*>(param1), static_cast<imFileOpenRec8*>(param2));
+        case imQuietFile:
+            return doQuietFile(stdParms, static_cast<imFileRef*>(param1), param2);
+        case imCloseFile:
+            return doCloseFile(stdParms, static_cast<imFileRef*>(param1), param2);
+
+        // ---- information ---------------------------------------------------
+        case imGetInfo8:
+            return handleGetInfo8(stdParms, static_cast<imFileAccessRec8*>(param1),
+                                  static_cast<imFileInfoRec8*>(param2));
+        case imGetInfo9:
+            return handleGetInfo9(stdParms, static_cast<imFileAccessRec8*>(param1),
+                                  static_cast<imFileInfoRec9*>(param2));
+        case imAnalysis:
+            return handleAnalysis(stdParms, static_cast<imAnalysisRec*>(param2));
+        case imGetTimeInfo8:
+            return handleGetTimeInfo8(stdParms, static_cast<imTimeInfoRec8*>(param2));
+        case imGetFileAttributes:
+            return handleGetFileAttributes(stdParms, static_cast<imFileAttributesRec*>(param1));
+
+        // ---- format negotiation ---------------------------------------------
+        case imGetIndPixelFormat:
+            return handleGetIndPixelFormat(stdParms, static_cast<csSDK_int32>(reinterpret_cast<std::intptr_t>(param1)),
+                                           static_cast<imIndPixelFormatRec*>(param2));
+        case imGetPreferredFrameSize:
+            return handleGetPreferredFrameSize(stdParms, static_cast<imPreferredFrameSizeRec*>(param1));
+        case imSelectClipFrameDescriptor:
+            return handleSelectClipFrameDescriptor(stdParms, static_cast<imClipFrameDescriptorRec*>(param2), false);
+        case imSelectClipFrameDescriptor2:
+            // 23.2 and later only; on an older host the selector never
+            // arrives, but the version gate makes that explicit.
+            if (!stdParms || stdParms->imInterfaceVer < IMPORTMOD_VERSION_24) {
+                PluginLog::oncef("sel-descriptor2-old-host", PluginLog::Level::Debug,
+                                 "imSelectClipFrameDescriptor2 from a host reporting interface version {}",
+                                 stdParms ? stdParms->imInterfaceVer : 0);
+                return imUnsupported;
+            }
+            return handleSelectClipFrameDescriptor(stdParms, static_cast<imClipFrameDescriptorRec*>(param2), true);
+        case imGetIndColorSpace:
+            return handleGetIndColorSpace(stdParms, static_cast<csSDK_int32>(reinterpret_cast<std::intptr_t>(param1)),
+                                          static_cast<imIndColorSpaceRec*>(param2));
+
+        // ---- frames ----------------------------------------------------------
+        case imGetSourceVideo:
+            return handleGetSourceVideo(stdParms, static_cast<imSourceVideoRec*>(param2));
+
+        // ---- audio -----------------------------------------------------------
+        case imImportAudio7:
+            return handleImportAudio7(stdParms, static_cast<imImportAudioRec7*>(param2));
+        case imResetSequentialAudio:
+            return handleResetSequentialAudio(stdParms, static_cast<imImportAudioRec7*>(param2));
+        case imGetSequentialAudio:
+            return handleGetSequentialAudio(stdParms, static_cast<imImportAudioRec7*>(param2));
+        case imGetAudioChannelLayout:
+            return handleGetAudioChannelLayout(stdParms, static_cast<imGetAudioChannelLayoutRec*>(param2));
+
+        // ---- prefs -----------------------------------------------------------
+        case imGetPrefs8:
+            return handleGetPrefs8(stdParms, static_cast<imFileAccessRec8*>(param1),
+                                   static_cast<imGetPrefsRec*>(param2));
+        case imGetInstancePrefs:
+            return handleGetInstancePrefs(stdParms, static_cast<imFileAccessRec8*>(param1),
+                                          static_cast<imGetInstancePrefsRec*>(param2));
+
+        default:
+            break;
+        }
+
+        // Everything else, including imGetColorSpaceFromOpaqueData (23.3,
+        // whose parameter struct is not in the public headers) and the
+        // AE-only selectors.  imUnsupported is a non-error return.
+        const char* name = selectorName(selector);
+        PluginLog::oncef("unsupported-" + std::to_string(selector), PluginLog::Level::Debug,
+                         "selector {} ({}) is not supported", selector, name ? name : "unnamed");
+        return imUnsupported;
+    } catch (const std::bad_alloc&) {
+        PluginLog::error("selector {}: out of memory", selector);
+        return imMemErr;
+    } catch (const std::exception& e) {
+        PluginLog::error("selector {}: unhandled exception: {}", selector, e.what());
+        return imOtherErr;
+    } catch (...) {
+        PluginLog::error("selector {}: unhandled non-standard exception", selector);
+        return imOtherErr;
+    }
+}

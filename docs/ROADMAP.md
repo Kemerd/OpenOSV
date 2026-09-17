@@ -1,6 +1,6 @@
 # Roadmap
 
-## Milestone 1 - core library and osvtool (this release)
+## Milestone 1 - core library and osvtool (DONE)
 
 * Container parser, protobuf metadata decoder, format detection.
 * Kannala-Brandt lens model, verified extrinsic and scaling conventions.
@@ -10,7 +10,16 @@
 * Seam disparity search and exposure matching on the overlap band.
 * Stills (PNG/TIFF/EXR) and HDR MP4 output through an external ffmpeg.
 
-## Milestone 2 - Premiere Pro importer (.prm)
+## Milestone 2 - Premiere Pro importer (.prm) (DONE)
+
+Built as `OpenOSVImporter.prm` and verified by `osv_importer_tests`
+(1222009 assertions in 38 cases) against the shipping binary; see the
+"Verification results" section of `docs/PREMIERE.md` for the numbers.
+Source settings, audio, colour tagging and the CUDA stitch are all in
+place. Still open: the `.LRF` proxy opens and describes itself but does
+not render (a milestone 1 library gap - `osvtool render` fails on it the
+same way), the importer is synchronous, and Premiere itself has not been
+launched to confirm the host accepts the plug-in.
 
 * Registers `.OSV` (and the `.LRF` proxy) with Premiere.
 * Declares the clip as equirectangular VR (360 x 180) so Premiere's own VR
@@ -28,18 +37,33 @@
   the colour-space tagging depends on newer hosts and degrades to Rec.709
   passthrough on old ones.
 
-## Milestone 3 - Premiere Pro reframe effect (.aex)
+## Milestone 3 - Premiere Pro reframe effect (.aex) (DONE, one item deferred)
+
+Built as `Open360Reframe.aex` with both entry points (`EffectMain` and
+`xGPUFilterEntry`) in one module, a CUDA fatbin path and a threaded CPU
+path over the shared kernel, verified by `osv_reframe_tests` (14266
+assertions in 125 cases) at 151.9 dB GPU/CPU PSNR in 32f. Deferred: the
+OpenCL branch of the GPU filter - CUDA and the CPU fallback cover every
+machine we can currently test.
 
 * AE-style effect with a `PrGPUFilter` CUDA + OpenCL path running the shared
   kernel in reframe mode on the equirect.
 * Host-keyframed Pan / Tilt / Roll / FOV / Correction Angle, preset
   perspectives (Crystal Ball, Asteroid, Wide, Ultra Wide, Dewarping), source
   orientation offsets and resolution presets.
-* Program-monitor drag handles via DrawBot.
+* Interactive Program Monitor overlay: drag the picture to pan and tilt, a
+  roll ring and corner FOV grips, `Shift` to constrain an axis, `Ctrl` to
+  zoom and `Alt` to roll from anywhere. Values are committed with
+  `PF_ChangeFlag_CHANGED_VALUE` at the current time, so the host records the
+  keyframes itself. Drawn with DrawBot as a thin crosshair, the ring arcs,
+  the grips and a degrees readout, every stroke shadowed so it stays legible
+  over bright and dark footage. There is no scroll-wheel zoom because the SDK
+  has no mouse-wheel event; see docs/PREMIERE.md, "Program Monitor overlay".
 * Same compatibility rule as the importer: PrGPUFilter interface v2 with a
   32-bit float CPU fallback so Premiere 2022 and newer all render it.
-* Installer that places both plug-ins in
-  `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\Open360\`.
+* `scripts/install_plugins.ps1` places both plug-ins in
+  `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\OpenOSV\`,
+  which Premiere Pro, Media Encoder and After Effects all scan.
 
 ## Later
 

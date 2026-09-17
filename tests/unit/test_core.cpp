@@ -24,6 +24,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <random>
+#include <thread>
 #include <vector>
 
 using namespace osv;
@@ -334,4 +335,63 @@ TEST_CASE("ThreadPool handles empty ranges, null bodies and exceptions", "[core]
     REQUIRE(pool.parallelRows(64, 8, [&](std::size_t) { rows.fetch_add(1); }).ok());
     REQUIRE(rows.load() == 64);
     REQUIRE(ThreadPool::global().size() >= 1);
+}
+
+TEST_CASE("ThreadPool never lets a worker outlive its job", "[core]") {
+    // The Job lives on the calling thread's stack.  A worker that has taken
+    // it out of m_currentJob but not yet left runChunks() still holds that
+    // pointer, so parallelFor must not return until every worker has left -
+    // otherwise the next caller's Job reuses the same stack address and the
+    // straggler runs chunk bounds from the WRONG job.  In the effect that
+    // showed up as a render writing row 230 of a 120-row frame, i.e. a wild
+    // store into freed memory (caught under cdb: dstRow unmapped, row 0xe6).
+    //
+    // Alternating a large job with a small one from two threads is the shape
+    // that produced it.  This is a guard rather than a reproduction: the
+    // timing window is narrow enough that the crash surfaced reliably only
+    // through the effect's own render tests (tests/premiere/reframe), which
+    // failed about one run in four before the fix and pass 40/40 after it.
+    ThreadPool pool(4);
+
+    constexpr int kRounds = 300;
+    std::atomic<bool> stop{false};
+    std::atomic<int> outOfRange{0};
+
+    // The "victim": a small range whose body checks that every index it is
+    // handed really belongs to this job.
+    std::thread small([&] {
+        for (int r = 0; r < kRounds && !stop.load(std::memory_order_relaxed); ++r) {
+            constexpr std::size_t kSmall = 64;
+            const Status st = pool.parallelFor(0, kSmall, 1, [&](std::size_t b, std::size_t e) {
+                for (std::size_t i = b; i < e; ++i) {
+                    if (i >= kSmall) {
+                        outOfRange.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            });
+            if (!st.ok()) {
+                outOfRange.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        stop.store(true, std::memory_order_relaxed);
+    });
+
+    // The "aggressor": a much larger range, so a leaked chunk index from it
+    // lands far outside the small job's bounds.
+    std::thread big([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            constexpr std::size_t kBig = 4096;
+            (void)pool.parallelFor(0, kBig, 1, [](std::size_t b, std::size_t e) {
+                for (std::size_t i = b; i < e; ++i) {
+                    std::this_thread::yield();
+                }
+            });
+        }
+    });
+
+    small.join();
+    big.join();
+
+    // Zero is the only acceptable answer: one leaked index is one wild write.
+    REQUIRE(outOfRange.load(std::memory_order_relaxed) == 0);
 }

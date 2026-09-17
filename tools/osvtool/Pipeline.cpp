@@ -158,7 +158,10 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     std::vector<std::string> scaleNotes;
     const double calFxMean = 0.5 * (p->calibration.slave.fx + p->calibration.master.fx);
     OSV_TRY_ASSIGN(geom::StreamScaling scaling,
-                   geom::StreamScaling::derive(static_cast<int>(p->format.streamW), static_cast<int>(p->format.streamH),
+                   // lensW()/lensH(), not streamW/streamH: the LRF proxy's single
+                   // side-by-side track is twice as wide as the lens image the
+                   // reader actually delivers, and the rig describes ONE lens.
+                   geom::StreamScaling::derive(static_cast<int>(p->format.lensW()), static_cast<int>(p->format.lensH()),
                                                static_cast<int>(p->format.sensorW), static_cast<int>(p->format.sensorH),
                                                p->format.digitalFocalLength, calFxMean, options.cropScale, &scaleNotes));
     for (const std::string& n : scaleNotes) {

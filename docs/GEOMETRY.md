@@ -53,6 +53,60 @@ feathers the last 4 degrees before `thetaMax` with a smoothstep and multiplies
 by an occlusion factor derived from the 14-point polygon in the calibration
 (the selfie-stick side of the image). Blending happens in scene-linear light.
 
+## Eye-offset projection
+
+The reframing camera's default look is the eye-offset ("generalised
+stereographic") model: the sphere is projected onto the image plane from a
+point `d` radii behind its centre. With `f` the focal length in pixels and
+`theta` the angle from the view axis:
+
+```
+r / f   = (1 + d) sin(theta) / (d + cos(theta))          forward
+k       = r / (f (1 + d))
+theta   = atan(k) + asin(k d / sqrt(1 + k^2))             inverse (pixel -> ray)
+f       = (W/2) (d + cos(hfov/2)) / ((1 + d) sin(hfov/2))  viewport edge = hfov/2
+```
+
+`d = 0` reduces to the pinhole (`r = f tan(theta)`) and `d = 1` to the
+stereographic projection (`r = 2 f tan(theta/2)`); `test_reframe` proves both
+equalities to double precision on the host and to float precision inside the
+kernel, plus monotonicity of `theta(r)` and the round trip for intermediate
+offsets. The forward model has an asymptote at `theta = acos(-d)`; `theta(r)`
+is strictly increasing below it (its derivative is proportional to
+`1 + d cos(theta) > 0`), and the kernel reports anything at or beyond it as
+uncovered. `VirtualCamera::effectiveHfovDeg()` clamps the requested field of
+view below `2 acos(-d) - 1 degree` (179 degrees at `d = 0`, 359 at `d = 1`)
+so the inverse stays well conditioned; `osvtool render --proj eye-offset
+--distortion d` and the Premiere effect's Distortion slider (`d = percent /
+100`) drive the same parameter, `OsvRenderParams::eyeOffset` /
+`OsvReframeParams::eyeOffset` with `OSV_PROJ_EYE_OFFSET`.
+
+The presets (`geom::kPresets`, user-editable starting points, not format
+conventions) all use this projection so one control moves between looks:
+
+| Preset | hfov (deg) | pitch (deg) | eye offset `d` | Equivalent |
+|---|---|---|---|---|
+| Crystal Ball | 240 | 0 | 1.0 | stereographic |
+| Asteroid | 300 | -90 | 1.0 | stereographic, looking down |
+| Wide | 120 | 0 | 0.15 | near-pinhole with mild barrel |
+| Ultra Wide | 150 | 0 | 0.4 | wider, corners kept compact |
+| Dewarping | 95 | 0 | 0.0 | rectilinear |
+
+### Equirect reframe entry point
+
+`osvReframeEquirectPixel` (osv_kernel.h) is the second kernel entry point:
+it reframes an already stitched Standard-layout equirect (32-bit or 16-bit
+float, RGBA or BGRA) with the same `osvViewRay` ray generator as the fisheye
+shader and the same `Rout = body <- view` rotation from
+`VirtualCamera::rotation()`, so `osvtool render --proj eye-offset` and the
+Premiere effect produce identical framing. The lookup is bilinear with
+longitude wrap-around at the +/-180 degree seam and latitude clamp at the
+poles; pixels outside the viewport rectangle are transparent black (aspect
+letterbox), alpha is carried straight from the source unless `fillAlphaOne`
+is set. The half-float decoder in the header is pure bit manipulation so the
+CPU, CUDA and OpenCL builds of the function execute the same arithmetic
+(`test_reframe`, CUDA parity >= 60 dB).
+
 ## Equirect layouts
 
 * **Standard**: `lon = (px/W - 0.5) 2pi`, `lat = (0.5 - py/H) pi`,

@@ -1,0 +1,124 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 The OpenOSV Contributors
+//
+// Resources of OpenOSVImporter.prm:
+//
+//   * the IMPT resource, without which Premiere does not recognise the module
+//     as an importer at all (SDK guide 4.3 / 7.3.17).  Its payload is a
+//     16-bit zero word followed by the 32-bit file-type fourcc, exactly the
+//     shape the SDK's own SDK_File_Import.rc produces;
+//   * the "OpenOSV Source Settings" dialog template;
+//   * VERSIONINFO so the file shows a proper product name and version in
+//     Explorer and in Premiere's plug-in list.
+//
+// Standard (non-synthetic) importers need no PiPL - only the .aex effect
+// does.
+
+#include <windows.h>
+#include "resource.h"
+
+// ---------------------------------------------------------------------------
+//  IMPT
+// ---------------------------------------------------------------------------
+// 'OSV_' = 0x4F53565F.  The value must match kOsvFileType in ImporterPlugin.h
+// and the filetype returned from imGetIndFormat.
+#define OSV_FILETYPE 0x4F53565FL
+
+IDR_IMPT IMPT DISCARDABLE
+BEGIN
+    0x0000
+    OSV_FILETYPE
+END
+
+// ---------------------------------------------------------------------------
+//  Source Settings dialog
+// ---------------------------------------------------------------------------
+// DIALOGEX so the controls get a real font; the geometry is in dialog units,
+// which scale with the system font and therefore with the DPI setting.
+IDD_SOURCE_SETTINGS DIALOGEX 0, 0, 268, 232
+STYLE DS_SETFONT | DS_MODALFRAME | DS_FIXEDSYS | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "OpenOSV Source Settings"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    // ---- Colour output ----------------------------------------------------
+    GROUPBOX        "Colour output", IDC_STATIC_COLOR, 7, 7, 254, 32
+    CONTROL         "Rec.2100 &PQ", IDC_COLOR_PQ, "Button",
+                    BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 16, 21, 62, 10
+    CONTROL         "Rec.2100 &HLG", IDC_COLOR_HLG, "Button",
+                    BS_AUTORADIOBUTTON, 92, 21, 62, 10
+    CONTROL         "Rec.&709", IDC_COLOR_709, "Button",
+                    BS_AUTORADIOBUTTON, 168, 21, 62, 10
+
+    // ---- Geometry ---------------------------------------------------------
+    LTEXT           "Output &size:", IDC_STATIC_SIZE, 7, 50, 70, 8
+    COMBOBOX        IDC_OUTPUT_SIZE, 82, 47, 179, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_GROUP | WS_TABSTOP
+
+    LTEXT           "S&tabilisation:", IDC_STATIC_STAB, 7, 70, 70, 8
+    COMBOBOX        IDC_STABILIZATION, 82, 67, 179, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "&Calibration:", IDC_STATIC_CALIB, 7, 90, 70, 8
+    COMBOBOX        IDC_CALIBRATION, 82, 87, 179, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    // ---- Stitch quality ---------------------------------------------------
+    CONTROL         "Seam sea&rch (parallax correction for near objects)",
+                    IDC_SEAM_SEARCH, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 7, 111, 254, 10
+    CONTROL         "E&xposure match between the two lenses",
+                    IDC_GAIN_MATCH, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 7, 125, 254, 10
+
+    // ---- Colour detail ----------------------------------------------------
+    LTEXT           "D-Log &M curve:", IDC_STATIC_FIT, 7, 148, 70, 8
+    COMBOBOX        IDC_DLOGM_FIT, 82, 145, 179, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "&Exposure:", IDC_STATIC_EXP, 7, 168, 70, 8
+    EDITTEXT        IDC_EXPOSURE, 82, 165, 50, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "stops", IDC_STATIC_STOPS, 137, 168, 40, 8
+
+    // ---- Backend ----------------------------------------------------------
+    LTEXT           "Render &device:", IDC_STATIC_DEVICE, 7, 188, 70, 8
+    COMBOBOX        IDC_RENDER_DEVICE, 82, 185, 179, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    // ---- Buttons ----------------------------------------------------------
+    DEFPUSHBUTTON   "OK", IDOK, 156, 209, 50, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 211, 209, 50, 16
+END
+
+// ---------------------------------------------------------------------------
+//  VERSIONINFO
+// ---------------------------------------------------------------------------
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "The OpenOSV Contributors"
+            VALUE "FileDescription",  "OpenOSV importer for DJI Osmo 360 .OSV clips"
+            VALUE "FileVersion",      "0.1.0.0"
+            VALUE "InternalName",     "OpenOSVImporter"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 The OpenOSV Contributors. Apache-2.0."
+            VALUE "OriginalFilename", "OpenOSVImporter.prm"
+            VALUE "ProductName",      "OpenOSV"
+            VALUE "ProductVersion",   "0.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

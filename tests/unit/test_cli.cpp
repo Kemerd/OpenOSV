@@ -169,6 +169,20 @@ TEST_CASE("osvtool probe/render/seam/selfcheck on the sample clip", "[cli][sampl
         REQUIRE(img.value().h == 360);
     }
 
+    SECTION("render with the eye-offset projection and a distortion value") {
+        const auto png = osvtest::tempDir() / "cli_eye_offset.png";
+        const RunResult r = runTool("render " + clip + " --frame 0 --size 320x180 --proj eye-offset --distortion 0.5 --fov 150 --device cpu --out " + quoted(png));
+        INFO(r.output);
+        REQUIRE(r.exitCode == 0);
+        auto img = osv::io::readImage(png);
+        REQUIRE(img.ok());
+        REQUIRE(img.value().w == 320);
+        // Out-of-range distortion is a usage error.
+        const RunResult bad = runTool("render " + clip + " --frame 0 --size 64x36 --proj eye-offset --distortion 1.5 --device cpu --out " + quoted(png));
+        REQUIRE(bad.exitCode != 0);
+        REQUIRE(bad.output.find("--distortion") != std::string::npos);
+    }
+
     SECTION("render polar equirect to linear EXR") {
         const auto exr = osvtest::tempDir() / "cli_equirect.exr";
         const RunResult r = runTool("render " + clip + " --frame 0 --mode equirect-polar --size 1024x512 --color linear --device cpu --out " + quoted(exr));

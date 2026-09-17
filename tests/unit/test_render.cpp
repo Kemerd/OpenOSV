@@ -414,8 +414,23 @@ void checkParity(render::IRenderer& gpu, const char* label) {
     map.h = 1024;
     auto jobB = render::RenderParamsBuilder().rig(sp.value().rig).equirect(map).color(cp).build(sp.value().pair);
     REQUIRE(jobB.ok());
+    // Eye-offset projection at d = 0.5: proves the GPU kernels carry the new
+    // OSV_PROJ_EYE_OFFSET branch (asinf / acosf included) and not only the
+    // rectilinear and equirect paths.
+    geom::VirtualCamera eye;
+    eye.projection = geom::Projection::EyeOffset;
+    eye.eyeOffset = 0.5;
+    eye.w = 1920;
+    eye.h = 1080;
+    eye.hfovDeg = 150;
+    eye.yawDeg = -20;
+    eye.pitchDeg = 15;
+    eye.rollDeg = 5;
+    auto jobC = render::RenderParamsBuilder().rig(sp.value().rig).camera(eye).color(cp).build(sp.value().pair);
+    REQUIRE(jobC.ok());
+    REQUIRE(jobC.value().params.projection == OSV_PROJ_EYE_OFFSET);
 
-    for (const render::RenderJob* job : {&jobA.value(), &jobB.value()}) {
+    for (const render::RenderJob* job : {&jobA.value(), &jobB.value(), &jobC.value()}) {
         auto ref = cpu.render(*job);
         auto test = gpu.render(*job);
         REQUIRE(ref.ok());
@@ -496,4 +511,217 @@ TEST_CASE("makeRenderer resolves names", "[render]") {
     REQUIRE(autoR.ok());
     REQUIRE_FALSE(chosen.empty());
     REQUIRE(render::makeRenderer("vulkan", pool, nullptr).error().code == ErrorCode::InvalidArgument);
+}
+
+// ===========================================================================
+//  The LRF proxy: one side-by-side track, two lenses
+//
+//  The .LRF proxy DJI writes beside every .OSV is a single 2048 x 1024 track
+//  holding two 1024 x 1024 fisheye halves, not two tracks of one lens each.
+//  video::DualStreamReader has always split it correctly, but everything
+//  downstream was built from FormatInfo::streamW - the WHOLE TRACK - so the
+//  rig described a 2048 x 1024 lens while the reader handed out 1024 x 1024
+//  frames, and render::RenderParamsBuilder rejected every frame with
+//  "frame size does not match the rig (1024x1024 vs 2048x1024)".  The proxy
+//  therefore opened, reported its geometry correctly and rendered nothing.
+//
+//  FormatInfo::lensW() / lensH() are the fix: one named per-lens size that
+//  every rig builder uses, halved for the side-by-side layout and identical
+//  to streamW / streamH for every other mode.
+// ===========================================================================
+namespace {
+
+/// Everything the LRF needs to reach a rendered frame, built the way the
+/// importer and osvtool both build it.
+struct LrfPipeline {
+    std::unique_ptr<OsvFile> file;
+    meta::MetadataTrack track;
+    meta::FormatInfo format;
+    geom::StreamScaling scaling;
+    geom::LensRig rig;
+    video::FramePair pair;
+};
+
+Result<LrfPipeline> openLrfFrame(std::uint32_t frameIndex) {
+    LrfPipeline s;
+    OSV_TRY_ASSIGN(OsvFile f, OsvFile::open(osvtest::sampleLrf()));
+    s.file = std::make_unique<OsvFile>(std::move(f));
+    OSV_TRY_ASSIGN(s.track, meta::MetadataTrack::load(*s.file));
+    OSV_TRY_ASSIGN(s.format, meta::FormatDetector::detect(*s.file, &s.track));
+    OSV_TRY_ASSIGN(meta::CalibrationSet cal, meta::CalibrationSelector::select(s.track.stream()));
+    // lensW()/lensH(), exactly as ImporterInstance::rebuildRig() and
+    // tools/osvtool/Pipeline.cpp do it.
+    OSV_TRY_ASSIGN(s.scaling,
+                   geom::StreamScaling::derive(static_cast<int>(s.format.lensW()), static_cast<int>(s.format.lensH()),
+                                               static_cast<int>(s.format.sensorW), static_cast<int>(s.format.sensorH),
+                                               s.format.digitalFocalLength, 0.5 * (cal.slave.fx + cal.master.fx)));
+    OSV_TRY_ASSIGN(s.rig, geom::LensRig::build(cal, s.scaling, geom::FocalSource::DigitalFocalLength,
+                                               s.format.digitalFocalLength, geom::ExtrinsicConvention{}));
+    OSV_TRY_ASSIGN(video::DualStreamReader reader, video::DualStreamReader::open(osvtest::sampleLrf(), s.format));
+    OSV_TRY_ASSIGN(s.pair, reader.read(frameIndex));
+    return s;
+}
+
+}  // namespace
+
+TEST_CASE("FormatInfo::lensW halves only the side-by-side layout", "[meta][lrf]") {
+    // A pure unit check, no clip needed: the accessor is the single place the
+    // side-by-side split is expressed, so it is worth pinning on its own.
+    meta::FormatInfo f;
+    f.streamW = 3000;
+    f.streamH = 3000;
+    f.sideBySideProxy = false;
+    CHECK(f.lensW() == 3000u);
+    CHECK(f.lensH() == 3000u);
+
+    f.streamW = 2048;
+    f.streamH = 1024;
+    f.sideBySideProxy = true;
+    CHECK(f.lensW() == 1024u);
+    CHECK(f.lensH() == 1024u * 0u + 1024u);
+
+    // Defensive: an odd or degenerate width is passed through rather than
+    // silently truncated, so a malformed clip fails in the rig builder (which
+    // reports what it saw) instead of being reinterpreted here.
+    f.streamW = 2049;
+    CHECK(f.lensW() == 2049u);
+    f.streamW = 1;
+    CHECK(f.lensW() == 1u);
+    f.streamW = 0;
+    CHECK(f.lensW() == 0u);
+}
+
+TEST_CASE("the LRF proxy builds a rig that matches its decoded halves", "[render][lrf][sample]") {
+    OSV_REQUIRE_SAMPLE_LRF();
+    auto lp = openLrfFrame(0);
+    REQUIRE(lp.ok());
+    const LrfPipeline& s = lp.value();
+
+    // The track is 2048 x 1024...
+    REQUIRE(s.format.sideBySideProxy);
+    REQUIRE(s.format.streamW == 2048u);
+    REQUIRE(s.format.streamH == 1024u);
+    // ...and one lens is 1024 x 1024.
+    REQUIRE(s.format.lensW() == 1024u);
+    REQUIRE(s.format.lensH() == 1024u);
+
+    // The reader splits the track into two halves of exactly that size.
+    REQUIRE(s.pair.lens[0].width == 1024u);
+    REQUIRE(s.pair.lens[0].height == 1024u);
+    REQUIRE(s.pair.lens[1].width == 1024u);
+    REQUIRE(s.pair.lens[1].height == 1024u);
+
+    // And the rig now describes the SAME size.  This is the assertion that
+    // was false before the fix - the rig said 2048 x 1024 - and it is the one
+    // RenderParamsBuilder checks per frame.
+    REQUIRE(s.rig.streamW == 1024);
+    REQUIRE(s.rig.streamH == 1024);
+
+    // The two halves are different pictures, not the same one twice: a split
+    // that forgot to advance the pointer for the right half would pass every
+    // size check above and still be wrong.
+    bool differs = false;
+    for (std::uint32_t y = 0; y < 1024u && !differs; y += 64u) {
+        for (std::uint32_t x = 0; x < 1024u; x += 64u) {
+            const std::uint16_t a = s.pair.lens[0].luma(x, y);
+            const std::uint16_t b = s.pair.lens[1].luma(x, y);
+            if (a != b) {
+                differs = true;
+                break;
+            }
+        }
+    }
+    CHECK(differs);
+}
+
+TEST_CASE("the LRF proxy renders an equirect frame", "[render][lrf][sample]") {
+    OSV_REQUIRE_SAMPLE_LRF();
+    auto lp = openLrfFrame(0);
+    REQUIRE(lp.ok());
+    const LrfPipeline& s = lp.value();
+
+    ThreadPool pool;
+    render::CpuRenderer cpu(pool);
+    const OsvColorParams cp = color::makeColorParams(color::DlogMFit::DjiRefit, color::OutputTransfer::PQ, 0.0f);
+
+    // The proxy's native equirect is 2 x the lens height, i.e. 2048 x 1024 -
+    // the same number as the track width, which is a coincidence of this
+    // layout and exactly the sort of thing that hid the bug.
+    geom::VirtualCamera cam;
+    cam.projection = geom::Projection::Equirect;
+    cam.w = 2048;
+    cam.h = 1024;
+    auto job = render::RenderParamsBuilder().rig(s.rig).camera(cam).color(cp).build(s.pair);
+    REQUIRE(job.ok());  // this is the call that used to fail
+
+    auto img = cpu.render(job.value());
+    REQUIRE(img.ok());
+    REQUIRE(allFinite(img.value()));
+
+    // Coverage: with a correct rig the two 195-degree lenses fill the sphere,
+    // so the overwhelming majority of the frame is opaque.  A rig built from
+    // the whole track would have projected each lens into a small disc and
+    // left most of the panorama transparent, which is what the wrong-focal
+    // variant of this bug looked like on screen.
+    std::size_t opaque = 0;
+    std::size_t total = 0;
+    for (std::uint32_t y = 0; y < 1024u; y += 4u) {
+        for (std::uint32_t x = 0; x < 2048u; x += 4u) {
+            const float* px = img.value().pixel(x, y);
+            if (px[3] > 0.5f) {
+                ++opaque;
+            }
+            ++total;
+        }
+    }
+    REQUIRE(total > 0u);
+    const double coverage = static_cast<double>(opaque) / static_cast<double>(total);
+    INFO("LRF equirect alpha coverage: " << coverage);
+    CHECK(coverage > 0.90);
+}
+
+TEST_CASE("the LRF's stale digital_focal_length does not reach the lens", "[render][lrf][sample]") {
+    OSV_REQUIRE_SAMPLE_LRF();
+    auto lp = openLrfFrame(0);
+    REQUIRE(lp.ok());
+    const LrfPipeline& s = lp.value();
+
+    // The proxy's ClipMeta repeats the 6K camera's digital_focal_length
+    // verbatim - it is the value for a 3000 px stream, not for a 1024 px one.
+    // Taken at face value it builds a lens nearly three times too long and
+    // the fisheye circle collapses to a disc in the middle of the panorama.
+    //
+    // LensRig::build() now checks the field against the calibration mapped
+    // through the same scaling and refuses it when the two disagree by more
+    // than a factor of 1.2, so the lens ends up at the calibrated focal.
+    const double stale = static_cast<double>(s.format.digitalFocalLength);
+    const double actual = s.rig.lens[geom::kSlaveLens].fx;
+    INFO("digital_focal_length " << stale << " vs lens fx " << actual);
+    CHECK(stale > 800.0);           // the 6K value really is in the file
+    CHECK(actual < stale / 2.0);    // and it really was rejected
+    CHECK(actual > 200.0);          // for something physically sensible
+    CHECK(actual < 400.0);
+
+    // The rejection is recorded, not silent: a human reading the notes can
+    // see which number was used and why.
+    bool noted = false;
+    for (const std::string& n : s.rig.notes) {
+        if (n.find("digital_focal_length") != std::string::npos && n.find("disagrees") != std::string::npos) {
+            noted = true;
+            break;
+        }
+    }
+    CHECK(noted);
+}
+
+TEST_CASE("the 6K clip still trusts its digital_focal_length", "[render][lrf][sample]") {
+    // The other side of the same guard: on the verified 6K clip the field and
+    // the scaled calibration agree to a fraction of a percent, so the field
+    // must still win and the rig must be bit-identical to what it always was.
+    OSV_REQUIRE_SAMPLE();
+    auto sp = openSampleFrame(0);
+    REQUIRE(sp.ok());
+    const double dfl = static_cast<double>(sp.value().format.digitalFocalLength);
+    CHECK(sp.value().rig.lens[geom::kSlaveLens].fx == dfl);
+    CHECK(sp.value().rig.lens[geom::kMasterLens].fx == dfl);
 }

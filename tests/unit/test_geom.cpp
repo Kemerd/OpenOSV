@@ -725,14 +725,39 @@ TEST_CASE("Presets table is sane and searchable", "[geom][presets]") {
         REQUIRE(findPreset(p.id) == &p);
         REQUIRE(findPreset(p.name) == &p);
     }
-    // The documented defaults.
+    // The documented defaults: every look is an eye-offset camera so one
+    // distortion control moves between them.
     const Preset* crystal = findPreset("Crystal Ball");
     REQUIRE(crystal != nullptr);
-    REQUIRE(crystal->projection == Projection::Stereographic);
+    REQUIRE(crystal->projection == Projection::EyeOffset);
+    REQUIRE(crystal->eyeOffset == 1.0);
     REQUIRE(crystal->hfovDeg == 240.0);
     const Preset* asteroid = findPreset("asteroid");
     REQUIRE(asteroid != nullptr);
     REQUIRE(asteroid->pitchDeg == -90.0);
+    REQUIRE(asteroid->eyeOffset == 1.0);
+    REQUIRE(findPreset("wide")->eyeOffset == 0.15);
+    REQUIRE(findPreset("ultra-wide")->eyeOffset == 0.4);
+    REQUIRE(findPreset("dewarping")->eyeOffset == 0.0);
+    // Crystal Ball at offset 1 must reproduce the stereographic rays exactly
+    // (the look did not change when the table switched projections).
+    {
+        VirtualCamera eye;
+        eye.w = 1000;
+        eye.h = 1000;
+        applyPreset(*crystal, eye);
+        VirtualCamera stereo = eye;
+        stereo.projection = Projection::Stereographic;
+        REQUIRE(eye.isValid());
+        REQUIRE(stereo.isValid());
+        REQUIRE_THAT(eye.focalPx(), Catch::Matchers::WithinRel(stereo.focalPx(), 1e-12));
+        for (const double r : {0.0, 50.0, 200.0, 400.0, 499.0}) {
+            Vec3d a, b;
+            REQUIRE(eye.pixelToRay(0.5 * eye.w - 0.5 + r, 0.5 * eye.h - 0.5 - 0.3 * r, a));
+            REQUIRE(stereo.pixelToRay(0.5 * eye.w - 0.5 + r, 0.5 * eye.h - 0.5 - 0.3 * r, b));
+            REQUIRE((a - b).norm() < 1e-12);
+        }
+    }
     REQUIRE(findPreset("ULTRA_WIDE") != nullptr);
     REQUIRE(findPreset("ultra wide") != nullptr);
     REQUIRE(findPreset("nope") == nullptr);
@@ -748,7 +773,8 @@ TEST_CASE("Presets table is sane and searchable", "[geom][presets]") {
     REQUIRE(cam.yawDeg == 12.0);
     REQUIRE(cam.rollDeg == 3.0);
     REQUIRE(cam.pitchDeg == -90.0);
-    REQUIRE(cam.projection == Projection::Stereographic);
+    REQUIRE(cam.projection == Projection::EyeOffset);
+    REQUIRE(cam.eyeOffset == 1.0);
 }
 
 // -----------------------------------------------------------------------------

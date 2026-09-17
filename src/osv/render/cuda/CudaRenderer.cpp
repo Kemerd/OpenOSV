@@ -24,12 +24,18 @@ std::string cudaMessage(const char* what, cudaError_t err) {
     return std::string(what) + ": " + cudaGetErrorString(err) + " (" + std::to_string(static_cast<int>(err)) + ")";
 }
 
-/// A pitched device buffer that is re-allocated only when it grows.
+/// A pitched device buffer that is re-allocated only when it grows and
+/// freed on destruction (so early returns cannot leak device memory).
 struct DeviceBuffer {
     void* ptr = nullptr;
     std::size_t pitch = 0;
     std::size_t widthBytes = 0;
     std::size_t height = 0;
+
+    DeviceBuffer() = default;
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    ~DeviceBuffer() { release(); }
 
     Status ensure(std::size_t wBytes, std::size_t h) {
         if (ptr && wBytes <= widthBytes && h <= height) {
@@ -349,6 +355,70 @@ Result<ImageRGBAf> CudaRenderer::render(const RenderJob& job) {
         return Error{ErrorCode::Gpu, cudaMessage("kernel execution", err)};
     }
     std::memcpy(image.data.data(), m_impl->staging.ptr, totalBytes);
+    return image;
+}
+
+// -----------------------------------------------------------------------------
+//  Equirect reframe (verification path for the effect kernel)
+// -----------------------------------------------------------------------------
+Result<ImageRGBAf> cudaReframeEquirect(int deviceIndex, const OsvReframeParams& params, const OsvRgbaSource& src,
+                                       const void* pixels) {
+    // Validate everything the kernel would otherwise trip over.
+    if (!pixels) {
+        return Error{ErrorCode::InvalidArgument, "cudaReframeEquirect: null source pixels"};
+    }
+    if (src.w <= 0 || src.h <= 0 || src.pitchBytes <= 0) {
+        return Error{ErrorCode::InvalidArgument, "cudaReframeEquirect: invalid source description"};
+    }
+    const std::size_t bytesPerTexel = src.isHalf ? 4u * sizeof(std::uint16_t) : 4u * sizeof(float);
+    if (static_cast<std::size_t>(src.pitchBytes) < static_cast<std::size_t>(src.w) * bytesPerTexel) {
+        return Error{ErrorCode::InvalidArgument, "cudaReframeEquirect: source pitch smaller than a row"};
+    }
+    if (params.outW <= 0 || params.outH <= 0) {
+        return Error{ErrorCode::InvalidArgument, "cudaReframeEquirect: invalid output size"};
+    }
+    if (deviceIndex < 0 || deviceIndex >= CudaRenderer::deviceCount()) {
+        return Error{ErrorCode::InvalidArgument, "cudaReframeEquirect: CUDA device index out of range"};
+    }
+    cudaError_t err = cudaSetDevice(deviceIndex);
+    if (err != cudaSuccess) {
+        return Error{ErrorCode::Gpu, cudaMessage("cudaSetDevice", err)};
+    }
+
+    // Device copies of the source (linear, same pitch as the host rows) and
+    // a pitched output buffer.  Both are freed on every exit path below.
+    DeviceBuffer srcBuf;
+    DeviceBuffer outBuf;
+    const std::size_t srcBytes = static_cast<std::size_t>(src.pitchBytes) * static_cast<std::size_t>(src.h);
+    OSV_TRY(srcBuf.ensure(srcBytes, 1));
+    err = cudaMemcpy(srcBuf.ptr, pixels, srcBytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        return Error{ErrorCode::Gpu, cudaMessage("upload equirect", err)};
+    }
+    const std::size_t outWidthBytes = static_cast<std::size_t>(params.outW) * 4u * sizeof(float);
+    OSV_TRY(outBuf.ensure(outWidthBytes, static_cast<std::size_t>(params.outH)));
+    const int outPitchFloats = static_cast<int>(outBuf.pitch / sizeof(float));
+
+    // Launch on the legacy default stream and wait for the result.
+    err = osvCudaLaunchReframeEquirect(params, src, srcBuf.ptr, static_cast<float*>(outBuf.ptr), outPitchFloats,
+                                       nullptr);
+    if (err != cudaSuccess) {
+        return Error{ErrorCode::Gpu, cudaMessage("equirect kernel launch", err)};
+    }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        return Error{ErrorCode::Gpu, cudaMessage("equirect kernel execution", err)};
+    }
+
+    // Read back straight into the host image (pageable copy is fine here:
+    // this path is for verification, not the frame loop).
+    OSV_TRY_ASSIGN(ImageRGBAf image, ImageRGBAf::create(static_cast<std::uint32_t>(params.outW),
+                                                        static_cast<std::uint32_t>(params.outH)));
+    err = cudaMemcpy2D(image.data.data(), image.pitchBytes(), outBuf.ptr, outBuf.pitch, image.pitchBytes(), image.h,
+                       cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        return Error{ErrorCode::Gpu, cudaMessage("equirect readback", err)};
+    }
     return image;
 }
 
