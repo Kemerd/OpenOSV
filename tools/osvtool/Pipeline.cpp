@@ -111,7 +111,7 @@ void addPipelineOptions(CLI::App* sub, PipelineOptions& opt) {
 
     auto* colorGroup = sub->add_option_group("Colour");
     colorGroup->add_option("--color", opt.color, "pq|hlg|709|linear|dlogm")->default_str("pq");
-    colorGroup->add_option("--fit", opt.fit, "D-Log M curve: dji|pocket3")->default_str("dji");
+    colorGroup->add_option("--fit", opt.fit, "D-Log M curve: osmo360|dji|pocket3")->default_str("osmo360");
     colorGroup->add_option("--input-encoding", opt.inputEncoding, "auto|dlogm|hlg|normal")->default_str("auto");
     colorGroup->add_option("--exposure", opt.exposureStops, "Exposure offset in stops")->default_val(0.0);
 
@@ -211,21 +211,28 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     // ---- colour -----------------------------------------------------------------------
     const std::string enc = lower(options.inputEncoding);
     if (enc == "auto") {
+        // The metadata is authoritative for the three modes the pipeline has
+        // curves for; anything else needs the statistical second opinion.
+        // Both branches go through the same library rule
+        // (color::inputEncodingForColorMode) so the CLI and the importer can
+        // never disagree about what a clip is.
         switch (p->format.colorMode) {
-        case meta::ColorMode::HLG: p->inputEncoding = color::InputEncoding::HLG; break;
-        case meta::ColorMode::Normal: p->inputEncoding = color::InputEncoding::Rec709Normal; break;
-        case meta::ColorMode::DLogM: p->inputEncoding = color::InputEncoding::DLogM; break;
+        case meta::ColorMode::HLG:
+        case meta::ColorMode::Normal:
+        case meta::ColorMode::DLogM:
+            p->inputEncoding = color::inputEncodingForColorMode(p->format.colorMode);
+            break;
         default: {
-            // No metadata: look at the first frame's luma statistics.
+            // No usable metadata: look at the first frame's luma statistics.
+            // On a read failure the encoding keeps its default, which the
+            // library rule also resolves to D-Log M.
             auto pair = p->reader->read(0);
             if (pair.ok()) {
                 const color::AutoDetectResult det = color::detectColorMode(pair.value().lens[0]);
                 p->notes.push_back("colour mode auto-detected from frame statistics: " +
                                    std::string(meta::colorModeName(det.guess)) + " (confidence " +
                                    std::to_string(det.confidence) + ")");
-                p->inputEncoding = det.guess == meta::ColorMode::HLG      ? color::InputEncoding::HLG
-                                   : det.guess == meta::ColorMode::Normal ? color::InputEncoding::Rec709Normal
-                                                                          : color::InputEncoding::DLogM;
+                p->inputEncoding = color::inputEncodingForColorMode(det.guess);
             }
             break;
         }

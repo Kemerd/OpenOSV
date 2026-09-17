@@ -1,19 +1,25 @@
 # Premiere Pro plug-ins (milestone 2)
 
-OpenOSV ships two native Premiere Pro plug-ins for Windows. Together they give
-the same workflow as DJI's macOS-only "Reframe for Adobe Premiere": drop an
-`.OSV` on the timeline, get a stitched 360 clip, add one effect to reframe it
-with host keyframes and GPU acceleration. Both are built from this repository
-against the Adobe SDKs (never committed) and share the milestone 1 library.
+OpenOSV ships three native Premiere Pro plug-ins for Windows. Together they
+give the same workflow as DJI's macOS-only "Reframe for Adobe Premiere": drop
+an `.OSV` on the timeline, get a stitched 360 clip, see the stitch options in
+the Effect Controls panel, add one effect to reframe it with host keyframes and
+GPU acceleration. All three are built from this repository against the Adobe
+SDKs (never committed) and share the milestone 1 library.
 
 | Binary | Kind | Entry point | What it does |
 |---|---|---|---|
-| `OpenOSVImporter.prm` | standard file importer | `xImportEntry` | Registers `.osv` and `.lrf`; decodes both lenses with FFmpeg, stitches with the CUDA / OpenCL / CPU renderer and hands Premiere an equirectangular 360 x 180 frame in `BGRA_4444_32f`, colour-tagged Rec.2100 PQ, HLG or Rec.709. Decodes the AAC track. Declares the clip as monoscopic equirectangular VR. Per-clip options live in a Source Settings dialog (right-click > Source Settings). |
+| `OpenOSVImporter.prm` | standard file importer | `xImportEntry` | Registers `.osv` and `.lrf`; decodes both lenses with FFmpeg, stitches with the CUDA / OpenCL / CPU renderer and hands Premiere an equirectangular 360 x 180 frame in `BGRA_4444_32f`, colour-tagged Rec.2100 PQ, HLG or Rec.709. Decodes the AAC track. Declares the clip as monoscopic equirectangular VR. Per-clip options reach it as a `PrefsBlob`, from either the Source Settings effect or the modal Source Settings dialog. |
+| `OpenOSVSourceSettings.aex` | AE API **source settings** effect | `EffectMain` | "OpenOSV Source Settings", attached by Premiere to the **master clip** automatically. Nine controls - colour output, output size, stabilisation, seam search, exposure match, calibration, D-Log M curve, exposure, render device - visible in the Effect Controls panel instead of behind a dialog. Renders nothing; its values reach the importer as a flat prefs blob, so they **cannot be keyframed**. See "Source Settings effect" below. |
 | `Open360Reframe.aex` | After Effects API effect + `PrGPUFilter` | `EffectMain`, `xGPUFilterEntry` | "Open 360 Reframe" in the Effects panel (bin "OpenOSV"). Host-keyframed Pan / Tilt / Roll / FOV / Distortion plus preset perspectives. Renders on the GPU through Premiere's own CUDA device (driver API, embedded fatbin) and falls back to a 32-bit float CPU path that runs the same kernel. |
 
-Install both (plus their runtime DLLs) in
+Install all three (plus their runtime DLLs) in
 `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\OpenOSV\`; Premiere Pro,
 Media Encoder and After Effects all scan that folder.
+
+The repository also ships three **sequence presets** (`presets/`), installed
+per user so `File > New > Sequence > OpenOSV` gives a correct 59.94 fps
+timeline in one click. See "Sequence presets" below.
 
 ## Compatibility rule
 
@@ -70,14 +76,18 @@ x64, `PRWIN_ENV` + `MSWindows` + `_WINDOWS` defines, `/SUBSYSTEM:WINDOWS`,
 
 ```
 plugins/
-  CMakeLists.txt              options OSV_PREMIERE_IMPORTER / OSV_PREMIERE_REFRAME (default ON), adds the three below
+  CMakeLists.txt              options OSV_PREMIERE_IMPORTER / OSV_PREMIERE_REFRAME /
+                              OSV_PREMIERE_SOURCE_SETTINGS (default ON), adds the four below
   common/                     osv_premiere_common (static)
     HostSuites.h/.cpp         RAII acquire/release of SweetPea suites by name+version
     PluginLog.h/.cpp          file log (%LOCALAPPDATA%\OpenOSV\<plugin>.log) + OutputDebugString
     DelayLoad.h/.cpp          delay-load hook: resolve avcodec/avformat/... /OpenCL.dll from the plug-in's own folder
     PixelCopy.h/.cpp          RGBA float top-down  ->  BGRA 32f / 8u bottom-up with row bytes (SIMD friendly loops)
     HostContext.h/.cpp        process-wide lazily created renderer pool + thread pool, torn down explicitly
-    PrefsBlob.h               the importer prefs struct (shared with the source settings dialog)
+    PrefsBlob.h               the importer prefs struct (shared with the dialog AND the source settings effect)
+    SourceSettingsIdentity.h  the ONE spelling of the source settings effect's match name, included by
+                              the effect's .r/.cpp and by the importer - the binding is a string compare
+                              with no diagnostic, so it must not exist twice
   importer/                   OpenOSVImporter.prm
     ImporterEntry.cpp         xImportEntry dispatch, DllMain, imInit/imShutdown, open/quiet/close, privateData handle
     ImporterInstance.h/.cpp   per-clip state (privateData): reader, rig, colour, stabilisation, frame + analysis caches, mutex
@@ -89,6 +99,17 @@ plugins/
     ImporterPlugin.h          identity constants, privateData accessors, handler declarations
     OpenOSVImporter.rc        IMPT resource + DIALOGEX template + VERSIONINFO
     resource.h                resource and control IDs shared by the .rc and the dialog code
+  sourcesettings/             OpenOSVSourceSettings.aex
+    OpenOSVSourceSettings.r   PiPL (AE kind); includes SourceSettingsParams.h, which includes
+                              SourceSettingsIdentity.h (reached through osv_add_pipl's new INCLUDES argument)
+    OpenOSVSourceSettings.rc  #include the generated .rcp + VERSIONINFO
+    SourceSettingsParams.h    out-flags, parameter ids/indices, popup item strings, ranges, defaults
+                              (single source of truth; the C++ half is hidden from the .r preprocessor pass)
+    SourceSettingsMapping.h/.cpp  the PURE ControlValues <-> PrefsBlob mapping (1-based AE popups vs
+                              0-based blob enums), compiled into the tests too
+    SourceSettingsMain.cpp    AE entry: ABOUT, GLOBAL_SETUP (SetIsSourceSettingsEffect), PARAMS_SETUP,
+                              SEQUENCE_SETUP (PerformSourceSettingsCommand), TRANSLATE_PARAMS_TO_PREFS
+    DllMain.cpp               arms the delay-load hook; nothing else (loader lock)
   reframe/                    Open360Reframe.aex
     Open360Reframe.r          PiPL (AE kind) -> cl /EP -> PiPLtool -> cl /EP -> .rcp; includes ReframeParams.h
     Open360Reframe.rc         #include "Open360Reframe.rcp" + VERSIONINFO
@@ -102,7 +123,9 @@ plugins/
     ReframeKernel.cu          thin CUDA wrapper around osvReframeEquirectPixel; nvcc -fatbin, embedded
                               with cmake/EmbedKernel.cmake, loaded with cuModuleLoadFatBinary
     ReframeCpu.h/.cpp         the geometry builder (buildParams) and the CPU pixel loop over the same
-                              kernel on the library ThreadPool; also compiled into osv_reframe_tests
+                              kernel on the library ThreadPool; owns PixelLayout (Bgra32f / 16f / 8u /
+                              16u), kBgra16uWhite = 32768 and promoteIntegerToFloat; also compiled
+                              into osv_reframe_tests
     DllMain.cpp               arms the delay-load hook; nothing else (loader lock)
 tests/premiere/               mock-host harness (see Verification); added from plugins/CMakeLists.txt because every target needs the SDK targets
   mockhost/                   osv_premiere_mockhost (static, Catch2-free): fake piSuites + SPBasicSuite serving our own suite implementations
@@ -111,14 +134,29 @@ tests/premiere/               mock-host harness (see Verification); added from p
     MockPPix.cpp              PPix v1, PPix2 v3, Creator v1, Creator2 v4, Cache v8/v7 (real LRU)
     MockSuites.cpp            Time, String, App Info, Error, Color Management, Memory Manager, Importer File Manager, Sequence Info v5..v9, Video Segment v6..v9
     MockGpu.cpp               GPU Device Suite v2 on a real CUDA driver-API context (stub without CUDA)
-    MockAe.cpp                PF Pixel Format v1, PF Utility v4..v13, PF_InData/PF_OutData builders, effect worlds
+    MockAe.cpp                PF Pixel Format v1, PF Utility v4..v13, PF Source Settings v1/v2,
+                              PF_InData/PF_OutData builders, effect worlds in BGRA 32f /
+                              32f_Linear / 16u / 8u and ARGB 8u (DEEP set from the sample
+                              width, not a format list), plus setWorldFormat() to relabel a
+                              world's format without touching its bytes so a test can prove
+                              an unknown format is refused rather than misread
   common/                     osv_premiere_common_tests (mock host + plugins/common)
   importer/                   osv_importer_tests: LoadLibraryW on the built .prm, driven through the mock host
     ImporterHarness.h/.cpp    loads the module, plays host (imInit/imShutdown, ClipHandle RAII, request builders)
     test_importer.cpp         registration, open/quiet/close, imGetInfo8/9, formats, sizes, colour, frames, audio, prefs, timing
     test_prefs_mapping.cpp    the pure prefs <-> controls mapping (links plugins/importer/PrefsMapping.cpp directly)
   reframe/                    osv_reframe_tests (loads Open360Reframe.aex)
-scripts/install_plugins.ps1   copy stage dir -> MediaCore\OpenOSV (-StageDir, -Destination, -Uninstall, -NoElevate, -Force), self-elevating, prints the Plugin Loading.log path and the Shift-launch hint
+  sourcesettings/             osv_source_settings_tests (loads OpenOSVSourceSettings.aex)
+    SourceSettingsTestSupport.h/.cpp  LoadedPlugin, an EffectFixture that runs GLOBAL_SETUP then
+                              PARAMS_SETUP in the host's own order, and the PiPL reader
+    test_params.cpp           module, GLOBAL_SETUP (incl. the source-settings declaration), PARAMS_SETUP
+    test_prefs.cpp            TRANSLATE_PARAMS_TO_PREFS round trips, SEQUENCE_SETUP seeding, the mapping
+    test_pipl.cpp             the PiPL, and its match name against the importer's constant
+presets/                      three .sqpreset sequence presets + README.md recording the verified schema
+scripts/install_plugins.ps1   copy stage dir -> MediaCore\OpenOSV AND presets/ -> the user's
+                              SequencePresets\OpenOSV (-StageDir, -Destination, -Uninstall, -NoElevate,
+                              -Force, -NoPresets, -PresetDir, -PresetDestination), self-elevating,
+                              prints the Plugin Loading.log path and the Shift-launch hint
 ```
 
 Everything that touches Premiere lives under `plugins/`; the library under
@@ -246,10 +284,15 @@ CPU / CUDA / OpenCL exactly like the fisheye path.
   advertised size.
 * `imGetIndColorSpace` index 0: `kPrSDKColorSpaceType_Predefined` with
   `ioProfileRec.outName` (String Suite) = `kPrOverranged2100PQ` ("BT.2100 PQ RGB Full"),
-  `kPrOverranged2100HLG` or `kPrOverranged709` according to prefs; index 1 -> `imBadFormatIndex`.
-  The tokens describe exactly what we emit: full-range 32f RGB signal codes.
+  `kPrOverranged2100HLG`, `kPrOverranged709` or `kPrOverranged2020Scene`
+  according to prefs; index 1 -> `imBadFormatIndex`.
+  The first three tokens describe exactly what we emit: full-range 32f RGB
+  signal codes. The fourth is the D-Log M passthrough output, for which the
+  SDK has no token at all, so it is declared approximately and logged as
+  such - see "D-Log M passthrough" under the Source Settings effect for the
+  full reasoning and for what is deliberately *not* returned.
   A compile-time switch (`OSV_IMPORTER_COLOR_SEI`) answers with
-  `kPrSDKColorSpaceType_SEITags` `{9, 16|18|1, 0, 32, full, rgb, display}`
+  `kPrSDKColorSpaceType_SEITags` `{9, 16|18|1|2, 0, 32, full, rgb, display}`
   instead, for the runtime comparison on real hosts.
 * `imGetColorSpaceFromOpaqueData` (23.3, undocumented) and every unknown
   selector return `imUnsupported`, logged once.
@@ -282,7 +325,7 @@ share a demuxer, so conforming cannot disturb video seeks.
 | Field | Values | Default |
 |---|---|---|
 | `magic` `'OOSV'`, `version` 1 | | |
-| `colorOutput` | 0 PQ, 1 HLG, 2 Rec.709 | 0 |
+| `colorOutput` | 0 PQ, 1 HLG, 2 Rec.709, 3 D-Log M passthrough (appended; never renumber) | 0 |
 | `outputSize` | 0 native, 1 4K (3840x1920), 2 2K (1920x960) | 0 |
 | `stabilization` | 0 off, 1 horizon lock, 2 full, 3 smooth | 1 |
 | `seamSearch` | 0/1 | 1 |
@@ -307,6 +350,370 @@ for different clips run in parallel. Renderers come from the process-wide
 renderer) and are internally serialised. No mutable globals besides that
 context. FFmpeg runtime DLLs and `OpenCL.dll` are delay-loaded from the
 plug-in folder so a machine without an OpenCL ICD still loads the importer.
+
+## Source Settings effect design
+
+`OpenOSVSourceSettings.aex` exists for one reason: the stitch options were
+only reachable through a modal Win32 dialog, which users have to know to go
+looking for. The SDK's intended mechanism for per-clip decode options is a
+*source settings effect* (`prsdk26.txt` lines 365-400,
+`PrSDKAESupport.h:1620-1637`): Premiere attaches it to the **master clip**
+automatically and its parameters appear in the Effect Controls panel.
+
+### What it deliberately cannot do, and why
+
+**It is not, and cannot be, the reframe effect.** Two SDK facts make that
+structural rather than a design preference:
+
+1. **A source settings effect is never sent `PF_Cmd_RENDER`.** It sits on the
+   master clip, describing how the media should be *decoded*; there is no
+   frame passing through it to filter. A render handler here would be dead
+   code, which is why there is not one (and why no colour-awareness out-flag
+   is set: those describe `PF_Cmd_RENDER` behaviour, and claiming a pixel
+   capability for code that does not exist would be a lie the host acts on).
+2. **Its values reach the importer only as one flat byte blob.**
+   `PF_Cmd_TRANSLATE_PARAMS_TO_PREFS` hands the effect a
+   `PF_TranslateParamsToPrefsExtra` whose `prefsPC` is a host-owned buffer
+   (`AE_Effect.h:2177-2190`) that the effect fills - our 128-byte `PrefsBlob`.
+   **A blob has no time axis.** The host asks for it once for the whole clip,
+   so a keyframe has literally nowhere to be stored and nowhere to be read
+   back from.
+
+Therefore every parameter here is static per clip, and every one carries
+`PF_ParamFlag_CANNOT_TIME_VARY` so the panel shows **no stopwatch**. That is
+honest UI: a stopwatch on a control whose keyframes can never reach the
+decoder is a control that silently does nothing, and "why did my keyframes do
+nothing?" is a far worse bug than "why can I not keyframe this?".
+
+**Pan / Tilt / Roll / FOV therefore stay in `Open360Reframe.aex`**, which is
+an ordinary timeline effect: it does receive `PF_Cmd_RENDER` at a specific
+time and reads its parameters per frame, which is exactly what keyframed
+reframing needs. The division is:
+
+| Belongs in Source Settings | Belongs in Open 360 Reframe |
+|---|---|
+| How the sphere is built (stitch, stabilisation, calibration, seam, gain) | Where the camera looks (Pan, Tilt, Roll) |
+| How the sphere is coloured (PQ / HLG / 709, D-Log M curve, exposure) | How wide it looks (FOV, Distortion, Preset) |
+| How big the sphere is (output size) | What shape the output is (Output Aspect) |
+| Which device stitches it (render device) | Smooth Keyframes |
+| **Static per clip** | **Keyframeable per frame** |
+
+It is also a **separate module** rather than a second PiPL in the reframe
+`.aex`, because the AE SDK lists "multiple PiPLs in a single plug-in" among
+the features Premiere does not support. A test asserts resource 16001 is
+absent, so that fact cannot be forgotten.
+
+### Identity
+
+* Display name "OpenOSV Source Settings", category "OpenOSV", match name
+  `OpenOSV.SourceSettings` (never changes), version 1.0.0.
+* `out_flags = PF_OutFlag_SEND_UPDATE_PARAMS_UI` (`0x04000000`) only.
+  `out_flags2 = PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG | PF_OutFlag2_SUPPORTS_THREADED_RENDERING`
+  (`0x08000008`). `SourceSettingsParams.h` carries both as decimal literals so
+  the `.r` can paste them into the resource (PiPLtool's parser rejects
+  anything more structured than a number), and `SourceSettingsMain.cpp`
+  `static_assert`s each against the real `AE_Effect.h` macro.
+* **The match name is the entire interface.** Premiere pairs importer and
+  effect by comparing `imFileInfoRec8::sourceSettingsMatchName`
+  (`PrSDKImport.h:425`) to the PiPL's `AE_Effect_Match_Name`, with no
+  handshake and no diagnostic on a mismatch: one mistyped character and the
+  panel simply never shows the options, with nothing in any log to say why.
+  So the string lives once, in `plugins/common/SourceSettingsIdentity.h`, and
+  is read by the effect's `.r`, the effect's `.cpp` and the importer. A test
+  reads the resource back out of the built module and compares it to that
+  header; another reads it out of a live `imGetInfo8`.
+
+### Parameters (IDs are permanent; the INDEX is not the ID)
+
+As in the reframe effect, `PF_ADD_TOPIC` and `PF_END_TOPIC` each issue their
+own `PF_ADD_PARAM`, so a group occupies two real parameter slots and the
+`GROUP_END` slot sits in the MIDDLE of the list. There are 13 parameters, not
+9. `SourceSettingsParams.h` spells the index table out literally.
+
+Every popup's items are in `PrefsBlob` enum order and AE popup values are
+**1-based** while the blob's enums are **0-based**, so every conversion is a
+deliberate -1 / +1 in `SourceSettingsMapping.cpp`.
+
+| Index | ID | Name | Type | Items / range | Default | Prefs field |
+|---|---|---|---|---|---|---|
+| 1 | 1 | Colour Output | popup | BT.2100 PQ \| BT.2100 HLG \| Rec. 709 \| D-Log M (no transform) | PQ | `colorOutput` |
+| 2 | 2 | Output Size | popup | Native \| 4K (3840x1920) \| 2560x1280 \| 2K (1920x960) | 2560x1280 | `outputSize` |
+| 3 | 3 | Stabilisation | popup | Off \| Horizon Lock \| Full \| Smooth | Horizon Lock | `stabilization` |
+| 4 | 4 | Stitching | topic (GROUP_START) | | | |
+| 5 | 5 | Seam Search | checkbox | | on | `seamSearch` |
+| 6 | 6 | Exposure Match | checkbox | | on | `gainMatch` |
+| 7 | 7 | Calibration | popup | Native \| Lens Guards \| Underwater | Native | `calibration` |
+| 8 | 8 | (closes Stitching) | GROUP_END | | | |
+| 9 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
+| 10 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 | DJI Refit | `dlogmFit` |
+| 11 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
+| 12 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
+| 13 | 13 | (closes Advanced) | GROUP_END | | | |
+
+#### D-Log M passthrough
+
+The fourth Colour Output entry is for the **grade-it-yourself** workflow: keep
+the camera's log signal and convert it once, downstream, with a D-Log M LUT or
+Lumetri's log handling, instead of having the importer convert and then
+grading on top of that.
+
+It maps to `color::OutputTransfer::Passthrough`, which the library already
+had (`include/osv/color/ColorParams.h`, exposed by `osvtool` as
+`--transfer dlogm`); the importer simply never wired it up. Passthrough
+bypasses **both** the transfer curve **and** the primaries matrix -
+`osvCodeToOutput` in `include/osv/color/ColorMath.h` returns the input
+untouched - so what Premiere receives is the stitched sphere still in the
+camera's own D-Log M encoding and its own gamut, as 32-bit float code values.
+The frame therefore looks flat and washed out until it is graded, which is the
+point, and the Properties panel (`imAnalysis`) says so in as many words.
+
+**Applying a D-Log M LUT on top of a PQ, HLG or Rec.709 output would
+double-convert.** That is the mistake this option exists to prevent, and it is
+why the popup entry reads "D-Log M (no transform)" rather than "D-Log M": the
+other three entries name what the output *is*, and this one has to say that
+nothing was done to it, or a user reads it as "convert to D-Log M" and applies
+a LUT anyway.
+
+**What Premiere is told the colour space is.** There is no predefined token
+for DJI D-Log M. `PrSDKColorSpaces.h` carries camera log spaces
+(`kPrSonySGamutSLog2`, `kPrSony2020SLog3`, `kPrSonySGamut3CineSLog3`,
+`kPrSonySGamut3SLog3`) but nothing for DJI, and grepping the whole SDK header
+set for "dlog" / "dji" finds nothing. So the declaration is necessarily an
+approximation, and the only question is which one misleads the host least.
+
+`imGetIndColorSpace` returns **`kPrOverranged2020Scene`** - "BT.2020 RGB Full
+(Scene)", full range, RGB, 32f, scene-referred - because three of its four
+properties are exactly right and the fourth is the closest available:
+
+* **full range**, **RGB** and **32f** are correct, and they are the properties
+  that decide whether the host *rescales or reinterprets our bytes*. Getting
+  these wrong corrupts pixels; getting the transfer wrong only mis-previews
+  them.
+* **scene-referred** is correct and matters: a log signal is scene light, not
+  display light. The `(Display)` variant would invite the host to tone-map it
+  for the monitor, which is precisely what a user who chose passthrough asked
+  us not to do.
+* **BT.2020 primaries** is the approximation. The real gamut is DJI's native
+  camera gamut, which is wide and has no SDK token; BT.2020 is the widest
+  standard gamut on offer, so it neither clips the data nor claims a small
+  gamut for wide-gamut values.
+
+Deliberately **not** returned:
+
+* `kPrOverranged709` - claiming BT.709 for log data is the one genuinely
+  harmful answer. The host would treat the flat log curve as a finished
+  Rec.709 image, so the Program Monitor would show washed-out mush **and** a
+  "Match Source" export would bake that interpretation in.
+* `kPrOverranged2100PQ` / `...HLG` - both assert a specific HDR display
+  transfer we did not apply, so the host's tone mapping would fight the log.
+* `kPrWorkingColorSpace` - explicitly forbidden: `PrSDKColorSpaces.h:104`
+  says "you can't use this token in the importer. the importer needs to
+  explicitly identify media color space to the host."
+
+Because the answer is approximate, `imGetIndColorSpace` **logs it once** with
+the reasoning, so a user chasing an unexpected preview finds it in the support
+log rather than nowhere. `colorSpaceIsApproximate()` is the single predicate
+that decides, and a test asserts it is true for passthrough and false for the
+other three. Under the `OSV_IMPORTER_COLOR_SEI` build the same output is
+declared as primaries 9 (BT.2020) with transfer **2 (unspecified)** - the
+honest H.273 answer, since there is no code point for D-Log M and naming a
+specific curve would assert one we did not apply.
+
+`PrefsColorOutput::DLogM` is **appended** as value 3, before `Count`, so every
+previously saved project keeps its colour setting. `sanitise()` now accepts
+0..3 and still rejects 4 and above, and a test pins that boundary from both
+sides - a `sanitise()` that still stopped at 2 would silently reset every clip
+a user had set to passthrough.
+
+**The modal dialog's colour control is now a combo box**, not the three-way
+radio group it was. A fourth option would not have fitted the old layout (the
+three buttons sat at x = 16 / 92 / 168 inside a 254-unit group box), and every
+other multi-choice setting in that dialog was already a combo. The retired IDs
+`IDC_COLOR_PQ` / `_HLG` / `_709` (1001-1003) are recorded as retired in
+`plugins/importer/resource.h` and deliberately not reused: a stale
+`GetDlgItem(IDC_COLOR_PQ)` must return null rather than silently finding a
+real but wrong control. Every `fillCombo` call in that dialog now passes
+`std::size(...)` rather than a literal count, and each list's length is
+`static_assert`ed against its enum's `Count` - a literal 3 against a
+four-entry size list had already made the new default output size unreachable
+in the one place a user goes to change it.
+
+Two classes of drift are compiled out rather than tested for:
+
+* every popup's item **count** is `static_assert`ed against its enum's
+  `Count`, so an enum that gains a value breaks the build instead of shipping
+  a popup that cannot express the new setting;
+* the Exposure slider's **valid** range is `static_assert`ed against
+  `PrefsBlob::kMinExposureStops` / `kMaxExposureStops`, so a slider can never
+  offer a value `sanitise()` would silently clamp.
+
+The 1-based popup **defaults** cannot be a `static_assert` because
+`PrefsBlob::defaults()` is a runtime function (it memsets, then assigns), so
+`test_params.cpp` compares each one against `defaults()` instead. That is the
+assertion that matters most: two independently written defaults - a 1-based
+literal in the PiPL and a 0-based enum in the blob - is exactly how a plug-in
+ends up showing "2560 x 1280" while decoding at 6000 x 3000.
+
+### Command flow
+
+* **`PF_Cmd_GLOBAL_SETUP`** reports the version and the two PiPL flag words,
+  then - inside Premiere only (`appl_id == 'PrMr'`) - calls
+  `PF_SourceSettingsSuite::SetIsSourceSettingsEffect(effect_ref, TRUE)`. That
+  single call is the difference between a master-clip settings panel and an
+  ordinary video filter offered in the Effects panel; without it
+  `PF_Cmd_TRANSLATE_PARAMS_TO_PREFS` never arrives and the nine controls do
+  nothing. The suite is acquired at v2 with a fallback to v1 (v2 is a typedef
+  of v1, so one code path serves both). A missing suite is a logged
+  degradation returning `PF_Err_NONE`, never an error: a plug-in that fails
+  `GLOBAL_SETUP` is dropped entirely, and a panel that works minus the
+  master-clip attachment is strictly better than no panel.
+* **`PF_Cmd_SEQUENCE_SETUP`** calls
+  `PF_SourceSettingsSuite::PerformSourceSettingsCommand`, which the host
+  routes to the importer's `imPerformSourceSettingsCommand` (selector 66).
+  The payload is a `PrefsBlob`; the SDK's only rule is that both halves agree
+  on it ("the data can be anything as long as both the importer and the
+  source settings effect both know what it is", `PrSDKImport.h:996`). The
+  effect seeds the buffer with what its controls currently say, the importer
+  replaces it with what the clip is actually being decoded with, and the
+  effect writes the result back into the controls with
+  `PF_ChangeFlag_CHANGED_VALUE` **on the changed ones only** - flagging an
+  untouched parameter would make the host record a spurious change, and on a
+  master clip effect that means an unnecessary media refresh and a re-stitch
+  of the whole clip. This is what makes the panel show "as shot" after a
+  project reopen instead of snapping every control back to the global default.
+  Every failure path (no suite, a failed call, a blob that is not ours) keeps
+  the stored control values and returns `PF_Err_NONE`. `sequence_data` stays
+  null throughout: the effect keeps no per-instance state, so there is nothing
+  to allocate, flatten or free.
+* **`PF_Cmd_TRANSLATE_PARAMS_TO_PREFS`** is the only route by which anything
+  set in the panel reaches the decoder. It reads the nine controls, builds a
+  sanitised `PrefsBlob` and `memcpy`s exactly `sizeof(PrefsBlob)` bytes into
+  `extra->prefsPC`. Three refusals, each a real failure mode: a null `extra`
+  or `prefsPC` leaves the importer on its existing prefs (writing through the
+  null would take the host down); a `prefs_sizeLu` **smaller** than the blob
+  is refused outright and logged, because writing 128 bytes into a smaller
+  buffer is a heap overflow in the *host's* allocator; a **larger** buffer is
+  fine and its tail is left untouched, because it is not our memory to define.
+* **`PF_Cmd_RENDER`** is answered with `PF_Err_NONE` and does nothing, because
+  it never arrives. A test sends it with a null params array and a null output
+  world anyway, so the one selector that should be impossible cannot be the
+  one that crashes.
+
+### Importer side
+
+* `imInit`: `hasSourceSettingsEffect = kPrTrue`. Without this flag Premiere
+  ignores `sourceSettingsMatchName` entirely, so the two must be set together.
+  `hasSetup` stays `kPrTrue` as well - the modal dialog is deliberately kept
+  working, because right-click > Source Settings is muscle memory for a lot of
+  users and is the only route left on a machine where the `.aex` failed to
+  install. Both paths write the same `PrefsBlob`.
+* `imGetInfo8` fills `sourceSettingsMatchName` from
+  `kSourceSettingsMatchNameW`.
+* `imPerformSourceSettingsCommand` (selector 66, `param1` an
+  `imFileAccessRec8*`, `param2` an `imSourceSettingsCommandRec*`) is in
+  `SourceSettingsDialog.cpp` beside the other prefs selectors. With a live
+  instance it answers with that instance's blob; with none (normal during
+  project load, before `imOpenFile8`) it **echoes the effect's own blob back**
+  rather than writing defaults - overwriting with defaults there would reset
+  every control of every clip on every project open. A payload that fails
+  `isValid()` becomes the defaults rather than being trusted, so a stale blob
+  from an older build cannot reinterpret its bytes as stitch settings. A
+  record with no buffer, or a buffer shorter than a blob, returns `imOtherErr`
+  and writes nothing. The two-step `imGetPrefs8` protocol is untouched.
+
+## Sequence presets
+
+Premiere copies a new sequence's frame size from the clip it is built from.
+An equirectangular sphere is necessarily 2:1, no importer field asks for a
+differently shaped sequence, and there is no SDK hook to suggest one - so a
+new sequence from a 2560 x 1280 `.OSV` is 2560 x 1280, which is right for
+working on the sphere and wrong for 16:9 delivery. The answer is to ship the
+sequence presets, so the correct timeline is one click rather than a
+hand-typed frame size and a frame rate that has to be exactly 59.94.
+
+`presets/` holds three, and `presets/README.md` documents the schema field by
+field and records where each field was verified from:
+
+| Preset | Frame size | Shape | For |
+|---|---|---|---|
+| `OpenOSV 2560x1440 59.94.sqpreset` | 2560 x 1440 | 16:9 | Reframed delivery. Pairs with the importer's default 2560 x 1280 output. |
+| `OpenOSV 3840x2160 59.94.sqpreset` | 3840 x 2160 | 16:9 | 4K delivery (set Output Size to Native or 4K first). |
+| `OpenOSV 360 equirect 2560x1280 59.94.sqpreset` | 2560 x 1280 | 2:1 | The sphere itself / VR export. Declares monoscopic equirectangular VR. |
+
+All three: square pixels (1:1), progressive, 59.94 fps, 48 kHz stereo over
+four mono audio tracks, `VideoUseMaxBitDepth = true`.
+
+### The verified format
+
+The `.sqpreset` schema is not documented by Adobe. It was read off the presets
+the installed application ships, under
+`C:\Program Files\Adobe\Adobe Premiere Pro 2026\Settings\SequencePresets\`,
+and nothing in ours is invented:
+
+* `HD 1080p\HD 1080p 59.94 fps.sqpreset` and
+  `UHD (4K)\UHD (4K) 2160p 59.94 fps.sqpreset` gave the Premiere 2026 record
+  layout - `ClassID 5e73dd7e-4f86-4917-80eb-08ddb2f4a5f3`, `Version="9"`,
+  which is the version that carries `WorkingColorSpace`,
+  `SequenceWorkingColorSpace` and `AutoToneMapEnabled` - the `AudioTracks`
+  JSON, the `EditingModeGUID` pair and the 59.94 tick value.
+* `Legacy\VR\Monoscopic 29.97\3840x1920.sqpreset` gave the
+  `ImmersiveVideoVRConfiguration` payload that declares equirectangular VR
+  (`"projectionType":1`, `"capturedHorizontalView":360`,
+  `"capturedVerticalView":180`). That file is `Version="8"`, so the VR field
+  was lifted into the Version 9 body rather than the whole file being copied.
+
+`VideoFrameRate` is a frame **duration in ticks**, not a rate. At Premiere's
+254016000000 ticks per second one 59.94 fps frame is exactly
+`254016000000 * 1001 / 60000 = 4237833600` - the same integer the importer
+reports from `imGetInfo8` and the same one `tests/premiere/common` already
+pins. A sequence built by hand at "60" is 4233600000 ticks and drifts against
+the media by one frame in a thousand. `VideoUseMaxBitDepth` is `true`, unlike
+Adobe's stock presets, because the importer hands Premiere 32-bit float frames
+and an 8-bit sequence would quantise the sphere before the reframe resamples
+it, banding every gradient in the sky. The files are UTF-8 with CRLF and no
+trailing newline after `</PremiereData>`, byte-for-byte matching Adobe's own.
+
+### Where they install
+
+    %USERPROFILE%\Documents\Adobe\Premiere Pro\26.0\Profile-<user>\Settings\SequencePresets\OpenOSV\
+
+They then appear in **File > New > Sequence** under a group called **OpenOSV**
+- the subfolder name is the group heading, which is how Adobe's own presets
+are grouped. Premiere caches the preset list, so it must be **restarted**.
+
+That path is not documented either, so it was derived:
+
+1. The per-user settings root is
+   `Documents\Adobe\Premiere Pro\<ver>\Profile-<user>\Settings\` - not
+   `%APPDATA%`. That directory exists on the test machine for 11.0, 24.0 and
+   26.0 and already holds `EssentialSound`, `Export Destinations`,
+   `Ingest Presets`, `Overlay Presets`, `Project View Presets`,
+   `Source Patcher Presets`, `Timecode Presets` and `Track Height Presets`,
+   all written by the application itself.
+2. The sequence-preset subfolder is `SequencePresets`, spelled **without** a
+   space. Every one of those folder names appears as a literal string inside
+   `Adobe Premiere Pro 2026\Mezzanine.dll` - the module whose exports include
+   `SequenceSettingsCache::GetSequencePresetsFromCache` and
+   `SequencePreviewPresets::CollectSequencePresets` - and `SequencePresets`
+   appears there too while `Sequence Presets` does not. It is also exactly the
+   folder name the shipped presets live in under Program Files.
+3. `.sqpreset` is confirmed as the extension by the string table in
+   `ScriptLayerPProQE.dll`, where `SequencePresets` and `sqpreset` are
+   adjacent.
+
+`scripts/install_plugins.ps1` enumerates the `<version>` folders and picks the
+newest numerically (so "9.0" does not outrank "26.0"), enumerates `Profile-*`
+rather than assembling it from `$env:USERNAME` (a domain account or a renamed
+profile would break that), and when it finds no settings root it **says so and
+skips** instead of inventing a path and reporting success. `-NoPresets` skips
+them; `-PresetDestination <dir>` overrides the location.
+
+One subtlety worth recording: the presets are installed by the **unelevated**
+parent process, before it hands the modules to the elevated child, and the
+child is always passed `-NoPresets`. A per-user path resolved inside an
+elevated session belongs to whichever account answered the UAC prompt, which
+on a machine with a separate admin account is not the person editing video -
+the presets would land in a profile nobody ever opens.
 
 ## Effect design
 
@@ -333,8 +740,8 @@ plug-in folder so a machine without an OpenCL ICD still loads the importer.
   literal against the real `AE_Effect.h` macro, so an SDK that renumbers a bit
   breaks the build instead of shipping a wrong PiPL.
 * In Premiere (`in_data->appl_id == 'PrMr'`) `PF_Cmd_GLOBAL_SETUP` registers
-  `PrPixelFormat_BGRA_4444_32f` then `PrPixelFormat_BGRA_4444_8u` through the
-  PF Pixel Format Suite.
+  the four formats below through the PF Pixel Format Suite, and
+  `PF_Cmd_RENDER` re-registers them. See "Pixel formats" below.
 
 ### Parameters (IDs are permanent; the INDEX is not the ID)
 
@@ -445,19 +852,104 @@ flag for the same "do not change the PiPL later" reason.
   `inFrames[0]`, output written in place into `*outFrame` (same size, same
   format, top-left origin). `outIsRealtime = true`.
 
+### Pixel formats
+
+The effect registers exactly these four, in this order, through
+`PF_PixelFormatSuite1::AddSupportedPixelFormat`. The order is a **preference
+ranking** to the host (`PrSDKAESupport.h:150-157`), not just a list.
+
+| # | `PrPixelFormat` | `PixelLayout` | Why, and where it sits |
+|---|---|---|---|
+| 1 | `BGRA_4444_32f` | `Bgra32f` | The native working format. The panorama is HDR-capable and reframing is a **resample**, so any quantisation before it bands the sky. |
+| 2 | `BGRA_4444_32f_Linear` | `Bgra32f` | Identical bytes to the above - four floats, B, G, R, A - differing **only** in transfer function. Accepted because this effect is colour agnostic (see below), and it renders **bit-identically** to `_32f`. |
+| 3 | `BGRA_4444_16u` | `Bgra16u` | Premiere's 16-bit integer RGB, so a **10-bit sequence** has a high-bit-depth format in common with us. The SDK guide recommends 32f over 16u for high bit depth, which is exactly why it sits below both float entries rather than being omitted. |
+| 4 | `BGRA_4444_8u` | `Bgra8u` | Last, so an 8-bit sequence still gets a native-format render instead of a host conversion. |
+
+`VUYA` is deliberately **not** offered: the shared sampler works in RGBA and
+converting per sample would cost more than letting the host convert the frame
+once. A `static_assert` in `EffectMain.cpp` proves every advertised format is
+one `layoutFor()` accepts, so advertising a format the render path would
+refuse cannot compile.
+
+**The 16-bit scale is 0..32768, not 0..65535.** Premiere SDK guide section
+5.4.2 ("Byte Order"): *"8-bit and 16-bit BGRA formats do not contain super
+whites or super blacks. The 16-bit formats use channels that go from black at
+0 to white at 32768, like After Effects and Photoshop 16-bit formats."* So
+white is `kBgra16uWhite = 32768` (`ReframeCpu.h`); codes above it are
+out-of-gamut rather than illegal. Input codes are **not** clamped (an
+over-range highlight is resampled faithfully); output is clamped to
+`[0, 32768]` on write. Getting this constant wrong is a 100 %-scale error on
+every pixel, so the tests assert it against the documented number spelled out
+independently on the test side (`kBgra16uWhiteRef`) rather than importing the
+plug-in's own constant.
+
+**Why `_32f_Linear` is safe to accept.** The effect never interprets a code as
+a luminance: it computes a direction per output pixel and bilinearly resamples
+the input there, so every operation is a weighted average of neighbouring
+samples in whatever space they already are. It introduces no error the host
+has not already accepted by asking a resampler for the frame, and the output
+carries exactly the tag the host gave the destination world. A
+colour-*managing* effect could not do this; a resampler can.
+
+**When the suite is missing.** `AcquireSuite(kPFPixelFormatSuite, 1)` can fail
+at `PF_Cmd_GLOBAL_SETUP` on a real host - the live log shows it missing on a
+minority of setups, on their own threads, interleaved with successful ones
+milliseconds apart, because Premiere calls `GLOBAL_SETUP` many times over
+(once per render session, plus short-lived probe instances) and not every
+effect reference has the pixel-format machinery attached. `pica_basicP` is
+valid on all of them, so there is no pointer to test and no documented way to
+tell them apart in advance. The effect therefore:
+
+* treats the failure as a **graceful downgrade**, never an error - it returns
+  `PF_Err_NONE` and logs one `WARN` naming the `AcquireSuite` error code and
+  which command it was in (the call-site is part of the log's once-key, so a
+  successful setup cannot silence a failed render-time retry);
+* **retries the registration from `PF_Cmd_RENDER`**, unconditionally. It
+  cannot help the current frame - the worlds are already allocated - but it
+  stops one missed negotiation from being permanent for the session. The
+  retry is not memoised: the registration is keyed on `effect_ref`, which is
+  a foreign pointer with no destruction hook this effect receives, so a table
+  of them could be matched by a *new* reference at a recycled address and
+  suppress the retry for the one instance that needs it. `AcquireSuite` is a
+  name lookup and the render path already acquires this same suite twice per
+  frame, so the unconditional retry costs nothing measurable;
+* **renders anyway**, because `layoutFor()` accepts all four formats above.
+  This is the half of the fix that matters when the retry also fails: a host
+  choosing unaided is then very likely to pick a format we can render.
+
+A format that is still unknown degrades with **one** `ERROR` line that names
+the offending fourcc as **readable characters** as well as hex (`PrPixelFormat`
+enumerators are fourccs; non-printable bytes render as `.`), says which side
+was wrong, and lists what would have been accepted - then returns
+`PF_Err_BAD_CALLBACK_PARAM` rather than misreading the bytes. The refusal
+happens every time; only the log line is deduplicated.
+
+> This is the fix for the reported bug: on a 10-bit HDR sequence, pressing
+> PLAY showed correctly reframed footage but stepping or scrubbing did not
+> update the picture. Playback goes through `xGPUFilterEntry`, which
+> negotiates separately and was fine; stepping and scrubbing go through
+> `PF_Cmd_RENDER`, which advertised only `32f` and `8u` and so had **no format
+> in common** with the sequence and refused every frame.
+
 ### CPU path (`PF_Cmd_RENDER`)
 
 `PF_Cmd_RENDER` receives `params[0]` (input layer) and `output` in the
 registered Premiere format. Rows are addressed as `data + y * rowbytes` in
 top-down order for both worlds (negative row bytes are legal). The same
-`osvReframeEquirectPixel` runs per pixel on the library `ThreadPool`. An 8u
-INPUT world is promoted once into a float scratch buffer
-(`promoteBgra8uToFloat`, codes / 255) because the shared sampler reads float
-or half only; an 8u OUTPUT world is quantised with rounding on write. The
-effect advertises `PrPixelFormat_BGRA_4444_8u` in GLOBAL_SETUP, so it accepts
-one rather than declining and hoping the host renegotiates.
-Parameters come from `params[i]` at the render time, with the same
-three-sample smoothing implemented through `PF_CHECKOUT_PARAM` at
+`osvReframeEquirectPixel` runs per pixel on the library `ThreadPool`. An
+integer-coded INPUT world (`8u` or `16u`) is promoted once into a float
+scratch buffer (`promoteIntegerToFloat`, codes / 255 or codes / 32768) because
+the shared sampler reads float or half only; an integer OUTPUT world is
+quantised with rounding on write. Promotion rather than teaching the sampler
+to read integers is deliberate: a bilinear fetch touches four pixels and
+sixteen components, so decoding inside it would put a multiply and a format
+branch in the hottest loop in the effect - on the GPU too, since the kernel is
+shared source - whereas promotion pays the conversion exactly once per source
+pixel in a parallel row-wise pass and leaves the kernel byte-for-byte the one
+that renders a float source. The effect advertises every one of these formats
+in GLOBAL_SETUP, so it accepts them rather than declining and hoping the host
+renegotiates. Parameters come from `params[i]` at the render time, with the
+same three-sample smoothing implemented through `PF_CHECKOUT_PARAM` at
 neighbouring times when "Smooth Keyframes" is on.
 
 ### Program Monitor overlay (`PF_Cmd_EVENT`)
@@ -737,9 +1229,34 @@ and a test runs five repaints and asserts the live-object count is zero.
      `ReframeParams.h` - the same header that generated them. The VERSIONINFO
      block is checked too.
    * `PF_Cmd_GLOBAL_SETUP`: `out_flags` / `out_flags2` equal the PiPL words
-     bit for bit, `PrPixelFormat_BGRA_4444_32f` then `_8u` are registered
-     through the PF Pixel Format Suite when `appl_id == 'PrMr'` and nothing
-     is registered otherwise, every acquired suite is released.
+     bit for bit, all four of `PrPixelFormat_BGRA_4444_32f`, `_32f_Linear`,
+     `_16u` and `_8u` are registered through the PF Pixel Format Suite **in
+     that order** (asserted positionally, because the order is a preference
+     ranking) when `appl_id == 'PrMr'` and nothing is registered otherwise,
+     every acquired suite is released.
+   * pixel formats (`[format16u]`, `[formatlinear]`, `[format]`) - the
+     regression suite for the "plays but does not update when I step" bug,
+     every case of which fails against the old two-format code:
+     a `PF_Cmd_RENDER` with **both** worlds `BGRA_4444_16u` (which is what a
+     10-bit sequence actually hands us) succeeds and aims where it is told,
+     decoded from the labelled panorama exactly as the 32f cases are;
+     the 16u render matches the 32f render within **one** step of the 0..32768
+     scale - a bound ~128x tighter than the 8-bit one, so a store using 65535
+     or 255 as white misses it by orders of magnitude and cannot pass by luck
+     - with a guard that neither render was simply black;
+     a 16u **input** reproduces the float panorama it was quantised from;
+     `_32f_Linear` is accepted as input, as output and as both, and is
+     **byte-identical** to the `_32f` render;
+     an unknown format (`VUYA_4444_32f`, relabelled onto a good buffer via the
+     mock's `setWorldFormat` so only the label differs, and the same 16-byte
+     width so nothing but the format check stands between us and misreading
+     luma as blue) is refused with `PF_Err_BAD_CALLBACK_PARAM` **every** time,
+     not just the first;
+     and - the regression proper - with the PF Pixel Format Suite **hidden**
+     for the whole of `GLOBAL_SETUP` and `PARAMS_SETUP`, so nothing is
+     registered exactly as on the failing host, a subsequent render into 16u
+     still succeeds, is still correctly aimed, and the render-time retry has
+     registered the full four-format list. No suite must not mean no picture.
    * `PF_Cmd_PARAMS_SETUP`: 15 parameters (13 controls + 2 group
      terminators) with the permanent ids, types,
      names, popup item strings, slider ranges and defaults of the table
@@ -772,12 +1289,75 @@ and a test runs five repaints and asserts the live-object count is zero.
      CPU render: PSNR >= 60 dB for 32f and >= 45 dB for 16f. Keyframed
      parameters are read at the render time and two concurrent instances
      render independently.
-3. `scripts/install_plugins.ps1` then a Premiere launch: the two plug-ins
+3. `osv_source_settings_tests` (`tests/premiere/sourcesettings/`) loads the
+   built `OpenOSVSourceSettings.aex` with `LoadLibraryW` - never links its
+   objects - and drives it through the mock host:
+   * module: `EffectMain` exported; unknown selectors (including
+     `PF_Cmd_RENDER`, which must never arrive and must still not crash when it
+     does) answered with `PF_Err_NONE`; every selector survives null
+     `in_data` / `out_data` / params; `PF_Cmd_ABOUT` fills a message that
+     actually mentions the keyframe constraint.
+   * PiPL: resource 16000 is read back with `FindResourceW` and parsed, and
+     its kind, display name, category, entry-point name, PiPL / spec / effect
+     version words, info flags, reserved word and both out-flag words are
+     compared to `SourceSettingsParams.h`. **The match name is compared to
+     `kSourceSettingsMatchName`** from `plugins/common/SourceSettingsIdentity.h`
+     - the same constant `ImporterVideo.cpp` copies into
+     `sourceSettingsMatchName` - and the narrow and wide spellings are checked
+     against each other. Resource 16001 is asserted absent (one PiPL per
+     module). The VERSIONINFO block is checked too.
+   * `PF_Cmd_GLOBAL_SETUP`: `out_flags` / `out_flags2` / `my_version` equal
+     the PiPL words bit for bit; `SetIsSourceSettingsEffect(TRUE)` **was
+     called** when `appl_id == 'PrMr'` and was **not** called otherwise
+     (`'FXTC'`); a host with the suite hidden still succeeds and still reports
+     the flags; every acquired suite is released.
+   * `PF_Cmd_PARAMS_SETUP`: 13 parameters (9 controls + 4 group markers) with
+     the permanent ids, types, names, popup item strings and slider ranges of
+     the table above; `PF_ParamFlag_CANNOT_TIME_VARY` on **every** one of the
+     nine value-carrying controls; `START_COLLAPSED` on Advanced and not on
+     Stitching; the parameter list walked with a nesting depth so both groups
+     are proved balanced, non-nested, and holding exactly the intended
+     controls; every popup's item count equals its `PrefsBlob` enum's `Count`
+     and its item string has that many entries; the Exposure slider's valid
+     range equals the blob's clamp range and its slider range sits inside it;
+     and **every default equals `PrefsBlob::defaults()`** field by field.
+   * `PF_Cmd_TRANSLATE_PARAMS_TO_PREFS`: the blob is valid, sanitises to
+     itself unchanged (nothing to repair, not merely repairable), and is
+     byte-identical to `PrefsBlob::defaults()` for untouched controls; every
+     value of every popup, both states of both checkboxes and seven exposure
+     values round-trip; all nine controls moved at once round-trip together
+     (so a field read from the wrong index cannot hide behind a neighbour's
+     default); a buffer one byte too small is refused and **not written at
+     all**; a larger buffer is accepted with its tail untouched; a null
+     `extra` and a null `prefsPC` are survived; hostile popup values
+     (0, -1, -12345, 99, 1000000) still produce a valid blob and fall back to
+     the **default** rather than to enum value 0; an out-of-range exposure is
+     clamped and NaN / +-infinity reset to zero.
+   * `PF_Cmd_SEQUENCE_SETUP`: `PerformSourceSettingsCommand` is actually
+     called, exactly once, with `sizeof(PrefsBlob)` and with a valid blob
+     seeded into the buffer; the importer's reply is written into all nine
+     controls and translating them back reproduces that blob exactly; a host
+     that replies with nothing leaves the controls alone; a **failed** call
+     leaves them alone even with a poison reply staged (proving the error is
+     checked before the buffer is read); a reply that fails `isValid()` is
+     rejected; `sequence_data` is forced non-null by the test and every
+     sequence selector clears it; and nothing is called at all under `'FXTC'`.
+   * the pure mapping (`SourceSettingsMapping.cpp`, compiled in directly):
+     every combination of colour x size x stabilisation x device and of
+     calibration x fit x seam x gain round-trips; the default controls give
+     `PrefsBlob::defaults()` and vice versa; a blob with a wrong magic or a
+     wrong version word yields the defaults rather than being reinterpreted;
+     and for seven hostile control values including `INT_MIN` / `INT_MAX` the
+     result is always valid, always sanitises to itself, and always has zeroed
+     reserved bytes (they are part of the PPix cache key).
+4. `scripts/install_plugins.ps1` then a Premiere launch: the three plug-ins
    appear in `%APPDATA%\Adobe\Premiere Pro\26.0\Plugin Loading.log` as
    successfully loaded, the registry cache has a `GPUVideoFilter.0` entry with
-   our match name, importing the sample clip shows 6000 x 3000, 59.94 fps,
-   VR Properties pre-filled, and the effect renders in the Program Monitor
-   with the GPU badge.
+   the reframe match name, importing the sample clip shows the stitched size,
+   59.94 fps and VR Properties pre-filled, the Effect Controls panel shows
+   "OpenOSV Source Settings" on the master clip with nine controls and no
+   stopwatches, `File > New > Sequence > OpenOSV` lists the three presets, and
+   the reframe effect renders in the Program Monitor with the GPU badge.
 
 ## Verification results (2026-09-16, integration build)
 

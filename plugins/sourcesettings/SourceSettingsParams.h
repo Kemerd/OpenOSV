@@ -153,9 +153,17 @@
  *  in every previously saved project.
  * ========================================================================== */
 
-/* PrefsColorOutput: PQ, HLG, Rec709. */
-#define OSV_SS_COLOR_ITEMS "BT.2100 PQ|BT.2100 HLG|Rec. 709"
-#define OSV_SS_COLOR_COUNT 3
+/* PrefsColorOutput: PQ, HLG, Rec709, DLogM.
+ *
+ * "D-Log M (no transform)" is the grade-it-yourself option: the sphere comes
+ * through in the camera's own log encoding and gamut, ready for a D-Log M LUT
+ * or a Lumetri log conversion downstream.  The label says "no transform"
+ * rather than just "D-Log M" because the other three entries name what the
+ * output IS, and this one has to say that nothing was done to it - a user who
+ * reads it as "convert to D-Log M" would then apply a LUT on top and
+ * double-convert. */
+#define OSV_SS_COLOR_ITEMS "BT.2100 PQ|BT.2100 HLG|Rec. 709|D-Log M (no transform)"
+#define OSV_SS_COLOR_COUNT 4
 #define OSV_SS_COLOR_DEFAULT 1
 
 /* PrefsOutputSize: Native, UHD4K, QHD2560, HD2K.  Every entry is 2:1 - a
@@ -178,10 +186,12 @@
 #define OSV_SS_CALIB_COUNT 3
 #define OSV_SS_CALIB_DEFAULT 1
 
-/* PrefsDlogmFit: DjiRefit, Pocket3. */
-#define OSV_SS_FIT_ITEMS "DJI Refit|Pocket 3"
-#define OSV_SS_FIT_COUNT 2
-#define OSV_SS_FIT_DEFAULT 1
+/* PrefsDlogmFit: DjiRefit, Pocket3, Osmo360.  The enum is append-only (the
+ * values are persisted), so Osmo 360 is last in the list even though it is
+ * the default; the default is the 1-based popup index 3. */
+#define OSV_SS_FIT_ITEMS "DJI Refit|Pocket 3|Osmo 360"
+#define OSV_SS_FIT_COUNT 3
+#define OSV_SS_FIT_DEFAULT 3
 
 /* PrefsRenderDevice: Auto, Cpu, Cuda, OpenCl. */
 #define OSV_SS_DEVICE_ITEMS "Auto|CPU|CUDA|OpenCL"
@@ -270,12 +280,17 @@ inline constexpr int kParamCount = OSV_SOURCE_SETTINGS_PARAM_COUNT;
 inline constexpr int kValueParamCount = 9;
 
 /// The parameter names, in index order, so a test can compare the built
-/// module's list without repeating the strings.  Group markers included: the
-/// host stores a name for them too and PF_ADD_TOPIC sets it.
+/// module's list without repeating the strings.
+///
+/// The two GROUP_END entries are deliberately EMPTY.  PF_ADD_TOPIC takes a
+/// name and sets it; PF_END_TOPIC takes only an id (Param_Utils.h:309-316)
+/// and leaves the name field zeroed, because a group terminator is a divider
+/// rather than a labelled control.  Writing "Stitching" here would have
+/// described a field the SDK never fills.
 inline constexpr const char* kParamNameByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
-    "Colour Output", "Output Size", "Stabilisation", "Stitching", "Seam Search",
-    "Exposure Match", "Calibration", "Stitching",    "Advanced",  "D-Log M Curve",
-    "Exposure",      "Render Device", "Advanced",
+    "Colour Output", "Output Size",   "Stabilisation", "Stitching", "Seam Search",
+    "Exposure Match", "Calibration",  "",              "Advanced",  "D-Log M Curve",
+    "Exposure",       "Render Device", "",
 };
 
 }  // namespace osv::premiere::sourcesettings

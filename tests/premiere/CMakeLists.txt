@@ -13,8 +13,13 @@
 #    common/     osv_premiere_common_tests  Catch2 v3 tests of the mock host
 #                                           and of plugins/common
 #
-#  The importer / reframe test executables are added by the next milestone
-#  step; their directories are picked up automatically when they appear.
+#    importer/        osv_importer_tests         loads OpenOSVImporter.prm
+#    reframe/         osv_reframe_tests          loads Open360Reframe.aex
+#    sourcesettings/  osv_source_settings_tests  loads OpenOSVSourceSettings.aex
+#
+#  Each of the three plug-in directories skips itself when its module is not
+#  being built, so any single OSV_PREMIERE_* option can be turned off without
+#  failing the configure.
 # =============================================================================
 if(NOT TARGET osv_premiere_sdk)
   message(FATAL_ERROR "tests/premiere requires the Adobe SDK targets (OSV_BUILD_PREMIERE=ON)")
@@ -79,7 +84,7 @@ catch_discover_tests(osv_premiere_common_tests
 # -----------------------------------------------------------------------------
 #  Plug-in test executables from the next milestone step (added when present).
 # -----------------------------------------------------------------------------
-foreach(_dir importer reframe)
+foreach(_dir importer reframe sourcesettings)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_dir}/CMakeLists.txt")
     add_subdirectory(${_dir})
   endif()

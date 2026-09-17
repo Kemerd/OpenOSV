@@ -15,11 +15,57 @@ The Pocket 3 D-Log M -> linear curve is public and has the form
 with `cut` defined as the intersection of the two branches
 (cut = intercept / (slope2 - slope)) so the curve is C0 continuous.
 
-For the Osmo 360 we have 64 neutral-axis measurements of DJI's own D-Log M
-to HLG conversion (grey code in -> HLG signal out, input i/63).  This script
-re-fits the SAME seven-parameter form to those measurements so the library
-can reproduce DJI's tonal placement (grey 0.40 -> HLG 0.380, 0.714 -> 0.75)
-while keeping a closed-form, invertible, continuous curve.
+Two measurement sources are supported.
+
+1. The built-in 64-point table (`HLG_TABLE`, the default).  These are
+   neutral-axis measurements of a DJI D-Log M -> HLG rendering (grey code in
+   -> HLG signal out, input i/63) taken from the Pocket-3 era reference.  The
+   table is kept verbatim because it is the provenance record of the
+   `kDlogMDjiRefit` constants that shipped first; re-running the script
+   without arguments must keep reproducing them.
+
+2. `--from-cube <path> --cube-transfer 709|hlg`: the neutral axis of a real
+   .cube file, sampled at every one of its N grid points instead of a
+   hand-copied subset.  This is how `kDlogMOsmo360` was produced, from DJI's
+   own Osmo 360 D-Log M -> Rec.709 LUT.  Nothing from the file is shipped:
+   only the fitted constants leave this script.
+
+Either way the script re-fits the SAME seven-parameter form so the library can
+reproduce DJI's tonal placement (grey 0.40 -> HLG 0.380, 0.714 -> 0.75) while
+keeping a closed-form, invertible, continuous curve.
+
+Why a Rec.709 LUT can be fitted in HLG-code space
+-------------------------------------------------
+OpenOSV's "Rec.709 output" is deliberately *not* a peak-to-peak tone map: it
+is the HLG signal itself, computed in Rec.709 primaries (docs/COLOR.md,
+"Rec.709 output"; BT.2390 "HLG on an SDR display").  Reading the neutral-axis
+branch of `osvLinearToOutput` for OSV_TRANSFER_REC709 with R == G == B:
+
+    working  = nativeToWorking * (lin, lin, lin)      -> (k*lin, k*lin, k*lin)
+    working *= sceneScale                              (0.2674)
+    tmp      = workingToOutput * working               (2020 -> 709, linear)
+    out      = HLG_OETF(tmp)
+
+Both 3x3 matrices are normalised so that a neutral input stays neutral - the
+rows of a primaries-conversion matrix sum to 1 for an equal-energy triple -
+so on the neutral axis they are the identity and the whole chain collapses to
+
+    out(code) = HLG_OETF(sceneScale * lin(code))
+
+which is *exactly* the HLG-output expression, and exactly the `model()` below.
+No inversion of a separate 709 rendering is needed: for neutrals our 709 and
+HLG outputs are numerically the same function, so a 709 reference LUT's
+diagonal can be treated directly as HLG-signal targets.  `--cube-transfer`
+therefore accepts both names and treats them identically for the neutral axis;
+it exists so the provenance of a fit records which file was measured, and it
+refuses anything else rather than silently fitting the wrong encoding.
+
+This identity was checked numerically against DJI's Osmo 360 file: inverting
+its diagonal through HLG_OETF^-1 / 0.2674 yields a smooth, strictly monotonic
+scene-linear curve reaching 3.74 at code 1.0 with 18 % grey at code 0.406 -
+i.e. DJI's 709 rendering really is an HLG-in-709 rendering, not a separate
+tone map.  Had it been one, the recovered "linear" curve would have shown the
+characteristic roll-off kink near diffuse white; it does not.
 
 Fit definition
 --------------
@@ -49,15 +95,32 @@ is 7-bit ASCII so it is safe on any Windows console.
 
 Usage
 -----
-    python scripts/fit_dlogm.py            # prints everything
+    # reproduce kDlogMDjiRefit from the built-in provenance table
+    python scripts/fit_dlogm.py
+
+    # reproduce kDlogMOsmo360 from DJI's Osmo 360 Rec.709 LUT
+    python scripts/fit_dlogm.py --from-cube DJI_Osmo360_DLogM_to_Rec709.cube \
+                               --cube-transfer 709 --name kDlogMOsmo360
+
     python scripts/fit_dlogm.py --json out.json   # also dumps the result
 """
 
 import argparse
+import io
 import json
+import os
 import sys
 
 import numpy as np
+
+# Windows consoles default to a legacy code page; every string this script
+# prints is 7-bit ASCII, but reconfiguring stdout to UTF-8 makes it safe even
+# if a future message is not (and is a no-op on a sane terminal).
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (ValueError, OSError):  # pragma: no cover - exotic/redirected stdout
+        pass
 
 # -----------------------------------------------------------------------------
 #  Measured data: DJI-matched neutral-axis samples (D-Log M code -> HLG signal)
@@ -105,6 +168,96 @@ MAX_SLOPE_RATIO_PENALTY = 50.0
 HLG_A = 0.17883277
 HLG_B = 0.28466892
 HLG_C = 0.55991073
+
+
+# Transfer names accepted by --cube-transfer.  Both map onto the same neutral
+# axis model (see the module docstring); the distinction is provenance only.
+CUBE_TRANSFERS = ("709", "hlg")
+
+
+def read_cube_neutral_axis(path):
+    """
+    Read the neutral (R == G == B) diagonal of a 3D .cube file.
+
+    Returns ``(codes, targets, size, title)`` where ``codes`` is ``i/(N-1)``
+    for every grid point and ``targets`` is the mean of the three output
+    channels at that point.  The mean is used rather than the red channel
+    alone because DJI's tables carry ~1e-4 of per-channel dither on the
+    diagonal (green and blue read a few units higher than red); averaging it
+    away is the right estimator for a neutral-axis fit and keeps the result
+    independent of which channel a future file happens to favour.
+
+    Defensive by design: the parser tolerates comments, blank lines, CRLF, a
+    missing TITLE, arbitrary keyword case and DOMAIN_MIN/MAX lines, and raises
+    a ``ValueError`` with a specific message for anything it cannot honour
+    (1D LUTs, a missing size, a truncated table, a non-unit domain) instead of
+    returning a silently wrong axis.
+    """
+    if not path or not os.path.isfile(path):
+        raise ValueError("cube file not found: %r" % (path,))
+
+    size = None
+    title = None
+    domain_min = [0.0, 0.0, 0.0]
+    domain_max = [1.0, 1.0, 1.0]
+    rows = []
+
+    # errors="replace" so a stray byte in a vendor file cannot abort the read;
+    # any replacement character lands in a token that then fails float() with
+    # a clear line number.
+    with io.open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            upper = line.upper()
+            if upper.startswith("TITLE"):
+                title = line[5:].strip().strip('"')
+                continue
+            if upper.startswith("LUT_1D_SIZE"):
+                raise ValueError("%s is a 1D LUT; a 3D LUT is required" % path)
+            if upper.startswith("LUT_3D_SIZE"):
+                try:
+                    size = int(line.split()[-1])
+                except (ValueError, IndexError):
+                    raise ValueError("%s:%d: malformed LUT_3D_SIZE" % (path, lineno))
+                continue
+            if upper.startswith("DOMAIN_MIN"):
+                domain_min = [float(v) for v in line.split()[1:4]]
+                continue
+            if upper.startswith("DOMAIN_MAX"):
+                domain_max = [float(v) for v in line.split()[1:4]]
+                continue
+            parts = line.split()
+            if len(parts) != 3:
+                raise ValueError("%s:%d: expected three floats, got %r" % (path, lineno, line))
+            try:
+                rows.append([float(v) for v in parts])
+            except ValueError:
+                raise ValueError("%s:%d: non-numeric table entry %r" % (path, lineno, line))
+
+    if size is None:
+        raise ValueError("%s: no LUT_3D_SIZE line" % path)
+    if size < 2 or size > 256:
+        raise ValueError("%s: LUT_3D_SIZE %d out of range [2, 256]" % (path, size))
+    if len(rows) != size ** 3:
+        raise ValueError("%s: expected %d table rows, found %d" % (path, size ** 3, len(rows)))
+    # A shifted or scaled input domain would make code = i/(N-1) wrong.
+    if any(abs(v) > 1e-6 for v in domain_min) or any(abs(v - 1.0) > 1e-6 for v in domain_max):
+        raise ValueError("%s: DOMAIN must be 0..1 (got %s..%s)" % (path, domain_min, domain_max))
+
+    # .cube stores red fastest, then green, then blue, so the neutral entry
+    # for grid index i is at i + i*N + i*N*N.
+    codes = np.arange(size, dtype=np.float64) / float(size - 1)
+    targets = np.empty(size, dtype=np.float64)
+    for i in range(size):
+        targets[i] = float(np.mean(rows[i + i * size + i * size * size]))
+
+    # The diagonal of a display-referred LUT must be monotonic; a decreasing
+    # step means the file is not what we think it is (or the axis order is).
+    if np.any(np.diff(targets) < -1e-6):
+        raise ValueError("%s: neutral axis is not monotonic; wrong axis order?" % path)
+    return codes, targets, size, title
 
 
 def hlg_oetf(e):
@@ -196,18 +349,64 @@ def levenberg_marquardt(fun, p0, args, iterations=400, lam=1e-3):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fit the DJI refit D-Log M curve.")
+    parser = argparse.ArgumentParser(description="Fit a D-Log M -> scene-linear curve.")
     parser.add_argument("--json", help="write the fitted constants and residuals to this JSON file")
+    parser.add_argument("--from-cube", metavar="PATH",
+                        help="measure the neutral axis of this 3D .cube file instead of the built-in table")
+    parser.add_argument("--cube-transfer", choices=CUBE_TRANSFERS, default="709",
+                        help="output encoding of --from-cube (709 and hlg are the same on the neutral axis)")
+    parser.add_argument("--name", default=None,
+                        help="C++ constant name to print (default: kDlogMDjiRefit, or kDlogMOsmo360 with --from-cube)")
     args = parser.parse_args()
 
-    codes = np.arange(64, dtype=np.float64) / 63.0
-    targets = np.asarray(HLG_TABLE, dtype=np.float64)
+    # --- gather the measurements -------------------------------------------
+    if args.from_cube:
+        try:
+            codes, targets, cube_size, cube_title = read_cube_neutral_axis(args.from_cube)
+        except ValueError as exc:
+            print("error: %s" % exc, file=sys.stderr)
+            return 2
+        source = "%s neutral axis, %d^3, --cube-transfer %s" % (args.from_cube, cube_size, args.cube_transfer)
+        if cube_title:
+            source += ' (TITLE "%s")' % cube_title
+        default_name = "kDlogMOsmo360"
+    else:
+        codes = np.arange(64, dtype=np.float64) / 63.0
+        targets = np.asarray(HLG_TABLE, dtype=np.float64)
+        source = "built-in 64-point HLG_TABLE (provenance record for kDlogMDjiRefit)"
+        default_name = "kDlogMDjiRefit"
+    name = args.name or default_name
+
     weights = np.where(codes >= TOE_CODE, 1.0, TOE_WEIGHT)
     weights[0] = FIRST_SAMPLE_WEIGHT
 
-    p0 = [POCKET3["x_shift"], POCKET3["y_shift"], POCKET3["scale"], POCKET3["slope"], POCKET3["slope2"],
-          POCKET3["intercept"]]
-    p, cost = levenberg_marquardt(residuals, p0, (codes, targets, weights))
+    # Multi-start: the residual surface of this seven-parameter form has
+    # several local minima (the exponential `scale` and the piecewise hinge
+    # trade off against each other), and the Pocket 3 start is only the best
+    # basin for Pocket-3-like data.  Trying a handful of spread-out starts and
+    # keeping the lowest cost makes the result deterministic and independent of
+    # which measurement set is being fitted.  The first entry is the historical
+    # Pocket 3 start, so the built-in table still converges where it always did.
+    starts = [
+        [POCKET3["x_shift"], POCKET3["y_shift"], POCKET3["scale"], POCKET3["slope"], POCKET3["slope2"],
+         POCKET3["intercept"]],
+        [-2.722814610, 0.244082124, 5.598943717, 1.010442692, 3.031328816, 1.554539968],  # the shipped refit
+        [-1.0, 0.0, 7.0, 1.0, 2.0, 0.5],
+        [-3.0, 1.0, 7.0, 1.0, 2.5, 1.0],
+    ]
+    p, cost = None, float("inf")
+    for start in starts:
+        cand, cand_cost = levenberg_marquardt(residuals, start, (codes, targets, weights))
+        # Reject any candidate the solver walked into that is not a usable
+        # curve, however low its cost: NaNs, a negative toe or a non-positive
+        # cut would all produce a broken OsvDlogMCurve.
+        if not np.all(np.isfinite(cand)) or cand[4] <= cand[3] or cand[3] <= 0.0:
+            continue
+        if cand_cost < cost:
+            p, cost = cand, cand_cost
+    if p is None:
+        print("error: no start point converged to a valid curve", file=sys.stderr)
+        return 1
 
     x_shift, y_shift, scale, slope, slope2, intercept = p
     mgs = mid_gray_scaling(p)
@@ -224,7 +423,8 @@ def main():
     # Code at which the exponential part crosses the cut (where the kink sits).
     cut_code = (np.log2(cut - x_shift) - y_shift) / scale if cut - x_shift > 0 else float("nan")
 
-    print("DJI refit of the D-Log M curve (7-parameter Pocket 3 form)")
+    print("D-Log M curve fit: %s (7-parameter Pocket 3 form)" % name)
+    print("measurements: %s (%d points)" % (source, codes.size))
     print("pin: lin(%.3f) = %.4f, cut = intercept/(slope2-slope) (C0 continuous)" % (PIN_CODE, PIN_LINEAR))
     print("slope2/slope = %.3f (bound %.2f), cut = %.6f reached at code %.4f" % (slope2 / slope, MAX_SLOPE_RATIO, cut,
                                                                               cut_code))
@@ -233,7 +433,7 @@ def main():
     for c, t, f, r, w in zip(codes, targets, pred, resid, weights):
         print("  %.4f  %.4f  %.4f  %+.4f  %.2f" % (c, t, f, r, w))
     print("")
-    print("RMS residual (all 64 points)     : %.5f HLG" % rms_all)
+    print("RMS residual (all %2d points)     : %.5f HLG" % (codes.size, rms_all))
     print("RMS residual (code >= %.2f)      : %.5f HLG" % (TOE_CODE, rms_used))
     print("max |residual| (code >= %.2f)    : %.5f HLG" % (TOE_CODE, max_used))
     print("max |residual| (all)             : %.5f HLG" % max_all)
@@ -252,7 +452,7 @@ def main():
           % ("yes" if np.all(diffs > 0) else "NO", float(diffs.min()), float(diffs.max())))
     print("")
     print("C++ initializer (paste into include/osv/color/DlogM.h):")
-    print("inline constexpr OsvDlogMCurve kDlogMDjiRefit = {")
+    print("inline constexpr OsvDlogMCurve %s = {" % name)
     print("    %.9ff,  // xShift" % x_shift)
     print("    %.9ff,  // yShift" % y_shift)
     print("    %.9ff,  // scale" % scale)
@@ -266,6 +466,9 @@ def main():
 
     if args.json:
         payload = {
+            "name": name,
+            "source": source,
+            "points": int(codes.size),
             "x_shift": x_shift,
             "y_shift": y_shift,
             "scale": scale,

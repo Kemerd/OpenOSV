@@ -33,6 +33,9 @@ target_compile_definitions(osv_tests PRIVATE
   OSV_SAMPLE_LRF_FILE="${OSV_SAMPLE_LRF_FILE}"
   OSV_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden"
   OSV_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+  # The committed .cube LUTs (build output of scripts/gen_luts.ps1); the cube
+  # test regenerates one and compares it against the committed copy.
+  OSV_LUTS_DIR="${CMAKE_SOURCE_DIR}/luts"
   OSV_TEST_OUTPUT_DIR="${CMAKE_BINARY_DIR}/test-output"
 )
 if(TARGET osvtool)

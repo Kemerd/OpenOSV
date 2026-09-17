@@ -41,18 +41,18 @@ CAPTION "OpenOSV Source Settings"
 FONT 8, "MS Shell Dlg", 400, 0, 0x1
 BEGIN
     // ---- Colour output ----------------------------------------------------
-    GROUPBOX        "Colour output", IDC_STATIC_COLOR, 7, 7, 254, 32
-    CONTROL         "Rec.2100 &PQ", IDC_COLOR_PQ, "Button",
-                    BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 16, 21, 62, 10
-    CONTROL         "Rec.2100 &HLG", IDC_COLOR_HLG, "Button",
-                    BS_AUTORADIOBUTTON, 92, 21, 62, 10
-    CONTROL         "Rec.&709", IDC_COLOR_709, "Button",
-                    BS_AUTORADIOBUTTON, 168, 21, 62, 10
+    // A combo box, not the three radio buttons this used to be: a fourth
+    // option (D-Log M passthrough) would not fit the 16 / 92 / 168 layout
+    // inside the old group box, and every other multi-choice setting below is
+    // already a combo.  See plugins/importer/resource.h.
+    LTEXT           "Colour o&utput:", IDC_STATIC_COLOR, 7, 10, 70, 8
+    COMBOBOX        IDC_COLOR_OUTPUT, 82, 7, 179, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_GROUP | WS_TABSTOP
 
     // ---- Geometry ---------------------------------------------------------
     LTEXT           "Output &size:", IDC_STATIC_SIZE, 7, 50, 70, 8
     COMBOBOX        IDC_OUTPUT_SIZE, 82, 47, 179, 80,
-                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_GROUP | WS_TABSTOP
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
 
     LTEXT           "S&tabilisation:", IDC_STATIC_STAB, 7, 70, 70, 8
     COMBOBOX        IDC_STABILIZATION, 82, 67, 179, 80,

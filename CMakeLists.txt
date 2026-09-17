@@ -37,9 +37,9 @@ set(OSV_AE_SDK_DIR       "" CACHE PATH "After Effects C++ SDK root (out of tree)
 # Sample clip used by the [sample] tagged tests.  Tests SKIP cleanly when the
 # file is absent, so CI machines without footage still exercise everything that
 # can be verified from synthetic fixtures.
-set(OSV_SAMPLE_FILE "${CMAKE_SOURCE_DIR}/CAM_20260904090647_0010_D.OSV"
+set(OSV_SAMPLE_FILE "${CMAKE_SOURCE_DIR}/example_footage_dlogm.OSV"
     CACHE FILEPATH "Sample .OSV clip for the [sample] tests")
-set(OSV_SAMPLE_LRF_FILE "${CMAKE_SOURCE_DIR}/CAM_20260904090647_0010_D.LRF"
+set(OSV_SAMPLE_LRF_FILE "${CMAKE_SOURCE_DIR}/example_footage_dlogm.LRF"
     CACHE FILEPATH "Sample .LRF proxy clip for the [sample] tests")
 
 # -----------------------------------------------------------------------------

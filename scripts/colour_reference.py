@@ -197,6 +197,7 @@ def main():
         header = fh.read()
     pocket3 = parse_curve(header, "kDlogMPocket3")
     refit = parse_curve(header, "kDlogMDjiRefit")
+    osmo360 = parse_curve(header, "kDlogMOsmo360")
 
     codes33 = np.linspace(0.0, 1.0, 33)
     codes65 = np.linspace(0.0, 1.0, 65)
@@ -226,7 +227,7 @@ def main():
         "pipeline_grey": {},
     }
 
-    for name, curve in (("pocket3", pocket3), ("dji_refit", refit)):
+    for name, curve in (("pocket3", pocket3), ("dji_refit", refit), ("osmo360", osmo360)):
         lin65 = dlogm_to_linear(curve, codes65)
         dense = np.linspace(0.0, 1.0, 4097)
         lin_dense = dlogm_to_linear(curve, dense)
@@ -264,6 +265,19 @@ def main():
             "linear": [float(v) for v in linear_to_output(lin, NATIVE_TO_2020, IDENTITY, "linear")],
         })
 
+    # The same spot checks for the default curve, so a change to it cannot
+    # slip past the golden test (which only pinned the refit before).
+    doc["pipeline_rgb_osmo360"] = []
+    for code in spots:
+        lin = [float(dlogm_to_linear(osmo360, c)) for c in code]
+        doc["pipeline_rgb_osmo360"].append({
+            "code": code,
+            "hlg": [float(v) for v in linear_to_output(lin, NATIVE_TO_2020, IDENTITY, "hlg")],
+            "pq": [float(v) for v in linear_to_output(lin, NATIVE_TO_2020, IDENTITY, "pq")],
+            "rec709": [float(v) for v in linear_to_output(lin, NATIVE_TO_2020, REC2020_TO_709, "rec709")],
+            "linear": [float(v) for v in linear_to_output(lin, NATIVE_TO_2020, IDENTITY, "linear")],
+        })
+
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(doc, fh, indent=1)
@@ -271,7 +285,7 @@ def main():
 
     # Console summary (ASCII only).
     print("wrote %s" % args.out)
-    for name in ("pocket3", "dji_refit"):
+    for name in ("pocket3", "dji_refit", "osmo360"):
         d = doc["dlogm"][name]
         print("%-10s code 0.40 -> lin %.5f (HLG %.4f); 0.714 -> HLG %.4f; 1.0 -> lin %.4f (HLG %.4f)"
               % (name, d["code_0_40"], d["hlg_0_40"], d["hlg_0_714"], d["code_1_00"], d["hlg_1_00"]))

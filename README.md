@@ -14,8 +14,16 @@ it natively in Adobe Premiere Pro.
 
 | Plug-in | What it does |
 |---|---|
-| `OpenOSVImporter.prm` | Registers `.osv` and `.lrf`. Decodes both fisheye lenses, stitches on CUDA / OpenCL / CPU and hands Premiere an equirectangular 360 x 180 frame tagged Rec.2100 PQ, HLG or Rec.709, with the AAC track decoded. Stitch options (colour output, output size, stabilisation and horizon lock, seam search, exposure match, calibration slot, D-Log M curve, exposure, render device) live in **Source Settings**. |
+| `OpenOSVImporter.prm` | Registers `.osv` and `.lrf`. Decodes both fisheye lenses, stitches on CUDA / OpenCL / CPU and hands Premiere an equirectangular 360 x 180 frame tagged Rec.2100 PQ, HLG, Rec.709 or D-Log M passthrough, with the AAC track decoded. |
+| `OpenOSVSourceSettings.aex` | "OpenOSV Source Settings", which Premiere attaches to the **master clip** by itself. The stitch options (colour output, output size, stabilisation and horizon lock, seam search, exposure match, calibration slot, D-Log M curve, exposure, render device) are right there in the Effect Controls panel. They apply to the whole clip and deliberately have no stopwatches — see below. |
 | `Open360Reframe.aex` | "Open 360 Reframe" in the Effects panel. Pan, Tilt, Roll, FOV, Distortion, preset perspectives and source orientation, all keyframed by Premiere itself. Renders on the GPU through Premiere's own CUDA device, with a CPU fallback running the same kernel. |
+
+Two effects, because they are two different jobs. **Source Settings** decides
+how the sphere is built and coloured; those values are handed to the decoder as
+one setting per clip, so they cannot be keyframed and the panel honestly shows
+no stopwatch. **Open 360 Reframe** decides where the camera looks, per frame,
+and keyframes everything. The old modal dialog (right-click > Source Settings)
+still works if you prefer it, and writes exactly the same settings.
 
 Reframing is interactive: **drag the picture** in the Program Monitor to pan and
 tilt, `Shift` to lock an axis, `Ctrl` to zoom, `Alt` or the roll ring to roll.
@@ -31,14 +39,54 @@ says where to put them.
 cmake --preset windows-msvc-premiere-release
 cmake --build --preset windows-msvc-premiere-release
 ctest --preset premiere
-scripts\install_plugins.ps1        # copies into the shared MediaCore plug-ins folder
+scripts\install_plugins.ps1        # plug-ins -> MediaCore, presets -> your Premiere profile
 ```
+
+## Sequence presets
+
+Premiere builds a new sequence at the clip's own frame size, and an
+equirectangular sphere is always 2:1 — so a new sequence from an `.OSV` is
+2:1 too, which is right for working on the sphere and wrong for 16:9 delivery.
+`scripts\install_plugins.ps1` installs three presets to save you typing one:
+
+| Preset | Size | For |
+|---|---|---|
+| **OpenOSV 2560x1440 59.94** | 2560 x 1440 | Reframed 16:9 delivery. The one you usually want. |
+| **OpenOSV 3840x2160 59.94** | 3840 x 2160 | 4K delivery — set Output Size to Native or 4K first. |
+| **OpenOSV 360 equirect 2560x1280 59.94** | 2560 x 1280 | The sphere itself, or a 360 VR export. Declares equirectangular VR, so Premiere's VR view works. |
+
+They show up under **File > New > Sequence** in a group called **OpenOSV**,
+and land in
+`Documents\Adobe\Premiere Pro\<version>\Profile-<you>\Settings\SequencePresets\OpenOSV\`.
+Premiere caches the preset list, so restart it if it was already running. Pass
+`-NoPresets` to skip them. All three are 59.94 fps exactly — not 60, which
+drifts against the footage by a frame every thousand.
 
 ## Why
 
 DJI only ships its Premiere reframe plug-in for macOS, and its own apps export
 SDR only. Osmo 360 owners on Windows with HDR pipelines were left out. OpenOSV
 fixes that with a permissively licensed implementation anyone can build on.
+
+## Shooting notes
+
+**Record in D-Log M, 10-bit.** That keeps the full latitude of the sensor, and
+the importer reads the clip's own `color_mode` metadata and applies the right
+curve automatically. Normal 10-bit works too; the importer follows the
+metadata rather than assuming.
+
+**Leave "Color Recovery" on if you like it.** It only affects the camera's
+live-view preview. The recorded `.OSV` is ordinary D-Log M either way and
+carries no flag for the setting, so it changes nothing about the file or how
+this toolkit decodes it. Monitoring is simply easier with it on, because raw
+D-Log M looks flat and grey on the camera screen.
+
+**Grading.** The importer converts D-Log M to Rec.2100 PQ (the default), HLG
+or Rec.709 for you, so no LUT is needed in Premiere. If you would rather grade
+the log yourself, set the clip's colour output to D-Log M passthrough in
+Source Settings and apply one of the LUTs in `luts/` (also installed beside
+the plug-ins) in Lumetri. Do not do both: applying a D-Log M LUT on top of a
+converted PQ/HLG/709 output double-converts the footage.
 
 ## Quick start
 

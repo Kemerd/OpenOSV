@@ -44,6 +44,23 @@ constexpr std::array<double, 64> kDjiHlgTable = {
     0.6601, 0.6758, 0.6915, 0.7072, 0.7229, 0.7386, 0.7503, 0.7660, 0.7778, 0.7935, 0.8052, 0.8183, 0.8327,
     0.8418, 0.8601, 0.8719, 0.8850, 0.8967, 0.9124, 0.9242, 0.9373, 0.9490, 0.9647, 0.9791, 0.9922};
 
+/// The 33 neutral-axis measurements of DJI's own Osmo 360 D-Log M -> Rec.709
+/// LUT (code i/32 -> output signal), the reference kDlogMOsmo360 was fitted to.
+///
+/// These are measurements of a transfer function, not redistributed LUT data:
+/// the diagonal is 33 of that file's 35937 entries, read with
+/// scripts/fit_dlogm.py --from-cube and recorded here so the residual test can
+/// run without the file on disk (see NOTICE).
+///
+/// They are usable directly as HLG-signal targets because OpenOSV's Rec.709
+/// output IS the HLG signal in Rec.709 primaries, and on the neutral axis the
+/// primaries matrices are the identity, so the Rec.709 and HLG branches of
+/// osvLinearToOutput are the same function of the code (see DlogM.h).
+constexpr std::array<double, 33> kOsmo360Rec709Table = {
+    0.000000, 0.002871, 0.011479, 0.027510, 0.053454, 0.084936, 0.119168, 0.155227, 0.192473, 0.230323, 0.269137,
+    0.308931, 0.348810, 0.388234, 0.423856, 0.456224, 0.487409, 0.519277, 0.553789, 0.590770, 0.629860, 0.668478,
+    0.705628, 0.740403, 0.774289, 0.807223, 0.840133, 0.872661, 0.903927, 0.933200, 0.960404, 0.983169, 1.000000};
+
 /// Run a grey code through the full pipeline of a parameter block.
 float greyThrough(const OsvColorParams& p, float code) {
     const float in[3] = {code, code, code};
@@ -257,8 +274,118 @@ TEST_CASE("DJI refit D-Log M curve matches the DJI HLG placement", "[color]") {
     REQUIRE(worst < 0.02);
 }
 
+TEST_CASE("Osmo 360 D-Log M curve matches DJI's Osmo 360 reference", "[color]") {
+    REQUIRE(dlogmCurveValid(kDlogMOsmo360));
+    // The fit pins 18 % grey exactly; the toe must not go negative.
+    REQUIRE_THAT(dlogmToLinear(kDlogMOsmo360, 0.40f), WithinAbs(0.18, 1e-4));
+    REQUIRE(dlogmToLinear(kDlogMOsmo360, 0.0f) >= -1e-6f);
+
+    // BT.2408 anchors.  Grey is pinned so it is tight; diffuse white is a fit
+    // result, and the tolerance is set by DJI's own placement (their file
+    // reads 0.7404 at code 0.71875) rather than by the nominal 0.750.
+    const auto hlgOf = [](float code) { return hlgOetf(kBt2408SceneScale * dlogmToLinear(kDlogMOsmo360, code)); };
+    REQUIRE_THAT(hlgOf(0.400f), WithinAbs(0.380, 0.001));
+    REQUIRE_THAT(hlgOf(0.714f), WithinAbs(0.750, 0.010));
+
+    // Residuals against the reference, for both the HLG and the Rec.709
+    // output: on the neutral axis they must be the SAME function, which is
+    // the algebraic claim the whole fit rests on, so this asserts it rather
+    // than assuming it.
+    const OsvColorParams hlgP = makeColorParams(DlogMFit::Osmo360, OutputTransfer::HLG, 0.0f);
+    const OsvColorParams sdrP = makeColorParams(DlogMFit::Osmo360, OutputTransfer::Rec709, 0.0f);
+    REQUIRE(colorParamsValid(hlgP));
+    REQUIRE(colorParamsValid(sdrP));
+
+    double worst = 0.0;
+    double sumSq = 0.0;
+    int n = 0;
+    for (std::size_t i = 0; i < kOsmo360Rec709Table.size(); ++i) {
+        const auto code = static_cast<float>(static_cast<double>(i) / 32.0);
+        const double hlgGot = greyThrough(hlgP, code);
+        const double sdrGot = greyThrough(sdrP, code);
+        // The identity that justifies fitting a 709 LUT in HLG space.
+        REQUIRE_THAT(sdrGot, WithinAbs(hlgGot, 2e-6));
+        const double err = std::fabs(hlgGot - kOsmo360Rec709Table[i]);
+        worst = std::max(worst, err);
+        sumSq += err * err;
+        ++n;
+    }
+    const double rms = std::sqrt(sumSq / n);
+    INFO("Osmo 360 curve vs DJI reference: worst " << worst << " RMS " << rms);
+    // The fitted values are 0.0462 worst / 0.0233 RMS over all 33 points.
+    // Both figures are dominated by the bottom four samples, which are the
+    // crushed 8-bit part of DJI's table and are deliberately down-weighted in
+    // the fit; above code 0.24 the RMS is 0.0160.  The bounds leave a little
+    // room for float evaluation but would catch a refit regression.
+    REQUIRE(worst < 0.050);
+    REQUIRE(rms < 0.025);
+
+    // Above the crushed toe, which is the range that actually matters.
+    double usedSumSq = 0.0;
+    int usedN = 0;
+    for (std::size_t i = 0; i < kOsmo360Rec709Table.size(); ++i) {
+        const double code = static_cast<double>(i) / 32.0;
+        if (code < 0.24) {
+            continue;
+        }
+        const double err = greyThrough(hlgP, static_cast<float>(code)) - kOsmo360Rec709Table[i];
+        usedSumSq += err * err;
+        ++usedN;
+    }
+    REQUIRE(usedN > 20);
+    REQUIRE(std::sqrt(usedSumSq / usedN) < 0.018);
+
+    // The point of the refit: it must beat the curve it replaced on this
+    // reference.  A future "improvement" that loses to kDlogMDjiRefit here is
+    // not an improvement, so this is a comparison, not a fixed threshold.
+    const OsvColorParams oldP = makeColorParams(DlogMFit::DjiRefit, OutputTransfer::HLG, 0.0f);
+    double oldWorst = 0.0;
+    double oldSumSq = 0.0;
+    for (std::size_t i = 0; i < kOsmo360Rec709Table.size(); ++i) {
+        const auto code = static_cast<float>(static_cast<double>(i) / 32.0);
+        const double err = std::fabs(greyThrough(oldP, code) - kOsmo360Rec709Table[i]);
+        oldWorst = std::max(oldWorst, err);
+        oldSumSq += err * err;
+    }
+    const double oldRms = std::sqrt(oldSumSq / n);
+    INFO("kDlogMDjiRefit on the same reference: worst " << oldWorst << " RMS " << oldRms);
+    REQUIRE(worst < oldWorst);
+    REQUIRE(rms < oldRms);
+}
+
+TEST_CASE("Osmo 360 is the default D-Log M curve", "[color]") {
+    // The default is stated in one place and every default path must agree
+    // with it, so moving the default again cannot leave a path behind.
+    REQUIRE(kDefaultDlogMFit == DlogMFit::Osmo360);
+    const OsvDlogMCurve& def = dlogmCurve(kDefaultDlogMFit);
+    REQUIRE(def.scale == kDlogMOsmo360.scale);
+    REQUIRE(def.midGrayScaling == kDlogMOsmo360.midGrayScaling);
+
+    // The named fits stay bound to their own constants: "dji" must keep
+    // decoding with the original refit so an existing project or script does
+    // not silently change rendering.
+    REQUIRE(dlogmCurve(DlogMFit::DjiRefit).scale == kDlogMDjiRefit.scale);
+    REQUIRE(dlogmCurve(DlogMFit::Pocket3).scale == kDlogMPocket3.scale);
+
+    // Names and parsing round trip, including the new aliases.
+    DlogMFit parsed{};
+    for (const char* text : {"osmo360", "osmo", "osmo-360", "360", "OSMO360"}) {
+        REQUIRE(parseDlogMFit(text, parsed));
+        REQUIRE(parsed == DlogMFit::Osmo360);
+    }
+    REQUIRE(parseDlogMFit("dji", parsed));
+    REQUIRE(parsed == DlogMFit::DjiRefit);
+    REQUIRE(std::string_view(dlogMFitName(DlogMFit::Osmo360)) == "osmo360");
+    REQUIRE(parseDlogMFit(dlogMFitName(DlogMFit::Osmo360), parsed));
+    REQUIRE(parsed == DlogMFit::Osmo360);
+    // An out-of-range enum (a corrupt persisted preference) must not pick an
+    // arbitrary curve.
+    REQUIRE(dlogmCurve(static_cast<DlogMFit>(99)).scale == kDlogMOsmo360.scale);
+    REQUIRE(std::string_view(dlogMFitName(static_cast<DlogMFit>(99))) == "unknown");
+}
+
 TEST_CASE("Both D-Log M curves are strictly increasing and continuous", "[color]") {
-    for (const OsvDlogMCurve* c : {&kDlogMPocket3, &kDlogMDjiRefit}) {
+    for (const OsvDlogMCurve* c : {&kDlogMPocket3, &kDlogMDjiRefit, &kDlogMOsmo360}) {
         const std::vector<double> v = denseCurve(*c, 4096);
         double maxStep = 0.0;
         for (std::size_t i = 1; i < v.size(); ++i) {
@@ -284,7 +411,7 @@ TEST_CASE("Both D-Log M curves are strictly increasing and continuous", "[color]
 }
 
 TEST_CASE("D-Log M inverse round trip", "[color]") {
-    for (const OsvDlogMCurve* c : {&kDlogMPocket3, &kDlogMDjiRefit}) {
+    for (const OsvDlogMCurve* c : {&kDlogMPocket3, &kDlogMDjiRefit, &kDlogMOsmo360}) {
         for (int i = 0; i <= 1000; ++i) {
             const double code = i / 1000.0;
             const double lin = dlogmToLinearD(*c, code);
@@ -405,7 +532,7 @@ TEST_CASE("makeColorParams is defensive about its inputs", "[color]") {
                                               true, 10, &custom);
     REQUIRE(o2.curve.scale == kDlogMDjiRefit.scale);
     // Enum names and parsing round trip.
-    for (const DlogMFit f : {DlogMFit::DjiRefit, DlogMFit::Pocket3}) {
+    for (const DlogMFit f : {DlogMFit::DjiRefit, DlogMFit::Pocket3, DlogMFit::Osmo360}) {
         DlogMFit back = DlogMFit::Pocket3;
         REQUIRE(parseDlogMFit(dlogMFitName(f), back));
         REQUIRE(back == f);
@@ -515,6 +642,7 @@ TEST_CASE("Kernel math matches the float64 golden reference", "[color]") {
     };
     checkCurve("pocket3", kDlogMPocket3);
     checkCurve("dji_refit", kDlogMDjiRefit);
+    checkCurve("osmo360", kDlogMOsmo360);
 
     // Grey pipelines and RGB spot checks through makeColorParams.
     const auto checkGrey = [&](const char* key, DlogMFit fit, const char* transferKey, OutputTransfer transfer) {
@@ -529,7 +657,8 @@ TEST_CASE("Kernel math matches the float64 golden reference", "[color]") {
             }
         }
     };
-    for (const auto& [key, fit] : {std::pair{"pocket3", DlogMFit::Pocket3}, std::pair{"dji_refit", DlogMFit::DjiRefit}}) {
+    for (const auto& [key, fit] : {std::pair{"pocket3", DlogMFit::Pocket3}, std::pair{"dji_refit", DlogMFit::DjiRefit},
+                                   std::pair{"osmo360", DlogMFit::Osmo360}}) {
         checkGrey(key, fit, "hlg", OutputTransfer::HLG);
         checkGrey(key, fit, "pq", OutputTransfer::PQ);
         checkGrey(key, fit, "rec709", OutputTransfer::Rec709);
@@ -596,4 +725,128 @@ TEST_CASE("Colour-mode auto-detect from luma statistics", "[color]") {
     REQUIRE(re.guess == meta::ColorMode::Unknown);
     REQUIRE(re.samples == 0);
     REQUIRE(detectColorMode(dlog.frame, 0).samples == 320u * 240u);
+}
+
+// -----------------------------------------------------------------------------
+//  Source colour mode -> input encoding
+//
+//  This is the rule the importer and osvtool both use to decide what a clip
+//  IS, as opposed to what the user wants out of it.  It lives in the library
+//  (color::inputEncodingForColorMode) precisely so it can be tested here
+//  without a Premiere host, and so the two front ends cannot drift apart.
+// -----------------------------------------------------------------------------
+TEST_CASE("Source colour mode selects the input encoding, never the output", "[color]") {
+    // The three modes the camera actually writes.
+    REQUIRE(inputEncodingForColorMode(meta::ColorMode::DLogM) == InputEncoding::DLogM);
+    REQUIRE(inputEncodingForColorMode(meta::ColorMode::HLG) == InputEncoding::HLG);
+    REQUIRE(inputEncodingForColorMode(meta::ColorMode::Normal) == InputEncoding::Rec709Normal);
+
+    // No metadata: D-Log M, the mode this container overwhelmingly carries.
+    REQUIRE(inputEncodingForColorMode(meta::ColorMode::Unknown) == InputEncoding::DLogM);
+
+    // Modes with no curve of their own must not silently pick a wrong branch.
+    for (const meta::ColorMode m : {meta::ColorMode::DCinelike, meta::ColorMode::DLog, meta::ColorMode::Vivid,
+                                    meta::ColorMode::DLog2}) {
+        REQUIRE(inputEncodingForColorMode(m) == InputEncoding::DLogM);
+    }
+    // A value that is not in the enum at all (a damaged metadata field).
+    REQUIRE(inputEncodingForColorMode(static_cast<meta::ColorMode>(12345)) == InputEncoding::DLogM);
+
+    // The output transfer must NOT move the input encoding.  This is the
+    // double-conversion guard: the same source mode has to decode identically
+    // whatever the delivery target is.
+    for (const meta::ColorMode m :
+         {meta::ColorMode::DLogM, meta::ColorMode::HLG, meta::ColorMode::Normal}) {
+        const InputEncoding expected = inputEncodingForColorMode(m);
+        for (const OutputTransfer t : {OutputTransfer::PQ, OutputTransfer::HLG, OutputTransfer::Rec709,
+                                       OutputTransfer::Linear, OutputTransfer::Passthrough}) {
+            const OsvColorParams p = makeColorParams(kDefaultDlogMFit, t, 0.0f, expected);
+            REQUIRE(colorParamsValid(p));
+            REQUIRE(p.inputEncoding == static_cast<int>(expected));
+        }
+    }
+}
+
+/// A non-log source must not be run through the D-Log M curve.
+///
+/// The failure this guards against is double conversion: if an HLG or a
+/// Rec.709 clip were decoded with the log curve, the de-log would be applied
+/// to a signal that was never logged.  The signature is unmistakable - grey
+/// lands nowhere near 18 % and the curve's shape is wrong - so rather than
+/// asserting on the implementation, this asserts on the OUTCOME: for each
+/// source mode, the mid-grey code of that encoding must decode to roughly
+/// scene-linear 0.18, and the wrong decoder must not.
+TEST_CASE("Each source encoding decodes its own mid grey, not another's", "[color]") {
+    // Mid grey in each source encoding:
+    //   D-Log M   : code 0.400 by the fit's pin.
+    //   HLG       : the BT.2408 38 % signal.
+    //   Rec.709   : the BT.709 OETF of 0.18 display-linear.
+    struct Case {
+        meta::ColorMode mode;
+        float greyCode;
+    };
+    const Case cases[] = {
+        {meta::ColorMode::DLogM, 0.400f},
+        {meta::ColorMode::HLG, 0.380f},
+        {meta::ColorMode::Normal, static_cast<float>(ref::rec709Oetf(0.18))},
+    };
+
+    for (const Case& c : cases) {
+        const InputEncoding enc = inputEncodingForColorMode(c.mode);
+        // Linear output so the assertion is about the decode alone, with no
+        // scene scale or transfer in the way.
+        const OsvColorParams p = makeColorParams(kDefaultDlogMFit, OutputTransfer::Linear, 0.0f, enc);
+        REQUIRE(colorParamsValid(p));
+        const double got = greyThrough(p, c.greyCode);
+        INFO("source " << meta::colorModeName(c.mode) << " grey code " << c.greyCode << " -> linear " << got);
+        // HLG decodes to scene light scaled by the BT.2408 anchor, so its
+        // mid grey lands at 0.18 * 0.2674 rather than at 0.18; Rec.709 is
+        // display-referred and lands at 0.18 directly.  Both are "about a
+        // fifth of the way up", which is the point: nowhere near what the
+        // wrong decoder would give.
+        REQUIRE(got > 0.02);
+        REQUIRE(got < 0.35);
+    }
+
+    // And the wrong decoder really is wrong.
+    //
+    // Note WHERE the damage is, because it is not where one would first look:
+    // at mid grey the two decoders very nearly agree (HLG 0.380 gives linear
+    // 0.180 decoded as HLG and 0.159 decoded as D-Log M, 0.18 stops apart),
+    // because both encodings are anchored near 18 % grey by construction.
+    // Double conversion is therefore invisible on a grey card and obvious at
+    // the ends of the range - the classic "it looked fine until the shadows
+    // and the sky" report.  So the assertion is made across the range, at the
+    // codes where the two curves genuinely diverge.
+    const OsvColorParams asLog = makeColorParams(kDefaultDlogMFit, OutputTransfer::Linear, 0.0f,
+                                                 InputEncoding::DLogM);
+    const OsvColorParams asHlg = makeColorParams(kDefaultDlogMFit, OutputTransfer::Linear, 0.0f,
+                                                 InputEncoding::HLG);
+    // A constant offset between the two decoders would only be an exposure
+    // error, which a grade trivially undoes.  What makes double conversion
+    // destructive is that the offset is NOT constant: the contrast of the
+    // decoded image is wrong, so no single lift or gain recovers it.  The
+    // measure is therefore the SPREAD of the ratio across the range, not the
+    // ratio itself.
+    double minStops = 1e9;
+    double maxStops = -1e9;
+    for (int i = 1; i <= 20; ++i) {
+        const auto code = static_cast<float>(i / 20.0);
+        const double wrong = greyThrough(asLog, code);
+        const double right = greyThrough(asHlg, code);
+        if (wrong > 1e-6 && right > 1e-6) {
+            const double stops = std::log2(wrong / right);
+            minStops = std::min(minStops, stops);
+            maxStops = std::max(maxStops, stops);
+        }
+    }
+    INFO("D-Log M vs HLG decoder ratio spans " << minStops << " .. " << maxStops << " stops");
+    // Measured span is 0.78 stops of differential contrast error.
+    REQUIRE(maxStops - minStops > 0.6);
+
+    // Mid grey, by contrast, is where the two agree - recorded so the fact
+    // above is a tested property rather than a comment nobody checks.
+    const double greyWrong = greyThrough(asLog, 0.380f);
+    const double greyRight = greyThrough(asHlg, 0.380f);
+    REQUIRE(std::fabs(std::log2(greyWrong / greyRight)) < 0.5);
 }

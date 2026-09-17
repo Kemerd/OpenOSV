@@ -122,6 +122,22 @@ struct Panorama {
 /// The panorama packed as BGRA 16-bit float (IEEE binary16), top-left.
 [[nodiscard]] std::vector<std::uint8_t> packBgra16f(const Panorama& p, std::int32_t rowBytes);
 
+/// The code Premiere's 16-bit-integer formats use for white: 32768, NOT
+/// 65535.  Premiere SDK guide section 5.4.2: "The 16-bit formats use channels
+/// that go from black at 0 to white at 32768, like After Effects and
+/// Photoshop 16-bit formats."
+///
+/// Declared here INDEPENDENTLY of the plug-in's own kBgra16uWhite, and that
+/// duplication is deliberate: a test that imported the constant from the code
+/// under test would pass just as happily if both were 65535.  Spelling the
+/// documented number out on the test side is what makes the scale an
+/// assertion rather than a tautology.
+constexpr float kBgra16uWhiteRef = 32768.0f;
+
+/// The panorama packed as BGRA 16-bit unsigned, top-left, on the 0..32768
+/// scale above.
+[[nodiscard]] std::vector<std::uint8_t> packBgra16u(const Panorama& p, std::int32_t rowBytes);
+
 /// UTF-16 -> UTF-8.  Used only to put a module path into a Catch2 INFO
 /// message; narrowing each wchar_t with a char cast would mangle any
 /// non-ASCII character in the build directory's name.
@@ -144,5 +160,8 @@ struct Panorama {
 void readPixelBgra32f(const std::uint8_t* base, std::int32_t rowBytes, int x, int y, float out[4]) noexcept;
 void readPixelBgra16f(const std::uint8_t* base, std::int32_t rowBytes, int x, int y, float out[4]) noexcept;
 void readPixelBgra8u(const std::uint8_t* base, std::int32_t rowBytes, int x, int y, float out[4]) noexcept;
+/// Read one BGRA 16-bit-unsigned pixel back as RGBA floats, dividing by the
+/// documented white point (kBgra16uWhiteRef).
+void readPixelBgra16u(const std::uint8_t* base, std::int32_t rowBytes, int x, int y, float out[4]) noexcept;
 
 }  // namespace osv::reframe::test

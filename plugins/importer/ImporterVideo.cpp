@@ -576,6 +576,21 @@ csSDK_int32 handleGetIndColorSpace(imStdParms* stdParms, csSDK_int32 index, imIn
         PluginLog::warn("imGetIndColorSpace: AllocateFromUTF8('{}') failed with {}", token, static_cast<int>(err));
         return imOtherErr;
     }
+    if (colorSpaceIsApproximate(prefs)) {
+        // The D-Log M passthrough output has no matching SDK token, so the
+        // host is being told something close rather than something exact.
+        // That is a deliberate, documented choice (see colorSpaceTokenFor in
+        // PrefsMapping.cpp), but it must not be invisible: a user chasing an
+        // unexpected preview needs to find this line in the support log.
+        PluginLog::oncef(std::string("colorspace-approx-") + token, PluginLog::Level::Info,
+                         "imGetIndColorSpace: declaring '{}' for the D-Log M passthrough output. The frames are "
+                         "really the camera's own log encoding in its own gamut, for which the SDK has no token; "
+                         "full range / RGB / 32f / scene-referred are exact and only the primaries are "
+                         "approximated. Grade with a D-Log M LUT or Lumetri, and expect a flat preview until "
+                         "you do.",
+                         token);
+        return imNoErr;
+    }
     PluginLog::oncef(std::string("colorspace-") + token, PluginLog::Level::Info,
                      "imGetIndColorSpace: declaring '{}'", token);
     return imNoErr;

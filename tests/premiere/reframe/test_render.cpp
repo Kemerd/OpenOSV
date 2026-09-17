@@ -876,8 +876,19 @@ struct RenderFixture {
                                  inputFormat);
         REQUIRE(input != nullptr);
 
-        if (inputFormat == PrPixelFormat_BGRA_4444_32f) {
+        if (inputFormat == PrPixelFormat_BGRA_4444_32f || inputFormat == PrPixelFormat_BGRA_4444_32f_Linear) {
+            // _32f_Linear has the identical byte layout - it differs only in
+            // transfer function - so the same packer fills either world.
             const std::vector<std::uint8_t> packed = packBgra32f(p, input->rowBytes());
+            REQUIRE(packed.size() <= static_cast<std::size_t>(input->rowBytes()) * static_cast<std::size_t>(p.height));
+            std::memcpy(input->pixels(), packed.data(), packed.size());
+        } else if (inputFormat == PrPixelFormat_BGRA_4444_16u) {
+            // Quantised on the documented 0..32768 scale, which is exactly
+            // the inverse of the effect's own promotion, so a 16u-input
+            // render can be compared against a 32f-input render of the SAME
+            // quantised data.
+            const std::vector<std::uint8_t> packed = packBgra16u(p, input->rowBytes());
+            REQUIRE(!packed.empty());
             REQUIRE(packed.size() <= static_cast<std::size_t>(input->rowBytes()) * static_cast<std::size_t>(p.height));
             std::memcpy(input->pixels(), packed.data(), packed.size());
         } else {
@@ -1208,6 +1219,360 @@ TEST_CASE("PF_Cmd_RENDER into an 8-bit world matches the float render", "[refram
     }
     INFO("worst 8u vs 32f difference through the module: " << worst);
     CHECK(worst <= 1.0 / 255.0 + 1e-6);
+}
+
+// ===========================================================================
+//  High-bit-depth pixel formats
+//
+//  These are the regression tests for the "plays fine but does not update
+//  when I step a frame" bug.  On a 10-bit HDR sequence Premiere handed the
+//  CPU path a format that was not one of the only two it accepted, so
+//  PF_Cmd_RENDER - which is what scrubbing and stepping use - refused every
+//  frame, while playback went through the separately negotiated GPU entry and
+//  looked correct.  Each case below fails against the old two-format code.
+// ===========================================================================
+
+TEST_CASE("PF_Cmd_RENDER into and out of a 16u world produces a correct picture",
+          "[reframe][render][format16u]") {
+    constexpr int kW = 200;
+    constexpr int kH = 150;
+
+    // BOTH worlds 16u, which is what a 10-bit sequence actually hands us -
+    // not a 16u output fed from a float input.
+    RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_16u, 0x2000, PrPixelFormat_BGRA_4444_16u);
+    f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+    f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
+    f.setFloat(kIndexFov, 90.0);
+    f.setFloat(kIndexDistortion, 0.0);
+
+    // The render must SUCCEED.  This single assertion is the bug: it returned
+    // PF_Err_BAD_CALLBACK_PARAM before the fix.
+    REQUIRE(f.render() == PF_Err_NONE);
+
+    // And it must aim where it is told, decoded from the labelled panorama
+    // exactly as the 32f cases do - so this proves a correct picture, not
+    // merely a non-error.
+    const struct {
+        double pan;
+        double tilt;
+    } cases[] = {{0.0, 0.0}, {90.0, 0.0}, {-90.0, 0.0}, {0.0, 40.0}};
+
+    for (const auto& c : cases) {
+        INFO("pan " << c.pan << " tilt " << c.tilt);
+        f.setAngle(kIndexPan, c.pan);
+        f.setAngle(kIndexTilt, c.tilt);
+        REQUIRE(f.render() == PF_Err_NONE);
+
+        float centre[4];
+        readPixelBgra16u(reinterpret_cast<const std::uint8_t*>(f.output->pixels()), f.output->rowBytes(), kW / 2,
+                         kH / 2, centre);
+        CHECK(std::fabs(angleDelta(lonOf(centre), -c.pan)) < 1.5);
+        CHECK(std::fabs(latOf(centre) - c.tilt) < 1.5);
+        // Alpha must be full scale, which on this format is 32768 and not
+        // 65535: readPixelBgra16u divides by the documented white point, so a
+        // renderer using the wrong scale reports 0.5 here and fails.
+        CHECK(centre[3] == Approx(1.0).margin(1e-3));
+    }
+}
+
+TEST_CASE("the 16u render matches the 32f render within the 0..32768 quantisation step",
+          "[reframe][render][format16u]") {
+    constexpr int kW = 160;
+    constexpr int kH = 120;
+
+    // Both renders read a 16u INPUT, so the only difference between them is
+    // the output store.  Feeding one a float input would also fold the input
+    // promotion into the comparison and make the tolerance meaningless.
+    auto renderInto = [](PrPixelFormat outFormat) {
+        RenderFixture f(kW, kH, outFormat, 0x2000, PrPixelFormat_BGRA_4444_16u);
+        f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+        f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
+        f.setFloat(kIndexFov, 90.0);
+        f.setFloat(kIndexDistortion, 0.0);
+        f.setAngle(kIndexPan, 30.0);
+        REQUIRE(f.render() == PF_Err_NONE);
+
+        std::vector<float> samples;
+        const auto* pixels = reinterpret_cast<const std::uint8_t*>(f.output->pixels());
+        for (int y = 2; y < kH - 2; y += 4) {
+            for (int x = 2; x < kW - 2; x += 4) {
+                float rgba[4];
+                if (outFormat == PrPixelFormat_BGRA_4444_32f) {
+                    readPixelBgra32f(pixels, f.output->rowBytes(), x, y, rgba);
+                } else {
+                    readPixelBgra16u(pixels, f.output->rowBytes(), x, y, rgba);
+                }
+                samples.insert(samples.end(), rgba, rgba + 4);
+            }
+        }
+        return samples;
+    };
+
+    const std::vector<float> f32 = renderInto(PrPixelFormat_BGRA_4444_32f);
+    const std::vector<float> u16 = renderInto(PrPixelFormat_BGRA_4444_16u);
+    REQUIRE(f32.size() == u16.size());
+    REQUIRE_FALSE(f32.empty());
+
+    double worst = 0.0;
+    for (std::size_t i = 0; i < f32.size(); ++i) {
+        worst = std::max(worst, std::fabs(static_cast<double>(f32[i]) - static_cast<double>(u16[i])));
+    }
+
+    // One quantisation step on the 0..32768 scale, plus a rounding epsilon.
+    // This bound is the point of the test: it is ~128x TIGHTER than the 8-bit
+    // one, so a store that used 65535 as white (halving every value) or 255
+    // (saturating everything) misses it by orders of magnitude and cannot
+    // pass by luck.
+    const double step = 1.0 / static_cast<double>(kBgra16uWhiteRef);
+    INFO("worst 16u vs 32f difference through the module: " << worst << " (one step = " << step << ")");
+    CHECK(worst <= step + 1e-7);
+
+    // Guard against the test passing because BOTH renders were black.
+    double peak = 0.0;
+    for (const float v : f32) {
+        peak = std::max(peak, static_cast<double>(v));
+    }
+    CHECK(peak > 0.25);
+}
+
+TEST_CASE("a 16u input renders the same picture as the equivalent float input",
+          "[reframe][render][format16u]") {
+    constexpr int kW = 160;
+    constexpr int kH = 120;
+
+    // Both write 32f, so the only difference is the INPUT promotion: 16u
+    // codes / 32768 must reproduce the float panorama it was quantised from.
+    auto renderFrom = [](PrPixelFormat inFormat) {
+        RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f, 0x2000, inFormat);
+        f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+        f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
+        f.setFloat(kIndexFov, 90.0);
+        f.setFloat(kIndexDistortion, 0.0);
+        f.setAngle(kIndexPan, 25.0);
+        REQUIRE(f.render() == PF_Err_NONE);
+        return copyWorld(*f.output, kH);
+    };
+
+    const std::vector<std::uint8_t> fromFloat = renderFrom(PrPixelFormat_BGRA_4444_32f);
+    const std::vector<std::uint8_t> from16u = renderFrom(PrPixelFormat_BGRA_4444_16u);
+    REQUIRE(fromFloat.size() == from16u.size());
+
+    // Compare as floats: the inputs differ by the input quantisation, which
+    // the bilinear sampler then averages, so the results are close rather
+    // than identical.
+    const std::int32_t pitch = static_cast<std::int32_t>(fromFloat.size() / static_cast<std::size_t>(kH));
+    double worst = 0.0;
+    for (int y = 2; y < kH - 2; y += 3) {
+        for (int x = 2; x < kW - 2; x += 3) {
+            float a[4];
+            float b[4];
+            readPixelBgra32f(fromFloat.data(), pitch, x, y, a);
+            readPixelBgra32f(from16u.data(), pitch, x, y, b);
+            for (int c = 0; c < 4; ++c) {
+                worst = std::max(worst, std::fabs(static_cast<double>(a[c]) - static_cast<double>(b[c])));
+            }
+        }
+    }
+    INFO("worst 16u-input vs 32f-input difference: " << worst);
+    CHECK(worst <= 1.0 / static_cast<double>(kBgra16uWhiteRef) + 1e-6);
+}
+
+TEST_CASE("BGRA_4444_32f_Linear is accepted and renders identically to 32f",
+          "[reframe][render][formatlinear]") {
+    constexpr int kW = 176;
+    constexpr int kH = 132;
+
+    // _32f_Linear differs from _32f ONLY in transfer function.  This effect
+    // resamples and never interprets a code, so the two must produce BIT
+    // IDENTICAL output - not merely similar - and that is what is asserted.
+    auto renderWith = [](PrPixelFormat inFormat, PrPixelFormat outFormat) {
+        RenderFixture f(kW, kH, outFormat, 0x2000, inFormat);
+        f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+        f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
+        f.setFloat(kIndexFov, 100.0);
+        f.setFloat(kIndexDistortion, 20.0);
+        f.setAngle(kIndexPan, 42.0);
+        f.setAngle(kIndexTilt, -15.0);
+        REQUIRE(f.render() == PF_Err_NONE);
+        return copyWorld(*f.output, kH);
+    };
+
+    const std::vector<std::uint8_t> plain =
+        renderWith(PrPixelFormat_BGRA_4444_32f, PrPixelFormat_BGRA_4444_32f);
+
+    SECTION("a linear INPUT world is accepted") {
+        const std::vector<std::uint8_t> linearIn =
+            renderWith(PrPixelFormat_BGRA_4444_32f_Linear, PrPixelFormat_BGRA_4444_32f);
+        CHECK(linearIn == plain);
+    }
+    SECTION("a linear OUTPUT world is accepted") {
+        const std::vector<std::uint8_t> linearOut =
+            renderWith(PrPixelFormat_BGRA_4444_32f, PrPixelFormat_BGRA_4444_32f_Linear);
+        CHECK(linearOut == plain);
+    }
+    SECTION("both linear is accepted") {
+        const std::vector<std::uint8_t> both =
+            renderWith(PrPixelFormat_BGRA_4444_32f_Linear, PrPixelFormat_BGRA_4444_32f_Linear);
+        CHECK(both == plain);
+    }
+
+    // Not all black, or the equality above would be vacuous.
+    bool nonZero = false;
+    for (const std::uint8_t b : plain) {
+        if (b != 0u) {
+            nonZero = true;
+            break;
+        }
+    }
+    CHECK(nonZero);
+}
+
+TEST_CASE("a genuinely unknown pixel format is refused, not misread", "[reframe][render][format]") {
+    constexpr int kW = 120;
+    constexpr int kH = 90;
+
+    // A world the effect cannot render.  VUYA_4444_32f is a real Premiere
+    // format of the same 16-byte width as BGRA_4444_32f, which makes it the
+    // honest test: the bytes are readable and plausibly sized, so nothing but
+    // the format check stands between us and silently interpreting luma as
+    // blue.  The mock reports the format through the same
+    // PF_PixelFormatSuite::GetPixelFormat call the real host answers.
+    RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f);
+    REQUIRE(f.render() == PF_Err_NONE);  // the fixture itself is sound
+
+    // Relabel the OUTPUT world's format without touching its bytes, so the
+    // only thing that changed is what the host says it is.
+    f.host.setWorldFormat(&f.output->world(), PrPixelFormat_VUYA_4444_32f);
+
+    // Refused with the documented error, and no crash.
+    CHECK(f.render() == PF_Err_BAD_CALLBACK_PARAM);
+
+    // Refused again, still without crashing: the log line is emitted once
+    // (PluginLog::oncef) but the REFUSAL must be every time, never a
+    // "logged already, so let it through" cache.
+    CHECK(f.render() == PF_Err_BAD_CALLBACK_PARAM);
+}
+
+TEST_CASE("GLOBAL_SETUP registers every renderable format in preference order",
+          "[reframe][setup][format]") {
+    MockHost host;
+    PF_ProgPtr ref = host.createEffectRef(0x3100, 11);
+    REQUIRE(ref != nullptr);
+
+    PF_InData in = host.makeInData(ref, {});
+    PF_OutData out = host.makeOutData();
+    REQUIRE(in.appl_id == kAppID_Premiere);
+    REQUIRE(LoadedPlugin::instance().effectMain()(PF_Cmd_GLOBAL_SETUP, &in, &out, nullptr, nullptr, nullptr) ==
+            PF_Err_NONE);
+
+    const std::vector<PrPixelFormat> formats = host.supportedPixelFormats(ref);
+
+    // The exact list, in the exact order, as docs/PREMIERE.md records it.
+    // Order is a PREFERENCE ranking to the host (PrSDKAESupport.h:150-157),
+    // so it is asserted positionally rather than as a set: float first so an
+    // HDR panorama is never quantised before being resampled, then linear
+    // float, then 16u for a 10-bit timeline, then 8u last.
+    REQUIRE(formats.size() == 4);
+    CHECK(formats[0] == PrPixelFormat_BGRA_4444_32f);
+    CHECK(formats[1] == PrPixelFormat_BGRA_4444_32f_Linear);
+    CHECK(formats[2] == PrPixelFormat_BGRA_4444_16u);
+    CHECK(formats[3] == PrPixelFormat_BGRA_4444_8u);
+
+    host.destroyEffectRef(ref);
+}
+
+TEST_CASE("the render path still produces a picture when the pixel format suite is ABSENT",
+          "[reframe][render][format]") {
+    // THE regression test for the reported bug.  The host log showed the PF
+    // Pixel Format Suite missing on some GLOBAL_SETUP calls; the effect then
+    // told the host nothing, the host chose a format unaided, and on a 10-bit
+    // sequence the CPU path refused it - so stepping a frame showed nothing
+    // while playback (the GPU path) was fine.
+    //
+    // "No suite at setup" must therefore NOT mean "no picture".  With the
+    // suite hidden for the whole of GLOBAL_SETUP, a subsequent render into
+    // the high-bit-depth format such a host would pick must still succeed and
+    // still be correct.
+    constexpr int kW = 144;
+    constexpr int kH = 108;
+
+    MockHost host;
+    PF_ProgPtr ref = host.createEffectRef(0x3200, 11);
+    REQUIRE(ref != nullptr);
+
+    // Hidden for GLOBAL_SETUP and PARAMS_SETUP...
+    host.setSuiteAvailable(kPFPixelFormatSuite, kPFPixelFormatSuiteVersion1, false);
+    {
+        PF_InData in = host.makeInData(ref, {});
+        PF_OutData out = host.makeOutData();
+        REQUIRE(LoadedPlugin::instance().effectMain()(PF_Cmd_GLOBAL_SETUP, &in, &out, nullptr, nullptr, nullptr) ==
+                PF_Err_NONE);
+        REQUIRE(LoadedPlugin::instance().effectMain()(PF_Cmd_PARAMS_SETUP, &in, &out, nullptr, nullptr, nullptr) ==
+                PF_Err_NONE);
+    }
+    // ...and nothing was registered, exactly as on the failing host.
+    CHECK(host.supportedPixelFormats(ref).empty());
+
+    // The suite comes back for rendering (the render path needs
+    // GetPixelFormat to identify the worlds at all, and on the real host the
+    // suite was present on most calls - it was the registration that got
+    // missed).  This is also what lets the render-time RETRY run.
+    host.setSuiteAvailable(kPFPixelFormatSuite, kPFPixelFormatSuiteVersion1, true);
+
+    const Panorama& p = panorama();
+    std::unique_ptr<EffectWorld> input =
+        host.createWorld(static_cast<std::uint32_t>(p.width), static_cast<std::uint32_t>(p.height),
+                         PrPixelFormat_BGRA_4444_16u);
+    REQUIRE(input != nullptr);
+    const std::vector<std::uint8_t> packed = packBgra16u(p, input->rowBytes());
+    REQUIRE(!packed.empty());
+    std::memcpy(input->pixels(), packed.data(), packed.size());
+    host.setInputWorld(ref, input.get());
+
+    std::unique_ptr<EffectWorld> output = host.createWorld(kW, kH, PrPixelFormat_BGRA_4444_16u);
+    REQUIRE(output != nullptr);
+
+    // Point the camera somewhere unambiguous.
+    {
+        std::vector<PF_ParamDef> params = host.addedParams(ref);
+        REQUIRE(params.size() >= static_cast<std::size_t>(kIndexSmooth));
+        PF_ParamDef aspect = params[static_cast<std::size_t>(kIndexOutputAspect) - 1u];
+        aspect.u.pd.value = static_cast<int>(Aspect::FullFrame);
+        host.setParamValue(ref, kIndexOutputAspect, aspect);
+        PF_ParamDef preset = params[static_cast<std::size_t>(kIndexPreset) - 1u];
+        preset.u.pd.value = static_cast<int>(Preset::Custom);
+        host.setParamValue(ref, kIndexPreset, preset);
+        PF_ParamDef fov = params[static_cast<std::size_t>(kIndexFov) - 1u];
+        fov.u.fs_d.value = static_cast<PF_FpShort>(90.0);
+        host.setParamValue(ref, kIndexFov, fov);
+        PF_ParamDef dist = params[static_cast<std::size_t>(kIndexDistortion) - 1u];
+        dist.u.fs_d.value = static_cast<PF_FpShort>(0.0);
+        host.setParamValue(ref, kIndexDistortion, dist);
+    }
+
+    PF_InData in = host.makeInData(ref, {});
+    PF_OutData out = host.makeOutData();
+    std::vector<PF_ParamDef*> params = host.renderParams(ref);
+
+    // No suite at setup must not mean no picture.
+    REQUIRE(LoadedPlugin::instance().effectMain()(PF_Cmd_RENDER, &in, &out, params.data(), &output->world(),
+                                                  nullptr) == PF_Err_NONE);
+
+    float centre[4];
+    readPixelBgra16u(reinterpret_cast<const std::uint8_t*>(output->pixels()), output->rowBytes(), kW / 2, kH / 2,
+                     centre);
+    CHECK(centre[3] == Approx(1.0).margin(1e-3));
+    // Pan is 0, so the centre must look along the panorama's centre column.
+    CHECK(std::fabs(angleDelta(lonOf(centre), 0.0)) < 1.5);
+
+    // And the render-time retry registered the list the setup call could not.
+    const std::vector<PrPixelFormat> formats = host.supportedPixelFormats(ref);
+    INFO("formats registered by the render-time retry: " << formats.size());
+    REQUIRE(formats.size() == 4);
+    CHECK(formats[0] == PrPixelFormat_BGRA_4444_32f);
+    CHECK(formats[3] == PrPixelFormat_BGRA_4444_8u);
+
+    host.destroyEffectRef(ref);
 }
 
 TEST_CASE("Smooth Keyframes averages three DIFFERENT sampled angles", "[reframe][render]") {

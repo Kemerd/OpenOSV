@@ -108,6 +108,26 @@ constexpr int kMaxEdge = 65536;
     return static_cast<std::uint8_t>(value * 255.0f + 0.5f);
 }
 
+/// Clamp to [0, 1] and quantise to a Premiere 16-bit code with rounding;
+/// NaN -> 0.
+///
+/// White is kBgra16uWhite (32768), not 65535 - see the constant's own comment
+/// for the SDK citation.  The `!(value > 0.0f)` spelling is deliberate: it is
+/// false for NaN as well as for negatives, so a NaN that survived the kernel
+/// becomes transparent black instead of an undefined conversion (a float ->
+/// integer cast of NaN is undefined behaviour in C++, not merely
+/// unspecified).  The upper bound is tested BEFORE the multiply so a large
+/// finite value cannot overflow the product either.
+[[nodiscard]] std::uint16_t floatTo16u(float value) noexcept {
+    if (!(value > 0.0f)) {
+        return 0u;
+    }
+    if (value >= 1.0f) {
+        return static_cast<std::uint16_t>(kBgra16uWhite);
+    }
+    return static_cast<std::uint16_t>(value * kBgra16uWhite + 0.5f);
+}
+
 /// Store one RGBA float quadruple as BGRA in the requested layout.
 void storePixel(void* dst, PixelLayout layout, const float rgba[4]) noexcept {
     switch (layout) {
@@ -133,6 +153,18 @@ void storePixel(void* dst, PixelLayout layout, const float rgba[4]) noexcept {
             p[1] = floatTo8u(rgba[1]);
             p[2] = floatTo8u(rgba[0]);
             p[3] = floatTo8u(rgba[3]);
+            break;
+        }
+        case PixelLayout::Bgra16u: {
+            // Not memcpy-able as one 64-bit word: the destination is only
+            // guaranteed to be 2-byte aligned (a host row pitch need not be a
+            // multiple of 8), so the four stores stay separate and let the
+            // compiler merge them when it can prove the alignment.
+            std::uint16_t* p = static_cast<std::uint16_t*>(dst);
+            p[0] = floatTo16u(rgba[2]);
+            p[1] = floatTo16u(rgba[1]);
+            p[2] = floatTo16u(rgba[0]);
+            p[3] = floatTo16u(rgba[3]);
             break;
         }
     }
@@ -488,10 +520,17 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
     // alpha", which is the honest behaviour for an arbitrary input clip.
     p.fillAlphaOne = 0;
 
-    // 8-bit sources are not supported by the kernel's sampler (it reads
-    // float or half only), so they are rejected here rather than
-    // reinterpreted as float and read four times too far.
-    if (src.layout == PixelLayout::Bgra8u) {
+    // Integer-coded sources (8u, 16u) are not supported by the kernel's
+    // sampler - it reads float or half only - so they are rejected here
+    // rather than reinterpreted as float and read four or two times too far.
+    //
+    // This is NOT the effect refusing the format: the render path promotes
+    // such a frame to float BEFORE calling buildParams (see
+    // promoteIntegerToFloat), so by the time the setup is built the source is
+    // always float or half.  The check remains as the backstop that turns a
+    // caller who forgot to promote into an invalid setup instead of an
+    // out-of-bounds read.
+    if (layoutNeedsPromotion(src.layout)) {
         return setup;
     }
 
@@ -581,16 +620,16 @@ bool renderCpu(const KernelSetup& setup, const ConstFrameView& src, const FrameV
 }
 
 // ---------------------------------------------------------------------------
-//  8-bit input promotion
+//  Integer input promotion
 // ---------------------------------------------------------------------------
 
-ConstFrameView promoteBgra8uToFloat(const ConstFrameView& src, std::vector<float>& scratch,
-                                    ThreadPool* pool) noexcept {
+ConstFrameView promoteIntegerToFloat(const ConstFrameView& src, std::vector<float>& scratch,
+                                     ThreadPool* pool) noexcept {
     // An invalid view is returned on every failure path: the caller tests
     // valid() and never sees a partially filled buffer.
     ConstFrameView out;
 
-    if (src.layout != PixelLayout::Bgra8u || !src.valid()) {
+    if (!layoutNeedsPromotion(src.layout) || !src.valid()) {
         return out;
     }
 
@@ -617,27 +656,56 @@ ConstFrameView promoteBgra8uToFloat(const ConstFrameView& src, std::vector<float
     }
 
     const int width = src.width;
+    const bool is16u = (src.layout == PixelLayout::Bgra16u);
+    // The reciprocal of the layout's white point, computed ONCE outside the
+    // pixel loop.  Both values are exact powers of two divided by an integer
+    // - 1/255 is not, 1/32768 is - so the 16u path is exact and the 8u path
+    // reproduces the previous behaviour bit for bit.
+    const float scale = is16u ? (1.0f / kBgra16uWhite) : (1.0f / 255.0f);
 
     // One row per job.  The promoted buffer is packed and top-down, so row y
     // of the output is always dstBase + y * width * 4 regardless of how the
     // source stores its rows - constRowTopDown() hides that.
-    auto promoteRow = [&src, dstBase, width](std::size_t rowIndex) noexcept {
+    //
+    // The 8u / 16u branch is taken once per ROW, not once per component: the
+    // two loops are written out separately so neither carries a per-pixel
+    // test, and the sample type is a compile-time constant inside each.
+    auto promoteRow = [&src, dstBase, width, is16u, scale](std::size_t rowIndex) noexcept {
         const int y = static_cast<int>(rowIndex);
-        const std::uint8_t* in = static_cast<const std::uint8_t*>(src.constRowTopDown(y));
+        const void* inRaw = src.constRowTopDown(y);
         float* outRow = dstBase + static_cast<std::size_t>(y) * static_cast<std::size_t>(width) * 4u;
-        if (!in || !outRow) {
+        if (!inRaw || !outRow) {
             return;
         }
-        // Codes / 255 is the exact inverse of floatTo8u's quantisation, so a
-        // promote-then-store round trip is lossless for every code.  The
-        // channel order is preserved: the sampler is told isBgra, so it
-        // reorders, and reordering here as well would swap R and B twice.
+        // Codes * (1 / white) is the exact inverse of the matching store
+        // path's quantisation, so a promote-then-store round trip is lossless
+        // for every code.  The channel order is preserved: the sampler is
+        // told isBgra, so it reorders, and reordering here as well would swap
+        // R and B twice.
+        //
+        // Nothing is clamped on the way IN.  A 16-bit host world may legally
+        // carry a code above kBgra16uWhite (the SDK calls those out of gamut,
+        // not invalid), and clamping it here would crush highlight detail
+        // before the resample instead of carrying it through and letting the
+        // store path decide.
+        if (is16u) {
+            const std::uint16_t* in = static_cast<const std::uint16_t*>(inRaw);
+            for (int x = 0; x < width; ++x) {
+                const std::size_t o = static_cast<std::size_t>(x) * 4u;
+                outRow[o + 0] = static_cast<float>(in[o + 0]) * scale;
+                outRow[o + 1] = static_cast<float>(in[o + 1]) * scale;
+                outRow[o + 2] = static_cast<float>(in[o + 2]) * scale;
+                outRow[o + 3] = static_cast<float>(in[o + 3]) * scale;
+            }
+            return;
+        }
+        const std::uint8_t* in = static_cast<const std::uint8_t*>(inRaw);
         for (int x = 0; x < width; ++x) {
             const std::size_t o = static_cast<std::size_t>(x) * 4u;
-            outRow[o + 0] = static_cast<float>(in[o + 0]) * (1.0f / 255.0f);
-            outRow[o + 1] = static_cast<float>(in[o + 1]) * (1.0f / 255.0f);
-            outRow[o + 2] = static_cast<float>(in[o + 2]) * (1.0f / 255.0f);
-            outRow[o + 3] = static_cast<float>(in[o + 3]) * (1.0f / 255.0f);
+            outRow[o + 0] = static_cast<float>(in[o + 0]) * scale;
+            outRow[o + 1] = static_cast<float>(in[o + 1]) * scale;
+            outRow[o + 2] = static_cast<float>(in[o + 2]) * scale;
+            outRow[o + 3] = static_cast<float>(in[o + 3]) * scale;
         }
     };
 
@@ -654,8 +722,8 @@ ConstFrameView promoteBgra8uToFloat(const ConstFrameView& src, std::vector<float
 
     // The promoted view is packed, top-down and positively pitched, which is
     // exactly the one arrangement sourceRowsRunForward() accepts - so the
-    // promotion also makes the two rejected source layouts renderable when
-    // they arrive as 8-bit.
+    // promotion also makes the two rejected row arrangements renderable when
+    // they arrive in an integer layout.
     out.base = dstBase;
     out.rowBytes = static_cast<std::int32_t>(static_cast<std::size_t>(width) * 4u * sizeof(float));
     out.width = width;

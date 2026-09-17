@@ -154,18 +154,36 @@ PF_Err pfGetPixelFormat(PF_EffectWorld* world, PrPixelFormat* format) {
 }
 
 /// Black / white in the requested format, used by effects that clear a
-/// buffer.  Only the three formats createWorld() supports are answered.
+/// buffer.  Exactly the formats createWorld() supports are answered, so the
+/// two stay in step.
 PF_Err pfFillPixel(PrPixelFormat format, float a, float r, float g, float b, void* pixel) {
     if (!pixel) {
         return PF_Err_BAD_CALLBACK_PARAM;
     }
     switch (format) {
-    case PrPixelFormat_BGRA_4444_32f: {
+    // _32f_Linear differs from _32f only in transfer function, so the byte
+    // layout - and therefore this store - is identical.
+    case PrPixelFormat_BGRA_4444_32f:
+    case PrPixelFormat_BGRA_4444_32f_Linear: {
         auto* f = static_cast<float*>(pixel);
         f[0] = b;
         f[1] = g;
         f[2] = r;
         f[3] = a;
+        return PF_Err_NONE;
+    }
+    case PrPixelFormat_BGRA_4444_16u: {
+        // White is 32768, not 65535 (Premiere SDK guide 5.4.2).  The mock
+        // uses the documented scale so a test comparing against it is
+        // testing the real convention rather than the mock's guess.
+        auto* u = static_cast<std::uint16_t*>(pixel);
+        const auto q = [](float v) {
+            return static_cast<std::uint16_t>(std::clamp(v, 0.0f, 1.0f) * 32768.0f + 0.5f);
+        };
+        u[0] = q(b);
+        u[1] = q(g);
+        u[2] = q(r);
+        u[3] = q(a);
         return PF_Err_NONE;
     }
     case PrPixelFormat_BGRA_4444_8u: {
@@ -507,7 +525,14 @@ PF_OutData MockHost::makeOutData() const {
 
 std::unique_ptr<EffectWorld> MockHost::createWorld(std::uint32_t width, std::uint32_t height, PrPixelFormat format) {
     // Only the formats a Premiere-hosted AE effect is handed.
-    if (format != PrPixelFormat_BGRA_4444_32f && format != PrPixelFormat_BGRA_4444_8u &&
+    //
+    // BGRA_4444_16u and BGRA_4444_32f_Linear are here because a real
+    // Premiere hands them to an effect on a high-bit-depth sequence - 16u on
+    // a 10-bit timeline in particular, which is exactly the configuration
+    // where the effect's CPU path used to refuse every frame.  A mock that
+    // cannot build such a world cannot test that path at all.
+    if (format != PrPixelFormat_BGRA_4444_32f && format != PrPixelFormat_BGRA_4444_32f_Linear &&
+        format != PrPixelFormat_BGRA_4444_16u && format != PrPixelFormat_BGRA_4444_8u &&
         format != PrPixelFormat_ARGB_4444_8u) {
         return nullptr;
     }
@@ -537,13 +562,15 @@ std::unique_ptr<EffectWorld> MockHost::createWorld(std::uint32_t width, std::uin
     world->m_pixels = reinterpret_cast<char*>(aligned);
 
     // The PF_EffectWorld the effect receives: top-left origin, positive
-    // pitch, DEEP set for the 32-bit float world (AE's own convention for
-    // "more than 8 bits per channel").
+    // pitch, DEEP set for every world carrying more than 8 bits per channel
+    // (AE's own convention), which is the two float formats and 16u - not
+    // just 32f.  Deriving it from the byte width rather than listing formats
+    // means a format added above cannot be left mislabelled.
     world->m_world.data = reinterpret_cast<PF_PixelPtr>(world->m_pixels);
     world->m_world.rowbytes = world->m_rowBytes;
     world->m_world.width = static_cast<A_long>(width);
     world->m_world.height = static_cast<A_long>(height);
-    world->m_world.world_flags = (format == PrPixelFormat_BGRA_4444_32f) ? PF_WorldFlag_DEEP : 0;
+    world->m_world.world_flags = (bpp > 4u) ? PF_WorldFlag_DEEP : 0;
     world->m_world.extent_hint.left = 0;
     world->m_world.extent_hint.top = 0;
     world->m_world.extent_hint.right = static_cast<A_long>(width);
@@ -554,6 +581,22 @@ std::unique_ptr<EffectWorld> MockHost::createWorld(std::uint32_t width, std::uin
     std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
     m_impl->worlds[&world->m_world] = world.get();
     return world;
+}
+
+bool MockHost::setWorldFormat(const PF_EffectWorld* world, PrPixelFormat format) {
+    if (!world) {
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    const auto it = m_impl->worlds.find(world);
+    if (it == m_impl->worlds.end() || !it->second) {
+        return false;
+    }
+    // The label only.  The buffer, its size and its pitch are deliberately
+    // left exactly as allocated, which is the whole point: the effect must
+    // decide from the FORMAT, not from the geometry.
+    it->second->m_format = format;
+    return true;
 }
 
 std::vector<PrPixelFormat> MockHost::supportedPixelFormats(PF_ProgPtr ref) const {
@@ -637,6 +680,128 @@ std::vector<PF_ParamDef*> MockHost::renderParams(PF_ProgPtr ref) {
 }
 
 // -----------------------------------------------------------------------------
+//  PF Source Settings Suite (v1 == v2)
+// -----------------------------------------------------------------------------
+//
+//  Two members, and between them they are the whole source settings contract:
+//  SetIsSourceSettingsEffect is how an effect tells the host it belongs on a
+//  master clip, and PerformSourceSettingsCommand is the private byte channel
+//  to the matching importer.  Neither leaves a trace anywhere a test could
+//  otherwise look, so both are recorded on the EffectRef.
+//
+//  PF_SourceSettingsSuite2 is a typedef of PF_SourceSettingsSuite
+//  (PrSDKAESupport.h:1637) - the two versions have identical layouts - so one
+//  table is registered for both, exactly as the real host must.
+
+namespace {
+
+PF_Err pfSourceSettingsSetIsSourceSettingsEffect(PF_ProgPtr effectRef, A_Boolean isSourceSettings) {
+    MockHost::Impl* p = impl();
+    if (!p) {
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+    std::lock_guard<std::recursive_mutex> lock(p->mutex);
+    EffectRef* ref = p->effectRef(effectRef);
+    if (!ref) {
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+    ref->isSourceSettingsEffect = (isSourceSettings != 0);
+    ref->sourceSettingsFlagSet = true;
+    return PF_Err_NONE;
+}
+
+PF_Err pfSourceSettingsPerformCommand(PF_ProgPtr effectRef, void* ioCommandStruct, csSDK_uint32 inDataSize) {
+    MockHost::Impl* p = impl();
+    if (!p) {
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+    std::lock_guard<std::recursive_mutex> lock(p->mutex);
+    EffectRef* ref = p->effectRef(effectRef);
+    if (!ref) {
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+    // A null buffer or a zero size is the caller's bug, and a real host would
+    // reject it rather than routing it to an importer.  Recording the call
+    // anyway lets a test assert that the effect did not make it.
+    ++ref->sourceSettingsCallCount;
+    ref->sourceSettingsSentSize = inDataSize;
+    if (!ioCommandStruct || inDataSize == 0) {
+        ref->sourceSettingsSent.clear();
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+
+    // Snapshot what the effect sent BEFORE any reply overwrites it: a test
+    // asserting "the effect seeded the buffer with its own controls" has to
+    // read the outbound bytes, which the reply would otherwise destroy.
+    const char* sent = static_cast<const char*>(ioCommandStruct);
+    ref->sourceSettingsSent.assign(sent, sent + inDataSize);
+
+    if (ref->sourceSettingsError != PF_Err_NONE) {
+        // A failing host call must leave the buffer alone; an effect that
+        // reads it anyway is the bug this path exists to catch.
+        return ref->sourceSettingsError;
+    }
+
+    if (ref->sourceSettingsReplies && !ref->sourceSettingsReply.empty()) {
+        // Truncate to the buffer the effect declared.  Writing more would be
+        // the overflow a real importer must never commit, and a mock that
+        // could commit it would hide the bug rather than expose it.
+        const std::size_t n = std::min(ref->sourceSettingsReply.size(), static_cast<std::size_t>(inDataSize));
+        std::memcpy(ioCommandStruct, ref->sourceSettingsReply.data(), n);
+    }
+    return PF_Err_NONE;
+}
+
+}  // namespace
+
+std::optional<bool> MockHost::isSourceSettingsEffect(PF_ProgPtr ref) const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    const EffectRef* r = m_impl->effectRef(ref);
+    if (!r || !r->sourceSettingsFlagSet) {
+        return std::nullopt;
+    }
+    return r->isSourceSettingsEffect;
+}
+
+std::vector<char> MockHost::sourceSettingsSentData(PF_ProgPtr ref) const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    const EffectRef* r = m_impl->effectRef(ref);
+    return r ? r->sourceSettingsSent : std::vector<char>{};
+}
+
+csSDK_uint32 MockHost::sourceSettingsSentSize(PF_ProgPtr ref) const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    const EffectRef* r = m_impl->effectRef(ref);
+    return r ? r->sourceSettingsSentSize : 0u;
+}
+
+std::size_t MockHost::sourceSettingsCallCount(PF_ProgPtr ref) const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    const EffectRef* r = m_impl->effectRef(ref);
+    return r ? r->sourceSettingsCallCount : 0u;
+}
+
+void MockHost::setSourceSettingsReply(PF_ProgPtr ref, const std::vector<char>& reply) {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    EffectRef* r = m_impl->effectRef(ref);
+    if (!r) {
+        return;
+    }
+    r->sourceSettingsReply = reply;
+    // An empty reply means "behave like a host with no clip instance", which
+    // is a distinct, meaningful state rather than an empty write.
+    r->sourceSettingsReplies = !reply.empty();
+}
+
+void MockHost::setSourceSettingsError(PF_ProgPtr ref, PF_Err err) {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    EffectRef* r = m_impl->effectRef(ref);
+    if (r) {
+        r->sourceSettingsError = err;
+    }
+}
+
+// -----------------------------------------------------------------------------
 //  Registration
 // -----------------------------------------------------------------------------
 void installAeSuites(MockHost::Impl& p) {
@@ -669,6 +834,14 @@ void installAeSuites(MockHost::Impl& p) {
     for (int v = kPFUtilitySuiteVersion4; v <= kPFUtilitySuiteVersion; ++v) {
         p.registerSuite(kPFUtilitySuite, v, &p.pfUtility);
     }
+
+    // The Source Settings Suite.  v2 is a typedef of v1, so one table serves
+    // both versions - which also means the effect's "acquire v2, fall back to
+    // v1" logic is exercised against a host that really does offer both.
+    p.pfSourceSettings.SetIsSourceSettingsEffect = &pfSourceSettingsSetIsSourceSettingsEffect;
+    p.pfSourceSettings.PerformSourceSettingsCommand = &pfSourceSettingsPerformCommand;
+    p.registerSuite(kPFSourceSettingsSuite, kPFSourceSettingsSuiteVersion1, &p.pfSourceSettings);
+    p.registerSuite(kPFSourceSettingsSuite, kPFSourceSettingsSuiteVersion2, &p.pfSourceSettings);
 }
 
 }  // namespace osv::premiere::mock

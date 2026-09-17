@@ -165,11 +165,20 @@ TEST_CASE("GLOBAL_SETUP registers the Premiere pixel formats in order", "[refram
     REQUIRE(call(PF_Cmd_GLOBAL_SETUP, in, out) == PF_Err_NONE);
 
     const std::vector<PrPixelFormat> formats = f.host.supportedPixelFormats(f.ref);
-    REQUIRE(formats.size() == 2);
-    // Order is preference order: float first, so an HDR panorama is not
-    // quantised to 8 bits before being resampled.
+    REQUIRE(formats.size() == 4);
+    // Order is PREFERENCE order (PrSDKAESupport.h:150-157): float first, so
+    // an HDR panorama is never quantised before being resampled; then linear
+    // float, which differs only in transfer and that this colour-agnostic
+    // effect renders identically; then 16u so a 10-bit timeline has a
+    // high-bit-depth format in common with us; then 8u last.
+    //
+    // The list used to be just 32f and 8u, and that was the reported bug: a
+    // 10-bit sequence had NO format in common with the CPU path, so stepping
+    // a frame rendered nothing while playback (the GPU path) looked fine.
     CHECK(formats[0] == PrPixelFormat_BGRA_4444_32f);
-    CHECK(formats[1] == PrPixelFormat_BGRA_4444_8u);
+    CHECK(formats[1] == PrPixelFormat_BGRA_4444_32f_Linear);
+    CHECK(formats[2] == PrPixelFormat_BGRA_4444_16u);
+    CHECK(formats[3] == PrPixelFormat_BGRA_4444_8u);
 }
 
 TEST_CASE("GLOBAL_SETUP registers nothing outside Premiere", "[reframe][setup]") {

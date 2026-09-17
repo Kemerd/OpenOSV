@@ -55,7 +55,7 @@ struct PipelineOptions {
 
     // Colour
     std::string color = "pq";                     ///< pq | hlg | 709 | linear | dlogm
-    std::string fit = "dji";                      ///< dji | pocket3
+    std::string fit = "osmo360";                  ///< osmo360 | dji | pocket3
     std::string inputEncoding = "auto";           ///< auto | dlogm | hlg | normal
     double exposureStops = 0.0;
 

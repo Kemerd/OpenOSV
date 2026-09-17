@@ -3,12 +3,15 @@
 //
 // D-Log M curve constants and host-side helpers.
 //
-// Two curves are shipped:
+// Three curves are shipped:
 //   * kDlogMPocket3  - the public DJI Pocket 3 D-Log M -> linear constants.
 //   * kDlogMDjiRefit - the same seven-parameter form re-fitted by
 //                      scripts/fit_dlogm.py to 64 neutral-axis measurements
-//                      of DJI's own D-Log M -> HLG conversion for the Osmo 360.
-// Both use the branch-intersection cut so the curve is C0 continuous and
+//                      of a DJI D-Log M -> HLG conversion (Pocket-3 era).
+//   * kDlogMOsmo360  - the same form fitted to the neutral axis of DJI's own
+//                      Osmo 360 D-Log M -> Rec.709 LUT (the default; see the
+//                      comment on the constant for why it replaced the refit).
+// All three use the branch-intersection cut so the curve is C0 continuous and
 // have a closed-form inverse (linearToDlogm).
 #pragma once
 
@@ -32,7 +35,13 @@ inline constexpr OsvDlogMCurve kDlogMPocket3 = {
     OSV_DLOGM_CUT_INTERSECTION,
 };
 
-/// DJI-matched refit for the Osmo 360.
+/// DJI-matched refit against Pocket-3-era D-Log M -> HLG measurements.
+///
+/// Superseded as the default by kDlogMOsmo360 once a genuine Osmo 360
+/// reference became available (this curve was fitted before that and is up to
+/// 0.30 stops off through the upper mids against it).  Kept verbatim, and
+/// selectable as `--fit refit`, so a project graded against it keeps rendering
+/// the same way.
 ///
 /// Provenance: produced by `python scripts/fit_dlogm.py` (numpy LM solver)
 /// from the 64 DJI-matched neutral-axis points (D-Log M code i/63 -> HLG
@@ -57,6 +66,68 @@ inline constexpr OsvDlogMCurve kDlogMDjiRefit = {
     1.554539968f,      // intercept
     0.02068748227f,    // midGrayScaling (pins code 0.40 -> 0.18)
     0.769236796f,      // cut (== intercept / (slope2 - slope))
+    OSV_DLOGM_CUT_INTERSECTION,
+};
+
+/// Osmo 360 fit -- the project default.
+///
+/// Provenance: produced by
+///     python scripts/fit_dlogm.py --from-cube DJI_Osmo360_DLogM_to_Rec709.cube
+///                                 --cube-transfer 709
+/// which samples the neutral (R == G == B) diagonal of DJI's own Osmo 360
+/// D-Log M -> Rec.709 LUT at all 33 of its grid points and least-squares fits
+/// this seven-parameter form to it.  Only these constants are shipped; no LUT
+/// data from that file is redistributed (see NOTICE).
+///
+/// Why a Rec.709 reference can be fitted in HLG-signal space: OpenOSV's
+/// Rec.709 output *is* the HLG signal computed in Rec.709 primaries (BT.2390
+/// "HLG on an SDR display", docs/COLOR.md).  On the neutral axis both 3x3
+/// primaries matrices are the identity (their rows sum to 1), so the whole
+/// Rec.709 branch of osvLinearToOutput collapses to
+///     out(code) = hlgOetf(sceneScale * lin(code))
+/// which is exactly the HLG branch.  Inverting DJI's diagonal through that
+/// expression recovers a smooth, strictly monotonic scene-linear curve
+/// (3.74 at code 1.0, 18 % grey at code 0.406), confirming that DJI's 709
+/// rendering is an HLG-in-709 rendering and not a separate tone map -- had it
+/// been one, the recovered curve would show a roll-off kink near diffuse
+/// white.  So the curve is what differs from DJI, not our output rendering,
+/// and the curve is what was refitted.
+///
+/// Why this is the default rather than kDlogMDjiRefit: the refit was fitted to
+/// Pocket-3-era D-Log M -> HLG measurements.  Against a genuine Osmo 360
+/// reference it is up to 0.30 stops off through the upper mids and 0.66 stops
+/// too bright in the toe.  Neutral-axis error against DJI's Osmo 360 LUT
+/// (HLG code units, all 33 points): kDlogMDjiRefit 0.0318 RMS / 0.0659 worst;
+/// this curve 0.0209 RMS / 0.0462 worst.  For code >= 0.24 (above the crushed
+/// part of the reference) 0.0259 -> 0.0160 RMS.  kDlogMDjiRefit is kept
+/// verbatim so existing projects can pin the old rendering with --fit refit.
+///
+/// Residual 0.0160 RMS is the honest ceiling of this seven-parameter family
+/// for this data, not a solver failure: relaxing the slope-ratio bound from 3
+/// to unbounded (ratio 40.8) moves the RMS above code 0.24 by 0.00002 and the
+/// worst residual by 0.0004, so the bound costs nothing here and is kept for
+/// the shadow-gradient and .cube-interpolation reasons documented in
+/// scripts/fit_dlogm.py.
+///
+/// Anchors: code 0.400 -> lin 0.18000 -> HLG 0.3800 (pinned exactly, BT.2408
+/// 18 % grey); code 0.714 -> lin 0.95775 -> HLG 0.7433.  The second anchor is
+/// 0.0067 below BT.2408's nominal 75 % diffuse white, but DJI's own file reads
+/// 0.7404 at its nearest grid point (code 0.71875), so this curve is *closer*
+/// to the camera manufacturer's placement than kDlogMDjiRefit's 0.7548.
+/// Code 1.000 -> lin 3.7647 -> HLG 1.0012, which the output clamp flattens to
+/// 1.0; only codes above 0.9986 are affected (DJI's own LUT likewise reaches
+/// exactly 1.0 at code 1.0).  Strictly monotonic over 4097 samples; the branch
+/// cut is reached at code 0.125, i.e. the derivative jump sits far below the
+/// usable shadows instead of at code 0.28 as in kDlogMDjiRefit.
+inline constexpr OsvDlogMCurve kDlogMOsmo360 = {
+    -2.360862594f,     // xShift
+    0.630835854f,      // yShift
+    6.691455736f,      // scale
+    1.011886004f,      // slope
+    3.035658045f,      // slope2
+    0.822056039f,      // intercept
+    0.00786506109f,    // midGrayScaling (pins code 0.40 -> 0.18)
+    0.406199919f,      // cut (== intercept / (slope2 - slope))
     OSV_DLOGM_CUT_INTERSECTION,
 };
 

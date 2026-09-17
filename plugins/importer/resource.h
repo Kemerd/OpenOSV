@@ -17,10 +17,25 @@
 // The Source Settings dialog template.
 #define IDD_SOURCE_SETTINGS 100
 
-// Colour output radio group (a contiguous range: CheckRadioButton needs it).
-#define IDC_COLOR_PQ  1001
-#define IDC_COLOR_HLG 1002
-#define IDC_COLOR_709 1003
+// Colour output.
+//
+// This was a three-way BS_AUTORADIOBUTTON group (IDC_COLOR_PQ / _HLG / _709).
+// It is a combo box now, for two reasons:
+//
+//   * a fourth option (D-Log M passthrough) had to be added, and a radio
+//     group grows by one CONTROL plus one hand-placed x coordinate every
+//     time - the three buttons were laid out at x = 16 / 92 / 168 inside a
+//     254-unit group box, so a fourth would not have fitted without
+//     re-flowing the whole dialog;
+//   * every other multi-choice setting in this dialog is already a combo box,
+//     so the odd one out was the radio group.
+//
+// The old IDs are deliberately NOT reused for anything else: a stale
+// GetDlgItem(IDC_COLOR_PQ) would then silently find a real but wrong control
+// instead of returning null.  They are retired, and the reason is recorded
+// here so nobody "tidies up" by reclaiming the numbers.
+#define IDC_COLOR_OUTPUT   1004
+// Retired: 1001, 1002, 1003 (the former PQ / HLG / 709 radio buttons).
 
 // Everything else.
 #define IDC_OUTPUT_SIZE    1010

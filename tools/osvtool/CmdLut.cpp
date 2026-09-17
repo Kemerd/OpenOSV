@@ -4,7 +4,7 @@
 // `osvtool lut`: bake the D-Log M -> HLG / PQ / Rec.709 pipeline into a .cube
 // 3D LUT for NLEs that cannot load OpenOSV directly.
 //
-//   osvtool lut [--fit dji|pocket3] [--out-transfer pq|hlg|709] [--size 65]
+//   osvtool lut [--fit osmo360|dji|pocket3] [--out-transfer pq|hlg|709] [--size 65]
 //               [--exposure 0] [--title "..."] [--input dlogm|hlg|709]
 //               [--narrow-input] out.cube
 
@@ -25,7 +25,7 @@ namespace {
 
 /// Options collected by CLI11 for the lut command.
 struct LutOptions {
-    std::string fit = "dji";
+    std::string fit = "osmo360";
     std::string outTransfer = "pq";
     std::string input = "dlogm";
     std::string title;
@@ -40,9 +40,10 @@ int runLut(const LutOptions& opt) {
     using namespace osv::color;
 
     // --- validate the enum-like strings ------------------------------------
-    DlogMFit fit = DlogMFit::DjiRefit;
+    DlogMFit fit = kDefaultDlogMFit;
     if (!parseDlogMFit(opt.fit, fit)) {
-        std::fprintf(stderr, "error: unknown --fit '%s' (expected dji or pocket3)\n", osv::log::safe(opt.fit).c_str());
+        std::fprintf(stderr, "error: unknown --fit '%s' (expected osmo360, dji or pocket3)\n",
+                     osv::log::safe(opt.fit).c_str());
         return kExitUsage;
     }
     OutputTransfer transfer = OutputTransfer::PQ;
@@ -123,7 +124,7 @@ int runLut(const LutOptions& opt) {
 void registerLutCommand(CLI::App& app, CommandContext& ctx) {
     auto opt = std::make_shared<LutOptions>();
     CLI::App* sub = app.add_subcommand("lut", "Write a .cube 3D LUT for the D-Log M colour pipeline");
-    sub->add_option("--fit", opt->fit, "D-Log M curve: dji (default) or pocket3")->capture_default_str();
+    sub->add_option("--fit", opt->fit, "D-Log M curve: osmo360 (default), dji or pocket3")->capture_default_str();
     sub->add_option("--out-transfer", opt->outTransfer, "Output encoding: pq (default), hlg, 709, linear, dlogm")
         ->capture_default_str();
     sub->add_option("--input", opt->input, "Source encoding: dlogm (default), hlg, 709")->capture_default_str();

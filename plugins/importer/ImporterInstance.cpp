@@ -11,8 +11,13 @@
 #include "ImporterAudio.h"
 
 #include "HostContext.h"
+// colorSpaceTokenFor(): the per-clip colour log line names the exact token the
+// importer will hand Premiere, so the log and imGetIndColorSpace can never
+// disagree about what the host was told.
+#include "ImporterPlugin.h"
 #include "PluginLog.h"
 
+#include "osv/color/AutoDetect.h"
 #include "osv/geom/ConventionProbe.h"
 #include "osv/geom/EquirectMap.h"
 #include "osv/geom/StreamScaling.h"
@@ -56,6 +61,11 @@ void trimAnalysisCache(MapT& cache, std::size_t limit) {
     switch (out) {
     case PrefsColorOutput::HLG:    return color::OutputTransfer::HLG;
     case PrefsColorOutput::Rec709: return color::OutputTransfer::Rec709;
+    // Passthrough bypasses the transfer AND the primaries matrix (see
+    // osvCodeToOutput in ColorMath.h), so the frame stays in the camera's
+    // own D-Log M encoding and its own gamut - which is exactly what a
+    // downstream D-Log M LUT expects to be fed.
+    case PrefsColorOutput::DLogM: return color::OutputTransfer::Passthrough;
     case PrefsColorOutput::PQ:
     case PrefsColorOutput::Count:
     default:                       return color::OutputTransfer::PQ;
@@ -64,7 +74,16 @@ void trimAnalysisCache(MapT& cache, std::size_t limit) {
 
 /// Map the prefs enum onto the library's D-Log M curve fit.
 [[nodiscard]] color::DlogMFit toDlogMFit(PrefsDlogmFit fit) noexcept {
-    return fit == PrefsDlogmFit::Pocket3 ? color::DlogMFit::Pocket3 : color::DlogMFit::DjiRefit;
+    switch (fit) {
+    case PrefsDlogmFit::Pocket3:  return color::DlogMFit::Pocket3;
+    case PrefsDlogmFit::DjiRefit: return color::DlogMFit::DjiRefit;
+    case PrefsDlogmFit::Osmo360:
+    case PrefsDlogmFit::Count:
+    default:                      break;
+    }
+    // A blob byte outside the enum lands on the project default rather than on
+    // an arbitrary curve.
+    return color::kDefaultDlogMFit;
 }
 
 /// Map the prefs enum onto the calibration selector's lens-mode override.
@@ -91,16 +110,16 @@ void trimAnalysisCache(MapT& cache, std::size_t limit) {
     }
 }
 
-/// The clip's own encoding, exactly the rule Pipeline.cpp uses for
-/// `--input-encoding auto` (without the statistical fallback, which needs a
-/// decoded frame and therefore cannot run before the reader exists; a clip
-/// with no colour metadata is treated as D-Log M, the project default).
+/// The clip's own encoding.
+///
+/// Delegates to the library rule (color::inputEncodingForColorMode) rather
+/// than repeating it: osvtool's `--input-encoding auto` and this importer must
+/// agree about what a given clip IS, or the same footage would render
+/// differently through the two front ends.  The statistical fallback that
+/// Pipeline.cpp also has is deliberately not used here - it needs a decoded
+/// frame, and this runs before the reader exists.
 [[nodiscard]] color::InputEncoding inputEncodingFor(meta::ColorMode mode) noexcept {
-    switch (mode) {
-    case meta::ColorMode::HLG:    return color::InputEncoding::HLG;
-    case meta::ColorMode::Normal: return color::InputEncoding::Rec709Normal;
-    default:                      return color::InputEncoding::DLogM;
-    }
+    return color::inputEncodingForColorMode(mode);
 }
 
 }  // namespace
@@ -250,6 +269,30 @@ Status ImporterInstance::parseOnce() {
     }
 
     m_parsed = true;
+
+    // ---- one line per clip, so colour decisions are answerable from a log --
+    //
+    // This is the line to look for when footage previews wrong.  It states the
+    // three facts that decide the whole colour path and cannot be recovered
+    // afterwards: what the camera said the clip is, whether that came from
+    // metadata or from the luma-histogram fallback, and which input/output
+    // encodings the pipeline therefore chose.
+    //
+    // The input encoding follows the CLIP's metadata (inputEncodingFor), never
+    // the output preference.  That separation is the whole point: an HLG or
+    // Normal clip must not be decoded with the D-Log M curve just because the
+    // output is set to PQ, or the source would be double-converted - a log
+    // de-log applied to an already display-referred signal, which crushes the
+    // shadows and blows the highlights.  A D-Log M clip with the default PQ
+    // output is the "auto PQ for log footage" case the default already gives.
+    {
+        const color::InputEncoding in = inputEncodingFor(m_format.colorMode);
+        PluginLog::info("colour: '{}': source {} ({}) -> input encoding {}, output {} ({})",
+                        m_path.filename().string(), meta::colorModeName(m_format.colorMode),
+                        m_format.colorModeFromMetadata ? "from metadata" : "inferred from luma statistics",
+                        color::inputEncodingName(in), color::outputTransferName(toOutputTransfer(m_prefs.color())),
+                        colorSpaceTokenFor(m_prefs));
+    }
     return okStatus();
 }
 
@@ -787,9 +830,18 @@ std::string ImporterInstance::analysisText() const {
     switch (m_prefs.color()) {
     case PrefsColorOutput::HLG:    outName = "BT.2100 HLG"; break;
     case PrefsColorOutput::Rec709: outName = "BT.709"; break;
+    case PrefsColorOutput::DLogM:  outName = "D-Log M passthrough (camera gamut, no transform)"; break;
     default:                       break;
     }
     line(std::string("Output colour: ") + outName + ", full-range RGB 32-bit float");
+    if (m_prefs.color() == PrefsColorOutput::DLogM) {
+        // Said out loud in the Properties panel, because it is the one output
+        // whose numbers are NOT ready to look at: the frame is log, so it
+        // will look flat and washed out until a D-Log M LUT or a Lumetri
+        // log conversion is applied downstream.
+        line("  Grade downstream: apply a D-Log M LUT or Lumetri log conversion.");
+        line("  Do NOT apply one on top of a PQ / HLG / 709 output - that double-converts.");
+    }
     if (m_prefs.exposureStops != 0.0f) {
         char buf[64] = {};
         std::snprintf(buf, sizeof(buf), "%+.2f", static_cast<double>(m_prefs.exposureStops));

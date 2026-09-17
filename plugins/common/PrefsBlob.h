@@ -23,10 +23,28 @@
 namespace osv::premiere {
 
 /// Output colour encoding requested for the stitched frame.
+///
+/// The numeric values are stored in project files, so a new entry is only
+/// ever APPENDED before Count.  Renumbering would silently change the colour
+/// of every clip in every saved project.
 enum class PrefsColorOutput : std::uint8_t {
     PQ = 0,      ///< BT.2100 PQ, full range RGB 32f.
     HLG = 1,     ///< BT.2100 HLG, full range RGB 32f.
     Rec709 = 2,  ///< BT.709, full range RGB 32f.
+    /// D-Log M passthrough: the camera's own log code values, untouched.
+    ///
+    /// Nothing is applied - not the D-Log M curve and not the primaries
+    /// matrix either (color::OutputTransfer::Passthrough bypasses both, see
+    /// osvCodeToOutput in include/osv/color/ColorMath.h).  What Premiere
+    /// receives is the stitched sphere still in the camera's native D-Log M
+    /// encoding and native gamut, as 32-bit float code values.
+    ///
+    /// It exists for the grade-it-yourself workflow: keep the log signal and
+    /// apply a D-Log M LUT or a Lumetri log-to-Rec.709 conversion downstream,
+    /// which keeps the whole grade in one place instead of converting twice.
+    /// Applying such a LUT on top of a PQ, HLG or Rec.709 output would
+    /// DOUBLE-CONVERT and is the mistake this option exists to avoid.
+    DLogM = 3,
     Count        ///< Number of valid values (not a value itself).
 };
 
@@ -63,9 +81,14 @@ enum class PrefsCalibration : std::uint8_t {
 };
 
 /// D-Log M decode fit.
+///
+/// These values are persisted in the blob, so they are append-only: Osmo360 is
+/// 2 even though it is the curve new clips default to, so a project saved by
+/// an older build still deserialises to the curve that build rendered with.
 enum class PrefsDlogmFit : std::uint8_t {
     DjiRefit = 0,
     Pocket3 = 1,
+    Osmo360 = 2,
     Count
 };
 
@@ -128,7 +151,7 @@ struct PrefsBlob {
         p.seamSearch = 1;
         p.gainMatch = 1;
         p.calibration = static_cast<std::uint8_t>(PrefsCalibration::Native);
-        p.dlogmFit = static_cast<std::uint8_t>(PrefsDlogmFit::DjiRefit);
+        p.dlogmFit = static_cast<std::uint8_t>(PrefsDlogmFit::Osmo360);
         p.exposureStops = 0.0f;
         p.renderDevice = static_cast<std::uint8_t>(PrefsRenderDevice::Auto);
         return p;

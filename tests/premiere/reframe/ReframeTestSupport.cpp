@@ -206,6 +206,37 @@ std::vector<std::uint8_t> packBgra16f(const Panorama& p, std::int32_t rowBytes) 
     return bytes;
 }
 
+std::vector<std::uint8_t> packBgra16u(const Panorama& p, std::int32_t rowBytes) {
+    std::vector<std::uint8_t> bytes;
+    if (p.width <= 0 || p.height <= 0 || rowBytes < p.width * 8) {
+        return bytes;
+    }
+    bytes.assign(static_cast<std::size_t>(rowBytes) * static_cast<std::size_t>(p.height), 0u);
+
+    // Quantise on the DOCUMENTED 0..32768 scale with round-to-nearest, which
+    // makes this the exact inverse of readPixelBgra16u below, so a
+    // pack-then-read round trip is lossless and any difference a test sees
+    // comes from the renderer rather than from this helper.
+    const auto quantise = [](float v) noexcept {
+        const float clamped = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+        return static_cast<std::uint16_t>(clamped * kBgra16uWhiteRef + 0.5f);
+    };
+
+    for (int y = 0; y < p.height; ++y) {
+        std::uint16_t* row = reinterpret_cast<std::uint16_t*>(
+            bytes.data() + static_cast<std::size_t>(rowBytes) * static_cast<std::size_t>(y));
+        for (int x = 0; x < p.width; ++x) {
+            const std::size_t src = (static_cast<std::size_t>(y) * static_cast<std::size_t>(p.width) +
+                                     static_cast<std::size_t>(x)) * 4u;
+            row[x * 4 + 0] = quantise(p.rgba[src + 2]);  // B
+            row[x * 4 + 1] = quantise(p.rgba[src + 1]);  // G
+            row[x * 4 + 2] = quantise(p.rgba[src + 0]);  // R
+            row[x * 4 + 3] = quantise(p.rgba[src + 3]);  // A
+        }
+    }
+    return bytes;
+}
+
 // ---------------------------------------------------------------------------
 //  Half conversions (independent of the plug-in's own, on purpose: a test
 //  that used the code under test to check the code under test would pass
@@ -322,6 +353,21 @@ void readPixelBgra8u(const std::uint8_t* base, std::int32_t rowBytes, int x, int
     out[1] = static_cast<float>(row[x * 4 + 1]) / 255.0f;
     out[2] = static_cast<float>(row[x * 4 + 0]) / 255.0f;
     out[3] = static_cast<float>(row[x * 4 + 3]) / 255.0f;
+}
+
+void readPixelBgra16u(const std::uint8_t* base, std::int32_t rowBytes, int x, int y, float out[4]) noexcept {
+    // memcpy rather than a reinterpret_cast: a host row pitch need not be a
+    // multiple of 2, so the 16-bit samples are not guaranteed to be aligned
+    // and a direct uint16_t* read would be undefined behaviour on a pedantic
+    // target (and is diagnosed by the sanitisers).
+    const std::uint8_t* row = base + static_cast<std::ptrdiff_t>(rowBytes) * static_cast<std::ptrdiff_t>(y);
+    std::uint16_t s[4] = {0, 0, 0, 0};
+    std::memcpy(s, row + static_cast<std::ptrdiff_t>(x) * 8, sizeof(s));
+    // BGRA in memory -> RGBA out, divided by the documented white point.
+    out[0] = static_cast<float>(s[2]) / kBgra16uWhiteRef;
+    out[1] = static_cast<float>(s[1]) / kBgra16uWhiteRef;
+    out[2] = static_cast<float>(s[0]) / kBgra16uWhiteRef;
+    out[3] = static_cast<float>(s[3]) / kBgra16uWhiteRef;
 }
 
 }  // namespace osv::reframe::test
