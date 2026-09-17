@@ -39,9 +39,22 @@ OOTF_GAMMA = 1.2
 SDR_PEAK_NITS = 100.0
 
 # --- matrices (row-major) -----------------------------------------------------
-NATIVE_TO_2020 = np.array([[0.785301, 0.178838, 0.035860],
-                           [-0.036655, 1.258089, -0.221434],
-                           [-0.014322, 0.077260, 0.937062]])
+# Camera native -> Rec.2020, one per D-Log M fit.  The pairing mirrors
+# osv::color::nativeToWorkingForFit: the Pocket 3 chart fit goes with the
+# Pocket 3 and DJI-refit curves, and the Osmo 360 matrix (fitted from the
+# off-diagonal entries of DJI's Osmo 360 reference LUT by
+# scripts/fit_primaries.py) goes with the Osmo 360 curve.  Keeping both here is
+# what lets the golden pin the non-neutral pipeline for each fit; on the
+# neutral axis they are interchangeable because both have unit row sums.
+NATIVE_TO_2020_POCKET3 = np.array([[0.785301, 0.178838, 0.035860],
+                                   [-0.036655, 1.258089, -0.221434],
+                                   [-0.014322, 0.077260, 0.937062]])
+NATIVE_TO_2020_OSMO360 = np.array([[0.807268560, 0.152663648, 0.040067792],
+                                   [0.042878162, 0.990737677, -0.033615828],
+                                   [-0.009603872, -0.094263740, 1.103867650]])
+# Backwards-compatible alias: the grey-axis helpers below are matrix-invariant
+# (unit row sums), so which of the two they name is immaterial to their result.
+NATIVE_TO_2020 = NATIVE_TO_2020_POCKET3
 REC2020_TO_709 = np.array([[1.660491, -0.587641, -0.072850],
                            [-0.124550, 1.132900, -0.008349],
                            [-0.018151, -0.100579, 1.118730]])
@@ -214,13 +227,22 @@ def main():
         "rec709_inverse_oetf": pairs(codes33, rec709_inverse_oetf(codes33)),
         "bt2390_eetf_1000_to_100": pairs(codes33, bt2390_eetf(codes33, PEAK_NITS, SDR_PEAK_NITS)),
         "matrices": {
-            "native_to_rec2020_pocket3": NATIVE_TO_2020.tolist(),
+            "native_to_rec2020_pocket3": NATIVE_TO_2020_POCKET3.tolist(),
+            "native_to_rec2020_osmo360": NATIVE_TO_2020_OSMO360.tolist(),
             "rec2020_to_rec709": REC2020_TO_709.tolist(),
             "rec709_to_rec2020": REC709_TO_2020.tolist(),
             "row_sums": {
-                "native_to_rec2020_pocket3": NATIVE_TO_2020.sum(axis=1).tolist(),
+                "native_to_rec2020_pocket3": NATIVE_TO_2020_POCKET3.sum(axis=1).tolist(),
+                "native_to_rec2020_osmo360": NATIVE_TO_2020_OSMO360.sum(axis=1).tolist(),
                 "rec2020_to_rec709": REC2020_TO_709.sum(axis=1).tolist(),
                 "rec709_to_rec2020": REC709_TO_2020.sum(axis=1).tolist(),
+            },
+            # Determinants: positive means the transform is invertible and
+            # orientation-preserving, which the C++ test asserts for both
+            # native matrices.
+            "determinants": {
+                "native_to_rec2020_pocket3": float(np.linalg.det(NATIVE_TO_2020_POCKET3)),
+                "native_to_rec2020_osmo360": float(np.linalg.det(NATIVE_TO_2020_OSMO360)),
             },
         },
         "dlogm": {},
@@ -266,16 +288,19 @@ def main():
         })
 
     # The same spot checks for the default curve, so a change to it cannot
-    # slip past the golden test (which only pinned the refit before).
+    # slip past the golden test (which only pinned the refit before).  This one
+    # uses the Osmo 360 primaries matrix, because that is what makeColorParams
+    # pairs with the Osmo 360 curve; using the Pocket 3 matrix here would make
+    # the golden disagree with the library on every non-neutral colour.
     doc["pipeline_rgb_osmo360"] = []
     for code in spots:
         lin = [float(dlogm_to_linear(osmo360, c)) for c in code]
         doc["pipeline_rgb_osmo360"].append({
             "code": code,
-            "hlg": [float(v) for v in linear_to_output(lin, NATIVE_TO_2020, IDENTITY, "hlg")],
-            "pq": [float(v) for v in linear_to_output(lin, NATIVE_TO_2020, IDENTITY, "pq")],
-            "rec709": [float(v) for v in linear_to_output(lin, NATIVE_TO_2020, REC2020_TO_709, "rec709")],
-            "linear": [float(v) for v in linear_to_output(lin, NATIVE_TO_2020, IDENTITY, "linear")],
+            "hlg": [float(v) for v in linear_to_output(lin, NATIVE_TO_2020_OSMO360, IDENTITY, "hlg")],
+            "pq": [float(v) for v in linear_to_output(lin, NATIVE_TO_2020_OSMO360, IDENTITY, "pq")],
+            "rec709": [float(v) for v in linear_to_output(lin, NATIVE_TO_2020_OSMO360, REC2020_TO_709, "rec709")],
+            "linear": [float(v) for v in linear_to_output(lin, NATIVE_TO_2020_OSMO360, IDENTITY, "linear")],
         })
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)

@@ -148,6 +148,22 @@ const OsvDlogMCurve& dlogmCurve(DlogMFit fit) noexcept {
     return kDlogMOsmo360;
 }
 
+const OsvMat3f& nativeToWorkingForFit(DlogMFit fit) noexcept {
+    switch (fit) {
+    case DlogMFit::Pocket3:
+    case DlogMFit::DjiRefit:
+        // Both of these shipped against the Pocket 3 chart fit.  DjiRefit in
+        // particular exists only so a project graded on it keeps rendering
+        // identically, so it keeps the matrix it was graded with.
+        return kNativeToRec2020_Pocket3;
+    case DlogMFit::Osmo360:
+        break;
+    }
+    // The default, and the fallback for a corrupt persisted preference byte:
+    // the curve and the matrix fitted from the same Osmo 360 reference.
+    return kNativeToRec2020_Osmo360;
+}
+
 // -----------------------------------------------------------------------------
 //  Parameter block construction
 // -----------------------------------------------------------------------------
@@ -206,7 +222,12 @@ OsvColorParams makeColorParams(DlogMFit fit, OutputTransfer transfer, float expo
         break;
     case InputEncoding::DLogM:
     default:
-        setMatrix(p.nativeToWorking, kNativeToRec2020_Pocket3);
+        // The primaries matrix follows the selected curve, because the two are
+        // halves of one camera characterisation (see nativeToWorkingForFit).
+        // Note this keys off `fit`, not off a curveOverride: a caller passing a
+        // custom curve is tweaking the tone response of the camera the fit
+        // names, and there is no matrix override to pair with it.
+        setMatrix(p.nativeToWorking, nativeToWorkingForFit(fit));
         break;
     }
     // Only the Rec.709 output leaves the Rec.2020 working space.

@@ -172,9 +172,40 @@ output, which is already converted.
 
 ## Native primaries
 
-The Osmo 360 sensor primaries are approximated by the Pocket 3 fit matrix
-(native -> Rec.2020). Saturated hues are therefore approximate until a chart
-based fit exists; the matrix is a parameter.
+The Osmo 360's native -> Rec.2020 matrix (`kNativeToRec2020_Osmo360`) is
+fitted from DJI's own Osmo 360 D-Log M -> Rec.709 reference LUT, measured over
+all 35937 entries by `scripts/fit_primaries.py`. A colour chart is not needed:
+a per-channel tone curve cannot move energy between channels, yet the
+reference plainly does -- a red-only input of 0.500 renders with 0.053 of
+blue -- and cross-channel terms of that shape are exactly what a primaries
+matrix produces, so they are recoverable by inverting the output transform and
+solving for the 3x3.
+
+Against that reference, in HLG code units, replacing the Pocket 3 matrix with
+this one cuts the full-cube error by 52.5 % (0.0947 -> 0.0450 RMS) and the
+saturated-entry error by 53.6 % (0.1002 -> 0.0465 RMS). The neutral axis is
+unchanged at 0.0233 RMS, which is structural rather than lucky: every matrix
+here has rows summing to 1, so it acts as the identity on equal-energy greys
+and cannot move 18 % grey off HLG 0.380 or disturb any BT.2408 anchor.
+
+The fit is physically plausible -- determinant +0.873, positive diagonal, all
+three implied primaries at positive luminance (R x=0.6914 y=0.3206,
+G x=0.2616 y=0.8225, B x=0.1448 y=0.0372), a gamut between Rec.709 and
+Rec.2020 -- unlike the Pocket 3 matrix, whose implied blue primary sits at
+negative luminance and therefore cannot describe a real sensor.
+
+What it does not reproduce, stated plainly: about 37 % of the reference's
+entries sit on an output boundary and roughly 71 % of the cube falls outside
+the Rec.709 output gamut, so on deeply saturated entries DJI's table holds a
+*gamut-mapped* value rather than a matrixed one. No 3x3 can reproduce that,
+because it is not a linear operation, and those entries dominate the residual
+worst case (0.263). Restricting the fit to the ~24 % of entries that are clean
+on both sides does not improve it, which is the evidence that the remaining
+error is DJI's gamut compression and not a mis-fitted matrix.
+
+The matrix remains a parameter: `--fit pocket3` selects the older one, since a
+project already graded against it must keep rendering the same way, and other
+DJI bodies may genuinely use those primaries.
 
 ## Signalling
 

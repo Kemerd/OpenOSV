@@ -96,8 +96,14 @@ float worstWholeCubeError(const Lut3D& lut, const OsvColorParams& params, const 
 /// varying channels (0.09), so only the neutral axis holds 0.02 there.
 float worstEncodableError(const Lut3D& lut, const OsvColorParams& params, const CubeOptions& options, int count,
                           unsigned seed, float minNativeLinear, float minMix, float loStops, float hiStops) {
+    // Invert the matrix the caller's params actually carry, not a named
+    // constant: the primaries matrix now follows the selected D-Log M fit
+    // (osv::color::nativeToWorkingForFit), so hardcoding one here would
+    // silently generate native values for a different camera the moment a
+    // caller changed its fit, and the "worst error" would be measuring the
+    // mismatch rather than the LUT's interpolation.
     OsvMat3f toNative{};
-    REQUIRE(mat3Inverse(kNativeToRec2020_Pocket3, toNative));
+    REQUIRE(mat3Inverse(params.nativeToWorking, toNative));
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
     float worst = 0.0f;
