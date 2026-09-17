@@ -1,0 +1,110 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "VCPKG_INSTALLED_DIR": "${sourceDir}/vcpkg_installed",
+        "VCPKG_MANIFEST_MODE": "ON"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "ninja-base",
+      "hidden": true,
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl"
+      },
+      "architecture": { "value": "x64", "strategy": "external" }
+    },
+    {
+      "name": "cuda-vars",
+      "hidden": true,
+      "cacheVariables": {
+        "OSV_ENABLE_CUDA": "ON",
+        "OSV_ENABLE_OPENCL": "ON",
+        "CMAKE_CUDA_COMPILER": "$env{CUDA_PATH}/bin/nvcc.exe",
+        "CMAKE_CUDA_ARCHITECTURES": "75-real;86-real;89-real;120-real;120-virtual",
+        "CMAKE_CUDA_HOST_COMPILER": "cl"
+      }
+    },
+    {
+      "name": "windows-msvc-cuda-release",
+      "displayName": "Windows MSVC x64 Release (CUDA + OpenCL, Ninja)",
+      "inherits": [ "ninja-base", "cuda-vars" ],
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "windows-msvc-cuda-debug",
+      "displayName": "Windows MSVC x64 Debug (CUDA + OpenCL, Ninja)",
+      "inherits": [ "ninja-base", "cuda-vars" ],
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "windows-msvc-cpu-only",
+      "displayName": "Windows MSVC x64 Release (CPU only, Ninja)",
+      "inherits": "ninja-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "OSV_ENABLE_CUDA": "OFF",
+        "OSV_ENABLE_OPENCL": "OFF"
+      }
+    },
+    {
+      "name": "windows-vs2022-cuda",
+      "displayName": "Windows Visual Studio 17 2022 x64 (CUDA + OpenCL)",
+      "inherits": [ "base", "cuda-vars" ],
+      "generator": "Visual Studio 17 2022",
+      "architecture": { "value": "x64", "strategy": "set" }
+    },
+    {
+      "name": "ci-windows",
+      "displayName": "CI (GitHub Actions windows-latest)",
+      "inherits": "windows-msvc-cuda-release",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "89-real;120-real",
+        "OSV_WARNINGS_AS_ERRORS": "ON",
+        "VCPKG_INSTALL_OPTIONS": "--clean-after-build"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows-msvc-cuda-release", "configurePreset": "windows-msvc-cuda-release" },
+    { "name": "windows-msvc-cuda-debug",   "configurePreset": "windows-msvc-cuda-debug" },
+    { "name": "windows-msvc-cpu-only",     "configurePreset": "windows-msvc-cpu-only" },
+    { "name": "windows-vs2022-cuda",       "configurePreset": "windows-vs2022-cuda", "configuration": "Release" },
+    { "name": "ci-windows",                "configurePreset": "ci-windows" }
+  ],
+  "testPresets": [
+    {
+      "name": "all",
+      "configurePreset": "windows-msvc-cuda-release",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "debug-all",
+      "configurePreset": "windows-msvc-cuda-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "cpu-only",
+      "configurePreset": "windows-msvc-cpu-only",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "ci",
+      "configurePreset": "ci-windows",
+      "output": { "outputOnFailure": true },
+      "filter": { "exclude": { "name": "cuda|opencl|hwaccel|ffmpeg-exe" } }
+    }
+  ]
+}

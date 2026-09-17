@@ -1,0 +1,158 @@
+OpenOSV
+Copyright 2026 The OpenOSV Contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+OpenOSV is an independent project.  It is not affiliated with, endorsed by or
+sponsored by SZ DJI Technology Co., Ltd. ("DJI") or Adobe Inc.  DJI, Osmo and
+Osmo 360 are trademarks of DJI; Adobe, Premiere Pro and After Effects are
+trademarks of Adobe; NVIDIA and CUDA are trademarks of NVIDIA Corporation.
+They are used only to say what OpenOSV is compatible with.  See docs/LEGAL.md.
+
+================================================================================
+Independent implementation and interoperability
+================================================================================
+OpenOSV lets owners of a DJI Osmo 360 read, stitch, colour and edit their own
+.OSV recordings in software of their choice.  It is an independent
+implementation, written in OpenOSV's own code.
+
+What this repository and the binaries built from it do NOT contain:
+  * DJI source code, or DJI binaries, libraries or other files from DJI
+    software;
+  * code transcribed from DJI software;
+  * DJI neural-network models or weights;
+  * DJI LUT files or LUT images, DJI masks or DJI remap tables;
+  * DJI SDK headers, or DJI images or artwork.
+The .cube files in luts/ contain no DJI data: each is generated in full by
+`osvtool lut` from OpenOSV's own fitted models (see "Colour science
+provenance" below).
+
+What WAS done.  DJI's publicly distributed software was studied for
+interoperability: to read the camera's files and to understand how DJI's own
+tools render them.  The software studied was DJI Studio for Windows (version
+1.0.0.24724), DJI's macOS Premiere reframe plug-in and DJI's macOS Premiere
+importer, including its stitching library.  DJI's publicly distributed LUTs
+were measured.  From that work OpenOSV took a limited set of numeric facts,
+formulas and parameters, and implemented every one of them in its own code:
+  * DJI's reframe camera model, its Zoom formula, zoom path, control limits
+    and five presets;
+  * the usable lens field of view (195.18 degrees);
+  * the Dense Inverse Search optical-flow parameters and densification weight;
+  * seam-finder cost weights and photometric rules;
+  * the lens-protector field-angle correction (OpenOSV's own polynomial fit
+    to DJI's curve; the curve itself is not included) and the order in which
+    it is applied;
+  * D-Log M curves, a camera primaries matrix and a Rec.709 look, fitted to
+    measurements of DJI's LUTs (see below);
+  * the meaning of the metadata's calibration slots and fields.
+docs/LEGAL.md lists every item, where it lives in OpenOSV and where it came
+from.  Nothing else from DJI software is used.
+
+The .OSV container layout was determined from recorded files.  The per-frame
+metadata's protobuf schema (message layout, field numbers, types and names)
+and the lens calibration model were determined from recorded files and from
+DJI's software (DJI Studio for Windows and DJI's macOS Premiere importer),
+and the schema was cross-checked against the dvtm_oq101.proto
+published by the open-source telemetry-parser project
+(github.com/AdrianEddy/telemetry-parser, MIT OR Apache-2.0).
+proto/dvtm_osmo360.proto is OpenOSV's own transcription of that schema.
+
+================================================================================
+Colour science provenance
+================================================================================
+* BT.2100 HLG / PQ transfer functions, BT.2020 and BT.709 primaries and the
+  BT.2408 signal-level anchors are implemented from the public ITU-R
+  Recommendations BT.2100-2, BT.2020-2 and BT.709-6 and the ITU-R Reports
+  BT.2408-5 and BT.2390-8.
+* The "DJI-matched" D-Log M decoding curve (kDlogMDjiRefit, `--fit dji`) is an
+  analytic 7-parameter fit produced by scripts/fit_dlogm.py from 64
+  neutral-axis measurements of DJI's publicly distributed D-Log M to HLG
+  rendering (the FT_StyleGeneralDlogm2HLG style LUT bundled with DJI Studio).
+  What is shipped is the fitted constants (include/osv/color/DlogM.h) and the
+  64-value measurement table, recorded as the fit's provenance
+  (scripts/fit_dlogm.py) and as the tests' reference
+  (tests/unit/test_color.cpp); no DJI LUT data beyond those 64 values is
+  included.
+* The "Osmo 360" D-Log M decoding curve (kDlogMOsmo360, the default) is an
+  analytic 7-parameter fit of the same form, produced by
+  `scripts/fit_dlogm.py --from-cube DJI_Osmo360_DLogM_to_Rec709.cube` from the
+  33 neutral-axis (R == G == B) samples of DJI's publicly distributed Osmo 360
+  D-Log M to Rec.709 LUT (as bundled with DJI Studio).  Measuring a transfer
+  function is what was done, not copying a table: what is shipped is the
+  seven fitted constants (include/osv/color/DlogM.h) and the 33 measured
+  diagonal values, recorded as the tests' reference
+  (tests/unit/DjiReference.h).  The fit scripts read the LUT from a local
+  copy (DJI Studio installs one) and print only fitted constants.
+* The Osmo 360 native primaries matrix (kNativeToRec2020_Osmo360, the
+  default) is OpenOSV's least-squares fit, produced by
+  `scripts/fit_primaries.py --from-cube DJI_Osmo360_DLogM_to_Rec709.cube`
+  from measurements of all 35937 entries of the same LUT.  Only the nine
+  fitted constants are shipped (include/osv/color/Matrices.h).
+* The "Pocket 3" D-Log M curve (kDlogMPocket3) reproduces the numeric
+  constants of the publicly published community fit by Thatcher Freeman
+  ("DJI Pocket 3 D-Log M to DWG.dctl", github.com/thatcherfreeman/
+  dwg-transforms), and kNativeToRec2020_Pocket3 is that file's colour-chart
+  matrix (camera native to DaVinci Wide Gamut) composed with the DaVinci Wide
+  Gamut to Rec.2020 conversion.  The constants are facts about a transfer
+  function and a colour matrix; no source code from that repository is
+  included.
+* The "DJI Studio" Rec.709 look (the default Rec.709 rendering) is OpenOSV's own
+  parametric model - a 3x3, a 17-knot monotone tone curve, a highlight hue
+  blend, a second 3x3 and a soft gamut compression, 46 stored constants of
+  which 38 are free parameters
+  (include/osv/color/Look.h) - fitted by scripts/fit_look.py to measurements of
+  DJI's publicly distributed Osmo 360 D-Log M to Rec.709 LUT (as bundled with
+  DJI Studio).  What is shipped is the fitted constants and 72 measured entries
+  recorded as the tests' reference (tests/unit/DjiReference.h, which also holds
+  the 33 neutral-axis values above: 105 of the LUT's 35937 entries in all); no
+  other DJI LUT data is redistributed, and the Rec.709 .cube in luts/ is
+  generated by `osvtool lut` from the fitted model.  The gamut compression
+  uses the published curve of the ACES Reference Gamut Compression (Academy
+  of Motion Picture Arts and Sciences), implemented from its mathematical
+  description; no ACES code is included.
+
+================================================================================
+Third-party components
+================================================================================
+* FFmpeg (libavcodec, libavformat, libavutil, libswscale, libswresample)
+  LGPL-2.1-or-later, dynamically linked, built without GPL components.
+  https://ffmpeg.org
+* zlib (dynamically linked, loaded by FFmpeg)
+                                    Zlib               https://zlib.net
+* miniz (dynamically linked)        MIT                https://github.com/richgel999/miniz
+* nv-codec-headers (ffnvcodec)      MIT                https://github.com/FFmpeg/nv-codec-headers
+* Khronos OpenCL headers + ICD      Apache-2.0         https://github.com/KhronosGroup/OpenCL-SDK
+* Catch2                            BSL-1.0            https://github.com/catchorg/Catch2
+* CLI11                             BSD-3-Clause       https://github.com/CLIUtils/CLI11
+* nlohmann/json                     MIT                https://github.com/nlohmann/json
+* spdlog                            MIT                https://github.com/gabime/spdlog
+* fmt                               MIT                https://github.com/fmtlib/fmt
+* tinyexr                           BSD-3-Clause       https://github.com/syoyo/tinyexr
+* NVIDIA CUDA Runtime               NVIDIA EULA        (statically linked cudart in osvtool
+                                                        and the Premiere importer)
+
+The Premiere Pro plug-ins are built against the Adobe Premiere Pro and After
+Effects SDKs, which are not redistributable and are not in this repository;
+each developer obtains them from Adobe (docs/BUILDING.md).
+
+================================================================================
+Optional neural optical flow (fetched by scripts, never committed)
+================================================================================
+Used only when the "Neural" flow backend is available; every build works
+without them, and nothing below is stored in this repository.  They are
+downloaded or rebuilt into gitignored folders by scripts/fetch_onnxruntime.ps1
+and scripts/fetch_flow_model.py.  A binary distribution that SHIPS them must
+include their licence texts.
+
+* ONNX Runtime                      MIT                https://github.com/microsoft/onnxruntime
+  Copyright (c) Microsoft Corporation.
+* SEA-RAFT optical flow model       BSD-3-Clause       https://github.com/princeton-vl/SEA-RAFT
+  Copyright (c) 2024, Princeton Vision & Learning Lab.
+  models/searaft_s_gray.onnx is an ONNX export of the authors' published
+  "Tartan-C-T-TSKH432x960-S" weights, with a grayscale input adapter and
+  input scaling folded into the graph; the network itself is unmodified.
+* NVIDIA cuDNN                      NVIDIA cuDNN SLA   https://developer.nvidia.com/cudnn
+  Loaded at runtime by ONNX Runtime's CUDA provider; not redistributed here.
+
+Research papers, standards and datasets the project used or evaluated are
+listed in docs/CITATIONS.md.

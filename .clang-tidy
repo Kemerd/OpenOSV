@@ -1,0 +1,20 @@
+# OpenOSV clang-tidy configuration.  Focused on the classes of bug that matter
+# for a library loaded into somebody else's process: UB, lifetime, narrowing.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  cert-err34-c,
+  clang-analyzer-*,
+  cppcoreguidelines-init-variables,
+  cppcoreguidelines-pro-type-member-init,
+  misc-unused-parameters,
+  modernize-use-nullptr,
+  modernize-use-override,
+  performance-*,
+  readability-braces-around-statements,
+  readability-misleading-indentation
+WarningsAsErrors: ''
+HeaderFilterRegex: 'include/osv/.*'
+FormatStyle: file
