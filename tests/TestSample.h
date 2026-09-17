@@ -38,11 +38,27 @@ inline bool haveSample() {
     return std::filesystem::exists(sampleOsv(), ec) && !ec;
 }
 
+/// True when the sample .LRF proxy is present on this machine.
+inline bool haveSampleLrf() {
+    std::error_code ec;
+    return std::filesystem::exists(sampleLrf(), ec) && !ec;
+}
+
 /// SKIP the current test when the sample is missing (CI without footage).
 #define OSV_REQUIRE_SAMPLE()                                                                                           \
     do {                                                                                                               \
         if (!::osvtest::haveSample()) {                                                                                \
             SKIP("sample clip not available: " << ::osvtest::sampleOsv().string());                                    \
+        }                                                                                                              \
+    } while (0)
+
+/// SKIP the current test when the sample .LRF proxy is missing.  It is a
+/// separate file from the .OSV and a machine can easily have one and not the
+/// other, so it needs its own guard rather than riding on OSV_REQUIRE_SAMPLE.
+#define OSV_REQUIRE_SAMPLE_LRF()                                                                                       \
+    do {                                                                                                               \
+        if (!::osvtest::haveSampleLrf()) {                                                                             \
+            SKIP("sample LRF proxy not available: " << ::osvtest::sampleLrf().string());                               \
         }                                                                                                              \
     } while (0)
 

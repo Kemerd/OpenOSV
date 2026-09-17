@@ -103,9 +103,19 @@ void ThreadPool::workerLoop() {
             }
             job = m_currentJob;
             seenGeneration = m_generation;
+            // Register while still holding the lock, so the count is visible
+            // to the owner before it can possibly observe the job finished.
+            if (job) {
+                job->workersInside.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         if (job) {
             runChunks(*job);
+            // Leaving: the owner may be waiting for exactly this.
+            if (job->workersInside.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_done.notify_all();
+            }
         }
     }
 }
@@ -121,6 +131,12 @@ Status ThreadPool::parallelFor(std::size_t begin, std::size_t end, std::size_t g
         grain = 1;
     }
 
+    // One job at a time per pool.  Concurrent callers (a host rendering on
+    // several threads through one shared pool) queue here instead of
+    // overwriting each other's m_currentJob, which would let a worker run
+    // chunks against a Job whose owner had already returned and destroyed it.
+    std::lock_guard<std::mutex> submit(m_submitMutex);
+
     Job job;
     job.begin = begin;
     job.end = end;
@@ -130,9 +146,8 @@ Status ThreadPool::parallelFor(std::size_t begin, std::size_t end, std::size_t g
     const std::size_t chunkCount = (total + grain - 1) / grain;
     job.remainingChunks.store(chunkCount, std::memory_order_relaxed);
 
-    // Publish the job and wake the workers.  parallelFor is serialised by the
-    // caller (one job at a time per pool); nested calls from a body would
-    // deadlock, which the CPU renderer never does.
+    // Publish the job and wake the workers.  Nested calls from a body would
+    // self-deadlock on m_submitMutex, which no caller in this project does.
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_currentJob = &job;
@@ -143,11 +158,21 @@ Status ThreadPool::parallelFor(std::size_t begin, std::size_t end, std::size_t g
     // The calling thread helps so single-threaded pools still make progress.
     runChunks(job);
 
-    // Wait for stragglers still inside their chunk.
+    // Wait for every chunk to be finished AND for every worker to have left
+    // runChunks().  Waiting only on remainingChunks is not enough: the last
+    // chunk is counted down from inside runChunks, so a worker can still be
+    // executing there (or be about to read job.begin/end for its next loop
+    // iteration) when the count reaches zero.  The Job lives on this stack
+    // frame, so returning at that point frees it under the worker's feet -
+    // the next caller's Job then reuses the address and the worker renders
+    // rows sized for the wrong frame.
     {
         std::unique_lock<std::mutex> lock(m_mutex);
-        m_done.wait(lock, [&] { return job.remainingChunks.load(std::memory_order_acquire) == 0; });
-        m_currentJob = nullptr;
+        m_currentJob = nullptr;  // no NEW worker may pick this job up
+        m_done.wait(lock, [&] {
+            return job.remainingChunks.load(std::memory_order_acquire) == 0 &&
+                   job.workersInside.load(std::memory_order_acquire) == 0;
+        });
     }
 
     if (job.failed.load(std::memory_order_relaxed)) {

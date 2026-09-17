@@ -4,7 +4,7 @@
 *.LRF
 *.lrf
 *.pkg
-1786677614599-DJI_Reframe_for_Adobe_Premiere/
+ref/
 
 # ---- build outputs ----
 build/
@@ -28,3 +28,7 @@ __pycache__/
 # Ad-hoc compiler check scratch and vcpkg logs
 build_check/
 vcpkg_install.err
+
+# Adobe SDKs and third-party references (never committed; Adobe licence)
+/Premiere Pro*SDK/
+/third_party/

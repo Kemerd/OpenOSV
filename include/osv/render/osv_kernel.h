@@ -60,6 +60,7 @@
 #define OSV_GLOBAL
 #endif
 #include <math.h>
+#include <stddef.h>
 #endif
 
 #if !defined(OSV_KERNEL_OPENCL)
@@ -94,6 +95,15 @@ typedef unsigned short osv_u16;
 #define OSV_PROJ_RECTILINEAR 0
 #define OSV_PROJ_FISHEYE 1
 #define OSV_PROJ_STEREOGRAPHIC 2
+/* Eye-offset ("generalised stereographic") projection: the sphere is viewed
+ * from a point d radii behind its centre, r/f = (1 + d) sin(theta) /
+ * (d + cos(theta)).  d = 0 is rectilinear, d = 1 is stereographic. */
+#define OSV_PROJ_EYE_OFFSET 3
+
+/* Entry points usable from plain C/C++, CUDA and OpenCL alike. */
+#ifndef OSV_FN
+#define OSV_FN OSV_HD
+#endif
 
 /* Equirect layout (OSV_MODE_EQUIRECT) */
 #define OSV_LAYOUT_STANDARD 0   /* Z up, +Y (master lens) at the image centre */
@@ -144,6 +154,7 @@ typedef struct OsvRenderParams {
     float focalPx;           /* virtual camera focal length in pixels          */
     float tanHalfH;          /* tan(hfov/2) (rectilinear)                      */
     float tanHalfV;          /* tan(hfov/2) * H / W (rectilinear)              */
+    float eyeOffset;         /* d in [0, 1] (OSV_PROJ_EYE_OFFSET only)         */
     float Rout[9];           /* body <- view rotation, row-major               */
     OsvLens lens[2];         /* [0] slave (stream 0), [1] master (stream 1)    */
     int blendEnabled;        /* 0 = nearest-lens only (no feather blend)       */
@@ -152,6 +163,42 @@ typedef struct OsvRenderParams {
     int outputAlphaCoverage; /* 1 = alpha = coverage, 0 = alpha always 1       */
     OsvColorParams color;    /* colour pipeline (see ColorMath.h)              */
 } OsvRenderParams;
+
+/* ------------------------------------------------------------------------- */
+/*  Second entry point: reframing an already stitched equirect RGBA frame     */
+/* ------------------------------------------------------------------------- */
+
+/* Description of an equirectangular RGBA frame in the Standard layout
+ * (lon = (x/W - 0.5) 2pi, lat = (0.5 - y/H) pi, centre column = +Y, row 0 =
+ * top).  The pixel memory itself is passed separately so the same descriptor
+ * serves host and device buffers. */
+typedef struct OsvRgbaSource {
+    int w, h;            /* equirect size in pixels                            */
+    int pitchBytes;      /* row pitch in bytes (positive, row 0 at the top)    */
+    int isHalf;          /* 1 = 16-bit float channels, 0 = 32-bit float        */
+    int isBgra;          /* 1 = channel order B,G,R,A (Premiere), 0 = R,G,B,A  */
+} OsvRgbaSource;
+
+/* Everything osvReframeEquirectPixel needs besides the source frame.  The
+ * picture is drawn into the viewport rectangle; pixels of the output frame
+ * outside it are transparent black (letterbox / pillarbox). */
+typedef struct OsvReframeParams {
+    int outW, outH;                 /* full output frame                        */
+    int viewX, viewY, viewW, viewH; /* rectangle that receives the picture      */
+    int projection;                 /* OSV_PROJ_* (EYE_OFFSET recommended)      */
+    float eyeOffset;                /* d in [0, 1]                              */
+    float focalPx;                  /* focal length for the viewport width      */
+    float tanHalfH, tanHalfV;       /* rectilinear helpers (viewport aspect)    */
+    float Rout[9];                  /* body <- view rotation, row-major         */
+    int fillAlphaOne;               /* 1 = opaque output inside the viewport    */
+} OsvReframeParams;
+
+/* Reinterpretation helper for the half-float decoder below.  A union is the
+ * one type pun every dialect (C99, C++, CUDA C++, OpenCL C) accepts. */
+typedef union OsvFloatBits {
+    unsigned int u;
+    float f;
+} OsvFloatBits;
 
 /* ------------------------------------------------------------------------- */
 /*  Small vector helpers                                                      */
@@ -206,6 +253,77 @@ OSV_HD void osvRotateAboutAxis(const float* v, const float* n, float a, float* o
 /*  Output pixel -> view ray                                                  */
 /* ------------------------------------------------------------------------- */
 
+/* Eye-offset projection, inverse direction: angle from the view axis for a
+ * radius r (pixels from the image centre).  Forward model
+ *     r / f = (1 + d) sin(theta) / (d + cos(theta)),
+ * inverted through k = r / (f (1 + d)):
+ *     theta = atan(k) + asin(k d / sqrt(1 + k^2)).
+ * The projection has an asymptote at theta = acos(-d); anything at or beyond
+ * it (and every non-finite input) is reported as uncovered by returning a
+ * negative angle. */
+OSV_HD float osvEyeOffsetTheta(float r, float focalPx, float d) {
+    if (!(focalPx > 0.0f) || !(r >= 0.0f)) {
+        return -1.0f;
+    }
+    const float k = r / (focalPx * (1.0f + d));
+    /* k d / sqrt(1 + k^2), written so that k^2 overflowing to infinity for
+     * absurd radii still gives the correct limit d instead of 0. */
+    const float s = (k > 1.0f) ? osvClampf(d / sqrtf(1.0f + 1.0f / (k * k)), -1.0f, 1.0f)
+                               : osvClampf(k * d / sqrtf(1.0f + k * k), -1.0f, 1.0f);
+    const float theta = atanf(k) + asinf(s);
+    const float thetaMax = acosf(osvClampf(-d, -1.0f, 1.0f));
+    if (!(theta < thetaMax)) {
+        return -1.0f;
+    }
+    return theta;
+}
+
+/* Unit view ray for a centred pixel offset (nx right, ny up, in pixels) of a
+ * W x H viewport under one of the OSV_PROJ_* camera models.  Shared by the
+ * fisheye stitching shader and the equirect reframe entry point so both
+ * produce the same framing for the same parameters.  Returns 0 when the
+ * pixel maps to no direction (outside the image circle / valid radius). */
+OSV_HD int osvViewRay(int projection, float focalPx, float eyeOffset, float tanHalfH, float tanHalfV, float W,
+                      float H, float nx, float ny, float* d) {
+    if (projection == OSV_PROJ_RECTILINEAR) {
+        const float u = (nx / (0.5f * W)) * tanHalfH;
+        const float v = (ny / (0.5f * H)) * tanHalfV;
+        d[0] = u;
+        d[1] = 1.0f;
+        d[2] = v;
+        osvNormalize3(d);
+        return 1;
+    }
+
+    /* Radial models: the angle from the view axis grows with the radius. */
+    const float r = sqrtf(nx * nx + ny * ny);
+    float theta;
+    if (projection == OSV_PROJ_STEREOGRAPHIC) {
+        theta = 2.0f * atanf(r / (2.0f * focalPx));
+    } else if (projection == OSV_PROJ_EYE_OFFSET) {
+        theta = osvEyeOffsetTheta(r, focalPx, eyeOffset);
+        if (theta < 0.0f) {
+            return 0; /* beyond the valid radius of the eye-offset model */
+        }
+    } else {
+        theta = r / focalPx;
+    }
+    if (theta >= OSV_KERNEL_PI) {
+        return 0; /* beyond the back of the sphere */
+    }
+    const float st = sinf(theta);
+    const float ct = cosf(theta);
+    if (r > 0.0f) {
+        d[0] = st * (nx / r);
+        d[2] = st * (ny / r);
+    } else {
+        d[0] = 0.0f;
+        d[2] = 0.0f;
+    }
+    d[1] = ct;
+    return 1;
+}
+
 /* Direction (unit vector, view frame) seen through output pixel (px, py).
  * Returns 0 when the pixel maps to no direction (outside a fisheye circle). */
 OSV_HD int osvRayForPixel(const OsvRenderParams* p, float px, float py, float* d) {
@@ -236,39 +354,7 @@ OSV_HD int osvRayForPixel(const OsvRenderParams* p, float px, float py, float* d
     /* Virtual camera.  nx/ny are centred pixel offsets with +ny = up. */
     const float nx = sx - 0.5f * W;
     const float ny = 0.5f * H - sy;
-
-    if (p->projection == OSV_PROJ_RECTILINEAR) {
-        const float u = (nx / (0.5f * W)) * p->tanHalfH;
-        const float v = (ny / (0.5f * H)) * p->tanHalfV;
-        d[0] = u;
-        d[1] = 1.0f;
-        d[2] = v;
-        osvNormalize3(d);
-        return 1;
-    }
-
-    /* Fisheye / stereographic: angle from the view axis grows with radius. */
-    const float r = sqrtf(nx * nx + ny * ny);
-    float theta;
-    if (p->projection == OSV_PROJ_STEREOGRAPHIC) {
-        theta = 2.0f * atanf(r / (2.0f * p->focalPx));
-    } else {
-        theta = r / p->focalPx;
-    }
-    if (theta >= OSV_KERNEL_PI) {
-        return 0; /* beyond the back of the sphere */
-    }
-    const float st = sinf(theta);
-    const float ct = cosf(theta);
-    if (r > 0.0f) {
-        d[0] = st * (nx / r);
-        d[2] = st * (ny / r);
-    } else {
-        d[0] = 0.0f;
-        d[2] = 0.0f;
-    }
-    d[1] = ct;
-    return 1;
+    return osvViewRay(p->projection, p->focalPx, p->eyeOffset, p->tanHalfH, p->tanHalfV, W, H, nx, ny, d);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -572,6 +658,170 @@ OSV_HD void osvShadePixel(const OsvRenderParams* p, const OsvPlane* planes, OSV_
         osvLinearToOutput(&p->color, acc, out);
     }
     out[3] = p->outputAlphaCoverage ? fminf(wsum, 1.0f) : 1.0f;
+}
+
+/* ------------------------------------------------------------------------- */
+/*  Equirect RGBA reframe (Premiere effect path)                              */
+/* ------------------------------------------------------------------------- */
+
+/* IEEE 754 binary16 -> binary32 by field manipulation only (no intrinsics,
+ * so MSVC, nvcc device code and OpenCL C all run the same instructions).
+ * Handles signed zero, subnormals, infinities and NaN payloads. */
+OSV_HD float osvHalfToFloat(unsigned int h) {
+    const unsigned int sign = (h >> 15) & 1u;
+    const unsigned int exponent = (h >> 10) & 0x1Fu;
+    const unsigned int mantissa = h & 0x3FFu;
+    unsigned int bits;
+    if (exponent == 0u) {
+        if (mantissa == 0u) {
+            /* signed zero */
+            bits = sign << 31;
+        } else {
+            /* subnormal: value = mantissa * 2^-24, renormalise by shifting the
+             * leading one into the implicit position (bit 10) */
+            unsigned int m = mantissa;
+            unsigned int e = 113u; /* 127 - 14: exponent of the first normal */
+            while ((m & 0x400u) == 0u) {
+                m <<= 1;
+                e -= 1u;
+            }
+            bits = (sign << 31) | (e << 23) | ((m & 0x3FFu) << 13);
+        }
+    } else if (exponent == 0x1Fu) {
+        /* infinity or NaN (payload kept) */
+        bits = (sign << 31) | 0x7F800000u | (mantissa << 13);
+    } else {
+        /* normal: rebias 15 -> 127 */
+        bits = (sign << 31) | ((exponent + 112u) << 23) | (mantissa << 13);
+    }
+    OsvFloatBits pun;
+    pun.u = bits;
+    return pun.f;
+}
+
+/* Wrap an integer index into [0, n) (n > 0), used for the longitude seam. */
+OSV_HD int osvWrapIndex(int i, int n) {
+    i %= n;
+    if (i < 0) {
+        i += n;
+    }
+    return i;
+}
+
+/* Read one texel of the source as straight RGBA floats.  x and y must
+ * already be inside the frame; the channel order and sample type of the
+ * source are resolved here so the sampler above stays generic. */
+OSV_HD void osvFetchRgba(const OsvRgbaSource* src, OSV_GLOBAL const void* pixels, int x, int y, float* rgba) {
+    OSV_GLOBAL const unsigned char* row =
+        (OSV_GLOBAL const unsigned char*)pixels + (size_t)y * (size_t)src->pitchBytes;
+    float c[4];
+    if (src->isHalf) {
+        OSV_GLOBAL const osv_u16* texel = (OSV_GLOBAL const osv_u16*)row + (size_t)x * 4u;
+        c[0] = osvHalfToFloat((unsigned int)texel[0]);
+        c[1] = osvHalfToFloat((unsigned int)texel[1]);
+        c[2] = osvHalfToFloat((unsigned int)texel[2]);
+        c[3] = osvHalfToFloat((unsigned int)texel[3]);
+    } else {
+        OSV_GLOBAL const float* texel = (OSV_GLOBAL const float*)row + (size_t)x * 4u;
+        c[0] = texel[0];
+        c[1] = texel[1];
+        c[2] = texel[2];
+        c[3] = texel[3];
+    }
+    if (src->isBgra) {
+        rgba[0] = c[2];
+        rgba[1] = c[1];
+        rgba[2] = c[0];
+    } else {
+        rgba[0] = c[0];
+        rgba[1] = c[1];
+        rgba[2] = c[2];
+    }
+    rgba[3] = c[3];
+}
+
+/* Bilinear sample of the Standard-layout equirect at a unit body direction.
+ * Longitude wraps around the +/-180 degree seam, latitude clamps at the
+ * poles.  Sample centres sit at integer + 0.5 like everywhere else. */
+OSV_HD void osvSampleEquirectRgba(const OsvRgbaSource* src, OSV_GLOBAL const void* pixels, const float* dBody,
+                                  float* rgba) {
+    const float W = (float)src->w;
+    const float H = (float)src->h;
+    /* Standard layout: d = (sin lon cos lat, cos lon cos lat, sin lat). */
+    const float lon = atan2f(dBody[0], dBody[1]);
+    const float lat = asinf(osvClampf(dBody[2], -1.0f, 1.0f));
+    /* Continuous sample coordinates, then the 0.5 centre offset. */
+    const float fx = (lon / OSV_KERNEL_TWO_PI + 0.5f) * W - 0.5f;
+    const float fy = (0.5f - lat / OSV_KERNEL_PI) * H - 0.5f;
+    const float flx = floorf(fx);
+    const float fly = floorf(fy);
+    const float tx = fx - flx;
+    const float ty = fy - fly;
+    const int x0 = (int)flx;
+    const int y0 = (int)fly;
+    /* Longitude wraps, latitude clamps. */
+    const int xa = osvWrapIndex(x0, src->w);
+    const int xb = osvWrapIndex(x0 + 1, src->w);
+    const int ya = y0 < 0 ? 0 : (y0 >= src->h ? src->h - 1 : y0);
+    const int yb = (y0 + 1) < 0 ? 0 : ((y0 + 1) >= src->h ? src->h - 1 : y0 + 1);
+    float a[4], b[4], c[4], d[4];
+    osvFetchRgba(src, pixels, xa, ya, a);
+    osvFetchRgba(src, pixels, xb, ya, b);
+    osvFetchRgba(src, pixels, xa, yb, c);
+    osvFetchRgba(src, pixels, xb, yb, d);
+    for (int i = 0; i < 4; ++i) {
+        const float top = a[i] + (b[i] - a[i]) * tx;
+        const float bot = c[i] + (d[i] - c[i]) * tx;
+        rgba[i] = top + (bot - top) * ty;
+    }
+}
+
+/* Compute output pixel (px, py) of a reframed equirect frame.  Pixels outside
+ * the viewport rectangle, pixels with no ray under the projection and every
+ * invalid input yield transparent black (0, 0, 0, 0).  Inside the viewport
+ * `out` receives straight RGBA in whatever encoding the source carries (the
+ * function is colour agnostic); alpha is the sampled alpha unless
+ * fillAlphaOne is set. */
+OSV_FN void osvReframeEquirectPixel(const OsvReframeParams* p, const OsvRgbaSource* src, OSV_GLOBAL const void* pixels,
+                                    int px, int py, float out[4]) {
+    if (!out) {
+        return;
+    }
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    if (!p || !src || !pixels) {
+        return;
+    }
+    if (src->w <= 0 || src->h <= 0 || src->pitchBytes <= 0) {
+        return;
+    }
+    if (p->outW <= 0 || p->outH <= 0 || p->viewW <= 0 || p->viewH <= 0) {
+        return;
+    }
+    if (px < 0 || py < 0 || px >= p->outW || py >= p->outH) {
+        return;
+    }
+    /* Letterbox: only the viewport receives the picture. */
+    const int lx = px - p->viewX;
+    const int ly = py - p->viewY;
+    if (lx < 0 || ly < 0 || lx >= p->viewW || ly >= p->viewH) {
+        return;
+    }
+    /* Centred pixel offsets inside the viewport, +ny = up. */
+    const float W = (float)p->viewW;
+    const float H = (float)p->viewH;
+    const float nx = ((float)lx + 0.5f) - 0.5f * W;
+    const float ny = 0.5f * H - ((float)ly + 0.5f);
+    float dView[3];
+    if (!osvViewRay(p->projection, p->focalPx, p->eyeOffset, p->tanHalfH, p->tanHalfV, W, H, nx, ny, dView)) {
+        return;
+    }
+    /* View -> body, then look the body direction up in the panorama. */
+    float dBody[3];
+    osvMat3MulVec(p->Rout, dView, dBody);
+    osvSampleEquirectRgba(src, pixels, dBody, out);
+    if (p->fillAlphaOne) {
+        out[3] = 1.0f;
+    }
 }
 
 #endif /* OSV_KERNEL_H */

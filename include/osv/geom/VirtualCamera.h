@@ -23,11 +23,18 @@ enum class Projection {
     Rectilinear,    ///< Pinhole: r = f * tan(theta).
     Fisheye,        ///< Equidistant: r = f * theta.
     Stereographic,  ///< r = 2 f tan(theta / 2) (Crystal Ball / Asteroid looks).
-    Equirect        ///< Full equirectangular panorama (Standard layout).
+    Equirect,       ///< Full equirectangular panorama (Standard layout).
+    EyeOffset       ///< r = f (1 + d) sin(theta) / (d + cos(theta)); d = 0 is Rectilinear, d = 1 Stereographic.
 };
 
 /// Stable name for logs / JSON.
 [[nodiscard]] const char* projectionName(Projection projection) noexcept;
+
+/// Largest horizontal field of view (deg) the eye-offset model can be
+/// inverted for at offset `d`: 2 acos(-d) minus a one degree guard band
+/// (179 deg at d = 0, 359 deg at d = 1).  Non-finite or out-of-range `d`
+/// is clamped to [0, 1] first.
+[[nodiscard]] double eyeOffsetMaxHfovDeg(double d) noexcept;
 
 /// The reframing camera.
 struct VirtualCamera {
@@ -39,17 +46,24 @@ struct VirtualCamera {
     double pitchDeg = 0.0;            ///< Rotation about +X (deg), positive looks up.
     double rollDeg = 0.0;             ///< Rotation about +Y (deg).
     double correctionAngleDeg = 0.0;  ///< Extra horizon roll offset composed with rollDeg (deg).
+    double eyeOffset = 0.0;           ///< Eye offset d in [0, 1] (Projection::EyeOffset only).
 
     /// Rotation mapping view rays into the body frame:
     /// Rz(yaw) * Rx(pitch) * Ry(roll + correctionAngle).
     [[nodiscard]] Mat3d rotation() const noexcept;
 
+    /// Field of view actually used by focalPx() / pixelToRay(): hfovDeg,
+    /// except that the eye-offset projection clamps it below
+    /// eyeOffsetMaxHfovDeg(eyeOffset) so the model stays invertible.
+    [[nodiscard]] double effectiveHfovDeg() const noexcept;
+
     /// Focal length in pixels for the current projection and hfov:
     ///   Rectilinear   : (W/2) / tan(hfov/2)
     ///   Fisheye       : (W/2) / (hfov/2 in rad)
     ///   Stereographic : (W/2) / (2 tan(hfov/4))
+    ///   EyeOffset     : (W/2) (d + cos(hfov/2)) / ((1 + d) sin(hfov/2))
     ///   Equirect      : W / (2 pi)
-    /// Returns 0 for a degenerate camera.
+    /// (hfov = effectiveHfovDeg()).  Returns 0 for a degenerate camera.
     [[nodiscard]] double focalPx() const noexcept;
 
     /// Map the pixel (px, py) (pixel index; 0.5 is added to hit the centre)

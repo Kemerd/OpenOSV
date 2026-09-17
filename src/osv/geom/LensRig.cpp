@@ -48,12 +48,54 @@ Result<KannalaBrandt5> buildLens(const meta::DewarpParams& params, const char* n
 
     // Focal length: either the camera's digital_focal_length (verified equal
     // to fx_cal * scale at 6K) or the scaled calibration values.
-    if (focalSource == FocalSource::DigitalFocalLength && std::isfinite(digitalFocalLength) &&
-        digitalFocalLength > 0.0) {
+    //
+    // digital_focal_length is only usable when it actually describes THIS
+    // stream.  The verified 6K invariant is digital_focal_length ==
+    // fx_cal * scale, and that is what makes the field trustworthy; when a
+    // clip carries a value that contradicts its own calibration by a wide
+    // margin the field is stale, not authoritative.
+    //
+    // The LRF proxy is exactly such a clip.  Its ClipMeta repeats the 6K
+    // camera's digital_focal_length (829.3612 px, correct for a 3000 px
+    // stream) verbatim, while its lens images are only 1024 px across and
+    // want roughly 283 px.  Taking the field at face value there builds a
+    // lens nearly three times too long: the fisheye circle collapses to a
+    // small disc in the middle of the equirect and the panorama is mostly
+    // empty.  Falling back to the calibration - which IS expressed in sensor
+    // pixels and is mapped through `scaling` to this exact stream - restores
+    // a correct rig for the proxy and cannot change the verified modes,
+    // where the two agree to a fraction of a percent.
+    //
+    // The tolerance is deliberately loose (a factor of 1.2 either way).  It
+    // is a staleness detector, not a precision check: real per-lens
+    // manufacturing spread against the shared digital_focal_length is well
+    // under a percent, while a wrong-resolution value is off by the ratio of
+    // the two stream sizes.
+    const double calFocalScaled = 0.5 * (params.fx + params.fy) * scaling.scale;
+    constexpr double kFocalAgreementTolerance = 1.2;
+    const bool dflUsable = std::isfinite(digitalFocalLength) && digitalFocalLength > 0.0;
+    const bool dflAgreesWithCalibration =
+        dflUsable && std::isfinite(calFocalScaled) && calFocalScaled > 0.0 &&
+        digitalFocalLength <= calFocalScaled * kFocalAgreementTolerance &&
+        digitalFocalLength >= calFocalScaled / kFocalAgreementTolerance;
+
+    if (focalSource == FocalSource::DigitalFocalLength && dflUsable && dflAgreesWithCalibration) {
         lens.fx = digitalFocalLength;
         lens.fy = digitalFocalLength;
         notes.push_back(std::format("{}: focal {:.4f} px from digital_focal_length (calibration * scale = {:.4f})",
-                                    name, digitalFocalLength, 0.5 * (params.fx + params.fy) * scaling.scale));
+                                    name, digitalFocalLength, calFocalScaled));
+    } else if (focalSource == FocalSource::DigitalFocalLength && dflUsable && !dflAgreesWithCalibration) {
+        // Stale or mis-scaled metadata: say so loudly (once per lens) and use
+        // the calibration, which is tied to this stream through `scaling`.
+        lens.fx *= scaling.scale;
+        lens.fy *= scaling.scale;
+        notes.push_back(std::format(
+            "{}: digital_focal_length {:.4f} px disagrees with calibration * scale {:.4f} px by {:.2f}x; "
+            "it does not describe this stream, using the scaled calibration focal {:.4f}/{:.4f} px",
+            name, digitalFocalLength, calFocalScaled, digitalFocalLength / calFocalScaled, lens.fx, lens.fy));
+        log::warn("LensRig: {} digital_focal_length {:.4f} does not match this stream (calibration * scale {:.4f}); "
+                  "using the scaled calibration focal",
+                  name, digitalFocalLength, calFocalScaled);
     } else {
         if (focalSource == FocalSource::DigitalFocalLength) {
             notes.push_back(std::format("{}: digital_focal_length unusable ({}), using scaled calibration focal",

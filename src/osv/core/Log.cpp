@@ -42,9 +42,22 @@ Level fromSpdlog(spdlog::level::level_enum level) {
 /// The logger used by the whole library.  Created lazily so static
 /// initialisation order never matters; writes to stderr so stdout stays free
 /// for machine readable output (JSON, raw frames over a pipe).
+///
+/// The logger is deliberately NOT put into spdlog's global registry.
+/// spdlog lives in its own DLL, so that registry is shared by every module in
+/// the process, and `spdlog::stderr_color_mt("osv")` THROWS
+/// spdlog_ex("logger with name 'osv' already exists") when a second module
+/// that statically links this library initialises its own copy.  That is not
+/// hypothetical: Premiere Pro loads the OpenOSV importer and the Open 360
+/// Reframe effect into one process, and a host can load and unload a plug-in
+/// repeatedly (spdlog.dll stays resident across the unload, so the stale
+/// registry entry outlives the module that made it).  Each module owning a
+/// private, unregistered logger is correct for every caller: the name is only
+/// used for spdlog's own lookup API, which nothing in this project uses.
 spdlog::logger& logger() {
     static std::shared_ptr<spdlog::logger> instance = [] {
-        auto l = spdlog::stderr_color_mt("osv");
+        auto sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
+        auto l = std::make_shared<spdlog::logger>("osv", std::move(sink));
         l->set_pattern("[%H:%M:%S.%e] [osv] [%^%l%$] %v");
         l->set_level(spdlog::level::info);
         return l;

@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -43,6 +44,8 @@ struct RenderOptions {
     std::string preset;
     double fov = 90.0;
     bool fovSet = false;
+    double distortion = 0.0;      ///< Eye offset d for --proj eye-offset (0..1)
+    bool distortionSet = false;
     double yaw = 0.0, pitch = 0.0, roll = 0.0, correction = 0.0;
     std::string size = "1920x1080";
     bool seamSearch = false;
@@ -193,6 +196,8 @@ int runRender(const RenderOptions& o) {
                 cam.projection = geom::Projection::Fisheye;
             } else if (proj == "stereographic") {
                 cam.projection = geom::Projection::Stereographic;
+            } else if (proj == "eye-offset") {
+                cam.projection = geom::Projection::EyeOffset;
             } else {
                 std::fprintf(stderr, "error: unknown --proj '%s'\n", log::safe(proj).c_str());
                 return kExitUsage;
@@ -201,6 +206,15 @@ int runRender(const RenderOptions& o) {
         if (o.fovSet || o.preset.empty()) {
             cam.hfovDeg = o.fov;
         }
+        // --distortion overrides the preset's eye offset; without a preset it
+        // is the offset of --proj eye-offset (and ignored by the other models).
+        if (o.distortionSet || o.preset.empty()) {
+            if (!std::isfinite(o.distortion) || o.distortion < 0.0 || o.distortion > 1.0) {
+                std::fprintf(stderr, "error: --distortion must be within 0..1\n");
+                return kExitUsage;
+            }
+            cam.eyeOffset = o.distortion;
+        }
         cam.yawDeg = o.yaw;
         cam.pitchDeg += o.pitch;
         cam.rollDeg = o.roll;
@@ -208,6 +222,12 @@ int runRender(const RenderOptions& o) {
         if (!cam.isValid()) {
             std::fprintf(stderr, "error: invalid virtual camera (check --fov)\n");
             return kExitUsage;
+        }
+        // The eye-offset model silently clamps its FOV; tell the user when
+        // the request was reduced so the framing is not a surprise.
+        if (cam.projection == geom::Projection::EyeOffset && cam.effectiveHfovDeg() < cam.hfovDeg) {
+            log::warn("--fov {:.1f} exceeds the eye-offset limit for distortion {:.2f}; using {:.1f} degrees",
+                      cam.hfovDeg, cam.eyeOffset, cam.effectiveHfovDeg());
         }
         builder.camera(cam);
     } else {
@@ -370,11 +390,16 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
 
     auto* outGeom = sub->add_option_group("Output");
     outGeom->add_option("--mode", opt->mode, "reframe|equirect|equirect-polar")->default_str("reframe");
-    outGeom->add_option("--proj", opt->proj, "rectilinear|fisheye|stereographic")->default_str("rectilinear");
+    outGeom->add_option("--proj", opt->proj, "rectilinear|fisheye|stereographic|eye-offset")->default_str("rectilinear");
     outGeom->add_option("--preset", opt->preset, "crystal-ball|asteroid|wide|ultra-wide|dewarping");
     outGeom->add_option("--fov", opt->fov, "Horizontal FOV in degrees")->default_val(90.0)->each([opt](const std::string&) {
         opt->fovSet = true;
     });
+    outGeom
+        ->add_option("--distortion", opt->distortion,
+                     "Eye offset for --proj eye-offset: 0 = rectilinear, 1 = stereographic (overrides the preset)")
+        ->default_val(0.0)
+        ->each([opt](const std::string&) { opt->distortionSet = true; });
     outGeom->add_option("--yaw", opt->yaw, "Pan angle (deg)")->default_val(0.0);
     outGeom->add_option("--pitch", opt->pitch, "Tilt angle (deg)")->default_val(0.0);
     outGeom->add_option("--roll", opt->roll, "Roll angle (deg)")->default_val(0.0);

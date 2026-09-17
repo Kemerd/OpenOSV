@@ -101,6 +101,12 @@ if(OSV_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
+# Premiere Pro plug-ins (importer .prm + reframe effect .aex).  Requires the
+# Adobe SDK paths validated by cmake/OsvPremiereSdk.cmake; see docs/PREMIERE.md.
+if(OSV_BUILD_PREMIERE)
+  add_subdirectory(plugins)
+endif()
+
 # -----------------------------------------------------------------------------
 #  Summary
 # -----------------------------------------------------------------------------
@@ -110,3 +116,4 @@ message(STATUS "  OpenCL backend : ${OSV_ENABLE_OPENCL}")
 message(STATUS "  Tests          : ${OSV_BUILD_TESTS}")
 message(STATUS "  Tools          : ${OSV_BUILD_TOOLS}")
 message(STATUS "  Sample clip    : ${OSV_SAMPLE_FILE}")
+message(STATUS "  Premiere plugs : ${OSV_BUILD_PREMIERE}")

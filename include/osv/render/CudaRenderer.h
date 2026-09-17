@@ -57,4 +57,14 @@ private:
     std::unique_ptr<Impl> m_impl;
 };
 
+/// Run the equirect reframe entry point (osvReframeEquirectPixel) on CUDA
+/// device `deviceIndex` for a host-resident source frame: uploads `pixels`
+/// (src.h rows of src.pitchBytes bytes), launches the kernel and reads the
+/// float RGBA result back.  Synchronous; every device allocation is released
+/// before returning.  This is the verification path that proves the device
+/// build of the shared function agrees with the CPU one; the Premiere effect
+/// runs the same kernel on the host's own buffers.
+Result<ImageRGBAf> cudaReframeEquirect(int deviceIndex, const OsvReframeParams& params, const OsvRgbaSource& src,
+                                       const void* pixels);
+
 }  // namespace osv::render

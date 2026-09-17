@@ -121,10 +121,16 @@ Result<OsvRenderParams> RenderParamsBuilder::buildParams() const {
         case geom::Projection::Rectilinear: p.projection = OSV_PROJ_RECTILINEAR; break;
         case geom::Projection::Fisheye: p.projection = OSV_PROJ_FISHEYE; break;
         case geom::Projection::Stereographic: p.projection = OSV_PROJ_STEREOGRAPHIC; break;
+        case geom::Projection::EyeOffset: p.projection = OSV_PROJ_EYE_OFFSET; break;
         case geom::Projection::Equirect: p.projection = OSV_PROJ_RECTILINEAR; break;  // handled above
         }
         p.focalPx = static_cast<float>(cam.focalPx());
-        const double halfH = deg2rad(cam.hfovDeg) * 0.5;
+        // The eye offset only matters for OSV_PROJ_EYE_OFFSET; the other
+        // projections ignore it and the value is clamped to the model's range.
+        p.eyeOffset = static_cast<float>(clampd(cam.eyeOffset, 0.0, 1.0));
+        // effectiveHfovDeg() equals hfovDeg except for the eye-offset model,
+        // which clamps itself below its asymptote.
+        const double halfH = deg2rad(cam.effectiveHfovDeg()) * 0.5;
         p.tanHalfH = static_cast<float>(std::tan(halfH));
         p.tanHalfV = static_cast<float>(std::tan(halfH) * static_cast<double>(cam.h) / static_cast<double>(cam.w));
         viewToBody = cam.rotation();

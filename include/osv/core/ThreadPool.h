@@ -40,6 +40,14 @@ public:
     /// Split [begin, end) into chunks of at most `grain` indices, run `body`
     /// on the workers (the calling thread also participates) and wait.
     /// Returns Internal if the body threw or the arguments are invalid.
+    ///
+    /// Safe to call from several threads at once: the pool runs one job at a
+    /// time and later callers queue behind the one in flight.  Hosts such as
+    /// Premiere Pro render on many threads and share a single pool, so this
+    /// must hold; without it two callers would publish rival jobs and a worker
+    /// could touch a Job whose owner had already returned and destroyed it.
+    /// Calling parallelFor from inside a body would self-deadlock and is not
+    /// supported (no caller in this project nests).
     Status parallelFor(std::size_t begin, std::size_t end, std::size_t grain, const ChunkBody& body);
 
     /// Convenience: parallelFor over rows with a per-row body.
@@ -61,12 +69,23 @@ private:
         std::atomic<bool> failed{false};
         std::string failureMessage;
         std::mutex failureMutex;
+        /// Workers that have taken this job out of m_currentJob and may still
+        /// be inside runChunks().  The owner cannot return until it is zero:
+        /// the Job lives on the owner's stack, so a worker still holding the
+        /// pointer would read chunk bounds from freed memory (and, because
+        /// the next caller's Job lands on the same address, would happily
+        /// render rows that belong to a different, possibly smaller frame).
+        std::atomic<int> workersInside{0};
     };
 
     void workerLoop();
     void runChunks(Job& job);
 
     std::vector<std::thread> m_workers;
+    /// Held for the whole of parallelFor so only one job is ever published.
+    /// Separate from m_mutex, which the workers take for short critical
+    /// sections; holding m_mutex across the wait would block them entirely.
+    std::mutex m_submitMutex;
     std::mutex m_mutex;
     std::condition_variable m_wake;
     std::condition_variable m_done;

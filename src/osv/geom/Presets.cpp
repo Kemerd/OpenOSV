@@ -52,6 +52,9 @@ void applyPreset(const Preset& preset, VirtualCamera& camera) noexcept {
     camera.projection = preset.projection;
     camera.hfovDeg = preset.hfovDeg;
     camera.pitchDeg = preset.pitchDeg;
+    // The offset is meaningful for the eye-offset projection only, but it is
+    // copied unconditionally so the camera mirrors the table exactly.
+    camera.eyeOffset = preset.eyeOffset;
 }
 
 }  // namespace osv::geom
