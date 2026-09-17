@@ -67,6 +67,30 @@ enum class InputEncoding : int {
 /// The curve constants for a fit.
 [[nodiscard]] const OsvDlogMCurve& dlogmCurve(DlogMFit fit) noexcept;
 
+/// The camera native primaries -> Rec.2020 matrix that pairs with a fit.
+///
+/// Curve and matrix are two halves of one camera characterisation and must be
+/// selected together: decoding with the Osmo 360 curve while converting with
+/// the Pocket 3 primaries mixes two different cameras' measurements. This is
+/// the single place that pairing is decided, so the two cannot drift apart.
+///
+///   * DlogMFit::Osmo360  -> kNativeToRec2020_Osmo360 (both fitted from DJI's
+///                           own Osmo 360 reference LUT: the curve from its
+///                           neutral axis, the matrix from its other 35904
+///                           entries).
+///   * DlogMFit::Pocket3  -> kNativeToRec2020_Pocket3 (the public Pocket 3
+///                           curve with the Pocket 3 chart fit, still
+///                           reachable as `--fit pocket3`).
+///   * DlogMFit::DjiRefit -> kNativeToRec2020_Pocket3, because that is the
+///                           matrix it shipped and rendered against; the whole
+///                           point of keeping this fit is bit-stable output
+///                           for projects already graded on it, which a matrix
+///                           change would break.
+///
+/// An out-of-range fit (a corrupt persisted preference byte) returns the
+/// default matrix rather than an arbitrary one, matching dlogmCurve.
+[[nodiscard]] const OsvMat3f& nativeToWorkingForFit(DlogMFit fit) noexcept;
+
 /**
  * @brief Build the kernel parameter block.
  *

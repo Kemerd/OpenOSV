@@ -16,12 +16,100 @@ inline constexpr OsvMat3f kIdentity3 = {{1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0
 
 /// Camera native primaries (DJI D-Log M, Pocket 3 fit) -> Rec.2020 linear.
 /// Derived from a least-squares fit of the Pocket 3 colour chart against a
-/// Rec.2020 reference; reused for the Osmo 360 which shares the D-Log M
-/// definition.  Rows sum to 1.
+/// Rec.2020 reference.  Rows sum to 1.
+///
+/// This was the Osmo 360 default until kNativeToRec2020_Osmo360 below was
+/// fitted, on the assumption that a shared D-Log M curve implied shared
+/// primaries.  It does not: measured against DJI's own Osmo 360 reference LUT
+/// this matrix carries more than twice the full-cube error of the Osmo 360
+/// fit (0.0947 vs 0.0450 RMS in HLG code units).  It is kept because it is the
+/// provenance record of what shipped, because other DJI bodies may genuinely
+/// use these primaries, and because a project already graded against it must
+/// keep rendering the same way (`--fit pocket3`).
+///
+/// It is also not physically realisable as a set of camera primaries: its
+/// implied blue primary lands at x = 0.1417, y = -0.0809 with luminance
+/// Y = -0.0851.  A negative-luminance primary cannot exist, which is a second,
+/// independent reason not to use it for the Osmo 360.  scripts/fit_primaries.py
+/// prints this check for both matrices.
 inline constexpr OsvMat3f kNativeToRec2020_Pocket3 = {{
     0.785301f, 0.178838f, 0.035860f,
     -0.036655f, 1.258089f, -0.221434f,
     -0.014322f, 0.077260f, 0.937062f,
+}};
+
+/// Osmo 360 camera native primaries -> Rec.2020 linear.  The default matrix,
+/// paired with kDlogMOsmo360 (see osv::color::nativeToWorkingForFit).
+///
+/// Provenance: produced by
+///     python scripts/fit_primaries.py \
+///         --from-cube DJI_Osmo360_DLogM_to_Rec709.cube
+/// which measures all 35937 entries of DJI's own Osmo 360 D-Log M -> Rec.709
+/// LUT.  Only these nine constants are shipped; no LUT data from that file is
+/// redistributed (see NOTICE).  The tone curve kDlogMOsmo360 was fitted from
+/// the same file's 33 neutral-axis entries; this matrix comes from the other
+/// 35904, which is where the gamut information lives.
+///
+/// Why a tone curve cannot supply this: a per-channel curve can never move
+/// energy between channels, yet the reference plainly does - a red-only input
+/// of 0.500 renders as (0.6071, 0.0000, 0.0534), leaking 0.053 into blue, and
+/// a blue-only 0.500 renders as (0.0066, 0.0000, 0.6201), leaking into red.
+/// Cross-channel terms of that shape are exactly what a primaries matrix
+/// produces, so they are recoverable from the file by inverting the output
+/// transform and solving for the 3x3.
+///
+/// Method (the algebra is spelled out in scripts/fit_primaries.py): for every
+/// entry, decode the input codes to native linear with kDlogMOsmo360, then
+/// least-squares solve the 3x3 against the reference output through the exact
+/// forward chain this header's matrices feed -
+///     native -> M -> x sceneScale -> kRec2020ToRec709 -> HLG OETF -> clamp
+/// - minimising the residual in output HLG code units (not in scene-linear,
+/// which would over-weight highlights by orders of magnitude because the HLG
+/// OETF is log-like).  Six free parameters: the third column of each row is
+/// parameterised as 1 - a - b so unit row sums hold identically rather than
+/// approximately.  Four spread-out starts all converge to this basin, with an
+/// RMS spread of 5e-5.
+///
+/// Results against that reference, in HLG code units, Pocket 3 -> this matrix:
+///   full cube (35937 entries) : 0.094685 -> 0.044988 RMS (52.5 % lower),
+///                               worst 0.603319 -> 0.262716;
+///   saturated entries (83.9 %): 0.100171 -> 0.046485 RMS (53.6 % lower);
+///   neutral axis (33 entries) : 0.023251 -> 0.023251 RMS, i.e. unchanged.
+///
+/// The neutral axis is unchanged *necessarily*, not coincidentally.  For a
+/// neutral native triple (L, L, L) and any matrix whose rows sum to 1,
+///     (M * (L, L, L))[j] = L * (M[j][0] + M[j][1] + M[j][2]) = L,
+/// so M acts as the identity on neutrals and the output depends only on the
+/// tone curve.  Swapping one unit-row-sum matrix for another therefore cannot
+/// move 18 % grey off HLG 0.380 or disturb any BT.2408 anchor; the measured
+/// swing over the reference's neutral axis is 4.1e-7, which is float round-off
+/// in the two matrix products.  tests/unit/test_color.cpp asserts this rather
+/// than assuming it.
+///
+/// Physically plausible, checked rather than asserted: determinant +0.873348,
+/// diagonal (0.8073, 0.9907, 1.1039) all positive, rows summing to 1 exactly
+/// in float32, and implied native primaries at R x=0.6914 y=0.3206,
+/// G x=0.2616 y=0.8225, B x=0.1448 y=0.0372 - a gamut a little wider than
+/// Rec.709 and a little narrower than Rec.2020, which is what a 1/1.7"-class
+/// sensor should look like.  All three primaries have positive luminance,
+/// unlike kNativeToRec2020_Pocket3.  The white point lands on D65 exactly,
+/// which the unit row sums guarantee.
+///
+/// What this does NOT fit, stated plainly: about 37 % of the reference's
+/// entries sit on the 0 or 1 output boundary and roughly 71 % of the cube is
+/// outside the Rec.709 output gamut, so on most saturated entries DJI's table
+/// holds a *gamut-mapped* value rather than a matrixed one - deeply saturated
+/// reds retain ~0.27 of green where a matrix plus clamp yields 0.  No 3x3 can
+/// reproduce that, because it is not a linear operation, and those entries
+/// dominate the residual worst case (0.2627) and always will.  Restricting the
+/// fit to the ~24 % of entries that are clean on both sides does not improve
+/// it, which is the evidence that the remaining error is DJI's gamut
+/// compression and not a mis-fitted matrix.  Reproducing that compression is
+/// out of scope for a primaries matrix and is not claimed here.
+inline constexpr OsvMat3f kNativeToRec2020_Osmo360 = {{
+    0.807268560f, 0.152663648f, 0.040067792f,
+    0.042878162f, 0.990737677f, -0.033615828f,
+    -0.009603872f, -0.094263740f, 1.103867650f,
 }};
 
 /// Rec.2020 linear -> Rec.709 linear (BT.2087 / derived from the primaries).

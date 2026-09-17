@@ -437,10 +437,22 @@ TEST_CASE("D-Log M inverse round trip", "[color]") {
 //  Matrices
 // -----------------------------------------------------------------------------
 TEST_CASE("Colour matrices preserve white", "[color]") {
-    for (const OsvMat3f* m : {&kNativeToRec2020_Pocket3, &kRec2020ToRec709, &kRec709ToRec2020, &kIdentity3}) {
+    for (const OsvMat3f* m : {&kNativeToRec2020_Pocket3, &kNativeToRec2020_Osmo360, &kRec2020ToRec709,
+                              &kRec709ToRec2020, &kIdentity3}) {
         for (int row = 0; row < 3; ++row) {
             REQUIRE_THAT(static_cast<double>(mat3RowSum(*m, row)), WithinAbs(1.0, 2e-6));
         }
+    }
+    // The Osmo 360 matrix is held to a far tighter tolerance than the 2e-6
+    // above, because scripts/fit_primaries.py derives each row's third entry
+    // as 1 - a - b *in float32*.  The row sums are therefore not merely close
+    // to 1, they are bit-exact, and this asserts that the shipped constants
+    // were produced that way.  It is the property the neutral-axis invariance
+    // below rests on, so it is worth pinning precisely: the other matrices are
+    // published constants rounded to six decimals and cannot meet it
+    // (kNativeToRec2020_Pocket3's first row sums to 0.999999).
+    for (int row = 0; row < 3; ++row) {
+        REQUIRE_THAT(static_cast<double>(mat3RowSum(kNativeToRec2020_Osmo360, row)), WithinAbs(1.0, 1e-9));
     }
     // 2020 -> 709 -> 2020 is (nearly) identity.
     const OsvMat3f rt = mat3Mul(kRec709ToRec2020, kRec2020ToRec709);
@@ -456,6 +468,380 @@ TEST_CASE("Colour matrices preserve white", "[color]") {
     // Null matrix is identity (defensive path).
     osvMat3Apply(nullptr, 0.1f, 0.2f, 0.3f, rgb);
     REQUIRE(rgb[2] == 0.3f);
+}
+
+TEST_CASE("Native primaries matrices are physically plausible", "[color]") {
+    // A primaries matrix has to be more than a low-residual fit: it has to be
+    // a transform a real camera could have.  These are the checks
+    // scripts/fit_primaries.py refuses to emit constants without.
+    for (const OsvMat3f* m : {&kNativeToRec2020_Pocket3, &kNativeToRec2020_Osmo360}) {
+        // Each channel must respond positively to its own primary, or a
+        // channel has been swapped or inverted somewhere in the fit.
+        REQUIRE(m->m[0] > 0.0f);
+        REQUIRE(m->m[4] > 0.0f);
+        REQUIRE(m->m[8] > 0.0f);
+        // Invertible and orientation-preserving, so a round trip exists (the
+        // .cube tests rely on inverting this matrix) and the gamut is not
+        // mirrored.  mat3Inverse returns false exactly when |det| is tiny.
+        OsvMat3f inverse{};
+        REQUIRE(mat3Inverse(*m, inverse));
+        const float det = m->m[0] * (m->m[4] * m->m[8] - m->m[5] * m->m[7]) -
+                          m->m[1] * (m->m[3] * m->m[8] - m->m[5] * m->m[6]) +
+                          m->m[2] * (m->m[3] * m->m[7] - m->m[4] * m->m[6]);
+        REQUIRE(det > 0.0f);
+        // Round trip through the inverse returns an arbitrary colour.
+        float mid[3];
+        float back[3];
+        osvMat3Apply(m, 0.31f, 0.47f, 0.22f, mid);
+        osvMat3Apply(&inverse, mid[0], mid[1], mid[2], back);
+        REQUIRE_THAT(back[0], WithinAbs(0.31, 2e-5));
+        REQUIRE_THAT(back[1], WithinAbs(0.47, 2e-5));
+        REQUIRE_THAT(back[2], WithinAbs(0.22, 2e-5));
+    }
+    // Determinants, pinned to the values the fit report quotes.
+    const auto determinant = [](const OsvMat3f& m) {
+        return static_cast<double>(m.m[0]) * (static_cast<double>(m.m[4]) * m.m[8] - static_cast<double>(m.m[5]) * m.m[7]) -
+               static_cast<double>(m.m[1]) * (static_cast<double>(m.m[3]) * m.m[8] - static_cast<double>(m.m[5]) * m.m[6]) +
+               static_cast<double>(m.m[2]) * (static_cast<double>(m.m[3]) * m.m[7] - static_cast<double>(m.m[4]) * m.m[6]);
+    };
+    REQUIRE_THAT(determinant(kNativeToRec2020_Osmo360), WithinAbs(0.873348, 1e-5));
+    REQUIRE_THAT(determinant(kNativeToRec2020_Pocket3), WithinAbs(0.946487, 1e-5));
+
+    // The implied native primaries, as CIE chromaticities.  Column i of
+    // (Rec.2020 RGB -> XYZ) * M is the XYZ of native primary i, because native
+    // primary i is the unit vector for that channel.
+    //
+    // This is where the two matrices genuinely differ in kind, not just in
+    // residual: kNativeToRec2020_Pocket3's blue primary lands at y = -0.081
+    // with luminance Y = -0.085.  A primary cannot have negative luminance, so
+    // that matrix is not realisable as a camera at all, whatever it fits.  The
+    // Osmo 360 fit's three primaries all have positive luminance.
+    constexpr float kRgb2020ToXyz[9] = {
+        0.6369580f, 0.1446169f, 0.1688810f,
+        0.2627002f, 0.6779981f, 0.0593017f,
+        0.0000000f, 0.0280727f, 1.0609851f,
+    };
+    const OsvMat3f toXyz = {{kRgb2020ToXyz[0], kRgb2020ToXyz[1], kRgb2020ToXyz[2], kRgb2020ToXyz[3],
+                             kRgb2020ToXyz[4], kRgb2020ToXyz[5], kRgb2020ToXyz[6], kRgb2020ToXyz[7],
+                             kRgb2020ToXyz[8]}};
+
+    /// Chromaticity (x, y) and luminance Y of native primary `channel`.
+    const auto primary = [&toXyz](const OsvMat3f& native, int channel) {
+        // The unit vector for `channel` in native space, pushed to XYZ.
+        const float unit[3] = {channel == 0 ? 1.0f : 0.0f, channel == 1 ? 1.0f : 0.0f, channel == 2 ? 1.0f : 0.0f};
+        float in2020[3];
+        float xyz[3];
+        osvMat3Apply(&native, unit[0], unit[1], unit[2], in2020);
+        osvMat3Apply(&toXyz, in2020[0], in2020[1], in2020[2], xyz);
+        const float sum = xyz[0] + xyz[1] + xyz[2];
+        // Defensive: a degenerate primary would divide by ~0.  Neither shipped
+        // matrix does, and a future one that did should fail loudly here.
+        REQUIRE(std::fabs(sum) > 1e-6f);
+        return std::array<double, 3>{xyz[0] / sum, xyz[1] / sum, xyz[1]};
+    };
+
+    // Osmo 360: every primary has positive luminance and a chromaticity inside
+    // the unit triangle, i.e. it is a physically realisable set of primaries.
+    // Values from the fit report (scripts/fit_primaries.py).
+    const std::array<std::array<double, 2>, 3> kOsmoXy = {{{0.6914, 0.3206}, {0.2616, 0.8225}, {0.1448, 0.0372}}};
+    for (int ch = 0; ch < 3; ++ch) {
+        const std::array<double, 3> p = primary(kNativeToRec2020_Osmo360, ch);
+        REQUIRE_THAT(p[0], WithinAbs(kOsmoXy[static_cast<std::size_t>(ch)][0], 1e-3));
+        REQUIRE_THAT(p[1], WithinAbs(kOsmoXy[static_cast<std::size_t>(ch)][1], 1e-3));
+        REQUIRE(p[2] > 0.0);       // positive luminance
+        REQUIRE(p[1] >= 0.0);      // inside the chromaticity diagram
+        REQUIRE(p[1] <= 1.0);
+    }
+    // The implied gamut sits between Rec.709 and Rec.2020, which is what a
+    // 1/1.7"-class sensor with a real colour filter array should look like:
+    // red less saturated than Rec.2020's 0.708 but more than Rec.709's 0.640,
+    // and green well inside Rec.2020's 0.170 x-coordinate.
+    REQUIRE(primary(kNativeToRec2020_Osmo360, 0)[0] > 0.640);
+    REQUIRE(primary(kNativeToRec2020_Osmo360, 0)[0] < 0.708);
+    REQUIRE(primary(kNativeToRec2020_Osmo360, 1)[0] > 0.170);
+
+    // And the documented counter-example, asserted so the claim in
+    // Matrices.h cannot rot: the Pocket 3 blue primary is unphysical.
+    const std::array<double, 3> p3Blue = primary(kNativeToRec2020_Pocket3, 2);
+    REQUIRE(p3Blue[1] < 0.0);
+    REQUIRE(p3Blue[2] < 0.0);
+
+    // White preservation, stated as a colour rather than as a row sum: an
+    // equal-energy native triple must stay equal-energy, which is the property
+    // the neutral-axis invariance below is built on.
+    for (const OsvMat3f* m : {&kNativeToRec2020_Pocket3, &kNativeToRec2020_Osmo360}) {
+        float white[3];
+        osvMat3Apply(m, 0.18f, 0.18f, 0.18f, white);
+        REQUIRE_THAT(white[0], WithinAbs(0.18, 2e-7));
+        REQUIRE_THAT(white[1], WithinAbs(0.18, 2e-7));
+        REQUIRE_THAT(white[2], WithinAbs(0.18, 2e-7));
+    }
+}
+
+TEST_CASE("Swapping the primaries matrix cannot move the neutral axis", "[color]") {
+    // The proof, then the measurement.
+    //
+    // For a neutral native triple (L, L, L) and any matrix M whose rows sum to
+    // 1, the j-th working channel is
+    //     (M * (L, L, L))[j] = L * (M[j][0] + M[j][1] + M[j][2]) = L * 1 = L,
+    // so M acts as the identity on neutrals and every later stage of
+    // osvLinearToOutput sees exactly the value it would have seen with the
+    // identity matrix.  The output on the neutral axis therefore depends only
+    // on the D-Log M curve, never on the primaries matrix.
+    //
+    // That is why the tone-curve fit (scripts/fit_dlogm.py, the LUT diagonal)
+    // and the primaries fit (scripts/fit_primaries.py, the other 35904
+    // entries) are genuinely separable, and why replacing the Pocket 3 matrix
+    // with the Osmo 360 one could not have disturbed 18 % grey or any BT.2408
+    // anchor even in principle.
+    //
+    // The residual difference below is not a modelling difference but the
+    // arithmetic, and it is worth being precise about where it comes from.
+    // kNativeToRec2020_Pocket3 is a set of published constants rounded to six
+    // decimals, so its first row sums to 0.999999 rather than 1: it scales a
+    // neutral by 1 - 1e-6 all by itself.  kNativeToRec2020_Osmo360 has no such
+    // error (its rows sum to 1 bit-exactly in float32, asserted above), so the
+    // whole difference is the Pocket 3 rounding, and its size depends on the
+    // transfer.  Measured worst |difference| over 65 grey codes in float32:
+    //
+    //   HLG     2.98e-07   the log branch's slope (~0.18 at diffuse white)
+    //   Rec.709 4.17e-07   compresses the relative error
+    //   Linear  3.82e-06   no OETF at all, so the 1e-6 relative error lands
+    //                      full-size on a scene-linear value reaching 3.76
+    //   PQ      6.56e-06   the worst case: the HLG OOTF's Ys^(gamma-1) = Ys^0.2
+    //                      raises the relative error by a further factor, and
+    //                      the PQ inverse EOTF's y^0.1593 is steep near black
+    //
+    // So one bound is stated per transfer from the measurement, rather than a
+    // single loose number that would hide a real regression in HLG behind PQ's
+    // headroom.  Against the identity matrix, which shares the Osmo 360
+    // matrix's exact unit row sums, all four transfers agree to 2.4e-07 or
+    // better (PQ agrees bit-exactly), which is the invariance itself.
+    for (const OutputTransfer transfer :
+         {OutputTransfer::HLG, OutputTransfer::PQ, OutputTransfer::Rec709, OutputTransfer::Linear}) {
+        // Per-transfer bound against the Pocket 3 matrix, from the measured
+        // table above with roughly 1.5x slack so float arithmetic cannot make
+        // it flap.
+        const double vsPocket3 = (transfer == OutputTransfer::PQ)       ? 1.0e-5
+                                 : (transfer == OutputTransfer::Linear) ? 6.0e-6
+                                                                        : 1.0e-6;
+        // Same curve both times: only the matrix differs, which is exactly the
+        // swap this change made.  Building the blocks by hand rather than via
+        // two different fits keeps the curve out of the comparison.
+        OsvColorParams withPocket3 = makeColorParams(DlogMFit::Osmo360, transfer, 0.0f);
+        OsvColorParams withOsmo360 = withPocket3;
+        for (int i = 0; i < 9; ++i) {
+            withPocket3.nativeToWorking.m[i] = kNativeToRec2020_Pocket3.m[i];
+            withOsmo360.nativeToWorking.m[i] = kNativeToRec2020_Osmo360.m[i];
+        }
+        // The sharper form of the same claim: against the *identity* matrix,
+        // which has exact unit row sums, the Osmo 360 matrix must agree to
+        // float epsilon, because the row-sum property makes them the same
+        // function on a neutral.  This isolates the new matrix from the Pocket
+        // 3 constants' rounding and is the real assertion of the invariance.
+        OsvColorParams withIdentity = withPocket3;
+        for (int i = 0; i < 9; ++i) {
+            withIdentity.nativeToWorking.m[i] = kIdentity3.m[i];
+        }
+        for (int i = 0; i <= 64; ++i) {
+            const float code = static_cast<float>(i) / 64.0f;
+            const double osmo = static_cast<double>(greyThrough(withOsmo360, code));
+            const double identity = static_cast<double>(greyThrough(withIdentity, code));
+            const double pocket3 = static_cast<double>(greyThrough(withPocket3, code));
+            // Against the identity: both matrices have exact unit row sums, so
+            // this is the invariance itself, and it holds to float epsilon on
+            // every transfer including Linear (measured worst 2.4e-07).
+            REQUIRE_THAT(osmo, WithinAbs(identity, 5e-7));
+            // Against the matrix actually replaced: bounded by the Pocket 3
+            // constants' 1e-6 row-sum rounding propagated through this
+            // transfer, per the measured table above.
+            REQUIRE_THAT(osmo, WithinAbs(pocket3, vsPocket3));
+        }
+    }
+
+    // The BT.2408 anchors themselves, through the shipped default pairing
+    // (Osmo 360 curve + Osmo 360 matrix): 18 % grey at code 0.400 lands on
+    // HLG 0.380 and the matrix swap did not move it.
+    const OsvColorParams hlg = makeColorParams(DlogMFit::Osmo360, OutputTransfer::HLG, 0.0f);
+    REQUIRE_THAT(static_cast<double>(greyThrough(hlg, 0.40f)), WithinAbs(0.380, 1e-4));
+    // Rec.709 output is the same function of the code on the neutral axis
+    // (it is the HLG signal in Rec.709 primaries), which is the identity the
+    // curve fit relies on.
+    const OsvColorParams sdr = makeColorParams(DlogMFit::Osmo360, OutputTransfer::Rec709, 0.0f);
+    REQUIRE_THAT(static_cast<double>(greyThrough(sdr, 0.40f)), WithinAbs(0.380, 1e-4));
+    for (int i = 0; i <= 32; ++i) {
+        const float code = static_cast<float>(i) / 32.0f;
+        REQUIRE_THAT(static_cast<double>(greyThrough(sdr, code)),
+                     WithinAbs(static_cast<double>(greyThrough(hlg, code)), 2e-6));
+    }
+}
+
+TEST_CASE("Curve and primaries matrix are selected together", "[color]") {
+    // Curve and matrix are two halves of one camera characterisation.  Mixing
+    // them (Osmo 360 curve with Pocket 3 primaries, as shipped before the
+    // primaries fit existed) is a silent error: the neutral axis looks right
+    // because of the row-sum property, so nothing but a saturated colour
+    // reveals it.  nativeToWorkingForFit is the single place the pairing is
+    // decided and this pins it.
+    REQUIRE(&nativeToWorkingForFit(DlogMFit::Osmo360) == &kNativeToRec2020_Osmo360);
+    REQUIRE(&nativeToWorkingForFit(DlogMFit::Pocket3) == &kNativeToRec2020_Pocket3);
+    // DjiRefit deliberately keeps the matrix it shipped and was graded with:
+    // its entire reason for still existing is bit-stable output for projects
+    // already graded on it, which a primaries change would break.
+    REQUIRE(&nativeToWorkingForFit(DlogMFit::DjiRefit) == &kNativeToRec2020_Pocket3);
+    // A corrupt persisted preference byte falls back to the default pairing
+    // rather than an arbitrary one, matching dlogmCurve's behaviour.
+    REQUIRE(&nativeToWorkingForFit(static_cast<DlogMFit>(99)) == &kNativeToRec2020_Osmo360);
+    REQUIRE(&dlogmCurve(static_cast<DlogMFit>(99)) == &kDlogMOsmo360);
+
+    // makeColorParams must actually install the paired matrix for D-Log M
+    // input, so selecting a fit through the CLI or a preference blob cannot
+    // produce a mixed pipeline.
+    const auto matrixOf = [](DlogMFit fit) {
+        const OsvColorParams p = makeColorParams(fit, OutputTransfer::PQ, 0.0f, InputEncoding::DLogM);
+        return p.nativeToWorking;
+    };
+    for (const DlogMFit fit : {DlogMFit::Osmo360, DlogMFit::Pocket3, DlogMFit::DjiRefit}) {
+        const OsvMat3f got = matrixOf(fit);
+        const OsvMat3f& want = nativeToWorkingForFit(fit);
+        for (int i = 0; i < 9; ++i) {
+            REQUIRE(got.m[i] == want.m[i]);
+        }
+        // ...and the curve stays paired with it.
+        const OsvColorParams p = makeColorParams(fit, OutputTransfer::PQ, 0.0f, InputEncoding::DLogM);
+        REQUIRE(p.curve.scale == dlogmCurve(fit).scale);
+    }
+    // The default really is the Osmo 360 pairing.
+    REQUIRE(kDefaultDlogMFit == DlogMFit::Osmo360);
+    const OsvColorParams def = makeColorParams(kDefaultDlogMFit, OutputTransfer::PQ, 0.0f);
+    for (int i = 0; i < 9; ++i) {
+        REQUIRE(def.nativeToWorking.m[i] == kNativeToRec2020_Osmo360.m[i]);
+    }
+
+    // The non-D-Log-M input encodings are unaffected: their primaries are a
+    // property of the signal, not of a camera fit, so they must NOT follow the
+    // selected curve.
+    const OsvColorParams fromHlg = makeColorParams(DlogMFit::Osmo360, OutputTransfer::PQ, 0.0f, InputEncoding::HLG);
+    const OsvColorParams from709 =
+        makeColorParams(DlogMFit::Osmo360, OutputTransfer::PQ, 0.0f, InputEncoding::Rec709Normal);
+    for (int i = 0; i < 9; ++i) {
+        REQUIRE(fromHlg.nativeToWorking.m[i] == kIdentity3.m[i]);
+        REQUIRE(from709.nativeToWorking.m[i] == kRec709ToRec2020.m[i]);
+    }
+}
+
+TEST_CASE("Osmo 360 primaries beat the Pocket 3 fit on saturated colour", "[color]") {
+    // Measured reference points from DJI's own Osmo 360 D-Log M -> Rec.709
+    // LUT (A:\...\DJI_Osmo360_DLogM_to_Rec709.cube, 33^3), read with
+    // scripts/fit_primaries.py and recorded here so this test runs without the
+    // file on disk.
+    //
+    // These are 22 of that file's 35937 entries: measurements of a colour
+    // transform, kept as the provenance record of the fitted matrix, exactly as
+    // kOsmo360Rec709Table above keeps the diagonal for the curve fit.  No LUT
+    // data is redistributed (see NOTICE).
+    //
+    // They are deliberately chosen to be *saturated* and *unclipped on both
+    // sides*: every one has a channel more than 0.15 from the mean of the
+    // three, and none sits on the 0/1 output boundary or drives our model
+    // outside the Rec.709 gamut.  That matters because 37 % of the reference
+    // is on the boundary and ~71 % of the cube is outside the output gamut,
+    // where a clamp rather than the matrix decides the result and neither
+    // matrix can be judged.  The selection is spread across the three
+    // dominant-channel buckets so it cannot be a flattering cherry-pick of
+    // hues: the matrix wins on 20 of the 22 individually.
+    struct Sample {
+        std::array<float, 3> code;
+        std::array<double, 3> rec709;
+    };
+    constexpr std::array<Sample, 22> kSamples = {{
+        {{0.62500f, 0.25000f, 0.37500f}, {0.734742, 0.128135, 0.353748}},
+        {{0.75000f, 0.25000f, 0.37500f}, {0.875604, 0.114016, 0.327522}},
+        {{0.62500f, 0.37500f, 0.37500f}, {0.712383, 0.299565, 0.310041}},
+        {{0.87500f, 0.50000f, 0.37500f}, {0.983900, 0.310774, 0.179433}},
+        {{0.37500f, 0.62500f, 0.37500f}, {0.210855, 0.663970, 0.243471}},
+        {{0.75000f, 0.62500f, 0.37500f}, {0.836332, 0.605795, 0.186599}},
+        {{0.50000f, 0.75000f, 0.50000f}, {0.290196, 0.820063, 0.337178}},
+        {{0.87500f, 0.75000f, 0.50000f}, {0.948666, 0.742653, 0.243134}},
+        {{0.25000f, 0.25000f, 0.62500f}, {0.218554, 0.143186, 0.764164}},
+        {{0.50000f, 0.25000f, 0.62500f}, {0.574545, 0.113522, 0.743723}},
+        {{0.37500f, 0.37500f, 0.62500f}, {0.369531, 0.322296, 0.737029}},
+        {{0.37500f, 0.62500f, 0.62500f}, {0.191846, 0.655587, 0.658080}},
+        {{0.62500f, 0.87500f, 0.62500f}, {0.330228, 0.936254, 0.408527}},
+        {{0.37500f, 0.37500f, 0.75000f}, {0.368656, 0.282344, 0.913875}},
+        {{0.62500f, 0.37500f, 0.75000f}, {0.718066, 0.228421, 0.891438}},
+        {{0.75000f, 0.37500f, 0.75000f}, {0.875390, 0.190519, 0.859939}},
+        {{0.75000f, 0.50000f, 0.75000f}, {0.864411, 0.377064, 0.853279}},
+        {{0.37500f, 0.62500f, 0.75000f}, {0.134973, 0.643534, 0.876377}},
+        {{0.50000f, 0.75000f, 0.75000f}, {0.260995, 0.808513, 0.810544}},
+        {{0.75000f, 0.37500f, 0.87500f}, {0.873800, 0.112818, 0.985493}},
+        {{0.62500f, 0.50000f, 0.87500f}, {0.701642, 0.354893, 0.998222}},
+        {{0.62500f, 0.87500f, 0.87500f}, {0.287191, 0.927406, 0.928881}},
+    }};
+
+    // Both blocks decode with the Osmo 360 curve; only the primaries matrix
+    // differs, so the comparison isolates the matrix.
+    OsvColorParams withOsmo360 = makeColorParams(DlogMFit::Osmo360, OutputTransfer::Rec709, 0.0f);
+    OsvColorParams withPocket3 = withOsmo360;
+    for (int i = 0; i < 9; ++i) {
+        withPocket3.nativeToWorking.m[i] = kNativeToRec2020_Pocket3.m[i];
+    }
+    // Sanity: the default block really carries the Osmo 360 matrix, or this
+    // test would be comparing Pocket 3 against itself and passing vacuously.
+    for (int i = 0; i < 9; ++i) {
+        REQUIRE(withOsmo360.nativeToWorking.m[i] == kNativeToRec2020_Osmo360.m[i]);
+    }
+
+    double sumSqOsmo = 0.0;
+    double sumSqPocket = 0.0;
+    double worstOsmo = 0.0;
+    double worstPocket = 0.0;
+    int osmoWins = 0;
+    for (const Sample& s : kSamples) {
+        float gotOsmo[3];
+        float gotPocket[3];
+        osvCodeToOutput(&withOsmo360, s.code.data(), gotOsmo);
+        osvCodeToOutput(&withPocket3, s.code.data(), gotPocket);
+        double sampleWorstOsmo = 0.0;
+        double sampleWorstPocket = 0.0;
+        for (int ch = 0; ch < 3; ++ch) {
+            const double want = s.rec709[static_cast<std::size_t>(ch)];
+            const double dOsmo = std::fabs(static_cast<double>(gotOsmo[ch]) - want);
+            const double dPocket = std::fabs(static_cast<double>(gotPocket[ch]) - want);
+            sumSqOsmo += dOsmo * dOsmo;
+            sumSqPocket += dPocket * dPocket;
+            sampleWorstOsmo = std::max(sampleWorstOsmo, dOsmo);
+            sampleWorstPocket = std::max(sampleWorstPocket, dPocket);
+        }
+        worstOsmo = std::max(worstOsmo, sampleWorstOsmo);
+        worstPocket = std::max(worstPocket, sampleWorstPocket);
+        if (sampleWorstOsmo < sampleWorstPocket) {
+            ++osmoWins;
+        }
+    }
+    const double n = static_cast<double>(kSamples.size() * 3);
+    const double rmsOsmo = std::sqrt(sumSqOsmo / n);
+    const double rmsPocket = std::sqrt(sumSqPocket / n);
+
+    // The margin measured when the matrix was fitted, asserted with slack so
+    // float arithmetic cannot make it flap, but tight enough that losing the
+    // improvement fails the build:
+    //   Pocket 3  RMS 0.126962  worst 0.377064
+    //   Osmo 360  RMS 0.050495  worst 0.142238   (RMS ratio 0.398)
+    REQUIRE(rmsPocket > 0.12);
+    REQUIRE(rmsOsmo < 0.055);
+    REQUIRE(rmsOsmo < 0.45 * rmsPocket);
+    REQUIRE(worstOsmo < 0.15);
+    REQUIRE(worstPocket > 0.37);
+    // Not an artefact of averaging: the fit is better on almost every
+    // individual sample, across all three hue buckets.
+    REQUIRE(osmoWins >= 20);
+
+    // The whole-cube figure the fit report quotes for context (full 33^3,
+    // HLG code units): Pocket 3 0.094685 RMS / 0.603319 worst against
+    // Osmo 360 0.044988 / 0.262716.  That number cannot be recomputed here
+    // without the reference file, so it lives in the fit report and in
+    // Matrices.h; this test pins the saturated subset that carries it.
 }
 
 // -----------------------------------------------------------------------------
@@ -663,21 +1049,59 @@ TEST_CASE("Kernel math matches the float64 golden reference", "[color]") {
         checkGrey(key, fit, "pq", OutputTransfer::PQ);
         checkGrey(key, fit, "rec709", OutputTransfer::Rec709);
     }
-    for (const auto& spot : j.at("pipeline_rgb_dji_refit")) {
-        const float in[3] = {spot.at("code")[0].get<float>(), spot.at("code")[1].get<float>(),
-                             spot.at("code")[2].get<float>()};
-        for (const auto& [name, transfer] : {std::pair{"hlg", OutputTransfer::HLG}, std::pair{"pq", OutputTransfer::PQ},
-                                             std::pair{"rec709", OutputTransfer::Rec709},
-                                             std::pair{"linear", OutputTransfer::Linear}}) {
-            const OsvColorParams p = makeColorParams(DlogMFit::DjiRefit, transfer, 0.0f);
-            float out[3];
-            osvCodeToOutput(&p, in, out);
-            for (int ch = 0; ch < 3; ++ch) {
-                const double want = spot.at(name)[static_cast<std::size_t>(ch)].get<double>();
-                REQUIRE_THAT(static_cast<double>(out[ch]), WithinAbs(want, 2e-4 + 1e-4 * std::fabs(want)));
+    // Matrices: the header constants equal the ones the reference script used,
+    // so the golden's non-neutral spot checks below are evaluated against the
+    // same primaries the library applies.
+    const auto checkMatrix = [&](const char* key, const OsvMat3f& m) {
+        const nlohmann::json& rows = j.at("matrices").at(key);
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                // 1e-7, not 1e-9: the header stores `float`, so a constant the
+                // script holds in float64 comes back changed in the eighth
+                // decimal (0.785301 -> 0.78530103).  That is float32 epsilon at
+                // this magnitude, not drift; anything larger means the two
+                // really have diverged and a re-fit was not propagated.
+                REQUIRE_THAT(static_cast<double>(m.m[r * 3 + c]),
+                             WithinAbs(rows[static_cast<std::size_t>(r)][static_cast<std::size_t>(c)].get<double>(),
+                                       1e-7));
+            }
+            REQUIRE_THAT(static_cast<double>(mat3RowSum(m, r)),
+                         WithinAbs(j.at("matrices").at("row_sums").at(key)[static_cast<std::size_t>(r)].get<double>(),
+                                   2e-7));
+        }
+    };
+    checkMatrix("native_to_rec2020_pocket3", kNativeToRec2020_Pocket3);
+    checkMatrix("native_to_rec2020_osmo360", kNativeToRec2020_Osmo360);
+    checkMatrix("rec2020_to_rec709", kRec2020ToRec709);
+    checkMatrix("rec709_to_rec2020", kRec709ToRec2020);
+    // Both native matrices are orientation-preserving, per the reference.
+    REQUIRE(j.at("matrices").at("determinants").at("native_to_rec2020_osmo360").get<double>() > 0.0);
+    REQUIRE(j.at("matrices").at("determinants").at("native_to_rec2020_pocket3").get<double>() > 0.0);
+
+    // Non-neutral spot checks, one set per fit.  These are the entries that
+    // exercise the primaries matrix at all - the grey pipelines above cannot,
+    // because every unit-row-sum matrix is the identity on the neutral axis -
+    // so pinning both fits is what stops a curve/matrix pairing change from
+    // slipping past the golden.
+    const auto checkSpots = [&](const char* key, DlogMFit fit) {
+        for (const auto& spot : j.at(key)) {
+            const float in[3] = {spot.at("code")[0].get<float>(), spot.at("code")[1].get<float>(),
+                                 spot.at("code")[2].get<float>()};
+            for (const auto& [name, transfer] :
+                 {std::pair{"hlg", OutputTransfer::HLG}, std::pair{"pq", OutputTransfer::PQ},
+                  std::pair{"rec709", OutputTransfer::Rec709}, std::pair{"linear", OutputTransfer::Linear}}) {
+                const OsvColorParams p = makeColorParams(fit, transfer, 0.0f);
+                float out[3];
+                osvCodeToOutput(&p, in, out);
+                for (int ch = 0; ch < 3; ++ch) {
+                    const double want = spot.at(name)[static_cast<std::size_t>(ch)].get<double>();
+                    REQUIRE_THAT(static_cast<double>(out[ch]), WithinAbs(want, 2e-4 + 1e-4 * std::fabs(want)));
+                }
             }
         }
-    }
+    };
+    checkSpots("pipeline_rgb_dji_refit", DlogMFit::DjiRefit);
+    checkSpots("pipeline_rgb_osmo360", DlogMFit::Osmo360);
 }
 
 // -----------------------------------------------------------------------------
