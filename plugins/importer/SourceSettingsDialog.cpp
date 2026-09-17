@@ -116,28 +116,60 @@ struct DialogState {
 
 /// Load the controls into the widgets.
 void controlsToWidgets(HWND dialog, const DialogControls& c) noexcept {
-    // Colour output is a radio group: exactly one of the three is checked.
-    ::CheckRadioButton(dialog, IDC_COLOR_PQ, IDC_COLOR_709,
-                       c.colorOutput == 1 ? IDC_COLOR_HLG : c.colorOutput == 2 ? IDC_COLOR_709 : IDC_COLOR_PQ);
+    // EVERY list below is ordered to match its PrefsBlob enum exactly: the
+    // combo box index IS the enum value, so inserting an entry anywhere but
+    // the end would silently re-map every previously saved project's setting.
+    //
+    // And every count is std::size(), never a literal.  That is not style:
+    // the size list gained a fourth entry (2560 x 1280) while its call still
+    // passed a hard-coded 3, so the new DEFAULT was unreachable in the one
+    // place a user goes to change it.  A literal count is a bug waiting for
+    // the next appended entry, and the colour list below has just become the
+    // second list to gain one.
 
-    // Order must match PrefsOutputSize exactly: the combo box index IS the
-    // enum value, so inserting an entry anywhere but the end would silently
-    // re-map every previously saved project's setting.
+    // Colour output.  A combo box, not the three radio buttons this used to
+    // be - see plugins/importer/resource.h for why it changed.  The fourth
+    // entry says "no transform" rather than just "D-Log M" because the other
+    // three name what the output IS, and this one has to say that nothing was
+    // done to it; a user who read it as "convert to D-Log M" would apply a
+    // LUT on top and double-convert.
+    static const wchar_t* const kColors[] = {L"Rec.2100 PQ", L"Rec.2100 HLG", L"Rec.709",
+                                             L"D-Log M (no transform, grade downstream)"};
+    fillCombo(dialog, IDC_COLOR_OUTPUT, kColors, static_cast<int>(std::size(kColors)), c.colorOutput);
+
     static const wchar_t* const kSizes[] = {L"Native", L"4K (3840 x 1920)", L"2560 x 1280 (default)",
                                             L"2K (1920 x 960)"};
-    fillCombo(dialog, IDC_OUTPUT_SIZE, kSizes, 3, c.outputSize);
+    fillCombo(dialog, IDC_OUTPUT_SIZE, kSizes, static_cast<int>(std::size(kSizes)), c.outputSize);
 
     static const wchar_t* const kStab[] = {L"Off", L"Horizon lock", L"Full", L"Smooth"};
-    fillCombo(dialog, IDC_STABILIZATION, kStab, 4, c.stabilization);
+    fillCombo(dialog, IDC_STABILIZATION, kStab, static_cast<int>(std::size(kStab)), c.stabilization);
 
     static const wchar_t* const kCalib[] = {L"Native", L"Lens guards", L"Underwater"};
-    fillCombo(dialog, IDC_CALIBRATION, kCalib, 3, c.calibration);
+    fillCombo(dialog, IDC_CALIBRATION, kCalib, static_cast<int>(std::size(kCalib)), c.calibration);
 
-    static const wchar_t* const kFit[] = {L"DJI refit", L"Pocket 3"};
-    fillCombo(dialog, IDC_DLOGM_FIT, kFit, 2, c.dlogmFit);
+    // Order must match PrefsDlogmFit exactly (the static_assert below pins the
+    // count, not the order).  Osmo 360 is last because the enum is append-only.
+    static const wchar_t* const kFit[] = {L"DJI refit", L"Pocket 3", L"Osmo 360"};
+    fillCombo(dialog, IDC_DLOGM_FIT, kFit, static_cast<int>(std::size(kFit)), c.dlogmFit);
 
     static const wchar_t* const kDevice[] = {L"Auto", L"CPU", L"CUDA", L"OpenCL"};
-    fillCombo(dialog, IDC_RENDER_DEVICE, kDevice, 4, c.renderDevice);
+    fillCombo(dialog, IDC_RENDER_DEVICE, kDevice, static_cast<int>(std::size(kDevice)), c.renderDevice);
+
+    // Each list must be able to express every value of its enum, or a setting
+    // becomes unreachable in the UI.  static_assert rather than a test,
+    // because an enum that grows must break the BUILD, not a test run.
+    static_assert(std::size(kColors) == static_cast<std::size_t>(PrefsColorOutput::Count),
+                  "the colour combo does not list every PrefsColorOutput value");
+    static_assert(std::size(kSizes) == static_cast<std::size_t>(PrefsOutputSize::Count),
+                  "the size combo does not list every PrefsOutputSize value");
+    static_assert(std::size(kStab) == static_cast<std::size_t>(PrefsStabilization::Count),
+                  "the stabilisation combo does not list every PrefsStabilization value");
+    static_assert(std::size(kCalib) == static_cast<std::size_t>(PrefsCalibration::Count),
+                  "the calibration combo does not list every PrefsCalibration value");
+    static_assert(std::size(kFit) == static_cast<std::size_t>(PrefsDlogmFit::Count),
+                  "the D-Log M combo does not list every PrefsDlogmFit value");
+    static_assert(std::size(kDevice) == static_cast<std::size_t>(PrefsRenderDevice::Count),
+                  "the device combo does not list every PrefsRenderDevice value");
 
     ::CheckDlgButton(dialog, IDC_SEAM_SEARCH, c.seamSearch ? BST_CHECKED : BST_UNCHECKED);
     ::CheckDlgButton(dialog, IDC_GAIN_MATCH, c.gainMatch ? BST_CHECKED : BST_UNCHECKED);
@@ -146,9 +178,7 @@ void controlsToWidgets(HWND dialog, const DialogControls& c) noexcept {
 
 /// Read the widgets back into the controls.
 void widgetsToControls(HWND dialog, DialogControls& c) noexcept {
-    c.colorOutput = ::IsDlgButtonChecked(dialog, IDC_COLOR_HLG) == BST_CHECKED   ? 1
-                    : ::IsDlgButtonChecked(dialog, IDC_COLOR_709) == BST_CHECKED ? 2
-                                                                                 : 0;
+    c.colorOutput = comboSelection(dialog, IDC_COLOR_OUTPUT);
     c.outputSize = comboSelection(dialog, IDC_OUTPUT_SIZE);
     c.stabilization = comboSelection(dialog, IDC_STABILIZATION);
     c.calibration = comboSelection(dialog, IDC_CALIBRATION);

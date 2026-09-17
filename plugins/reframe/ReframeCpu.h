@@ -31,11 +31,37 @@ namespace osv::reframe {
 
 /// Pixel layouts the CPU renderer can read and write.  All of them are BGRA
 /// (Premiere channel order) and differ only in sample type.
+///
+/// The enumerator VALUES are load-bearing for nothing outside this header -
+/// no project file and no host structure stores them - but `Bgra16u` is
+/// appended at the end rather than inserted next to the other integer layout
+/// so that a stale object file compiled against the old header cannot
+/// silently reinterpret `Bgra8u` as something else.
 enum class PixelLayout : int {
-    Bgra32f = 0,  ///< PrPixelFormat_BGRA_4444_32f / GPU_BGRA_4444_32f: four floats.
+    Bgra32f = 0,  ///< PrPixelFormat_BGRA_4444_32f / _32f_Linear / GPU_BGRA_4444_32f: four floats.
     Bgra16f = 1,  ///< PrPixelFormat_GPU_BGRA_4444_16f: four IEEE binary16.
     Bgra8u = 2,   ///< PrPixelFormat_BGRA_4444_8u: four bytes, 0..255.
+    Bgra16u = 3,  ///< PrPixelFormat_BGRA_4444_16u: four uint16, 0..32768 (see kBgra16uWhite).
 };
+
+/// The code Premiere's 16-bit-integer formats use for white.
+///
+/// This is 32768, NOT 65535, and getting it wrong is a 100%-scale error on
+/// every pixel rather than a subtle one.  The Premiere SDK guide, section
+/// 5.4.2 "Byte Order", states it in as many words:
+///
+///     "8-bit and 16-bit BGRA formats do not contain super whites or super
+///      blacks.  The 16-bit formats use channels that go from black at 0 to
+///      white at 32768, like After Effects and Photoshop 16-bit formats."
+///
+/// So the representable range is 0..32768 inclusive - 32769 distinct codes
+/// in a container that can hold 65536 - and codes above 32768 are simply
+/// out-of-gamut rather than illegal.  We clamp on the way out (a 16-bit
+/// host world is a display-referred integer buffer, and writing 40000 there
+/// would read as a wildly over-bright pixel on a host that assumes the
+/// documented scale) and do NOT clamp on the way in, so an input that does
+/// carry an over-range code is resampled faithfully.
+constexpr float kBgra16uWhite = 32768.0f;
 
 /// Bytes one pixel of a layout occupies.
 [[nodiscard]] constexpr std::size_t bytesPerPixel(PixelLayout layout) noexcept {
@@ -46,6 +72,8 @@ enum class PixelLayout : int {
             return 8;
         case PixelLayout::Bgra8u:
             return 4;
+        case PixelLayout::Bgra16u:
+            return 8;
     }
     return 0;
 }
@@ -155,28 +183,54 @@ bool renderCpu(const KernelSetup& setup, const ConstFrameView& src, const FrameV
 bool renderPixel(const KernelSetup& setup, const ConstFrameView& src, int px, int py, float out[4]) noexcept;
 
 // ---------------------------------------------------------------------------
-//  8-bit input promotion
+//  Integer input promotion
 // ---------------------------------------------------------------------------
 
-/// Promote a PixelLayout::Bgra8u source frame to a packed Bgra32f one.
+/// True when a layout stores integer codes the shared sampler cannot read,
+/// so a frame in it has to be promoted to float before it can be sampled.
 ///
-/// The shared sampler (`osvFetchRgba`) reads float or half only, so an 8-bit
-/// source cannot be described by an OsvRgbaSource at all.  Rather than
-/// DECLINE a pixel format we advertise in GLOBAL_SETUP - which would leave
-/// the effect contradicting its own registration and depending on an
-/// undocumented host retry - the effect promotes the frame once, here, and
-/// renders from the promoted copy.
+/// This is the ONE predicate both buildParams() and the render path consult,
+/// so "which layouts need promoting" is stated once.  Adding a new integer
+/// layout and forgetting one of the two call sites is exactly how the
+/// original 8-bit path came to reject a format the effect advertised.
+[[nodiscard]] constexpr bool layoutNeedsPromotion(PixelLayout layout) noexcept {
+    return layout == PixelLayout::Bgra8u || layout == PixelLayout::Bgra16u;
+}
+
+/// Promote an integer-coded source frame (Bgra8u or Bgra16u) to a packed
+/// Bgra32f one.
+///
+/// The shared sampler (`osvFetchRgba`) reads float or half only, so an
+/// integer-coded source cannot be described by an OsvRgbaSource at all.
+/// Rather than DECLINE a pixel format we advertise in GLOBAL_SETUP - which
+/// would leave the effect contradicting its own registration and depending
+/// on an undocumented host retry - the effect promotes the frame once, here,
+/// and renders from the promoted copy.
+///
+/// Promoting rather than teaching the sampler to read integers is the
+/// deliberate choice, and the reason is the sampler's inner loop.  A
+/// bilinear fetch touches four pixels and sixteen components; decoding each
+/// one would put a divide (or a multiply plus a format branch) inside the
+/// hottest loop in the effect, on the GPU as well as the CPU, because the
+/// kernel is shared source.  Promotion pays the conversion exactly ONCE per
+/// source pixel, up front, in a perfectly parallel row-wise pass, and leaves
+/// the kernel byte-for-byte the one that renders a float source.  That also
+/// means a 16u render and a 32f render of the same picture go through
+/// identical code after the promotion, which is what makes them comparable
+/// in a test instead of merely similar.
 ///
 /// `scratch` is resized to width * height * 4 floats and becomes the backing
 /// store of the returned view, so it must outlive every use of that view.
-/// Codes are divided by 255 (the exact inverse of the 8-bit store path), row
-/// order is normalised to top-down with a positive pitch, and the promoted
-/// view is therefore always one the sampler can describe.
+/// Codes are normalised by the layout's own white point - 255 for Bgra8u,
+/// kBgra16uWhite for Bgra16u - row order is normalised to top-down with a
+/// positive pitch, and the promoted view is therefore always one the sampler
+/// can describe.
 ///
 /// Returns a view whose `valid()` is false when `src` is unusable or is not
-/// an 8-bit frame; the caller checks that rather than getting a half-filled
-/// buffer.  Rows run in parallel on `pool` (nullptr = the calling thread).
-[[nodiscard]] ConstFrameView promoteBgra8uToFloat(const ConstFrameView& src, std::vector<float>& scratch,
-                                                  ThreadPool* pool) noexcept;
+/// an integer-coded frame (see layoutNeedsPromotion); the caller checks that
+/// rather than getting a half-filled buffer.  Rows run in parallel on `pool`
+/// (nullptr = the calling thread).
+[[nodiscard]] ConstFrameView promoteIntegerToFloat(const ConstFrameView& src, std::vector<float>& scratch,
+                                                   ThreadPool* pool) noexcept;
 
 }  // namespace osv::reframe

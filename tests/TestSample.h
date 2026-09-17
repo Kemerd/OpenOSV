@@ -68,6 +68,9 @@ inline std::filesystem::path goldenDir() { return std::filesystem::path(OSV_GOLD
 /// Directory holding small synthetic fixtures.
 inline std::filesystem::path fixtureDir() { return std::filesystem::path(OSV_FIXTURE_DIR); }
 
+/// Directory holding the committed .cube LUTs (<repo>/luts).
+inline std::filesystem::path lutsDir() { return std::filesystem::path(OSV_LUTS_DIR); }
+
 /// Load a golden JSON document by file name (e.g. "sample_probe.json").
 inline nlohmann::json loadGolden(const std::string& name) {
     std::ifstream in(goldenDir() / name);

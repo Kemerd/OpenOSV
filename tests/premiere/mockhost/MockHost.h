@@ -422,9 +422,22 @@ public:
     [[nodiscard]] PF_OutData makeOutData() const;
 
     /// Allocate a top-left effect world of the given format
-    /// (BGRA_4444_32f, BGRA_4444_8u, ARGB_4444_8u); row bytes are rounded up
-    /// to 64.  Returns nullptr for an unsupported format or size.
+    /// (BGRA_4444_32f, BGRA_4444_32f_Linear, BGRA_4444_16u, BGRA_4444_8u,
+    /// ARGB_4444_8u); row bytes are rounded up to 64.  Returns nullptr for an
+    /// unsupported format or size.
     [[nodiscard]] std::unique_ptr<EffectWorld> createWorld(std::uint32_t width, std::uint32_t height, PrPixelFormat format);
+
+    /// Relabel an already-created world's pixel format WITHOUT touching its
+    /// bytes, so PF_PixelFormatSuite::GetPixelFormat then reports the new
+    /// value.
+    ///
+    /// This exists so a test can hand an effect a format the mock cannot
+    /// allocate a buffer for - an unknown or exotic one - and check that the
+    /// effect refuses it rather than misreading the bytes.  Allocating such a
+    /// world for real would mean teaching the mock every format in the SDK
+    /// just to prove they are rejected.  Returns false when the world is not
+    /// registered with this host.
+    bool setWorldFormat(const PF_EffectWorld* world, PrPixelFormat format);
 
     /// Pixel formats registered by the effect through
     /// PF_PixelFormatSuite::AddSupportedPixelFormat, in order.

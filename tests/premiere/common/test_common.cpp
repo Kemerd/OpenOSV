@@ -153,7 +153,7 @@ TEST_CASE("PrefsBlob defaults match the documented table", "[common][prefs]") {
     REQUIRE(p.seamSearch == 1);
     REQUIRE(p.gainMatch == 1);
     REQUIRE(p.calib() == PrefsCalibration::Native);
-    REQUIRE(p.fit() == PrefsDlogmFit::DjiRefit);
+    REQUIRE(p.fit() == PrefsDlogmFit::Osmo360);
     REQUIRE(p.exposureStops == 0.0f);
     REQUIRE(p.device() == PrefsRenderDevice::Auto);
     for (const std::uint8_t b : p.reserved) {
@@ -188,6 +188,30 @@ TEST_CASE("PrefsBlob sanitise clamps every out-of-range field", "[common][prefs]
         REQUIRE(p.device() == PrefsRenderDevice::Auto);
         // A second pass has nothing left to do.
         REQUIRE(p.sanitise());
+    }
+
+    SECTION("every colour output 0..3 is accepted and 4 upward is not") {
+        // The enum gained D-Log M passthrough as value 3, APPENDED so saved
+        // projects keep their values.  The boundary is worth pinning from
+        // both sides: a sanitise() that still stopped at 2 would silently
+        // reset every clip a user had set to passthrough.
+        for (int value = 0; value < static_cast<int>(PrefsColorOutput::Count); ++value) {
+            PrefsBlob p = PrefsBlob::defaults();
+            p.colorOutput = static_cast<std::uint8_t>(value);
+            INFO("colour output " << value);
+            REQUIRE(p.sanitise());   // nothing to change: it is in range
+            REQUIRE(p.colorOutput == static_cast<std::uint8_t>(value));
+        }
+        REQUIRE(static_cast<int>(PrefsColorOutput::DLogM) == 3);
+        REQUIRE(static_cast<int>(PrefsColorOutput::Count) == 4);
+
+        for (const int value : {4, 5, 99, 255}) {
+            PrefsBlob p = PrefsBlob::defaults();
+            p.colorOutput = static_cast<std::uint8_t>(value);
+            INFO("out-of-range colour output " << value);
+            REQUIRE_FALSE(p.sanitise());
+            REQUIRE(p.color() == PrefsColorOutput::PQ);
+        }
     }
 
     SECTION("valid values are preserved") {

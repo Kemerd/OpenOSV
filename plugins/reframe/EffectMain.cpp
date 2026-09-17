@@ -14,7 +14,9 @@
 //   PF_Cmd_ABOUT            the one-line description in the About box.
 //   PF_Cmd_GLOBAL_SETUP     version, out-flags (byte-identical to the PiPL),
 //                           and - in Premiere only - the pixel formats we
-//                           want frames in.
+//                           want frames in.  That registration is RETRIED
+//                           from the first PF_Cmd_RENDER if the suite was not
+//                           available here; see registerPixelFormats().
 //   PF_Cmd_PARAMS_SETUP     the 13 controls, with their permanent ids.
 //   PF_Cmd_USER_CHANGED_PARAM  Preset writes FOV/Distortion/Tilt; editing
 //                           any of those three flips Preset to Custom.
@@ -75,6 +77,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -188,39 +191,177 @@ constexpr A_long kPremiereApplId = 'PrMr';
 //  Pixel format negotiation (Premiere only)
 // ===========================================================================
 
-/// Tell Premiere which formats we can render, most preferred first.
+/// Every format the CPU render path can actually produce, in PREFERENCE
+/// order - which is also exactly the order they are registered in, because
+/// AddSupportedPixelFormat's own documentation (PrSDKAESupport.h:150-157)
+/// says the host reads the list as a preference ranking.
 ///
-/// 32-bit float first because the panorama is HDR-capable and the reframe is
-/// a resampling operation - quantising to 8 bits before it would band the
-/// sky.  8u second so an 8-bit sequence still gets a native-format render
-/// instead of a host conversion.  VUYA is deliberately not offered: the
-/// shared sampler works in RGBA and converting per sample would cost more
-/// than letting the host convert the frame once.
-PF_Err registerPixelFormats(PF_InData* in_data) noexcept {
+/// The list is a single named table rather than a run of calls so that
+/// "which formats do we advertise" and "which formats does layoutFor()
+/// accept" cannot drift apart: a static_assert below pins the two together,
+/// and the render path's error message enumerates this same table.
+///
+/// The order, and why:
+///
+///   1. BGRA_4444_32f         the native working format.  The panorama is
+///                            HDR-capable and reframing is a RESAMPLE, so
+///                            any quantisation before it bands the sky.
+///   2. BGRA_4444_32f_Linear  the same 16 bytes in the same channel order;
+///                            it differs from the above ONLY in transfer
+///                            function.  This effect is colour agnostic - it
+///                            resamples, it never interprets a code as a
+///                            luminance - so accepting it is correct rather
+///                            than merely convenient, and refusing it would
+///                            be refusing a format we are already able to
+///                            render bit-identically.  See layoutFor().
+///   3. BGRA_4444_16u         Premiere's 16-bit integer RGB.  Offered so a
+///                            10-bit sequence has a high-bit-depth format in
+///                            common with us; the SDK guide recommends 32f
+///                            over 16u for high bit depth, which is exactly
+///                            why 16u sits BELOW both float entries rather
+///                            than being left out.
+///   4. BGRA_4444_8u          last, so an 8-bit sequence still gets a
+///                            native-format render instead of a host
+///                            conversion.
+///
+/// VUYA is deliberately not offered at all: the shared sampler works in
+/// RGBA, and converting per sample would cost more than letting the host
+/// convert the frame once.
+constexpr PrPixelFormat kSupportedFormats[] = {
+    PrPixelFormat_BGRA_4444_32f,
+    PrPixelFormat_BGRA_4444_32f_Linear,
+    PrPixelFormat_BGRA_4444_16u,
+    PrPixelFormat_BGRA_4444_8u,
+};
+constexpr int kSupportedFormatCount = static_cast<int>(sizeof(kSupportedFormats) / sizeof(kSupportedFormats[0]));
+
+/// Decode a Premiere pixel format's fourcc into printable characters.
+///
+/// PrPixelFormat enumerators are fourcc codes, so an unknown one is far more
+/// informative as 'Bgra' than as 0x42677261.  Non-printable bytes become '.'
+/// so a value that is NOT a fourcc (a GPU format, a corrupt field) cannot
+/// inject control characters into the log line.  Returns the four characters
+/// in memory order, most significant byte first, plus a NUL.
+struct FourCc {
+    char text[5];
+};
+[[nodiscard]] FourCc fourCcOf(PrPixelFormat format) noexcept {
+    FourCc out{};
+    const auto bits = static_cast<std::uint32_t>(format);
+    for (int i = 0; i < 4; ++i) {
+        const auto byte = static_cast<unsigned char>((bits >> (24 - 8 * i)) & 0xFFu);
+        // Printable ASCII only; anything else is not part of a fourcc.
+        out.text[i] = (byte >= 0x20u && byte < 0x7Fu) ? static_cast<char>(byte) : '.';
+    }
+    out.text[4] = '\0';
+    return out;
+}
+
+/// Ask the host for the PF Pixel Format Suite and register kSupportedFormats.
+///
+/// Returns true when the whole list was registered, false when the suite was
+/// not available - which is NOT an error for the caller to propagate (the
+/// host then picks a format itself) but IS something the render path wants to
+/// know, because it is the difference between "the host chose from our list"
+/// and "the host chose blind".
+///
+/// WHY THIS CAN FAIL, AND WHY IT IS RETRIED
+/// ----------------------------------------
+/// Adobe's own samples register during PF_Cmd_GLOBAL_SETUP guarded by
+/// `appl_id == 'PrMr'`, which is what this effect has always done, and on a
+/// real Premiere Pro 26.2 that guard and that ordering are both correct: the
+/// live host log shows 43 successful GLOBAL_SETUPs between the first and the
+/// last failure, so the suite IS normally there at GLOBAL_SETUP and the
+/// registration normally succeeds.
+///
+/// What the log actually shows is that the suite is MISSING on a MINORITY of
+/// GLOBAL_SETUP calls, on their own threads, interleaved with successful ones
+/// milliseconds apart.  Premiere calls GLOBAL_SETUP many times over - once
+/// per render session, on a pool thread, and also on short-lived probe
+/// instances used to enumerate the effect - and on some of those the effect
+/// reference is not one the pixel-format machinery is attached to, so the
+/// suite legitimately is not offered.  There is no documented way to tell
+/// those apart in advance, and `pica_basicP` is perfectly valid on all of
+/// them, so there is no pointer to test.  The failure is therefore not a
+/// mistake in WHEN we ask; it is a context in which the answer is genuinely
+/// "not here".
+///
+/// The consequence used to be permanent: an instance that missed its one
+/// chance at GLOBAL_SETUP never told the host anything, so on a 10-bit
+/// sequence the host picked a format outside our old two-entry list and the
+/// CPU path refused every frame - stepping and scrubbing showed nothing while
+/// playback (the GPU path, which negotiates separately) was fine.  So the
+/// registration is retried from the first PF_Cmd_RENDER, where a different
+/// effect reference may well have the suite.  There is precedent in this very
+/// plug-in: GpuFilter.cpp re-probes its parameter map at render time for the
+/// same class of reason - a host that does not answer at setup time may
+/// answer later, and the cheap retry is worth strictly more than the
+/// assumption.
+///
+/// Both halves of the fix matter independently, and that is the point.  The
+/// retry makes the registration far more likely to land; widening the
+/// accepted format set (layoutFor) makes the render CORRECT even when it
+/// never lands at all, because the host's unaided choice is then very likely
+/// a format we can render anyway.  Neither alone would be enough: a retry
+/// that also failed would still black the frame, and a wide format set with
+/// no registration would still leave the host free to pick VUYA.
+bool registerPixelFormats(PF_InData* in_data, bool atRender) noexcept {
+    // The label is used both in the log text and - crucially - as part of the
+    // once-key, because PluginLog dedups on the key alone and is process-wide.
+    // Sharing one key between the setup and render call sites would mean the
+    // FIRST outcome silenced the other for the life of the process, so a
+    // successful GLOBAL_SETUP would hide every render-time retry and the log
+    // would no longer show the very interleaving that identified this bug.
+    const char* const whenLabel = atRender ? "RENDER" : "GLOBAL_SETUP";
+
     if (!in_data || !in_data->pica_basicP) {
-        return PF_Err_NONE;  // not fatal: the host then picks its default
+        return false;  // not fatal: the host then picks its default
     }
     // AcquireSuite hands back a const void*; the suite tables themselves are
     // read-only function pointers, so the pointer stays const throughout.
-    const PF_PixelFormatSuite1* suite = nullptr;
     const void* raw = nullptr;
     const SPErr err = in_data->pica_basicP->AcquireSuite(kPFPixelFormatSuite, kPFPixelFormatSuiteVersion1, &raw);
-    suite = static_cast<const PF_PixelFormatSuite1*>(raw);
+    const PF_PixelFormatSuite1* suite = static_cast<const PF_PixelFormatSuite1*>(raw);
     if (err != kSPNoError || !suite) {
-        PluginLog::warn("reframe: no PF Pixel Format Suite; the host will choose the format");
-        return PF_Err_NONE;
+        // Report the ERROR CODE and WHICH COMMAND we were in.  Without the
+        // code there is no way to tell "suite absent" from "asked at the
+        // wrong time", and without the label there is no way to tell a failed
+        // GLOBAL_SETUP from a failed render-time retry - which is precisely
+        // the distinction that identified this bug.
+        PluginLog::oncef(atRender ? "reframe/format/nosuite/render" : "reframe/format/nosuite/setup",
+                         PluginLog::Level::Warn,
+                         "reframe: PF Pixel Format Suite unavailable at {} (AcquireSuite err {}, suite {}); "
+                         "the host will choose the format unaided - the render path accepts all of "
+                         "32f / 32f_Linear / 16u / 8u, so this is usually still renderable",
+                         whenLabel, static_cast<long>(err), suite ? "non-null" : "null");
+        return false;
+    }
+
+    // A suite table with null members is not a usable suite.  Checked
+    // together, before either call, so the list is never half-registered:
+    // clearing and then failing to add would leave the host with an EMPTY
+    // list, which is strictly worse than the list it already had.
+    if (!suite->ClearSupportedPixelFormats || !suite->AddSupportedPixelFormat) {
+        PluginLog::oncef(atRender ? "reframe/format/nomembers/render" : "reframe/format/nomembers/setup",
+                         PluginLog::Level::Warn,
+                         "reframe: PF Pixel Format Suite v1 at {} has no Clear/Add member; not registering",
+                         whenLabel);
+        in_data->pica_basicP->ReleaseSuite(kPFPixelFormatSuite, kPFPixelFormatSuiteVersion1);
+        return false;
     }
 
     // Clear first: the host may carry a list from a previous load.
-    if (suite->ClearSupportedPixelFormats) {
-        suite->ClearSupportedPixelFormats(in_data->effect_ref);
-    }
-    if (suite->AddSupportedPixelFormat) {
-        suite->AddSupportedPixelFormat(in_data->effect_ref, PrPixelFormat_BGRA_4444_32f);
-        suite->AddSupportedPixelFormat(in_data->effect_ref, PrPixelFormat_BGRA_4444_8u);
+    suite->ClearSupportedPixelFormats(in_data->effect_ref);
+    for (const PrPixelFormat format : kSupportedFormats) {
+        suite->AddSupportedPixelFormat(in_data->effect_ref, format);
     }
     in_data->pica_basicP->ReleaseSuite(kPFPixelFormatSuite, kPFPixelFormatSuiteVersion1);
-    return PF_Err_NONE;
+
+    PluginLog::oncef(atRender ? "reframe/format/registered/render" : "reframe/format/registered/setup",
+                     PluginLog::Level::Info,
+                     "reframe: registered {} pixel formats at {} (32f, 32f_Linear, 16u, 8u)", kSupportedFormatCount,
+                     whenLabel);
+    return true;
 }
 
 /// The Premiere pixel format of an effect world, or PrPixelFormat_Invalid
@@ -251,13 +392,36 @@ PrPixelFormat worldFormat(PF_InData* in_data, PF_EffectWorld* world) noexcept {
 /// Map a Premiere pixel format onto the layouts the CPU renderer handles.
 /// Returns false for anything else (VUYA, ARGB, a compressed format), which
 /// makes RENDER decline rather than misinterpret the bytes.
+///
+/// BGRA_4444_32f_Linear maps to the SAME layout as BGRA_4444_32f, and that
+/// is deliberate, not a shortcut.  The two formats are identical in
+/// everything this function describes - four 32-bit floats per pixel in B, G,
+/// R, A order - and differ only in the TRANSFER FUNCTION the codes are
+/// understood through.  This effect never interprets a code: it computes a
+/// direction per output pixel and bilinearly resamples the input at that
+/// direction, so every arithmetic operation it performs is a weighted average
+/// of neighbouring samples in whatever space they are already in.  A
+/// weighted average commutes with nothing about the transfer curve, which is
+/// why a colour-managing effect could not do this - but it also means we
+/// introduce no error the host has not already accepted by asking a
+/// resampler for the frame, and the output carries exactly the tag the host
+/// gave the destination world.  Refusing the format would black the frame;
+/// accepting it renders it correctly.  (docs/PREMIERE.md records the same
+/// reasoning.)
+///
+/// The two integer layouts are accepted here and PROMOTED to float by the
+/// render path before the kernel sees them; see promoteIntegerToFloat.
 bool layoutFor(PrPixelFormat format, PixelLayout* out) noexcept {
     if (!out) {
         return false;
     }
     switch (format) {
         case PrPixelFormat_BGRA_4444_32f:
+        case PrPixelFormat_BGRA_4444_32f_Linear:
             *out = PixelLayout::Bgra32f;
+            return true;
+        case PrPixelFormat_BGRA_4444_16u:
+            *out = PixelLayout::Bgra16u;
             return true;
         case PrPixelFormat_BGRA_4444_8u:
             *out = PixelLayout::Bgra8u;
@@ -266,6 +430,33 @@ bool layoutFor(PrPixelFormat format, PixelLayout* out) noexcept {
             return false;
     }
 }
+
+/// Compile-time proof that every format we ADVERTISE is a format we can
+/// actually RENDER.
+///
+/// Advertising a format the render path then refuses is the exact shape of
+/// the bug this file was changed to fix, only inverted - so it is worth
+/// making unrepresentable rather than merely avoiding.  layoutFor() is
+/// constexpr-evaluable through this wrapper because it only switches on its
+/// argument, so the whole check happens at compile time and an entry added to
+/// kSupportedFormats without a matching case in layoutFor() breaks the build.
+[[nodiscard]] constexpr bool everyAdvertisedFormatIsRenderable() noexcept {
+    for (const PrPixelFormat format : kSupportedFormats) {
+        switch (format) {
+            case PrPixelFormat_BGRA_4444_32f:
+            case PrPixelFormat_BGRA_4444_32f_Linear:
+            case PrPixelFormat_BGRA_4444_16u:
+            case PrPixelFormat_BGRA_4444_8u:
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+static_assert(everyAdvertisedFormatIsRenderable(),
+              "kSupportedFormats advertises a pixel format layoutFor() does not accept");
+static_assert(kSupportedFormatCount == 4, "the documented format list is four entries; docs/PREMIERE.md must agree");
 
 // ===========================================================================
 //  Sequence geometry (the "Match Sequence" aspect)
@@ -447,8 +638,16 @@ PF_Err globalSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     out_data->out_flags = OSV_REFRAME_OUT_FLAGS;
     out_data->out_flags2 = OSV_REFRAME_OUT_FLAGS_2;
 
+    // Premiere only: tell the host which formats we can render.  The guard is
+    // Adobe's own (their samples test appl_id == 'PrMr' here too) and is
+    // correct - After Effects has no such suite at all.
+    //
+    // The return value is deliberately ignored HERE: a failure is not a setup
+    // failure, and the render path retries on its own (see the retry block in
+    // render()).  Reporting it would only turn a recoverable negotiation miss
+    // into a host-visible broken effect.
     if (in_data && in_data->appl_id == kPremiereApplId) {
-        registerPixelFormats(in_data);
+        (void)registerPixelFormats(in_data, /*atRender=*/false);
     }
 
     PluginLog::info("reframe: global setup (host '{}{}{}{}', flags 0x{:08X}/0x{:08X})",
@@ -634,6 +833,40 @@ PF_Err render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
         return PF_Err_BAD_CALLBACK_PARAM;
     }
 
+    // ---- second chance at the format negotiation --------------------------
+    // If GLOBAL_SETUP could not acquire the PF Pixel Format Suite, this
+    // effect instance never told the host what it can render, and the host
+    // picked a format unaided.  That is the root of the "plays but does not
+    // update when I step" bug: the live host log shows the suite missing on
+    // some GLOBAL_SETUP calls, after which a 10-bit sequence got a format the
+    // CPU path refused - while playback, which goes through the separately
+    // negotiated GPU entry, kept working.
+    //
+    // It cannot help the CURRENT frame - the worlds are already allocated -
+    // which is precisely why widening layoutFor() was the other half of the
+    // fix; what it does is stop the miss from being permanent for the rest of
+    // the session.
+    //
+    // The retry is UNCONDITIONAL rather than memoised, and that is a
+    // deliberate choice about correctness over a micro-optimisation.  The
+    // registration is keyed on `effect_ref` (PrSDKAESupport.h:104-106), so a
+    // memo would have to be keyed on it too - and an effect_ref is a foreign
+    // pointer with no destruction hook this effect receives.  (SEQUENCE_SETDOWN
+    // does not reliably pair with it, and this effect deliberately keeps
+    // sequence_data null.)  A table of such pointers can therefore be matched
+    // by a NEW reference that the host allocated at a recycled address, and
+    // would then suppress the retry for the one instance that actually needs
+    // it - reintroducing this very bug, intermittently and unreproducibly.
+    //
+    // The cost of not memoising is provably negligible: AcquireSuite is a
+    // name lookup in the host's suite table, and this same function already
+    // acquires this same suite TWICE per frame in worldFormat() below, so the
+    // retry adds a third to a path that then does width * height kernel
+    // evaluations.  A correctness hazard is not worth a third of nothing.
+    if (in_data->appl_id == kPremiereApplId) {
+        (void)registerPixelFormats(in_data, /*atRender=*/true);
+    }
+
     // ---- what layout are the worlds in? ----------------------------------
     // In Premiere the PF Pixel Format Suite answers; without it (After
     // Effects, or a host that hid the suite) the world is an AE-native
@@ -643,10 +876,23 @@ PF_Err render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     PixelLayout outLayout = PixelLayout::Bgra32f;
     const PrPixelFormat inFormat = worldFormat(in_data, input);
     const PrPixelFormat outFormat = worldFormat(in_data, output);
-    if (!layoutFor(inFormat, &inLayout) || !layoutFor(outFormat, &outLayout)) {
+    const bool inOk = layoutFor(inFormat, &inLayout);
+    const bool outOk = layoutFor(outFormat, &outLayout);
+    if (!inOk || !outOk) {
+        // Degrade gracefully with ONE clear line that NAMES the format.  A
+        // bare hex word is nearly useless in a bug report: PrPixelFormat
+        // enumerators are fourccs, so the offending format is spelled out as
+        // characters as well, and the line says which SIDE was wrong and what
+        // we would have accepted instead.  A silent refusal here is what made
+        // this bug take a live host log to find.
+        const FourCc inCc = fourCcOf(inFormat);
+        const FourCc outCc = fourCcOf(outFormat);
         PluginLog::oncef("reframe/render/format", PluginLog::Level::Error,
-                         "reframe: unsupported world format (in 0x{:08X}, out 0x{:08X})",
-                         static_cast<unsigned>(inFormat), static_cast<unsigned>(outFormat));
+                         "reframe: unsupported world format - input '{}' (0x{:08X}) {}, output '{}' (0x{:08X}) {}; "
+                         "this effect renders BGRA_4444_32f, _32f_Linear, _16u and _8u only, so the frame is "
+                         "declined rather than misread",
+                         inCc.text, static_cast<unsigned>(inFormat), inOk ? "ok" : "REJECTED", outCc.text,
+                         static_cast<unsigned>(outFormat), outOk ? "ok" : "REJECTED");
         return PF_Err_BAD_CALLBACK_PARAM;
     }
     // ---- describe the two worlds -----------------------------------------
@@ -703,22 +949,23 @@ PF_Err render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     const std::shared_ptr<osv::ThreadPool> poolLease = osv::premiere::HostContext::instance().threadPoolShared();
     osv::ThreadPool* pool = poolLease.get();
 
-    // ---- promote an 8-bit input -------------------------------------------
-    // GLOBAL_SETUP advertises PrPixelFormat_BGRA_4444_8u, so the host is
-    // entitled to hand us one, and an effect that advertises a format must
-    // accept it.  The shared sampler reads float or half only, so the frame
-    // is promoted once into a scratch buffer and rendered from that.  (This
-    // used to return PF_Err_BAD_CALLBACK_PARAM in the hope the host would
-    // retry with 32f, which nothing in the SDK promises: a host that took us
-    // at our word got a hard error on every frame.)
+    // ---- promote an integer-coded input -----------------------------------
+    // GLOBAL_SETUP advertises PrPixelFormat_BGRA_4444_8u AND _16u, so the
+    // host is entitled to hand us either, and an effect that advertises a
+    // format must accept it.  The shared sampler reads float or half only, so
+    // the frame is promoted once into a scratch buffer and rendered from
+    // that.  (This used to return PF_Err_BAD_CALLBACK_PARAM in the hope the
+    // host would retry with 32f, which nothing in the SDK promises: a host
+    // that took us at our word got a hard error on every frame.)
     //
     // `promoted` must outlive `src`, so it is declared in this scope.
     std::vector<float> promoted;
-    if (src.layout == PixelLayout::Bgra8u) {
-        const ConstFrameView promotedView = promoteBgra8uToFloat(src, promoted, pool);
+    if (layoutNeedsPromotion(src.layout)) {
+        const ConstFrameView promotedView = promoteIntegerToFloat(src, promoted, pool);
         if (!promotedView.valid()) {
-            PluginLog::oncef("reframe/render/8u-in", PluginLog::Level::Error,
-                             "reframe: could not promote an 8-bit input world ({}x{})", src.width, src.height);
+            PluginLog::oncef("reframe/render/promote-in", PluginLog::Level::Error,
+                             "reframe: could not promote a {}-bit integer input world ({}x{})",
+                             src.layout == PixelLayout::Bgra16u ? 16 : 8, src.width, src.height);
             return PF_Err_OUT_OF_MEMORY;
         }
         src = promotedView;
@@ -728,6 +975,18 @@ PF_Err render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
     const Settings settings = readSettings(in_data, params);
     const KernelSetup setup = buildParams(settings, src, dst.width, dst.height, sequenceAspect(in_data));
     if (!setup.valid) {
+        // Log the SETTINGS too, not just the sizes: every rejection inside
+        // buildParams() is driven by a parameter value, so the sizes alone
+        // never say which one.  This is the line that identifies whether the
+        // CPU path read a sane FOV or garbage.
+        PluginLog::oncef("reframe/render/setup-values", PluginLog::Level::Error,
+                         "reframe: setup rejected with aspect={} preset={} fov={:.3f} distortion={:.3f} "
+                         "pan={:.3f} tilt={:.3f} roll={:.3f} srcPan={:.3f} srcTilt={:.3f} srcRoll={:.3f} "
+                         "smooth={} seqAspect={:.4f}",
+                         static_cast<int>(settings.aspect), static_cast<int>(settings.preset), settings.fovDeg,
+                         settings.distortion, settings.panDeg, settings.tiltDeg, settings.rollDeg,
+                         settings.sourcePanDeg, settings.sourceTiltDeg, settings.sourceRollDeg,
+                         settings.smoothKeyframes ? 1 : 0, sequenceAspect(in_data));
         PluginLog::oncef("reframe/render/setup", PluginLog::Level::Error,
                          "reframe: could not build the kernel parameters ({}x{} -> {}x{})", src.width, src.height,
                          dst.width, dst.height);

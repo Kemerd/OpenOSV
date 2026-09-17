@@ -58,7 +58,7 @@ void checkMath() {
     report("PQ(203 nit) == 0.5807", std::fabs(pq203 - 0.5807f) < 5e-4f, std::to_string(pq203));
     const float grey = color::dlogmToLinear(color::kDlogMPocket3, 0.40f);
     report("Pocket3 code 0.40 -> 0.18", std::fabs(grey - 0.18f) < 2e-3f, std::to_string(grey));
-    const OsvColorParams hlg = color::makeColorParams(color::DlogMFit::DjiRefit, color::OutputTransfer::HLG, 0.0f);
+    const OsvColorParams hlg = color::makeColorParams(color::kDefaultDlogMFit, color::OutputTransfer::HLG, 0.0f);
     float codes[3] = {0.40f, 0.40f, 0.40f}, lin[3], out[3];
     osvCodeToLinear(&hlg, codes, lin);
     osvLinearToOutput(&hlg, lin, out);

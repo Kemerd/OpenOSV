@@ -5,3 +5,11 @@
 *.ps1 text eol=crlf
 *.mp4 binary
 *.png binary
+
+# Premiere sequence presets are read by the app; Adobe writes CRLF and the
+# format is not documented, so keep the bytes exactly as generated.
+*.sqpreset text eol=crlf
+
+# Generated LUTs are compared byte-for-byte by a test against a fresh
+# generation, so their line endings must not be rewritten either.
+*.cube text eol=lf

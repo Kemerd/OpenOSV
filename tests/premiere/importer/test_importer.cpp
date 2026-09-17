@@ -28,6 +28,10 @@
 #include "PrSDKPixelFormat.h"
 
 #include "PrefsBlob.h"
+// kSourceSettingsMatchNameW: the one spelling of the Source Settings effect's
+// match name.  The same header the effect's PiPL is generated from, which is
+// what makes the importer/effect binding provably one string.
+#include "SourceSettingsIdentity.h"
 
 #include <algorithm>
 #include <chrono>
@@ -171,13 +175,20 @@ TEST_CASE("the built .prm loads, exports xImportEntry and answers imInit", "[imp
 
     SECTION("the capability flags are the ones the design fixes") {
         const imImportInfoRec& info = harness.importInfo();
+        // The modal dialog AND the master clip effect, deliberately both:
+        // the dialog is muscle memory for existing users and is the fallback
+        // on a machine where OpenOSVSourceSettings.aex failed to install.
         REQUIRE(info.hasSetup == kPrTrue);            // the Source Settings dialog
         REQUIRE(info.canProvidePeakAudio == kPrFalse);
         REQUIRE(info.avoidAudioConform == kPrFalse);  // AAC: let the host conform
         REQUIRE(info.priority == 0);
         REQUIRE(info.keepLoaded == kPrFalse);
         REQUIRE(info.addToMenu == imMenuNone);
-        REQUIRE(info.hasSourceSettingsEffect == kPrFalse);
+        // This flag is what makes Premiere look at
+        // imFileInfoRec8::sourceSettingsMatchName at all; without it the
+        // field is ignored and OpenOSVSourceSettings.aex is never attached to
+        // a master clip, so the Effect Controls panel stays empty.
+        REQUIRE(info.hasSourceSettingsEffect == kPrTrue);
         REQUIRE(info.canSave == kPrFalse);
         REQUIRE(info.canTrim == kPrFalse);
     }
@@ -710,7 +721,17 @@ TEST_CASE("imGetIndColorSpace declares the token the prefs ask for",
     };
     const Case cases[] = {{PrefsColorOutput::PQ, kPrOverranged2100PQ},
                           {PrefsColorOutput::HLG, kPrOverranged2100HLG},
-                          {PrefsColorOutput::Rec709, kPrOverranged709}};
+                          {PrefsColorOutput::Rec709, kPrOverranged709},
+                          // The SDK has no DJI D-Log M token, so passthrough
+                          // is declared as the closest honest space: full
+                          // range, RGB, 32f, SCENE-referred (a log signal is
+                          // scene light) with BT.2020 primaries as the widest
+                          // standard gamut.  See colorSpaceTokenFor().
+                          {PrefsColorOutput::DLogM, kPrOverranged2020Scene}};
+    // Every value of the enum is covered, so a newly appended output cannot
+    // be added without either extending this table or failing here.
+    static_assert(std::size(cases) == static_cast<std::size_t>(PrefsColorOutput::Count),
+                  "the colour-space table does not cover every PrefsColorOutput value");
 
     for (const Case& c : cases) {
         // The colour space follows the prefs, so the instance has to see them
@@ -1011,7 +1032,8 @@ TEST_CASE("8u and 32f frames agree within one 8-bit code", "[importer][video][sa
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }
 
-TEST_CASE("PQ, HLG and Rec.709 produce different pixels", "[importer][video][color][sample]") {
+TEST_CASE("PQ, HLG, Rec.709 and D-Log M passthrough produce different pixels",
+          "[importer][video][color][sample]") {
     REQUIRE_SAMPLE_CLIP();
     ImporterHarness harness;
     REQUIRE(harness.loaded());
@@ -1044,12 +1066,50 @@ TEST_CASE("PQ, HLG and Rec.709 produce different pixels", "[importer][video][col
     const DecodedFrame pq = render(PrefsColorOutput::PQ);
     const DecodedFrame hlg = render(PrefsColorOutput::HLG);
     const DecodedFrame rec709 = render(PrefsColorOutput::Rec709);
+    const DecodedFrame dlogm = render(PrefsColorOutput::DLogM);
 
-    // Three different transfer functions on the same linear light: the frames
-    // must differ substantially, not by a rounding error.
+    // Four different treatments of the same linear light: every pair must
+    // differ substantially, not by a rounding error.  The passthrough pairs
+    // are the new ones, and they are the assertion that catches the failure
+    // mode that matters - a toOutputTransfer() switch that fell through to
+    // its PQ default would make `dlogm` byte-identical to `pq` while every
+    // other test still passed.
     REQUIRE(maxChannelDiff(pq, hlg) > 0.02f);
     REQUIRE(maxChannelDiff(pq, rec709) > 0.02f);
     REQUIRE(maxChannelDiff(hlg, rec709) > 0.02f);
+    REQUIRE(maxChannelDiff(pq, dlogm) > 0.02f);
+    REQUIRE(maxChannelDiff(hlg, dlogm) > 0.02f);
+    REQUIRE(maxChannelDiff(rec709, dlogm) > 0.02f);
+
+    // And the passthrough frame is a real picture, not a black or blown-out
+    // one: "nothing was applied" must not have become "nothing came out".
+    // Passthrough emits the camera's own log code values, so every sample is
+    // finite and in [0, 1] and the frame has genuine variation in it.
+    {
+        float lo = 1.0f;
+        float hi = 0.0f;
+        double sum = 0.0;
+        std::size_t counted = 0;
+        for (std::size_t i = 0; i < dlogm.rgba.size(); i += 4) {
+            for (int c = 0; c < 3; ++c) {  // RGB only; alpha is lens coverage
+                const float v = dlogm.rgba[i + static_cast<std::size_t>(c)];
+                REQUIRE(std::isfinite(v));
+                lo = std::min(lo, v);
+                hi = std::max(hi, v);
+                sum += static_cast<double>(v);
+                ++counted;
+            }
+        }
+        REQUIRE(counted > 0);
+        const double mean = sum / static_cast<double>(counted);
+        INFO("passthrough range [" << lo << ", " << hi << "], mean " << mean);
+        REQUIRE(lo >= 0.0f);
+        REQUIRE(hi <= 1.0f);
+        // Not black, not clipped white, and with real contrast in between.
+        REQUIRE(hi > 0.1f);
+        REQUIRE(mean > 0.01f);
+        REQUIRE(hi - lo > 0.05f);
+    }
 
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }
@@ -1514,6 +1574,187 @@ TEST_CASE("imGetInstancePrefs reaches the live instance", "[importer][prefs][sam
     REQUIRE(harness.getInfo8(clip, info) == imNoErr);
     REQUIRE(info.vidInfo.imageWidth == 1920);
     REQUIRE(info.vidInfo.imageHeight == 960);
+}
+
+// =============================================================================
+//  The Source Settings effect binding
+// =============================================================================
+
+TEST_CASE("imGetInfo8 advertises the Source Settings effect's match name",
+          "[importer][sourcesettings][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+
+    imFileInfoRec8 info{};
+    REQUIRE(harness.getInfo8(clip, info) == imNoErr);
+
+    // This string is the ENTIRE binding between the importer and
+    // OpenOSVSourceSettings.aex: Premiere compares it to the effect's PiPL
+    // match name, with no handshake and no diagnostic on a mismatch.  One
+    // mistyped character and the Effect Controls panel never shows the stitch
+    // options, with nothing in any log to say why - which is exactly why both
+    // sides read plugins/common/SourceSettingsIdentity.h and why this test
+    // and the effect's own PiPL test compare against the same constant.
+    //
+    // prUTF16Char is a 16-bit code unit, which on Windows is wchar_t.
+    const std::wstring advertised(reinterpret_cast<const wchar_t*>(info.sourceSettingsMatchName));
+    REQUIRE(advertised == std::wstring(kSourceSettingsMatchNameW));
+    REQUIRE_FALSE(advertised.empty());
+    // It must fit the field WITH its terminator, or the host reads past it.
+    REQUIRE(advertised.size() < 256u);
+}
+
+TEST_CASE("imPerformSourceSettingsCommand exchanges a prefs blob",
+          "[importer][sourcesettings][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+
+    imFileAccessRec8 access{};
+
+    SECTION("a live instance reports the blob it is actually decoding with") {
+        // Put a known, non-default blob into the instance the way the host
+        // would, then ask the selector what the clip is doing.  Answering
+        // with the instance's own settings is what makes the effect's panel
+        // show "as shot" after a project reopen instead of snapping every
+        // control back to the global default.
+        PrefsBlob adopted = PrefsBlob::defaults();
+        adopted.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::UHD4K);
+        adopted.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::HLG);
+        adopted.seamSearch = 0;
+        REQUIRE(adopted.sanitise());
+
+        std::vector<char> prefsStorage(PrefsBlob::kSize, 0);
+        std::memcpy(prefsStorage.data(), &adopted, PrefsBlob::kSize);
+        imGetInstancePrefsRec instanceRec{};
+        instanceRec.privateData = clip.privateData();
+        instanceRec.prefsRec.prefs = prefsStorage.data();
+        instanceRec.prefsRec.prefsLength = static_cast<csSDK_int32>(PrefsBlob::kSize);
+        REQUIRE(harness.send(imGetInstancePrefs, &access, &instanceRec) == imNoErr);
+
+        // The effect sends its own (different) idea of the settings.
+        PrefsBlob fromEffect = PrefsBlob::defaults();
+        fromEffect.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::HD2K);
+        std::vector<char> buffer(PrefsBlob::kSize, 0);
+        std::memcpy(buffer.data(), &fromEffect, PrefsBlob::kSize);
+
+        imSourceSettingsCommandRec rec{};
+        rec.ioData = buffer.data();
+        rec.inDataSize = static_cast<csSDK_int32>(PrefsBlob::kSize);
+        rec.inPrivateData = clip.privateData();
+        REQUIRE(harness.send(imPerformSourceSettingsCommand, &access, &rec) == imNoErr);
+
+        // The instance's blob wins, because it is the only party that knows
+        // what the media is really being decoded with.
+        const PrefsBlob returned = PrefsBlob::fromBytes(buffer.data(), buffer.size());
+        REQUIRE(returned == adopted);
+    }
+
+    SECTION("with no instance the effect's own settings are echoed back") {
+        // Normal during project load and before imOpenFile8.  Overwriting
+        // with defaults here would reset every control of every clip on every
+        // project open, so the effect's values have to survive.
+        PrefsBlob fromEffect = PrefsBlob::defaults();
+        fromEffect.stabilization = static_cast<std::uint8_t>(PrefsStabilization::Smooth);
+        fromEffect.exposureStops = -1.25f;
+        REQUIRE(fromEffect.sanitise());
+
+        std::vector<char> buffer(PrefsBlob::kSize, 0);
+        std::memcpy(buffer.data(), &fromEffect, PrefsBlob::kSize);
+
+        imSourceSettingsCommandRec rec{};
+        rec.ioData = buffer.data();
+        rec.inDataSize = static_cast<csSDK_int32>(PrefsBlob::kSize);
+        rec.inPrivateData = nullptr;
+        REQUIRE(harness.send(imPerformSourceSettingsCommand, &access, &rec) == imNoErr);
+
+        REQUIRE(PrefsBlob::fromBytes(buffer.data(), buffer.size()) == fromEffect);
+    }
+
+    SECTION("a payload that is not one of our blobs becomes the defaults") {
+        // A stale payload from an older build must not be trusted: its bytes
+        // would otherwise be reinterpreted as stitch settings.
+        std::vector<char> buffer(PrefsBlob::kSize, '\x5A');
+
+        imSourceSettingsCommandRec rec{};
+        rec.ioData = buffer.data();
+        rec.inDataSize = static_cast<csSDK_int32>(PrefsBlob::kSize);
+        rec.inPrivateData = nullptr;
+        REQUIRE(harness.send(imPerformSourceSettingsCommand, &access, &rec) == imNoErr);
+
+        const PrefsBlob returned = PrefsBlob::fromBytes(buffer.data(), buffer.size());
+        REQUIRE(returned.isValid());
+        REQUIRE(returned == PrefsBlob::defaults());
+    }
+}
+
+TEST_CASE("imPerformSourceSettingsCommand refuses a bad record", "[importer][sourcesettings]") {
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    imFileAccessRec8 access{};
+
+    SECTION("a null record") {
+        REQUIRE(harness.send(imPerformSourceSettingsCommand, &access, nullptr) == imOtherErr);
+    }
+
+    SECTION("a null buffer") {
+        imSourceSettingsCommandRec rec{};
+        rec.ioData = nullptr;
+        rec.inDataSize = static_cast<csSDK_int32>(PrefsBlob::kSize);
+        REQUIRE(harness.send(imPerformSourceSettingsCommand, &access, &rec) == imOtherErr);
+    }
+
+    SECTION("a buffer smaller than a blob is refused and NOT written") {
+        // Writing 128 bytes into a smaller buffer is a heap overflow in the
+        // host's own allocator - both a crash and a security problem - so the
+        // write has to be refused outright rather than truncated.
+        std::vector<char> buffer(PrefsBlob::kSize, '\xAB');
+        imSourceSettingsCommandRec rec{};
+        rec.ioData = buffer.data();
+        rec.inDataSize = static_cast<csSDK_int32>(PrefsBlob::kSize) - 1;
+        REQUIRE(harness.send(imPerformSourceSettingsCommand, &access, &rec) == imOtherErr);
+        for (const char c : buffer) {
+            REQUIRE(c == '\xAB');
+        }
+    }
+
+    SECTION("a negative size is refused") {
+        std::vector<char> buffer(PrefsBlob::kSize, '\xAB');
+        imSourceSettingsCommandRec rec{};
+        rec.ioData = buffer.data();
+        rec.inDataSize = -1;
+        REQUIRE(harness.send(imPerformSourceSettingsCommand, &access, &rec) == imOtherErr);
+    }
+}
+
+TEST_CASE("imPerformSourceSettingsCommand leaves a larger buffer's tail alone",
+          "[importer][sourcesettings]") {
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    imFileAccessRec8 access{};
+
+    // Only the first kSize bytes are ours.  The tail belongs to the host and
+    // is not ours to define, so it must come back untouched.
+    constexpr std::size_t kTail = 32;
+    std::vector<char> buffer(PrefsBlob::kSize + kTail, '\xAB');
+    const PrefsBlob fromEffect = PrefsBlob::defaults();
+    std::memcpy(buffer.data(), &fromEffect, PrefsBlob::kSize);
+
+    imSourceSettingsCommandRec rec{};
+    rec.ioData = buffer.data();
+    rec.inDataSize = static_cast<csSDK_int32>(buffer.size());
+    rec.inPrivateData = nullptr;
+    REQUIRE(harness.send(imPerformSourceSettingsCommand, &access, &rec) == imNoErr);
+
+    REQUIRE(PrefsBlob::fromBytes(buffer.data(), PrefsBlob::kSize) == fromEffect);
+    for (std::size_t i = PrefsBlob::kSize; i < buffer.size(); ++i) {
+        REQUIRE(buffer[i] == '\xAB');
+    }
 }
 
 // =============================================================================

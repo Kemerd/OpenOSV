@@ -23,6 +23,18 @@ Colour science provenance
   produced by scripts/fit_dlogm.py from 64 neutral-axis measurements of DJI's
   publicly distributed D-Log M to HLG rendering.  Only the fitted constants and
   the measurement table are shipped; no DJI LUT data is redistributed.
+* The "Osmo 360" D-Log M decoding curve (the default) is an analytic
+  7-parameter fit of the same form, produced by
+  `scripts/fit_dlogm.py --from-cube DJI_Osmo360_DLogM_to_Rec709.cube` from the
+  33 neutral-axis (R == G == B) samples of DJI's publicly distributed Osmo 360
+  D-Log M to Rec.709 LUT.  Measuring a transfer function is what was done, not
+  copying a table: what is shipped is the seven fitted constants
+  (include/osv/color/DlogM.h) and the 33 measured diagonal values recorded as
+  the fit's provenance and residual reference (scripts/fit_dlogm.py,
+  tests/unit/test_color.cpp).  No DJI LUT data is redistributed, and none of
+  the .cube files in luts/ contains any: each is generated in full by
+  `osvtool lut` from OpenOSV's own fitted curve and transfer functions
+  (scripts/gen_luts.ps1 regenerates them reproducibly).
 * The "Pocket 3" D-Log M curve reproduces the numeric constants of the publicly
   published community fit by Thatcher Freeman (github.com/thatcherfreeman/
   dwg-transforms).  The constants are facts about a transfer function; no source

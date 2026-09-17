@@ -73,7 +73,7 @@ Result<LensBands> renderLensBands(const geom::LensRig& rig, const video::FramePa
     const std::uint32_t row0 = centre > halfRows ? centre - halfRows : 0;
     const std::uint32_t row1 = std::min(mapH, centre + halfRows);
 
-    const OsvColorParams cp = color::makeColorParams(color::DlogMFit::DjiRefit,
+    const OsvColorParams cp = color::makeColorParams(color::kDefaultDlogMFit,
                                                      linear ? color::OutputTransfer::Linear
                                                             : color::OutputTransfer::Passthrough,
                                                      0.0f);
@@ -276,7 +276,7 @@ Result<GainEstimate> estimateGain(const geom::LensRig& rig, const video::FramePa
     const int row0 = std::max(0, centre - halfRows);
     const int row1 = std::min(map.h, centre + halfRows);
 
-    const OsvColorParams cp = color::makeColorParams(color::DlogMFit::DjiRefit, color::OutputTransfer::Linear, 0.0f);
+    const OsvColorParams cp = color::makeColorParams(color::kDefaultDlogMFit, color::OutputTransfer::Linear, 0.0f);
     CpuRenderer cpu(pool);
     ImageRGBAf imgs[2];
     for (int lens = 0; lens < 2; ++lens) {

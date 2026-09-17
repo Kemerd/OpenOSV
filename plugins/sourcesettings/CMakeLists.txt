@@ -66,43 +66,25 @@ osv_add_pipl(OpenOSVSourceSettings
 # -----------------------------------------------------------------------------
 #  3. Delay loading
 #
-#  The effect itself needs nothing beyond the Windows API, but it links
-#  osv_premiere_common, which pulls osv_render and with it the library's
-#  FFmpeg / OpenCL users, plus spdlog and fmt for PluginLog.  Delay-loading
-#  every one of them means:
-#    * a machine with no OpenCL ICD still loads the effect;
-#    * the vcpkg copies beside the plug-in win over the older ones Premiere
-#      ships in its own application directory (the DelayLoad hook resolves
-#      from the module's folder first).
+#  Only two entries, and the short list is the point: this module renders
+#  nothing, so it pulls in none of the library's FFmpeg / OpenCL / CUDA
+#  machinery the way plugins/reframe does.  What it does use is PluginLog,
+#  which goes through spdlog and fmt - and Adobe ships its own copies of
+#  common libraries in the application directory, which Windows searches
+#  before a plug-in's own folder.  Loading Premiere's fmt.dll against our
+#  spdlog build is exactly the silent ABI mismatch that crashes inside the
+#  logger on the first message, so both are delay-loaded and resolved from
+#  this module's folder by plugins/common/DelayLoad.cpp.
 #
-#  The names must match the DLL file names exactly.  The FFmpeg ones carry a
-#  major version in the file name, so they are globbed from the installed
-#  vcpkg tree rather than guessed - the same approach plugins/reframe uses.
+#  Listing them explicitly rather than inferring them from the configuration
+#  is deliberate: a Debug / RelWithDebInfo link surfaces these imports where
+#  a Release link may inline the calls away, and an entry for a DLL the
+#  module happens not to import is harmless (the linker reports it as unused
+#  and the POST_BUILD audit prints it), while a MISSING entry is a load
+#  failure on a user's machine.
 # -----------------------------------------------------------------------------
-set(_osv_ss_delayload "")
-if(OSV_ENABLE_OPENCL)
-  list(APPEND _osv_ss_delayload OpenCL.dll)
-endif()
-if(OSV_ENABLE_CUDA)
-  # osv_render's CUDA renderer is reachable through the static library even
-  # though this module never calls it, so the import has to be satisfied -
-  # and delay-loading it means a driver-less machine still loads the effect.
-  list(APPEND _osv_ss_delayload nvcuda.dll)
-endif()
-foreach(_ff IN ITEMS avcodec avformat avutil swresample swscale)
-  file(GLOB _ff_dlls "${CMAKE_SOURCE_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/${_ff}-*.dll")
-  foreach(_ff_dll IN LISTS _ff_dlls)
-    get_filename_component(_ff_name "${_ff_dll}" NAME)
-    list(APPEND _osv_ss_delayload "${_ff_name}")
-  endforeach()
-endforeach()
-# PluginLog goes through spdlog/fmt.  Listed explicitly rather than inferred
-# from the configuration: a Debug/RelWithDebInfo link surfaces them where a
-# Release link may not.
-list(APPEND _osv_ss_delayload fmt.dll spdlog.dll)
-list(REMOVE_DUPLICATES _osv_ss_delayload)
-osv_add_delayload(OpenOSVSourceSettings DLL_NAMES ${_osv_ss_delayload})
+osv_add_delayload(OpenOSVSourceSettings DLL_NAMES fmt.dll spdlog.dll)
 
 message(STATUS "OpenOSVSourceSettings")
 message(STATUS "  Match name    : OpenOSV.SourceSettings")
-message(STATUS "  Delay-loaded  : ${_osv_ss_delayload}")
+message(STATUS "  Delay-loaded  : fmt.dll, spdlog.dll")

@@ -90,10 +90,64 @@ const char* colorSpaceTokenFor(const PrefsBlob& prefs) noexcept {
     switch (prefs.color()) {
     case PrefsColorOutput::HLG:    return kPrOverranged2100HLG;
     case PrefsColorOutput::Rec709: return kPrOverranged709;
+
+    // ---- D-Log M passthrough ------------------------------------------------
+    //
+    // There is NO predefined token for DJI D-Log M.  PrSDKColorSpaces.h has
+    // camera log spaces (kPrSonySGamutSLog2, kPrSony2020SLog3,
+    // kPrSonySGamut3CineSLog3, kPrSonySGamut3SLog3) but nothing for DJI, and
+    // grepping the whole SDK header set for "dlog" / "dji" finds nothing.  So
+    // whatever this returns is an APPROXIMATION and the only question is which
+    // approximation misleads the host least.
+    //
+    // kPrOverranged2020Scene - "BT.2020 RGB Full (Scene)", full range, RGB,
+    // 32f, scene-referred - is chosen because three of its four properties are
+    // exactly right and the fourth is the closest available:
+    //
+    //   * FULL RANGE and RGB and 32f: correct, and they are the properties
+    //     that decide whether the host rescales or reinterprets our bytes.
+    //     Getting these wrong corrupts the pixels; getting the transfer wrong
+    //     only mis-previews them.
+    //   * SCENE-REFERRED: correct and important.  A log signal is scene
+    //     light, not display light.  The Display variant would invite the
+    //     host to tone-map it for the monitor, which is precisely what a user
+    //     who picked passthrough is asking us not to do.
+    //   * BT.2020 primaries: the approximation.  The real gamut is DJI's
+    //     native camera gamut, which is wide and has no SDK token; BT.2020 is
+    //     the widest standard gamut on offer, so it neither clips the data nor
+    //     claims a small gamut for wide-gamut values.
+    //
+    // What is deliberately NOT returned, and why:
+    //
+    //   * kPrOverranged709 - claiming BT.709 for log data is the one genuinely
+    //     harmful answer.  The host would treat the flat log curve as a
+    //     finished Rec.709 image, so the Program Monitor would show washed-out
+    //     mush AND a "Match Source" export would bake that interpretation in.
+    //   * kPrOverranged2100PQ / ...HLG - both assert a specific HDR display
+    //     transfer we did not apply, so the host's tone mapping would fight
+    //     the log curve.
+    //   * kPrWorkingColorSpace - explicitly forbidden here:
+    //     PrSDKColorSpaces.h:104 says "you can't use this token in the
+    //     importer. the importer needs to explicitly identify media color
+    //     space to the host."
+    //
+    // handleGetIndColorSpace logs once when this branch is taken, so a
+    // support log records that Premiere was told something approximate.  The
+    // reasoning is in docs/PREMIERE.md under "D-Log M passthrough".
+    case PrefsColorOutput::DLogM: return kPrOverranged2020Scene;
+
     case PrefsColorOutput::PQ:
     case PrefsColorOutput::Count:
     default:                       return kPrOverranged2100PQ;
     }
+}
+
+bool colorSpaceIsApproximate(const PrefsBlob& prefs) noexcept {
+    // Only the passthrough output is declared with a token that does not
+    // describe it exactly (see colorSpaceTokenFor).  Keeping this as its own
+    // predicate rather than a comparison at the call site means the "is this
+    // honest?" question has one answer, in the same file as the decision.
+    return prefs.color() == PrefsColorOutput::DLogM;
 }
 
 SeiCodes seiCodesFor(const PrefsBlob& prefs) noexcept {
@@ -108,6 +162,16 @@ SeiCodes seiCodesFor(const PrefsBlob& prefs) noexcept {
     case PrefsColorOutput::Rec709:
         codes.primaries = 1;   // BT.709
         codes.transfer = 1;    // BT.709
+        break;
+    case PrefsColorOutput::DLogM:
+        // H.273 has no code point for DJI D-Log M, so the honest answer is
+        // the "unspecified" transfer (2) rather than a wrong specific one:
+        // 2 tells the host "this is not a transfer you know", which is true,
+        // whereas naming BT.709 or PQ would assert a curve we did not apply.
+        // The primaries are BT.2020 (9) for the same reason as the predefined
+        // token above - the widest standard gamut, so nothing is clipped.
+        codes.primaries = 9;   // BT.2020
+        codes.transfer = 2;    // unspecified
         break;
     case PrefsColorOutput::PQ:
     case PrefsColorOutput::Count:

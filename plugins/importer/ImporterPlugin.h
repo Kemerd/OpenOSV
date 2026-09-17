@@ -153,9 +153,20 @@ void ensureSuites(imStdParms* stdParms) noexcept;
 // ---------------------------------------------------------------------------
 
 /// The predefined colour-space token (PrSDKColorSpaces.h) the importer
-/// declares for a prefs blob: "BT.2100 PQ RGB Full", "BT.2100 HLG RGB Full"
-/// or "BT.709 RGB Full".  Never null.
+/// declares for a prefs blob: "BT.2100 PQ RGB Full", "BT.2100 HLG RGB Full",
+/// "BT.709 RGB Full", or "BT.2020 RGB Full (Scene)" for the D-Log M
+/// passthrough output.  Never null.
+///
+/// The passthrough case is the only one where the token does not describe the
+/// pixels exactly, because the SDK has no DJI D-Log M token; the reasoning
+/// for the choice is written out at the switch in PrefsMapping.cpp and in
+/// docs/PREMIERE.md.  Use colorSpaceIsApproximate() to find out.
 [[nodiscard]] const char* colorSpaceTokenFor(const PrefsBlob& prefs) noexcept;
+
+/// True when colorSpaceTokenFor() is only an approximation of what the
+/// frames really are, so the caller can log that Premiere is being told
+/// something inexact rather than leaving it undiscoverable in a support log.
+[[nodiscard]] bool colorSpaceIsApproximate(const PrefsBlob& prefs) noexcept;
 
 /// The SEI code point triple for a prefs blob, used by the
 /// OSV_IMPORTER_COLOR_SEI build of imGetIndColorSpace.  `primaries`,
@@ -220,8 +231,11 @@ csSDK_int32 handlePerformSourceSettingsCommand(imStdParms* stdParms, imFileAcces
 /// The pure mapping the dialog uses, exposed so it can be unit-tested without
 /// ever creating a window.  `controls` is the state of the dialog's widgets.
 struct DialogControls {
-    int colorOutput = 0;    ///< Radio index: 0 PQ, 1 HLG, 2 Rec.709.
-    int outputSize = 0;     ///< Combo index: 0 Native, 1 4K, 2 2K.
+    /// Combo index: 0 PQ, 1 HLG, 2 Rec.709, 3 D-Log M passthrough.  (It was a
+    /// three-way radio group until the fourth option arrived; see
+    /// plugins/importer/resource.h.)
+    int colorOutput = 0;
+    int outputSize = 0;     ///< Combo index: 0 Native, 1 4K, 2 2560x1280, 3 2K.
     int stabilization = 1;  ///< Combo index: 0 Off, 1 Horizon lock, 2 Full, 3 Smooth.
     bool seamSearch = true;
     bool gainMatch = true;

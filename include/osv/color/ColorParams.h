@@ -16,10 +16,21 @@
 namespace osv::color {
 
 /// Which D-Log M -> linear curve to decode with.
+///
+/// The numeric values are persisted (plugins/common/PrefsBlob.h stores the
+/// enum as a byte in the effect/importer preference blob), so existing values
+/// must never be renumbered: Osmo360 was appended as 2 rather than taking 0,
+/// even though it is now the default curve.  A blob written by an older build
+/// still deserialises to exactly the curve that build used.
 enum class DlogMFit : int {
-    DjiRefit = 0,  ///< kDlogMDjiRefit (default; matches DJI's HLG placement).
-    Pocket3 = 1    ///< kDlogMPocket3 (public Pocket 3 constants).
+    DjiRefit = 0,  ///< kDlogMDjiRefit (Pocket-3-era HLG measurements).
+    Pocket3 = 1,   ///< kDlogMPocket3 (public Pocket 3 constants).
+    Osmo360 = 2    ///< kDlogMOsmo360 (default; fitted to the Osmo 360 reference).
 };
+
+/// The curve new code and the CLI defaults select.  Named so the default can
+/// move again without hunting for literals.
+inline constexpr DlogMFit kDefaultDlogMFit = DlogMFit::Osmo360;
 
 /// Output encoding produced by osvLinearToOutput.
 enum class OutputTransfer : int {
@@ -37,7 +48,7 @@ enum class InputEncoding : int {
     Rec709Normal = OSV_INPUT_REC709_NORMAL  ///< color_mode 0 "Normal" Rec.709 clips.
 };
 
-/// Stable lower-case names ("dji", "pocket3").
+/// Stable lower-case names ("dji", "pocket3", "osmo360").
 [[nodiscard]] const char* dlogMFitName(DlogMFit fit) noexcept;
 /// Stable lower-case names ("hlg", "pq", "709", "linear", "dlogm").
 [[nodiscard]] const char* outputTransferName(OutputTransfer transfer) noexcept;
@@ -45,8 +56,8 @@ enum class InputEncoding : int {
 [[nodiscard]] const char* inputEncodingName(InputEncoding encoding) noexcept;
 
 /// Parse a name (case-insensitive; accepts the aliases documented in the CLI
-/// help: "dji"/"refit", "pocket3"/"pocket").  Returns false and leaves `out`
-/// untouched when the text is not recognised.
+/// help: "dji"/"refit", "pocket3"/"pocket", "osmo360"/"osmo").  Returns false
+/// and leaves `out` untouched when the text is not recognised.
 [[nodiscard]] bool parseDlogMFit(std::string_view text, DlogMFit& out) noexcept;
 /// Parse "pq", "hlg", "709"/"rec709"/"sdr", "linear"/"exr", "dlogm"/"passthrough"/"none".
 [[nodiscard]] bool parseOutputTransfer(std::string_view text, OutputTransfer& out) noexcept;

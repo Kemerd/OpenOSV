@@ -18,12 +18,55 @@
 // mind, so callers do not need to mask the frame first.
 #pragma once
 
+#include "osv/color/ColorParams.h"
 #include "osv/meta/Types.h"
 #include "osv/video/PlanarFrame.h"
 
 #include <cstdint>
 
 namespace osv::color {
+
+/**
+ * @brief The clip's own colour mode -> the encoding the pipeline must decode.
+ *
+ * This is the single rule for "what IS this footage", and it deliberately has
+ * nothing to do with what the user asked the output to be.  Keeping the two
+ * apart is what prevents the one genuinely destructive failure in this
+ * pipeline: decoding an already display-referred clip as if it were log.
+ * An HLG or Rec.709 source run through the D-Log M curve is double-converted
+ * - a de-log applied to a signal that was never logged - which crushes the
+ * shadows and blows the highlights, and no downstream grade recovers it.
+ * So the input encoding follows the METADATA and the output transfer follows
+ * the PREFERENCE, always, and never the other way round.
+ *
+ * Unknown maps to D-Log M rather than to Rec.709 on purpose.  A clip with no
+ * usable colour metadata is overwhelmingly D-Log M in this container (it is
+ * the mode the project targets and the mode the camera writes for the .OSV
+ * dual-fisheye format), and the statistical fallback (detectColorMode) is the
+ * intended second opinion when a decoded frame is available.  Guessing
+ * Rec.709 for a log clip would leave it flat and washed out with no hint as
+ * to why; guessing D-Log M for the rare non-log clip is visible immediately.
+ *
+ * The modes that are neither log nor HLG nor Normal - D-Cinelike, Vivid,
+ * D-Log, D-Log2 - fall through to D-Log M as well.  They are not produced by
+ * the Osmo 360 in this container, and none of them has its own curve here, so
+ * the honest choice is the default rather than a silently wrong branch.
+ *
+ * @param mode  StreamMeta.colorMode (19 = D-Log M, 9 = HLG, 0 = Normal).
+ */
+[[nodiscard]] constexpr InputEncoding inputEncodingForColorMode(meta::ColorMode mode) noexcept {
+    switch (mode) {
+    case meta::ColorMode::HLG:    return InputEncoding::HLG;
+    case meta::ColorMode::Normal: return InputEncoding::Rec709Normal;
+    case meta::ColorMode::DLogM:
+    case meta::ColorMode::DLog:
+    case meta::ColorMode::DLog2:
+    case meta::ColorMode::DCinelike:
+    case meta::ColorMode::Vivid:
+    case meta::ColorMode::Unknown:
+    default:                      return InputEncoding::DLogM;
+    }
+}
 
 /// Result of detectColorMode.
 struct AutoDetectResult {

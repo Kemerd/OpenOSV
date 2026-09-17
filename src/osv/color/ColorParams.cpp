@@ -46,6 +46,7 @@ const char* dlogMFitName(DlogMFit fit) noexcept {
     switch (fit) {
     case DlogMFit::DjiRefit: return "dji";
     case DlogMFit::Pocket3: return "pocket3";
+    case DlogMFit::Osmo360: return "osmo360";
     }
     return "unknown";
 }
@@ -75,12 +76,20 @@ const char* inputEncodingName(InputEncoding encoding) noexcept {
 // -----------------------------------------------------------------------------
 bool parseDlogMFit(std::string_view text, DlogMFit& out) noexcept {
     const std::string t = lowerAscii(text);
+    // "dji" keeps resolving to the original refit rather than following the
+    // default: a stored preference, a CI script or a user's documented command
+    // line that says "dji" must keep decoding with the curve it was written
+    // against.  The new curve has its own explicit names.
     if (t == "dji" || t == "refit" || t == "dji-refit" || t == "djirefit") {
         out = DlogMFit::DjiRefit;
         return true;
     }
     if (t == "pocket3" || t == "pocket" || t == "pocket-3") {
         out = DlogMFit::Pocket3;
+        return true;
+    }
+    if (t == "osmo360" || t == "osmo" || t == "osmo-360" || t == "360") {
+        out = DlogMFit::Osmo360;
         return true;
     }
     return false;
@@ -131,9 +140,12 @@ bool parseInputEncoding(std::string_view text, InputEncoding& out) noexcept {
 const OsvDlogMCurve& dlogmCurve(DlogMFit fit) noexcept {
     switch (fit) {
     case DlogMFit::Pocket3: return kDlogMPocket3;
-    case DlogMFit::DjiRefit: break;
+    case DlogMFit::DjiRefit: return kDlogMDjiRefit;
+    case DlogMFit::Osmo360: break;
     }
-    return kDlogMDjiRefit;
+    // Anything out of range (a corrupt persisted preference byte) falls back
+    // to the default curve rather than an arbitrary one.
+    return kDlogMOsmo360;
 }
 
 // -----------------------------------------------------------------------------
@@ -146,7 +158,7 @@ OsvColorParams makeDisabledColorParams() noexcept {
     // `enabled` on gets an identity-ish pipeline rather than zeros.
     p.enabled = 0;
     p.inputEncoding = OSV_INPUT_DLOGM;
-    p.curve = kDlogMDjiRefit;
+    p.curve = kDlogMOsmo360;
     setMatrix(p.nativeToWorking, kIdentity3);
     setMatrix(p.workingToOutput, kIdentity3);
     p.sceneScale = kBt2408SceneScale;
