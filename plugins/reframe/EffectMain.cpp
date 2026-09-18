@@ -988,8 +988,10 @@ PF_Err render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
                          settings.sourcePanDeg, settings.sourceTiltDeg, settings.sourceRollDeg,
                          settings.smoothKeyframes ? 1 : 0, sequenceAspect(in_data));
         PluginLog::oncef("reframe/render/setup", PluginLog::Level::Error,
-                         "reframe: could not build the kernel parameters ({}x{} -> {}x{})", src.width, src.height,
-                         dst.width, dst.height);
+                         "reframe: could not build the kernel parameters ({}x{} -> {}x{}): {} "
+                         "[src layout={} rowBytes={} topDown={}]",
+                         src.width, src.height, dst.width, dst.height, setupRejectName(setup.reject),
+                         static_cast<int>(src.layout), src.rowBytes, src.topDown ? 1 : 0);
         return PF_Err_BAD_CALLBACK_PARAM;
     }
 

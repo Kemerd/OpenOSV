@@ -122,11 +122,34 @@ struct ConstFrameView {
 };
 
 /// Everything the kernel needs, built once per frame.
+/// Why buildParams() refused to build a setup.
+///
+/// Every `return setup;` before the success path sets one of these.  Without
+/// it a rejection logs only the frame sizes, which never say which of the
+/// several independent checks fired - and the checks fail for completely
+/// different reasons (a bad control value, an unpromoted integer world, a
+/// bottom-up frame), so guessing between them costs a debugging session.
+enum class SetupReject {
+    None = 0,          ///< The setup is valid.
+    SourceInvalid,     ///< The input frame view itself was not usable.
+    OutputSize,        ///< outW/outH non-positive or beyond kMaxEdge.
+    Viewport,          ///< The letterbox rectangle came out empty.
+    DegenerateCamera,  ///< No usable focal length, even at the default FOV.
+    NeedsPromotion,    ///< An 8u/16u source reached us without being promoted.
+    RowsBackwards,     ///< Image rows do not run forward in memory.
+    SourcePointer,     ///< Null row-0 pointer or a non-positive pitch.
+};
+
+/// Human-readable name of a rejection reason, for the log line.
+[[nodiscard]] const char* setupRejectName(SetupReject reason) noexcept;
+
 struct KernelSetup {
     OsvReframeParams params{};  ///< Projection, viewport, rotation.
     OsvRgbaSource source{};     ///< Size and sample type of the equirect input.
     const void* sourceRow0 = nullptr;  ///< Address the source descriptor is relative to (its TOP row).
     bool valid = false;         ///< False when the inputs were unusable.
+    /// Set on every failure path; `None` exactly when `valid` is true.
+    SetupReject reject = SetupReject::SourceInvalid;
 };
 
 /// True when a source frame's IMAGE rows run forward in memory, which is the

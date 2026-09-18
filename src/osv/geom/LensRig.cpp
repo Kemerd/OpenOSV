@@ -121,22 +121,106 @@ Result<KannalaBrandt5> buildLens(const meta::DewarpParams& params, const char* n
     return lens;
 }
 
-/// Convert the occlusion polygon of a record to stream pixels.
-std::vector<Vec2d> buildOcclusion(const meta::DewarpParams& params, const StreamScaling& scaling) {
+/// Convert the occlusion arc of a record into a closed polygon in stream
+/// pixels.
+///
+/// The metadata does NOT store a closed outline.  It stores an open ARC of
+/// points sitting at an almost constant radius from the lens centre, sampled
+/// at a regular angular pitch, marking where the selfie stick crosses the
+/// image.  On the Osmo 360 clips examined that is 13 distinct points at
+/// r = 1442..1472 stream px spanning polar angle 30 deg to 150 deg in 10 deg
+/// steps, plus a duplicate of the apex stored first:
+///
+///     [0] (1920, 3735)  <- apex, repeated
+///     [1] ( 318, 2845)  <- one far end of the arc
+///     ...                  the arc, in order
+///     [7] (1920, 3735)  <- the apex again, in its proper place
+///     ...
+///     [13](3522, 2845)  <- the other far end
+///
+/// Two things go wrong if those points are used as a polygon directly, and
+/// both were observed as a large black ellipse in reframed output:
+///
+///  1. In stored order the ring closes from the apex straight back to the far
+///     end, crossing the arc.  The result SELF-INTERSECTS (measured: four
+///     crossings), and an even-odd fill of that bowtie marks a broad band
+///     across the bottom of the frame - 3.8 % of a 3000x3000 stream - rather
+///     than the stick.
+///  2. Merely sorting the points into boundary order does not help: the arc
+///     is OPEN, so any closure across its chord encloses the whole cap below
+///     it (measured: 13.8 % of the frame, worse than the bug it replaces).
+///
+/// The occluded region is the thin sliver between the arc and the edge of the
+/// image circle, because the stick enters from outside the frame.  So the arc
+/// is closed OUTWARD: walk the arc in angular order, then walk back along the
+/// image-circle rim at `rimRadiusPx` to the starting angle.  That produces a
+/// simple, correctly-oriented polygon of exactly the occluded band, which the
+/// kernel's existing even-odd test then handles unchanged.
+std::vector<Vec2d> buildOcclusion(const meta::DewarpParams& params, const StreamScaling& scaling,
+                                  const Vec2d& centreStreamPx, double rimRadiusPx) {
     std::vector<Vec2d> poly;
     // Both coordinate lists must agree; a mismatch is treated as no polygon.
     const std::size_t n = std::min(params.occlusionPtX.size(), params.occlusionPtY.size());
     if (n < 3 || params.occlusionPtX.size() != params.occlusionPtY.size()) {
         return poly;
     }
-    poly.reserve(n);
+
+    // ---- gather the arc points, dropping duplicates -----------------------
+    // The apex appears twice; a repeated vertex is a zero-length edge, which
+    // the point-in-polygon test survives but the distance-to-edge feather
+    // would divide by zero on.
+    std::vector<Vec2d> arc;
+    arc.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
         const Vec2d sensorPx{static_cast<double>(params.occlusionPtX[i]), static_cast<double>(params.occlusionPtY[i])};
         // Skip garbage vertices instead of poisoning the polygon.
         if (!std::isfinite(sensorPx.x) || !std::isfinite(sensorPx.y)) {
             continue;
         }
-        poly.push_back(scaling.apply(sensorPx));
+        const Vec2d streamPx = scaling.apply(sensorPx);
+        const bool duplicate = std::any_of(arc.begin(), arc.end(), [&streamPx](const Vec2d& v) {
+            return std::abs(v.x - streamPx.x) < 1e-6 && std::abs(v.y - streamPx.y) < 1e-6;
+        });
+        if (!duplicate) {
+            arc.push_back(streamPx);
+        }
+    }
+    if (arc.size() < 3) {
+        return poly;
+    }
+
+    // ---- put the arc in angular order about the lens centre ---------------
+    // This is the arc's own natural parameter, so it is correct whether or
+    // not a future firmware reorders the list or drops the duplicate apex.
+    const auto polarAngle = [&centreStreamPx](const Vec2d& v) {
+        return std::atan2(v.y - centreStreamPx.y, v.x - centreStreamPx.x);
+    };
+    std::stable_sort(arc.begin(), arc.end(),
+                     [&polarAngle](const Vec2d& a, const Vec2d& b) { return polarAngle(a) < polarAngle(b); });
+
+    // A rim we cannot trust means we cannot close the arc outward; returning
+    // no polygon masks nothing, which is far better than masking the wrong
+    // region (the bug this function exists to avoid).
+    if (!std::isfinite(rimRadiusPx) || rimRadiusPx <= 0.0) {
+        return poly;
+    }
+    // The rim must lie OUTSIDE every arc point, or "outward" is meaningless.
+    double maxArcRadius = 0.0;
+    for (const Vec2d& v : arc) {
+        maxArcRadius = std::max(maxArcRadius, std::hypot(v.x - centreStreamPx.x, v.y - centreStreamPx.y));
+    }
+    const double rim = std::max(rimRadiusPx, maxArcRadius * 1.02);
+
+    // ---- close it outward along the rim -----------------------------------
+    // Forward along the arc, then back along the rim at the same angles, so
+    // the two runs bound the sliver between them.  The rim is sampled at the
+    // arc's own angles, which is dense enough (10 deg) that the chord error
+    // against the true circle stays under 0.4 % of the radius.
+    poly.reserve(arc.size() * 2);
+    poly.insert(poly.end(), arc.begin(), arc.end());
+    for (auto it = arc.rbegin(); it != arc.rend(); ++it) {
+        const double a = polarAngle(*it);
+        poly.push_back(Vec2d{centreStreamPx.x + rim * std::cos(a), centreStreamPx.y + rim * std::sin(a)});
     }
     if (poly.size() < 3) {
         poly.clear();
@@ -180,7 +264,12 @@ Result<LensRig> LensRig::build(const meta::CalibrationSet& calibration, const St
                                                      thetaMaxRad, rig.notes));
         rig.lens[static_cast<std::size_t>(i)] = lens;
         rig.bodyToLens[static_cast<std::size_t>(i)] = bodyToLensMatrix(records[i]->camExtriQ, convention);
-        rig.occlusionPolyStream[static_cast<std::size_t>(i)] = buildOcclusion(*records[i], scaling);
+        // The arc is closed outward to the edge of the usable image circle,
+        // which is where thetaMax lands, so the polygon covers exactly the
+        // sliver between the stick arc and the rim (see buildOcclusion).
+        const double rimRadiusPx = lens.rMaxPx;
+        rig.occlusionPolyStream[static_cast<std::size_t>(i)] =
+            buildOcclusion(*records[i], scaling, Vec2d{lens.cx, lens.cy}, rimRadiusPx);
         rig.notes.push_back(std::format("{}: occlusion polygon with {} vertices", names[i],
                                         rig.occlusionPolyStream[static_cast<std::size_t>(i)].size()));
     }

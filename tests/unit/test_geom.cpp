@@ -472,8 +472,12 @@ TEST_CASE("LensRig: stream-space intrinsics and build failures", "[geom][rig]") 
     // The scaled calibration focal is within a pixel of digital_focal_length
     // (the relationship that verified the crop scale in the first place).
     REQUIRE_THAT(0.5 * (1043.8802 + 1043.6731) * 0.794492, Catch::Matchers::WithinAbs(kDigitalFocal, 1.0));
-    // Occlusion polygon mapped to stream px: 14 vertices, bottom half.
-    REQUIRE(rig.occlusionPolyStream[kSlaveLens].size() == 14);
+    // Occlusion polygon mapped to stream px.  The metadata stores an OPEN arc
+    // of 14 entries (13 distinct - the apex is repeated); buildOcclusion drops
+    // the duplicate and closes the arc outward to the rim, so the closed
+    // polygon has 13 arc vertices plus 13 rim vertices.  See buildOcclusion:
+    // using the stored points directly gives a self-intersecting bowtie.
+    REQUIRE(rig.occlusionPolyStream[kSlaveLens].size() == 26);
     REQUIRE(rig.occlusionPolyStream[kMasterLens].empty());
     for (const Vec2d& p : rig.occlusionPolyStream[kSlaveLens]) {
         REQUIRE(p.y > slave.cy);
@@ -829,7 +833,32 @@ TEST_CASE("Blend weight: occlusion polygon geometry and feather", "[geom][blend]
     const LensRig rig = sampleRig();
     const KannalaBrandt5& slave = rig.lens[kSlaveLens];
     const std::vector<Vec2d>& poly = rig.occlusionPolyStream[kSlaveLens];
-    REQUIRE(poly.size() == 14);
+    // 13 distinct arc vertices closed outward along the rim (see above).
+    REQUIRE(poly.size() == 26);
+
+    // The defect this polygon construction exists to prevent: in the order the
+    // metadata stores them the vertices form a SELF-INTERSECTING bowtie, whose
+    // even-odd fill marks a broad band across the bottom of the frame instead
+    // of the stick.  That painted a large black ellipse into reframed output.
+    // A simple polygon has no two non-adjacent edges crossing.
+    const auto segmentsCross = [](const Vec2d& a, const Vec2d& b, const Vec2d& c, const Vec2d& d) {
+        const auto orient = [](const Vec2d& p, const Vec2d& q, const Vec2d& r) {
+            const double v = (q.y - p.y) * (r.x - q.x) - (q.x - p.x) * (r.y - q.y);
+            return v > 1e-9 ? 1 : (v < -1e-9 ? 2 : 0);
+        };
+        return orient(a, b, c) != orient(a, b, d) && orient(c, d, a) != orient(c, d, b);
+    };
+    const std::size_t n = poly.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = i + 1; j < n; ++j) {
+            // Adjacent edges share an endpoint, so they always "touch".
+            if (j == i + 1 || (i == 0 && j == n - 1)) {
+                continue;
+            }
+            INFO("edges " << i << " and " << j << " of the occlusion polygon cross");
+            REQUIRE_FALSE(segmentsCross(poly[i], poly[(i + 1) % n], poly[j], poly[(j + 1) % n]));
+        }
+    }
 
     // Coordinate-space sanity: the polygon hugs the bottom of the image
     // circle.  Every vertex lies in the bottom half and its radial distance
@@ -846,25 +875,46 @@ TEST_CASE("Blend weight: occlusion polygon geometry and feather", "[geom][blend]
         REQUIRE(r < rim + 10.0);
     }
 
-    // A point between the chord P0-P1 and the arc vertex P3 is inside the
-    // crescent (the region between the arc and the chords is the occluded
-    // area), far from the principal point is outside.
-    const Vec2d p0 = poly[0];
-    const Vec2d p1 = poly[1];
-    const Vec2d p3 = poly[3];
-    const double t = (p3.x - p0.x) / (p1.x - p0.x);
-    const Vec2d chord{p3.x, p0.y + t * (p1.y - p0.y)};
-    const Vec2d inside = (chord + p3) * 0.5;
+    // The occluded region is the sliver BETWEEN the arc and the rim, so a
+    // point just outside an arc vertex - radially, away from the principal
+    // point - must be inside it, while the principal point itself is not.
+    // Vertex 6 is near the apex of the arc, the widest part of the sliver.
+    const Vec2d centre{slave.cx, slave.cy};
+    const Vec2d apex = poly[6];
+    const Vec2d radial = (apex - centre) * (1.0 / (apex - centre).norm());
+    const Vec2d inside = apex + radial * 8.0;
     REQUIRE(pointInPolygon(poly, inside));
-    REQUIRE(signedDistanceToPolygon(poly, inside) < -24.0);
+    // The sliver is thin, so the interior point sits only a few px from an
+    // edge; asserting a large depth would be asserting the wrong shape.
+    REQUIRE(signedDistanceToPolygon(poly, inside) < 0.0);
     const Vec2d outside{slave.cx, slave.cy};
     REQUIRE_FALSE(pointInPolygon(poly, outside));
     REQUIRE(signedDistanceToPolygon(poly, outside) > 1000.0);
     // Signed distance is continuous across the boundary: on a vertex it is 0.
-    REQUIRE_THAT(signedDistanceToPolygon(poly, p3), Catch::Matchers::WithinAbs(0.0, 1e-9));
+    REQUIRE_THAT(signedDistanceToPolygon(poly, apex), Catch::Matchers::WithinAbs(0.0, 1e-9));
     // Fewer than three vertices occlude nothing.
     REQUIRE(signedDistanceToPolygon({}, inside) == std::numeric_limits<double>::infinity());
-    REQUIRE_FALSE(pointInPolygon({p0, p1}, inside));
+    REQUIRE_FALSE(pointInPolygon({poly[0], poly[1]}, inside));
+
+    // The whole point of the sliver: it must cover only a small part of the
+    // frame.  The self-intersecting bowtie covered 3.8 % of a 3000x3000
+    // stream and closing the arc across its chord instead would cover 13.8 %;
+    // the correct outward closure covers under 2.5 %.
+    int masked = 0;
+    int sampled = 0;
+    for (int y = 0; y < rig.streamH; y += 10) {
+        for (int x = 0; x < rig.streamW; x += 10) {
+            ++sampled;
+            if (pointInPolygon(poly, Vec2d{static_cast<double>(x), static_cast<double>(y)})) {
+                ++masked;
+            }
+        }
+    }
+    REQUIRE(sampled > 0);
+    const double maskedFraction = static_cast<double>(masked) / static_cast<double>(sampled);
+    INFO("occlusion polygon masks " << 100.0 * maskedFraction << " % of the frame");
+    REQUIRE(maskedFraction > 0.005);
+    REQUIRE(maskedFraction < 0.025);
 
     // Weights: the inside pixel gets 0 through the mask, 1 without it; the
     // principal point is unaffected either way.
@@ -878,29 +928,30 @@ TEST_CASE("Blend weight: occlusion polygon geometry and feather", "[geom][blend]
     params.useOcclusionMask = true;
 
     // The occlusion feather ramps linearly from 0 at the boundary to 1 at
-    // occlusionFeatherPx outside.  The crescent lies between the arc and
-    // the chords (towards the image centre), so walking straight down from
-    // the arc vertex P3 (+y, towards the rim) leaves the polygon.  The arc
-    // edge is slanted (~39 deg at P3) so the perpendicular distance grows at
-    // ~0.78 x the walked distance; margins below allow for that.
-    const Vec2d down{0.0, 1.0};
+    // occlusionFeatherPx outside.  The occluded sliver lies between the arc
+    // and the rim, so leaving it means walking RADIALLY INWARD from an arc
+    // vertex, towards the principal point.  (Walking +y from the arc would go
+    // deeper into the sliver, not out of it.)  The arc is nearly
+    // perpendicular to the radius here, so the perpendicular distance grows
+    // at very nearly the walked distance.
+    const Vec2d inward = radial * -1.0;
     double prev = -1.0;
     for (int i = 0; i <= 80; ++i) {
-        const Vec2d p = p3 + down * (0.5 * i);
+        const Vec2d p = apex + inward * (0.5 * i);
         const double w = lensWeightRef(rig, kSlaveLens, 0.0, p, params);
         REQUIRE(w >= prev - 1e-12);
         REQUIRE(w >= 0.0);
         REQUIRE(w <= 1.0);
         prev = w;
     }
-    REQUIRE(lensWeightRef(rig, kSlaveLens, 0.0, p3 + down * (2.0 * params.occlusionFeatherPx), params) == 1.0);
-    const double half = lensWeightRef(rig, kSlaveLens, 0.0, p3 + down * (0.5 * params.occlusionFeatherPx), params);
+    REQUIRE(lensWeightRef(rig, kSlaveLens, 0.0, apex + inward * (2.0 * params.occlusionFeatherPx), params) == 1.0);
+    const double half = lensWeightRef(rig, kSlaveLens, 0.0, apex + inward * (0.5 * params.occlusionFeatherPx), params);
     REQUIRE(half > 0.2);
     REQUIRE(half < 0.8);
     // A zero feather is a hard mask.
     params.occlusionFeatherPx = 0.0;
     REQUIRE(lensWeightRef(rig, kSlaveLens, 0.0, inside, params) == 0.0);
-    REQUIRE(lensWeightRef(rig, kSlaveLens, 0.0, p3 + down * 1.0, params) == 1.0);
+    REQUIRE(lensWeightRef(rig, kSlaveLens, 0.0, apex + inward * 1.0, params) == 1.0);
     // The master has no polygon in this fixture: nothing is masked.
     REQUIRE(lensWeightRef(rig, kMasterLens, 0.0, Vec2d{1500.0, 2900.0}, params) == 1.0);
 }

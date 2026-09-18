@@ -391,15 +391,35 @@ Viewport computeViewport(int frameW, int frameH, double aspectRatio) noexcept {
 // ---------------------------------------------------------------------------
 //  Kernel parameter construction
 // ---------------------------------------------------------------------------
+/// Names for the rejection reasons, so a log line says which check fired
+/// instead of only that one did.
+const char* setupRejectName(SetupReject reason) noexcept {
+    switch (reason) {
+    case SetupReject::None:             return "none";
+    case SetupReject::SourceInvalid:    return "source frame invalid";
+    case SetupReject::OutputSize:       return "output size out of range";
+    case SetupReject::Viewport:         return "empty letterbox viewport";
+    case SetupReject::DegenerateCamera: return "degenerate virtual camera";
+    case SetupReject::NeedsPromotion:   return "integer source was not promoted to float";
+    case SetupReject::RowsBackwards:    return "source rows run backwards in memory";
+    case SetupReject::SourcePointer:    return "null row pointer or non-positive pitch";
+    }
+    // Unreachable for any enumerator above; a value from a corrupt read lands
+    // here rather than off the end of a table.
+    return "unknown";
+}
+
 KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int outW, int outH,
                         double sequenceAspect) noexcept {
     KernelSetup setup;
 
     // ---- defensive checks on everything that came from the host ----------
     if (!src.valid()) {
+        setup.reject = SetupReject::SourceInvalid;
         return setup;
     }
     if (outW <= 0 || outH <= 0 || outW > kMaxEdge || outH > kMaxEdge) {
+        setup.reject = SetupReject::OutputSize;
         return setup;
     }
 
@@ -408,6 +428,7 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
     const double ratio = resolveAspectRatio(settings.aspect, sequenceAspect, frameAspect);
     const Viewport view = computeViewport(outW, outH, ratio);
     if (view.w <= 0 || view.h <= 0) {
+        setup.reject = SetupReject::Viewport;
         return setup;
     }
 
@@ -481,6 +502,7 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
                 "reframe: degenerate virtual camera ({}x{} viewport, fov {} deg, distortion {}%); "
                 "no frame can be built",
                 view.w, view.h, requested, distortion);
+            setup.reject = SetupReject::DegenerateCamera;
             return setup;
         }
     }
@@ -531,11 +553,13 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
     // caller who forgot to promote into an invalid setup instead of an
     // out-of-bounds read.
     if (layoutNeedsPromotion(src.layout)) {
+        setup.reject = SetupReject::NeedsPromotion;
         return setup;
     }
 
     // The sampler cannot walk rows backwards (see sourceRowsRunForward).
     if (!sourceRowsRunForward(src)) {
+        setup.reject = SetupReject::RowsBackwards;
         return setup;
     }
 
@@ -550,10 +574,12 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
                                                      : static_cast<std::int64_t>(src.rowBytes));
     setup.sourceRow0 = src.constRowTopDown(0);
     if (!setup.sourceRow0 || s.pitchBytes <= 0) {
+        setup.reject = SetupReject::SourcePointer;
         return setup;
     }
 
     setup.valid = true;
+    setup.reject = SetupReject::None;
     return setup;
 }
 

@@ -873,15 +873,26 @@ TEST_CASE("imGetSourceVideo renders frame 0 at native size", "[importer][video][
         // preserves vertical brightness order.  Pin the measured MAGNITUDES
         // too, against the osvtool numbers above (124/255 = 0.486 and
         // 97/255 = 0.380 in the 0..1 values readPPix produces).  A generous
-        // +-25% band absorbs the render-size difference between the 1920x960
+        // band absorbs the render-size difference between the 1920x960
         // osvtool reference and this frame while still failing a render that
         // is, say, half as bright or twice as contrasty.
+        //
+        // The bottom band gets more headroom than the top on purpose.  It is
+        // the band that contains the selfie-stick occlusion arc, and it used
+        // to be measurably DARKER than the scene because a bug in the
+        // occlusion polygon punched a black region into it (see
+        // buildOcclusion in src/osv/geom/LensRig.cpp).  With that fixed the
+        // hole is filled from the other lens, which legitimately raises this
+        // band - measured 0.4762 against the 0.4755 that +-25% allowed, i.e.
+        // the old ceiling was pinning the BUG.  +-30 % keeps a real
+        // regression detectable without re-encoding that hole as the
+        // expectation.
         constexpr double kOsvtoolTop = 124.0 / 255.0;
         constexpr double kOsvtoolBottom = 97.0 / 255.0;
         CHECK(top > kOsvtoolTop * 0.75);
         CHECK(top < kOsvtoolTop * 1.25);
         CHECK(bottom > kOsvtoolBottom * 0.75);
-        CHECK(bottom < kOsvtoolBottom * 1.25);
+        CHECK(bottom < kOsvtoolBottom * 1.30);
     }
 
     SECTION("longitude is not mirrored and the seam is where it belongs") {
