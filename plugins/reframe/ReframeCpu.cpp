@@ -676,22 +676,35 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
         return setup;
     }
 
-    // The sampler cannot walk rows backwards (see sourceRowsRunForward).
-    if (!sourceRowsRunForward(src)) {
-        setup.reject = SetupReject::RowsBackwards;
-        return setup;
-    }
-
     OsvRgbaSource& s = setup.source;
     s.w = src.width;
     s.h = src.height;
     s.isHalf = (src.layout == PixelLayout::Bgra16f) ? 1 : 0;
     s.isBgra = 1;  // every layout we accept is BGRA
-    // Image row 0 is the top row; the check above guarantees the rows then
-    // run forward, so the pitch the kernel wants is simply |rowBytes|.
+    // The kernel wants a positive pitch, because it indexes rows with an
+    // unsigned multiply; |rowBytes| is that pitch whichever way the rows run.
     s.pitchBytes = static_cast<int>(src.rowBytes < 0 ? -static_cast<std::int64_t>(src.rowBytes)
                                                      : static_cast<std::int64_t>(src.rowBytes));
-    setup.sourceRow0 = src.constRowTopDown(0);
+
+    // Which end of the buffer does the kernel start from?
+    //
+    // Two of the four (topDown, sign-of-pitch) combinations put image row 0
+    // at the LOWEST address and the rest ascending, which is what the sampler
+    // reads natively.  The other two store the image the other way round, and
+    // those used to be REFUSED - which is why the effect rendered nothing at
+    // all for frames Premiere legitimately hands out (a log shows topDown
+    // with rowBytes = -40960, rejected on every single frame).
+    //
+    // They are now handled instead: point at the LAST image row and set
+    // flipY, so the kernel walks forward in memory while walking down the
+    // image.  Every offset stays non-negative and no pixels are copied.
+    if (sourceRowsRunForward(src)) {
+        s.flipY = 0;
+        setup.sourceRow0 = src.constRowTopDown(0);
+    } else {
+        s.flipY = 1;
+        setup.sourceRow0 = src.constRowTopDown(src.height - 1);
+    }
     if (!setup.sourceRow0 || s.pitchBytes <= 0) {
         setup.reject = SetupReject::SourcePointer;
         return setup;

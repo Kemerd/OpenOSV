@@ -183,9 +183,22 @@ typedef struct OsvRenderParams {
  * serves host and device buffers. */
 typedef struct OsvRgbaSource {
     int w, h;            /* equirect size in pixels                            */
-    int pitchBytes;      /* row pitch in bytes (positive, row 0 at the top)    */
+    int pitchBytes;      /* row pitch in bytes (positive, see flipY)           */
     int isHalf;          /* 1 = 16-bit float channels, 0 = 32-bit float        */
     int isBgra;          /* 1 = channel order B,G,R,A (Premiere), 0 = R,G,B,A  */
+    /* 1 = the pixel pointer addresses the LAST image row and rows ascend in
+     * memory as the image descends, i.e. image row y lives at
+     * pixels + (h - 1 - y) * pitchBytes.
+     *
+     * Why this exists: the sampler indexes rows with an UNSIGNED multiply, so
+     * a negative pitch is not expressible - it would become an enormous
+     * positive offset and walk off the allocation.  Premiere hands out worlds
+     * whose rows genuinely descend in memory (a session log shows topDown
+     * with rowBytes = -40960), and those used to be REFUSED outright, which
+     * made the whole effect render nothing at all.  Pointing at the far end
+     * and flipping the row index keeps every offset non-negative and costs
+     * one subtraction per fetch. */
+    int flipY;
 } OsvRgbaSource;
 
 /* Everything osvReframeEquirectPixel needs besides the source frame.  The
@@ -764,8 +777,12 @@ OSV_HD int osvWrapIndex(int i, int n) {
  * already be inside the frame; the channel order and sample type of the
  * source are resolved here so the sampler above stays generic. */
 OSV_HD void osvFetchRgba(const OsvRgbaSource* src, OSV_GLOBAL const void* pixels, int x, int y, float* rgba) {
+    /* With flipY the pointer is at the last image row, so walking DOWN the
+     * image walks UP in memory.  The index stays non-negative either way,
+     * which is what the unsigned multiply below requires. */
+    const int memoryRow = src->flipY ? (src->h - 1 - y) : y;
     OSV_GLOBAL const unsigned char* row =
-        (OSV_GLOBAL const unsigned char*)pixels + (size_t)y * (size_t)src->pitchBytes;
+        (OSV_GLOBAL const unsigned char*)pixels + (size_t)memoryRow * (size_t)src->pitchBytes;
     float c[4];
     if (src->isHalf) {
         OSV_GLOBAL const osv_u16* texel = (OSV_GLOBAL const osv_u16*)row + (size_t)x * 4u;

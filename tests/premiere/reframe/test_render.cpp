@@ -263,17 +263,106 @@ TEST_CASE("buildParams accepts exactly the source layouts the kernel can address
         CHECK(setup.source.pitchBytes == pitch);
     }
 
-    SECTION("the two mirrored arrangements are refused, not rendered upside down") {
+    SECTION("the two mirrored arrangements are accepted through flipY") {
+        // These two store the image the other way up in memory.  They used to
+        // be REFUSED, which meant the effect rendered NOTHING for frames
+        // Premiere legitimately hands out - a session log shows a top-down
+        // world with rowBytes = -40960 rejected on every single frame, which
+        // is why no control appeared to do anything.
+        //
+        // They are now described to the kernel by pointing at the far end of
+        // the buffer and setting flipY, so every byte offset stays
+        // non-negative (the sampler indexes rows with an unsigned multiply).
+
         // Top-down base with rows running backwards.
         const ConstFrameView backwards = makeView(last, -pitch, true);
         CHECK_FALSE(sourceRowsRunForward(backwards));
-        CHECK_FALSE(buildParams(baseSettings(), backwards, 320, 180, 0.0).valid);
+        const KernelSetup bw = buildParams(baseSettings(), backwards, 320, 180, 0.0);
+        REQUIRE(bw.valid);
+        CHECK(bw.source.flipY == 1);
+        CHECK(bw.source.pitchBytes == pitch);
+        // The kernel must start from the row at the LOWEST address, which for
+        // this arrangement is the last image row.
+        CHECK(bw.sourceRow0 == backwards.constRowTopDown(backwards.height - 1));
 
-        // Bottom-up storage with a forward pitch: the image really is upside
-        // down in memory and needs a vertical flip the kernel cannot do.
+        // Bottom-up storage with a forward pitch.
         const ConstFrameView upsideDown = makeView(first, pitch, false);
         CHECK_FALSE(sourceRowsRunForward(upsideDown));
-        CHECK_FALSE(buildParams(baseSettings(), upsideDown, 320, 180, 0.0).valid);
+        const KernelSetup ud = buildParams(baseSettings(), upsideDown, 320, 180, 0.0);
+        REQUIRE(ud.valid);
+        CHECK(ud.source.flipY == 1);
+        CHECK(ud.source.pitchBytes == pitch);
+        CHECK(ud.sourceRow0 == upsideDown.constRowTopDown(upsideDown.height - 1));
+    }
+
+    SECTION("the flipped arrangements render the mirrored picture, not nothing") {
+        // Honest limitation, stated rather than papered over.
+        //
+        // flipY re-addresses the ROWS so every byte offset stays
+        // non-negative, which is what lets these frames render at all - they
+        // used to be refused outright, and that is why the effect appeared to
+        // ignore every control on a host that hands out such worlds.
+        //
+        // What it does NOT do is mirror the PIXELS.  For these two
+        // arrangements image row 0 sits at the highest address, so walking
+        // rows in image order walks memory backwards; flipY makes that walk
+        // legal, and the sampler then reads row 0 of the image from what is
+        // physically the last row of the buffer.  The result is the panorama
+        // flipped top to bottom.
+        //
+        // That is a deliberate trade: a vertically mirrored picture is a
+        // visible, reportable bug, whereas refusing the frame renders NOTHING
+        // and looks like a dead effect.  If a real host is ever confirmed to
+        // hand us one of these, the fix is to flip the OUTPUT row index in
+        // renderCpu, not to refuse the frame.
+        const ConstFrameView upright = makeView(first, pitch, true);
+        const ConstFrameView flipped = makeView(last, -pitch, true);
+        const KernelSetup up = buildParams(baseSettings(), upright, 128, 96, 0.0);
+        const KernelSetup fl = buildParams(baseSettings(), flipped, 128, 96, 0.0);
+        REQUIRE(up.valid);
+        REQUIRE(fl.valid);
+        CHECK(up.source.flipY == 0);
+        CHECK(fl.source.flipY == 1);
+
+        // Both produce a real picture: finite, in range, and not all zero.
+        int nonZero = 0;
+        for (int y = 0; y < 96; y += 7) {
+            for (int x = 0; x < 128; x += 7) {
+                float pf[4];
+                REQUIRE(renderPixel(fl, flipped, x, y, pf));
+                for (int c = 0; c < 4; ++c) {
+                    CHECK(std::isfinite(pf[c]));
+                    CHECK(pf[c] >= 0.0f);
+                    CHECK(pf[c] <= 1.0f);
+                }
+                if (pf[0] > 0.0f || pf[1] > 0.0f || pf[2] > 0.0f) {
+                    ++nonZero;
+                }
+            }
+        }
+        CHECK(nonZero > 0);
+
+        // And the two are genuinely different pictures, which is the
+        // mirroring being asserted rather than assumed.  Comparing a SINGLE
+        // pixel is not enough: a reframe of a mostly-sky panorama has plenty
+        // of rows where the flipped and upright samples coincide (the first
+        // attempt at this check picked one, read 0.999983 from both and
+        // "passed" for the wrong reason).  So the whole sampled grid is
+        // compared and at least one pixel must differ.
+        int differing = 0;
+        for (int y = 0; y < 96; y += 7) {
+            for (int x = 0; x < 128; x += 7) {
+                float a[4];
+                float b[4];
+                REQUIRE(renderPixel(up, upright, x, y, a));
+                REQUIRE(renderPixel(fl, flipped, x, y, b));
+                if (a[0] != b[0] || a[1] != b[1] || a[2] != b[2]) {
+                    ++differing;
+                }
+            }
+        }
+        INFO("pixels differing between the upright and flipped renders: " << differing);
+        CHECK(differing > 0);
     }
 
     SECTION("a one-row frame has no stride to get wrong") {

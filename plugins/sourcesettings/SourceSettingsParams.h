@@ -171,10 +171,17 @@
  * because the number a user cares about is the one a new sequence inherits. */
 #define OSV_SS_SIZE_ITEMS "Native (2 x decoded height)|4K (3840 x 1920)|2560 x 1280|2K (1920 x 960)"
 #define OSV_SS_SIZE_COUNT 4
-/* 3 = QHD2560, which is PrefsBlob::defaults().outputSize.  A static_assert in
+/* 1 = Native (the popup is 1-based, PrefsOutputSize::Native is 0), which is
+ * PrefsBlob::defaults().outputSize.  A static_assert in
  * SourceSettingsMain.cpp checks this literal against the blob so the popup
- * default and the decoder default cannot disagree. */
-#define OSV_SS_SIZE_DEFAULT 3
+ * default and the decoder default cannot disagree.
+ *
+ * Native rather than a fixed size because the importer's job is to hand over
+ * every pixel the camera recorded; a reframe crops a small window out of the
+ * sphere and therefore MAGNIFIES it, so a downscaled default made zooming
+ * soft for no reason.  The timeline size is chosen by the sequence presets,
+ * which is where that decision belongs. */
+#define OSV_SS_SIZE_DEFAULT 1
 
 /* PrefsStabilization: Off, HorizonLock, Full, Smooth. */
 #define OSV_SS_STAB_ITEMS "Off|Horizon Lock|Full|Smooth"
