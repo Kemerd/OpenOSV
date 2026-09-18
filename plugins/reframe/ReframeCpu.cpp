@@ -234,6 +234,120 @@ bool sourceRowsRunForward(const ConstFrameView& src) noexcept {
 // ---------------------------------------------------------------------------
 //  Host parameter identification (declared in ReframeParams.h)
 // ---------------------------------------------------------------------------
+/// Identify the host list from the one structure in it that cannot move.
+///
+/// WHY A SECOND MATCHER
+/// --------------------
+/// matchHostParams() walks the whole signature and needs every entry to agree.
+/// That is the right thing when the host answers every GetParam, but Premiere
+/// Pro 26.2 does not: a session log shows it reporting ELEVEN entries for this
+/// effect while refusing to return a type for four of them -
+///
+///     [0]i32:8 [1]=<err> [2]i32:1 [3]f32:42.0 [4]f32:-15.0 [5]f32:7.0
+///     [6]f64:100.0 [7]f64:30.0 [8]=<err> [9]=<err> [10]=<err>
+///
+/// - and those refusals sit exactly where the exact walk needs a type.  The
+/// walk therefore failed on every such call and the caller fell back to the
+/// static "AE index - 1" mapping, which for THIS list reads one control too
+/// early: Pan was read out of the Preset slot and FOV out of Roll's.  Playback
+/// reached the renderer by a different route, which is why playback looked
+/// right while scrubbing and keyframe stepping did not.
+///
+/// THE ANCHOR
+/// ----------
+/// Our eleven controls contain exactly one adjacent Float64 PAIR - FOV and
+/// Distortion are the only Float64 sliders in the effect (kValueParamKind).
+/// A host list that contains exactly one adjacent Float64 pair therefore
+/// pins the alignment with no ambiguity at all, whatever it did with the
+/// entries it could not type: the offset is (where the pair is) minus (where
+/// we put it), and every other control follows by counting.  In the log above
+/// the pair sits at 6/7 against our 5/6, giving offset +1 - which places Pan,
+/// Tilt and Roll at 3, 4 and 5, and the VALUES at those indices (42, -15, 7)
+/// are exactly what the user had dialled in.  That is the confirmation that
+/// the offset is real and not a coincidence of types.
+///
+/// Anything less certain is refused: no pair, or more than one, means the
+/// anchor is not unique and the caller keeps its documented fallback.
+[[nodiscard]] bool matchByFov64Pair(const HostParamKind* kinds, int count, HostParamMap* outMap) noexcept {
+    if (!kinds || !outMap || count <= 0) {
+        return false;
+    }
+
+    // Where the pair sits in OUR index space, derived rather than hard-coded
+    // so reordering kValueParamKind cannot silently invalidate this.
+    int ourPair = -1;
+    for (int i = 0; i + 1 < kValueParamCount; ++i) {
+        if (kValueParamKind[i] == HostParamKind::Float64 && kValueParamKind[i + 1] == HostParamKind::Float64) {
+            if (ourPair >= 0) {
+                return false;  // our own signature is no longer distinctive
+            }
+            ourPair = i;
+        }
+    }
+    if (ourPair < 0) {
+        return false;
+    }
+
+    // Where it sits in the host's, and it must be unique there too.
+    int hostPair = -1;
+    for (int i = 0; i + 1 < count; ++i) {
+        if (kinds[i] == HostParamKind::Float64 && kinds[i + 1] == HostParamKind::Float64) {
+            if (hostPair >= 0) {
+                return false;  // two candidate anchors: no single right answer
+            }
+            hostPair = i;
+        }
+    }
+    if (hostPair < 0) {
+        return false;
+    }
+
+    // ---- lay our controls down at that offset -----------------------------
+    const int offset = hostPair - ourPair;
+    HostParamMap map{};
+    for (int i = 0; i <= OSV_REFRAME_PARAM_COUNT; ++i) {
+        map.hostIndex[i] = -1;
+    }
+    // Only slots the host actually TYPED are mapped.
+    //
+    // A slot whose type the host refused is left at -1 so the control keeps
+    // its documented default.  That matters because a host that cannot report
+    // an entry's type usually cannot return its value either - the mock host
+    // in the tests fails both with suiteError_InvalidParms, and a real
+    // Premiere that refused the type gave us <err> for the value in the same
+    // dump.  Mapping such a slot on the anchor's word alone would replace a
+    // known-good default with whatever a failed GetParam left behind, which
+    // is how an unset Output Aspect lost its letterbox.
+    //
+    // A slot the host DID type and that CONTRADICTS ours is fatal rather than
+    // skippable: at this offset the list is demonstrably not our parameter
+    // set, and mapping the rest would mean reading someone else's controls.
+    int mapped = 0;
+    for (int ours = 0; ours < kValueParamCount; ++ours) {
+        const int host = ours + offset;
+        if (host < 0 || host >= count) {
+            continue;
+        }
+        if (kinds[host] == HostParamKind::Unknown) {
+            continue;
+        }
+        if (kinds[host] != kValueParamKind[ours]) {
+            return false;
+        }
+        map.hostIndex[kValueParamAeIndex[ours]] = host;
+        ++mapped;
+    }
+
+    // The anchor itself is two of those; demanding more than the pair alone
+    // keeps a nearly-empty list from being "identified" by coincidence.
+    if (mapped < 5) {
+        return false;
+    }
+    map.probed = true;
+    *outMap = map;
+    return true;
+}
+
 bool matchHostParams(const HostParamKind* kinds, int count, HostParamMap* outMap) noexcept {
     // ---- defensive gate on everything that came from the host -------------
     // A null list, a negative count or a list longer than our own can never
@@ -276,6 +390,8 @@ bool matchHostParams(const HostParamKind* kinds, int count, HostParamMap* outMap
             // HostParamKind::Unknown is deliberately excluded by the
             // equality test: an entry we could not read matches nothing, so
             // a failed GetParam can only ever reduce the candidate set.
+            // (When the host refuses so many types that this exact match
+            // fails outright, matchByFov64Pair below takes over.)
             if (kinds[hostPos] != kValueParamKind[ours]) {
                 ok = false;
                 break;
@@ -294,7 +410,10 @@ bool matchHostParams(const HostParamKind* kinds, int count, HostParamMap* outMap
         }
     }
     if (matchCount != 1 || matchedGapStart < 0) {
-        return false;
+        // The exact walk could not identify the list.  Before giving up and
+        // letting the caller use the static mapping - which is the mapping
+        // that reads the WRONG control - try the structural anchor below.
+        return matchByFov64Pair(kinds, count, outMap);
     }
 
     // ---- build the table --------------------------------------------------
