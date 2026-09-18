@@ -88,11 +88,11 @@ struct FlowField {
 
 /// Tuning for the DIS solver.
 ///
-/// The defaults are the paper's own "DIS-Fast" operating point adapted to a
-/// narrow overlap band, NOT DJI's numbers - those live in their binary's data
-/// section and are being recovered separately.  Every one of them is a named
-/// field precisely so a reversed constant can be dropped in without touching
-/// the solver, so treat these as a starting point and not as gospel.
+/// Most of these match the values DJI's own stitcher uses, determined for
+/// interoperability.
+/// Each field says where its default came from.  Four of them - pyramid
+/// levels and iteration count among them - keep the paper's operating point
+/// and say so at their own declaration.
 struct DisFlowParams {
     /// Coarsest-to-finest pyramid levels actually solved.  The paper uses 5
     /// for 1024-wide images; a band a few hundred rows tall cannot support
@@ -103,24 +103,70 @@ struct DisFlowParams {
     /// Patch side in pixels at every level (the paper's theta_ps = 8).
     int patchSize = 8;
 
-    /// Stride between patch origins, as a fraction of patchSize.  The paper's
-    /// theta_ov = 0.3 overlap means a stride of 0.7 * patchSize; expressed as
-    /// a stride so the grid maths has no rounding surprise.
-    double patchStrideFraction = 0.5;
+    /// Stride between patch origins in PIXELS.
+    ///
+    /// 5, as DJI's stitcher uses (patch 8, stride 5, border 2, grid
+    /// nx = (W - 8) / 5 + 1).  Expressed in pixels rather than as a fraction
+    /// of the patch because that is how it is actually specified there, and a
+    /// fraction would reintroduce a rounding decision that has already been
+    /// made for us.
+    int patchStridePx = 5;
 
-    /// Inverse-search iterations per patch per level (theta_it = 12).
+    /// Inverse-search iterations per patch per level.
+    ///
+    /// The paper's theta_it = 12: DJI's iteration count is not known, so this
+    /// is the one significant DIS parameter that keeps the paper's value.
     int iterations = 12;
+
+    /// Multiplier on each inverse-search step, in (0, 1].
+    ///
+    /// 0.4, as DJI's stitcher uses.  Damping the step below 1 trades
+    /// convergence speed for stability: the undamped Gauss-Newton step of an
+    /// inverse-search iteration overshoots on a patch whose tensor is only
+    /// marginally well conditioned, and the overshoot is what produces the
+    /// occasional wild vector that a spatial smoothing pass then spreads.
+    double stepScale = 0.4;
 
     /// Give up on a patch once its step is smaller than this, in pixels.
     /// Purely a speed guard: the remaining motion is below what the densify
     /// step can represent anyway.
     double minStepPx = 0.01;
 
-    /// Reject a patch whose structure tensor is near-singular.  A patch on
-    /// flat sky has no gradient to match on, and inverting its tensor
-    /// amplifies noise into a large bogus displacement.  Compared against the
-    /// tensor's determinant normalised by its trace squared.
-    double minTensorDet = 1e-6;
+    /// Reject a patch whose structure tensor determinant falls below this.
+    ///
+    /// 0.001, as DJI's stitcher uses, and compared against the RAW
+    /// determinant of the tensor computed on the **8-BIT SCALE** - see
+    /// `intensityScale` below, which is what makes that comparison valid.
+    ///
+    /// An earlier version used a scale-free test (det / trace^2) against
+    /// 1e-6, reasoning that a raw threshold conflates contrast with
+    /// conditioning.  That reasoning is sound in general but it is not what
+    /// DJI does, and matching their output is the requirement, so the raw
+    /// test is used and the scale-free variant is gone rather than left as a
+    /// dead option.
+    double minTensorDet = 0.001;
+
+    /// Reject a patch whose final SSD exceeds this.  1e7, as DJI's stitcher uses,
+    /// and likewise on the 8-bit scale.
+    double maxPatchSsd = 1.0e7;
+
+    /// Multiplier applied to image values before the solve, so that the
+    /// thresholds shared with DJI's stitcher mean what they mean.
+    ///
+    /// THIS IS NOT COSMETIC.  minTensorDet and maxPatchSsd are absolute
+    /// numbers, and a structure tensor determinant scales with the FOURTH
+    /// power of the intensity range: measured on a textured test image, one
+    /// patch gives det = 9.5e-05 with values in [0, 1] and det = 4.0e+05
+    /// with the same image in [0, 255].  The first is rejected by the 0.001
+    /// threshold and the second passes comfortably, so feeding [0, 1] data
+    /// to DJI's constants rejects EVERY patch and the solver returns a
+    /// uniformly zero field - which is exactly what happened when these
+    /// constants were first dropped in.
+    ///
+    /// The library's own images are normalised to [0, 1], DJI's stitcher works
+    /// on 8-bit-scaled values, and 255 reconciles the two.  Set it to 1.0
+    /// only alongside thresholds derived for a [0, 1] range.
+    double intensityScale = 255.0;
 
     /// Largest displacement any single patch may report, in pixels, per
     /// level.  The overlap band is narrow and the true disparity is a few

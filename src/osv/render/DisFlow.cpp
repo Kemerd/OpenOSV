@@ -197,9 +197,8 @@ std::vector<Patch> precomputeTensors(const GrayImage& img, const std::vector<flo
     std::vector<Patch> patches;
     const int ps = std::max(2, params.patchSize);
     const int half = ps / 2;
-    // Stride from the overlap fraction; at least one pixel so the loop ends.
-    const int stride = std::max(1, static_cast<int>(std::lround(static_cast<double>(ps) *
-                                                               std::clamp(params.patchStrideFraction, 0.1, 1.0))));
+    // Stride in pixels, as DJI specifies it; at least one so the loop ends.
+    const int stride = std::max(1, params.patchStridePx);
     if (img.w < static_cast<std::uint32_t>(ps) || img.h < static_cast<std::uint32_t>(ps)) {
         return patches;
     }
@@ -228,13 +227,13 @@ std::vector<Patch> precomputeTensors(const GrayImage& img, const std::vector<flo
                 }
             }
 
-            // Invertibility test on a SCALE-FREE quantity: det / trace^2.  A
-            // raw determinant threshold would reject a low-contrast patch
-            // that is nonetheless well conditioned, and accept a
-            // high-contrast edge patch that is singular along the edge.
+            // Invertibility test on the RAW determinant, floored at
+            // params.minTensorDet (DJI's 0.001).  A scale-free test
+            // (det / trace^2) is arguably better conditioned in general, but
+            // it is not what DJI does and the requirement is to match their
+            // output, so their test is the one used.
             const double det = hxx * hyy - hxy * hxy;
-            const double trace = hxx + hyy;
-            if (trace > 0.0 && det / (trace * trace) > params.minTensorDet) {
+            if (det > params.minTensorDet) {
                 const double invDet = 1.0 / det;
                 p.iHxx = static_cast<float>(hyy * invDet);
                 p.iHxy = static_cast<float>(-hxy * invDet);
@@ -316,8 +315,12 @@ void solvePatch(Patch& patch, const GrayImage& from, const GrayImage& to, const 
 
         // The inverse-tensor step.  Negated because b was accumulated as
         // (target - template): we move the displacement to REDUCE it.
-        const float du = -(patch.iHxx * static_cast<float>(bx) + patch.iHxy * static_cast<float>(by));
-        const float dv = -(patch.iHxy * static_cast<float>(bx) + patch.iHyy * static_cast<float>(by));
+        // Damped by stepScale (DJI's 0.4): an undamped Gauss-Newton step
+        // overshoots on a marginally conditioned patch, and the overshoot is
+        // what produces the occasional wild vector.
+        const float scale = static_cast<float>(params.stepScale);
+        const float du = -scale * (patch.iHxx * static_cast<float>(bx) + patch.iHxy * static_cast<float>(by));
+        const float dv = -scale * (patch.iHxy * static_cast<float>(bx) + patch.iHyy * static_cast<float>(by));
         if (!std::isfinite(du) || !std::isfinite(dv)) {
             patch.usable = false;
             patch.quality = 0.0f;
@@ -341,11 +344,26 @@ void solvePatch(Patch& patch, const GrayImage& from, const GrayImage& to, const 
         }
     }
 
+    // A patch whose final residual is enormous matched nothing; disown it
+    // rather than let it contribute at a tiny weight.  DJI's threshold is on
+    // the SSD over the patch, so the mean residual is scaled back up.
+    // lastResidual is already on the intensityScale range (the images were
+    // scaled at the pyramid base), so no further conversion is needed here.
+    const double ssd = lastResidual * lastResidual * static_cast<double>(ps) * ps;
+    if (ssd > params.maxPatchSsd) {
+        patch.usable = false;
+        patch.quality = 0.0f;
+        return;
+    }
+
     patch.u = u;
     patch.v = v;
-    // Quality falls off with the residual, so densify() prefers patches that
-    // actually matched.  The +1 keeps it bounded in (0, 1].
-    patch.quality = static_cast<float>(1.0 / (1.0 + lastResidual));
+    // DJI's densification weight: 1 / max(1, |residual|) on the 8-bit scale,
+    // floored at 1 so a perfect match weighs 1 instead of dividing by zero.
+    // The residual is already on that scale (see the pyramid base), and it is
+    // the patch mean rather than per-pixel because densify() does not have
+    // the target image to recompute it from.
+    patch.quality = static_cast<float>(1.0 / std::max(1.0, lastResidual));
 }
 
 /// Scatter the solved patches into a per-pixel field, weighted by quality.
@@ -365,12 +383,25 @@ FlowField densify(const std::vector<Patch>& patches, std::uint32_t w, std::uint3
     std::vector<float> weight(static_cast<std::size_t>(w) * h, 0.0f);
     const int ps = std::max(2, params.patchSize);
     const int half = ps / 2;
-    // Spatial falloff scaled to the patch: sigma of half the patch means the
-    // weight is ~0.6 at the patch edge, so overlapping patches blend rather
-    // than one winning outright.
-    const double sigma = std::max(1.0, static_cast<double>(half));
-    const double inv2s2 = 1.0 / (2.0 * sigma * sigma);
 
+    // The weight is PHOTOMETRIC ONLY, with no spatial falloff from the patch
+    // centre.  DJI's densification is exactly
+    //
+    //     w = 1 / max(1, |255 * (I1_bilinear - I0)|)
+    //
+    // i.e. the reciprocal of the per-pixel residual on an 8-bit scale,
+    // floored at 1 so a perfect match gets weight 1 rather than infinity.
+    // An earlier version of this function multiplied in a Gaussian of the
+    // distance to the patch centre, on the reasoning that a patch should not
+    // impose its displacement on pixels near its edge.  That is a defensible
+    // choice and it is NOT what DJI does, and since the requirement is to
+    // match their output, theirs wins.  The overlap between patches (stride
+    // 5 against size 8) already provides the blending the spatial term was
+    // there to supply.
+    //
+    // patch.quality carries the same quantity, computed once per patch from
+    // its mean residual, because a per-pixel residual would need the target
+    // image here and densify() deliberately does not take one.
     for (const Patch& p : patches) {
         if (!p.usable || !(p.quality > 0.0f)) {
             continue;
@@ -387,8 +418,7 @@ FlowField densify(const std::vector<Patch>& patches, std::uint32_t w, std::uint3
                 if (x < 0 || x >= static_cast<int>(w)) {
                     continue;
                 }
-                const double r2 = static_cast<double>(dx) * dx + static_cast<double>(dy) * dy;
-                const float wgt = p.quality * static_cast<float>(std::exp(-r2 * inv2s2));
+                const float wgt = p.quality;
                 const std::size_t idx = static_cast<std::size_t>(y) * w + static_cast<std::size_t>(x);
                 flow.u[idx] += p.u * wgt;
                 flow.v[idx] += p.v * wgt;
@@ -577,8 +607,25 @@ Result<FlowField> disFlow(const GrayImage& from, const GrayImage& to, const DisF
         return Error{ErrorCode::InvalidArgument, "disFlow: patchSize must be >= 2 and iterations >= 1"};
     }
 
-    const std::vector<GrayImage> pyrFrom = buildPyramid(from, std::max(1, params.levels));
-    const std::vector<GrayImage> pyrTo = buildPyramid(to, std::max(1, params.levels));
+    // Scale both images onto the intensity range DJI's thresholds assume
+    // (see DisFlowParams::intensityScale).  Done ONCE here, at the pyramid
+    // base, so every level and every derived quantity - gradients, structure
+    // tensors, residuals - is consistently on that scale and no individual
+    // threshold needs its own conversion.
+    GrayImage scaledFrom = from;
+    GrayImage scaledTo = to;
+    if (params.intensityScale != 1.0 && std::isfinite(params.intensityScale) && params.intensityScale > 0.0) {
+        const float k = static_cast<float>(params.intensityScale);
+        for (float& value : scaledFrom.data) {
+            value *= k;
+        }
+        for (float& value : scaledTo.data) {
+            value *= k;
+        }
+    }
+
+    const std::vector<GrayImage> pyrFrom = buildPyramid(scaledFrom, std::max(1, params.levels));
+    const std::vector<GrayImage> pyrTo = buildPyramid(scaledTo, std::max(1, params.levels));
     if (pyrFrom.empty() || pyrTo.empty() || pyrFrom.size() != pyrTo.size()) {
         return Error{ErrorCode::Internal, "disFlow: pyramid construction failed"};
     }
