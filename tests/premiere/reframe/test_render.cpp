@@ -1857,6 +1857,85 @@ TEST_CASE("matchHostParams recovers the real Premiere mapping from 8 entries", "
     CHECK(map[kIndexFov] != gpuParamIndex(kIndexFov));
 }
 
+TEST_CASE("matchHostParams tolerates entries Premiere cannot type", "[reframe][params]") {
+    // THE regression test for the keyframing bug.
+    //
+    // This is a verbatim kind sequence from a real session log
+    // (%LOCALAPPDATA%/OpenOSV/Open360Reframe.log): Premiere reported 11
+    // entries - our full list, one to one - but could not return a type for
+    // four of them:
+    //
+    //   [0]i32:8 [1]=<err> [2]i32:1 [3]f32:42.0 [4]f32:-15.0 [5]f32:7.0
+    //   [6]f64:100.0 [7]f64:30.0 [8]=<err> [9]=<err> [10]=<err>
+    //
+    // Note the VALUES: 42 / -15 / 7 / 100 / 30 are exactly the Pan / Tilt /
+    // Roll / FOV / Distortion the user had dialled in, sitting at indices
+    // 3..7 - one further along than the 8-entry layout puts them.  Reading
+    // them with the static mapping therefore returns a neighbouring control.
+    //
+    // Treating Unknown as "matches nothing" rejected this alignment on the
+    // first hole, so all 74 renders in that log fell back to the static
+    // mapping.  Playback happened to take another path, which is why
+    // scrubbing and keyframe stepping looked broken while playback did not.
+    const std::vector<HostParamKind> logged = {
+        HostParamKind::Int32,    // [0]  an entry ahead of our list
+        HostParamKind::Unknown,  // [1]  the host refused this one's type
+        HostParamKind::Int32,    // [2]  Output Aspect
+        HostParamKind::Float32,  // [3]  Pan        (42)
+        HostParamKind::Float32,  // [4]  Tilt       (-15)
+        HostParamKind::Float32,  // [5]  Roll       (7)
+        HostParamKind::Float64,  // [6]  FOV        (100)  <- the anchor pair
+        HostParamKind::Float64,  // [7]  Distortion (30)   <-
+        HostParamKind::Unknown,  // [8]  Source Pan
+        HostParamKind::Unknown,  // [9]  Source Tilt
+        HostParamKind::Unknown,  // [10] Source Roll
+    };
+    REQUIRE(logged.size() == static_cast<std::size_t>(kValueParamCount));
+
+    HostParamMap map{};
+    REQUIRE(matchKinds(logged, &map));
+    CHECK(map.probed);
+
+    // The whole point: the angles must resolve to the indices that actually
+    // held them.  The logged VALUES are the independent confirmation - 42,
+    // -15 and 7 were the Pan, Tilt and Roll the user had dialled in, and they
+    // sit at 3, 4 and 5, one further along than the static mapping assumes.
+    CHECK(map[kIndexPan] == 3);
+    CHECK(map[kIndexTilt] == 4);
+    CHECK(map[kIndexRoll] == 5);
+    CHECK(map[kIndexFov] == 6);
+    CHECK(map[kIndexDistortion] == 7);
+
+    // Group markers still carry no value.
+    CHECK(map[kIndexCameraTopic] == -1);
+    CHECK(map[kIndexSourceTopic] == -1);
+}
+
+TEST_CASE("the Float64 anchor refuses lists it cannot pin", "[reframe][params]") {
+    HostParamMap map{};
+
+    SECTION("no Float64 pair at all") {
+        // Without FOV and Distortion adjacent there is nothing to anchor on.
+        const std::vector<HostParamKind> noPair(11, HostParamKind::Float32);
+        CHECK_FALSE(matchKinds(noPair, &map));
+    }
+
+    SECTION("two Float64 pairs are two candidate anchors") {
+        std::vector<HostParamKind> twoPairs(11, HostParamKind::Float32);
+        twoPairs[1] = HostParamKind::Float64;
+        twoPairs[2] = HostParamKind::Float64;
+        twoPairs[7] = HostParamKind::Float64;
+        twoPairs[8] = HostParamKind::Float64;
+        CHECK_FALSE(matchKinds(twoPairs, &map));
+    }
+
+    SECTION("an anchor with almost nothing around it is not enough") {
+        // A pair and one neighbour could be coincidence in any short list.
+        const std::vector<HostParamKind> tiny = {HostParamKind::Float64, HostParamKind::Float64};
+        CHECK_FALSE(matchKinds(tiny, &map));
+    }
+}
+
 TEST_CASE("matchHostParams refuses lists it cannot identify", "[reframe][params]") {
     HostParamMap map{};
 
@@ -1873,12 +1952,13 @@ TEST_CASE("matchHostParams refuses lists it cannot identify", "[reframe][params]
         CHECK_FALSE(matchKinds(tooLong, &map));
     }
 
-    SECTION("an entry the host refused matches nothing") {
-        // Blanking FOV's slot makes the alignment impossible rather than
-        // letting a neighbouring control slide into its place.
-        std::vector<HostParamKind> withHole = kFullSignature;
-        withHole[5] = HostParamKind::Unknown;
-        CHECK_FALSE(matchKinds(withHole, &map));
+    SECTION("enough unreadable entries make the answer ambiguous") {
+        // An unreadable entry is a WILDCARD (see matchHostParams), so one
+        // hole does not break the match - the remaining types still pin the
+        // alignment.  Blank enough of them and several alignments become
+        // viable, and then the matcher must decline rather than guess.
+        std::vector<HostParamKind> mostlyBlank(8, HostParamKind::Unknown);
+        CHECK_FALSE(matchKinds(mostlyBlank, &map));
     }
 
     SECTION("a list of the right length but the wrong types") {
