@@ -140,6 +140,16 @@ static_assert(static_cast<std::uint32_t>(kModOptAlt) == static_cast<std::uint32_
 // ---------------------------------------------------------------------------
 constexpr double kFixedOne = 65536.0;
 
+/// Largest frame edge the overlay will lay itself out against.
+///
+/// The only values that reach the geometry come from the host, and one of
+/// them (a draw event's update rect) is a pair of subtractions that a
+/// nonsense rectangle could make enormous.  Anything past this is treated as
+/// "no usable frame" rather than propagated into the layout maths.  It is
+/// deliberately far above any real Program Monitor size, including a 16K
+/// timeline on a scaled display.
+constexpr long kMaxOverlayEdge = 65536;
+
 /// PF_Fixed -> degrees.
 [[nodiscard]] double fixedToDeg(PF_Fixed value) noexcept { return static_cast<double>(value) / kFixedOne; }
 
@@ -904,11 +914,47 @@ PF_Err onDraw(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* extra) n
         return PF_Err_NONE;
     }
 
-    const RectF viewport = viewportForFrame(params, in_data->width, in_data->height);
+    // How big is the thing we are drawing on?
+    //
+    // in_data->width/height are the LAYER's dimensions, which is what an AE
+    // comp-window custom UI is normally sized against.  Premiere Pro 26.2
+    // hands us zeroes there - a session log shows "degenerate frame 0x0" on
+    // every draw - so the overlay bailed before it acquired a single suite.
+    //
+    // PF_DrawEventInfo::update_rect (AE_EffectUI.h:284) is the area the host
+    // is asking us to repaint, in the window's own coordinates, and it is
+    // filled for a comp-window draw.  It is used only as a FALLBACK: when the
+    // layer size is sane it remains the authority, because update_rect can be
+    // a partial invalidation rather than the whole frame.
+    int frameW = in_data->width;
+    int frameH = in_data->height;
+    if (frameW <= 0 || frameH <= 0) {
+        const PF_UnionableRect& r = extra->u.draw.update_rect;
+        const long rectW = static_cast<long>(r.right) - static_cast<long>(r.left);
+        const long rectH = static_cast<long>(r.bottom) - static_cast<long>(r.top);
+        // Guard the subtraction: an empty or inverted rect is not a frame,
+        // and kMaxOverlayEdge keeps a nonsense value out of the geometry.
+        if (rectW > 0 && rectH > 0 && rectW <= kMaxOverlayEdge && rectH <= kMaxOverlayEdge) {
+            frameW = static_cast<int>(rectW);
+            frameH = static_cast<int>(rectH);
+            (void)PluginLog::oncef("reframe.ui.updaterect", PluginLog::Level::Info,
+                                   "reframe ui: the host reports a {}x{} layer; drawing against the "
+                                   "event's {}x{} update rect instead",
+                                   in_data->width, in_data->height, frameW, frameH);
+        }
+    }
+
+    const RectF viewport = viewportForFrame(params, frameW, frameH);
     const Layout layout = computeLayout(viewport);
     if (!layout.valid) {
         (void)PluginLog::oncef("reframe.ui.viewport", PluginLog::Level::Warn,
-                               "reframe ui: no overlay, degenerate frame {}x{}", in_data->width, in_data->height);
+                               "reframe ui: no overlay, degenerate frame {}x{} (layer {}x{}, update rect "
+                               "{},{},{},{})",
+                               frameW, frameH, in_data->width, in_data->height,
+                               static_cast<int>(extra->u.draw.update_rect.left),
+                               static_cast<int>(extra->u.draw.update_rect.top),
+                               static_cast<int>(extra->u.draw.update_rect.right),
+                               static_cast<int>(extra->u.draw.update_rect.bottom));
         return PF_Err_NONE;
     }
 
@@ -922,21 +968,60 @@ PF_Err onDraw(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* extra) n
     }
 
     // The custom UI suite hands out the DrawBot reference for this context.
-    // It is a v2 suite frozen in AE 13.5, which every Premiere we target
-    // ships, but a missing suite is still handled rather than assumed.
+    //
+    // v2 was frozen in AE 13.5 and is what a current host should offer, but a
+    // session log from Premiere Pro 26.2 shows it refusing that version -
+    // "PF Effect Custom UI Suite v2 unavailable" on every draw, so no overlay
+    // ever appeared.  v1 (frozen in 10.0) is therefore tried as well.
+    //
+    // This is safe rather than hopeful: the two structures are
+    // layout-compatible where it matters.  v1 has exactly one member and v2
+    // declares that SAME member first, adding only PF_GetContextAsyncManager
+    // after it (AE_EffectSuitesOld.h:274, AE_EffectSuites.h:649).  The
+    // overlay uses nothing but PF_GetDrawingReference, so a v1 suite read
+    // through either pointer is correct; the async manager is never touched
+    // and would require PF_OutFlag2_CUSTOM_UI_ASYNC_MANAGER, which this
+    // effect does not set.
     osv::premiere::SuiteHandle<PF_EffectCustomUISuite2> customUi;
-    if (!customUi.acquire(basic, kPFEffectCustomUISuite, kPFEffectCustomUISuiteVersion2) ||
-        !customUi->PF_GetDrawingReference) {
+    osv::premiere::SuiteHandle<PF_EffectCustomUISuite1> customUiV1;
+    PF_Err (*getDrawingReference)(const PF_ContextH, DRAWBOT_DrawRef*) = nullptr;
+
+    if (customUi.acquire(basic, kPFEffectCustomUISuite, kPFEffectCustomUISuiteVersion2) &&
+        customUi->PF_GetDrawingReference) {
+        getDrawingReference = customUi->PF_GetDrawingReference;
+    } else if (customUiV1.acquire(basic, kPFEffectCustomUISuite, kPFEffectCustomUISuiteVersion1) &&
+               customUiV1->PF_GetDrawingReference) {
+        getDrawingReference = customUiV1->PF_GetDrawingReference;
+        (void)PluginLog::oncef("reframe.ui.customsuite.v1", PluginLog::Level::Info,
+                               "reframe ui: the host offers no v2 custom UI suite; using v1");
+    }
+
+    if (!getDrawingReference) {
         (void)PluginLog::oncef("reframe.ui.customsuite", PluginLog::Level::Warn,
-                               "reframe ui: no overlay, PF Effect Custom UI Suite v2 unavailable");
+                               "reframe ui: no overlay, PF Effect Custom UI Suite unavailable at v2 or v1");
         return PF_Err_NONE;
     }
 
     DRAWBOT_DrawRef drawRef = nullptr;
-    const PF_Err refErr = customUi->PF_GetDrawingReference(extra->contextH, &drawRef);
+    const PF_Err refErr = getDrawingReference(extra->contextH, &drawRef);
     if (refErr != PF_Err_NONE || !drawRef) {
+        // Name the common codes.  512 is PF_Err_INTERNAL_STRUCT_DAMAGED
+        // (PF_FIRST_ERR, AE_Effect.h:337) and is what a host returns when it
+        // does not accept the context handle we passed - the code seen in a
+        // Premiere Pro 26.2 log alongside the v2 suite being refused.
+        const char* meaning = "unknown";
+        switch (refErr) {
+            case PF_Err_INTERNAL_STRUCT_DAMAGED: meaning = "INTERNAL_STRUCT_DAMAGED (host rejected the context)"; break;
+            case PF_Err_INVALID_INDEX:           meaning = "INVALID_INDEX"; break;
+            case PF_Err_INVALID_CALLBACK:        meaning = "INVALID_CALLBACK"; break;
+            case PF_Err_BAD_CALLBACK_PARAM:      meaning = "BAD_CALLBACK_PARAM"; break;
+            case PF_Err_OUT_OF_MEMORY:           meaning = "OUT_OF_MEMORY"; break;
+            default: break;
+        }
         (void)PluginLog::oncef("reframe.ui.drawref", PluginLog::Level::Warn,
-                               "reframe ui: no overlay, no drawing reference (err {})", static_cast<int>(refErr));
+                               "reframe ui: no overlay, no drawing reference (err {} = {}, context {})",
+                               static_cast<int>(refErr), meaning,
+                               extra->contextH ? "non-null" : "NULL");
         return PF_Err_NONE;
     }
 
