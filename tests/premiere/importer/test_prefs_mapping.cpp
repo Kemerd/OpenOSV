@@ -32,7 +32,7 @@ TEST_CASE("the defaults round trip through the control mapping", "[importer][pre
 
     SECTION("the controls show the documented defaults") {
         REQUIRE(controls.colorOutput == 0);     // PQ
-        REQUIRE(controls.outputSize == static_cast<int>(PrefsOutputSize::QHD2560));  // 2560 x 1280
+        REQUIRE(controls.outputSize == static_cast<int>(PrefsOutputSize::Native));  // full sensor
         REQUIRE(controls.stabilization == 1);   // Horizon lock
         REQUIRE(controls.seamSearch == true);
         REQUIRE(controls.gainMatch == true);

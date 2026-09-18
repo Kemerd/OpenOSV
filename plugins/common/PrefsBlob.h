@@ -142,11 +142,21 @@ struct PrefsBlob {
         p.magic = kMagic;
         p.version = kVersion;
         p.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::PQ);
-        // QHD2560, not Native: a new sequence built from an .OSV inherits the
-        // size reported by imGetInfo8, and a 6000 x 3000 timeline is unwieldy
-        // and is nobody's delivery format.  Source Settings offers Native for
-        // when the full sphere really is wanted.
-        p.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::QHD2560);
+        // NATIVE, which for 6K footage is 6000 x 3000.
+        //
+        // This defaulted to QHD2560 for a while, to stop a new sequence built
+        // from an .OSV inheriting a 6000 x 3000 timeline.  That was the wrong
+        // lever: it solved a TIMELINE problem by permanently discarding
+        // SOURCE resolution, so every reframe - which crops a small window out
+        // of the sphere and therefore magnifies it - was upscaling from a
+        // quarter-area panorama.  Zooming in looked soft for no reason.
+        //
+        // The timeline is handled where it belongs, by the sequence presets
+        // that scripts/install_plugins.ps1 installs (2560x1440 and the rest).
+        // The importer's job is to hand over every pixel the camera recorded
+        // and let the sequence decide the delivery size; Source Settings still
+        // offers the smaller sizes for a machine that cannot keep up.
+        p.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::Native);
         p.stabilization = static_cast<std::uint8_t>(PrefsStabilization::HorizonLock);
         p.seamSearch = 1;
         p.gainMatch = 1;
@@ -194,7 +204,7 @@ struct PrefsBlob {
         // should land on the same setting a fresh one would, otherwise
         // "garbage in Source Settings" silently means "full 6000 x 3000".
         clampEnum(outputSize, static_cast<std::uint8_t>(PrefsOutputSize::Count),
-                  static_cast<std::uint8_t>(PrefsOutputSize::QHD2560));
+                  static_cast<std::uint8_t>(PrefsOutputSize::Native));
         clampEnum(stabilization, static_cast<std::uint8_t>(PrefsStabilization::Count), 1);
         clampEnum(seamSearch, 2, 1);
         clampEnum(gainMatch, 2, 1);

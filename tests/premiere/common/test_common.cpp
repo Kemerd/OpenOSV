@@ -148,7 +148,10 @@ TEST_CASE("PrefsBlob defaults match the documented table", "[common][prefs]") {
     REQUIRE(p.magic == PrefsBlob::kMagic);
     REQUIRE(p.version == PrefsBlob::kVersion);
     REQUIRE(p.color() == PrefsColorOutput::PQ);
-    REQUIRE(p.size() == PrefsOutputSize::QHD2560);
+    // NATIVE, not a fixed size: the importer hands over every pixel the
+    // camera recorded and the SEQUENCE decides the delivery size.  A fixed
+    // default here made every reframe upscale from a quarter-area panorama.
+    REQUIRE(p.size() == PrefsOutputSize::Native);
     REQUIRE(p.stab() == PrefsStabilization::HorizonLock);
     REQUIRE(p.seamSearch == 1);
     REQUIRE(p.gainMatch == 1);
@@ -179,7 +182,7 @@ TEST_CASE("PrefsBlob sanitise clamps every out-of-range field", "[common][prefs]
         p.renderDevice = 100;
         REQUIRE_FALSE(p.sanitise());
         REQUIRE(p.color() == PrefsColorOutput::PQ);
-        REQUIRE(p.size() == PrefsOutputSize::QHD2560);
+        REQUIRE(p.size() == PrefsOutputSize::Native);
         REQUIRE(p.stab() == PrefsStabilization::HorizonLock);
         REQUIRE(p.seamSearch == 1);
         REQUIRE(p.gainMatch == 1);
