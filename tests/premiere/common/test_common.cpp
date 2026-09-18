@@ -135,11 +135,44 @@ TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     static_assert(offsetof(PrefsBlob, version) == 4, "version follows magic");
     static_assert(offsetof(PrefsBlob, colorOutput) == 8, "the byte fields start at 8");
     static_assert(offsetof(PrefsBlob, exposureStops) == 16, "exposureStops sits at 16");
-    static_assert(offsetof(PrefsBlob, reserved) == 20, "reserved fills the rest");
+    // parallax and flowBackend came out of the front of the reserved block,
+    // so the struct is still 128 bytes and every field before them kept its
+    // offset - which is exactly what makes an older project's blob still
+    // readable.  Its zero bytes read as parallax Off / backend Auto.
+    static_assert(offsetof(PrefsBlob, parallax) == 20, "parallax sits at 20");
+    static_assert(offsetof(PrefsBlob, flowBackend) == 21, "flowBackend follows parallax");
+    static_assert(offsetof(PrefsBlob, reserved) == 22, "reserved fills the rest");
     static_assert(std::is_trivially_copyable_v<PrefsBlob>, "the blob is memcpy'd to and from the host");
 
     REQUIRE(sizeof(PrefsBlob) == PrefsBlob::kSize);
     REQUIRE(PrefsBlob::cacheKeySize() == 128);
+}
+
+TEST_CASE("a blob from an older build still deserialises", "[common][prefs]") {
+    // The parallax and flowBackend fields were added by taking two bytes off
+    // the front of the reserved block.  A project saved before that change
+    // has zeros there, and this pins what those zeros mean - because the
+    // alternative is an old project silently rendering differently after an
+    // update, which is the exact failure the reserved block exists to avoid.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.parallax = 0;     // what an older build's reserved bytes contain
+    old.flowBackend = 0;
+
+    REQUIRE(old.isValid());
+    // Zero is a VALID value for both, so sanitise must not rewrite them.
+    REQUIRE(old.sanitise());
+    CHECK(old.parallax == 0);
+    CHECK(old.flowBackend == 0);
+
+    // And it reads as parallax OFF, not as the new default of On: an old
+    // project keeps rendering the way it always did until the user opts in.
+    CHECK(old.parallaxMode() == PrefsParallax::Off);
+    CHECK_FALSE(old.parallaxEnabled());
+    CHECK(old.flow() == PrefsFlowBackend::Auto);
+
+    // A FRESH blob, by contrast, has it on.
+    const PrefsBlob fresh = PrefsBlob::defaults();
+    CHECK(fresh.parallaxEnabled());
 }
 
 TEST_CASE("PrefsBlob defaults match the documented table", "[common][prefs]") {

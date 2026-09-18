@@ -92,6 +92,36 @@ enum class PrefsDlogmFit : std::uint8_t {
     Count
 };
 
+/// Parallax correction: how the overlap band's optical flow is measured.
+///
+/// The numeric values are stored in the blob and match
+/// osv::render::FlowBackendKind, so a change here needs a change there.
+enum class PrefsFlowBackend : std::uint8_t {
+    /// Neural when it can run on this machine, classical otherwise.  The
+    /// default, because it is correct on a machine with the model installed
+    /// and on one without.
+    Auto = 0,
+    /// Dense Inverse Search on the CPU.  Always available and fully
+    /// deterministic, so it is also the choice for a reproducible render.
+    Classical = 1,
+    /// A neural network on the GPU.  Better on large displacements and
+    /// repetitive texture; needs the model file and a working GPU runtime.
+    Neural = 2,
+    Count
+};
+
+/// Whether the flow-based parallax correction runs at all.
+///
+/// Separate from the backend choice because "off" is a legitimate
+/// preference, not a third backend: it is the fastest path, it is what a
+/// user wants when the scene has no near objects, and it is the A/B against
+/// which the corrected result is judged.
+enum class PrefsParallax : std::uint8_t {
+    Off = 0,
+    On = 1,
+    Count
+};
+
 /// Renderer selection; the numeric values are the ones stored in the blob
 /// and match HostContext's RenderDevicePreference.
 enum class PrefsRenderDevice : std::uint8_t {
@@ -133,7 +163,9 @@ struct PrefsBlob {
     std::uint8_t dlogmFit = 0;         ///< PrefsDlogmFit.
     std::uint8_t renderDevice = 0;     ///< PrefsRenderDevice.
     float exposureStops = 0.0f;        ///< Exposure offset in stops.
-    std::uint8_t reserved[108] = {};   ///< Zero; future fields.
+    std::uint8_t parallax = 0;         ///< PrefsParallax; flow-based seam correction.
+    std::uint8_t flowBackend = 0;      ///< PrefsFlowBackend.
+    std::uint8_t reserved[106] = {};   ///< Zero; future fields.
 
     /// A blob with every field at its documented default.
     [[nodiscard]] static PrefsBlob defaults() noexcept {
@@ -164,6 +196,11 @@ struct PrefsBlob {
         p.dlogmFit = static_cast<std::uint8_t>(PrefsDlogmFit::Osmo360);
         p.exposureStops = 0.0f;
         p.renderDevice = static_cast<std::uint8_t>(PrefsRenderDevice::Auto);
+        // Parallax correction ON by default: it is the thing that makes a
+        // seam look stitched rather than folded, and a user who does not
+        // know the option exists should still get the better picture.
+        p.parallax = static_cast<std::uint8_t>(PrefsParallax::On);
+        p.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Auto);
         return p;
     }
 
@@ -211,6 +248,13 @@ struct PrefsBlob {
         clampEnum(calibration, static_cast<std::uint8_t>(PrefsCalibration::Count), 0);
         clampEnum(dlogmFit, static_cast<std::uint8_t>(PrefsDlogmFit::Count), 0);
         clampEnum(renderDevice, static_cast<std::uint8_t>(PrefsRenderDevice::Count), 0);
+        // Both fall back to the DEFAULT, not to enum value 0, wherever those
+        // differ: a corrupt blob should land where a fresh one would.  For
+        // parallax that means On (1), not Off (0).
+        clampEnum(parallax, static_cast<std::uint8_t>(PrefsParallax::Count),
+                  static_cast<std::uint8_t>(PrefsParallax::On));
+        clampEnum(flowBackend, static_cast<std::uint8_t>(PrefsFlowBackend::Count),
+                  static_cast<std::uint8_t>(PrefsFlowBackend::Auto));
 
         // NaN compares false with everything, so test the valid range and
         // reset anything else (NaN, infinities, out of range).
@@ -255,12 +299,26 @@ struct PrefsBlob {
     [[nodiscard]] PrefsCalibration calib() const noexcept { return static_cast<PrefsCalibration>(calibration); }
     [[nodiscard]] PrefsDlogmFit fit() const noexcept { return static_cast<PrefsDlogmFit>(dlogmFit); }
     [[nodiscard]] PrefsRenderDevice device() const noexcept { return static_cast<PrefsRenderDevice>(renderDevice); }
+    [[nodiscard]] PrefsParallax parallaxMode() const noexcept { return static_cast<PrefsParallax>(parallax); }
+    [[nodiscard]] PrefsFlowBackend flow() const noexcept { return static_cast<PrefsFlowBackend>(flowBackend); }
+    /// True when the flow-based parallax correction should run.
+    [[nodiscard]] bool parallaxEnabled() const noexcept { return parallaxMode() == PrefsParallax::On; }
 };
 
 #pragma pack(pop)
 
 static_assert(sizeof(PrefsBlob) == PrefsBlob::kSize, "PrefsBlob must be exactly 128 bytes");
 static_assert(offsetof(PrefsBlob, exposureStops) == 16, "PrefsBlob layout drifted");
-static_assert(offsetof(PrefsBlob, reserved) == 20, "PrefsBlob layout drifted");
+// parallax and flowBackend were taken from the front of the reserved block,
+// which is what that block is for: the struct stays 128 bytes, every field
+// before them keeps its offset, and a blob written by an older build still
+// deserialises - its zero bytes read as Auto / Off there.
+//
+// Off is NOT the default for parallax (On is), so an old blob deliberately
+// reads as "parallax disabled" rather than silently changing how an existing
+// project renders.  A new blob gets On from defaults().
+static_assert(offsetof(PrefsBlob, parallax) == 20, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, flowBackend) == 21, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, reserved) == 22, "PrefsBlob layout drifted");
 
 }  // namespace osv::premiere
