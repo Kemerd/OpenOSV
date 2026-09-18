@@ -901,8 +901,8 @@ prSuiteError render(PrGPUFilterInstance* instanceData, const PrGPUFilterRenderPa
         const KernelSetup setup = buildParams(settings, srcView, dst.width, dst.height, sequenceAspect(*inst));
         if (!setup.valid) {
             PluginLog::oncef("reframe/gpu/setup", PluginLog::Level::Error,
-                             "reframe/gpu: could not build the kernel parameters ({}x{} -> {}x{})", src.width,
-                             src.height, dst.width, dst.height);
+                             "reframe/gpu: could not build the kernel parameters ({}x{} -> {}x{}): {}", src.width,
+                             src.height, dst.width, dst.height, setupRejectName(setup.reject));
             return suiteError_Fail;
         }
 

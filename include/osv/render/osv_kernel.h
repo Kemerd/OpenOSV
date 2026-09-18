@@ -109,8 +109,17 @@ typedef unsigned short osv_u16;
 #define OSV_LAYOUT_STANDARD 0   /* Z up, +Y (master lens) at the image centre */
 #define OSV_LAYOUT_POLAR_AXIS 1 /* lens axes at the poles, seam on the equator */
 
-/* Maximum vertices of the occlusion polygon carried per lens. */
-#define OSV_MAX_OCCLUSION_POINTS 16
+/* Maximum vertices of the occlusion polygon carried per lens.
+ *
+ * The metadata stores an OPEN arc (14 entries, 13 distinct, on the Osmo 360),
+ * but the polygon the kernel tests is that arc closed outward along the image
+ * rim, so it carries roughly TWICE the stored vertex count - 26 on this
+ * camera.  A limit of 16 silently truncated it to a shape that bore no
+ * relation to the stick, so this is sized with headroom for a firmware that
+ * samples the arc more finely.  Cost: 4 floats per point per lens, i.e. 512
+ * bytes total at 32, well inside the 4 KB parameter-block budget that
+ * tests/unit/test_render.cpp asserts. */
+#define OSV_MAX_OCCLUSION_POINTS 32
 
 /* ------------------------------------------------------------------------- */
 /*  Plain-old-data parameter blocks (built on the host, copied by value)      */
@@ -579,6 +588,10 @@ OSV_HD void osvShadePixel(const OsvRenderParams* p, const OsvPlane* planes, OSV_
     float w[2] = {0.0f, 0.0f};
     float px[2] = {0.0f, 0.0f};
     float py[2] = {0.0f, 0.0f};
+    /* Whether osvProjectLens actually wrote px/py for this lens.  It returns
+     * early - leaving them untouched - for a ray past thetaMax, so a rescue
+     * that read px/py without checking this would sample pixel (0, 0). */
+    int projected[2] = {0, 0};
     for (int i = 0; i < 2; ++i) {
         const OsvLens* L = &p->lens[i];
         if (!L->enabled) {
@@ -596,6 +609,7 @@ OSV_HD void osvShadePixel(const OsvRenderParams* p, const OsvPlane* planes, OSV_
         float theta;
         if (osvProjectLens(L, dl, &px[i], &py[i], &theta)) {
             w[i] = osvLensWeight(L, theta, px[i], py[i]);
+            projected[i] = 1;
         }
     }
 
@@ -612,7 +626,45 @@ OSV_HD void osvShadePixel(const OsvRenderParams* p, const OsvPlane* planes, OSV_
      * the GPU and CPU transcendental functions can disagree by an ulp on
      * whether a ray is inside the FOV, and normalising an almost-zero weight
      * would turn that ulp into a full-brightness pixel. */
-    const float wsum = w[0] + w[1];
+    float wsum = w[0] + w[1];
+
+    /* ---- occlusion rescue -------------------------------------------------
+     * A direction can be occluded in one lens and merely PAST THE FOV EDGE in
+     * the other, and then both weights are zero and the pixel comes out black.
+     * On a back-to-back 360 rig that is never the honest answer: the selfie
+     * stick arc sits at theta 92.6..97.6 deg, where the opposite lens looks
+     * along its own theta ~= 180 - 95 = 85 deg, comfortably inside its 97.59
+     * deg limit.  The black only appeared because the OCCLUSION factor, not
+     * the field of view, had zeroed the near lens while the far lens happened
+     * to be just outside its feather.
+     *
+     * So before giving up, take whichever lens actually landed on valid
+     * pixels and is NOT occluded there, ignoring the FOV feather.  The
+     * feather exists to cross-fade the seam, not to declare a direction
+     * unseeable, and a slightly soft pixel is enormously better than a hole.
+     * A direction genuinely outside both lenses still falls through to
+     * transparent black below. */
+    if (wsum <= 1e-4f) {
+        for (int i = 0; i < 2; ++i) {
+            const OsvLens* L = &p->lens[i];
+            /* projected[i] is the guard that makes px/py meaningful here. */
+            if (!L->enabled || !projected[i]) {
+                continue;
+            }
+            /* Inside the stick arc this lens is genuinely blind, so it must
+             * stay at zero - rescuing it would paint the stick back in. */
+            if (osvOcclusionFactor(L, px[i], py[i]) <= 0.0f) {
+                continue;
+            }
+            /* The lens landed on a real, unoccluded pixel and was zeroed only
+             * by the FOV feather.  Give it a tiny weight: enough to fill the
+             * hole, small enough that any lens with real coverage still
+             * dominates the blend. */
+            w[i] = 1e-3f;
+        }
+        wsum = w[0] + w[1];
+    }
+
     if (wsum <= 1e-4f) {
         out[0] = out[1] = out[2] = out[3] = 0.0f;
         return;
