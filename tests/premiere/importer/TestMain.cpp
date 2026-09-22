@@ -12,13 +12,17 @@
 //      back door, because an unattended render farm needs exactly the same
 //      behaviour.
 //
-//   2. The plug-in's own log is pointed at a harmless level.  The importer
-//      logs to %LOCALAPPDATA%\OpenOSV\OpenOSVImporter.log through its own
-//      copy of PluginLog inside the .prm, which this process cannot reach
-//      (different module, different statics), so the level is controlled the
-//      way the plug-in itself reads it: through the environment.
+//   2. The plug-in's log is kept out of the user's profile and turned down.
+//      The importer logs through its own copy of PluginLog inside the .prm,
+//      which this process cannot reach (different module, different
+//      statics), so both are controlled the way the plug-in itself reads
+//      them: through the environment.  isolatePluginLogs() points
+//      LOCALAPPDATA at a private temporary directory, and the level below
+//      keeps a normal run quiet even there.
 
 #include <catch2/catch_session.hpp>
+
+#include "TestLogIsolation.h"
 
 #include <cstdlib>
 
@@ -31,6 +35,11 @@
 #include <windows.h>
 
 int main(int argc, char* argv[]) {
+    // FIRST, before anything can log: keep every plug-in log of this run out
+    // of the user's real %LOCALAPPDATA%\OpenOSV (see TestLogIsolation.h for
+    // the diagnosis this cost when it was missing).
+    osv::premiere::testsupport::isolatePluginLogs();
+
     SetConsoleOutputCP(CP_UTF8);
 
     // Never block on a modal dialog.  _putenv_s rather than SetEnvironmentVariable

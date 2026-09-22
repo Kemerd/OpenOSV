@@ -23,6 +23,7 @@
 #include "PixelCopy.h"
 #include "PluginLog.h"
 #include "PrefsBlob.h"
+#include "TestLogIsolation.h"
 
 #include "osv/core/ThreadPool.h"
 #include "osv/render/ImageRGBAf.h"
@@ -35,6 +36,7 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include <cwctype>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -126,6 +128,39 @@ std::wstring executableDirectory() {
 // =============================================================================
 //  PrefsBlob
 // =============================================================================
+TEST_CASE("a test run never writes into the user's real plug-in log folder", "[common][log]") {
+    // The invariant TestLogIsolation.h exists for.  Negative tests provoke
+    // warnings on purpose, and when they reached %LOCALAPPDATA%\OpenOSV they
+    // sat interleaved with real Premiere output and misled a diagnosis twice.
+    //
+    // NOT "the path is outside the original LOCALAPPDATA": %TEMP% defaults to
+    // <LOCALAPPDATA>\Temp, so the isolated directory legitimately lives
+    // inside it.  The folder that must never be touched is the plug-ins' own,
+    // <LOCALAPPDATA>\OpenOSV.
+    const auto lower = [](std::wstring s) {
+        for (wchar_t& c : s) {
+            c = static_cast<wchar_t>(towlower(c));
+        }
+        return s;
+    };
+
+    REQUIRE(PluginLog::init(L"OpenOSVIsolationProbe"));
+    const std::wstring path = lower(PluginLog::filePath());
+    REQUIRE_FALSE(path.empty());
+
+    const std::wstring original = testsupport::originalLocalAppData();
+    if (!original.empty()) {
+        const std::wstring userLogFolder = lower(original + L"\\OpenOSV\\");
+        INFO("log path must not be under the user's folder");
+        CHECK(path.rfind(userLogFolder, 0) != 0);
+    }
+    // And it is where the redirect says it is, so the check above is not
+    // passing merely because logging went nowhere.
+    CHECK(path.find(L"\\openosv-tests\\pid-") != std::wstring::npos);
+
+    PluginLog::shutdown();
+}
+
 TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     // These are compile-time guarantees; asserting them again here documents
     // them for a reader and makes a layout change a test failure too.

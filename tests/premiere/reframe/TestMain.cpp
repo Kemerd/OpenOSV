@@ -11,6 +11,8 @@
 
 #include <catch2/catch_session.hpp>
 
+#include "TestLogIsolation.h"
+
 #include "PluginLog.h"
 
 #include <cstdlib>
@@ -24,6 +26,11 @@
 #include <windows.h>
 
 int main(int argc, char* argv[]) {
+    // FIRST, before anything can log: keep every plug-in log of this run out
+    // of the user's real %LOCALAPPDATA%\OpenOSV (see TestLogIsolation.h for
+    // the diagnosis this cost when it was missing).
+    osv::premiere::testsupport::isolatePluginLogs();
+
     SetConsoleOutputCP(CP_UTF8);
 
     // OSV_TEST_VERBOSE=1 turns the effect's own logging back on, which is
