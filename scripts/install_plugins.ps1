@@ -205,6 +205,12 @@ function Find-StageDir {
         throw "No -StageDir given and '$buildRoot' does not exist. Build the plug-ins first (see docs/BUILDING.md) or pass -StageDir."
     }
 
+    # Ranked by the newest MODULE inside each folder, not by the folder's own
+    # timestamp.  A directory's LastWriteTime changes only when an entry is
+    # added, removed or renamed in it - and the linker overwrites a module IN
+    # PLACE - so a freshly rebuilt folder keeps an old timestamp while a
+    # folder created later by some other build looks newer.  That once
+    # installed a stale build from a scratch directory over a verified one.
     $candidates = Get-ChildItem -LiteralPath $buildRoot -Directory -ErrorAction SilentlyContinue |
         ForEach-Object { Join-Path $_.FullName 'plugins\OpenOSV' } |
         Where-Object { Test-Path -LiteralPath $_ } |
@@ -213,7 +219,17 @@ function Find-StageDir {
             $folder = $_
             $script:PluginFiles | Where-Object { Test-Path -LiteralPath (Join-Path $folder $_) }
         } |
-        Sort-Object { (Get-Item -LiteralPath $_).LastWriteTimeUtc } -Descending
+        Sort-Object {
+            # A plain sort rather than Measure-Object -Maximum, which Windows
+            # PowerShell 5.1 refuses for non-numeric values like DateTime.
+            $folder = $_
+            $script:PluginFiles |
+                ForEach-Object { Join-Path $folder $_ } |
+                Where-Object { Test-Path -LiteralPath $_ } |
+                ForEach-Object { (Get-Item -LiteralPath $_).LastWriteTimeUtc } |
+                Sort-Object -Descending |
+                Select-Object -First 1
+        } -Descending
 
     if (-not $candidates) {
         throw "No built plug-ins found under '$buildRoot'. Configure with -DOSV_BUILD_PREMIERE=ON, build, then run this script again (or pass -StageDir)."
