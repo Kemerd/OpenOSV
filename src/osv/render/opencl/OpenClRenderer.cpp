@@ -124,6 +124,7 @@ struct OpenClRenderer::Impl {
     std::string buildLog;
     ClBuffer y[2], u[2], v[2];
     ClBuffer seam;
+    ClBuffer warp;
     ClBuffer out;
     std::mutex mutex;
 
@@ -137,6 +138,7 @@ struct OpenClRenderer::Impl {
             v[i].release();
         }
         seam.release();
+        warp.release();
         out.release();
         if (kernel) {
             clReleaseKernel(kernel);
@@ -338,6 +340,21 @@ Result<ImageRGBAf> OpenClRenderer::render(const RenderJob& job) {
         }
     }
     err = clSetKernelArg(impl.kernel, arg++, sizeof(cl_mem), &impl.seam.mem);
+
+    // 2-D parallax warp grid.  Like the seam table, an empty grid still needs
+    // a valid buffer object bound - OpenCL rejects a null __global argument -
+    // and params.warpEnabled is what actually decides whether it is read.
+    const std::size_t warpBytes = std::max<std::size_t>(job.warpGrid.size(), 1) * sizeof(float);
+    OSV_TRY(impl.warp.ensure(impl.context, warpBytes, CL_MEM_READ_ONLY));
+    if (!job.warpGrid.empty()) {
+        cl_int werr = clEnqueueWriteBuffer(impl.queue, impl.warp.mem, CL_FALSE, 0,
+                                           job.warpGrid.size() * sizeof(float), job.warpGrid.data(), 0, nullptr,
+                                           nullptr);
+        if (werr != CL_SUCCESS) {
+            return Error{ErrorCode::Gpu, clMessage("upload warp grid", werr)};
+        }
+    }
+    err |= clSetKernelArg(impl.kernel, arg++, sizeof(cl_mem), &impl.warp.mem);
 
     // Output buffer (tightly packed float4 rows).
     OSV_TRY_ASSIGN(ImageRGBAf image, ImageRGBAf::create(static_cast<std::uint32_t>(job.params.outW),

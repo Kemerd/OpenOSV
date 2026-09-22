@@ -92,6 +92,11 @@ constexpr unsigned kBlockDimY = 16;
 /// GPUs; 16 is generous and bounds the static state.
 constexpr unsigned kMaxDevices = 16;
 
+/// Largest sequence edge we will believe from the Sequence Info Suite.  See
+/// the identical constant in EffectMain.cpp: a corrupt rectangle must become
+/// "unknown", not a camera dimension.
+constexpr long long kMaxSequenceEdge = 65536;
+
 // ===========================================================================
 //  Small helpers
 // ===========================================================================
@@ -454,9 +459,9 @@ void probeParams(Instance& inst) noexcept {
     inst.paramMapProbed = true;
     PluginLog::oncef("reframe/gpu/probe-ok", PluginLog::Level::Info,
                      "reframe/gpu: probed the host parameter mapping from {} entries - "
-                     "aspect={} preset={} pan={} tilt={} roll={} fov={} distortion={} "
+                     "resolution={} preset={} pan={} tilt={} roll={} fov={} distortion={} "
                      "srcPan={} srcTilt={} srcRoll={} smooth={} (-1 = not exposed by the host)",
-                     hostCount, probed[kIndexOutputAspect], probed[kIndexPreset], probed[kIndexPan],
+                     hostCount, probed[kIndexOutputResolution], probed[kIndexPreset], probed[kIndexPan],
                      probed[kIndexTilt], probed[kIndexRoll], probed[kIndexFov], probed[kIndexDistortion],
                      probed[kIndexSourcePan], probed[kIndexSourceTilt], probed[kIndexSourceRoll],
                      probed[kIndexSmooth]);
@@ -541,7 +546,8 @@ bool readBool(const Instance& inst, int aeIndex, PrTime time, bool fallback) noe
 /// path, which does the same three-sample average through PF_CHECKOUT_PARAM.
 Settings readSettings(const Instance& inst, PrTime clipTime, PrTime ticksPerFrame) noexcept {
     Settings s;
-    s.aspect = sanitiseAspect(readPopup(inst, kIndexOutputAspect, clipTime, OSV_REFRAME_ASPECT_DEFAULT));
+    s.resolution =
+        sanitiseResolution(readPopup(inst, kIndexOutputResolution, clipTime, OSV_REFRAME_RESOLUTION_DEFAULT));
     s.preset = sanitisePreset(readPopup(inst, kIndexPreset, clipTime, OSV_REFRAME_PRESET_DEFAULT));
     s.fovDeg = readFloat(inst, kIndexFov, clipTime, OSV_REFRAME_FOV_DEFAULT);
     s.distortion = readFloat(inst, kIndexDistortion, clipTime, OSV_REFRAME_DISTORTION_DEFAULT);
@@ -580,22 +586,27 @@ Settings readSettings(const Instance& inst, PrTime clipTime, PrTime ticksPerFram
     return s;
 }
 
-/// Aspect ratio of the sequence, or <= 0 when the suite cannot tell us (the
-/// caller then falls back to 16:9 as docs/PREMIERE.md prescribes).
-double sequenceAspect(const Instance& inst) noexcept {
+/// Pixel size of the sequence, or an invalid size when the suite cannot tell
+/// us (the caller then falls back to the output frame's own size).
+///
+/// The GPU instance already holds the timeline id and the suite, so unlike
+/// the CPU path this needs no acquire / release dance.
+SizePx sequenceSize(const Instance& inst) noexcept {
     if (!inst.sequence || !inst.sequence->GetFrameRect) {
-        return 0.0;
+        return SizePx{};
     }
     prRect rect{};
     if (inst.sequence->GetFrameRect(inst.timelineId, &rect) != suiteError_NoError) {
-        return 0.0;
+        return SizePx{};
     }
-    const double w = static_cast<double>(rect.right) - static_cast<double>(rect.left);
-    const double h = static_cast<double>(rect.bottom) - static_cast<double>(rect.top);
-    if (!(w > 0.0) || !(h > 0.0)) {
-        return 0.0;
+    // Host-supplied, therefore validated: an inverted or absurd rectangle is
+    // reported as "unknown" rather than carried into the camera.
+    const long long w = static_cast<long long>(rect.right) - static_cast<long long>(rect.left);
+    const long long h = static_cast<long long>(rect.bottom) - static_cast<long long>(rect.top);
+    if (w <= 0 || h <= 0 || w > kMaxSequenceEdge || h > kMaxSequenceEdge) {
+        return SizePx{};
     }
-    return w / h;
+    return SizePx{static_cast<int>(w), static_cast<int>(h)};
 }
 
 // ===========================================================================
@@ -898,7 +909,7 @@ prSuiteError render(PrGPUFilterInstance* instanceData, const PrGPUFilterRenderPa
         srcView.layout = src.isHalf ? PixelLayout::Bgra16f : PixelLayout::Bgra32f;
         srcView.topDown = true;  // "GPU Frames always have origin top left"
 
-        const KernelSetup setup = buildParams(settings, srcView, dst.width, dst.height, sequenceAspect(*inst));
+        const KernelSetup setup = buildParams(settings, srcView, dst.width, dst.height, sequenceSize(*inst));
         if (!setup.valid) {
             PluginLog::oncef("reframe/gpu/setup", PluginLog::Level::Error,
                              "reframe/gpu: could not build the kernel parameters ({}x{} -> {}x{}): {}", src.width,

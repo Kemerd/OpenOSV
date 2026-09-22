@@ -56,7 +56,7 @@ double nccMasked(const float* a, const float* b, const std::uint8_t* mask, std::
 
 Result<LensBands> renderLensBands(const geom::LensRig& rig, const video::FramePair& frames,
                                   const geom::BlendParams& blend, const BandParams& band, bool linear,
-                                  const std::vector<float>* seamTable, ThreadPool& pool) {
+                                  const std::vector<float>* seamTable, ThreadPool& pool, const WarpGridView* warp) {
     if (band.equirectW < 64 || band.equirectW > 16384 || band.bandHalfDeg <= 0.0 || band.bandHalfDeg > 45.0) {
         return Error{ErrorCode::InvalidArgument, "renderLensBands: bad band parameters"};
     }
@@ -90,6 +90,16 @@ Result<LensBands> renderLensBands(const geom::LensRig& rig, const video::FramePa
         if (seamTable && !seamTable->empty()) {
             builder.seam(*seamTable);
         }
+        // Each lens is rendered ALONE here, but the kernel still applies the
+        // warp with the sign that belongs to that lens index - so the two
+        // single-lens bands end up at the same middle position the blended
+        // render would put them at.  That is what makes an NCC measured on
+        // these bands describe the real output rather than an approximation.
+        if (warp && warp->valid()) {
+            const std::size_t n = static_cast<std::size_t>(warp->w) * warp->h * 2u;
+            builder.warp(std::vector<float>(warp->uv, warp->uv + n), warp->w, warp->h, warp->latMinRad,
+                         warp->latMaxRad);
+        }
         OSV_TRY_ASSIGN(RenderJob job, builder.build(frames));
         OSV_TRY_ASSIGN(ImageRGBAf img, cpu.render(job));
         out.luma[lens].resize(static_cast<std::size_t>(out.w) * out.h);
@@ -106,8 +116,9 @@ Result<LensBands> renderLensBands(const geom::LensRig& rig, const video::FramePa
 }
 
 Result<double> overlapNcc(const geom::LensRig& rig, const video::FramePair& frames, const geom::BlendParams& blend,
-                          const BandParams& band, ThreadPool& pool, const std::vector<float>* seamTable) {
-    OSV_TRY_ASSIGN(LensBands b, renderLensBands(rig, frames, blend, band, false, seamTable, pool));
+                          const BandParams& band, ThreadPool& pool, const std::vector<float>* seamTable,
+                          const WarpGridView* warp) {
+    OSV_TRY_ASSIGN(LensBands b, renderLensBands(rig, frames, blend, band, false, seamTable, pool, warp));
     const std::size_t n = b.luma[0].size();
     std::vector<std::uint8_t> mask(n, 0);
     for (std::size_t i = 0; i < n; ++i) {

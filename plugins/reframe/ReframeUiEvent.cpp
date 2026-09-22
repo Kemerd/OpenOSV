@@ -421,38 +421,127 @@ void packRefcon(A_intptr_t refcon[4], int index, std::uint64_t generation) noexc
 
 /// The viewport rectangle the overlay draws over, in frame pixels.
 ///
-/// The effect letterboxes its output into a centred rectangle of the chosen
-/// aspect (ReframeParams::computeViewport), and the overlay must sit on THAT
-/// rectangle rather than on the whole frame - otherwise the crosshair would
-/// float in the black bars and a corner grip would be unreachable.
+/// This is now simply the WHOLE frame, and the parameter array is no longer
+/// consulted at all.
 ///
-/// The aspect popup is read from the parameter array; "Match Sequence" has
-/// no sequence to ask during an event, so it falls back to the frame's own
-/// shape, which is what Match Sequence resolves to for a sequence-sized
-/// frame anyway.
+/// It used to read the "Output Aspect" popup and reproduce the effect's
+/// letterbox, so the crosshair and the corner grips sat on the picture rather
+/// than floating in the black bars.  With the letterbox gone - the reframe
+/// camera fills the output frame whatever shape it is (see
+/// ReframeParams::computeViewport) - the picture IS the frame, and the
+/// overlay must cover all of it or the grips would stop short of the edges.
+///
+/// The function is kept rather than inlined at its call sites because it is
+/// the single statement of "where the picture is" for the UI, and it is the
+/// place a future sub-rectangle render would have to be mirrored.
 ///
 /// A degenerate frame yields a zero rectangle and, through computeLayout(),
 /// an invalid layout that every consumer already handles.
 [[nodiscard]] RectF viewportForFrame(PF_ParamDef* params[], int frameW, int frameH) noexcept {
+    // The popup no longer affects where the picture is drawn, so it is not
+    // read; the parameter is still taken so every caller keeps its shape.
+    (void)params;
     if (frameW <= 0 || frameH <= 0) {
         return RectF{};
     }
-    const double frameAspect = static_cast<double>(frameW) / static_cast<double>(frameH);
-
-    Aspect aspect = Aspect::MatchSequence;
-    if (params && params[kIndexOutputAspect]) {
-        aspect = sanitiseAspect(params[kIndexOutputAspect]->u.pd.value);
-    }
-
-    // -1 for the sequence aspect: the Sequence Info Suite is not safe to ask
-    // during a UI event (it wants a timeline id we do not have here), and
-    // resolveAspectRatio() documents a non-positive value as "could not
-    // ask".  For Match Sequence that lands on the frame's own shape below.
-    const double ratio = resolveAspectRatio(aspect, -1.0, frameAspect);
-
-    const Viewport vp = computeViewport(frameW, frameH, ratio);
+    const Viewport vp = computeViewport(frameW, frameH);
     return RectF{static_cast<double>(vp.x), static_cast<double>(vp.y), static_cast<double>(vp.w),
                  static_cast<double>(vp.h)};
+}
+
+// ---------------------------------------------------------------------------
+//  The frame geometry cache
+//
+//  THE PROBLEM THIS SOLVES.  Only PF_Event_DRAW is told how big the drawing
+//  area is, and in Premiere that information arrives ONLY as the draw
+//  event's update rect, because in_data->width/height are zero for a
+//  comp-window custom UI.  PF_Event_DO_CLICK, PF_Event_DRAG and
+//  PF_Event_ADJUST_CURSOR carry a pointer position and nothing else.
+//
+//  Before this cache existed those three handlers built their layout from
+//  in_data->width/height directly, which in Premiere meant a 0x0 viewport,
+//  an INVALID layout, and an early return on every single one of them.  The
+//  visible symptom was exactly what the user reported: the HUD drew (the
+//  draw path had the update-rect fallback) but nothing could be grabbed,
+//  because onDoClick() bailed before it ever set `send_drag` and so no
+//  PF_Event_DRAG was ever delivered.  The HUD was a picture of a control
+//  rather than a control.
+//
+//  So the last geometry a draw event established is remembered here and the
+//  pointer handlers read it.  That is sound because the host always paints a
+//  view before the user can point at it: a repaint necessarily precedes the
+//  first click, and any resize repaints before the pointer can act on the
+//  new size.
+//
+//  It is stored as a single 64-bit-word-per-field POD behind a mutex rather
+//  than as atomics, because the four fields must be read as ONE consistent
+//  snapshot - a torn read mixing a new width with an old origin would offset
+//  every drag of that gesture.  The critical section is four loads and is
+//  not contended in practice (one UI thread), so a mutex costs nothing
+//  measurable and buys exact consistency.
+// ---------------------------------------------------------------------------
+
+/// The cache and its guard.  A function-local static for the same
+/// initialisation-order reasons as dragTable().
+struct FrameGeometryCache {
+    std::mutex mutex;
+    FrameGeometry geometry;
+};
+
+[[nodiscard]] FrameGeometryCache& frameGeometryCache() noexcept {
+    static FrameGeometryCache cache;
+    return cache;
+}
+
+/// Publish the geometry a draw event established.
+///
+/// Rejects anything that is not a usable frame, so a single malformed draw
+/// event cannot poison the cache for the pointer handlers that follow: a
+/// bad update rect leaves the last GOOD geometry in place, which is far
+/// better than invalidating a working overlay.
+void publishFrameGeometry(const FrameGeometry& geometry) noexcept {
+    if (!geometry.valid) {
+        return;
+    }
+    if (!(std::isfinite(geometry.originX) && std::isfinite(geometry.originY) && std::isfinite(geometry.width) &&
+          std::isfinite(geometry.height))) {
+        return;
+    }
+    if (!(geometry.width > 0.0) || !(geometry.height > 0.0)) {
+        return;
+    }
+    FrameGeometryCache& cache = frameGeometryCache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.geometry = geometry;
+}
+
+/// The last geometry a draw event established, or an invalid one when no
+/// draw has happened yet.
+[[nodiscard]] FrameGeometry currentFrameGeometry() noexcept {
+    FrameGeometryCache& cache = frameGeometryCache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    return cache.geometry;
+}
+
+/// Work out the frame geometry for an event, preferring what the host says
+/// directly and falling back to the cache.
+///
+/// `hostW`/`hostH` are in_data->width/height. When the host fills them in
+/// (After Effects does; Premiere does not) they are the authority and the
+/// origin is zero, because a layer-sized custom UI starts at the layer's own
+/// top-left. When they are zero the cached geometry from the last repaint is
+/// used instead, origin included.
+[[nodiscard]] FrameGeometry resolveFrameGeometry(int hostW, int hostH) noexcept {
+    if (hostW > 0 && hostH > 0 && hostW <= kMaxOverlayEdge && hostH <= kMaxOverlayEdge) {
+        FrameGeometry geometry;
+        geometry.originX = 0.0;
+        geometry.originY = 0.0;
+        geometry.width = static_cast<double>(hostW);
+        geometry.height = static_cast<double>(hostH);
+        geometry.valid = true;
+        return geometry;
+    }
+    return currentFrameGeometry();
 }
 
 /// Convert a point the host gave in WINDOW coordinates into frame pixels.
@@ -460,15 +549,96 @@ void packRefcon(A_intptr_t refcon[4], int index, std::uint64_t generation) noexc
 /// The host supplies `frame_to_source` / `source_to_frame` in
 /// PF_EventCallbacks (AE_EffectUI.h:474-475) but they map between the
 /// LAYER's source space and the composition frame, which is not what we
-/// need: the overlay works in the coordinates of the rendered output frame,
-/// and the event's screen_point is already in that frame's space for a comp
-/// window custom UI.
+/// need: the overlay works in the coordinates of the rendered output frame.
 ///
-/// So the conversion is the identity, and this function exists to say so
-/// explicitly and to do the one thing that is genuinely needed: reject a
-/// non-finite or absurd coordinate before it reaches the maths.
-[[nodiscard]] PointF windowToFrame(const PF_Point& point) noexcept {
-    return PointF{static_cast<double>(point.h), static_cast<double>(point.v)};
+/// The transform is a translation by the frame's window-space origin. It
+/// USED to be hard-coded as the identity, which was correct only as long as
+/// the layout came from the layer size (implicitly rooted at 0,0). Now that
+/// the layout can come from a draw event's update rect - a rectangle in
+/// WINDOW coordinates that need not start at the origin - the same identity
+/// would offset every drag by the rect's top-left corner. The maths lives in
+/// ReframeUi.cpp so the tests pin it.
+[[nodiscard]] PointF windowToFramePoint(const FrameGeometry& geometry, const PF_Point& point) noexcept {
+    return windowToFrame(geometry, PointF{static_cast<double>(point.h), static_cast<double>(point.v)});
+}
+
+// ---------------------------------------------------------------------------
+//  Asking for a repaint
+//
+//  WHY THIS IS NEEDED.  Committing a value with PF_ChangeFlag_CHANGED_VALUE
+//  makes the host re-RENDER the frame, but a render is not a repaint of the
+//  custom UI: the HUD is drawn in a separate PF_Event_DRAW pass and the host
+//  has no reason to think that pass is stale just because a parameter moved.
+//  Without an explicit request the readout would keep showing the numbers
+//  from whenever the view last happened to be invalidated, and the hover
+//  highlight would never light up at all - the overlay would look frozen
+//  while the picture underneath it moved.
+//
+//  PF_InvalidateRect (AE_EffectSuites.h:588-594) is the documented mechanism
+//  and its contract is quoted there: "Use it to invalidate rect of current
+//  window being drawn... Specify PF_EO_UPDATE_NOW out flag to update the
+//  window immediately after the event returns. Specify rectP0 as NULL to
+//  invalidate the whole window. Only valid while handling an NON-DRAW event
+//  in the effect."
+//
+//  That last sentence is why this is never called from onDraw(): doing so
+//  during a draw is explicitly out of contract and is the classic way to get
+//  a host into a repaint loop that pegs a core.
+//
+//  A null rect (the whole window) rather than a computed dirty rectangle:
+//  the HUD spans the entire picture - crosshair at the centre, grips at four
+//  corners, readout at the top-left - so any honest dirty rect is very
+//  nearly the whole view anyway, and getting it slightly wrong leaves
+//  visible smears of stale ink.
+// ---------------------------------------------------------------------------
+
+/// Ask the host to repaint the custom UI, and to do it as soon as this
+/// event returns.
+///
+/// Every failure is silent and harmless: without the suite or the function
+/// the overlay simply refreshes on the host's own schedule, which is what it
+/// did before. It must only be called while handling a NON-DRAW event.
+void requestOverlayRepaint(PF_InData* in_data, PF_EventExtra* extra) noexcept {
+    if (!in_data || !extra || !extra->contextH) {
+        return;
+    }
+    SPBasicSuite* basic = in_data->pica_basicP;
+    if (!basic) {
+        return;
+    }
+    osv::premiere::SuiteHandle<PFAppSuite6> app;
+    if (app.acquire(basic, kPFAppSuite, kPFAppSuiteVersion6) && app->PF_InvalidateRect) {
+        // NULL rect: invalidate the whole window (see the note above).
+        (void)app->PF_InvalidateRect(extra->contextH, nullptr);
+    }
+
+    // Set the out-flag whether or not the invalidate succeeded. It is the
+    // half of the contract that turns "repaint eventually, during idle" into
+    // "repaint the moment this event returns", and on a host that refreshes
+    // on its own it is simply redundant rather than harmful.
+    extra->evt_out_flags |= PF_EO_UPDATE_NOW;
+}
+
+/// The layout for a geometry: the one call every handler makes, so all four
+/// of them place the handles identically by construction.
+///
+/// The viewport is expressed in FRAME coordinates (top-left at 0,0), which
+/// is the space `windowToFrame()` maps a pointer into - so the layout and
+/// the pointer always agree without either of them knowing the origin.
+[[nodiscard]] Layout layoutForGeometry(PF_ParamDef* params[], const FrameGeometry& geometry) noexcept {
+    if (!geometry.valid) {
+        return Layout{};
+    }
+    // The double->int narrowing is guarded: the cache only ever holds finite
+    // positive sizes below kMaxOverlayEdge, but the conversion is checked
+    // anyway so a future writer cannot make this a silent truncation.
+    if (!(geometry.width > 0.0) || !(geometry.height > 0.0) || geometry.width > static_cast<double>(kMaxOverlayEdge) ||
+        geometry.height > static_cast<double>(kMaxOverlayEdge)) {
+        return Layout{};
+    }
+    const int frameW = static_cast<int>(geometry.width);
+    const int frameH = static_cast<int>(geometry.height);
+    return computeLayout(viewportForFrame(params, frameW, frameH));
 }
 
 // ---------------------------------------------------------------------------
@@ -926,37 +1096,81 @@ PF_Err onDraw(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* extra) n
     // filled for a comp-window draw.  It is used only as a FALLBACK: when the
     // layer size is sane it remains the authority, because update_rect can be
     // a partial invalidation rather than the whole frame.
-    int frameW = in_data->width;
-    int frameH = in_data->height;
-    if (frameW <= 0 || frameH <= 0) {
+    FrameGeometry geometry;
+    if (in_data->width > 0 && in_data->height > 0 && in_data->width <= kMaxOverlayEdge &&
+        in_data->height <= kMaxOverlayEdge) {
+        // After Effects fills these in and they are the authority: a
+        // layer-sized custom UI is rooted at the layer's own top-left, so
+        // the origin is zero and window space IS frame space.
+        geometry.originX = 0.0;
+        geometry.originY = 0.0;
+        geometry.width = static_cast<double>(in_data->width);
+        geometry.height = static_cast<double>(in_data->height);
+        geometry.valid = true;
+    } else {
+        // Premiere's comp-window path. The update rect is the only size the
+        // host offers, and unlike the layer size it has an ORIGIN as well -
+        // it is expressed in the window's coordinate system
+        // (AE_EffectUI.h:284). Both are captured, because the origin is what
+        // `windowToFrame()` subtracts from a screen_point to put a click in
+        // the same space as the layout.
         const PF_UnionableRect& r = extra->u.draw.update_rect;
         const long rectW = static_cast<long>(r.right) - static_cast<long>(r.left);
         const long rectH = static_cast<long>(r.bottom) - static_cast<long>(r.top);
         // Guard the subtraction: an empty or inverted rect is not a frame,
         // and kMaxOverlayEdge keeps a nonsense value out of the geometry.
         if (rectW > 0 && rectH > 0 && rectW <= kMaxOverlayEdge && rectH <= kMaxOverlayEdge) {
-            frameW = static_cast<int>(rectW);
-            frameH = static_cast<int>(rectH);
+            geometry.originX = static_cast<double>(r.left);
+            geometry.originY = static_cast<double>(r.top);
+            geometry.width = static_cast<double>(rectW);
+            geometry.height = static_cast<double>(rectH);
+            geometry.valid = true;
             (void)PluginLog::oncef("reframe.ui.updaterect", PluginLog::Level::Info,
                                    "reframe ui: the host reports a {}x{} layer; drawing against the "
-                                   "event's {}x{} update rect instead",
-                                   in_data->width, in_data->height, frameW, frameH);
+                                   "event's {}x{} update rect at origin {},{} instead",
+                                   in_data->width, in_data->height, rectW, rectH,
+                                   static_cast<int>(r.left), static_cast<int>(r.top));
         }
     }
 
-    const RectF viewport = viewportForFrame(params, frameW, frameH);
-    const Layout layout = computeLayout(viewport);
+    const Layout layout = layoutForGeometry(params, geometry);
     if (!layout.valid) {
-        (void)PluginLog::oncef("reframe.ui.viewport", PluginLog::Level::Warn,
-                               "reframe ui: no overlay, degenerate frame {}x{} (layer {}x{}, update rect "
-                               "{},{},{},{})",
-                               frameW, frameH, in_data->width, in_data->height,
+        // Neither source gave a usable size. This is NOT a malfunction and
+        // must not be reported as one: Premiere sends draw events to
+        // throwaway plug-in instances that have no window behind them at
+        // all. The session log shows exactly that - one such event per
+        // freshly loaded instance during the startup scan, each immediately
+        // after its own GLOBAL_SETUP, and never again once a real Program
+        // Monitor exists.
+        //
+        // PF_Context::w_type (AE_EffectUI.h:414) is what separates the two
+        // cases. A comp-window context with no size is a view that is not on
+        // screen yet (a hidden or collapsed panel, or a pre-roll); anything
+        // else is a context this overlay never asked to draw in, because
+        // registerCustomUi() requests PF_CustomEFlag_COMP alone. Both are
+        // expected, so both are logged at Info - a Warn here trains the user
+        // to ignore the log, which is worse than no log at all.
+        long windowType = -1;
+        if (extra->contextH && *extra->contextH) {
+            windowType = static_cast<long>((*extra->contextH)->w_type);
+        }
+        (void)PluginLog::oncef("reframe.ui.viewport", PluginLog::Level::Info,
+                               "reframe ui: no overlay for a sizeless context (layer {}x{}, update rect "
+                               "{},{},{},{}, window type {}); this is normal for a host probe or an "
+                               "off-screen view and the overlay appears as soon as a sized one draws",
+                               in_data->width, in_data->height,
                                static_cast<int>(extra->u.draw.update_rect.left),
                                static_cast<int>(extra->u.draw.update_rect.top),
                                static_cast<int>(extra->u.draw.update_rect.right),
-                               static_cast<int>(extra->u.draw.update_rect.bottom));
+                               static_cast<int>(extra->u.draw.update_rect.bottom), windowType);
         return PF_Err_NONE;
     }
+
+    // Publish BEFORE drawing, so that even if a DrawBot suite is missing and
+    // the HUD never appears, the click handlers still know how big the view
+    // is. Dragging without a visible overlay is odd but it is strictly
+    // better than a monitor that ignores the mouse.
+    publishFrameGeometry(geometry);
 
     // Every suite below comes from the host's SPBasicSuite, which the effect
     // is handed in in_data.  Without it there is nothing to acquire.
@@ -1056,13 +1270,20 @@ PF_Err onDoClick(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* extra
     }
     PF_DoClickEventInfo& click = extra->u.do_click;
 
-    const RectF viewport = viewportForFrame(params, in_data->width, in_data->height);
-    const Layout layout = computeLayout(viewport);
+    // A click event carries a pointer position and NOTHING about the size of
+    // the view, so the geometry comes from the last repaint (see the frame
+    // geometry cache). Building it from in_data->width/height here - which
+    // is what this handler used to do - produced a 0x0 viewport in Premiere,
+    // an invalid layout, and an early return on EVERY click: `send_drag` was
+    // never set, the host never sent a single PF_Event_DRAG, and the overlay
+    // was inert no matter how correct the drag maths underneath it was.
+    const FrameGeometry geometry = resolveFrameGeometry(in_data->width, in_data->height);
+    const Layout layout = layoutForGeometry(params, geometry);
     if (!layout.valid) {
         return PF_Err_NONE;  // No picture to grab; leave the click to the host.
     }
 
-    const PointF where = windowToFrame(click.screen_point);
+    const PointF where = windowToFramePoint(geometry, click.screen_point);
     const Handle handle = hitTest(layout, where);
     if (handle == Handle::None) {
         // Outside the picture: emphatically not ours.  PF_EO_HANDLED_EVENT
@@ -1084,6 +1305,8 @@ PF_Err onDoClick(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* extra
     state.anchor = where;
     state.last = where;
     state.layout = layout;
+    // Pin the coordinate transform for the gesture; see DragState::geometry.
+    state.geometry = geometry;
     state.start = readCamera(params);
     state.mode = resolveDragMode(handle, static_cast<std::uint32_t>(click.modifiers));
     state.axisLocked = false;
@@ -1135,7 +1358,15 @@ PF_Err onDrag(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* extra) n
         return PF_Err_NONE;
     }
 
-    const PointF where = windowToFrame(drag.screen_point);
+    // The geometry used here is the one captured when the gesture STARTED,
+    // carried in the drag state, not the live cache. A repaint arriving
+    // mid-drag (the overlay asks for one on every move) could publish a
+    // slightly different update rect, and converting this event's pointer
+    // with a different origin to the one the anchor was converted with would
+    // make the picture jump by that difference in the middle of the drag.
+    // Pinning the origin for the whole gesture is what makes a drag smooth.
+    const PointF where = windowToFrame(state.geometry, PointF{static_cast<double>(drag.screen_point.h),
+                                                              static_cast<double>(drag.screen_point.v)});
     const std::uint32_t modifiers = static_cast<std::uint32_t>(drag.modifiers);
 
     const CameraValues updated = applyDrag(state, where, modifiers);
@@ -1151,6 +1382,12 @@ PF_Err onDrag(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* extra) n
         // (AE_Effect.h:2380): "If set during PF_Cmd_EVENT, be sure to also
         // set PF_EO_HANDLED_EVENT before returning."
         extra->evt_out_flags |= PF_EO_HANDLED_EVENT;
+
+        // The value moved, so the readout in the HUD is now stale. Ask for
+        // the overlay to be redrawn; without this the numbers only refresh
+        // when something else happens to invalidate the view, which makes a
+        // drag look like it is doing nothing.
+        requestOverlayRepaint(in_data, extra);
     }
 
     if (drag.last_time) {
@@ -1177,18 +1414,32 @@ PF_Err onAdjustCursor(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* 
     }
     PF_AdjustCursorEventInfo& info = extra->u.adjust_cursor;
 
-    const RectF viewport = viewportForFrame(params, in_data->width, in_data->height);
-    const Layout layout = computeLayout(viewport);
+    // Same story as onDoClick: no size in the event, so the cached geometry
+    // from the last repaint is the only way to know where the picture is.
+    const FrameGeometry geometry = resolveFrameGeometry(in_data->width, in_data->height);
+    const Layout layout = layoutForGeometry(params, geometry);
     if (!layout.valid) {
         return PF_Err_NONE;
     }
 
-    const PointF where = windowToFrame(info.screen_point);
+    const PointF where = windowToFramePoint(geometry, info.screen_point);
     const Handle handle = hitTest(layout, where);
 
     // Remember the answer for the next repaint, which has no pointer of its
     // own and needs this to highlight the handle under the cursor.
+    //
+    // The repaint is requested ONLY when the answer actually changed.
+    // ADJUST_CURSOR arrives on every mouse move over the view - hundreds a
+    // second - and invalidating the whole window on each one would make the
+    // plug-in repaint the Program Monitor continuously while the pointer
+    // merely travels across it. Comparing first means the cost is paid once
+    // per handle transition, which is exactly when the highlight needs to
+    // move.
+    const Handle previous = hoverHandle();
     setHoverHandle(handle);
+    if (handle != previous) {
+        requestOverlayRepaint(in_data, extra);
+    }
 
     if (handle == Handle::None) {
         // Leave the cursor alone outside the picture: PF_Cursor_NONE is the
@@ -1314,7 +1565,14 @@ PF_Err handleEvent(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params
             // The pointer left the view, so nothing is hovered any more and
             // the next repaint must drop the highlight.  Without this a
             // handle stays lit after the mouse has gone elsewhere.
-            setHoverHandle(Handle::None);
+            //
+            // A repaint is requested when a handle really was lit, so the
+            // highlight visibly goes out instead of waiting for whatever
+            // invalidates the view next.
+            if (hoverHandle() != Handle::None) {
+                setHoverHandle(Handle::None);
+                requestOverlayRepaint(in_data, extra);
+            }
             return PF_Err_NONE;
 
         case PF_Event_NEW_CONTEXT:

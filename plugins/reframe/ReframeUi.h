@@ -233,6 +233,63 @@ struct Layout {
 /// place the handle sizes are decided.
 [[nodiscard]] Layout computeLayout(const RectF& viewport) noexcept;
 
+// ===========================================================================
+//  Frame geometry: the bridge between window and frame coordinates
+//
+//  WHY THIS TYPE EXISTS.  The overlay's geometry has to be derived from
+//  whatever the host is willing to tell us, and the host tells us different
+//  things on different events:
+//
+//    * PF_Event_DRAW carries PF_DrawEventInfo::update_rect, which is the
+//      area to repaint IN THE WINDOW'S OWN COORDINATE SYSTEM
+//      (AE_EffectUI.h:284).  It has both a size AND AN ORIGIN.
+//    * PF_Event_DO_CLICK / _DRAG / _ADJUST_CURSOR carry only a
+//      `screen_point`, also in window coordinates, and NO size at all.
+//
+//  Premiere Pro reports in_data->width/height as 0 during a comp-window
+//  custom UI event, so the size can ONLY come from a draw event's update
+//  rect - which means the pointer events have no way to compute a layout of
+//  their own and must reuse the one the last repaint established.
+//
+//  Carrying the ORIGIN as well as the size is what keeps a drag from being
+//  offset.  If the update rect starts at (x0, y0) then the layout built from
+//  it lives in a box whose top-left is (0, 0) only when x0 == y0 == 0.  A
+//  screen_point is absolute in window space, so mapping one into frame space
+//  is a subtraction of that origin - the identity ONLY in the case the
+//  overlay happened to be tested in.  `FrameGeometry` stores the origin so
+//  the subtraction is explicit, checked and unit-tested rather than assumed.
+// ===========================================================================
+
+/// The size and window-space origin of the frame the overlay draws on.
+///
+/// `valid` is false until a draw event has established it; every pointer
+/// event checks that before hit-testing, because acting on an unestablished
+/// geometry would hit-test against zeros and grab nothing (or, worse, grab
+/// the wrong thing).
+struct FrameGeometry {
+    double originX = 0.0;  ///< Window-space x of the frame's left edge.
+    double originY = 0.0;  ///< Window-space y of the frame's top edge.
+    double width = 0.0;    ///< Frame width in pixels.
+    double height = 0.0;   ///< Frame height in pixels.
+    bool valid = false;    ///< False until a draw event supplied a real size.
+};
+
+/// Map a point the host gave in WINDOW coordinates into FRAME coordinates.
+///
+/// This is the one place the two spaces are reconciled.  The transform is a
+/// translation by the frame's origin and nothing more: neither space is
+/// scaled or rotated relative to the other, because the update rect and the
+/// screen_point are both delivered in the same window's pixels.
+///
+/// An invalid geometry is treated as the identity rather than as a failure -
+/// that is the historical behaviour for a host that reports a zero origin,
+/// and it keeps a caller that forgot to check `valid` no worse off than
+/// before.  A non-finite input is passed through unchanged so the finiteness
+/// checks downstream (hitTest, applyDrag) still see it and still reject it;
+/// silently turning a NaN into a zero here would make a garbage event look
+/// like a click at the frame's top-left corner.
+[[nodiscard]] PointF windowToFrame(const FrameGeometry& geometry, const PointF& windowPoint) noexcept;
+
 /// The four corner grip rectangles of a layout, written into `out` in the
 /// order top-left, top-right, bottom-left, bottom-right.
 ///
@@ -289,6 +346,13 @@ struct DragState {
     PointF last;                 ///< The previous position, frame pixels.
     CameraValues start;          ///< Values when the gesture started.
     Layout layout;               ///< Layout captured at grab time.
+    /// Window->frame transform captured at grab time.
+    ///
+    /// Held for the WHOLE gesture on purpose. The live geometry can be
+    /// republished by a repaint mid-drag, and converting one event of a
+    /// gesture with a different origin to the one its anchor used would
+    /// offset the picture by that difference in a single mouse move.
+    FrameGeometry geometry;
     double startRollAngleDeg = 0.0; ///< Angle of the anchor about the centre.
     bool axisLocked = false;     ///< Shift: whether the axis is already chosen.
 };

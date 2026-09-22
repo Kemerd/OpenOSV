@@ -170,6 +170,33 @@ typedef struct OsvRenderParams {
     int seamShiftEnabled;    /* 1 = apply the per-column seam table            */
     int seamColumns;         /* number of entries in the seam table            */
     int outputAlphaCoverage; /* 1 = alpha = coverage, 0 = alpha always 1       */
+
+    /* ---- 2-D parallax warp grid (optional) --------------------------------
+     * The seam table above corrects a shift ALONG each meridian and nothing
+     * else.  Real parallax is two-dimensional: a wing tip or a propeller near
+     * the camera displaces content across meridians too, and a 1-D table can
+     * only smear that.  The warp grid carries the missing second component.
+     *
+     * It is a coarse (warpW x warpH) lattice over the polar-axis overlap
+     * band, holding a half-disparity in RADIANS per lens.  The kernel
+     * bilinearly samples it for the ray's (longitude, latitude) and rotates
+     * each lens's sampling direction by that amount - symmetrically, so each
+     * lens moves half way toward the other, exactly as the seam table does.
+     *
+     * Two components, because the two directions are geometrically distinct:
+     *   warpV  along the meridian through the lens axis (the same rotation
+     *          osvShiftTowardAxis already performs for the seam table);
+     *   warpU  about the lens axis itself, i.e. the perpendicular direction
+     *          no 1-D table can express.
+     *
+     * Zero outside the band, which is what makes the correction safe: the
+     * host decays the field to zero across a ring around the band, so a ray
+     * leaving the overlap returns continuously to the uncorrected geometry
+     * rather than stepping to it. */
+    int warpEnabled;         /* 1 = apply the 2-D warp grid                    */
+    int warpW, warpH;        /* grid size (columns = longitude, rows = lat)    */
+    float warpLatMinRad;     /* latitude of grid row 0                          */
+    float warpLatMaxRad;     /* latitude of grid row warpH - 1                  */
     OsvColorParams color;    /* colour pipeline (see ColorMath.h)              */
 } OsvRenderParams;
 
@@ -571,15 +598,99 @@ OSV_HD void osvShiftTowardAxis(const OsvLens* L, const float* dBody, float delta
 }
 
 /* ------------------------------------------------------------------------- */
+/*  2-D parallax warp grid                                                    */
+/* ------------------------------------------------------------------------- */
+
+/* Bilinear fetch of one component of the warp grid.
+ *
+ * `grid` is interleaved (u, v) pairs, warpW * warpH of them, row-major with
+ * rows running from warpLatMinRad to warpLatMaxRad.  `comp` selects 0 = u
+ * (about the lens axis) or 1 = v (along the meridian).
+ *
+ * Longitude WRAPS: the band is a closed ring around the sphere, and column
+ * warpW - 1 is adjacent to column 0.  Clamping there instead would freeze the
+ * correction across the wrap meridian and leave a visible vertical step at
+ * longitude +/-180 - the one place the grid is guaranteed to be continuous in
+ * the real world.  Latitude CLAMPS, because the band genuinely ends. */
+OSV_HD float osvWarpSample(const OsvRenderParams* p, OSV_GLOBAL const float* grid, float lon, float lat, int comp) {
+    if (p->warpW <= 0 || p->warpH <= 0 || grid == 0) {
+        return 0.0f;
+    }
+    /* Longitude -> continuous column.  The grid spans the full 2pi, so the
+     * sample position is a plain fraction of the ring. */
+    float fx = ((lon + OSV_KERNEL_PI) / OSV_KERNEL_TWO_PI) * (float)p->warpW;
+    /* Latitude -> continuous row across the band's own extent. */
+    const float span = p->warpLatMaxRad - p->warpLatMinRad;
+    if (!(span > 1e-9f) && !(span < -1e-9f)) {
+        return 0.0f; /* degenerate band: no correction rather than a divide */
+    }
+    float fy = ((lat - p->warpLatMinRad) / span) * (float)(p->warpH - 1);
+
+    /* Outside the band there is nothing measured.  Returning zero here is
+     * what makes the decay ring the host built actually reach zero. */
+    if (fy < 0.0f || fy > (float)(p->warpH - 1)) {
+        return 0.0f;
+    }
+
+    const float flx = floorf(fx);
+    const float fly = floorf(fy);
+    int x0 = (int)flx;
+    int y0 = (int)fly;
+    const float tx = fx - flx;
+    const float ty = fy - fly;
+
+    /* Wrap the two longitude taps into [0, warpW). */
+    int x1 = x0 + 1;
+    x0 = ((x0 % p->warpW) + p->warpW) % p->warpW;
+    x1 = ((x1 % p->warpW) + p->warpW) % p->warpW;
+    int y1 = y0 + 1;
+    if (y0 < 0) { y0 = 0; }
+    if (y0 > p->warpH - 1) { y0 = p->warpH - 1; }
+    if (y1 < 0) { y1 = 0; }
+    if (y1 > p->warpH - 1) { y1 = p->warpH - 1; }
+
+    const float a = grid[((y0 * p->warpW) + x0) * 2 + comp];
+    const float b = grid[((y0 * p->warpW) + x1) * 2 + comp];
+    const float c = grid[((y1 * p->warpW) + x0) * 2 + comp];
+    const float d = grid[((y1 * p->warpW) + x1) * 2 + comp];
+    const float top = a + (b - a) * tx;
+    const float bot = c + (d - c) * tx;
+    return top + (bot - top) * ty;
+}
+
+/* Rotate the body ray ABOUT the optical axis of lens L by `deltaRad`.
+ *
+ * This is the component osvShiftTowardAxis cannot express.  That function
+ * rotates along the meridian through the axis (changing the angle FROM the
+ * axis); this one rotates around the axis (changing the angle AROUND it),
+ * and the two together span the tangent plane at the ray.  A 2-D parallax
+ * displacement needs both, which is the whole reason the warp grid carries
+ * two components. */
+OSV_HD void osvRotateAboutLensAxis(const OsvLens* L, const float* dBody, float deltaRad, float* out) {
+    if (deltaRad == 0.0f) {
+        out[0] = dBody[0];
+        out[1] = dBody[1];
+        out[2] = dBody[2];
+        return;
+    }
+    const float z[3] = {0.0f, 0.0f, 1.0f};
+    float axis[3];
+    osvMat3TMulVec(L->R, z, axis);
+    osvNormalize3(axis);
+    osvRotateAboutAxis(dBody, axis, deltaRad, out);
+}
+
+/* ------------------------------------------------------------------------- */
 /*  The shader                                                                */
 /* ------------------------------------------------------------------------- */
 
 /* Compute output pixel (x, y).  `planes` holds the two lens frames, `seam`
  * the optional per-column seam shift table in degrees (may be 0 when
- * seamShiftEnabled == 0).  `out` receives R, G, B in the output encoding and
+ * seamShiftEnabled == 0), `warp` the optional 2-D parallax grid (may be 0
+ * when warpEnabled == 0).  `out` receives R, G, B in the output encoding and
  * A = coverage (or 1).  Pixels seen by neither lens are (0,0,0,0). */
-OSV_HD void osvShadePixel(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam, int x,
-                          int y, float* out) {
+OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
+                           OSV_GLOBAL const float* warp, int x, int y, float* out) {
     float dView[3];
     if (!osvRayForPixel(p, (float)x, (float)y, dView)) {
         out[0] = out[1] = out[2] = out[3] = 0.0f;
@@ -595,6 +706,26 @@ OSV_HD void osvShadePixel(const OsvRenderParams* p, const OsvPlane* planes, OSV_
     float seamDelta = 0.0f;
     if (p->seamShiftEnabled && p->seamColumns > 0 && seam != 0) {
         seamDelta = -seam[osvSeamColumn(p, dBody)] * (OSV_KERNEL_PI / 180.0f) * 0.5f;
+    }
+
+    /* Optional 2-D parallax warp.  Sampled once per pixel for the ray's
+     * polar-axis coordinates and applied with OPPOSITE sign to the two
+     * lenses, so each moves half way toward the other and the correction is
+     * symmetric - the same reasoning that makes warpToMiddle() warp both
+     * views rather than one (see FlowWarp.h).  A one-sided warp would put
+     * the whole error on one lens and read as a discontinuity.
+     *
+     * The grid already holds HALF the measured disparity, so no further
+     * halving happens here. */
+    float warpU = 0.0f;
+    float warpV = 0.0f;
+    if (p->warpEnabled && warp != 0 && p->warpW > 0 && p->warpH > 0) {
+        /* Polar-axis longitude/latitude of this ray: poles are the two lens
+         * axes (+/-Y), so latitude is measured from the equator plane. */
+        const float lon = atan2f(dBody[0], dBody[2]);
+        const float lat = asinf(osvClampf(dBody[1], -1.0f, 1.0f));
+        warpU = osvWarpSample(p, warp, lon, lat, 0);
+        warpV = osvWarpSample(p, warp, lon, lat, 1);
     }
 
     /* Project into both lenses and compute their weights. */
@@ -618,6 +749,31 @@ OSV_HD void osvShadePixel(const OsvRenderParams* p, const OsvPlane* planes, OSV_
             dl[0] = dBody[0];
             dl[1] = dBody[1];
             dl[2] = dBody[2];
+        }
+        /* 2-D parallax warp, applied on top of the 1-D seam shift.
+         *
+         * The sign flips between the lenses (i == 0 gets +, i == 1 gets -)
+         * so the pair converges on the middle instead of both chasing the
+         * same direction.  Order matters only to second order at these
+         * angles - the two rotations are a few tenths of a degree - so the
+         * meridian component is applied first to keep it consistent with the
+         * seam shift it extends. */
+        if (warpU != 0.0f || warpV != 0.0f) {
+            const float sgn = (i == 0) ? 1.0f : -1.0f;
+            if (warpV != 0.0f) {
+                float tmp[3];
+                osvShiftTowardAxis(L, dl, sgn * warpV, tmp);
+                dl[0] = tmp[0];
+                dl[1] = tmp[1];
+                dl[2] = tmp[2];
+            }
+            if (warpU != 0.0f) {
+                float tmp[3];
+                osvRotateAboutLensAxis(L, dl, sgn * warpU, tmp);
+                dl[0] = tmp[0];
+                dl[1] = tmp[1];
+                dl[2] = tmp[2];
+            }
         }
         float theta;
         if (osvProjectLens(L, dl, &px[i], &py[i], &theta)) {
@@ -723,6 +879,17 @@ OSV_HD void osvShadePixel(const OsvRenderParams* p, const OsvPlane* planes, OSV_
         osvLinearToOutput(&p->color, acc, out);
     }
     out[3] = p->outputAlphaCoverage ? fminf(wsum, 1.0f) : 1.0f;
+}
+
+/* Back-compatible entry point: shade with no 2-D warp grid.
+ *
+ * Kept as a distinct symbol rather than folded into osvShadePixelW with a
+ * null argument at every call site, because the OpenCL kernel and the parity
+ * tests both call this name and a signature change there would ripple into
+ * source strings compiled at runtime. */
+OSV_HD void osvShadePixel(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam, int x,
+                          int y, float* out) {
+    osvShadePixelW(p, planes, seam, (OSV_GLOBAL const float*)0, x, y, out);
 }
 
 /* ------------------------------------------------------------------------- */

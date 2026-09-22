@@ -6,7 +6,8 @@
 // Every output pixel is produced by osvReframeEquirectPixel() from
 // include/osv/render/osv_kernel.h.  Nothing in this file reimplements the
 // projection, the sampler or the half-float decoder; it only decides WHERE
-// the picture goes (the letterbox rectangle), WHICH WAY the camera points
+// the picture goes (the render rectangle, which is the whole frame), WHICH
+// WAY the camera points
 // (Rout) and HOW the float result is stored in the host's buffer.
 //
 // Coordinate conventions, all from docs/GEOMETRY.md and docs/PREMIERE.md:
@@ -317,7 +318,8 @@ bool sourceRowsRunForward(const ConstFrameView& src) noexcept {
     // Premiere that refused the type gave us <err> for the value in the same
     // dump.  Mapping such a slot on the anchor's word alone would replace a
     // known-good default with whatever a failed GetParam left behind, which
-    // is how an unset Output Aspect lost its letterbox.
+    // is how an unset Output Aspect lost its letterbox, back when there was
+    // one to lose.
     //
     // A slot the host DID type and that CONTRADICTS ours is fatal rather than
     // skippable: at this offset the list is demonstrably not our parameter
@@ -438,73 +440,99 @@ bool matchHostParams(const HostParamKind* kinds, int count, HostParamMap* outMap
 }
 
 // ---------------------------------------------------------------------------
-//  Aspect resolution and the letterbox rectangle (declared in ReframeParams.h)
+//  Output size and the render rectangle (declared in ReframeParams.h)
 // ---------------------------------------------------------------------------
-double resolveAspectRatio(Aspect aspect, double sequenceAspect, double frameAspect) noexcept {
-    switch (aspect) {
-        case Aspect::MatchSequence:
-            // The Sequence Info Suite answers on a real host; without it
-            // (older host, suite hidden, a timeline id we cannot resolve)
-            // docs/PREMIERE.md prescribes 16:9.
-            if (std::isfinite(sequenceAspect) && sequenceAspect > 0.0) {
-                return sequenceAspect;
-            }
-            return 16.0 / 9.0;
-        case Aspect::FullFrame:
-            // Whatever shape the frame is; a degenerate frame falls back to
-            // 16:9 rather than producing a zero-width viewport.
-            if (std::isfinite(frameAspect) && frameAspect > 0.0) {
-                return frameAspect;
-            }
-            return 16.0 / 9.0;
-        default:
-            break;
-    }
-    for (const AspectEntry& e : kAspects) {
-        if (e.value == aspect && e.heightUnits > 0.0) {
-            return e.widthUnits / e.heightUnits;
+SizePx resolveOutputSize(Resolution resolution, SizePx sequenceSize, SizePx frameSize) noexcept {
+    // A fixed entry is a pair of literals from the table and needs no host
+    // cooperation at all, so it is answered first and can never fail.
+    for (const ResolutionEntry& e : kResolutions) {
+        if (e.value == resolution && e.width > 0 && e.height > 0) {
+            return SizePx{e.width, e.height};
         }
     }
-    return 16.0 / 9.0;
+
+    // "Match Sequence" (and any value that fell through the table, which
+    // sanitiseResolution should already have prevented).
+    //
+    // The Sequence Info Suite is the authority when it answered.  When it did
+    // not - an older host, a hidden suite, a timeline id we could not resolve
+    // during a UI event - the frame the host handed us is the next best thing
+    // and is, in the ordinary case, exactly the same number.
+    if (sequenceSize.valid()) {
+        return sequenceSize;
+    }
+    if (frameSize.valid()) {
+        return frameSize;
+    }
+    // Neither is usable.  Return an invalid size rather than inventing one:
+    // buildParams() turns that into a clean rejection with a named reason,
+    // which is far easier to diagnose than a frame silently rendered at a
+    // resolution nobody asked for.
+    return SizePx{};
 }
 
-Viewport computeViewport(int frameW, int frameH, double aspectRatio) noexcept {
+Viewport computeViewport(int frameW, int frameH) noexcept {
     Viewport v;
     if (frameW <= 0 || frameH <= 0) {
         return v;  // zeroed: the caller treats w/h == 0 as invalid
     }
-    if (!std::isfinite(aspectRatio) || aspectRatio <= 0.0) {
-        // Unusable ratio: fill the frame instead of producing nothing.
-        v.x = 0;
-        v.y = 0;
-        v.w = frameW;
-        v.h = frameH;
-        return v;
-    }
-
-    // Largest rectangle of the requested shape that fits, centred.  Compare
-    // in doubles, then round to whole pixels and clamp: the rounding can
-    // otherwise produce w = frameW + 1 for a ratio that is a hair too wide.
-    const double frameRatio = static_cast<double>(frameW) / static_cast<double>(frameH);
-    int w = frameW;
-    int h = frameH;
-    if (aspectRatio > frameRatio) {
-        // Wider than the frame: full width, letterbox above and below.
-        h = static_cast<int>(std::lround(static_cast<double>(frameW) / aspectRatio));
-    } else if (aspectRatio < frameRatio) {
-        // Taller than the frame: full height, pillarbox left and right.
-        w = static_cast<int>(std::lround(static_cast<double>(frameH) * aspectRatio));
-    }
-    w = std::clamp(w, 1, frameW);
-    h = std::clamp(h, 1, frameH);
-
-    v.w = w;
-    v.h = h;
-    // Centre, biasing the odd pixel to the left / top so a 1-pixel remainder
-    // is deterministic rather than depending on rounding mode.
-    v.x = (frameW - w) / 2;
-    v.y = (frameH - h) / 2;
+    // The picture always covers the whole frame.  See the header for why the
+    // letterbox is gone; this function remains so that the one place that
+    // decides "which pixels get painted" is still named and testable, and so
+    // that confining the render to a sub-rectangle stays a one-line change
+    // here rather than a change to the shared kernel.
+    v.x = 0;
+    v.y = 0;
+    v.w = frameW;
+    v.h = frameH;
     return v;
+}
+
+// ---------------------------------------------------------------------------
+//  Automatic projection ramp (declared in ReframeParams.h)
+// ---------------------------------------------------------------------------
+double autoEyeOffsetForFov(double fovDeg) noexcept {
+    // Garbage in gives the feature's identity element, not a NaN that would
+    // propagate into the focal length and kill the frame.
+    if (!std::isfinite(fovDeg)) {
+        return 0.0;
+    }
+    constexpr double kStart = OSV_REFRAME_AUTO_EYE_FOV_START;
+    constexpr double kFull = OSV_REFRAME_AUTO_EYE_FOV_FULL;
+    // Defensive: if the two constants were ever edited into a degenerate or
+    // inverted pair, fall back to "no automatic distortion" instead of
+    // dividing by zero or ramping backwards.
+    if (!(kFull > kStart)) {
+        return 0.0;
+    }
+    if (fovDeg <= kStart) {
+        return 0.0;
+    }
+    if (fovDeg >= kFull) {
+        return 1.0;
+    }
+    const double t = (fovDeg - kStart) / (kFull - kStart);
+    // Smoothstep: zero derivative at both ends, so the curvature eases in at
+    // 120 deg and eases out at 240 deg with no perceptible kink at either
+    // join (see the header for the full reasoning).
+    return t * t * (3.0 - 2.0 * t);
+}
+
+double effectiveEyeOffset(double distortionPercent, double fovDeg) noexcept {
+    // The manual slider, sanitised exactly as buildParams() used to do it
+    // inline: a non-finite value becomes the documented default rather than
+    // poisoning the maximum below.
+    const double manual = std::isfinite(distortionPercent)
+                              ? std::clamp(distortionPercent, 0.0, 100.0) / 100.0
+                              : (OSV_REFRAME_DISTORTION_DEFAULT / 100.0);
+    const double automatic = autoEyeOffsetForFov(fovDeg);
+    // Maximum, so the ramp is a FLOOR the user can always exceed and never a
+    // ceiling that overrides them.
+    const double d = manual > automatic ? manual : automatic;
+    // The eye-offset model is only defined on [0, 1]; the clamp is redundant
+    // given the two inputs above but costs nothing and makes this function's
+    // postcondition true by construction rather than by argument.
+    return std::clamp(d, 0.0, 1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +545,7 @@ const char* setupRejectName(SetupReject reason) noexcept {
     case SetupReject::None:             return "none";
     case SetupReject::SourceInvalid:    return "source frame invalid";
     case SetupReject::OutputSize:       return "output size out of range";
-    case SetupReject::Viewport:         return "empty letterbox viewport";
+    case SetupReject::Viewport:         return "empty render viewport";
     case SetupReject::DegenerateCamera: return "degenerate virtual camera";
     case SetupReject::NeedsPromotion:   return "integer source was not promoted to float";
     case SetupReject::RowsBackwards:    return "source rows run backwards in memory";
@@ -529,7 +557,7 @@ const char* setupRejectName(SetupReject reason) noexcept {
 }
 
 KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int outW, int outH,
-                        double sequenceAspect) noexcept {
+                        SizePx sequenceSize) noexcept {
     KernelSetup setup;
 
     // ---- defensive checks on everything that came from the host ----------
@@ -542,12 +570,31 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
         return setup;
     }
 
-    // ---- the letterbox rectangle -----------------------------------------
-    const double frameAspect = static_cast<double>(outW) / static_cast<double>(outH);
-    const double ratio = resolveAspectRatio(settings.aspect, sequenceAspect, frameAspect);
-    const Viewport view = computeViewport(outW, outH, ratio);
+    // ---- the rectangle we paint ------------------------------------------
+    // Always the whole frame: a virtual camera fills its sensor.  The chosen
+    // resolution below decides the camera's pixel density, not its coverage,
+    // so there is no letterbox to compute and none to leave black.
+    const Viewport view = computeViewport(outW, outH);
     if (view.w <= 0 || view.h <= 0) {
         setup.reject = SetupReject::Viewport;
+        return setup;
+    }
+
+    // ---- what resolution did the user ask for? ---------------------------
+    // The size is what the control NAMES, which is not necessarily the size
+    // of the frame the host gave us: Premiere renders previews and scrubs at
+    // a fraction of full resolution, so `outW x outH` is routinely smaller.
+    //
+    // It is resolved here purely so a bad control value is caught with a
+    // named reason.  The geometry below deliberately does NOT scale anything
+    // by it - see the note on the camera - because the output frame is the
+    // output frame whatever the popup says.
+    const SizePx requested = resolveOutputSize(settings.resolution, sequenceSize, SizePx{outW, outH});
+    if (!requested.valid()) {
+        // Nothing could tell us a size: no sequence, and a frame that failed
+        // its own validity check above (which cannot happen here, but the
+        // branch costs nothing and makes the postcondition unconditional).
+        setup.reject = SetupReject::OutputSize;
         return setup;
     }
 
@@ -561,6 +608,17 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
     const double fov = std::isfinite(settings.fovDeg)
                            ? std::clamp(settings.fovDeg, OSV_REFRAME_FOV_VALID_MIN, OSV_REFRAME_FOV_VALID_MAX)
                            : OSV_REFRAME_FOV_DEFAULT;
+    // The eye offset the camera will actually use: the Distortion slider
+    // raised to the automatic ramp's floor for this field of view.  A user
+    // who only ever drags FOV therefore slides from rectilinear towards
+    // stereographic on the way out - the "Tiny Planet" behaviour - while a
+    // user who does touch Distortion is never overridden, because the two are
+    // combined with a maximum.  effectiveEyeOffset() documents the choice.
+    //
+    // Note it is computed from the CLAMPED fov, not the raw setting, so the
+    // ramp and the focal length below always agree about which field of view
+    // is being rendered.
+    const double eyeOffset = effectiveEyeOffset(distortion, fov);
     const double pan = std::isfinite(settings.panDeg) ? settings.panDeg : 0.0;
     // Tilt is clamped in code (the dial itself is unbounded so it can be
     // keyframed smoothly through a turn).
@@ -583,7 +641,7 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
     camera.w = view.w;
     camera.h = view.h;
     camera.hfovDeg = fov;
-    camera.eyeOffset = distortion / 100.0;
+    camera.eyeOffset = eyeOffset;
     camera.yawDeg = pan;
     camera.pitchDeg = tilt;
     camera.rollDeg = roll;
@@ -655,10 +713,12 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
     for (int i = 0; i < 9; ++i) {
         p.Rout[i] = static_cast<float>(rout.m[i]);
     }
-    // The letterbox must be transparent, but inside the picture the alpha of
-    // the panorama is what the user sees; the importer emits opaque frames
-    // so this is 1 there anyway.  Leaving it at 0 means "use the sampled
-    // alpha", which is the honest behaviour for an arbitrary input clip.
+    // The alpha of the panorama is what the user sees; the importer emits
+    // opaque frames so this is 1 in practice.  Leaving it at 0 means "use the
+    // sampled alpha", which is the honest behaviour for an arbitrary input
+    // clip.  (There is no letterbox to keep transparent any more - the
+    // picture covers the whole frame - but a ray that misses the sphere
+    // entirely still comes back transparent, which is correct.)
     p.fillAlphaOne = 0;
 
     // Integer-coded sources (8u, 16u) are not supported by the kernel's

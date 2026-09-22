@@ -133,7 +133,7 @@ enum class SetupReject {
     None = 0,          ///< The setup is valid.
     SourceInvalid,     ///< The input frame view itself was not usable.
     OutputSize,        ///< outW/outH non-positive or beyond kMaxEdge.
-    Viewport,          ///< The letterbox rectangle came out empty.
+    Viewport,          ///< The render rectangle came out empty (a degenerate frame).
     DegenerateCamera,  ///< No usable focal length, even at the default FOV.
     NeedsPromotion,    ///< An 8u/16u source reached us without being promoted.
     RowsBackwards,     ///< Image rows do not run forward in memory.
@@ -179,14 +179,19 @@ struct KernelSetup {
 /// `settings`      the resolved controls (already smoothed, if smoothing is on);
 /// `src`           the equirectangular input frame;
 /// `outW`, `outH`  the output frame size;
-/// `sequenceAspect` width/height of the sequence frame, <= 0 when unknown.
+/// `sequenceSize`  pixel size of the sequence frame, invalid when unknown.
+///
+/// The camera is always built to cover the WHOLE output frame - there is no
+/// letterbox any more - and the eye offset it uses is effectiveEyeOffset(),
+/// i.e. the Distortion control raised to the automatic ramp's floor for the
+/// chosen field of view.
 ///
 /// Returns an invalid setup (`valid == false`) for any input the kernel
 /// cannot be pointed at, including a source that fails
 /// sourceRowsRunForward().  On success `sourceRow0` is what must be passed
 /// to the kernel as `pixels` and `source.pitchBytes` is positive.
 [[nodiscard]] KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int outW, int outH,
-                                      double sequenceAspect) noexcept;
+                                      SizePx sequenceSize) noexcept;
 
 /// Render one frame on the CPU.
 ///

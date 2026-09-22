@@ -50,6 +50,36 @@ RenderParamsBuilder& RenderParamsBuilder::seam(const std::vector<float>& shiftDe
     return *this;
 }
 
+RenderParamsBuilder& RenderParamsBuilder::warp(const std::vector<float>& uv, std::uint32_t w, std::uint32_t h,
+                                               float latMinRad, float latMaxRad) {
+    // Defensive: a grid whose payload does not match its declared size would
+    // be read past its end by the kernel, so a mismatch disables the warp
+    // rather than configuring it half way.  The latitudes must also describe
+    // a real span - a degenerate one makes the kernel's row mapping divide by
+    // approximately zero.
+    const std::size_t need = static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 2u;
+    const bool sane = w > 0 && h > 1 && uv.size() == need && std::isfinite(latMinRad) && std::isfinite(latMaxRad) &&
+                      std::fabs(latMaxRad - latMinRad) > 1e-6f;
+    if (!sane) {
+        return clearWarp();
+    }
+    m_warp = uv;
+    m_warpW = w;
+    m_warpH = h;
+    m_warpLatMin = latMinRad;
+    m_warpLatMax = latMaxRad;
+    return *this;
+}
+
+RenderParamsBuilder& RenderParamsBuilder::clearWarp() {
+    m_warp.clear();
+    m_warpW = 0;
+    m_warpH = 0;
+    m_warpLatMin = 0.0f;
+    m_warpLatMax = 0.0f;
+    return *this;
+}
+
 RenderParamsBuilder& RenderParamsBuilder::color(const OsvColorParams& params) {
     m_color = params;
     return *this;
@@ -194,6 +224,11 @@ Result<OsvRenderParams> RenderParamsBuilder::buildParams() const {
     p.blendEnabled = m_blendEnabled ? 1 : 0;
     p.seamShiftEnabled = m_seam.empty() ? 0 : 1;
     p.seamColumns = static_cast<int>(m_seam.size());
+    p.warpEnabled = m_warp.empty() ? 0 : 1;
+    p.warpW = static_cast<int>(m_warpW);
+    p.warpH = static_cast<int>(m_warpH);
+    p.warpLatMinRad = m_warpLatMin;
+    p.warpLatMaxRad = m_warpLatMax;
     p.outputAlphaCoverage = m_alphaCoverage ? 1 : 0;
     p.color = *m_color;
     return p;
@@ -221,6 +256,7 @@ Result<RenderJob> RenderParamsBuilder::build(const video::FramePair& frames) con
         job.deviceFrames[i] = frames.device[i];
     }
     job.seamShiftDeg = m_seam;
+    job.warpGrid = m_warp;
     return job;
 }
 

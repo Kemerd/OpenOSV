@@ -19,6 +19,10 @@ Result<ImageRGBAf> CpuRenderer::render(const RenderJob& job) {
     const OsvRenderParams params = job.params;
     const OsvPlane planes[2] = {job.planes[0], job.planes[1]};
     const float* seam = (params.seamShiftEnabled && !job.seamShiftDeg.empty()) ? job.seamShiftDeg.data() : nullptr;
+    // The 2-D parallax grid, when one was built.  job.valid() has already
+    // checked that its size matches warpW * warpH, so the kernel's indexing
+    // is bounded by construction rather than by trust.
+    const float* warp = (params.warpEnabled && !job.warpGrid.empty()) ? job.warpGrid.data() : nullptr;
     const int width = params.outW;
     float* pixels = image.data.data();
 
@@ -28,7 +32,7 @@ Result<ImageRGBAf> CpuRenderer::render(const RenderJob& job) {
                                        for (std::size_t y = rowBegin; y < rowEnd; ++y) {
                                            float* row = pixels + y * static_cast<std::size_t>(width) * 4u;
                                            for (int x = 0; x < width; ++x) {
-                                               osvShadePixel(&params, planes, seam, x, static_cast<int>(y), row + x * 4);
+                                               osvShadePixelW(&params, planes, seam, warp, x, static_cast<int>(y), row + x * 4);
                                            }
                                        }
                                    });

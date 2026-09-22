@@ -147,7 +147,26 @@
  *  static_asserts in EffectMain.cpp and by a test that walks the real
  *  parameter list the module produced.
  * ========================================================================== */
-#define OSV_REFRAME_ID_OUTPUT_ASPECT 1
+/* Id 1 was "Output Aspect", a popup of aspect RATIOS that letterboxed the
+ * picture inside the frame.  It is now "Output Resolution", a popup of pixel
+ * SIZES that always fills the frame.
+ *
+ * The id is REUSED deliberately, which is the one place this header bends its
+ * own rule, so the reasoning is worth stating.  Reuse is safe here because
+ * both incarnations are a 1-based popup read through `u.pd.value`, so a saved
+ * project can only ever yield a small integer - never a type confusion - and
+ * sanitiseResolution() maps every value, in range or not, onto a valid entry.
+ * The worst case for a project saved against the old table is that a clip
+ * comes back on a different entry of the new one; it cannot crash, cannot
+ * read a neighbouring control, and the user fixes it with one click.
+ *
+ * Appending a NEW id and retiring this one was the alternative, and it is
+ * worse: the retired popup would still occupy a parameter slot and still be
+ * drawn in the Effect Controls panel (AE has no way to remove a parameter
+ * from an existing effect), so every user would see two output controls, one
+ * of which does nothing.  A dead control that looks live is a worse bug than
+ * a popup that needs re-picking once. */
+#define OSV_REFRAME_ID_OUTPUT_RESOLUTION 1
 #define OSV_REFRAME_ID_CAMERA_TOPIC 2
 #define OSV_REFRAME_ID_PRESET 3
 #define OSV_REFRAME_ID_PAN 4
@@ -176,8 +195,8 @@
  *  also mirrored as C++ arrays below so the tests can compare them item by
  *  item without re-parsing the separator.
  * ========================================================================== */
-#define OSV_REFRAME_ASPECT_ITEMS "Match Sequence|16:9|9:16|1:1|4:3|3:4|2.35:1|Full Frame"
-#define OSV_REFRAME_ASPECT_COUNT 8
+#define OSV_REFRAME_RESOLUTION_ITEMS "Match Sequence|3840 x 2160|2560 x 1440|1920 x 1080|1280 x 720"
+#define OSV_REFRAME_RESOLUTION_COUNT 5
 
 #define OSV_REFRAME_PRESET_ITEMS "Custom|Crystal Ball|Asteroid|Wide|Ultra Wide|Dewarping"
 #define OSV_REFRAME_PRESET_COUNT 6
@@ -185,8 +204,8 @@
 /* ==========================================================================
  *  Ranges and defaults (the numbers PF_ADD_* is called with)
  * ========================================================================== */
-/* Output Aspect: 1-based popup value; 1 = "Match Sequence". */
-#define OSV_REFRAME_ASPECT_DEFAULT 1
+/* Output Resolution: 1-based popup value; 1 = "Match Sequence". */
+#define OSV_REFRAME_RESOLUTION_DEFAULT 1
 
 /* Preset: 1-based popup value; 4 = "Wide" (Custom is 1). */
 #define OSV_REFRAME_PRESET_DEFAULT 4
@@ -239,7 +258,7 @@ namespace osv::reframe {
 /// out literally is deliberate - deriving them from the ids is exactly the
 /// mistake that made the groups unbalanced in the first place.
 ///
-///   1  Output Aspect
+///   1  Output Resolution
 ///   2  Camera            (GROUP_START)
 ///   3    Preset
 ///   4    Pan
@@ -255,7 +274,7 @@ namespace osv::reframe {
 ///  14  (GROUP_END, Source)
 ///  15  Smooth Keyframes
 enum ParamIndex : int {
-    kIndexOutputAspect = 1,
+    kIndexOutputResolution = 1,
     kIndexCameraTopic = 2,
     kIndexPreset = 3,
     kIndexPan = 4,
@@ -277,7 +296,7 @@ enum ParamIndex : int {
 /// against the list the built module actually produced, so the two can never
 /// drift apart silently.
 inline constexpr int kParamIdByIndex[OSV_REFRAME_PARAM_COUNT] = {
-    OSV_REFRAME_ID_OUTPUT_ASPECT, OSV_REFRAME_ID_CAMERA_TOPIC,     OSV_REFRAME_ID_PRESET,
+    OSV_REFRAME_ID_OUTPUT_RESOLUTION, OSV_REFRAME_ID_CAMERA_TOPIC,   OSV_REFRAME_ID_PRESET,
     OSV_REFRAME_ID_PAN,           OSV_REFRAME_ID_TILT,             OSV_REFRAME_ID_ROLL,
     OSV_REFRAME_ID_FOV,           OSV_REFRAME_ID_DISTORTION,       OSV_REFRAME_ID_CAMERA_TOPIC_END,
     OSV_REFRAME_ID_SOURCE_TOPIC,  OSV_REFRAME_ID_SOURCE_PAN,       OSV_REFRAME_ID_SOURCE_TILT,
@@ -307,7 +326,7 @@ inline constexpr int kParamCount = OSV_REFRAME_PARAM_COUNT;
 /// spelled independently so this header still needs no Adobe include.
 enum class HostParamKind : int {
     Unknown = 0,
-    Int32,    ///< A popup (Output Aspect, Preset): a small 1-based integer.
+    Int32,    ///< A popup (Output Resolution, Preset): a small 1-based integer.
     Float32,  ///< An AE angle dial (the six Pan / Tilt / Roll controls), in degrees.
     Float64,  ///< An AE float slider (FOV, Distortion).
     Bool,     ///< A checkbox (Smooth Keyframes).
@@ -322,7 +341,7 @@ inline constexpr int kValueParamCount = 11;
 /// The group markers are absent by construction: they hold no value, so no
 /// host can report one for them and nothing ever reads them.
 inline constexpr int kValueParamAeIndex[kValueParamCount] = {
-    kIndexOutputAspect, kIndexPreset,     kIndexPan,        kIndexTilt,
+    kIndexOutputResolution, kIndexPreset, kIndexPan,        kIndexTilt,
     kIndexRoll,         kIndexFov,        kIndexDistortion, kIndexSourcePan,
     kIndexSourceTilt,   kIndexSourceRoll, kIndexSmooth,
 };
@@ -443,49 +462,78 @@ struct HostParamMap {
 [[nodiscard]] bool matchHostParams(const HostParamKind* kinds, int count, HostParamMap* outMap) noexcept;
 
 // ---------------------------------------------------------------------------
-//  Output aspect
+//  Output resolution
+//
+//  WHY A RESOLUTION AND NOT AN ASPECT
+//  ----------------------------------
+//  This control used to pick an aspect RATIO, and buildParams() letterboxed a
+//  box of that shape inside the output frame.  That was wrong twice over.
+//
+//  Visibly wrong: a reframe is a virtual camera pointed into a sphere, and a
+//  virtual camera has no reason to leave black bars.  Whatever shape the
+//  sequence is, the camera should simply be built with THAT shape's field of
+//  view and fill it.  Letterboxing threw away real output pixels and gave the
+//  user bars they then had to crop.
+//
+//  Structurally wrong: a ratio cannot answer the question the renderer
+//  actually has to ask, which is "how many pixels do I produce?".  The render
+//  cost of this effect is linear in output pixel count and nothing else - it
+//  is one kernel evaluation per output pixel - so the size is the ONLY knob
+//  that changes the time a frame takes.  Measured on the library renderer at
+//  the same decode cost, the render-only time runs from about 0 ms at
+//  640 x 320 to 413 ms at 6000 x 3000, tracking area almost exactly.  A
+//  control that names the size therefore controls the speed; a control that
+//  names a shape controls nothing.
 // ---------------------------------------------------------------------------
 
-/// Popup values of "Output Aspect" (1-based, matching AE popup semantics).
-enum class Aspect : int {
-    MatchSequence = 1,  ///< Ask the Sequence Info Suite; 16:9 when it cannot answer.
-    Ratio16x9 = 2,
-    Ratio9x16 = 3,
-    Ratio1x1 = 4,
-    Ratio4x3 = 5,
-    Ratio3x4 = 6,
-    Ratio235x1 = 7,
-    FullFrame = 8,  ///< The whole input frame, whatever shape it is.
+/// Popup values of "Output Resolution" (1-based, matching AE popup semantics).
+enum class Resolution : int {
+    MatchSequence = 1,  ///< Ask the Sequence Info Suite; the frame itself when it cannot answer.
+    Uhd3840x2160 = 2,
+    Qhd2560x1440 = 3,
+    Fhd1920x1080 = 4,
+    Hd1280x720 = 5,
 };
 
-/// One entry of the aspect table.
-struct AspectEntry {
-    Aspect value;        ///< Popup value.
-    const char* label;   ///< Exactly the text in OSV_REFRAME_ASPECT_ITEMS.
-    double widthUnits;   ///< 0 for the two dynamic entries.
-    double heightUnits;  ///< 0 for the two dynamic entries.
+/// One entry of the resolution table.
+struct ResolutionEntry {
+    Resolution value;   ///< Popup value.
+    const char* label;  ///< Exactly the text in OSV_REFRAME_RESOLUTION_ITEMS.
+    int width;          ///< 0 for "Match Sequence", which is resolved at render time.
+    int height;         ///< 0 for "Match Sequence".
 };
 
-/// The aspect table.  Order and labels must match OSV_REFRAME_ASPECT_ITEMS.
-inline constexpr AspectEntry kAspects[OSV_REFRAME_ASPECT_COUNT] = {
-    {Aspect::MatchSequence, "Match Sequence", 0.0, 0.0},
-    {Aspect::Ratio16x9, "16:9", 16.0, 9.0},
-    {Aspect::Ratio9x16, "9:16", 9.0, 16.0},
-    {Aspect::Ratio1x1, "1:1", 1.0, 1.0},
-    {Aspect::Ratio4x3, "4:3", 4.0, 3.0},
-    {Aspect::Ratio3x4, "3:4", 3.0, 4.0},
-    {Aspect::Ratio235x1, "2.35:1", 2.35, 1.0},
-    {Aspect::FullFrame, "Full Frame", 0.0, 0.0},
+/// The resolution table.  Order and labels must match
+/// OSV_REFRAME_RESOLUTION_ITEMS.
+inline constexpr ResolutionEntry kResolutions[OSV_REFRAME_RESOLUTION_COUNT] = {
+    {Resolution::MatchSequence, "Match Sequence", 0, 0},
+    {Resolution::Uhd3840x2160, "3840 x 2160", 3840, 2160},
+    {Resolution::Qhd2560x1440, "2560 x 1440", 2560, 1440},
+    {Resolution::Fhd1920x1080, "1920 x 1080", 1920, 1080},
+    {Resolution::Hd1280x720, "1280 x 720", 1280, 720},
 };
 
-/// Clamp an arbitrary popup value (a corrupt project can hold anything) into
-/// the valid range.
-[[nodiscard]] inline constexpr Aspect sanitiseAspect(int popupValue) noexcept {
-    if (popupValue < 1 || popupValue > OSV_REFRAME_ASPECT_COUNT) {
-        return Aspect::MatchSequence;
+/// Clamp an arbitrary popup value (a corrupt project, or a project saved
+/// against the old "Output Aspect" table, can hold anything) into the valid
+/// range.  Out of range means "Match Sequence", which is both the default and
+/// the entry that cannot be wrong for any sequence.
+[[nodiscard]] inline constexpr Resolution sanitiseResolution(int popupValue) noexcept {
+    if (popupValue < 1 || popupValue > OSV_REFRAME_RESOLUTION_COUNT) {
+        return Resolution::MatchSequence;
     }
-    return static_cast<Aspect>(popupValue);
+    return static_cast<Resolution>(popupValue);
 }
+
+/// A pixel size.  Used both for what the sequence reported and for what the
+/// control resolved to.
+struct SizePx {
+    int w = 0;
+    int h = 0;
+
+    /// A size is usable only when BOTH edges are positive.  A half-filled
+    /// rect from a host that answered partially is not a size.
+    [[nodiscard]] constexpr bool valid() const noexcept { return w > 0 && h > 0; }
+};
 
 // ---------------------------------------------------------------------------
 //  Presets
@@ -551,7 +599,7 @@ inline constexpr PresetEntry kPresetTable[OSV_REFRAME_PRESET_COUNT] = {
 /// sanitised.  Both the CPU and the GPU path build one of these and nothing
 /// downstream ever touches a PF_ParamDef or a PrParam again.
 struct Settings {
-    Aspect aspect = Aspect::MatchSequence;
+    Resolution resolution = Resolution::MatchSequence;
     Preset preset = Preset::Wide;
     double panDeg = OSV_REFRAME_PAN_DEFAULT;
     double tiltDeg = OSV_REFRAME_TILT_DEFAULT;
@@ -564,24 +612,145 @@ struct Settings {
     bool smoothKeyframes = false;
 };
 
-/// The aspect the picture is drawn at, as a width/height ratio.
+/// The pixel size the user asked for.
 ///
-/// `sequenceAspect` is what the Sequence Info Suite reported (<= 0 when it
-/// could not be asked) and `frameAspect` the shape of the frame we are
-/// rendering into.  "Match Sequence" falls back to 16:9 exactly as
-/// docs/PREMIERE.md specifies, and "Full Frame" is the frame itself.
-[[nodiscard]] double resolveAspectRatio(Aspect aspect, double sequenceAspect, double frameAspect) noexcept;
+/// `sequenceSize` is what the Sequence Info Suite reported (invalid when it
+/// could not be asked) and `frameSize` the frame we have actually been given
+/// to render into.
+///
+/// "Match Sequence" prefers the sequence and falls back to the FRAME, not to
+/// a fixed 16:9 guess as the old aspect control did.  That fallback is the
+/// honest one: when nobody can tell us how big the sequence is, the frame the
+/// host allocated for this render IS the sequence frame in every case that
+/// matters, so using it is exact rather than approximate.  The old 16:9
+/// constant was only ever a shape, and a shape was all the old control could
+/// use; now that we need pixels there is a strictly better answer available.
+///
+/// The returned size is always valid() as long as `frameSize` is, so callers
+/// never have to handle a zero.
+[[nodiscard]] SizePx resolveOutputSize(Resolution resolution, SizePx sequenceSize, SizePx frameSize) noexcept;
 
-/// The centred rectangle of the given aspect ratio that fits inside a
-/// `frameW` x `frameH` frame.  Always at least 1x1 and never larger than the
-/// frame; a non-finite or non-positive ratio yields the whole frame.
+/// The rectangle of the output frame that receives the picture.
+///
+/// This ALWAYS covers the whole frame - `x` and `y` are zero and `w` / `h`
+/// are the frame's own size.  It stays a struct, and buildParams() still
+/// fills OsvReframeParams::viewX..viewH from it, because the kernel's
+/// viewport fields are the mechanism by which a render can be confined to a
+/// sub-rectangle and removing them would be a gratuitous change to shared
+/// kernel source that the CLI renderer also compiles.
+///
+/// WHY THERE IS NO LETTERBOX ANY MORE
+/// ----------------------------------
+/// The picture used to be drawn into a centred box of the chosen aspect,
+/// leaving transparent bars.  A virtual camera has no reason to do that: if
+/// the frame is a different shape than the user's chosen resolution, the
+/// right answer is to build the camera for the FRAME's shape and fill it,
+/// which is what buildParams() now does.  The chosen resolution influences
+/// the camera's pixel density (and therefore the cost), never the coverage.
+///
+/// A degenerate frame still yields a zero rectangle, which buildParams()
+/// rejects rather than dividing by.
 struct Viewport {
     int x = 0;
     int y = 0;
     int w = 0;
     int h = 0;
 };
-[[nodiscard]] Viewport computeViewport(int frameW, int frameH, double aspectRatio) noexcept;
+[[nodiscard]] Viewport computeViewport(int frameW, int frameH) noexcept;
+
+// ---------------------------------------------------------------------------
+//  Automatic projection ramp
+// ---------------------------------------------------------------------------
+
+/// Field of view (deg) at or below which the automatic ramp contributes
+/// nothing, so a normal shot is exactly as rectilinear as the user asked for.
+///
+/// 120 is the default FOV and the "Wide" preset, i.e. the widest view most
+/// users ever reach deliberately.  Below it, straight lines staying straight
+/// is the whole point and any curvature would read as a defect.
+#define OSV_REFRAME_AUTO_EYE_FOV_START 120.0
+
+/// Field of view (deg) at which the ramp has reached full stereographic.
+///
+/// A rectilinear projection has a hard mathematical wall at 180 deg (the
+/// tangent goes to infinity), and it becomes unusable well before it - at
+/// 170 deg a rectilinear frame has already stretched the corners past any
+/// tolerable amount.  The ramp therefore has to be FINISHED before the wall,
+/// not at it.  240 is where the stereographic look is fully established; it
+/// is also exactly the "Crystal Ball" preset's field of view, so the ramp
+/// reproduces that preset's d = 1 at that preset's FOV, which is a useful
+/// consistency: zooming out to 240 deg by hand lands on the same look the
+/// preset gives.
+#define OSV_REFRAME_AUTO_EYE_FOV_FULL 240.0
+
+/// The eye offset `d` the automatic ramp asks for at a given field of view.
+///
+/// WHY THIS EXISTS
+/// ---------------
+/// Zooming out is the one gesture every user tries first, and past about
+/// 170 deg a rectilinear camera simply cannot answer it - r = f tan(theta)
+/// diverges at 180 and the corners tear long before that.  DJI Studio solves
+/// this by sliding towards a stereographic projection as the view widens,
+/// which is what produces the familiar "Tiny Planet" look; the user never
+/// picks a projection, they just zoom out and the picture stays sane.
+///
+/// We already had the machinery - Projection::EyeOffset interpolates
+/// continuously from rectilinear (d = 0) to stereographic (d = 1) - but it
+/// was only reachable through the Distortion slider, which a user who is
+/// simply dragging the FOV has no reason to have found.  This function is
+/// what connects the two, so the default behaviour matches the expectation.
+///
+/// THE CURVE
+/// ---------
+/// A smoothstep in FOV between the two constants above:
+///
+///     t = (fov - START) / (FULL - START)   clamped to [0, 1]
+///     d = t * t * (3 - 2t)
+///
+/// Smoothstep rather than a straight line for one concrete reason: its
+/// DERIVATIVE is zero at both ends.  The ramp has to join the
+/// no-auto-distortion region at 120 deg and the fully-stereographic region at
+/// 240 deg, and if d changed at a non-zero rate across either join, a user
+/// slowly dragging the FOV through it would see the curvature start or stop
+/// abruptly - a visible kink, exactly the "pop" that has to be avoided.  With
+/// smoothstep the value AND its first derivative are continuous everywhere,
+/// so the distortion eases in and eases out and the drag feels like one
+/// continuous motion.  (A cubic is enough here; smootherstep's additional
+/// second-derivative continuity buys nothing a viewer can perceive in a
+/// quantity that is itself a gentle geometric warp.)
+///
+/// Below START this returns exactly 0, so ordinary shots are untouched.
+/// A non-finite field of view returns 0 as well: the safe answer for garbage
+/// is the projection the user would have had without this feature at all.
+[[nodiscard]] double autoEyeOffsetForFov(double fovDeg) noexcept;
+
+/// The eye offset actually used, combining the manual Distortion control with
+/// the automatic ramp.
+///
+/// `distortionPercent` is the slider, 0..100, and `fovDeg` the field of view.
+///
+/// The two are combined with a MAXIMUM, not a sum or a replacement, and that
+/// choice is the whole design of this feature:
+///
+///   * it cannot fight the user.  Asking for more distortion than the ramp
+///     wants always wins, so the slider never feels ignored or clamped - at
+///     any FOV, dragging Distortion to 100 gives exactly stereographic, and
+///     the presets (Crystal Ball and Asteroid both ask for 100) still land on
+///     precisely the look they always did.
+///   * it cannot produce an unusable frame.  Leaving the slider at 0 and
+///     zooming out to 300 deg still ramps up to stereographic, because the
+///     ramp's floor applies regardless, which is the entire point: a user who
+///     has never found the Distortion control gets the right projection.
+///   * it stays continuous.  A maximum of two continuous functions is
+///     continuous, so there is still no value of FOV or Distortion at which
+///     the picture jumps.
+///
+/// A sum would have broken the first property (the slider would over-drive
+/// past stereographic and need clamping, which WOULD feel ignored) and a
+/// replacement would have broken it outright.
+///
+/// Returns a value in [0, 1] for every input, including non-finite ones.
+[[nodiscard]] double effectiveEyeOffset(double distortionPercent, double fovDeg) noexcept;
 
 }  // namespace osv::reframe
 

@@ -18,7 +18,7 @@ struct OsvPlanePair {
 
 /// Launch the reframe kernel asynchronously on `stream`.
 cudaError_t osvCudaLaunchReframe(const OsvRenderParams& params, const OsvPlanePair& planes, const float* seam,
-                                 float* out, int outPitchFloats, cudaStream_t stream);
+                                 const float* warp, float* out, int outPitchFloats, cudaStream_t stream);
 
 /// Launch the equirect reframe kernel (osvReframeEquirectPixel) asynchronously
 /// on `stream`.  `pixels` is the device copy of the source equirect described

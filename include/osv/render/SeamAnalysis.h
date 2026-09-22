@@ -40,16 +40,39 @@ struct LensBands {
     std::vector<float> alpha[2]; ///< Coverage per lens.
 };
 
+/// A 2-D parallax warp grid as the band renderer needs to see it.
+///
+/// Deliberately a plain view rather than a ParallaxWarpGrid: SeamAnalysis is
+/// the LOWER layer (ParallaxWarp.h includes it, not the other way round), so
+/// taking the full type here would be a circular dependency.  Pointing at the
+/// caller's data also keeps the measurement path free of a copy of a grid it
+/// only reads.
+struct WarpGridView {
+    const float* uv = nullptr;  ///< Interleaved (u, v) radians, w * h pairs.
+    std::uint32_t w = 0;
+    std::uint32_t h = 0;
+    float latMinRad = 0.0f;     ///< Latitude of row 0.
+    float latMaxRad = 0.0f;     ///< Latitude of row h - 1.
+
+    [[nodiscard]] bool valid() const noexcept { return uv != nullptr && w > 0 && h > 1; }
+};
+
 /// Render the two per-lens luma bands.  `linear` selects scene-linear values
 /// (gain estimation) instead of D-Log M codes (matching).
+///
+/// `warp` (optional) applies a 2-D parallax grid while rendering, which is
+/// what makes an after-correction NCC measure the same geometry the real
+/// render path produces rather than an approximation of it.
 Result<LensBands> renderLensBands(const geom::LensRig& rig, const video::FramePair& frames,
                                   const geom::BlendParams& blend, const BandParams& band, bool linear,
-                                  const std::vector<float>* seamTable, ThreadPool& pool);
+                                  const std::vector<float>* seamTable, ThreadPool& pool,
+                                  const WarpGridView* warp = nullptr);
 
 /// Normalised cross-correlation of the two lenses over the co-visible band.
 /// Returns a value in [-1, 1]; 0 when nothing is co-visible.
 Result<double> overlapNcc(const geom::LensRig& rig, const video::FramePair& frames, const geom::BlendParams& blend,
-                          const BandParams& band, ThreadPool& pool, const std::vector<float>* seamTable = nullptr);
+                          const BandParams& band, ThreadPool& pool, const std::vector<float>* seamTable = nullptr,
+                          const WarpGridView* warp = nullptr);
 
 struct SeamSearchParams {
     BandParams band;

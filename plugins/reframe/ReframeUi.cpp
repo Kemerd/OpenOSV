@@ -118,6 +118,27 @@ Layout computeLayout(const RectF& viewport) noexcept {
     return layout;
 }
 
+PointF windowToFrame(const FrameGeometry& geometry, const PointF& windowPoint) noexcept {
+    // A geometry that no draw event has filled in yet, or one holding a
+    // nonsense origin, degrades to the identity.  That is deliberately the
+    // same answer the overlay gave before the origin was tracked at all, so
+    // a host that reports a zero-origin update rect is unaffected by this
+    // function existing.
+    if (!geometry.valid || !std::isfinite(geometry.originX) || !std::isfinite(geometry.originY)) {
+        return windowPoint;
+    }
+
+    // Non-finite input is passed through UNCHANGED rather than zeroed: the
+    // callers all test finiteness themselves, and a NaN that arrived here
+    // must stay a NaN so it is rejected instead of being mistaken for a
+    // legitimate click at the origin.
+    if (!isFinitePoint(windowPoint)) {
+        return windowPoint;
+    }
+
+    return PointF{windowPoint.x - geometry.originX, windowPoint.y - geometry.originY};
+}
+
 int fovGripRects(const Layout& layout, RectF out[4]) noexcept {
     if (!out || !layout.valid) {
         return 0;

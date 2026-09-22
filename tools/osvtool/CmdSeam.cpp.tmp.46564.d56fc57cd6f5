@@ -118,6 +118,55 @@ int runSeam(const SeamOptions& o) {
         }
     }
 
+    // ---- 2-D parallax correction ------------------------------------------
+    // Measured on the residual the seam table leaves behind when --search was
+    // also asked for, so the reported "after" number describes the two
+    // corrections composed, which is how they are actually rendered.
+    if (o.parallax) {
+        render::ParallaxWarpParams pw;
+        if (o.flowBackend == "classical") {
+            pw.backend = render::FlowBackendKind::Classical;
+        } else if (o.flowBackend == "neural") {
+            pw.backend = render::FlowBackendKind::Neural;
+        }
+        const std::vector<float>* seamIn = nullptr;
+        std::vector<float> seamHold;
+        if (o.search && out.contains("search")) {
+            seamHold = out["search"]["shiftDeg"].get<std::vector<float>>();
+            if (!seamHold.empty()) {
+                seamIn = &seamHold;
+            }
+        }
+        const auto tp0 = std::chrono::steady_clock::now();
+        auto grid = render::buildParallaxWarp(P.rig, pair.value(), P.blendParams, pw, seamIn, *P.pool);
+        const double buildMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
+        if (grid.ok()) {
+            const render::ParallaxWarpGrid& g = grid.value();
+            render::WarpGridView view;
+            view.uv = g.uv.data();
+            view.w = g.w;
+            view.h = g.h;
+            view.latMinRad = g.latMinRad;
+            view.latMaxRad = g.latMaxRad;
+            nlohmann::json pj;
+            pj["backend"] = render::flowBackendName(g.usedBackend);
+            pj["gridW"] = g.w;
+            pj["gridH"] = g.h;
+            pj["consistentFraction"] = g.consistentFraction();
+            pj["meanAbsCorrectionDeg"] = g.meanAbsCorrectionDeg;
+            pj["maxAbsCorrectionDeg"] = g.maxAbsCorrectionDeg;
+            pj["buildMs"] = buildMs;
+            auto after = render::overlapNcc(P.rig, pair.value(), P.blendParams, band, *P.pool, seamIn, &view);
+            if (after.ok()) {
+                pj["nccAfter"] = after.value();
+            }
+            out["parallax"] = pj;
+        } else {
+            out["parallax"] = {{"error", grid.error().message}};
+        }
+    }
+
     if (o.json) {
         std::printf("%s\n", out.dump(2).c_str());
     } else {

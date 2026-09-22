@@ -23,6 +23,10 @@ struct RenderJob {
     std::array<video::DeviceFrameRef, 2> deviceFrames{}; ///< Optional GPU-resident inputs (CUDA zero-copy).
     std::vector<float> seamShiftDeg;             ///< Per-column seam table (empty when disabled).
 
+    /// 2-D parallax warp grid, interleaved (u, v) radians, warpW * warpH
+    /// pairs (empty when disabled).  See osv_kernel.h and ParallaxWarp.h.
+    std::vector<float> warpGrid;
+
     /// True when both planes describe usable memory and the output size is sane.
     [[nodiscard]] bool valid() const noexcept {
         if (params.outW <= 0 || params.outH <= 0 || params.outW > 32768 || params.outH > 32768) {
@@ -35,6 +39,18 @@ struct RenderJob {
         }
         if (params.seamShiftEnabled && seamShiftDeg.size() != static_cast<std::size_t>(params.seamColumns)) {
             return false;
+        }
+        // The kernel indexes the grid as warpW * warpH interleaved pairs; a
+        // table that does not match those dimensions would read past its end.
+        if (params.warpEnabled) {
+            if (params.warpW <= 0 || params.warpH <= 0) {
+                return false;
+            }
+            const std::size_t need = static_cast<std::size_t>(params.warpW) *
+                                     static_cast<std::size_t>(params.warpH) * 2u;
+            if (warpGrid.size() != need) {
+                return false;
+            }
         }
         return true;
     }

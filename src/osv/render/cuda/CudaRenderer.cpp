@@ -107,6 +107,7 @@ struct CudaRenderer::Impl {
     DeviceBuffer u[2];
     DeviceBuffer v[2];
     DeviceBuffer seam;
+    DeviceBuffer warp;
     DeviceBuffer out;
     PinnedBuffer staging;
     std::mutex mutex;  // one render at a time per renderer
@@ -122,6 +123,7 @@ struct CudaRenderer::Impl {
             v[i].release();
         }
         seam.release();
+        warp.release();
         out.release();
         staging.release();
     }
@@ -236,6 +238,20 @@ struct CudaRenderer::Impl {
             seamPtr = static_cast<const float*>(seam.ptr);
         }
 
+        // 2-D parallax warp grid (optional).  Small - a few hundred KB at
+        // most - so a plain linear upload per frame is cheaper than any
+        // scheme for tracking whether it changed.
+        const float* warpPtr = nullptr;
+        if (job.params.warpEnabled && !job.warpGrid.empty()) {
+            const std::size_t bytes = job.warpGrid.size() * sizeof(float);
+            OSV_TRY(warp.ensure(bytes, 1));
+            err = cudaMemcpyAsync(warp.ptr, job.warpGrid.data(), bytes, cudaMemcpyHostToDevice, stream);
+            if (err != cudaSuccess) {
+                return failStatus(ErrorCode::Gpu, cudaMessage("upload warp grid", err));
+            }
+            warpPtr = static_cast<const float*>(warp.ptr);
+        }
+
         // Output buffer.
         const std::size_t outWidthBytes = static_cast<std::size_t>(job.params.outW) * 4 * sizeof(float);
         OSV_TRY(out.ensure(outWidthBytes, static_cast<std::size_t>(job.params.outH)));
@@ -245,7 +261,7 @@ struct CudaRenderer::Impl {
         OsvPlanePair pair;
         pair.p[0] = devPlanes[0];
         pair.p[1] = devPlanes[1];
-        err = osvCudaLaunchReframe(job.params, pair, seamPtr, static_cast<float*>(out.ptr), outPitchFloats, stream);
+        err = osvCudaLaunchReframe(job.params, pair, seamPtr, warpPtr, static_cast<float*>(out.ptr), outPitchFloats, stream);
         if (err != cudaSuccess) {
             return failStatus(ErrorCode::Gpu, cudaMessage("kernel launch", err));
         }

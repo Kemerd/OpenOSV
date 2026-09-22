@@ -52,6 +52,18 @@ public:
     /// Per-column seam shift table in degrees (polar-axis longitude columns).
     RenderParamsBuilder& seam(const std::vector<float>& shiftDeg);
 
+    /// 2-D parallax warp grid over the overlap band (see ParallaxWarp.h).
+    ///
+    /// `uv` is interleaved (u, v) half-corrections in radians, w * h pairs;
+    /// `latMinRad` and `latMaxRad` are the latitudes of grid rows 0 and
+    /// h - 1.  An empty grid, or one whose size does not match w * h, leaves
+    /// the warp disabled rather than half-configured.
+    RenderParamsBuilder& warp(const std::vector<float>& uv, std::uint32_t w, std::uint32_t h, float latMinRad,
+                              float latMaxRad);
+
+    /// Remove any previously set warp grid (A/B comparison).
+    RenderParamsBuilder& clearWarp();
+
     /// Colour pipeline block from osv::color::makeColorParams (required).
     RenderParamsBuilder& color(const OsvColorParams& params);
 
@@ -78,6 +90,11 @@ private:
     bool m_blendEnabled = true;
     std::array<Vec3d, 2> m_gain{Vec3d{1, 1, 1}, Vec3d{1, 1, 1}};
     std::vector<float> m_seam;
+    std::vector<float> m_warp;
+    std::uint32_t m_warpW = 0;
+    std::uint32_t m_warpH = 0;
+    float m_warpLatMin = 0.0f;
+    float m_warpLatMax = 0.0f;
     std::optional<OsvColorParams> m_color;
     bool m_alphaCoverage = true;
     std::array<bool, 2> m_lensEnabled{true, true};

@@ -2,7 +2,7 @@
  * Copyright 2026 The OpenOSV Contributors
  *
  * kernel.cl - last source string of the OpenCL program: the __kernel wrapper
- * around osvShadePixel.  OpenCL cannot pass structs containing pointers as
+ * around osvShadePixelW.  OpenCL cannot pass structs containing pointers as
  * kernel arguments, so the two planes arrive as separate buffers plus their
  * integer descriptors and are re-assembled into OsvPlane here.
  */
@@ -12,6 +12,7 @@ __kernel void osvReframe(const OsvRenderParams params,
                          __global const ushort* y1, __global const ushort* u1, __global const ushort* v1,
                          int w1, int h1, int cw1, int ch1, int sy1, int sc1, int bs1, int il1,
                          __global const float* seam,
+                         __global const float* warp,
                          __global float* out, int outPitchFloats) {
     const int x = (int)get_global_id(0);
     const int y = (int)get_global_id(1);
@@ -27,7 +28,7 @@ __kernel void osvReframe(const OsvRenderParams params,
     planes[1].strideY = sy1; planes[1].strideC = sc1; planes[1].bitShift = bs1; planes[1].chromaInterleaved = il1;
 
     float rgba[4];
-    osvShadePixel(&params, planes, seam, x, y, rgba);
+    osvShadePixelW(&params, planes, seam, warp, x, y, rgba);
     __global float* dst = out + (size_t)y * (size_t)outPitchFloats + (size_t)x * 4;
     dst[0] = rgba[0];
     dst[1] = rgba[1];

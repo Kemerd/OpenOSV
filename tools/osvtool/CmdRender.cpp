@@ -16,6 +16,7 @@
 #include "osv/geom/VirtualCamera.h"
 #include "osv/io/FfmpegPipe.h"
 #include "osv/io/ImageWriter.h"
+#include "osv/render/ParallaxWarp.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
 
@@ -49,6 +50,8 @@ struct RenderOptions {
     double yaw = 0.0, pitch = 0.0, roll = 0.0, correction = 0.0;
     std::string size = "1920x1080";
     bool seamSearch = false;
+    bool parallax = false;         ///< 2-D flow-based parallax correction
+    std::string flowBackend = "auto";
     bool gain = false;
     int seamInterval = 1;
     std::string out;
@@ -303,10 +306,25 @@ int runRender(const RenderOptions& o) {
         }
     });
 
+    // ---- flow backend selection ------------------------------------------------------------
+    render::FlowBackendKind parallaxBackend = render::FlowBackendKind::Auto;
+    if (o.flowBackend == "auto") {
+        parallaxBackend = render::FlowBackendKind::Auto;
+    } else if (o.flowBackend == "classical") {
+        parallaxBackend = render::FlowBackendKind::Classical;
+    } else if (o.flowBackend == "neural") {
+        parallaxBackend = render::FlowBackendKind::Neural;
+    } else {
+        std::fprintf(stderr, "error: unknown --flow-backend '%s'\n", log::safe(o.flowBackend).c_str());
+        return kExitUsage;
+    }
+
     // ---- main loop ------------------------------------------------------------------------
     const auto t0 = std::chrono::steady_clock::now();
     int exitCode = kExitOk;
     std::vector<float> seamTable;
+    render::ParallaxWarpGrid warpGrid;
+    bool haveWarp = false;
     for (std::uint32_t f = first; f <= last && !writerFailed; ++f) {
         auto pair = P.reader->read(f);
         if (!pair.ok()) {
@@ -315,7 +333,8 @@ int runRender(const RenderOptions& o) {
             break;
         }
         // Optional per-frame analysis (every seamInterval frames).
-        const bool analyse = (o.seamSearch || o.gain) && ((f - first) % static_cast<std::uint32_t>(std::max(1, o.seamInterval)) == 0);
+        const bool analyse = (o.seamSearch || o.gain || o.parallax) &&
+                             ((f - first) % static_cast<std::uint32_t>(std::max(1, o.seamInterval)) == 0);
         if (analyse && o.seamSearch) {
             render::SeamSearchParams sp;
             auto profile = render::searchSeam(P.rig, pair.value(), P.blendParams, sp, *P.pool);
@@ -336,6 +355,36 @@ int runRender(const RenderOptions& o) {
         }
         if (o.seamSearch) {
             builder.seam(seamTable);
+        }
+        // 2-D parallax correction.  Measured on the residual left by the seam
+        // table (which is why seamTable is passed in), so the two compose.
+        //
+        // A failure here is NOT fatal: on featureless content the flow cannot
+        // be trusted and buildParallaxWarp says so, in which case the frame
+        // renders with whatever correction was already in force rather than
+        // with a field of repaired guesses.
+        if (analyse && o.parallax) {
+            render::ParallaxWarpParams pw;
+            pw.backend = parallaxBackend;
+            const std::vector<float>* seamIn = (o.seamSearch && !seamTable.empty()) ? &seamTable : nullptr;
+            const auto tWarp0 = std::chrono::steady_clock::now();
+            auto grid = render::buildParallaxWarp(P.rig, pair.value(), P.blendParams, pw, seamIn, *P.pool);
+            const double warpMs =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tWarp0).count();
+            if (grid.ok()) {
+                warpGrid = std::move(grid).value();
+                haveWarp = true;
+                log::info("frame {}: parallax {} grid {}x{}, consistent {:.1f}%, mean {:.3f} deg, max {:.3f} deg, {:.0f} ms",
+                          f, render::flowBackendName(warpGrid.usedBackend), warpGrid.w, warpGrid.h,
+                          100.0 * warpGrid.consistentFraction(), warpGrid.meanAbsCorrectionDeg,
+                          warpGrid.maxAbsCorrectionDeg, warpMs);
+            } else {
+                log::warn("frame {}: parallax correction unavailable ({}); rendering without it", f,
+                          log::safe(grid.error().message));
+            }
+        }
+        if (o.parallax && haveWarp) {
+            builder.warp(warpGrid.uv, warpGrid.w, warpGrid.h, warpGrid.latMinRad, warpGrid.latMaxRad);
         }
         builder.stabilization(P.stabilizationFor(f));
 
@@ -406,6 +455,9 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
     outGeom->add_option("--correction", opt->correction, "Correction (horizon) angle (deg)")->default_val(0.0);
     outGeom->add_option("--size", opt->size, "Output size WxH")->default_str("1920x1080");
     outGeom->add_flag("--seam-search", opt->seamSearch, "Per-column seam disparity correction");
+    outGeom->add_flag("--parallax", opt->parallax,
+                      "2-D optical-flow parallax correction at the seam (fixes ghosting on close objects)");
+    outGeom->add_option("--flow-backend", opt->flowBackend, "auto|classical|neural")->default_str("auto");
     outGeom->add_flag("--gain", opt->gain, "Exposure matching between lenses");
     outGeom->add_option("--seam-interval", opt->seamInterval, "Re-run the analyses every N frames")->default_val(1);
     outGeom->add_option("--out", opt->out, "Output: image (.png/.tif/.exr, %05d pattern) or .mp4")->required();

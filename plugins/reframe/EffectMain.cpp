@@ -117,7 +117,8 @@ static_assert(osv::reframe::kIndexSourceTopicEnd == osv::reframe::kIndexSourceRo
               "the Source group must close immediately after Source Roll");
 static_assert(osv::reframe::kParamIdByIndex[osv::reframe::kIndexSmooth - 1] == OSV_REFRAME_ID_SMOOTH,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
-static_assert(osv::reframe::kParamIdByIndex[osv::reframe::kIndexOutputAspect - 1] == OSV_REFRAME_ID_OUTPUT_ASPECT,
+static_assert(osv::reframe::kParamIdByIndex[osv::reframe::kIndexOutputResolution - 1] ==
+                  OSV_REFRAME_ID_OUTPUT_RESOLUTION,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
 
 // ---------------------------------------------------------------------------
@@ -459,37 +460,51 @@ static_assert(everyAdvertisedFormatIsRenderable(),
 static_assert(kSupportedFormatCount == 4, "the documented format list is four entries; docs/PREMIERE.md must agree");
 
 // ===========================================================================
-//  Sequence geometry (the "Match Sequence" aspect)
+//  Sequence geometry (the "Match Sequence" resolution)
 // ===========================================================================
 
-/// Aspect ratio of the sequence this effect instance sits on, or 0 when it
-/// cannot be determined.
+/// Largest sequence edge we will believe.  A host that reports a nonsense
+/// rectangle (or one we mis-parsed) must not have its number carried into a
+/// camera, so anything beyond this is treated as "could not be determined"
+/// and the frame is used instead.  8K is 7680 wide; 65536 leaves enormous
+/// headroom while still rejecting a value that is obviously a corrupt read.
+constexpr long long kMaxSequenceEdge = 65536;
+
+/// Pixel size of the sequence this effect instance sits on, or an invalid
+/// size when it cannot be determined.
+///
+/// This used to return only the ASPECT RATIO, because the old "Output Aspect"
+/// control could not use anything more.  "Output Resolution" needs the real
+/// pixel dimensions for its "Match Sequence" entry, and GetFrameRect has
+/// always reported exactly those - the ratio was computed from them and the
+/// pixels thrown away.  Returning the size loses nothing and is what the
+/// control actually asks for.
 ///
 /// On the CPU side the timeline id is not handed to us directly: the PF
 /// Utility Suite's GetContainingTimelineID answers it (PrSDKAESupport.h,
 /// a v4 member so every host since CC has it), and the Sequence Info Suite
 /// then reports the frame rectangle.
-double sequenceAspect(PF_InData* in_data) noexcept {
+SizePx sequenceSize(PF_InData* in_data) noexcept {
     if (!in_data || !in_data->pica_basicP) {
-        return 0.0;
+        return SizePx{};
     }
     SPBasicSuite* basic = in_data->pica_basicP;
 
     // Step 1: which timeline?
     const void* rawUtility = nullptr;
     if (basic->AcquireSuite(kPFUtilitySuite, kPFUtilitySuiteVersion4, &rawUtility) != kSPNoError || !rawUtility) {
-        return 0.0;
+        return SizePx{};
     }
     const PF_UtilitySuite4* utility = static_cast<const PF_UtilitySuite4*>(rawUtility);
     if (!utility->GetContainingTimelineID) {
         basic->ReleaseSuite(kPFUtilitySuite, kPFUtilitySuiteVersion4);
-        return 0.0;
+        return SizePx{};
     }
     PrTimelineID timeline = 0;
     const PF_Err timelineErr = utility->GetContainingTimelineID(in_data->effect_ref, &timeline);
     basic->ReleaseSuite(kPFUtilitySuite, kPFUtilitySuiteVersion4);
     if (timelineErr != PF_Err_NONE || timeline == 0) {
-        return 0.0;
+        return SizePx{};
     }
 
     // Step 2: how big is its frame?  Acquire the newest Sequence Info Suite
@@ -506,20 +521,24 @@ double sequenceAspect(PF_InData* in_data) noexcept {
         }
     }
     if (!sequence) {
-        return 0.0;
+        return SizePx{};
     }
 
-    double aspect = 0.0;
+    SizePx size{};
     prRect rect{};
     if (sequence->GetFrameRect && sequence->GetFrameRect(timeline, &rect) == suiteError_NoError) {
-        const double w = static_cast<double>(rect.right) - static_cast<double>(rect.left);
-        const double h = static_cast<double>(rect.bottom) - static_cast<double>(rect.top);
-        if (w > 0.0 && h > 0.0) {
-            aspect = w / h;
+        // The rectangle is host-supplied, so it is validated rather than
+        // trusted: a right < left or an absurd edge yields an invalid size
+        // and "Match Sequence" falls back to the frame.
+        const long long w = static_cast<long long>(rect.right) - static_cast<long long>(rect.left);
+        const long long h = static_cast<long long>(rect.bottom) - static_cast<long long>(rect.top);
+        if (w > 0 && h > 0 && w <= kMaxSequenceEdge && h <= kMaxSequenceEdge) {
+            size.w = static_cast<int>(w);
+            size.h = static_cast<int>(h);
         }
     }
     basic->ReleaseSuite(kPrSDKSequenceInfoSuite, acquiredVersion);
-    return aspect;
+    return size;
 }
 
 // ===========================================================================
@@ -566,7 +585,7 @@ Settings readSettings(PF_InData* in_data, PF_ParamDef* params[]) noexcept {
     // NOT the permanent id - the two group terminators shift everything after
     // the first group - so the kIndex* constants are the only correct
     // subscripts here (ReframeParams.h spells the whole list out).
-    s.aspect = sanitiseAspect(params[kIndexOutputAspect]->u.pd.value);
+    s.resolution = sanitiseResolution(params[kIndexOutputResolution]->u.pd.value);
     s.preset = sanitisePreset(params[kIndexPreset]->u.pd.value);
     s.fovDeg = static_cast<double>(params[kIndexFov]->u.fs_d.value);
     s.distortion = static_cast<double>(params[kIndexDistortion]->u.fs_d.value);
@@ -679,10 +698,15 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     }
     PF_ParamDef def{};
 
-    // ---- 1. Output Aspect -------------------------------------------------
+    // ---- 1. Output Resolution ---------------------------------------------
+    // Named sizes, not aspect ratios: the render cost of this effect is one
+    // kernel evaluation per OUTPUT PIXEL, so the pixel count is the only
+    // control that changes how long a frame takes.  "Match Sequence" is the
+    // default and reads the real sequence size through the Sequence Info
+    // Suite (sequenceSize() below).
     AEFX_CLR_STRUCT(def);
-    PF_ADD_POPUPX("Output Aspect", OSV_REFRAME_ASPECT_COUNT, OSV_REFRAME_ASPECT_DEFAULT, OSV_REFRAME_ASPECT_ITEMS,
-                  PF_ParamFlag_SUPERVISE, OSV_REFRAME_ID_OUTPUT_ASPECT);
+    PF_ADD_POPUPX("Output Resolution", OSV_REFRAME_RESOLUTION_COUNT, OSV_REFRAME_RESOLUTION_DEFAULT,
+                  OSV_REFRAME_RESOLUTION_ITEMS, PF_ParamFlag_SUPERVISE, OSV_REFRAME_ID_OUTPUT_RESOLUTION);
 
     // ---- 2. Camera topic --------------------------------------------------
     AEFX_CLR_STRUCT(def);
@@ -973,20 +997,20 @@ PF_Err render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
 
     // ---- parameters and geometry ------------------------------------------
     const Settings settings = readSettings(in_data, params);
-    const KernelSetup setup = buildParams(settings, src, dst.width, dst.height, sequenceAspect(in_data));
+    const KernelSetup setup = buildParams(settings, src, dst.width, dst.height, sequenceSize(in_data));
     if (!setup.valid) {
         // Log the SETTINGS too, not just the sizes: every rejection inside
         // buildParams() is driven by a parameter value, so the sizes alone
         // never say which one.  This is the line that identifies whether the
         // CPU path read a sane FOV or garbage.
         PluginLog::oncef("reframe/render/setup-values", PluginLog::Level::Error,
-                         "reframe: setup rejected with aspect={} preset={} fov={:.3f} distortion={:.3f} "
+                         "reframe: setup rejected with resolution={} preset={} fov={:.3f} distortion={:.3f} "
                          "pan={:.3f} tilt={:.3f} roll={:.3f} srcPan={:.3f} srcTilt={:.3f} srcRoll={:.3f} "
-                         "smooth={} seqAspect={:.4f}",
-                         static_cast<int>(settings.aspect), static_cast<int>(settings.preset), settings.fovDeg,
+                         "smooth={} seq={}x{}",
+                         static_cast<int>(settings.resolution), static_cast<int>(settings.preset), settings.fovDeg,
                          settings.distortion, settings.panDeg, settings.tiltDeg, settings.rollDeg,
                          settings.sourcePanDeg, settings.sourceTiltDeg, settings.sourceRollDeg,
-                         settings.smoothKeyframes ? 1 : 0, sequenceAspect(in_data));
+                         settings.smoothKeyframes ? 1 : 0, sequenceSize(in_data).w, sequenceSize(in_data).h);
         PluginLog::oncef("reframe/render/setup", PluginLog::Level::Error,
                          "reframe: could not build the kernel parameters ({}x{} -> {}x{}): {} "
                          "[src layout={} rowBytes={} topDown={}]",
