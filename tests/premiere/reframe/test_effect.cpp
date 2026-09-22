@@ -236,7 +236,7 @@ TEST_CASE("PARAMS_SETUP registers the 13 documented parameters", "[reframe][para
     // issues its own PF_ADD_PARAM, so a group terminator is a real parameter
     // occupying a real index in the MIDDLE of the list.
     const int expectedIds[kParamCount] = {
-        OSV_REFRAME_ID_OUTPUT_ASPECT,    OSV_REFRAME_ID_CAMERA_TOPIC, OSV_REFRAME_ID_PRESET,
+        OSV_REFRAME_ID_OUTPUT_RESOLUTION, OSV_REFRAME_ID_CAMERA_TOPIC, OSV_REFRAME_ID_PRESET,
         OSV_REFRAME_ID_PAN,              OSV_REFRAME_ID_TILT,         OSV_REFRAME_ID_ROLL,
         OSV_REFRAME_ID_FOV,              OSV_REFRAME_ID_DISTORTION,   OSV_REFRAME_ID_CAMERA_TOPIC_END,
         OSV_REFRAME_ID_SOURCE_TOPIC,     OSV_REFRAME_ID_SOURCE_PAN,   OSV_REFRAME_ID_SOURCE_TILT,
@@ -251,7 +251,7 @@ TEST_CASE("PARAMS_SETUP registers the 13 documented parameters", "[reframe][para
     // PF_END_TOPIC sets no name, and AEFX_CLR_STRUCT zeroes the def before
     // it, so a terminator's name is the empty string.
     const char* expectedNames[kParamCount] = {
-        "Output Aspect", "Camera",      "Preset",           "Pan",  "Tilt",
+        "Output Resolution", "Camera",  "Preset",           "Pan",  "Tilt",
         "Roll",          "FOV",         "Distortion",       "",     "Source",
         "Source Pan",    "Source Tilt", "Source Roll",      "",     "Smooth Keyframes",
     };
@@ -273,7 +273,7 @@ TEST_CASE("PARAMS_SETUP registers the 13 documented parameters", "[reframe][para
     }
 
     // And the named constants really do point at the parameters they name.
-    CHECK(params[kIndexOutputAspect - 1].uu.id == OSV_REFRAME_ID_OUTPUT_ASPECT);
+    CHECK(params[kIndexOutputResolution - 1].uu.id == OSV_REFRAME_ID_OUTPUT_RESOLUTION);
     CHECK(params[kIndexPreset - 1].uu.id == OSV_REFRAME_ID_PRESET);
     CHECK(params[kIndexFov - 1].uu.id == OSV_REFRAME_ID_FOV);
     CHECK(params[kIndexDistortion - 1].uu.id == OSV_REFRAME_ID_DISTORTION);
@@ -297,21 +297,38 @@ TEST_CASE("the popup items are exactly the documented lists", "[reframe][params]
     const std::vector<PF_ParamDef> params = setupParams(f);
     REQUIRE(params.size() == static_cast<std::size_t>(kParamCount));
 
-    SECTION("Output Aspect") {
-        const PF_ParamDef& def = params[kIndexOutputAspect - 1];
+    SECTION("Output Resolution") {
+        const PF_ParamDef& def = params[kIndexOutputResolution - 1];
         REQUIRE(def.param_type == PF_Param_POPUP);
-        CHECK(def.u.pd.num_choices == OSV_REFRAME_ASPECT_COUNT);
-        CHECK(def.u.pd.dephault == OSV_REFRAME_ASPECT_DEFAULT);
-        CHECK(def.u.pd.value == OSV_REFRAME_ASPECT_DEFAULT);
+        CHECK(def.u.pd.num_choices == OSV_REFRAME_RESOLUTION_COUNT);
+        CHECK(def.u.pd.dephault == OSV_REFRAME_RESOLUTION_DEFAULT);
+        CHECK(def.u.pd.value == OSV_REFRAME_RESOLUTION_DEFAULT);
+        // "Match Sequence" is the default: a new instance must render at the
+        // size of the sequence it was dropped on, never at a fixed guess.
+        CHECK(static_cast<Resolution>(def.u.pd.dephault) == Resolution::MatchSequence);
 
         const std::vector<std::string> items = splitItems(def.u.pd.u.namesptr);
-        REQUIRE(items.size() == OSV_REFRAME_ASPECT_COUNT);
-        for (int i = 0; i < OSV_REFRAME_ASPECT_COUNT; ++i) {
-            INFO("aspect item " << i);
+        REQUIRE(items.size() == OSV_REFRAME_RESOLUTION_COUNT);
+        for (int i = 0; i < OSV_REFRAME_RESOLUTION_COUNT; ++i) {
+            INFO("resolution item " << i);
             // The label in the table and the label in the popup string must
             // be the same text, or the table lookup a test does is fiction.
-            CHECK(items[static_cast<std::size_t>(i)] == kAspects[i].label);
-            CHECK(static_cast<int>(kAspects[i].value) == i + 1);
+            CHECK(items[static_cast<std::size_t>(i)] == kResolutions[i].label);
+            CHECK(static_cast<int>(kResolutions[i].value) == i + 1);
+        }
+        // Every fixed entry's label must spell out its own numbers, so the
+        // user reading "2560 x 1440" gets exactly 2560 x 1440.  Only the
+        // dynamic "Match Sequence" entry carries no size.
+        for (const ResolutionEntry& e : kResolutions) {
+            INFO("resolution '" << e.label << "'");
+            if (e.value == Resolution::MatchSequence) {
+                CHECK(e.width == 0);
+                CHECK(e.height == 0);
+                continue;
+            }
+            REQUIRE(e.width > 0);
+            REQUIRE(e.height > 0);
+            CHECK(std::string(e.label) == std::to_string(e.width) + " x " + std::to_string(e.height));
         }
     }
 
@@ -385,7 +402,7 @@ TEST_CASE("exactly the supervised parameters carry PF_ParamFlag_SUPERVISE", "[re
     // Preset needs it to write the other three; FOV, Distortion and Tilt
     // need it so editing one flips Preset to Custom.
     const bool expected[kParamCount] = {
-        true,   // Output Aspect (reserved for future UI enabling)
+        true,   // Output Resolution (reserved for future UI enabling)
         false,  // Camera topic
         true,   // Preset
         false,  // Pan
@@ -447,7 +464,7 @@ TEST_CASE("every parameter group is opened and closed exactly once", "[reframe][
     CHECK(maxDepth == 1);
 
     // The three top-level controls.
-    CHECK(depthOfIndex[kIndexOutputAspect] == 0);
+    CHECK(depthOfIndex[kIndexOutputResolution] == 0);
     CHECK(depthOfIndex[kIndexCameraTopic] == 0);
     CHECK(depthOfIndex[kIndexSourceTopic] == 0);
     CHECK(depthOfIndex[kIndexSmooth] == 0);

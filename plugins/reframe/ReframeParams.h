@@ -475,15 +475,32 @@ struct HostParamMap {
 //  view and fill it.  Letterboxing threw away real output pixels and gave the
 //  user bars they then had to crop.
 //
-//  Structurally wrong: a ratio cannot answer the question the renderer
-//  actually has to ask, which is "how many pixels do I produce?".  The render
-//  cost of this effect is linear in output pixel count and nothing else - it
-//  is one kernel evaluation per output pixel - so the size is the ONLY knob
-//  that changes the time a frame takes.  Measured on the library renderer at
-//  the same decode cost, the render-only time runs from about 0 ms at
-//  640 x 320 to 413 ms at 6000 x 3000, tracking area almost exactly.  A
-//  control that names the size therefore controls the speed; a control that
-//  names a shape controls nothing.
+//  Structurally wrong: a ratio says nothing about the deliverable.  Users
+//  think in deliverables - "this cut is 2560 x 1440" - and "Match Sequence"
+//  can only be answered exactly with the sequence's real pixel size, which
+//  the Sequence Info Suite reports and the old control threw away.
+//
+//  WHAT THE CONTROL DOES, AND WHAT IT CANNOT DO
+//  --------------------------------------------
+//  The named size decides the camera's FRAMING: the field of view spans the
+//  width of that size, and the resulting image is cover-fitted onto the
+//  output frame - scaled uniformly until it fills the frame, overflow cropped,
+//  never letterboxed (buildParams() documents the maths).  When the named
+//  shape matches the frame, which is always the case for "Match Sequence" and
+//  for every preview-scaled frame, the cover-fit is the identity and FOV
+//  spans the frame width exactly.
+//
+//  It does NOT change how many pixels this effect renders, and it cannot:
+//  in Premiere the HOST allocates the output world (sequence size times the
+//  playback resolution) before PF_Cmd_RENDER or the GPU Render call ever
+//  runs.  The effect is already one kernel evaluation per output pixel, so it
+//  already renders exactly the pixels the sequence needs.  The pixel count
+//  that dominates frame time lives upstream, in how large a sphere the
+//  importer stitches (ImporterVideo.cpp, nearestAdvertisedSize and
+//  geometryForLocked).  This module links no decoder and no lens model, the
+//  effect only ever sees the equirect frame Premiere hands it, and there is
+//  no channel through which it could ask the importer for fewer pixels.  Do
+//  not add a code path here that pretends otherwise.
 // ---------------------------------------------------------------------------
 
 /// Popup values of "Output Resolution" (1-based, matching AE popup semantics).
@@ -644,9 +661,10 @@ struct Settings {
 /// The picture used to be drawn into a centred box of the chosen aspect,
 /// leaving transparent bars.  A virtual camera has no reason to do that: if
 /// the frame is a different shape than the user's chosen resolution, the
-/// right answer is to build the camera for the FRAME's shape and fill it,
-/// which is what buildParams() now does.  The chosen resolution influences
-/// the camera's pixel density (and therefore the cost), never the coverage.
+/// right answer is to fill the frame and crop whatever does not fit, which
+/// is what buildParams() now does.  The chosen resolution influences the
+/// camera's framing (which shape FOV is measured across), never the
+/// coverage.
 ///
 /// A degenerate frame still yields a zero rectangle, which buildParams()
 /// rejects rather than dividing by.

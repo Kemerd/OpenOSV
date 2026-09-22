@@ -84,7 +84,7 @@ catch_discover_tests(osv_premiere_common_tests
 # -----------------------------------------------------------------------------
 #  Plug-in test executables from the next milestone step (added when present).
 # -----------------------------------------------------------------------------
-foreach(_dir importer reframe sourcesettings)
+foreach(_dir importer reframe sourcesettings bench)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_dir}/CMakeLists.txt")
     add_subdirectory(${_dir})
   endif()

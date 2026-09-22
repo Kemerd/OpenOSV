@@ -317,6 +317,56 @@ CameraValues sanitise(const CameraValues& values) noexcept {
     return out;
 }
 
+CameraValues mergeLiveReadout(const CameraValues& fromHost, const CameraValues& live,
+                              std::uint32_t touchedFields) noexcept {
+    // Sanitise both sides BEFORE comparing: a NaN compares unequal to
+    // everything, which would silently turn "consistent" into "not", and a
+    // NaN must never reach the screen either way.
+    const CameraValues host = sanitise(fromHost);
+    const CameraValues gesture = sanitise(live);
+
+    // One field at a time: (host, gesture, the field's bit).  A table keeps
+    // the four checks identical by construction rather than by copy-paste.
+    struct Field {
+        double hostValue;
+        double gestureValue;
+        std::uint32_t bit;
+    };
+    const Field fields[] = {
+        {host.panDeg, gesture.panDeg, kChangedPan},
+        {host.tiltDeg, gesture.tiltDeg, kChangedTilt},
+        {host.rollDeg, gesture.rollDeg, kChangedRoll},
+        {host.fovDeg, gesture.fovDeg, kChangedFov},
+    };
+
+    // Consistency: every field the gesture never wrote must already agree
+    // with the host.  If one does not, `live` describes some other state and
+    // the host stays the authority - wholesale, not field by field, because
+    // a mismatch means NONE of the gesture's numbers can be trusted here.
+    for (const Field& f : fields) {
+        if ((touchedFields & f.bit) == 0u && std::fabs(f.hostValue - f.gestureValue) > kLiveReadoutMatchEpsDeg) {
+            return host;
+        }
+    }
+
+    // Consistent: the touched fields come from the gesture, the rest from
+    // the host (which agrees with the gesture on them anyway).
+    CameraValues out = host;
+    if ((touchedFields & kChangedPan) != 0u) {
+        out.panDeg = gesture.panDeg;
+    }
+    if ((touchedFields & kChangedTilt) != 0u) {
+        out.tiltDeg = gesture.tiltDeg;
+    }
+    if ((touchedFields & kChangedRoll) != 0u) {
+        out.rollDeg = gesture.rollDeg;
+    }
+    if ((touchedFields & kChangedFov) != 0u) {
+        out.fovDeg = gesture.fovDeg;
+    }
+    return out;
+}
+
 CameraValues applyDrag(DragState& state, const PointF& current, std::uint32_t modifiers) noexcept {
     // Nothing in flight, or a garbage position: hand back what we started
     // with, unchanged.  Returning the START values rather than some partial

@@ -420,6 +420,45 @@ enum ChangedField : std::uint32_t {
 [[nodiscard]] CameraValues sanitise(const CameraValues& values) noexcept;
 
 // ===========================================================================
+//  The live readout
+//
+//  While a drag is in flight the HUD shows the values the gesture committed
+//  rather than trusting the parameter array a draw event carries, because a
+//  host may hand the draw pass the values of the frame it last FINISHED
+//  rendering - and with a slow render those lag the hand by a long way.  The
+//  shim (ReframeUiEvent.cpp) remembers the values; the decision of what to
+//  SHOW is this pure function, so it is pinned by tests.
+// ===========================================================================
+
+/// Two readout values closer than this (degrees) are the same number.
+///
+/// PF_Fixed holds 1/65536 of a degree and the FOV slider is a float, so a
+/// value that went into the host and came back can differ from what was
+/// written by far less than this - and anything the readout prints (one
+/// decimal place) differs by far more.
+inline constexpr double kLiveReadoutMatchEpsDeg = 1e-3;
+
+/// What the HUD should show, given what the host reports and what an
+/// in-flight gesture has committed.
+///
+/// `touchedFields` is the union of `changedFieldsFor()` over every event of
+/// the gesture so far.  The rule is:
+///
+///   * the fields the gesture has TOUCHED come from `live` - those are the
+///     ones a lagging host can be behind on;
+///   * the fields it has NOT touched must already agree with the host.  A
+///     drag cannot have moved them, so if they disagree, `live` is not a
+///     picture of this host's state at all (another instance, another
+///     moment) and the host's values are returned untouched.
+///
+/// That consistency check is what makes the substitution safe even though
+/// the shim can only identify an instance by an address that the host is
+/// free to reuse.  Both inputs are sanitised first, so a NaN from either
+/// side can neither be shown nor defeat the comparison.
+[[nodiscard]] CameraValues mergeLiveReadout(const CameraValues& fromHost, const CameraValues& live,
+                                            std::uint32_t touchedFields) noexcept;
+
+// ===========================================================================
 //  The SDK half lives in ReframeUiEvent.h
 //
 //  It is a SEPARATE header on purpose.  The Adobe headers are wrapped in

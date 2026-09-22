@@ -44,6 +44,53 @@ using osv::premiere::mock::MockHost;
 
 namespace {
 
+/// The resolution entry the parity tests render with.  These tests used to
+/// select the "Full Frame" aspect; that entry went with the letterbox, and
+/// its exact equivalent is "Match Sequence" whenever no sequence size is
+/// known - resolveOutputSize() then falls back to the frame and the cover-fit
+/// factor is exactly 1.  The GPU fixture's timeline is never given a
+/// SequenceConfig (except by the one Match Sequence test, which says so), so
+/// GetFrameRect fails and GpuFilter takes that fallback; the CPU mirrors pass
+/// SizePx{} to buildParams() for the same answer.
+constexpr Resolution kFillFrame = Resolution::MatchSequence;
+
+/// Horizontal angle (deg) from the frame centre to the right-hand edge pixel
+/// of the centre row, decoded from the labelled panorama.  With a level
+/// rectilinear camera this is exactly atan(dx / focal).
+double edgeAngleDeg(const std::vector<std::uint8_t>& bytes, std::int32_t rowBytes, int w, int h) {
+    float centre[4];
+    float edge[4];
+    readPixelBgra32f(bytes.data(), rowBytes, w / 2, h / 2, centre);
+    readPixelBgra32f(bytes.data(), rowBytes, w - 1, h / 2, edge);
+    double d = std::fmod(Panorama::decodeLongitude(edge) - Panorama::decodeLongitude(centre) + 540.0, 360.0);
+    if (d < 0.0) {
+        d += 360.0;
+    }
+    return std::fabs(d - 180.0);
+}
+
+/// atan(dx / focal) in degrees for the right-hand edge pixel of a `w`-wide
+/// frame.
+double expectedEdgeAngleDeg(int w, double focal) {
+    const double dx = (w - 1) + 0.5 - w / 2.0;
+    return std::atan(dx / focal) * 180.0 / 3.14159265358979323846;
+}
+
+/// Number of pixels whose alpha is not fully opaque.
+int countNonOpaque(const std::vector<std::uint8_t>& bytes, std::int32_t rowBytes, int w, int h) {
+    int n = 0;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            float rgba[4];
+            readPixelBgra32f(bytes.data(), rowBytes, x, y, rgba);
+            if (!(rgba[3] > 0.999f)) {
+                ++n;
+            }
+        }
+    }
+    return n;
+}
+
 /// The panorama the GPU tests reframe, shared with the CPU comparison.
 const Panorama& panorama() {
     static const Panorama p = makePanorama(1024, 512);
@@ -265,10 +312,10 @@ struct GpuRenderFixture {
 
     /// The Settings the same parameters would produce on the CPU side, for
     /// the parity comparison.
-    Settings mirrorSettings(Aspect aspect, double pan, double tilt, double roll, double fov,
+    Settings mirrorSettings(Resolution resolution, double pan, double tilt, double roll, double fov,
                             double distortion) const {
         Settings s;
-        s.aspect = aspect;
+        s.resolution = resolution;
         s.preset = Preset::Custom;
         s.panDeg = pan;
         s.tiltDeg = tilt;
@@ -512,7 +559,7 @@ TEST_CASE("the GPU render matches the CPU render in 32f", "[reframe][gpu][cuda]"
     const double roll = 7.0;
     const double fov = 100.0;
     const double distortion = 30.0;
-    f.setInt32(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+    f.setInt32(kIndexOutputResolution, static_cast<int>(kFillFrame));
     f.setInt32(kIndexPreset, static_cast<int>(Preset::Custom));
     f.setFloat32(kIndexPan, static_cast<float>(pan));
     f.setFloat32(kIndexTilt, static_cast<float>(tilt));
@@ -565,8 +612,8 @@ TEST_CASE("the GPU render matches the CPU render in 32f", "[reframe][gpu][cuda]"
     src.layout = PixelLayout::Bgra32f;
     src.topDown = true;
 
-    const Settings settings = f.mirrorSettings(Aspect::FullFrame, pan, tilt, roll, fov, distortion);
-    const KernelSetup setup = buildParams(settings, src, kW, kH, 0.0);
+    const Settings settings = f.mirrorSettings(kFillFrame, pan, tilt, roll, fov, distortion);
+    const KernelSetup setup = buildParams(settings, src, kW, kH, SizePx{});
     REQUIRE(setup.valid);
 
     std::vector<std::uint8_t> cpuBytes(static_cast<std::size_t>(kW) * kH * 16u, 0u);
@@ -622,7 +669,7 @@ TEST_CASE("the GPU render matches the CPU render in 16f", "[reframe][gpu][cuda]"
 
     const double pan = -70.0;
     const double tilt = 25.0;
-    f.setInt32(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+    f.setInt32(kIndexOutputResolution, static_cast<int>(kFillFrame));
     f.setInt32(kIndexPreset, static_cast<int>(Preset::Custom));
     f.setFloat32(kIndexPan, static_cast<float>(pan));
     f.setFloat32(kIndexTilt, static_cast<float>(tilt));
@@ -664,8 +711,8 @@ TEST_CASE("the GPU render matches the CPU render in 16f", "[reframe][gpu][cuda]"
     src.layout = PixelLayout::Bgra16f;
     src.topDown = true;
 
-    const Settings settings = f.mirrorSettings(Aspect::FullFrame, pan, tilt, 0.0, 120.0, 15.0);
-    const KernelSetup setup = buildParams(settings, src, kW, kH, 0.0);
+    const Settings settings = f.mirrorSettings(kFillFrame, pan, tilt, 0.0, 120.0, 15.0);
+    const KernelSetup setup = buildParams(settings, src, kW, kH, SizePx{});
     REQUIRE(setup.valid);
 
     std::vector<std::uint8_t> cpuBytes(static_cast<std::size_t>(kW) * kH * 8u, 0u);
@@ -700,11 +747,19 @@ TEST_CASE("the GPU render matches the CPU render in 16f", "[reframe][gpu][cuda]"
     REQUIRE(scope.filter().DisposeInstance(&instance) == suiteError_NoError);
 }
 
-TEST_CASE("the GPU render writes transparent black outside the letterbox", "[reframe][gpu][cuda]") {
+TEST_CASE("the GPU render fills every pixel and cover-fits a fixed resolution", "[reframe][gpu][cuda]") {
+    // This replaced "the GPU render writes transparent black outside the
+    // letterbox".  The letterbox was removed on purpose - the reframe must
+    // always fill the frame - so the same situation (a shape unlike the
+    // frame's) must now paint EVERY pixel and crop the overflow.  Checking
+    // every pixel's alpha is stricter than the old four sampled bar rows, and
+    // it still proves the GPU writes the whole frame rather than relying on
+    // the buffer arriving zeroed (a zeroed pixel has alpha 0 and would fail).
+    //
     // GpuRenderFixture owns the MockHost: only one may exist at a time
     // (the suite functions reach the instance through MockHost::current()).
-    constexpr int kW = 400;
-    constexpr int kH = 400;
+    constexpr int kW = 401;
+    constexpr int kH = 401;
     GpuRenderFixture f(kW, kH, /*half=*/false);
     if (!f.host.gpuAvailable()) {
         SKIP("no CUDA device: " << f.host.gpuFailureReason());
@@ -716,7 +771,7 @@ TEST_CASE("the GPU render writes transparent black outside the letterbox", "[ref
     GpuEntryScope scope(f.host);
     REQUIRE(scope.result() == suiteError_NoError);
 
-    f.setInt32(kIndexOutputAspect, static_cast<int>(Aspect::Ratio235x1));
+    f.setInt32(kIndexOutputResolution, static_cast<int>(Resolution::Qhd2560x1440));
     f.setInt32(kIndexPreset, static_cast<int>(Preset::Custom));
     f.setFloat64(kIndexFov, 90.0);
     f.setFloat64(kIndexDistortion, 0.0);
@@ -740,24 +795,14 @@ TEST_CASE("the GPU render writes transparent black outside the letterbox", "[ref
     std::vector<std::uint8_t> gpuBytes(static_cast<std::size_t>(f.outRowBytes) * static_cast<std::size_t>(kH), 0u);
     REQUIRE(downloadFromPPix(f.gpu, f.outFrame, gpuBytes));
 
-    // The GPU writes the whole frame including the bars, so the letterbox
-    // does not depend on the buffer happening to arrive zeroed.
-    const Viewport view = computeViewport(kW, kH, 2.35);
-    for (const int y : {0, view.y - 2, view.y + view.h + 1, kH - 1}) {
-        if (y < 0 || y >= kH) {
-            continue;
-        }
-        INFO("letterbox row " << y);
-        float rgba[4];
-        readPixelBgra32f(gpuBytes.data(), f.outRowBytes, kW / 2, y, rgba);
-        CHECK(rgba[0] == 0.0f);
-        CHECK(rgba[1] == 0.0f);
-        CHECK(rgba[2] == 0.0f);
-        CHECK(rgba[3] == 0.0f);
-    }
-    float inside[4];
-    readPixelBgra32f(gpuBytes.data(), f.outRowBytes, kW / 2, view.y + view.h / 2, inside);
-    CHECK(inside[3] > 0.5f);
+    CHECK(countNonOpaque(gpuBytes, f.outRowBytes, kW, kH) == 0);
+
+    // 16:9 on a square frame: the height binds and the sides are cropped by
+    // (2560 * 401) / (1440 * 401) = 16/9, so the edge pixel sits at
+    // atan(200 / (200.5 * 16/9)) ~ 29.3 degrees instead of ~44.9.
+    const double coverFocal = (kW / 2.0) * (2560.0 * kH) / (1440.0 * kW);
+    CHECK(edgeAngleDeg(gpuBytes, f.outRowBytes, kW, kH) ==
+          Approx(expectedEdgeAngleDeg(kW, coverFocal)).margin(0.5));
 
     REQUIRE(scope.filter().DisposeInstance(&instance) == suiteError_NoError);
 }
@@ -848,7 +893,7 @@ TEST_CASE("the GPU path reads a keyframed angle at the render time", "[reframe][
 
     const PrTime ticksPerFrame = osv::premiere::mock::kTicksPerSecond / 30;
 
-    f.setInt32(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+    f.setInt32(kIndexOutputResolution, static_cast<int>(kFillFrame));
     f.setInt32(kIndexPreset, static_cast<int>(Preset::Custom));
     f.setFloat64(kIndexFov, 90.0);
     f.setFloat64(kIndexDistortion, 0.0);
@@ -915,11 +960,18 @@ TEST_CASE("the GPU path honours Match Sequence through the Sequence Info Suite",
 
     // On the GPU side the timeline id comes straight from the instance, not
     // from PF_UtilitySuite - a different code path from the CPU test.
+    //
+    // The sequence used to be 1:2, which showed up as a PILLARBOX.  With the
+    // letterbox gone a relatively TALLER sequence cover-fits with a factor of
+    // exactly 1 - indistinguishable from the fallback, so the test would pass
+    // even if the suite were never asked.  A 2:1 sequence is relatively WIDER
+    // on this square frame, which crops the sides by exactly 2 and can only
+    // come from the suite's answer.
     osv::premiere::mock::SequenceConfig config = f.host.sequence(f.timelineId);
-    prSetRect(&config.frameRect, 0, 0, 1000, 2000);  // a 1:2 sequence
+    prSetRect(&config.frameRect, 0, 0, 2000, 1000);  // a 2:1 sequence
     f.host.setSequence(f.timelineId, config);
 
-    f.setInt32(kIndexOutputAspect, static_cast<int>(Aspect::MatchSequence));
+    f.setInt32(kIndexOutputResolution, static_cast<int>(Resolution::MatchSequence));
     f.setInt32(kIndexPreset, static_cast<int>(Preset::Custom));
     f.setFloat64(kIndexFov, 90.0);
     f.setFloat64(kIndexDistortion, 0.0);
@@ -941,15 +993,13 @@ TEST_CASE("the GPU path honours Match Sequence through the Sequence Info Suite",
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(f.outRowBytes) * static_cast<std::size_t>(kH), 0u);
     REQUIRE(downloadFromPPix(f.gpu, f.outFrame, bytes));
 
-    // A 1:2 picture in a square frame is pillarboxed.
-    const Viewport view = computeViewport(kW, kH, 0.5);
-    REQUIRE(view.w < kW);
-    float inside[4];
-    float outside[4];
-    readPixelBgra32f(bytes.data(), f.outRowBytes, view.x + view.w / 2, kH / 2, inside);
-    readPixelBgra32f(bytes.data(), f.outRowBytes, view.x - 2, kH / 2, outside);
-    CHECK(inside[3] > 0.5f);
-    CHECK(outside[3] == 0.0f);
+    // No bars anywhere, and the sides cropped by the 2:1 factor.
+    CHECK(countNonOpaque(bytes, f.outRowBytes, kW, kH) == 0);
+    const double measured = edgeAngleDeg(bytes, f.outRowBytes, kW, kH);
+    CHECK(measured == Approx(expectedEdgeAngleDeg(kW, (kW / 2.0) * 2.0)).margin(0.5));
+    // ...and NOT the frame fallback, which would put the edge ~18 degrees
+    // further out.
+    CHECK(measured < expectedEdgeAngleDeg(kW, kW / 2.0) - 10.0);
 
     REQUIRE(scope.filter().DisposeInstance(&instance) == suiteError_NoError);
 }
@@ -977,8 +1027,8 @@ TEST_CASE("two concurrent instances render independently", "[reframe][gpu][cuda]
     for (const csSDK_int32 node : {nodeA, nodeB}) {
         PrParam popup{};
         popup.mType = kPrParamType_Int32;
-        popup.mInt32 = static_cast<csSDK_int32>(Aspect::FullFrame);
-        f.host.setParam(node, gpuParamIndex(kIndexOutputAspect), 0, popup);
+        popup.mInt32 = static_cast<csSDK_int32>(kFillFrame);
+        f.host.setParam(node, gpuParamIndex(kIndexOutputResolution), 0, popup);
         popup.mInt32 = static_cast<csSDK_int32>(Preset::Custom);
         f.host.setParam(node, gpuParamIndex(kIndexPreset), 0, popup);
         PrParam slider{};
@@ -1051,7 +1101,7 @@ namespace {
 /// markers, no Source angles.  The values are deliberately distinctive so a
 /// misread lands on an obviously wrong number rather than on a plausible one.
 struct PremiereParamLayout {
-    static constexpr int kAspect = 0;
+    static constexpr int kResolution = 0;
     static constexpr int kPreset = 1;
     static constexpr int kPan = 2;
     static constexpr int kTilt = 3;
@@ -1093,7 +1143,7 @@ struct PremiereParamLayout {
             host.setParam(nodeId, index, 0, p);
         };
 
-        i32(kAspect, static_cast<int>(Aspect::FullFrame));
+        i32(kResolution, static_cast<int>(kFillFrame));
         i32(kPreset, static_cast<int>(Preset::Custom));
         f32(kPan, pan);
         f32(kTilt, tilt);
@@ -1207,8 +1257,8 @@ TEST_CASE("the GPU path reads the right controls from an 8-parameter host", "[re
     src.topDown = true;
 
     const Settings settings =
-        f.mirrorSettings(Aspect::FullFrame, layout.pan, layout.tilt, layout.roll, layout.fov, layout.distortion);
-    const KernelSetup setup = buildParams(settings, src, kW, kH, 0.0);
+        f.mirrorSettings(kFillFrame, layout.pan, layout.tilt, layout.roll, layout.fov, layout.distortion);
+    const KernelSetup setup = buildParams(settings, src, kW, kH, SizePx{});
     REQUIRE(setup.valid);
 
     std::vector<std::uint8_t> cpuBytes(static_cast<std::size_t>(kW) * kH * 16u, 0u);

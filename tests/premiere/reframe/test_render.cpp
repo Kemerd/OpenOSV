@@ -18,6 +18,8 @@
 
 #include "MockHost.h"
 
+#include "osv/geom/VirtualCamera.h"
+
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -81,11 +83,25 @@ struct PackedSource {
     }
 };
 
-/// Default settings: "Full Frame" so the picture fills the output and a
-/// pixel's position maps straight to a direction with no letterbox to skip.
+/// The resolution entry the geometry tests render with: FOV spans the width
+/// of the frame being rendered, and nothing is cropped.
+///
+/// These tests used to select "Full Frame", an aspect entry that meant "the
+/// frame's own shape".  That entry is gone with the letterbox; its exact
+/// equivalent now is "Match Sequence" whenever no sequence size is known,
+/// because resolveOutputSize() then falls back to the frame itself and the
+/// cover-fit factor is exactly 1 (a test below proves both halves of that).
+/// Every buildParams() call here passes SizePx{} for the sequence, and the
+/// RenderFixture timelines are never given a SequenceConfig, so the mock's
+/// GetFrameRect answers suiteError_IDNotValid and the effect takes the same
+/// fallback.  A test that DOES configure a sequence says so explicitly.
+constexpr Resolution kFillFrame = Resolution::MatchSequence;
+
+/// Default settings: the picture fills the output and a pixel's position maps
+/// straight to a direction, with no cover-fit crop to account for.
 Settings baseSettings() {
     Settings s;
-    s.aspect = Aspect::FullFrame;
+    s.resolution = kFillFrame;
     s.preset = Preset::Custom;
     s.fovDeg = 90.0;
     s.distortion = 0.0;  // rectilinear: the easiest geometry to reason about
@@ -97,89 +113,228 @@ Settings baseSettings() {
 // ===========================================================================
 //  The geometry helpers (pure functions in ReframeParams.h / ReframeCpu.cpp)
 // ===========================================================================
-TEST_CASE("resolveAspectRatio answers the documented ratios", "[reframe][geometry]") {
-    // Fixed ratios ignore both the sequence and the frame.
-    CHECK(resolveAspectRatio(Aspect::Ratio16x9, 1.0, 1.0) == Approx(16.0 / 9.0));
-    CHECK(resolveAspectRatio(Aspect::Ratio9x16, 1.0, 1.0) == Approx(9.0 / 16.0));
-    CHECK(resolveAspectRatio(Aspect::Ratio1x1, 2.0, 3.0) == Approx(1.0));
-    CHECK(resolveAspectRatio(Aspect::Ratio4x3, 0.0, 0.0) == Approx(4.0 / 3.0));
-    CHECK(resolveAspectRatio(Aspect::Ratio3x4, 0.0, 0.0) == Approx(3.0 / 4.0));
-    CHECK(resolveAspectRatio(Aspect::Ratio235x1, 0.0, 0.0) == Approx(2.35));
+TEST_CASE("resolveOutputSize answers the documented sizes", "[reframe][geometry]") {
+    const SizePx seq{2000, 1000};
+    const SizePx frame{640, 480};
 
-    // "Match Sequence" uses the sequence when there is one...
-    CHECK(resolveAspectRatio(Aspect::MatchSequence, 2.0, 1.0) == Approx(2.0));
-    // ...and falls back to 16:9 exactly as docs/PREMIERE.md specifies.
-    CHECK(resolveAspectRatio(Aspect::MatchSequence, 0.0, 1.0) == Approx(16.0 / 9.0));
-    CHECK(resolveAspectRatio(Aspect::MatchSequence, -1.0, 1.0) == Approx(16.0 / 9.0));
-    CHECK(resolveAspectRatio(Aspect::MatchSequence, std::nan(""), 1.0) == Approx(16.0 / 9.0));
+    SECTION("fixed entries ignore both the sequence and the frame") {
+        // Every fixed entry is exactly the pair of numbers its label spells,
+        // whatever the host reports, including when it reports nothing.
+        for (const ResolutionEntry& e : kResolutions) {
+            if (e.value == Resolution::MatchSequence) {
+                continue;
+            }
+            INFO("resolution '" << e.label << "'");
+            for (const SizePx sequence : {seq, SizePx{}, SizePx{-5, 7}}) {
+                for (const SizePx f : {frame, SizePx{}}) {
+                    const SizePx r = resolveOutputSize(e.value, sequence, f);
+                    CHECK(r.w == e.width);
+                    CHECK(r.h == e.height);
+                }
+            }
+        }
+        CHECK(resolveOutputSize(Resolution::Uhd3840x2160, seq, frame).w == 3840);
+        CHECK(resolveOutputSize(Resolution::Uhd3840x2160, seq, frame).h == 2160);
+        CHECK(resolveOutputSize(Resolution::Hd1280x720, seq, frame).w == 1280);
+        CHECK(resolveOutputSize(Resolution::Hd1280x720, seq, frame).h == 720);
+    }
 
-    // "Full Frame" is the frame, whatever shape it is.
-    CHECK(resolveAspectRatio(Aspect::FullFrame, 2.0, 1.5) == Approx(1.5));
-    CHECK(resolveAspectRatio(Aspect::FullFrame, 2.0, 0.0) == Approx(16.0 / 9.0));
+    SECTION("Match Sequence uses the sequence when there is one") {
+        const SizePx r = resolveOutputSize(Resolution::MatchSequence, seq, frame);
+        CHECK(r.w == 2000);
+        CHECK(r.h == 1000);
+    }
+
+    SECTION("Match Sequence falls back to the frame, never to a guess") {
+        // The old aspect control fell back to a fixed 16:9.  That was a shape
+        // and a shape was all it could use; a size needs pixels, and when the
+        // sequence cannot be asked the frame the host allocated for THIS
+        // render is the exact answer, so it replaced the constant.
+        //
+        // A partially valid rectangle (one edge zero or negative) is not a
+        // size and must take the fallback too, rather than half of it being
+        // mixed with half of the frame.
+        for (const SizePx bad : {SizePx{}, SizePx{0, 1080}, SizePx{1920, 0}, SizePx{-1920, 1080}, SizePx{1920, -1}}) {
+            INFO("sequence " << bad.w << "x" << bad.h);
+            const SizePx r = resolveOutputSize(Resolution::MatchSequence, bad, frame);
+            CHECK(r.w == 640);
+            CHECK(r.h == 480);
+        }
+    }
+
+    SECTION("with nothing to go on the answer is invalid, not invented") {
+        CHECK_FALSE(resolveOutputSize(Resolution::MatchSequence, SizePx{}, SizePx{}).valid());
+    }
+
+    SECTION("a corrupt popup value is sanitised onto Match Sequence") {
+        // Includes the values a project saved against the OLD eight-entry
+        // aspect table can still hold (6, 7, 8): they must land on a valid
+        // entry, never index past the table.
+        for (const int raw : {0, -1, 6, 7, 8, 1000, std::numeric_limits<int>::min()}) {
+            INFO("popup value " << raw);
+            CHECK(sanitiseResolution(raw) == Resolution::MatchSequence);
+        }
+        for (int raw = 1; raw <= OSV_REFRAME_RESOLUTION_COUNT; ++raw) {
+            CHECK(static_cast<int>(sanitiseResolution(raw)) == raw);
+        }
+    }
 }
 
-TEST_CASE("computeViewport centres the largest rectangle of the requested shape", "[reframe][geometry]") {
-    SECTION("a 16:9 picture in a 16:9 frame fills it") {
-        const Viewport v = computeViewport(1920, 1080, 16.0 / 9.0);
+TEST_CASE("computeViewport always covers the whole frame", "[reframe][geometry]") {
+    // The letterbox is gone ON PURPOSE: a virtual camera fills its sensor, so
+    // the painted rectangle is the frame for every size and shape.  (The old
+    // expectations - a centred 2.35:1 box with bars, a pillarboxed 9:16 box -
+    // described exactly the behaviour the user asked to remove.)
+    for (const SizePx frame : {SizePx{1920, 1080}, SizePx{1080, 1920}, SizePx{400, 400}, SizePx{1, 1},
+                               SizePx{6000, 3000}, SizePx{321, 241}}) {
+        INFO("frame " << frame.w << "x" << frame.h);
+        const Viewport v = computeViewport(frame.w, frame.h);
         CHECK(v.x == 0);
         CHECK(v.y == 0);
-        CHECK(v.w == 1920);
-        CHECK(v.h == 1080);
+        CHECK(v.w == frame.w);
+        CHECK(v.h == frame.h);
     }
 
-    SECTION("a wider picture letterboxes") {
-        const Viewport v = computeViewport(1920, 1080, 2.35);
-        CHECK(v.w == 1920);
-        CHECK(v.h == static_cast<int>(std::lround(1920.0 / 2.35)));
-        CHECK(v.x == 0);
-        CHECK(v.y == (1080 - v.h) / 2);
-        CHECK(v.h < 1080);
-    }
-
-    SECTION("a taller picture pillarboxes") {
-        const Viewport v = computeViewport(1920, 1080, 9.0 / 16.0);
-        CHECK(v.h == 1080);
-        CHECK(v.w == static_cast<int>(std::lround(1080.0 * 9.0 / 16.0)));
-        CHECK(v.y == 0);
-        CHECK(v.x == (1920 - v.w) / 2);
-    }
-
-    SECTION("a square picture in a wide frame") {
-        const Viewport v = computeViewport(1920, 1080, 1.0);
-        CHECK(v.w == 1080);
-        CHECK(v.h == 1080);
-        CHECK(v.x == 420);
-        CHECK(v.y == 0);
-    }
-
-    SECTION("degenerate inputs never produce an out-of-frame rectangle") {
-        for (const double ratio : {0.0, -1.0, std::nan(""), std::numeric_limits<double>::infinity()}) {
-            const Viewport v = computeViewport(640, 480, ratio);
-            CHECK(v.w > 0);
-            CHECK(v.h > 0);
-            CHECK(v.x >= 0);
-            CHECK(v.y >= 0);
-            CHECK(v.x + v.w <= 640);
-            CHECK(v.y + v.h <= 480);
-        }
-        // A zero-sized frame yields a zero-sized viewport, which buildParams
-        // treats as invalid rather than dividing by it.
-        const Viewport empty = computeViewport(0, 0, 1.0);
+    // A degenerate frame yields a zero-sized viewport, which buildParams
+    // treats as invalid rather than dividing by.
+    for (const SizePx bad : {SizePx{0, 0}, SizePx{0, 480}, SizePx{640, 0}, SizePx{-640, 480}}) {
+        const Viewport empty = computeViewport(bad.w, bad.h);
         CHECK(empty.w == 0);
         CHECK(empty.h == 0);
     }
+}
 
-    SECTION("the rectangle always fits, for every aspect in the table") {
-        for (const AspectEntry& e : kAspects) {
-            const double ratio = resolveAspectRatio(e.value, 16.0 / 9.0, 1920.0 / 1080.0);
-            const Viewport v = computeViewport(1920, 1080, ratio);
-            INFO("aspect '" << e.label << "' ratio " << ratio);
-            CHECK(v.x + v.w <= 1920);
-            CHECK(v.y + v.h <= 1080);
-            // And it is the LARGEST such rectangle: growing either edge by
-            // two pixels (one per side, keeping it centred) would overflow.
-            CHECK((v.w + 2 > 1920 || v.h + 2 > 1080));
+// ===========================================================================
+//  The automatic projection ramp
+// ===========================================================================
+TEST_CASE("autoEyeOffsetForFov is a smoothstep from 120 to 240 degrees", "[reframe][geometry][autoproj]") {
+    SECTION("ordinary shots are untouched") {
+        // At and below the start the ramp contributes exactly nothing, so a
+        // rectilinear Dewarping shot stays rectilinear.
+        for (const double fov : {10.0, 30.0, 60.0, 95.0, 119.999, 120.0}) {
+            INFO("fov " << fov);
+            CHECK(autoEyeOffsetForFov(fov) == 0.0);
         }
+    }
+
+    SECTION("wide shots reach full stereographic") {
+        for (const double fov : {240.0, 240.001, 300.0, 350.0, 1.0e9}) {
+            INFO("fov " << fov);
+            CHECK(autoEyeOffsetForFov(fov) == 1.0);
+        }
+    }
+
+    SECTION("the curve is the documented smoothstep") {
+        // t = (fov - 120) / 120, d = t^2 (3 - 2t).
+        for (const double fov : {130.0, 150.0, 180.0, 200.0, 230.0}) {
+            const double t = (fov - OSV_REFRAME_AUTO_EYE_FOV_START) /
+                             (OSV_REFRAME_AUTO_EYE_FOV_FULL - OSV_REFRAME_AUTO_EYE_FOV_START);
+            INFO("fov " << fov);
+            CHECK(autoEyeOffsetForFov(fov) == Approx(t * t * (3.0 - 2.0 * t)).margin(1e-12));
+        }
+        // Symmetric about the midpoint, which is exactly one half.
+        CHECK(autoEyeOffsetForFov(180.0) == Approx(0.5).margin(1e-12));
+    }
+
+    SECTION("it is monotonic and continuous - no pop anywhere in the slider range") {
+        // Walk the whole valid range in 0.01 degree steps.  Continuity is
+        // checked as a Lipschitz bound: smoothstep's steepest slope is
+        // 1.5 / 120 per degree (at the midpoint), so no 0.01 degree step may
+        // move d by more than 1.25e-4, plus a hair of slack for rounding.
+        double previous = autoEyeOffsetForFov(OSV_REFRAME_FOV_VALID_MIN);
+        double worstStep = 0.0;
+        for (double fov = OSV_REFRAME_FOV_VALID_MIN + 0.01; fov <= OSV_REFRAME_FOV_VALID_MAX; fov += 0.01) {
+            const double d = autoEyeOffsetForFov(fov);
+            REQUIRE(d >= previous);  // never ramps backwards
+            worstStep = std::max(worstStep, d - previous);
+            previous = d;
+        }
+        INFO("largest change of d over a 0.01 degree step: " << worstStep);
+        CHECK(worstStep < 1.26e-4);
+    }
+
+    SECTION("it eases in and out: zero slope at both joins") {
+        // This is the property that makes the joins invisible.  A linear ramp
+        // would change d at 1/120 per degree the instant FOV crossed 120; the
+        // smoothstep's slope there is zero, so the first tenth of a degree
+        // past each join moves d by a vanishing amount.
+        const double justPastStart = autoEyeOffsetForFov(OSV_REFRAME_AUTO_EYE_FOV_START + 0.1);
+        const double justBeforeFull = autoEyeOffsetForFov(OSV_REFRAME_AUTO_EYE_FOV_FULL - 0.1);
+        CHECK(justPastStart < 3.0e-6);  // a linear ramp would give 8.3e-4
+        CHECK(1.0 - justBeforeFull < 3.0e-6);
+    }
+
+    SECTION("garbage gives the identity, not a NaN") {
+        CHECK(autoEyeOffsetForFov(std::nan("")) == 0.0);
+        CHECK(autoEyeOffsetForFov(std::numeric_limits<double>::infinity()) == 0.0);
+        CHECK(autoEyeOffsetForFov(-std::numeric_limits<double>::infinity()) == 0.0);
+    }
+}
+
+TEST_CASE("effectiveEyeOffset lets the user exceed the ramp but never undercut it", "[reframe][geometry][autoproj]") {
+    SECTION("below the ramp the slider is used verbatim") {
+        CHECK(effectiveEyeOffset(0.0, 90.0) == 0.0);
+        CHECK(effectiveEyeOffset(15.0, 120.0) == Approx(0.15));
+        CHECK(effectiveEyeOffset(100.0, 60.0) == Approx(1.0));
+    }
+
+    SECTION("a user who never touches Distortion still gets stereographic when zoomed out") {
+        CHECK(effectiveEyeOffset(0.0, 180.0) == Approx(0.5));
+        CHECK(effectiveEyeOffset(0.0, 240.0) == 1.0);
+        CHECK(effectiveEyeOffset(0.0, 300.0) == 1.0);
+    }
+
+    SECTION("asking for MORE than the ramp always wins") {
+        // 40% at 150 deg: the ramp only wants ~0.156 there.
+        CHECK(effectiveEyeOffset(40.0, 150.0) == Approx(0.4));
+        CHECK(effectiveEyeOffset(100.0, 130.0) == Approx(1.0));
+    }
+
+    SECTION("every preset renders at exactly the distortion it writes") {
+        // The presets were tuned by eye before the ramp existed.  With a
+        // MAXIMUM, none of them is overridden: each one's own distortion is
+        // already at or above the ramp's floor at its own FOV.
+        for (const PresetEntry& e : kPresetTable) {
+            if (!e.writesControls) {
+                continue;
+            }
+            INFO("preset '" << e.label << "' fov " << e.fovDeg << " distortion " << e.distortion);
+            CHECK(effectiveEyeOffset(e.distortion, e.fovDeg) == Approx(e.distortion / 100.0).margin(1e-12));
+        }
+    }
+
+    SECTION("the result is always a valid eye offset") {
+        const double nan = std::nan("");
+        const double inf = std::numeric_limits<double>::infinity();
+        for (const double dist : {nan, inf, -inf, -50.0, 0.0, 50.0, 100.0, 250.0}) {
+            for (const double fov : {nan, inf, -inf, -10.0, 0.0, 90.0, 180.0, 350.0, 1.0e6}) {
+                INFO("distortion " << dist << " fov " << fov);
+                const double d = effectiveEyeOffset(dist, fov);
+                CHECK(std::isfinite(d));
+                CHECK(d >= 0.0);
+                CHECK(d <= 1.0);
+            }
+        }
+    }
+}
+
+TEST_CASE("the ramp keeps every slider FOV renderable without the invertibility clamp",
+          "[reframe][geometry][autoproj]") {
+    // The eye-offset model can only be inverted below 2 acos(-d), and
+    // VirtualCamera silently CLAMPS a wider request - so before the ramp, a
+    // user at Distortion 0 who dragged FOV past 179 degrees got 179 degrees,
+    // however far they dragged.  With the ramp as a floor on d, the requested
+    // field of view is the RENDERED field of view across the whole valid
+    // range, for a user who never touches Distortion at all.
+    for (double fov = OSV_REFRAME_FOV_VALID_MIN; fov <= OSV_REFRAME_FOV_VALID_MAX; fov += 0.5) {
+        osv::geom::VirtualCamera camera;
+        camera.projection = osv::geom::Projection::EyeOffset;
+        camera.w = 1920;
+        camera.h = 1080;
+        camera.hfovDeg = fov;
+        camera.eyeOffset = effectiveEyeOffset(0.0, fov);
+        INFO("fov " << fov << " d " << camera.eyeOffset);
+        CHECK(camera.effectiveHfovDeg() == Approx(fov).margin(1e-9));
     }
 }
 
@@ -193,29 +348,29 @@ TEST_CASE("buildParams rejects everything it cannot render", "[reframe][geometry
     SECTION("a null source") {
         ConstFrameView bad = src.view;
         bad.base = nullptr;
-        CHECK_FALSE(buildParams(s, bad, 640, 360, 0.0).valid);
+        CHECK_FALSE(buildParams(s, bad, 640, 360, SizePx{}).valid);
     }
     SECTION("a zero-sized source") {
         ConstFrameView bad = src.view;
         bad.width = 0;
-        CHECK_FALSE(buildParams(s, bad, 640, 360, 0.0).valid);
+        CHECK_FALSE(buildParams(s, bad, 640, 360, SizePx{}).valid);
     }
     SECTION("a pitch too small for one row") {
         ConstFrameView bad = src.view;
         bad.rowBytes = 16;  // one pixel, not 1024
-        CHECK_FALSE(buildParams(s, bad, 640, 360, 0.0).valid);
+        CHECK_FALSE(buildParams(s, bad, 640, 360, SizePx{}).valid);
     }
     SECTION("an 8-bit source (the kernel's sampler reads float or half only)") {
         ConstFrameView bad = src.view;
         bad.layout = PixelLayout::Bgra8u;
-        CHECK_FALSE(buildParams(s, bad, 640, 360, 0.0).valid);
+        CHECK_FALSE(buildParams(s, bad, 640, 360, SizePx{}).valid);
     }
     SECTION("a zero-sized output") {
-        CHECK_FALSE(buildParams(s, src.view, 0, 360, 0.0).valid);
-        CHECK_FALSE(buildParams(s, src.view, 640, 0, 0.0).valid);
+        CHECK_FALSE(buildParams(s, src.view, 0, 360, SizePx{}).valid);
+        CHECK_FALSE(buildParams(s, src.view, 640, 0, SizePx{}).valid);
     }
     SECTION("an absurd output size") {
-        CHECK_FALSE(buildParams(s, src.view, 1 << 20, 360, 0.0).valid);
+        CHECK_FALSE(buildParams(s, src.view, 1 << 20, 360, SizePx{}).valid);
     }
 }
 
@@ -245,7 +400,7 @@ TEST_CASE("buildParams accepts exactly the source layouts the kernel can address
     SECTION("top-down with a positive pitch is the ordinary case") {
         const ConstFrameView v = makeView(first, pitch, true);
         CHECK(sourceRowsRunForward(v));
-        const KernelSetup setup = buildParams(baseSettings(), v, 320, 180, 0.0);
+        const KernelSetup setup = buildParams(baseSettings(), v, 320, 180, SizePx{});
         REQUIRE(setup.valid);
         CHECK(setup.sourceRow0 == first);
         CHECK(setup.source.pitchBytes == pitch);
@@ -256,7 +411,7 @@ TEST_CASE("buildParams accepts exactly the source layouts the kernel can address
         // so image row 0 is at `last` and image row 1 is at `last + pitch`.
         const ConstFrameView v = makeView(last, -pitch, false);
         CHECK(sourceRowsRunForward(v));
-        const KernelSetup setup = buildParams(baseSettings(), v, 320, 180, 0.0);
+        const KernelSetup setup = buildParams(baseSettings(), v, 320, 180, SizePx{});
         REQUIRE(setup.valid);
         // ...which is byte for byte the top-down description above.
         CHECK(setup.sourceRow0 == first);
@@ -277,7 +432,7 @@ TEST_CASE("buildParams accepts exactly the source layouts the kernel can address
         // Top-down base with rows running backwards.
         const ConstFrameView backwards = makeView(last, -pitch, true);
         CHECK_FALSE(sourceRowsRunForward(backwards));
-        const KernelSetup bw = buildParams(baseSettings(), backwards, 320, 180, 0.0);
+        const KernelSetup bw = buildParams(baseSettings(), backwards, 320, 180, SizePx{});
         REQUIRE(bw.valid);
         CHECK(bw.source.flipY == 1);
         CHECK(bw.source.pitchBytes == pitch);
@@ -288,7 +443,7 @@ TEST_CASE("buildParams accepts exactly the source layouts the kernel can address
         // Bottom-up storage with a forward pitch.
         const ConstFrameView upsideDown = makeView(first, pitch, false);
         CHECK_FALSE(sourceRowsRunForward(upsideDown));
-        const KernelSetup ud = buildParams(baseSettings(), upsideDown, 320, 180, 0.0);
+        const KernelSetup ud = buildParams(baseSettings(), upsideDown, 320, 180, SizePx{});
         REQUIRE(ud.valid);
         CHECK(ud.source.flipY == 1);
         CHECK(ud.source.pitchBytes == pitch);
@@ -317,8 +472,8 @@ TEST_CASE("buildParams accepts exactly the source layouts the kernel can address
         // renderCpu, not to refuse the frame.
         const ConstFrameView upright = makeView(first, pitch, true);
         const ConstFrameView flipped = makeView(last, -pitch, true);
-        const KernelSetup up = buildParams(baseSettings(), upright, 128, 96, 0.0);
-        const KernelSetup fl = buildParams(baseSettings(), flipped, 128, 96, 0.0);
+        const KernelSetup up = buildParams(baseSettings(), upright, 128, 96, SizePx{});
+        const KernelSetup fl = buildParams(baseSettings(), flipped, 128, 96, SizePx{});
         REQUIRE(up.valid);
         REQUIRE(fl.valid);
         CHECK(up.source.flipY == 0);
@@ -372,8 +527,8 @@ TEST_CASE("buildParams accepts exactly the source layouts the kernel can address
     }
 
     SECTION("the two accepted descriptions render identically") {
-        const KernelSetup a = buildParams(baseSettings(), makeView(first, pitch, true), 128, 96, 0.0);
-        const KernelSetup b = buildParams(baseSettings(), makeView(last, -pitch, false), 128, 96, 0.0);
+        const KernelSetup a = buildParams(baseSettings(), makeView(first, pitch, true), 128, 96, SizePx{});
+        const KernelSetup b = buildParams(baseSettings(), makeView(last, -pitch, false), 128, 96, SizePx{});
         REQUIRE(a.valid);
         REQUIRE(b.valid);
         for (int y = 0; y < 96; y += 7) {
@@ -399,7 +554,7 @@ TEST_CASE("buildParams clamps hostile parameter values", "[reframe][geometry]") 
         s.tiltDeg = std::nan("");
         s.fovDeg = std::nan("");
         s.distortion = std::nan("");
-        const KernelSetup setup = buildParams(s, src.view, 320, 180, 0.0);
+        const KernelSetup setup = buildParams(s, src.view, 320, 180, SizePx{});
         REQUIRE(setup.valid);
         CHECK(std::isfinite(setup.params.focalPx));
         CHECK(setup.params.focalPx > 0.0f);
@@ -411,9 +566,9 @@ TEST_CASE("buildParams clamps hostile parameter values", "[reframe][geometry]") 
     SECTION("tilt is clamped to the poles") {
         Settings s = baseSettings();
         s.tiltDeg = 1000.0;
-        const KernelSetup a = buildParams(s, src.view, 320, 180, 0.0);
+        const KernelSetup a = buildParams(s, src.view, 320, 180, SizePx{});
         s.tiltDeg = 90.0;
-        const KernelSetup b = buildParams(s, src.view, 320, 180, 0.0);
+        const KernelSetup b = buildParams(s, src.view, 320, 180, SizePx{});
         REQUIRE(a.valid);
         REQUIRE(b.valid);
         // A tilt past the pole is the same camera as a tilt at the pole.
@@ -422,14 +577,43 @@ TEST_CASE("buildParams clamps hostile parameter values", "[reframe][geometry]") 
         }
     }
 
-    SECTION("the field of view is clamped so the eye-offset model stays invertible") {
+    SECTION("an extreme field of view at Distortion 0 renders instead of degenerating") {
+        // This used to be a test of the invertibility CLAMP: at d = 0 the
+        // model degenerates at 180 degrees, so a 350 degree request was cut
+        // back to 179.  The automatic ramp changed the premise on purpose -
+        // Distortion 0 no longer means d = 0 once FOV passes 120 degrees; at
+        // 350 the ramp has reached d = 1, which is invertible up to 359.  So
+        // the camera must now be finite AND render the full 350 degrees:
+        // its focal length is the unclamped eye-offset focal at d = 1,
+        //     f = (W/2) (d + cos(fov/2)) / ((1 + d) sin(fov/2)).
         Settings s = baseSettings();
-        s.distortion = 0.0;   // d = 0: the model degenerates at 180 degrees
-        s.fovDeg = 350.0;     // far beyond it
-        const KernelSetup setup = buildParams(s, src.view, 320, 180, 0.0);
+        s.distortion = 0.0;
+        s.fovDeg = 350.0;
+        const KernelSetup setup = buildParams(s, src.view, 320, 180, SizePx{});
         REQUIRE(setup.valid);
         CHECK(std::isfinite(setup.params.focalPx));
         CHECK(setup.params.focalPx > 0.0f);
+        CHECK(setup.params.eyeOffset == 1.0f);
+        const double half = 0.5 * 350.0 * 3.14159265358979323846 / 180.0;
+        const double expectedFocal = 160.0 * (1.0 + std::cos(half)) / (2.0 * std::sin(half));
+        CHECK(setup.params.focalPx == Approx(expectedFocal).epsilon(1e-5));
+    }
+
+    SECTION("the eye offset handed to the kernel is effectiveEyeOffset()") {
+        // Distortion and FOV reach the kernel through exactly one function,
+        // so the CPU path, the GPU path (which shares buildParams) and the
+        // tests above cannot disagree about the curve.
+        for (const double fov : {60.0, 120.0, 150.0, 180.0, 239.0, 300.0}) {
+            for (const double dist : {0.0, 15.0, 60.0, 100.0}) {
+                Settings s = baseSettings();
+                s.fovDeg = fov;
+                s.distortion = dist;
+                const KernelSetup setup = buildParams(s, src.view, 320, 180, SizePx{});
+                INFO("fov " << fov << " distortion " << dist);
+                REQUIRE(setup.valid);
+                CHECK(setup.params.eyeOffset == static_cast<float>(effectiveEyeOffset(dist, fov)));
+            }
+        }
     }
 }
 
@@ -442,7 +626,12 @@ TEST_CASE("renderCpu reproduces osvReframeEquirectPixel exactly", "[reframe][cpu
     // kernel's own answer.
     PackedSource src(panorama(), panorama().width * 16);
     Settings s = baseSettings();
-    s.aspect = Aspect::Ratio16x9;
+    // A 16:9 resolution on the 4:3 frame below.  This used to be a 16:9
+    // LETTERBOX, which made the anchor cover transparent-bar pixels too; with
+    // the letterbox gone the same shape mismatch now exercises the cover-fit
+    // (a focal length scaled by 4/3), so the anchor still covers the
+    // non-trivial geometry path rather than only the identity.
+    s.resolution = Resolution::Fhd1920x1080;
     s.panDeg = 37.0;
     s.tiltDeg = -12.0;
     s.rollDeg = 5.0;
@@ -451,8 +640,17 @@ TEST_CASE("renderCpu reproduces osvReframeEquirectPixel exactly", "[reframe][cpu
 
     constexpr int kW = 320;
     constexpr int kH = 240;
-    const KernelSetup setup = buildParams(s, src.view, kW, kH, 0.0);
+    const KernelSetup setup = buildParams(s, src.view, kW, kH, SizePx{});
     REQUIRE(setup.valid);
+    // Prove the cover-fit really is in play, so this anchor cannot silently
+    // degrade into the identity case.
+    const KernelSetup identity = [&] {
+        Settings same = s;
+        same.resolution = kFillFrame;
+        return buildParams(same, src.view, kW, kH, SizePx{});
+    }();
+    REQUIRE(identity.valid);
+    CHECK(setup.params.focalPx == Approx(identity.params.focalPx * (1920.0 * kH) / (1080.0 * kW)).epsilon(1e-6));
 
     std::vector<std::uint8_t> out(static_cast<std::size_t>(kW) * kH * 16u, 0u);
     FrameView dst;
@@ -490,7 +688,7 @@ TEST_CASE("renderCpu gives the same picture with and without the thread pool", "
 
     constexpr int kW = 256;
     constexpr int kH = 144;
-    const KernelSetup setup = buildParams(s, src.view, kW, kH, 0.0);
+    const KernelSetup setup = buildParams(s, src.view, kW, kH, SizePx{});
     REQUIRE(setup.valid);
 
     auto render = [&](osv::ThreadPool* pool) {
@@ -514,7 +712,7 @@ TEST_CASE("renderCpu gives the same picture with and without the thread pool", "
 
 TEST_CASE("renderCpu refuses a mismatched destination without writing anything", "[reframe][cpu]") {
     PackedSource src(panorama(), panorama().width * 16);
-    const KernelSetup setup = buildParams(baseSettings(), src.view, 320, 180, 0.0);
+    const KernelSetup setup = buildParams(baseSettings(), src.view, 320, 180, SizePx{});
     REQUIRE(setup.valid);
 
     constexpr std::uint8_t kSentinel = 0xA5;
@@ -555,7 +753,7 @@ TEST_CASE("the centre pixel reports the direction the camera is pointed at", "[r
         s.panDeg = c.pan;
         s.tiltDeg = c.tilt;
 
-        const KernelSetup setup = buildParams(s, src.view, kW, kH, 0.0);
+        const KernelSetup setup = buildParams(s, src.view, kW, kH, SizePx{});
         REQUIRE(setup.valid);
 
         float centre[4];
@@ -579,7 +777,7 @@ TEST_CASE("panning moves the picture and wrapping round returns it", "[reframe][
     auto centreColour = [&](double pan) {
         Settings s = baseSettings();
         s.panDeg = pan;
-        const KernelSetup setup = buildParams(s, src.view, kW, kH, 0.0);
+        const KernelSetup setup = buildParams(s, src.view, kW, kH, SizePx{});
         REQUIRE(setup.valid);
         float rgba[4];
         REQUIRE(renderPixel(setup, src.view, kW / 2, kH / 2, rgba));
@@ -608,7 +806,7 @@ TEST_CASE("the longitude seam is sampled without a discontinuity", "[reframe][cp
 
     constexpr int kW = 201;
     constexpr int kH = 101;
-    const KernelSetup setup = buildParams(s, src.view, kW, kH, 0.0);
+    const KernelSetup setup = buildParams(s, src.view, kW, kH, SizePx{});
     REQUIRE(setup.valid);
 
     // Walk the centre row across the seam.  R encodes longitude, which jumps
@@ -634,123 +832,221 @@ TEST_CASE("the longitude seam is sampled without a discontinuity", "[reframe][cp
 }
 
 // ===========================================================================
-//  The letterbox
+//  Coverage and cover-fit (these replaced the letterbox tests)
+//
+//  The letterbox was removed ON PURPOSE - the user's requirement is that the
+//  reframe always fills the output frame.  The old tests asserted transparent
+//  bars above and below a 2.35:1 picture and a distinct letterbox per aspect
+//  entry; those expectations describe precisely the behaviour that was asked
+//  to go, so they are replaced rather than loosened.  The new tests are at
+//  least as strict: they check EVERY pixel's alpha rather than a few rows,
+//  and they pin the cover-fit geometry to a closed-form angle.
 // ===========================================================================
-TEST_CASE("the letterbox is transparent and the picture is opaque", "[reframe][cpu][geometry]") {
-    PackedSource src(panorama(), panorama().width * 16);
+namespace {
 
-    // A tall frame with a wide picture: bars top and bottom.
-    constexpr int kW = 400;
-    constexpr int kH = 400;
-    Settings s = baseSettings();
-    s.aspect = Aspect::Ratio235x1;
-
-    const KernelSetup setup = buildParams(s, src.view, kW, kH, 0.0);
-    REQUIRE(setup.valid);
-    const Viewport view = computeViewport(kW, kH, 2.35);
-    REQUIRE(view.h < kH);
-    REQUIRE(view.w == kW);
-
-    std::vector<std::uint8_t> out(static_cast<std::size_t>(kW) * kH * 16u, 0u);
+/// Render a whole frame into a packed 32f buffer; REQUIREs success.
+std::vector<std::uint8_t> renderWhole(const KernelSetup& setup, const ConstFrameView& src, int w, int h) {
+    std::vector<std::uint8_t> out(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 16u, 0u);
     FrameView dst;
     dst.base = out.data();
-    dst.rowBytes = kW * 16;
-    dst.width = kW;
-    dst.height = kH;
+    dst.rowBytes = w * 16;
+    dst.width = w;
+    dst.height = h;
     dst.layout = PixelLayout::Bgra32f;
     dst.topDown = true;
-    REQUIRE(renderCpu(setup, src.view, dst, nullptr));
+    REQUIRE(renderCpu(setup, src, dst, nullptr));
+    return out;
+}
 
-    SECTION("outside the viewport every channel is zero") {
-        // A row above the picture and a row below it.
-        for (const int y : {0, view.y - 1, view.y + view.h, kH - 1}) {
-            if (y < 0 || y >= kH) {
-                continue;
+/// Horizontal angle (deg) between the centre-row pixel `x` and the frame
+/// centre, read back from the labelled panorama.  With the camera level and
+/// rectilinear, this is exactly atan(dx / focal).
+double horizontalAngleFromCentre(const std::vector<std::uint8_t>& out, int w, int h, int x) {
+    float centre[4];
+    float edge[4];
+    readPixelBgra32f(out.data(), w * 16, w / 2, h / 2, centre);
+    readPixelBgra32f(out.data(), w * 16, x, h / 2, edge);
+    return std::fabs(angleDelta(lonOf(edge), lonOf(centre)));
+}
+
+}  // namespace
+
+TEST_CASE("every resolution fills every pixel of the frame", "[reframe][cpu][geometry]") {
+    PackedSource src(panorama(), panorama().width * 16);
+
+    // A square frame, a tall frame and a wide one: every entry is a
+    // different shape from at least two of them, so each one is exercised
+    // in both cover-fit directions.  Odd sizes catch an off-by-one at the
+    // far edge.
+    for (const SizePx frame : {SizePx{121, 121}, SizePx{91, 161}, SizePx{201, 85}}) {
+        for (const ResolutionEntry& e : kResolutions) {
+            INFO("frame " << frame.w << "x" << frame.h << ", resolution '" << e.label << "'");
+            Settings s = baseSettings();
+            s.resolution = e.value;
+            // Give "Match Sequence" a shape unlike every frame so it takes
+            // the cover-fit path as well, not only the identity.
+            const KernelSetup setup = buildParams(s, src.view, frame.w, frame.h, SizePx{3000, 1000});
+            REQUIRE(setup.valid);
+
+            // The painted rectangle is the frame itself...
+            CHECK(setup.params.viewX == 0);
+            CHECK(setup.params.viewY == 0);
+            CHECK(setup.params.viewW == frame.w);
+            CHECK(setup.params.viewH == frame.h);
+
+            // ...and every single pixel of it carries the panorama, which is
+            // opaque.  A letterbox bar, a pillarbox or an unpainted edge row
+            // would all show up here as alpha 0.
+            const std::vector<std::uint8_t> out = renderWhole(setup, src.view, frame.w, frame.h);
+            int transparent = 0;
+            for (int y = 0; y < frame.h; ++y) {
+                for (int x = 0; x < frame.w; ++x) {
+                    float rgba[4];
+                    readPixelBgra32f(out.data(), frame.w * 16, x, y, rgba);
+                    if (!(rgba[3] > 0.999f)) {
+                        ++transparent;
+                    }
+                }
             }
-            INFO("letterbox row " << y);
-            for (int x = 0; x < kW; x += 17) {
-                float rgba[4];
-                readPixelBgra32f(out.data(), dst.rowBytes, x, y, rgba);
-                CHECK(rgba[0] == 0.0f);
-                CHECK(rgba[1] == 0.0f);
-                CHECK(rgba[2] == 0.0f);
-                // Transparent, not black-opaque: that is what
-                // PF_OutFlag2_REVEALS_ZERO_ALPHA promises the host.
-                CHECK(rgba[3] == 0.0f);
-            }
+            CHECK(transparent == 0);
         }
-    }
-
-    SECTION("inside the viewport alpha is the panorama's, which is 1") {
-        for (int y = view.y + 2; y < view.y + view.h - 2; y += 13) {
-            for (int x = 2; x < kW - 2; x += 29) {
-                float rgba[4];
-                readPixelBgra32f(out.data(), dst.rowBytes, x, y, rgba);
-                INFO("picture pixel " << x << "," << y);
-                CHECK(rgba[3] == Approx(1.0).margin(1e-5));
-            }
-        }
-    }
-
-    SECTION("the boundary is exactly where computeViewport says") {
-        float insideTop[4];
-        float outsideTop[4];
-        readPixelBgra32f(out.data(), dst.rowBytes, kW / 2, view.y, insideTop);
-        readPixelBgra32f(out.data(), dst.rowBytes, kW / 2, view.y - 1, outsideTop);
-        CHECK(insideTop[3] > 0.5f);
-        CHECK(outsideTop[3] == 0.0f);
     }
 }
 
-TEST_CASE("every aspect produces its own letterbox", "[reframe][cpu][geometry]") {
+TEST_CASE("a resolution of the frame's own shape is exactly the identity", "[reframe][cpu][geometry]") {
+    // "Match Sequence" and every preview-scaled frame land here: Premiere
+    // renders a 1920x1080 sequence at 960x540 or 480x270 while scrubbing,
+    // and the picture must be the SAME picture, only smaller.  The cover-fit
+    // test is exact integer arithmetic, so the setup must be bit-identical to
+    // the frame-only one - not merely close.
     PackedSource src(panorama(), panorama().width * 16);
+    Settings s = baseSettings();
+    s.fovDeg = 100.0;
+    s.distortion = 20.0;
+    s.panDeg = 33.0;
+
     constexpr int kW = 480;
-    constexpr int kH = 270;  // a 16:9 frame
+    constexpr int kH = 270;
+    const KernelSetup reference = buildParams(s, src.view, kW, kH, SizePx{});
+    REQUIRE(reference.valid);
 
-    for (const AspectEntry& e : kAspects) {
-        INFO("aspect '" << e.label << "'");
-        Settings s = baseSettings();
-        s.aspect = e.value;
-        // Give "Match Sequence" a square sequence so it differs from the
-        // 16:9 frame and the test actually exercises the lookup.
-        const double sequenceAspect = 1.0;
-
-        const KernelSetup setup = buildParams(s, src.view, kW, kH, sequenceAspect);
+    struct Case {
+        Resolution resolution;
+        SizePx sequence;
+        const char* what;
+    };
+    const Case cases[] = {
+        {Resolution::MatchSequence, SizePx{1920, 1080}, "Match Sequence, quarter-resolution preview"},
+        {Resolution::MatchSequence, SizePx{3840, 2160}, "Match Sequence, UHD sequence"},
+        {Resolution::Uhd3840x2160, SizePx{}, "3840 x 2160"},
+        {Resolution::Qhd2560x1440, SizePx{}, "2560 x 1440"},
+        {Resolution::Fhd1920x1080, SizePx{}, "1920 x 1080"},
+        {Resolution::Hd1280x720, SizePx{}, "1280 x 720"},
+    };
+    for (const Case& c : cases) {
+        INFO(c.what);
+        Settings t = s;
+        t.resolution = c.resolution;
+        const KernelSetup setup = buildParams(t, src.view, kW, kH, c.sequence);
         REQUIRE(setup.valid);
-
-        const double ratio = resolveAspectRatio(e.value, sequenceAspect, static_cast<double>(kW) / kH);
-        const Viewport expected = computeViewport(kW, kH, ratio);
-        CHECK(setup.params.viewX == expected.x);
-        CHECK(setup.params.viewY == expected.y);
-        CHECK(setup.params.viewW == expected.w);
-        CHECK(setup.params.viewH == expected.h);
-
-        // Render and confirm the alpha boundary matches the rectangle.
-        std::vector<std::uint8_t> out(static_cast<std::size_t>(kW) * kH * 16u, 0u);
-        FrameView dst;
-        dst.base = out.data();
-        dst.rowBytes = kW * 16;
-        dst.width = kW;
-        dst.height = kH;
-        dst.layout = PixelLayout::Bgra32f;
-        dst.topDown = true;
-        REQUIRE(renderCpu(setup, src.view, dst, nullptr));
-
-        float inside[4];
-        readPixelBgra32f(out.data(), dst.rowBytes, expected.x + expected.w / 2, expected.y + expected.h / 2, inside);
-        CHECK(inside[3] > 0.5f);
-
-        if (expected.x > 0) {
-            float outside[4];
-            readPixelBgra32f(out.data(), dst.rowBytes, expected.x - 1, expected.y + expected.h / 2, outside);
-            CHECK(outside[3] == 0.0f);
-        }
-        if (expected.y > 0) {
-            float outside[4];
-            readPixelBgra32f(out.data(), dst.rowBytes, expected.x + expected.w / 2, expected.y - 1, outside);
-            CHECK(outside[3] == 0.0f);
+        CHECK(setup.params.focalPx == reference.params.focalPx);
+        CHECK(setup.params.eyeOffset == reference.params.eyeOffset);
+        CHECK(setup.params.tanHalfH == reference.params.tanHalfH);
+        CHECK(setup.params.tanHalfV == reference.params.tanHalfV);
+        for (int i = 0; i < 9; ++i) {
+            CHECK(setup.params.Rout[i] == reference.params.Rout[i]);
         }
     }
+}
+
+TEST_CASE("a WIDER resolution crops the sides and keeps FOV across its own width", "[reframe][cpu][geometry]") {
+    // A 16:9 deliverable framed on a square frame.  The field of view spans
+    // the width of the 16:9 image; that image is scaled until its HEIGHT
+    // fills the frame, and the overflowing sides are cropped - no bars.
+    //
+    // Rectilinear at 90 degrees keeps the maths closed-form:
+    //     identity:  f = (W/2) / tan(45) = W/2
+    //     cover:     f' = f * (16/9) / (W/H)            (here W = H)
+    // and the centre-row pixel x sits at atan((x + 0.5 - W/2) / f) from the
+    // centre, which the labelled panorama reports directly.
+    PackedSource src(panorama(), panorama().width * 16);
+    constexpr int kW = 401;
+    constexpr int kH = 401;
+    Settings s = baseSettings();  // fov 90, distortion 0
+
+    const KernelSetup fill = buildParams(s, src.view, kW, kH, SizePx{});
+    s.resolution = Resolution::Fhd1920x1080;
+    const KernelSetup cover = buildParams(s, src.view, kW, kH, SizePx{});
+    REQUIRE(fill.valid);
+    REQUIRE(cover.valid);
+
+    const double scale = (1920.0 * kH) / (1080.0 * kW);
+    CHECK(fill.params.focalPx == Approx(kW / 2.0).epsilon(1e-5));
+    CHECK(cover.params.focalPx == Approx(fill.params.focalPx * scale).epsilon(1e-6));
+
+    const std::vector<std::uint8_t> fillOut = renderWhole(fill, src.view, kW, kH);
+    const std::vector<std::uint8_t> coverOut = renderWhole(cover, src.view, kW, kH);
+
+    // The right-hand edge pixel: 44.9 degrees from centre when FOV spans the
+    // frame, but only ~29.4 degrees under the 16:9 cover-fit, because the
+    // other 15.5 degrees on each side are the cropped part of the wider image.
+    const double dx = (kW - 1) + 0.5 - kW / 2.0;
+    const double expectFill = std::atan(dx / fill.params.focalPx) * 180.0 / 3.14159265358979323846;
+    const double expectCover = std::atan(dx / cover.params.focalPx) * 180.0 / 3.14159265358979323846;
+    CHECK(horizontalAngleFromCentre(fillOut, kW, kH, kW - 1) == Approx(expectFill).margin(0.5));
+    CHECK(horizontalAngleFromCentre(coverOut, kW, kH, kW - 1) == Approx(expectCover).margin(0.5));
+    CHECK(expectCover < expectFill - 10.0);
+
+    // The centre does not move: cover-fit is a uniform scale about it.
+    float a[4];
+    float b[4];
+    readPixelBgra32f(fillOut.data(), kW * 16, kW / 2, kH / 2, a);
+    readPixelBgra32f(coverOut.data(), kW * 16, kW / 2, kH / 2, b);
+    CHECK(std::fabs(angleDelta(lonOf(a), lonOf(b))) < 0.05);
+    CHECK(std::fabs(latOf(a) - latOf(b)) < 0.05);
+}
+
+TEST_CASE("a TALLER resolution crops top and bottom and leaves FOV untouched", "[reframe][cpu][geometry]") {
+    // 16:9 on a 2.35:1 frame: the frame is relatively wider, so the WIDTH
+    // binds, FOV spans the frame width exactly as before and only the top
+    // and bottom of the 16:9 image are cropped.  The factor is exactly 1.
+    PackedSource src(panorama(), panorama().width * 16);
+    constexpr int kW = 470;
+    constexpr int kH = 200;
+    Settings s = baseSettings();
+    const KernelSetup fill = buildParams(s, src.view, kW, kH, SizePx{});
+    s.resolution = Resolution::Hd1280x720;
+    const KernelSetup cover = buildParams(s, src.view, kW, kH, SizePx{});
+    REQUIRE(fill.valid);
+    REQUIRE(cover.valid);
+    CHECK(cover.params.focalPx == fill.params.focalPx);
+}
+
+TEST_CASE("Match Sequence cover-fits a sequence of a different shape", "[reframe][cpu][geometry]") {
+    // The sequence size is only a SHAPE to the effect: a 2:1 sequence on a
+    // 16:9 frame crops the sides by exactly 2 / (16/9) = 1.125, and the same
+    // sequence on a 1:2 frame crops by 4.
+    PackedSource src(panorama(), panorama().width * 16);
+    Settings s = baseSettings();
+    s.resolution = Resolution::MatchSequence;
+
+    const KernelSetup wide = buildParams(s, src.view, 480, 270, SizePx{2000, 1000});
+    const KernelSetup wideRef = buildParams(s, src.view, 480, 270, SizePx{});
+    REQUIRE(wide.valid);
+    REQUIRE(wideRef.valid);
+    CHECK(wide.params.focalPx == Approx(wideRef.params.focalPx * 1.125).epsilon(1e-6));
+
+    const KernelSetup tall = buildParams(s, src.view, 100, 200, SizePx{2000, 1000});
+    const KernelSetup tallRef = buildParams(s, src.view, 100, 200, SizePx{});
+    REQUIRE(tall.valid);
+    REQUIRE(tallRef.valid);
+    CHECK(tall.params.focalPx == Approx(tallRef.params.focalPx * 4.0).epsilon(1e-6));
+
+    // A square sequence on a 16:9 frame is relatively TALLER: width binds,
+    // factor 1, top and bottom cropped.
+    const KernelSetup square = buildParams(s, src.view, 480, 270, SizePx{1080, 1080});
+    REQUIRE(square.valid);
+    CHECK(square.params.focalPx == wideRef.params.focalPx);
 }
 
 // ===========================================================================
@@ -764,7 +1060,7 @@ TEST_CASE("the 8-bit output agrees with the float output within one code", "[ref
 
     constexpr int kW = 200;
     constexpr int kH = 120;
-    const KernelSetup setup = buildParams(s, src.view, kW, kH, 0.0);
+    const KernelSetup setup = buildParams(s, src.view, kW, kH, SizePx{});
     REQUIRE(setup.valid);
 
     std::vector<std::uint8_t> out32(static_cast<std::size_t>(kW) * kH * 16u, 0u);
@@ -808,7 +1104,7 @@ TEST_CASE("the 16f output agrees with the float output to half precision", "[ref
 
     constexpr int kW = 192;
     constexpr int kH = 108;
-    const KernelSetup setup = buildParams(s, src.view, kW, kH, 0.0);
+    const KernelSetup setup = buildParams(s, src.view, kW, kH, SizePx{});
     REQUIRE(setup.valid);
 
     std::vector<std::uint8_t> out32(static_cast<std::size_t>(kW) * kH * 16u, 0u);
@@ -853,7 +1149,7 @@ TEST_CASE("a negative destination pitch writes the same picture upside down in m
     PackedSource src(panorama(), panorama().width * 16);
     constexpr int kW = 64;
     constexpr int kH = 48;
-    const KernelSetup setup = buildParams(baseSettings(), src.view, kW, kH, 0.0);
+    const KernelSetup setup = buildParams(baseSettings(), src.view, kW, kH, SizePx{});
     REQUIRE(setup.valid);
 
     const std::int32_t pitch = kW * 16;
@@ -905,8 +1201,8 @@ TEST_CASE("a 16f source is sampled as accurately as a 32f one", "[reframe][cpu]"
 
     constexpr int kW = 128;
     constexpr int kH = 96;
-    const KernelSetup setup32 = buildParams(s, src32.view, kW, kH, 0.0);
-    const KernelSetup setup16 = buildParams(s, src16, kW, kH, 0.0);
+    const KernelSetup setup32 = buildParams(s, src32.view, kW, kH, SizePx{});
+    const KernelSetup setup16 = buildParams(s, src16, kW, kH, SizePx{});
     REQUIRE(setup32.valid);
     REQUIRE(setup16.valid);
     CHECK(setup16.source.isHalf == 1);
@@ -1083,7 +1379,7 @@ TEST_CASE("PF_Cmd_RENDER produces the expected picture through the loaded module
     RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f);
 
     // Full Frame, rectilinear, 90 degrees: the simplest geometry.
-    f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+    f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
     f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
     f.setFloat(kIndexFov, 90.0);
     f.setFloat(kIndexDistortion, 0.0);
@@ -1109,78 +1405,134 @@ TEST_CASE("PF_Cmd_RENDER produces the expected picture through the loaded module
     }
 }
 
-TEST_CASE("PF_Cmd_RENDER letterboxes according to the aspect popup", "[reframe][render]") {
-    constexpr int kW = 400;
-    constexpr int kH = 400;
-    RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f);
-    f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::Ratio235x1));
-    REQUIRE(f.render() == PF_Err_NONE);
+namespace {
 
-    const Viewport view = computeViewport(kW, kH, 2.35);
+/// Horizontal angle (deg) from the frame centre to the right-hand edge pixel
+/// of the centre row of a PF_Cmd_RENDER output, read from the labelled
+/// panorama.  With a level rectilinear camera this is atan(dx / focal), so it
+/// measures the cover-fit through the whole loaded module.
+double renderedEdgeAngle(const RenderFixture& f, int w, int h) {
     const auto* pixels = reinterpret_cast<const std::uint8_t*>(f.output->pixels());
+    float centre[4];
+    float edge[4];
+    readPixelBgra32f(pixels, f.output->rowBytes(), w / 2, h / 2, centre);
+    readPixelBgra32f(pixels, f.output->rowBytes(), w - 1, h / 2, edge);
+    return std::fabs(angleDelta(lonOf(edge), lonOf(centre)));
+}
 
-    float insideCentre[4];
-    readPixelBgra32f(pixels, f.output->rowBytes(), kW / 2, view.y + view.h / 2, insideCentre);
-    CHECK(insideCentre[3] > 0.5f);
+/// True when every pixel of the output is opaque - i.e. no letterbox, no
+/// pillarbox and no unpainted edge.
+bool everyPixelOpaque(const RenderFixture& f, int w, int h) {
+    const auto* pixels = reinterpret_cast<const std::uint8_t*>(f.output->pixels());
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            float rgba[4];
+            readPixelBgra32f(pixels, f.output->rowBytes(), x, y, rgba);
+            if (!(rgba[3] > 0.999f)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
 
-    float aboveBar[4];
-    readPixelBgra32f(pixels, f.output->rowBytes(), kW / 2, 0, aboveBar);
-    CHECK(aboveBar[3] == 0.0f);
-    CHECK(aboveBar[0] == 0.0f);
+/// atan(dx / f) in degrees for the right-hand edge pixel of a `w`-wide frame.
+double expectedEdgeAngle(int w, double focal) {
+    const double dx = (w - 1) + 0.5 - w / 2.0;
+    return std::atan(dx / focal) * 180.0 / 3.14159265358979323846;
+}
+
+}  // namespace
+
+TEST_CASE("PF_Cmd_RENDER fills the frame and cover-fits a fixed resolution", "[reframe][render]") {
+    // This replaced "PF_Cmd_RENDER letterboxes according to the aspect
+    // popup".  A 2.35:1 entry on a square frame used to leave transparent
+    // bars above and below; the letterbox was removed on purpose, so the
+    // same situation - a fixed shape on a frame of another shape - must now
+    // fill every pixel and crop the overflow instead.
+    constexpr int kW = 401;
+    constexpr int kH = 401;
+    RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f);
+    f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
+    f.setFloat(kIndexFov, 90.0);
+    f.setFloat(kIndexDistortion, 0.0);
+
+    // Frame-shaped first: FOV spans the frame, the edge is ~44.9 degrees out.
+    f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
+    REQUIRE(f.render() == PF_Err_NONE);
+    CHECK(everyPixelOpaque(f, kW, kH));
+    const double fillFocal = kW / 2.0;  // rectilinear, 90 degrees
+    CHECK(renderedEdgeAngle(f, kW, kH) == Approx(expectedEdgeAngle(kW, fillFocal)).margin(0.5));
+
+    // 2560 x 1440 on the same square frame: still no bars anywhere, and the
+    // sides are cropped by exactly the 16:9 cover factor.
+    f.setPopup(kIndexOutputResolution, static_cast<int>(Resolution::Qhd2560x1440));
+    REQUIRE(f.render() == PF_Err_NONE);
+    CHECK(everyPixelOpaque(f, kW, kH));
+    const double coverFocal = fillFocal * (2560.0 * kH) / (1440.0 * kW);
+    CHECK(renderedEdgeAngle(f, kW, kH) == Approx(expectedEdgeAngle(kW, coverFocal)).margin(0.5));
 }
 
 TEST_CASE("PF_Cmd_RENDER honours Match Sequence through the Sequence Info Suite", "[reframe][render]") {
-    constexpr int kW = 400;
-    constexpr int kH = 400;
+    constexpr int kW = 401;
+    constexpr int kH = 401;
     constexpr PrTimelineID kTimeline = 0x2222;
     RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f, kTimeline);
+    f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
+    f.setFloat(kIndexFov, 90.0);
+    f.setFloat(kIndexDistortion, 0.0);
 
     // Tell the mock the sequence is 2:1; "Match Sequence" must pick that up
     // through GetContainingTimelineID + GetFrameRect rather than fall back.
+    // It used to show up as a 2:1 LETTERBOX; the letterbox is gone on
+    // purpose, so it now shows up as a 2:1 cover-fit: every pixel filled and
+    // the sides cropped by (2000 * 401) / (1000 * 401) = 2.
     osv::premiere::mock::SequenceConfig config = f.host.sequence(kTimeline);
     prSetRect(&config.frameRect, 0, 0, 2000, 1000);
     f.host.setSequence(kTimeline, config);
 
-    f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::MatchSequence));
+    f.setPopup(kIndexOutputResolution, static_cast<int>(Resolution::MatchSequence));
     REQUIRE(f.render() == PF_Err_NONE);
+    CHECK(everyPixelOpaque(f, kW, kH));
 
-    const Viewport expected = computeViewport(kW, kH, 2.0);
-    const auto* pixels = reinterpret_cast<const std::uint8_t*>(f.output->pixels());
-
-    float inside[4];
-    float outside[4];
-    readPixelBgra32f(pixels, f.output->rowBytes(), kW / 2, expected.y + 1, inside);
-    readPixelBgra32f(pixels, f.output->rowBytes(), kW / 2, expected.y - 2, outside);
-    CHECK(inside[3] > 0.5f);
-    CHECK(outside[3] == 0.0f);
-    // And it is NOT the 16:9 fallback, which would put the boundary
-    // elsewhere.
-    const Viewport fallback = computeViewport(kW, kH, 16.0 / 9.0);
-    CHECK(expected.h != fallback.h);
+    const double fillFocal = kW / 2.0;
+    const double sequenceFocal = fillFocal * 2.0;
+    const double measured = renderedEdgeAngle(f, kW, kH);
+    CHECK(measured == Approx(expectedEdgeAngle(kW, sequenceFocal)).margin(0.5));
+    // And it is NOT the frame fallback, which would put the edge ~18 degrees
+    // further out - so the suite genuinely answered.
+    CHECK(measured < expectedEdgeAngle(kW, fillFocal) - 10.0);
 }
 
-TEST_CASE("Match Sequence falls back to 16:9 with no Sequence Info Suite", "[reframe][render]") {
-    constexpr int kW = 400;
-    constexpr int kH = 400;
-    RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f);
+TEST_CASE("Match Sequence falls back to the frame with no Sequence Info Suite", "[reframe][render]") {
+    // This used to fall back to a fixed 16:9 letterbox.  Both halves of that
+    // changed on purpose: there is no letterbox, and "Match Sequence" now
+    // needs a SIZE, for which the frame the host allocated is the exact
+    // answer rather than a guessed shape (resolveOutputSize documents why).
+    // What must NOT change is that a host that cannot answer produces a real
+    // picture instead of a failure.
+    constexpr int kW = 401;
+    constexpr int kH = 401;
+    constexpr PrTimelineID kTimeline = 0x2323;
+    RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f, kTimeline);
+    f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
+    f.setFloat(kIndexFov, 90.0);
+    f.setFloat(kIndexDistortion, 0.0);
 
-    // Hide every version the effect tries; a host that cannot answer must
-    // produce the documented fallback, not a failure.
+    // Configure a sequence that WOULD change the picture, then hide every
+    // version of the suite the effect tries, so the only way to get the
+    // frame-shaped answer below is the fallback itself.
+    osv::premiere::mock::SequenceConfig config = f.host.sequence(kTimeline);
+    prSetRect(&config.frameRect, 0, 0, 2000, 1000);
+    f.host.setSequence(kTimeline, config);
     for (const int version : {9, 8, 7, 6, 5}) {
         f.host.setSuiteAvailable(kPrSDKSequenceInfoSuite, version, false);
     }
 
-    f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::MatchSequence));
+    f.setPopup(kIndexOutputResolution, static_cast<int>(Resolution::MatchSequence));
     REQUIRE(f.render() == PF_Err_NONE);
-
-    const Viewport expected = computeViewport(kW, kH, 16.0 / 9.0);
-    const auto* pixels = reinterpret_cast<const std::uint8_t*>(f.output->pixels());
-    float inside[4];
-    float outside[4];
-    readPixelBgra32f(pixels, f.output->rowBytes(), kW / 2, expected.y + 1, inside);
-    readPixelBgra32f(pixels, f.output->rowBytes(), kW / 2, expected.y - 2, outside);
-    CHECK(inside[3] > 0.5f);
-    CHECK(outside[3] == 0.0f);
+    CHECK(everyPixelOpaque(f, kW, kH));
+    CHECK(renderedEdgeAngle(f, kW, kH) == Approx(expectedEdgeAngle(kW, kW / 2.0)).margin(0.5));
 
     for (const int version : {9, 8, 7, 6, 5}) {
         f.host.setSuiteAvailable(kPrSDKSequenceInfoSuite, version, true);
@@ -1197,7 +1549,7 @@ TEST_CASE("PF_Cmd_RENDER ACCEPTS an 8-bit input world", "[reframe][render]") {
     // that Premiere would renegotiate to 32f - and no test ever built an 8u
     // INPUT world, so the refusal was never exercised at all.
     RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f, 0x2000, PrPixelFormat_BGRA_4444_8u);
-    f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+    f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
     f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
     f.setFloat(kIndexFov, 90.0);
     f.setFloat(kIndexDistortion, 0.0);
@@ -1237,7 +1589,7 @@ TEST_CASE("an 8-bit input renders the same picture as the equivalent float input
     // the promotion reproduces the picture rather than merely producing one.
     auto renderWith = [](PrPixelFormat inputFormat) {
         RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f, 0x2000, inputFormat);
-        f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+        f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
         f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
         f.setFloat(kIndexFov, 90.0);
         f.setFloat(kIndexDistortion, 0.0);
@@ -1278,7 +1630,7 @@ TEST_CASE("PF_Cmd_RENDER into an 8-bit world matches the float render", "[refram
 
     auto renderInto = [](PrPixelFormat format) {
         RenderFixture f(kW, kH, format);
-        f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+        f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
         f.setAngle(kIndexPan, 30.0);
         REQUIRE(f.render() == PF_Err_NONE);
         std::vector<float> samples;
@@ -1329,7 +1681,7 @@ TEST_CASE("PF_Cmd_RENDER into and out of a 16u world produces a correct picture"
     // BOTH worlds 16u, which is what a 10-bit sequence actually hands us -
     // not a 16u output fed from a float input.
     RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_16u, 0x2000, PrPixelFormat_BGRA_4444_16u);
-    f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+    f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
     f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
     f.setFloat(kIndexFov, 90.0);
     f.setFloat(kIndexDistortion, 0.0);
@@ -1374,7 +1726,7 @@ TEST_CASE("the 16u render matches the 32f render within the 0..32768 quantisatio
     // promotion into the comparison and make the tolerance meaningless.
     auto renderInto = [](PrPixelFormat outFormat) {
         RenderFixture f(kW, kH, outFormat, 0x2000, PrPixelFormat_BGRA_4444_16u);
-        f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+        f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
         f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
         f.setFloat(kIndexFov, 90.0);
         f.setFloat(kIndexDistortion, 0.0);
@@ -1433,7 +1785,7 @@ TEST_CASE("a 16u input renders the same picture as the equivalent float input",
     // codes / 32768 must reproduce the float panorama it was quantised from.
     auto renderFrom = [](PrPixelFormat inFormat) {
         RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f, 0x2000, inFormat);
-        f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+        f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
         f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
         f.setFloat(kIndexFov, 90.0);
         f.setFloat(kIndexDistortion, 0.0);
@@ -1476,7 +1828,7 @@ TEST_CASE("BGRA_4444_32f_Linear is accepted and renders identically to 32f",
     // IDENTICAL output - not merely similar - and that is what is asserted.
     auto renderWith = [](PrPixelFormat inFormat, PrPixelFormat outFormat) {
         RenderFixture f(kW, kH, outFormat, 0x2000, inFormat);
-        f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+        f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
         f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
         f.setFloat(kIndexFov, 100.0);
         f.setFloat(kIndexDistortion, 20.0);
@@ -1625,9 +1977,9 @@ TEST_CASE("the render path still produces a picture when the pixel format suite 
     {
         std::vector<PF_ParamDef> params = host.addedParams(ref);
         REQUIRE(params.size() >= static_cast<std::size_t>(kIndexSmooth));
-        PF_ParamDef aspect = params[static_cast<std::size_t>(kIndexOutputAspect) - 1u];
-        aspect.u.pd.value = static_cast<int>(Aspect::FullFrame);
-        host.setParamValue(ref, kIndexOutputAspect, aspect);
+        PF_ParamDef resolution = params[static_cast<std::size_t>(kIndexOutputResolution) - 1u];
+        resolution.u.pd.value = static_cast<int>(kFillFrame);
+        host.setParamValue(ref, kIndexOutputResolution, resolution);
         PF_ParamDef preset = params[static_cast<std::size_t>(kIndexPreset) - 1u];
         preset.u.pd.value = static_cast<int>(Preset::Custom);
         host.setParamValue(ref, kIndexPreset, preset);
@@ -1693,7 +2045,7 @@ TEST_CASE("Smooth Keyframes averages three DIFFERENT sampled angles", "[reframe]
     std::vector<std::uint8_t> reference;
     {
         RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f);
-        f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+        f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
         f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
         f.setFloat(kIndexFov, 90.0);
         f.setFloat(kIndexDistortion, 0.0);
@@ -1707,7 +2059,7 @@ TEST_CASE("Smooth Keyframes averages three DIFFERENT sampled angles", "[reframe]
     std::vector<std::uint8_t> smoothed;
     {
         RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f);
-        f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+        f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
         f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
         f.setFloat(kIndexFov, 90.0);
         f.setFloat(kIndexDistortion, 0.0);
@@ -1734,7 +2086,7 @@ TEST_CASE("Smooth Keyframes averages three DIFFERENT sampled angles", "[reframe]
     std::vector<std::uint8_t> centreOnly;
     {
         RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f);
-        f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+        f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
         f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
         f.setFloat(kIndexFov, 90.0);
         f.setFloat(kIndexDistortion, 0.0);
@@ -1765,7 +2117,7 @@ TEST_CASE("Smooth Keyframes at the clip start falls back to the centre sample", 
     std::vector<std::uint8_t> reference;
     {
         RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f);
-        f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+        f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
         f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
         f.setFloat(kIndexFov, 90.0);
         f.setFloat(kIndexDistortion, 0.0);
@@ -1778,7 +2130,7 @@ TEST_CASE("Smooth Keyframes at the clip start falls back to the centre sample", 
     std::vector<std::uint8_t> smoothed;
     {
         RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f);
-        f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+        f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
         f.setPopup(kIndexPreset, static_cast<int>(Preset::Custom));
         f.setFloat(kIndexFov, 90.0);
         f.setFloat(kIndexDistortion, 0.0);
@@ -1822,7 +2174,7 @@ TEST_CASE("the presets produce visibly different framings", "[reframe][render]")
         }
         INFO("preset '" << entry.label << "'");
         RenderFixture f(kW, kH, PrPixelFormat_BGRA_4444_32f);
-        f.setPopup(kIndexOutputAspect, static_cast<int>(Aspect::FullFrame));
+        f.setPopup(kIndexOutputResolution, static_cast<int>(kFillFrame));
         // The supervised handler writes FOV / Distortion / Tilt for us.
         f.setPopup(kIndexPreset, static_cast<int>(entry.value));
         f.setFloat(kIndexFov, entry.fovDeg);
@@ -1863,7 +2215,7 @@ namespace {
 /// Written out literally rather than copied from kValueParamKind so the test
 /// would notice a change to that table instead of following it.
 const std::vector<HostParamKind> kFullSignature = {
-    HostParamKind::Int32,    // Output Aspect
+    HostParamKind::Int32,    // Output Resolution
     HostParamKind::Int32,    // Preset
     HostParamKind::Float32,  // Pan
     HostParamKind::Float32,  // Tilt
@@ -1896,7 +2248,7 @@ TEST_CASE("matchHostParams maps an unreduced host list one to one", "[reframe][p
     CHECK(map.probed);
 
     // Every control present, in order, with no gap.
-    CHECK(map[kIndexOutputAspect] == 0);
+    CHECK(map[kIndexOutputResolution] == 0);
     CHECK(map[kIndexPreset] == 1);
     CHECK(map[kIndexPan] == 2);
     CHECK(map[kIndexTilt] == 3);
@@ -1926,7 +2278,7 @@ TEST_CASE("matchHostParams recovers the real Premiere mapping from 8 entries", "
     CHECK(map.probed);
 
     // The seven controls before the gap keep their positions...
-    CHECK(map[kIndexOutputAspect] == 0);
+    CHECK(map[kIndexOutputResolution] == 0);
     CHECK(map[kIndexPreset] == 1);
     CHECK(map[kIndexPan] == 2);
     CHECK(map[kIndexTilt] == 3);
@@ -1969,7 +2321,7 @@ TEST_CASE("matchHostParams tolerates entries Premiere cannot type", "[reframe][p
     const std::vector<HostParamKind> logged = {
         HostParamKind::Int32,    // [0]  an entry ahead of our list
         HostParamKind::Unknown,  // [1]  the host refused this one's type
-        HostParamKind::Int32,    // [2]  Output Aspect
+        HostParamKind::Int32,    // [2]  Output Resolution
         HostParamKind::Float32,  // [3]  Pan        (42)
         HostParamKind::Float32,  // [4]  Tilt       (-15)
         HostParamKind::Float32,  // [5]  Roll       (7)
@@ -2077,7 +2429,7 @@ TEST_CASE("HostParamMap::setStatic reproduces the documented rule", "[reframe][p
     HostParamMap map{};
     map.setStatic();
     CHECK_FALSE(map.probed);
-    CHECK(map[kIndexOutputAspect] == gpuParamIndex(kIndexOutputAspect));
+    CHECK(map[kIndexOutputResolution] == gpuParamIndex(kIndexOutputResolution));
     CHECK(map[kIndexFov] == gpuParamIndex(kIndexFov));
     CHECK(map[kIndexSmooth] == gpuParamIndex(kIndexSmooth));
     // The input layer is never read through GetParam.
@@ -2101,9 +2453,9 @@ TEST_CASE("buildParams clamps a hostile field of view instead of failing", "[ref
     const double hostile = GENERATE(-1.0e9, -180.0, 0.0, 1.0e-9, 359.999, 1.0e9);
     INFO("field of view " << hostile);
     Settings s;
-    s.aspect = Aspect::FullFrame;
+    s.resolution = kFillFrame;
     s.fovDeg = hostile;
-    const KernelSetup setup = buildParams(s, src.view, 320, 180, 0.0);
+    const KernelSetup setup = buildParams(s, src.view, 320, 180, SizePx{});
     CHECK(setup.valid);
     CHECK(std::isfinite(setup.params.focalPx));
     CHECK(setup.params.focalPx > 0.0f);
@@ -2118,9 +2470,9 @@ TEST_CASE("buildParams survives a non-finite field of view", "[reframe][geometry
     for (const double bad : {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity(),
                              -std::numeric_limits<double>::infinity()}) {
         Settings s;
-        s.aspect = Aspect::FullFrame;
+        s.resolution = kFillFrame;
         s.fovDeg = bad;
-        const KernelSetup setup = buildParams(s, src.view, 320, 180, 0.0);
+        const KernelSetup setup = buildParams(s, src.view, 320, 180, SizePx{});
         CHECK(setup.valid);
         CHECK(std::isfinite(setup.params.focalPx));
         CHECK(setup.params.focalPx > 0.0f);

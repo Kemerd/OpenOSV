@@ -98,6 +98,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -316,6 +317,126 @@ void setHoverHandle(Handle handle) noexcept {
     default:
         return Handle::None;
     }
+}
+
+// ---------------------------------------------------------------------------
+//  The live readout
+//
+//  WHY THE HUD DOES NOT SIMPLY READ `params` DURING A DRAG.  The numbers in
+//  the readout are the only feedback that can be instant: the picture
+//  underneath moves only as fast as the host re-renders the frame, and a 360
+//  reframe of a 6K source in Premiere is anything but instant.  The
+//  parameter array a PF_Event_DRAW receives is whatever the host considers
+//  current for the view being painted, and nothing in the SDK promises that
+//  it already holds the value a PF_Event_DRAG committed a few milliseconds
+//  earlier - a host is free to hand the draw pass the values of the frame it
+//  last FINISHED rendering.  If Premiere does that, a readout built from
+//  `params` lags exactly as badly as the picture and the one piece of
+//  instant feedback is gone.
+//
+//  So while a gesture is in flight, every value it commits is also
+//  remembered here and the draw pass shows that instead.  The guards:
+//
+//    * it is keyed by the effect instance (in_data->effect_ref), so a
+//      second reframe effect on another clip never shows this one's numbers;
+//    * an effect reference is only an address and a host may reuse one, so
+//      the values are also checked for CONSISTENCY before they are shown:
+//      every field the gesture has not written must already agree with the
+//      host, and only the fields it has written are substituted (see
+//      mergeLiveReadout() in ReframeUi.cpp, which the tests pin);
+//    * it is dropped the moment the gesture ends (the DRAG event with
+//      `last_time` set) - from then on the host is the authority again, and
+//      a value typed into Effect Controls afterwards shows up at once;
+//    * it expires kLiveReadoutMaxAge after its last update whatever happens,
+//      so a gesture the host abandons without ever sending `last_time`
+//      cannot pin stale numbers on the HUD.
+//
+//  Deliberately NOT held past the end of the gesture.  Holding it until the
+//  host "caught up" would need a guess at when that is, and an effect
+//  reference is only an address: one freed and reused inside the hold
+//  window would put a dead instance's numbers on a new one.
+//
+//  One process-wide slot rather than one per instance: there is one mouse,
+//  so only one gesture can be in flight at a time.
+// ---------------------------------------------------------------------------
+
+/// How long a remembered drag value may stand in for the host's values
+/// without a fresh drag event.  Every drag event restarts the clock, so a
+/// long continuous drag never expires; this only bounds how long a gesture
+/// the host abandoned can mislead.
+constexpr auto kLiveReadoutMaxAge = std::chrono::milliseconds(2000);
+
+/// The remembered values and their guard.
+struct LiveReadout {
+    std::mutex mutex;
+    PF_ProgPtr effectRef = nullptr;  ///< Which instance the values belong to.
+    CameraValues values;             ///< What the gesture last committed.
+    std::uint32_t touched = kChangedNone;  ///< Union of the fields it has written.
+    std::chrono::steady_clock::time_point stamp{};  ///< When they were committed.
+    bool active = false;             ///< Whether `values` may be shown at all.
+};
+
+[[nodiscard]] LiveReadout& liveReadout() noexcept {
+    static LiveReadout readout;
+    return readout;
+}
+
+/// Remember what an in-flight drag event just committed, and which fields
+/// it wrote.
+///
+/// The written fields ACCUMULATE over the gesture (a pan that becomes a zoom
+/// when Ctrl goes down has touched Pan, Tilt and FOV by the end), because
+/// mergeLiveReadout() needs the whole set to know which of the host's values
+/// may legitimately lag.  A null effect reference could never be matched
+/// against a later draw, so it is not remembered at all.
+void publishLiveReadout(PF_ProgPtr effectRef, const CameraValues& values, std::uint32_t touched) noexcept {
+    if (!effectRef) {
+        return;
+    }
+    LiveReadout& readout = liveReadout();
+    std::lock_guard<std::mutex> lock(readout.mutex);
+    // A different instance, or nothing remembered: this is the start of the
+    // set.  Otherwise it is the same gesture continuing (onDoClick clears the
+    // slot when a new one begins), so the set grows.
+    const bool continuing = readout.active && readout.effectRef == effectRef;
+    readout.touched = continuing ? (readout.touched | touched) : touched;
+    readout.effectRef = effectRef;
+    readout.values = sanitise(values);
+    readout.stamp = std::chrono::steady_clock::now();
+    readout.active = true;
+}
+
+/// The gesture is over: hand the readout back to the host.  Only the
+/// instance that owns the remembered values can clear them.
+void clearLiveReadout(PF_ProgPtr effectRef) noexcept {
+    LiveReadout& readout = liveReadout();
+    std::lock_guard<std::mutex> lock(readout.mutex);
+    if (readout.effectRef == effectRef) {
+        readout.active = false;
+        readout.touched = kChangedNone;
+    }
+}
+
+/// The numbers the HUD should show for this instance: the in-flight
+/// gesture's own values for the fields it has written, while they are fresh
+/// and consistent with the host; otherwise the host's.  The consistency rule
+/// lives in mergeLiveReadout() (ReframeUi.cpp) so the tests pin it.
+[[nodiscard]] CameraValues readoutValues(PF_ProgPtr effectRef, const CameraValues& fromHost) noexcept {
+    if (!effectRef) {
+        return fromHost;
+    }
+    LiveReadout& readout = liveReadout();
+    std::lock_guard<std::mutex> lock(readout.mutex);
+    if (!readout.active || readout.effectRef != effectRef) {
+        return fromHost;
+    }
+    if (std::chrono::steady_clock::now() - readout.stamp > kLiveReadoutMaxAge) {
+        // Abandoned gesture: the host is the authority again.
+        readout.active = false;
+        readout.touched = kChangedNone;
+        return fromHost;
+    }
+    return mergeLiveReadout(fromHost, readout.values, readout.touched);
 }
 
 /// Pack a slot reference into the host's continue_refcon words.
@@ -1251,7 +1372,13 @@ PF_Err onDraw(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* extra) n
     // Which handle is under the cursor right now, so it can be highlighted.
     // PF_Event_DRAW carries no pointer position, so the last answer from
     // PF_Event_ADJUST_CURSOR is reused; see hoverHandle().
-    drawOverlay(bundle.suites(), drawRef, layout, readCamera(params), hoverHandle());
+    //
+    // The numbers come through readoutValues() rather than straight from
+    // `params`, so a drag's values appear the moment it commits them instead
+    // of whenever the host's (possibly slow) re-render catches up; see the
+    // live readout section above.
+    const CameraValues shown = readoutValues(in_data->effect_ref, readCamera(params));
+    drawOverlay(bundle.suites(), drawRef, layout, shown, hoverHandle());
 
     // The overlay was drawn, so the host must not also draw its own default
     // controls over the same pixels.
@@ -1322,6 +1449,11 @@ PF_Err onDoClick(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* extra
     writeDragSlot(slot, generation, state);
     packRefcon(click.continue_refcon, slot, generation);
 
+    // A new gesture starts with a clean live readout for this instance, so
+    // the set of touched fields describes THIS gesture only, even if the
+    // host abandoned the previous one without a final drag event.
+    clearLiveReadout(in_data->effect_ref);
+
     // Ask the host to send us the drag stream.
     click.send_drag = TRUE;
 
@@ -1383,6 +1515,14 @@ PF_Err onDrag(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* extra) n
         // set PF_EO_HANDLED_EVENT before returning."
         extra->evt_out_flags |= PF_EO_HANDLED_EVENT;
 
+        // Remember what was just committed so the very next repaint shows it
+        // even if the host has not propagated it into the draw pass's
+        // parameter array yet (see the live readout section).  The final
+        // event of a gesture is not remembered: it is cleared just below.
+        if (!drag.last_time) {
+            publishLiveReadout(in_data->effect_ref, updated, changed);
+        }
+
         // The value moved, so the readout in the HUD is now stale. Ask for
         // the overlay to be redrawn; without this the numbers only refresh
         // when something else happens to invalidate the view, which makes a
@@ -1394,6 +1534,11 @@ PF_Err onDrag(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* extra) n
         // The gesture is over: free the slot so a long session cannot leak
         // the fixed table, and clear the refcon so a duplicated final event
         // cannot resume the finished gesture.
+        //
+        // The live readout goes with it: from here on the host's own values
+        // are the authority (see the live readout section for why it is not
+        // held any longer than the gesture).
+        clearLiveReadout(in_data->effect_ref);
         releaseDragSlot(slot, generation);
         if (drag.continue_refcon) {
             drag.continue_refcon[0] = 0;

@@ -43,7 +43,9 @@
 #include "AE_EffectUI.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -671,6 +673,277 @@ TEST_CASE("each drag mode writes exactly the parameters it moved", "[reframe][ui
 }
 
 // ===========================================================================
+//  2b. Window -> frame coordinates
+//
+//  Premiere reports a 0x0 layer during a comp-window custom UI event, so the
+//  overlay's size comes from a draw event's update rect instead - and that
+//  rectangle is in WINDOW coordinates, so it can start anywhere.  A pointer
+//  event's screen_point is in the same window space.  windowToFrame() is the
+//  one transform that puts the pointer in the layout's space; if it were
+//  wrong (or went back to being the identity) every click in an offset frame
+//  would land on the wrong handle and every drag would be anchored in the
+//  wrong place.
+// ===========================================================================
+
+namespace {
+
+/// The geometry a draw event with this update rect would establish.
+[[nodiscard]] FrameGeometry geometryAt(double x, double y, double w, double h) noexcept {
+    FrameGeometry g;
+    g.originX = x;
+    g.originY = y;
+    g.width = w;
+    g.height = h;
+    g.valid = true;
+    return g;
+}
+
+/// The window-space origin every offset test below uses.  Chosen so that a
+/// click near the frame's top-left corner, taken WITHOUT the correction,
+/// lands on open picture instead of the grip - which is what makes the
+/// "wrong handle" test able to tell the two mappings apart.
+constexpr double kOffsetX = 400.0;
+constexpr double kOffsetY = 300.0;
+
+}  // namespace
+
+TEST_CASE("windowToFrame is the identity until a frame geometry is established", "[reframe][ui][coords]") {
+    // Before any draw has run, the pointer handlers hold a default (invalid)
+    // geometry.  It must not move the point: that is the historical
+    // behaviour, and a caller that forgot to check validity is then no worse
+    // off than before the transform existed.
+    const FrameGeometry none;
+    REQUIRE_FALSE(none.valid);
+    const PointF p{123.25, -45.5};
+    const PointF q = windowToFrame(none, p);
+    CHECK(q.x == p.x);
+    CHECK(q.y == p.y);
+
+    // An invalid geometry is ignored even when it carries an origin: only a
+    // geometry a draw actually established may shift a pointer.
+    FrameGeometry notEstablished = geometryAt(kOffsetX, kOffsetY, kFrameW, kFrameH);
+    notEstablished.valid = false;
+    const PointF r = windowToFrame(notEstablished, p);
+    CHECK(r.x == p.x);
+    CHECK(r.y == p.y);
+}
+
+TEST_CASE("windowToFrame subtracts the frame's window-space origin", "[reframe][ui][coords]") {
+    const FrameGeometry g = geometryAt(kOffsetX, kOffsetY, kFrameW, kFrameH);
+
+    // The frame's own top-left corner is frame (0, 0).
+    const PointF topLeft = windowToFrame(g, PointF{kOffsetX, kOffsetY});
+    CHECK(topLeft.x == Approx(0.0));
+    CHECK(topLeft.y == Approx(0.0));
+
+    // The frame's centre is the layout's centre.
+    const PointF centre = windowToFrame(g, PointF{kOffsetX + 960.0, kOffsetY + 540.0});
+    CHECK(centre.x == Approx(computeLayout(fullFrame()).centre.x));
+    CHECK(centre.y == Approx(computeLayout(fullFrame()).centre.y));
+
+    // Left of and above the frame is NEGATIVE frame space, which the
+    // hit-test rejects as outside - the click is handed back to the host.
+    const PointF outside = windowToFrame(g, PointF{10.0, 10.0});
+    CHECK(outside.x == Approx(10.0 - kOffsetX));
+    CHECK(outside.y == Approx(10.0 - kOffsetY));
+    CHECK(hitTest(computeLayout(fullFrame()), outside) == Handle::None);
+
+    // A zero origin is exactly the identity: the After Effects case, and
+    // Premiere whenever the update rect covers the whole window.
+    const PointF same = windowToFrame(geometryAt(0.0, 0.0, kFrameW, kFrameH), PointF{960.0, 540.0});
+    CHECK(same.x == 960.0);
+    CHECK(same.y == 540.0);
+}
+
+TEST_CASE("windowToFrame keeps a garbage point garbage so it is rejected downstream",
+          "[reframe][ui][coords]") {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    const Layout layout = computeLayout(fullFrame());
+    const FrameGeometry g = geometryAt(kOffsetX, kOffsetY, kFrameW, kFrameH);
+
+    // A non-finite pointer stays non-finite.  Turning it into a number here
+    // would make a garbage event look like a real click at some position.
+    const PointF a = windowToFrame(g, PointF{nan, 10.0});
+    const PointF b = windowToFrame(g, PointF{10.0, inf});
+    CHECK(std::isnan(a.x));
+    CHECK(std::isinf(b.y));
+
+    // ...which is what lets the hit-test and the drag reject it.
+    CHECK(hitTest(layout, a) == Handle::None);
+    CHECK(hitTest(layout, b) == Handle::None);
+
+    // A geometry holding a non-finite origin cannot shift a point at all.
+    const PointF p{50.0, 60.0};
+    for (const FrameGeometry& broken : {geometryAt(nan, kOffsetY, kFrameW, kFrameH),
+                                        geometryAt(kOffsetX, -inf, kFrameW, kFrameH)}) {
+        const PointF q = windowToFrame(broken, p);
+        CHECK(q.x == p.x);
+        CHECK(q.y == p.y);
+    }
+}
+
+TEST_CASE("an offset frame hit-tests and drags exactly like one at the origin", "[reframe][ui][coords]") {
+    // Translation invariance: the same frame-relative gesture, expressed in
+    // window coordinates of a frame drawn at (kOffsetX, kOffsetY), must grab
+    // the same handle and produce the same values to the last bit that
+    // matters.  This is the property that stops a drag being offset.
+    const Layout layout = computeLayout(fullFrame());
+    const FrameGeometry offset = geometryAt(kOffsetX, kOffsetY, kFrameW, kFrameH);
+
+    // One point on every kind of target, in FRAME coordinates.
+    const PointF framePoints[] = {
+        layout.centre,                                                   // open picture
+        PointF{5.0, 5.0},                                                // top-left grip
+        PointF{kFrameW - 5.0, kFrameH - 5.0},                            // bottom-right grip
+        PointF{layout.centre.x + layout.rollRingRadius, layout.centre.y},  // roll arc
+        PointF{-5.0, 500.0},                                             // outside
+    };
+    for (const PointF& p : framePoints) {
+        INFO("frame point " << p.x << "," << p.y);
+        const PointF window{p.x + kOffsetX, p.y + kOffsetY};
+        CHECK(hitTest(layout, windowToFrame(offset, window)) == hitTest(layout, p));
+    }
+
+    // A pan/tilt drag of (+96, +40) pixels from the centre.
+    CameraValues start;
+    start.fovDeg = 90.0;
+
+    DragState atOrigin = beginDrag(layout, layout.centre, start, kModNone);
+    const CameraValues expected =
+        applyDrag(atOrigin, PointF{layout.centre.x + 96.0, layout.centre.y + 40.0}, kModNone);
+
+    const PointF anchorWindow{layout.centre.x + kOffsetX, layout.centre.y + kOffsetY};
+    DragState shifted = beginDrag(layout, windowToFrame(offset, anchorWindow), start, kModNone);
+    const CameraValues got = applyDrag(
+        shifted, windowToFrame(offset, PointF{anchorWindow.x + 96.0, anchorWindow.y + 40.0}), kModNone);
+
+    CHECK(got.panDeg == Approx(expected.panDeg));
+    CHECK(got.tiltDeg == Approx(expected.tiltDeg));
+    // And both are the calibrated rate, not merely equal to each other.
+    CHECK(got.panDeg == Approx(96.0 * 90.0 / kFrameW));
+    CHECK(got.tiltDeg == Approx(40.0 * 90.0 / kFrameW));
+}
+
+TEST_CASE("without the origin correction an offset frame grabs the wrong handle", "[reframe][ui][coords]") {
+    // Pins WHY the transform exists.  A click 5px inside the top-left corner
+    // of a frame drawn at (kOffsetX, kOffsetY) is on the FOV grip; read with
+    // the old identity mapping, the same window coordinates land in open
+    // picture and would start a pan instead of a zoom.
+    const Layout layout = computeLayout(fullFrame());
+    const FrameGeometry offset = geometryAt(kOffsetX, kOffsetY, kFrameW, kFrameH);
+    const PointF click{kOffsetX + 5.0, kOffsetY + 5.0};
+
+    CHECK(hitTest(layout, windowToFrame(offset, click)) == Handle::Fov);
+    CHECK(hitTest(layout, click) == Handle::PanTilt);
+}
+
+// ===========================================================================
+//  2c. The live readout
+//
+//  While a drag is in flight the HUD shows the gesture's own numbers for the
+//  fields it has written, because the host may hand the draw pass values
+//  that lag behind a slow render.  mergeLiveReadout() decides what is shown;
+//  these tests pin its rule, including the consistency check that stops a
+//  gesture's numbers appearing on a state they do not describe.
+// ===========================================================================
+
+namespace {
+
+[[nodiscard]] CameraValues camera(double pan, double tilt, double roll, double fov) noexcept {
+    CameraValues v;
+    v.panDeg = pan;
+    v.tiltDeg = tilt;
+    v.rollDeg = roll;
+    v.fovDeg = fov;
+    return v;
+}
+
+}  // namespace
+
+TEST_CASE("the live readout takes the fields a gesture wrote and the host's for the rest",
+          "[reframe][ui][readout]") {
+    // A pan/tilt drag the host has not caught up with yet.
+    const CameraValues host = camera(0.0, 0.0, 12.0, 90.0);
+    const CameraValues live = camera(4.5, -2.0, 12.0, 90.0);
+
+    const CameraValues shown = mergeLiveReadout(host, live, kChangedPan | kChangedTilt);
+    CHECK(shown.panDeg == Approx(4.5));
+    CHECK(shown.tiltDeg == Approx(-2.0));
+    CHECK(shown.rollDeg == Approx(12.0));
+    CHECK(shown.fovDeg == Approx(90.0));
+
+    // Untouched fields that agree only to within the host's own round-trip
+    // precision (PF_Fixed, a float slider) still count as agreeing.
+    const CameraValues roundTripped = camera(0.0, 0.0, 12.0 + 1.0 / 65536.0, 90.0f);
+    const CameraValues shown2 = mergeLiveReadout(roundTripped, live, kChangedPan | kChangedTilt);
+    CHECK(shown2.panDeg == Approx(4.5));
+    CHECK(shown2.tiltDeg == Approx(-2.0));
+}
+
+TEST_CASE("the live readout is ignored when a field the gesture never wrote disagrees",
+          "[reframe][ui][readout]") {
+    // An FOV-grip gesture remembered for an instance whose address was later
+    // reused by a DIFFERENT effect with different values: the gesture cannot
+    // have moved Pan, Tilt or Roll, so the disagreement proves `live` is not
+    // a picture of this host - and NONE of its numbers may be shown.
+    const CameraValues host = camera(12.5, -3.5, 45.0, 110.0);
+    const CameraValues live = camera(0.0, 0.0, 0.0, 170.0);
+
+    const CameraValues shown = mergeLiveReadout(host, live, kChangedFov);
+    CHECK(shown.panDeg == Approx(12.5));
+    CHECK(shown.tiltDeg == Approx(-3.5));
+    CHECK(shown.rollDeg == Approx(45.0));
+    CHECK(shown.fovDeg == Approx(110.0));  // not 170: the host keeps authority wholesale
+}
+
+TEST_CASE("the live readout with nothing or everything touched", "[reframe][ui][readout]") {
+    const CameraValues host = camera(1.0, 2.0, 3.0, 100.0);
+
+    // Nothing written: the host's numbers, whatever `live` says.
+    const CameraValues same = mergeLiveReadout(host, host, kChangedNone);
+    CHECK(same.panDeg == Approx(1.0));
+    const CameraValues other = mergeLiveReadout(host, camera(9.0, 9.0, 9.0, 99.0), kChangedNone);
+    CHECK(other.panDeg == Approx(1.0));
+    CHECK(other.fovDeg == Approx(100.0));
+
+    // Everything written (a pan that became a zoom and then a roll): there
+    // is nothing left to cross-check, so the gesture's numbers are shown.
+    const std::uint32_t all = kChangedPan | kChangedTilt | kChangedRoll | kChangedFov;
+    const CameraValues live = camera(9.0, 8.0, 7.0, 99.0);
+    const CameraValues shown = mergeLiveReadout(host, live, all);
+    CHECK(shown.panDeg == Approx(9.0));
+    CHECK(shown.tiltDeg == Approx(8.0));
+    CHECK(shown.rollDeg == Approx(7.0));
+    CHECK(shown.fovDeg == Approx(99.0));
+}
+
+TEST_CASE("the live readout never shows a NaN or an out-of-range value", "[reframe][ui][readout]") {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::uint32_t all = kChangedPan | kChangedTilt | kChangedRoll | kChangedFov;
+
+    // Garbage on either side, in touched and untouched fields alike.
+    const CameraValues cases[][2] = {
+        {camera(nan, 0.0, 0.0, 90.0), camera(4.5, 0.0, 0.0, 90.0)},
+        {camera(0.0, 0.0, 0.0, 90.0), camera(nan, nan, nan, nan)},
+        {camera(0.0, 500.0, 0.0, 1e9), camera(0.0, -500.0, 0.0, -1e9)},
+    };
+    for (const auto& c : cases) {
+        for (const std::uint32_t touched :
+             {static_cast<std::uint32_t>(kChangedNone), static_cast<std::uint32_t>(kChangedPan), all}) {
+            const CameraValues shown = mergeLiveReadout(c[0], c[1], touched);
+            CHECK(std::isfinite(shown.panDeg));
+            CHECK(std::isfinite(shown.tiltDeg));
+            CHECK(std::isfinite(shown.rollDeg));
+            CHECK(std::isfinite(shown.fovDeg));
+            CHECK(std::fabs(shown.tiltDeg) <= OSV_REFRAME_TILT_LIMIT_DEG);
+            CHECK(shown.fovDeg >= OSV_REFRAME_FOV_VALID_MIN);
+            CHECK(shown.fovDeg <= OSV_REFRAME_FOV_VALID_MAX);
+        }
+    }
+}
+
+// ===========================================================================
 //  3. The module: flags and registration
 // ===========================================================================
 
@@ -1288,9 +1561,19 @@ TEST_CASE("a degenerate frame produces no overlay and no crash", "[reframe][ui][
     CHECK(f.event(draw, params) == PF_Err_NONE);
     CHECK(f.host.drawbotRecord().ops.empty());
 
+    // A click with a 0x0 layer.  This used to click at (0, 0) and expect no
+    // drag, on the assumption that a 0x0 layer means nothing is grabbable.
+    // That assumption is exactly what made the overlay inert in Premiere,
+    // which reports 0x0 on EVERY event: a click now uses the frame the last
+    // sized repaint established (section 8 pins that), and in a process
+    // where an earlier test drew one, (0, 0) is the top-left FOV grip.  So
+    // the click is placed left of and above ANY frame the process could have
+    // cached - every cached origin is >= 0 - which keeps the contract this
+    // test is about (no crash, no gesture from nowhere) independent of test
+    // order.
     PF_EventExtra click = makeExtra(f.host, PF_Event_DO_CLICK);
-    click.u.do_click.screen_point.h = 0;
-    click.u.do_click.screen_point.v = 0;
+    click.u.do_click.screen_point.h = -5;
+    click.u.do_click.screen_point.v = -5;
     CHECK(f.event(click, params) == PF_Err_NONE);
     CHECK(click.u.do_click.send_drag == FALSE);
 }
@@ -1325,4 +1608,360 @@ TEST_CASE("many gestures in a row do not exhaust the drag table", "[reframe][ui]
         // The same answer every time: the table is not degrading.
         CHECK(angleOf(params, kIndexPan) == Approx(96.0 * 90.0 / 1920.0).margin(0.01));
     }
+}
+
+// ===========================================================================
+//  8. Premiere's comp-window events: no layer size, an update rect instead
+//
+//  Premiere reports in_data->width/height as 0x0 during a comp-window custom
+//  UI event.  The UiFixture above is sized the way After Effects sizes it, so
+//  none of the tests before this section ever reproduced Premiere - which is
+//  how an overlay that DREW but could never be GRABBED shipped: the draw
+//  path had learned to fall back to the update rect, the click path had not,
+//  so every click saw an invalid layout and never asked for a drag.
+//
+//  Every test here zeroes the layer size first, so the geometry can only come
+//  from what a draw event's update rect established.
+// ===========================================================================
+
+namespace {
+
+/// A DRAW event carrying the given update rect, as Premiere sends one.
+[[nodiscard]] PF_EventExtra makeDrawWithRect(MockHost& host, A_long left, A_long top, A_long right, A_long bottom) {
+    PF_EventExtra extra = makeExtra(host, PF_Event_DRAW);
+    extra.u.draw.update_rect.left = left;
+    extra.u.draw.update_rect.top = top;
+    extra.u.draw.update_rect.right = right;
+    extra.u.draw.update_rect.bottom = bottom;
+    return extra;
+}
+
+/// A DO_CLICK at a window-space point.
+[[nodiscard]] PF_EventExtra makeClickAt(MockHost& host, A_long h, A_long v) {
+    PF_EventExtra extra = makeExtra(host, PF_Event_DO_CLICK);
+    extra.u.do_click.screen_point.h = h;
+    extra.u.do_click.screen_point.v = v;
+    return extra;
+}
+
+/// A DRAG continuing the gesture `click` started, to a window-space point.
+[[nodiscard]] PF_EventExtra makeDragFrom(MockHost& host, const PF_EventExtra& click, A_long h, A_long v, bool last) {
+    PF_EventExtra extra = makeExtra(host, PF_Event_DRAG);
+    std::memcpy(extra.u.do_click.continue_refcon, click.u.do_click.continue_refcon,
+                sizeof(extra.u.do_click.continue_refcon));
+    extra.u.do_click.screen_point.h = h;
+    extra.u.do_click.screen_point.v = v;
+    extra.u.do_click.last_time = last ? TRUE : FALSE;
+    return extra;
+}
+
+/// An ADJUST_CURSOR at a window-space point.  The event is returned so the
+/// test can read both the cursor and the out-flags.
+[[nodiscard]] PF_EventExtra makeCursorAt(MockHost& host, A_long h, A_long v) {
+    PF_EventExtra extra = makeExtra(host, PF_Event_ADJUST_CURSOR);
+    extra.u.adjust_cursor.screen_point.h = h;
+    extra.u.adjust_cursor.screen_point.v = v;
+    return extra;
+}
+
+/// Whether any string the last draw put on screen contains `needle`.
+[[nodiscard]] bool drewText(const DrawbotRecord& record, const std::string& needle) {
+    for (const osv::premiere::mock::DrawbotStringOp& op : record.strings) {
+        if (op.text.find(needle) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The start of the readout for a given Pan, exactly as the HUD formats it
+/// ("Pan %.1f" and then the two-space separator), so "Pan 4.5" cannot be
+/// mistaken for "Pan 4.55".
+[[nodiscard]] std::string panReadout(double panDeg) {
+    char buffer[32] = {};
+    (void)std::snprintf(buffer, sizeof(buffer), "Pan %.1f ", panDeg);
+    return std::string(buffer);
+}
+
+}  // namespace
+
+TEST_CASE("with a 0x0 layer a DRAW's update rect makes the overlay grabbable", "[reframe][ui][module][premiere]") {
+    // The regression this whole section exists for.
+    UiFixture f;
+    f.setFov(90.0);
+    std::vector<PF_ParamDef*> params = f.params();
+    f.in.width = 0;
+    f.in.height = 0;
+
+    // The repaint establishes the frame, and the HUD is drawn against it.
+    f.host.clearDrawbotRecord();
+    PF_EventExtra draw = makeDrawWithRect(f.host, 0, 0, 1920, 1080);
+    REQUIRE(f.event(draw, params) == PF_Err_NONE);
+    CHECK((draw.evt_out_flags & PF_EO_HANDLED_EVENT) != 0);
+    CHECK_FALSE(f.host.drawbotRecord().ops.empty());
+
+    // A click on open picture now starts a gesture and asks for the drag
+    // stream.  Before the fix send_drag stayed FALSE here, and the host
+    // never sent a single PF_Event_DRAG.
+    PF_EventExtra click = makeClickAt(f.host, 960, 540);
+    REQUIRE(f.event(click, params) == PF_Err_NONE);
+    REQUIRE(click.u.do_click.send_drag == TRUE);
+    CHECK((click.evt_out_flags & PF_EO_HANDLED_EVENT) != 0);
+
+    // And the drag commits Pan at the calibrated rate.
+    PF_EventExtra drag = makeDragFrom(f.host, click, 960 + 96, 540, true);
+    REQUIRE(f.event(drag, params) == PF_Err_NONE);
+    CHECK(angleOf(params, kIndexPan) == Approx(96.0 * 90.0 / 1920.0).margin(0.01));
+    CHECK(angleOf(params, kIndexTilt) == Approx(0.0).margin(1e-4));
+    CHECK(changed(params, kIndexPan));
+    CHECK((drag.evt_out_flags & PF_EO_HANDLED_EVENT) != 0);
+}
+
+TEST_CASE("an update rect that does not start at the window origin does not offset the gesture",
+          "[reframe][ui][module][premiere]") {
+    UiFixture f;
+    f.setFov(90.0);
+    std::vector<PF_ParamDef*> params = f.params();
+    f.in.width = 0;
+    f.in.height = 0;
+
+    // The frame drawn at (400, 300) in window space.
+    constexpr A_long kX = 400;
+    constexpr A_long kY = 300;
+    PF_EventExtra draw = makeDrawWithRect(f.host, kX, kY, kX + 1920, kY + 1080);
+    REQUIRE(f.event(draw, params) == PF_Err_NONE);
+    REQUIRE((draw.evt_out_flags & PF_EO_HANDLED_EVENT) != 0);
+
+    // The cursor feedback agrees with the hit-test in FRAME space: just
+    // inside the frame's top-left corner is the FOV grip, just outside it is
+    // not ours, and the frame's centre is open picture.
+    PF_EventExtra onGrip = makeCursorAt(f.host, kX + 5, kY + 5);
+    REQUIRE(f.event(onGrip, params) == PF_Err_NONE);
+    CHECK(onGrip.u.adjust_cursor.set_cursor == PF_Cursor_SCALE_DIAG_LR);
+
+    PF_EventExtra beside = makeCursorAt(f.host, kX - 5, kY - 5);
+    REQUIRE(f.event(beside, params) == PF_Err_NONE);
+    CHECK(beside.u.adjust_cursor.set_cursor == PF_Cursor_NONE);
+
+    PF_EventExtra overPicture = makeCursorAt(f.host, kX + 960, kY + 540);
+    REQUIRE(f.event(overPicture, params) == PF_Err_NONE);
+    CHECK(overPicture.u.adjust_cursor.set_cursor == PF_Cursor_PAN);
+
+    // A purely horizontal drag from the frame's centre moves Pan by the
+    // calibrated amount and Tilt by EXACTLY nothing: an origin that leaked
+    // into one axis but not the other would show up here as a Tilt.
+    PF_EventExtra click = makeClickAt(f.host, kX + 960, kY + 540);
+    REQUIRE(f.event(click, params) == PF_Err_NONE);
+    REQUIRE(click.u.do_click.send_drag == TRUE);
+
+    PF_EventExtra drag = makeDragFrom(f.host, click, kX + 960 + 96, kY + 540, true);
+    REQUIRE(f.event(drag, params) == PF_Err_NONE);
+    CHECK(angleOf(params, kIndexPan) == Approx(96.0 * 90.0 / 1920.0).margin(0.01));
+    CHECK(angleOf(params, kIndexTilt) == Approx(0.0).margin(1e-4));
+}
+
+TEST_CASE("a sizeless DRAW draws nothing and does not erase an established frame",
+          "[reframe][ui][module][premiere]") {
+    // What a host probe, a hidden panel or a pre-roll sends: no layer size
+    // and no usable update rect.  It must draw nothing - and, just as
+    // important, it must not wipe the frame a real monitor established, or
+    // one probe would make the overlay ungrabbable until the next repaint.
+    UiFixture f;
+    std::vector<PF_ParamDef*> params = f.params();
+    f.in.width = 0;
+    f.in.height = 0;
+
+    PF_EventExtra real = makeDrawWithRect(f.host, 0, 0, 1920, 1080);
+    REQUIRE(f.event(real, params) == PF_Err_NONE);
+    REQUIRE((real.evt_out_flags & PF_EO_HANDLED_EVENT) != 0);
+
+    // Empty, inverted and absurd rects: each one is a no-op for the overlay.
+    struct Rect {
+        A_long l, t, r, b;
+    };
+    const Rect sizeless[] = {
+        {0, 0, 0, 0},              // what the probe sends
+        {500, 500, 100, 100},      // inverted
+        {0, 0, 1 << 20, 1 << 20},  // far past kMaxOverlayEdge
+    };
+    for (const Rect& r : sizeless) {
+        INFO("update rect " << r.l << "," << r.t << "," << r.r << "," << r.b);
+        f.host.clearDrawbotRecord();
+        PF_EventExtra probe = makeDrawWithRect(f.host, r.l, r.t, r.r, r.b);
+        CHECK(f.event(probe, params) == PF_Err_NONE);
+        CHECK(f.host.drawbotRecord().ops.empty());
+        CHECK((probe.evt_out_flags & PF_EO_HANDLED_EVENT) == 0);
+    }
+
+    // The frame the real draw established survived every probe.
+    PF_EventExtra click = makeClickAt(f.host, 960, 540);
+    REQUIRE(f.event(click, params) == PF_Err_NONE);
+    CHECK(click.u.do_click.send_drag == TRUE);
+
+    // Finish the gesture so the drag table is left as it was found.
+    PF_EventExtra release = makeDragFrom(f.host, click, 960, 540, true);
+    CHECK(f.event(release, params) == PF_Err_NONE);
+}
+
+TEST_CASE("a drag that moves a value asks for an immediate overlay repaint", "[reframe][ui][module][repaint]") {
+    // PF_InvalidateRect + PF_EO_UPDATE_NOW is the SDK's "repaint the custom
+    // UI now" (AE_EffectSuites.h:588-594).  Without it the readout only
+    // refreshes when something else invalidates the view - in practice when
+    // the slow frame render lands - so the HUD would look frozen mid-drag.
+    //
+    // The mock host serves no App suite, so this pins the out-flag half of
+    // the contract.  The PF_InvalidateRect half is acquired defensively and
+    // simply skipped when the suite is absent, which this also proves.
+    UiFixture f;
+    f.setFov(90.0);
+    std::vector<PF_ParamDef*> params = f.params();
+
+    PF_EventExtra click = makeClickAt(f.host, 960, 540);
+    REQUIRE(f.event(click, params) == PF_Err_NONE);
+    REQUIRE(click.u.do_click.send_drag == TRUE);
+
+    PF_EventExtra move = makeDragFrom(f.host, click, 960 + 48, 540, false);
+    REQUIRE(f.event(move, params) == PF_Err_NONE);
+    CHECK((move.evt_out_flags & PF_EO_HANDLED_EVENT) != 0);
+    CHECK((move.evt_out_flags & PF_EO_UPDATE_NOW) != 0);
+
+    // ALWAYS_UPDATE means "re-render the comp", which is the slow thing the
+    // repaint exists to avoid waiting for.  CHANGED_VALUE already schedules
+    // the one render that is needed, so the overlay must never ask for more.
+    CHECK((move.evt_out_flags & PF_EO_ALWAYS_UPDATE) == 0);
+
+    PF_EventExtra release = makeDragFrom(f.host, click, 960 + 96, 540, true);
+    REQUIRE(f.event(release, params) == PF_Err_NONE);
+    CHECK((release.evt_out_flags & PF_EO_UPDATE_NOW) != 0);
+
+    // A drag the module does not recognise changes nothing, so it asks for
+    // nothing either.
+    PF_EventExtra foreign = makeExtra(f.host, PF_Event_DRAG);
+    foreign.u.do_click.screen_point.h = 1000;
+    foreign.u.do_click.screen_point.v = 540;
+    REQUIRE(f.event(foreign, params) == PF_Err_NONE);
+    CHECK(foreign.evt_out_flags == PF_EO_NONE);
+}
+
+TEST_CASE("the hover highlight asks for a repaint only when the handle under the cursor changes",
+          "[reframe][ui][module][repaint]") {
+    // ADJUST_CURSOR arrives on every mouse move.  Repainting the whole view
+    // on each one would keep the Program Monitor busy just because the
+    // pointer is travelling across it, so the repaint is requested only on a
+    // transition between handles.
+    UiFixture f;
+    std::vector<PF_ParamDef*> params = f.params();
+    const Layout layout = computeLayout(fullFrame());
+    const A_long cx = static_cast<A_long>(layout.centre.x);
+    const A_long cy = static_cast<A_long>(layout.centre.y);
+
+    // Settle on open picture first.  Whether THIS asks for a repaint depends
+    // on what an earlier test left hovered, so it is not asserted.
+    PF_EventExtra settle = makeCursorAt(f.host, cx, cy);
+    REQUIRE(f.event(settle, params) == PF_Err_NONE);
+
+    // Moving within the same handle: no repaint.
+    PF_EventExtra same = makeCursorAt(f.host, cx + 10, cy + 10);
+    REQUIRE(f.event(same, params) == PF_Err_NONE);
+    CHECK((same.evt_out_flags & PF_EO_UPDATE_NOW) == 0);
+
+    // Onto a grip: the highlight moves, so repaint.
+    PF_EventExtra grip = makeCursorAt(f.host, 5, 5);
+    REQUIRE(f.event(grip, params) == PF_Err_NONE);
+    CHECK((grip.evt_out_flags & PF_EO_UPDATE_NOW) != 0);
+
+    // Still on the grip: no repaint.
+    PF_EventExtra gripAgain = makeCursorAt(f.host, 8, 8);
+    REQUIRE(f.event(gripAgain, params) == PF_Err_NONE);
+    CHECK((gripAgain.evt_out_flags & PF_EO_UPDATE_NOW) == 0);
+
+    // Leaving the view drops the highlight, once.
+    PF_EventExtra exited = makeExtra(f.host, PF_Event_MOUSE_EXITED);
+    REQUIRE(f.event(exited, params) == PF_Err_NONE);
+    CHECK((exited.evt_out_flags & PF_EO_UPDATE_NOW) != 0);
+
+    PF_EventExtra exitedAgain = makeExtra(f.host, PF_Event_MOUSE_EXITED);
+    REQUIRE(f.event(exitedAgain, params) == PF_Err_NONE);
+    CHECK((exitedAgain.evt_out_flags & PF_EO_UPDATE_NOW) == 0);
+}
+
+TEST_CASE("while a drag is in flight the readout shows its values even if the host's are stale",
+          "[reframe][ui][module][readout]") {
+    // A host is free to hand a DRAW the values of the frame it last FINISHED
+    // rendering.  With a slow render that is several drag events behind, and
+    // a readout built from those values would lag as badly as the picture.
+    // A stale copy of the parameter array stands in for such a host.
+    UiFixture f;
+    f.setFov(90.0);
+    std::vector<PF_ParamDef*> params = f.params();
+
+    std::vector<PF_ParamDef> staleDefs;
+    staleDefs.reserve(params.size());
+    for (PF_ParamDef* def : params) {
+        REQUIRE(def != nullptr);
+        staleDefs.push_back(*def);
+    }
+    std::vector<PF_ParamDef*> stale;
+    stale.reserve(staleDefs.size());
+    for (PF_ParamDef& def : staleDefs) {
+        stale.push_back(&def);
+    }
+
+    PF_EventExtra click = makeClickAt(f.host, 960, 540);
+    REQUIRE(f.event(click, params) == PF_Err_NONE);
+    REQUIRE(click.u.do_click.send_drag == TRUE);
+
+    // First move: the host's own array now holds 4.5, the stale one still 0.
+    PF_EventExtra move1 = makeDragFrom(f.host, click, 960 + 96, 540, false);
+    REQUIRE(f.event(move1, params) == PF_Err_NONE);
+    REQUIRE(angleOf(params, kIndexPan) == Approx(4.5).margin(0.01));
+    REQUIRE(angleOf(stale, kIndexPan) == Approx(0.0).margin(1e-6));
+
+    f.host.clearDrawbotRecord();
+    PF_EventExtra draw1 = makeExtra(f.host, PF_Event_DRAW);
+    REQUIRE(f.event(draw1, stale) == PF_Err_NONE);
+    CHECK(drewText(f.host.drawbotRecord(), panReadout(4.5)));
+
+    // It tracks every move, not just the first.
+    PF_EventExtra move2 = makeDragFrom(f.host, click, 960 + 192, 540, false);
+    REQUIRE(f.event(move2, params) == PF_Err_NONE);
+    f.host.clearDrawbotRecord();
+    PF_EventExtra draw2 = makeExtra(f.host, PF_Event_DRAW);
+    REQUIRE(f.event(draw2, stale) == PF_Err_NONE);
+    CHECK(drewText(f.host.drawbotRecord(), panReadout(9.0)));
+
+    // Another reframe instance never shows this gesture's numbers.
+    {
+        PF_ProgPtr other = f.host.createEffectRef(0x2001, 12);
+        REQUIRE(other != nullptr);
+        PF_InData otherIn = f.host.makeInData(other, {});
+        PF_OutData otherOut = f.host.makeOutData();
+        REQUIRE(LoadedPlugin::instance().effectMain()(PF_Cmd_PARAMS_SETUP, &otherIn, &otherOut, nullptr, nullptr,
+                                                      nullptr) == PF_Err_NONE);
+        otherIn = f.host.makeInData(other, {});
+        std::vector<PF_ParamDef*> otherParams = f.host.renderParams(other);
+
+        f.host.clearDrawbotRecord();
+        PF_EventExtra otherDraw = makeExtra(f.host, PF_Event_DRAW);
+        REQUIRE(LoadedPlugin::instance().effectMain()(PF_Cmd_EVENT, &otherIn, &otherOut, otherParams.data(),
+                                                      nullptr, &otherDraw) == PF_Err_NONE);
+        CHECK(drewText(f.host.drawbotRecord(), panReadout(OSV_REFRAME_PAN_DEFAULT)));
+        CHECK_FALSE(drewText(f.host.drawbotRecord(), panReadout(9.0)));
+        f.host.destroyEffectRef(other);
+    }
+
+    // Release: from here on the host is the authority again, so a stale
+    // array shows stale numbers and the real one shows the committed value.
+    PF_EventExtra release = makeDragFrom(f.host, click, 960 + 192, 540, true);
+    REQUIRE(f.event(release, params) == PF_Err_NONE);
+
+    f.host.clearDrawbotRecord();
+    PF_EventExtra afterStale = makeExtra(f.host, PF_Event_DRAW);
+    REQUIRE(f.event(afterStale, stale) == PF_Err_NONE);
+    CHECK(drewText(f.host.drawbotRecord(), panReadout(0.0)));
+
+    f.host.clearDrawbotRecord();
+    PF_EventExtra afterReal = makeExtra(f.host, PF_Event_DRAW);
+    REQUIRE(f.event(afterReal, params) == PF_Err_NONE);
+    CHECK(drewText(f.host.drawbotRecord(), panReadout(9.0)));
 }

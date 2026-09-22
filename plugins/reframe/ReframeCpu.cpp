@@ -499,12 +499,10 @@ double autoEyeOffsetForFov(double fovDeg) noexcept {
     }
     constexpr double kStart = OSV_REFRAME_AUTO_EYE_FOV_START;
     constexpr double kFull = OSV_REFRAME_AUTO_EYE_FOV_FULL;
-    // Defensive: if the two constants were ever edited into a degenerate or
-    // inverted pair, fall back to "no automatic distortion" instead of
-    // dividing by zero or ramping backwards.
-    if (!(kFull > kStart)) {
-        return 0.0;
-    }
+    // If the two constants were ever edited into a degenerate or inverted
+    // pair the division below would be by zero or the ramp would run
+    // backwards.  That is a build-time mistake, so it fails the build.
+    static_assert(kFull > kStart, "the automatic eye-offset ramp must end after it starts");
     if (fovDeg <= kStart) {
         return 0.0;
     }
@@ -571,9 +569,10 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
     }
 
     // ---- the rectangle we paint ------------------------------------------
-    // Always the whole frame: a virtual camera fills its sensor.  The chosen
-    // resolution below decides the camera's pixel density, not its coverage,
-    // so there is no letterbox to compute and none to leave black.
+    // Always the whole frame: a virtual camera fills its sensor, so there is
+    // no letterbox to compute and none to leave black.  The chosen
+    // resolution below decides the camera's FRAMING (see coverScale), never
+    // its coverage.
     const Viewport view = computeViewport(outW, outH);
     if (view.w <= 0 || view.h <= 0) {
         setup.reject = SetupReject::Viewport;
@@ -585,17 +584,54 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
     // of the frame the host gave us: Premiere renders previews and scrubs at
     // a fraction of full resolution, so `outW x outH` is routinely smaller.
     //
-    // It is resolved here purely so a bad control value is caught with a
-    // named reason.  The geometry below deliberately does NOT scale anything
-    // by it - see the note on the camera - because the output frame is the
-    // output frame whatever the popup says.
-    const SizePx requested = resolveOutputSize(settings.resolution, sequenceSize, SizePx{outW, outH});
-    if (!requested.valid()) {
+    // Only its SHAPE is used below.  The host allocates the output world, so
+    // no control value can change how many pixels this function is asked to
+    // fill; what the named size can honestly decide is which shape the field
+    // of view is measured across when that shape differs from the frame.
+    const SizePx requestedSize = resolveOutputSize(settings.resolution, sequenceSize, SizePx{outW, outH});
+    if (!requestedSize.valid()) {
         // Nothing could tell us a size: no sequence, and a frame that failed
         // its own validity check above (which cannot happen here, but the
         // branch costs nothing and makes the postcondition unconditional).
         setup.reject = SetupReject::OutputSize;
         return setup;
+    }
+
+    // ---- cover-fit the requested shape onto the frame --------------------
+    // The field of view spans the WIDTH of the requested resolution.  That
+    // image is then scaled uniformly until it covers the whole frame, and
+    // whatever overflows is cropped - never letterboxed.
+    //
+    //   requested relatively WIDER than the frame  (reqW / reqH > outW / outH)
+    //       the height binds: the virtual image is outH tall and wider than
+    //       the frame, so the sides are cropped and the visible horizontal
+    //       field of view is narrower than FOV.  The focal length grows by
+    //       virtualWidth / outW = (reqW * outH) / (reqH * outW) > 1.
+    //
+    //   requested the same shape, or TALLER
+    //       the width binds: FOV spans the frame width exactly as before, the
+    //       top and bottom (if any) are cropped, and the factor is 1.
+    //
+    // The comparison is done in EXACT integer arithmetic (int64 cross
+    // products of two positive ints, which cannot overflow).  That matters: for "Match Sequence" and
+    // for every preview-scaled frame the shapes are identical, the factor is
+    // exactly 1.0 and the render is bit-for-bit the full-frame render - a
+    // floating-point ratio test would let a rounding error nudge the focal
+    // length on frames where nothing was asked to change.
+    //
+    // A factor >= 1 only ever NARROWS the visible field of view, so the
+    // eye-offset invertibility clamp VirtualCamera applies below (measured
+    // across the frame width) remains a valid bound for what is shown.
+    const std::int64_t reqWxOutH = static_cast<std::int64_t>(requestedSize.w) * static_cast<std::int64_t>(outH);
+    const std::int64_t reqHxOutW = static_cast<std::int64_t>(requestedSize.h) * static_cast<std::int64_t>(outW);
+    double coverScale = 1.0;
+    if (reqWxOutH > reqHxOutW && reqHxOutW > 0) {
+        coverScale = static_cast<double>(reqWxOutH) / static_cast<double>(reqHxOutW);
+    }
+    if (!std::isfinite(coverScale) || !(coverScale >= 1.0)) {
+        // Unreachable with validated sizes, but a non-finite factor would
+        // turn into a NaN focal length and a NaN frame, so it is neutralised.
+        coverScale = 1.0;
     }
 
     // ---- the virtual camera ----------------------------------------------
@@ -702,12 +738,17 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
     p.viewH = view.h;
     p.projection = OSV_PROJ_EYE_OFFSET;
     p.eyeOffset = static_cast<float>(camera.eyeOffset);
-    p.focalPx = static_cast<float>(focal);
+    // The cover-fit factor is applied HERE, after the fallback above, so the
+    // degenerate-camera logic still reasons about the unscaled camera and a
+    // factor of exactly 1.0 leaves the focal length untouched.
+    p.focalPx = static_cast<float>(focal * coverScale);
     // The rectilinear helpers are unused by the eye-offset branch but are
     // filled anyway so the struct never carries stale garbage into a device
     // buffer (and so a future projection switch needs no extra plumbing).
+    // They are divided by the same cover factor so they keep describing the
+    // same (cropped) picture the focal length does: tan(half fov) = (W/2) / f.
     const double halfFov = 0.5 * camera.effectiveHfovDeg() * kPi / 180.0;
-    const double tanHalf = std::tan(std::min(halfFov, 1.55));  // guard the pole
+    const double tanHalf = std::tan(std::min(halfFov, 1.55)) / coverScale;  // guard the pole
     p.tanHalfH = static_cast<float>(tanHalf);
     p.tanHalfV = static_cast<float>(tanHalf * static_cast<double>(view.h) / static_cast<double>(view.w));
     for (int i = 0; i < 9; ++i) {
