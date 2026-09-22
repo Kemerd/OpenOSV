@@ -597,25 +597,46 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
 // ---------------------------------------------------------------------------
 //  Full measurement
 // ---------------------------------------------------------------------------
-Result<ParallaxWarpGrid> buildParallaxWarp(const geom::LensRig& rig, const video::FramePair& frames,
-                                           const geom::BlendParams& blend, const ParallaxWarpParams& params,
-                                           const std::vector<float>* seamTable, ThreadPool& pool) {
+Result<LensBands> measureParallaxBands(const geom::LensRig& rig, const video::FramePair& frames,
+                                       const geom::BlendParams& blend, const ParallaxWarpParams& params,
+                                       const std::vector<float>* seamTable, ThreadPool& pool) {
     OSV_TRY(checkParams(params));
 
     // Render the two per-lens bands.  Passing the seam table through means
     // the flow measures the RESIDUAL parallax the 1-D correction left behind,
     // so the two mechanisms compose instead of both claiming the same
     // disparity and over-correcting it.
+    OSV_TRY_ASSIGN(LensBands bands, renderLensBands(rig, frames, blend, params.band, false, seamTable, pool));
+    if (bands.w == 0 || bands.h == 0) {
+        return Error{ErrorCode::Internal, "measureParallaxBands: band render produced nothing"};
+    }
+    return bands;
+}
+
+Result<ParallaxWarpGrid> buildParallaxWarp(const geom::LensRig& rig, const video::FramePair& frames,
+                                           const geom::BlendParams& blend, const ParallaxWarpParams& params,
+                                           const std::vector<float>* seamTable, ThreadPool& pool) {
+    // Exactly the two halves in sequence, so a caller that splits them (the
+    // importer, to keep the flow solve off its render thread) gets a result
+    // identical to one that does not.
+    const auto tBand = std::chrono::steady_clock::now();
+    OSV_TRY_ASSIGN(LensBands bands, measureParallaxBands(rig, frames, blend, params, seamTable, pool));
+    const double bandMs =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tBand).count();
+    return parallaxFromBands(bands, params, &pool, bandMs);
+}
+
+Result<ParallaxWarpGrid> parallaxFromBands(const LensBands& bands, const ParallaxWarpParams& params,
+                                           ThreadPool* pool, double bandMs) {
+    OSV_TRY(checkParams(params));
+    if (bands.w == 0 || bands.h == 0) {
+        return Error{ErrorCode::InvalidArgument, "parallaxFromBands: empty bands"};
+    }
+
     using Clock = std::chrono::steady_clock;
     const auto msSince = [](Clock::time_point t) {
         return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
     };
-    const auto tBand = Clock::now();
-    OSV_TRY_ASSIGN(LensBands bands, renderLensBands(rig, frames, blend, params.band, false, seamTable, pool));
-    const double bandMs = msSince(tBand);
-    if (bands.w == 0 || bands.h == 0) {
-        return Error{ErrorCode::Internal, "buildParallaxWarp: band render produced nothing"};
-    }
 
     // The band luma planes are already exactly the shape the flow solver
     // wants, so there is no conversion here beyond wrapping them.
@@ -628,12 +649,12 @@ Result<ParallaxWarpGrid> buildParallaxWarp(const geom::LensRig& rig, const video
     b.h = bands.h;
     b.data = bands.luma[1];
     if (!a.valid() || !b.valid()) {
-        return Error{ErrorCode::Internal, "buildParallaxWarp: band planes are malformed"};
+        return Error{ErrorCode::Internal, "parallaxFromBands: band planes are malformed"};
     }
 
     FlowBackendKind used = params.backend;
     const auto tFlow = Clock::now();
-    OSV_TRY_ASSIGN(BidirFlow flow, computeFlow(params.backend, a, b, params.flow, &pool, &used));
+    OSV_TRY_ASSIGN(BidirFlow flow, computeFlow(params.backend, a, b, params.flow, pool, &used));
     const double flowMs = msSince(tFlow);
 
     const auto tGrid = Clock::now();
@@ -651,6 +672,31 @@ Result<ParallaxWarpGrid> buildParallaxWarp(const geom::LensRig& rig, const video
         return Error{ErrorCode::Unsupported, "parallax flow too inconsistent to use"};
     }
     return grid;
+}
+
+Result<ParallaxWarpGrid> blendParallaxGrids(const ParallaxWarpGrid& from, const ParallaxWarpGrid& to, double t) {
+    if (!from.valid() || !to.valid()) {
+        return Error{ErrorCode::InvalidArgument, "blendParallaxGrids: a grid is empty or malformed"};
+    }
+    // Same layout or nothing: blending cell i of one grid with cell i of
+    // another is only meaningful when cell i is the same place on the sphere
+    // in both.  Grids built with one parameter set always agree; a mismatch
+    // means the caller mixed grids from different settings.
+    if (from.w != to.w || from.h != to.h || from.latMinRad != to.latMinRad || from.latMaxRad != to.latMaxRad) {
+        return Error{ErrorCode::InvalidArgument, "blendParallaxGrids: the two grids have different layouts"};
+    }
+    if (!std::isfinite(t)) {
+        return Error{ErrorCode::InvalidArgument, "blendParallaxGrids: non-finite blend weight"};
+    }
+    const float k = static_cast<float>(std::clamp(t, 0.0, 1.0));
+
+    // Start from `to` so every diagnostic field describes the newer
+    // measurement, then overwrite only the correction itself.
+    ParallaxWarpGrid out = to;
+    for (std::size_t i = 0; i < out.uv.size(); ++i) {
+        out.uv[i] = from.uv[i] + (to.uv[i] - from.uv[i]) * k;
+    }
+    return out;
 }
 
 }  // namespace osv::render

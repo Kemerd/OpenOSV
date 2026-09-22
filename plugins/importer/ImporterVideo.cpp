@@ -215,6 +215,27 @@ struct FormatChoice {
     }
 }
 
+/// Whether this request may wait for the parallax analysis (see
+/// RenderPurpose in ImporterInstance.h).
+///
+/// Only the three intents where the user is MOVING through the timeline are
+/// interactive: a frame there is on screen for a sixtieth of a second, and
+/// blocking it for a ~220 ms flow solve is what made scrubbing feel broken.
+/// Everything else - export, a paused frame, analysis, and any intent this
+/// build does not know - is exact, because its pixels are the ones that get
+/// looked at or written out.  (Thumbnails and prefetch are drafts already and
+/// skip the correction altogether, so their purpose does not matter.)
+[[nodiscard]] RenderPurpose renderPurposeFor(const imSourceVideoRec& rec) noexcept {
+    switch (rec.inRenderContext.inIntent) {
+    case imRenderIntent_Scrubbing:
+    case imRenderIntent_Playing:
+    case imRenderIntent_Preroll:
+        return RenderPurpose::Interactive;
+    default:
+        return RenderPurpose::Exact;
+    }
+}
+
 /// Name of an intent for the log.
 [[nodiscard]] const char* intentName(imRenderIntent intent) noexcept {
     switch (intent) {
@@ -708,7 +729,7 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
     std::lock_guard<std::mutex> guard(instance->lock());
     instance->applyPrefsLocked(&prefs, PrefsBlob::kSize);
 
-    auto rendered = instance->renderFrame(frameIndex, geometry, draft);
+    auto rendered = instance->renderFrame(frameIndex, geometry, draft, renderPurposeFor(*rec));
     if (!rendered.ok()) {
         PluginLog::error("imGetSourceVideo: frame {} failed: {}", frameIndex, rendered.error().message);
         // A decode failure for one frame is not a bad file; the host shows a

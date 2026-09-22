@@ -31,6 +31,36 @@ struct ImageRGBAf {
         return img;
     }
 
+    /// Make this image `width` x `height`, REUSING its allocation.
+    ///
+    /// The contents afterwards are unspecified - stale pixels from the last
+    /// frame, zeros for any newly grown tail - which is correct only because
+    /// every renderer that calls this writes every output pixel.
+    ///
+    /// WHY IT EXISTS: create() allocates and zero-fills the whole image, and
+    /// the kernel then overwrites every byte of it.  At native 6000 x 3000
+    /// that is 288 MB of page faults and memset per frame, measured at ~50 ms
+    /// of an importer frame that otherwise costs ~60 ms - pure waste once a
+    /// caller keeps one image across frames.  A same-sized frame now costs
+    /// nothing here; only a size change (a new output resolution) reallocates.
+    ///
+    /// Same size limits as create().  On error the image is left untouched.
+    [[nodiscard]] Status reshape(std::uint32_t width, std::uint32_t height) {
+        if (width == 0 || height == 0 || width > 32768 || height > 32768) {
+            return failStatus(ErrorCode::InvalidArgument, "ImageRGBAf::reshape: unsupported size");
+        }
+        const std::size_t n = static_cast<std::size_t>(width) * height * 4u;
+        // resize() only value-initialises elements it ADDS, so a same-size
+        // or shrinking reshape touches no memory at all, and shrinking keeps
+        // the capacity for when the size grows back.
+        if (data.size() != n) {
+            data.resize(n);
+        }
+        w = width;
+        h = height;
+        return okStatus();
+    }
+
     [[nodiscard]] bool valid() const noexcept { return w > 0 && h > 0 && data.size() == static_cast<std::size_t>(w) * h * 4u; }
 
     /// Pointer to the first float of row `y` (nullptr when out of range).

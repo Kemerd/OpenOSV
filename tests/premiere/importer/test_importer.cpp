@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -2207,4 +2208,231 @@ TEST_CASE("parallax correction cost in the importer",
 
         harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
     }
+}
+
+// =============================================================================
+//  Parallax schedule: bucketed, and off the render thread when interactive
+// =============================================================================
+
+namespace {
+
+/// Pixels that differ between two renders of one frame, split by whether
+/// they lie in the overlap band (|seam latitude| <= 9.5 deg, the grid's span
+/// plus margin) or outside it.
+struct BandDifference {
+    std::uint64_t inside = 0;
+    std::uint64_t outside = 0;
+};
+
+[[nodiscard]] BandDifference bandDifference(const DecodedFrame& a, const DecodedFrame& b) {
+    REQUIRE(a.width == b.width);
+    REQUIRE(a.height == b.height);
+    BandDifference d;
+    for (std::uint32_t y = 0; y < a.height; ++y) {
+        for (std::uint32_t x = 0; x < a.width; ++x) {
+            const float* p = a.pixel(x, y);
+            const float* q = b.pixel(x, y);
+            if (p[0] == q[0] && p[1] == q[1] && p[2] == q[2] && p[3] == q[3]) {
+                continue;
+            }
+            if (std::fabs(seamLatitudeDeg(x, y, a.width, a.height)) > 9.5) {
+                ++d.outside;
+            } else {
+                ++d.inside;
+            }
+        }
+    }
+    return d;
+}
+
+/// Everything else that touches the seam OFF, so a difference between two
+/// renders is the parallax correction and nothing else.  Classical flow so
+/// the result does not depend on whether a neural model is installed.
+[[nodiscard]] PrefsBlob parallaxOnlyPrefs(bool parallaxOn) {
+    PrefsBlob p = PrefsBlob::defaults();
+    p.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::Native);
+    p.seamSearch = 0;
+    p.gainMatch = 0;
+    p.stabilization = static_cast<std::uint8_t>(PrefsStabilization::Off);
+    p.parallax = static_cast<std::uint8_t>(parallaxOn ? PrefsParallax::On : PrefsParallax::Off);
+    p.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Classical);
+    return p;
+}
+
+/// A request for `frame` at the half step of the native ladder.
+[[nodiscard]] ImporterHarness::SourceVideoRequest requestFor(std::uint32_t frame, imRenderIntent intent) {
+    ImporterHarness::SourceVideoRequest r;
+    r.frameTime = kTicksPerFrame5994 * static_cast<PrTime>(frame);
+    r.width = 3000;
+    r.height = 1500;
+    r.intent = intent;
+    // Real-time playback.  Below 1.0 a Playing request is a DRAFT
+    // (isDraftRequest), which skips the correction altogether - and a test
+    // that left this at 0 would pass without ever exercising the worker.
+    r.playbackRatio = 1.0;
+    return r;
+}
+
+/// The overlap must be substantially corrected for these to mean anything:
+/// the first parallax test measured far more than this on the sample clip.
+constexpr std::uint64_t kCorrectedPixels = 10000;
+
+}  // namespace
+
+TEST_CASE("an interactive request never waits for the parallax measurement, and later frames receive it",
+          "[importer][video][parallax][async][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+
+    const PrefsBlob off = parallaxOnlyPrefs(false);
+    const PrefsBlob on = parallaxOnlyPrefs(true);
+    const DecodedFrame off1 = renderFrame(harness, clip, ppix, requestFor(1, imRenderIntent_Export), off);
+    const DecodedFrame off2 = renderFrame(harness, clip, ppix, requestFor(2, imRenderIntent_Export), off);
+    harness.host().clearCache();
+
+    // The first interactive request finds nothing measured - not its own
+    // bucket, not a neighbour - so it must come back UNCORRECTED, bit for
+    // bit.  Anything else means it waited for the ~220 ms flow solve, which
+    // is exactly what made scrubbing unusable.
+    const DecodedFrame first = renderFrame(harness, clip, ppix, requestFor(1, imRenderIntent_Playing), on);
+    const BandDifference firstDiff = bandDifference(off1, first);
+    INFO("first interactive frame differs from uncorrected in " << firstDiff.inside << " / " << firstDiff.outside
+                                                                << " pixels (inside / outside the overlap)");
+    REQUIRE(firstDiff.inside == 0);
+    REQUIRE(firstDiff.outside == 0);
+
+    // Later frames of the same bucket pick up the background result.
+    // Frames 2 and 1 alternate: the importer's one-frame cache would
+    // otherwise keep handing back the stand-in it has just built.
+    bool corrected = false;
+    std::uint32_t frame = 2;
+    std::uint32_t attempts = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (!corrected && std::chrono::steady_clock::now() < deadline) {
+        harness.host().clearCache();
+        const DecodedFrame f = renderFrame(harness, clip, ppix, requestFor(frame, imRenderIntent_Playing), on);
+        const BandDifference d = bandDifference(frame == 1 ? off1 : off2, f);
+        // Stand-in or not, a correction must never leak outside the overlap.
+        REQUIRE(d.outside == 0);
+        corrected = d.inside > kCorrectedPixels;
+        frame = frame == 1 ? 2 : 1;
+        ++attempts;
+        if (!corrected) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    INFO("interactive requests until the background measurement arrived: " << attempts);
+    REQUIRE(corrected);
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
+TEST_CASE("an exact request is never served a frame built with a stand-in analysis",
+          "[importer][video][parallax][async][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+
+    const PrefsBlob off = parallaxOnlyPrefs(false);
+    const PrefsBlob on = parallaxOnlyPrefs(true);
+
+    // The reference: frame 0 exported from a clip that has never seen an
+    // interactive request.
+    DecodedFrame reference;
+    {
+        auto fresh = harness.openClip(sampleClipPath());
+        REQUIRE(fresh.open());
+        reference = renderFrame(harness, fresh, ppix, requestFor(0, imRenderIntent_Export), on);
+    }
+    harness.host().clearCache();
+
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+    const DecodedFrame off0 = renderFrame(harness, clip, ppix, requestFor(0, imRenderIntent_Export), off);
+    harness.host().clearCache();
+
+    // An interactive request builds a stand-in for frame 0 and caches it...
+    const DecodedFrame standIn = renderFrame(harness, clip, ppix, requestFor(0, imRenderIntent_Playing), on);
+    REQUIRE(bandDifference(off0, standIn).inside == 0);
+    harness.host().clearCache();
+
+    // ...and the export of the SAME frame, at the same settings, must not
+    // inherit it.  Whether the background worker has finished by now or not,
+    // the export must be corrected, and exactly as if the interactive request
+    // had never happened: an export may not depend on what was scrubbed
+    // through before it.
+    const DecodedFrame exported = renderFrame(harness, clip, ppix, requestFor(0, imRenderIntent_Export), on);
+    const BandDifference d = bandDifference(off0, exported);
+    REQUIRE(d.outside == 0);
+    REQUIRE(d.inside > kCorrectedPixels);
+    const BandDifference vsReference = bandDifference(reference, exported);
+    INFO("export after an interactive request vs a fresh clip's export: " << vsReference.inside << " / "
+                                                                           << vsReference.outside << " pixels differ");
+    REQUIRE(vsReference.inside == 0);
+    REQUIRE(vsReference.outside == 0);
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
+TEST_CASE("quieting or closing a clip while a background measurement is queued neither hangs nor breaks it",
+          "[importer][video][parallax][async][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+    const PrefsBlob off = parallaxOnlyPrefs(false);
+    const PrefsBlob on = parallaxOnlyPrefs(true);
+
+    // releaseHeavy() holds the instance lock while it joins the worker, so a
+    // worker that ever took that lock would hang here forever.  The join may
+    // legitimately wait for ONE measurement (~220 ms); ten seconds is
+    // generous enough never to flake and still catches a deadlock.
+    constexpr auto kMaxJoin = std::chrono::seconds(10);
+
+    SECTION("imQuietFile, then the clip is used again") {
+        auto clip = harness.openClip(sampleClipPath());
+        REQUIRE(clip.open());
+        const DecodedFrame off0 = renderFrame(harness, clip, ppix, requestFor(0, imRenderIntent_Export), off);
+        harness.host().clearCache();
+        (void)renderFrame(harness, clip, ppix, requestFor(0, imRenderIntent_Playing), on);  // queues bucket 0
+
+        const auto t0 = std::chrono::steady_clock::now();
+        REQUIRE(clip.quiet() == imNoErr);
+        const auto waited = std::chrono::steady_clock::now() - t0;
+        // Computed outside INFO(): the comma in duration<double, std::milli>
+        // would otherwise split the macro's arguments.
+        const double waitedMs = std::chrono::duration<double, std::milli>(waited).count();
+        INFO("imQuietFile took " << waitedMs << " ms");
+        REQUIRE(waited < kMaxJoin);
+
+        // The quiet dropped the queued job and bumped the generation; the
+        // clip must still render, and correctly.
+        harness.host().clearCache();
+        const DecodedFrame after = renderFrame(harness, clip, ppix, requestFor(0, imRenderIntent_Export), on);
+        const BandDifference d = bandDifference(off0, after);
+        REQUIRE(d.outside == 0);
+        REQUIRE(d.inside > kCorrectedPixels);
+    }
+
+    SECTION("imCloseFile destroys the instance with the worker still running") {
+        auto clip = harness.openClip(sampleClipPath());
+        REQUIRE(clip.open());
+        (void)renderFrame(harness, clip, ppix, requestFor(0, imRenderIntent_Playing), on);  // queues bucket 0
+        const auto t0 = std::chrono::steady_clock::now();
+        REQUIRE(clip.close() == imNoErr);
+        REQUIRE(std::chrono::steady_clock::now() - t0 < kMaxJoin);
+    }
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }

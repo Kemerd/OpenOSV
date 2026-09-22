@@ -7,11 +7,20 @@
 namespace osv::render {
 
 Result<ImageRGBAf> CpuRenderer::render(const RenderJob& job) {
+    // A fresh image grows from empty, so reshape() value-initialises it
+    // exactly as create() did - the result is byte-identical to before.
+    ImageRGBAf image;
+    OSV_TRY(renderInto(job, image));
+    return image;
+}
+
+Status CpuRenderer::renderInto(const RenderJob& job, ImageRGBAf& image) {
     if (!job.valid()) {
-        return Error{ErrorCode::InvalidArgument, "CpuRenderer: invalid render job"};
+        return failStatus(ErrorCode::InvalidArgument, "CpuRenderer: invalid render job");
     }
-    OSV_TRY_ASSIGN(ImageRGBAf image, ImageRGBAf::create(static_cast<std::uint32_t>(job.params.outW),
-                                                        static_cast<std::uint32_t>(job.params.outH)));
+    // Reuse the caller's allocation.  No zero-fill is needed: the loop below
+    // writes every pixel of every row.
+    OSV_TRY(image.reshape(static_cast<std::uint32_t>(job.params.outW), static_cast<std::uint32_t>(job.params.outH)));
 
     // Copies of the POD blocks so the kernel reads exactly what a GPU would
     // receive by value (and so a caller mutating the job mid-render cannot
@@ -37,7 +46,7 @@ Result<ImageRGBAf> CpuRenderer::render(const RenderJob& job) {
                                        }
                                    });
     OSV_TRY(st);
-    return image;
+    return okStatus();
 }
 
 }  // namespace osv::render

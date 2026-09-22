@@ -16,6 +16,8 @@ public:
     explicit CpuRenderer(ThreadPool& pool) noexcept : m_pool(pool) {}
 
     Result<ImageRGBAf> render(const RenderJob& job) override;
+    /// Reuses `out`'s allocation across same-sized frames (IRenderer::renderInto).
+    Status renderInto(const RenderJob& job, ImageRGBAf& out) override;
     [[nodiscard]] const char* name() const noexcept override { return "cpu"; }
 
     /// Rows per work item handed to the pool (tunable for tests).

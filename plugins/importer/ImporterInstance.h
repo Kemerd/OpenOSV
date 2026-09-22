@@ -52,7 +52,9 @@
 #include "osv/render/ParallaxWarp.h"
 #include "osv/video/DualStreamReader.h"
 
+#include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -60,6 +62,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -87,13 +90,33 @@ struct OutputGeometry {
     }
 };
 
+/// Why a frame is being rendered, which decides whether it may wait for the
+/// parallax analysis.
+///
+/// The analysis costs ~220 ms of CPU per measurement.  A frame that will be
+/// looked at closely or written to a file waits for it; a frame the user is
+/// sweeping past must not.
+enum class RenderPurpose {
+    /// Export, a paused frame, anything whose pixels must be final: the
+    /// analysis for this frame's bucket runs synchronously if it has not
+    /// been measured yet, so the result does not depend on timing.
+    Exact,
+    /// Playback and scrubbing: never block on the analysis.  A missing
+    /// measurement is queued for a background worker and the frame renders
+    /// with the nearest one already available - or without, if none is.
+    Interactive,
+};
+
 /// One rendered frame plus what it was rendered with, kept so a repeat
 /// request for the same frame at the same settings does not decode again.
 /// (The host's PPix cache is the primary cache; this one only survives a
 /// host cache miss caused by a different pixel format request for the same
 /// frame, which happens constantly while scrubbing.)
 struct RenderedFrame {
-    std::uint32_t frameIndex = 0xFFFFFFFFu;
+    /// frameIndex of a cache holding no usable frame.  Never a real index -
+    /// clips are far shorter than 2^32 frames - so it can never match.
+    static constexpr std::uint32_t kNoFrame = 0xFFFFFFFFu;
+    std::uint32_t frameIndex = kNoFrame;
     OutputGeometry geometry;
     PrefsBlob prefs = PrefsBlob::defaults();
     bool seamApplied = false;   ///< Whether the seam search ran for this frame.
@@ -102,12 +125,18 @@ struct RenderedFrame {
     /// seamApplied is: the prefs blob alone does not distinguish a draft
     /// render from a full one, and a draft must never be served in its place.
     bool parallaxWanted = false;
+    /// False when an Interactive render made do with a stand-in analysis -
+    /// a neighbouring bucket's grid, or none while its own was still being
+    /// measured.  An Exact request must never be served such a frame, or a
+    /// paused frame or an export would inherit whatever happened to be ready
+    /// while the user was scrubbing.
+    bool exact = true;
     render::ImageRGBAf image;
 
     [[nodiscard]] bool matches(std::uint32_t index, const OutputGeometry& geom, const PrefsBlob& blob, bool wantSeam,
-                               bool wantParallax) const noexcept {
+                               bool wantParallax, bool needExact) const noexcept {
         return image.valid() && frameIndex == index && geometry == geom && prefs == blob && seamApplied == wantSeam &&
-               parallaxWanted == wantParallax;
+               parallaxWanted == wantParallax && (exact || !needExact);
     }
 };
 
@@ -231,15 +260,22 @@ public:
 
     // ---- rendering ---------------------------------------------------------
     /// Decode + stitch frame `index` at `geometry`.  `draft` disables the
-    /// seam search for this frame regardless of the prefs (scrubbing and low
-    /// quality requests).  The returned image is owned by the instance's
-    /// frame cache and stays valid until the next renderFrame() call on this
-    /// instance, so the caller must copy it out before releasing the lock.
+    /// seam search and the parallax correction for this frame regardless of
+    /// the prefs (scrubbing and low quality requests).  `purpose` decides
+    /// whether a missing parallax measurement is made now (Exact) or queued
+    /// for the background worker (Interactive) - see RenderPurpose.
+    ///
+    /// The returned image is owned by the instance's frame cache and stays
+    /// valid until the next renderFrame() call on this instance, so the
+    /// caller must copy it out before releasing the lock.  The cache reuses
+    /// one allocation across frames, so a stale pointer would read the NEXT
+    /// frame's pixels, not freed memory - still wrong, hence the rule.
     ///
     /// The caller MUST hold lock() for the whole call and for its use of the
     /// returned reference.
     [[nodiscard]] Result<const render::ImageRGBAf*> renderFrame(std::uint32_t index, const OutputGeometry& geometry,
-                                                                bool draft);
+                                                                bool draft,
+                                                                RenderPurpose purpose = RenderPurpose::Exact);
 
     /// Backend that served the last renderFrame() ("cpu", "cuda", "opencl";
     /// empty before the first frame).
@@ -360,23 +396,76 @@ private:
     PrefsStabilization m_stabBuiltFor = PrefsStabilization::Off;
     bool m_stabBuilt = false;
 
-    // ---- per-frame analysis caches ----------------------------------------
-    /// Seam shift table per frame index (only populated when seamSearch is
-    /// on).  Bounded: entries beyond kMaxAnalysisCache are dropped oldest
-    /// first so a long timeline cannot grow the instance without limit.
+    // ---- analysis caches, keyed by BUCKET (render::parallaxBucket) --------
+    /// Seam shift table per bucket (only populated when seamSearch is on).
+    /// Keyed by bucket rather than frame: the seam search costs ~28 ms and a
+    /// shift that changes from one frame to the next is noise, not signal,
+    /// so one measurement per kParallaxBucketFrames frames loses nothing and
+    /// removes ~7/8 of the cost.  Bounded: entries beyond kMaxAnalysisCache
+    /// are dropped (never the one being inserted) so a long timeline cannot
+    /// grow the instance without limit.
     std::map<std::uint32_t, std::vector<float>> m_seamTables;
-    /// Per-lens linear gains per frame index (gainMatch).
+    /// Per-lens linear gains per bucket (gainMatch).  Exposure drifts even
+    /// more slowly than the seam, so the same bucketing applies.
     std::map<std::uint32_t, std::array<Vec3d, 2>> m_gains;
     static constexpr std::size_t kMaxAnalysisCache = 256;
-    /// Parallax warp grid per frame index (parallax on, non-draft requests).
-    /// std::nullopt records a frame whose measurement was REFUSED - too
-    /// little consistent flow, typically open sky - so a revisit falls back
-    /// to the seam table at once instead of paying ~220 ms to be refused
-    /// again.  A grid is ~100 KB, hence a much smaller bound than the other
-    /// caches: 32 grids is ~3 MB and still covers half a second of scrubbing
-    /// at 60 fps.
-    std::map<std::uint32_t, std::optional<render::ParallaxWarpGrid>> m_parallaxGrids;
-    static constexpr std::size_t kMaxParallaxCache = 32;
+
+    // ---- parallax analysis, shared with the background worker -------------
+    //
+    // LOCK ORDER: m_mutex, then m_parallaxMutex - never the reverse, and the
+    // worker NEVER takes m_mutex.  That last rule is load-bearing:
+    // releaseHeavy() holds m_mutex while it joins the worker, so a worker
+    // that wanted m_mutex would deadlock the quiet.  Everything below is
+    // guarded by m_parallaxMutex alone.
+
+    /// One unit of background work: a frame's bands, OWNED, so the decoded
+    /// frame they were cut from can be released as soon as they exist.
+    struct ParallaxJob {
+        std::uint32_t bucket = 0;
+        std::uint64_t generation = 0;  ///< m_parallaxGeneration when queued.
+        render::LensBands bands;
+        render::ParallaxWarpParams params;
+        double bandMs = 0.0;
+    };
+
+    /// Measured parallax per bucket.  A PRESENT entry holding nullptr records
+    /// a measurement that was REFUSED (too little consistent flow - open sky)
+    /// so the bucket is not measured again; an ABSENT entry means not yet
+    /// measured.  shared_ptr so a render can keep using a grid while the
+    /// worker trims the cache under it.  A grid is ~100 KB, so 64 buckets is
+    /// ~6 MB and covers ~8.5 s at 60 fps.
+    std::map<std::uint32_t, std::shared_ptr<const render::ParallaxWarpGrid>> m_parallaxGrids;
+    static constexpr std::size_t kMaxParallaxCache = 64;
+    /// An Interactive frame whose own bucket is not measured yet may borrow
+    /// the nearest measured grid up to this many buckets away (32 frames,
+    /// ~0.5 s at 60 fps).  Further than that the scene near the seam may
+    /// have changed, and the seam table is the safer fallback.
+    static constexpr std::uint32_t kParallaxBorrowBuckets = 4;
+
+    mutable std::mutex m_parallaxMutex;
+    std::condition_variable m_parallaxCv;
+    std::thread m_parallaxWorker;  ///< Started lazily; joined by stopParallaxWorker().
+    /// The next job.  A single slot, LATEST WINS: while scrubbing only the
+    /// frame the user stopped on matters, so a newer request replaces an
+    /// older one that has not started rather than queueing behind it.
+    std::optional<ParallaxJob> m_parallaxPending;
+    std::optional<std::uint32_t> m_parallaxBusyBucket;  ///< Bucket being measured right now.
+    bool m_parallaxStop = false;
+    /// Bumped whenever the measurements become invalid (prefs change, quiet),
+    /// so a job that was already running for the old settings has its result
+    /// discarded instead of polluting the fresh cache.
+    std::uint64_t m_parallaxGeneration = 0;
+
+    /// The worker's body.  Takes only m_parallaxMutex (see LOCK ORDER).
+    void parallaxWorkerLoop() noexcept;
+    /// Stop and join the worker, dropping any job not yet started.  Safe to
+    /// call when no worker is running.  May block for one in-flight
+    /// measurement (~220 ms).  The caller may hold m_mutex; it must NOT hold
+    /// m_parallaxMutex.
+    void stopParallaxWorker() noexcept;
+    /// Invalidate every measurement: clear the cache, drop the pending job
+    /// and bump the generation.  Takes m_parallaxMutex.
+    void resetParallaxLocked() noexcept;
 
     RenderedFrame m_lastFrame;
     std::string m_rendererName;

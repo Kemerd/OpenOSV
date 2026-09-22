@@ -29,14 +29,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <iterator>
 
 namespace osv::premiere {
 
 namespace {
 
-/// Keep a bounded analysis cache: once it grows past `limit` the lowest
-/// frame indices are dropped.  Scrubbing walks forward and backward, so
+/// Keep a bounded analysis cache: once it grows past `limit` the lowest keys
+/// (bucket indices - every analysis cache is keyed by bucket) are dropped.  Scrubbing walks forward and backward, so
 /// dropping the numerically smallest keys is as good a policy as any and
 /// costs nothing to implement on a std::map.
 ///
@@ -162,9 +163,106 @@ void trimAnalysisCache(MapT& cache, std::size_t limit, const typename MapT::key_
 ImporterInstance::ImporterInstance(std::filesystem::path path) : m_path(std::move(path)) {}
 
 ImporterInstance::~ImporterInstance() {
-    // releaseHeavy() closes the OS handle and tears the decoders down in the
-    // right order (audio before video, reader before file mapping).
+    // releaseHeavy() closes the OS handle, tears the decoders down in the
+    // right order (audio before video, reader before file mapping) and joins
+    // the parallax worker - which must be gone before the members it reads
+    // are destroyed.
     releaseHeavy();
+}
+
+// ---------------------------------------------------------------------------
+//  Background parallax analysis
+// ---------------------------------------------------------------------------
+void ImporterInstance::parallaxWorkerLoop() noexcept {
+    for (;;) {
+        ParallaxJob job;
+        {
+            std::unique_lock<std::mutex> lock(m_parallaxMutex);
+            m_parallaxCv.wait(lock, [this] { return m_parallaxStop || m_parallaxPending.has_value(); });
+            if (m_parallaxStop) {
+                return;
+            }
+            job = std::move(*m_parallaxPending);
+            m_parallaxPending.reset();
+            m_parallaxBusyBucket = job.bucket;
+        }
+
+        // The expensive half, with NO lock held and no pool: the render pool
+        // is shared with the frame renders this worker exists to stay out of
+        // the way of, and ThreadPool serialises whole jobs, so borrowing it
+        // would make a frame render queue behind a flow solve.
+        std::shared_ptr<const render::ParallaxWarpGrid> result;
+        std::string refusal;
+        double ms = 0.0;
+        try {
+            const auto t0 = std::chrono::steady_clock::now();
+            auto grid = render::parallaxFromBands(job.bands, job.params, nullptr, job.bandMs);
+            ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (grid.ok()) {
+                result = std::make_shared<const render::ParallaxWarpGrid>(std::move(grid).value());
+            } else {
+                refusal = grid.error().message;
+            }
+        } catch (const std::exception& e) {
+            // Allocation failure is the realistic case.  Record it as a
+            // refusal so the bucket is not retried in a tight loop.
+            refusal = std::string("exception: ") + e.what();
+        } catch (...) {
+            refusal = "unknown exception";
+        }
+
+        bool stored = false;
+        {
+            std::lock_guard<std::mutex> lock(m_parallaxMutex);
+            m_parallaxBusyBucket.reset();
+            // A result measured under settings that have since changed (or a
+            // clip that has since been quieted) describes nothing current.
+            if (job.generation == m_parallaxGeneration && !m_parallaxStop) {
+                m_parallaxGrids[job.bucket] = result;  // nullptr records a refusal
+                trimAnalysisCache(m_parallaxGrids, kMaxParallaxCache, job.bucket);
+                stored = true;
+            }
+        }
+        if (result) {
+            PluginLog::debug("parallax bucket {} measured in the background in {:.0f} ms (flow {:.0f}){}", job.bucket,
+                             ms, result->flowMs, stored ? "" : " - discarded, settings changed");
+        } else {
+            PluginLog::debug("parallax bucket {} refused in the background after {:.0f} ms ({})", job.bucket, ms,
+                             refusal);
+        }
+    }
+}
+
+void ImporterInstance::stopParallaxWorker() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(m_parallaxMutex);
+        m_parallaxStop = true;
+        m_parallaxPending.reset();
+    }
+    m_parallaxCv.notify_all();
+    // Joining is safe with m_mutex held because the worker never takes it.
+    // It may wait for one in-flight measurement to finish: the flow solver
+    // has no cancellation point, and abandoning the thread instead would
+    // leave it touching this object after the destructor ran.
+    if (m_parallaxWorker.joinable()) {
+        try {
+            m_parallaxWorker.join();
+        } catch (...) {
+            // join() only throws for a thread that is not joinable or is the
+            // calling thread; neither can happen here, and a noexcept
+            // function must not let it escape if the library disagrees.
+        }
+    }
+    // Leave the instance ready to start a fresh worker after a quiet.
+    std::lock_guard<std::mutex> lock(m_parallaxMutex);
+    m_parallaxStop = false;
+}
+
+void ImporterInstance::resetParallaxLocked() noexcept {
+    std::lock_guard<std::mutex> lock(m_parallaxMutex);
+    m_parallaxGrids.clear();
+    m_parallaxPending.reset();
+    ++m_parallaxGeneration;
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +510,12 @@ Status ImporterInstance::ensureReader() {
 void ImporterInstance::releaseHeavy() noexcept {
     std::lock_guard<std::mutex> guard(m_mutex);
 
+    // The parallax worker first: it holds bands and may be mid-measurement,
+    // and a quiet must not leave a thread running against a clip that is
+    // about to lose its decoders.  (Joining with m_mutex held is safe - the
+    // worker never takes m_mutex; see the LOCK ORDER note in the header.)
+    stopParallaxWorker();
+
     // Order matters: the audio decoder owns its own AVFormatContext and OS
     // handle, the reader owns two decoders; both must go before the mapping
     // they may reference.
@@ -425,7 +529,7 @@ void ImporterInstance::releaseHeavy() noexcept {
     m_lastFrame = RenderedFrame{};
     m_seamTables.clear();
     m_gains.clear();
-    m_parallaxGrids.clear();
+    resetParallaxLocked();
 
     if (m_fileHandle != INVALID_HANDLE_VALUE) {
         ::CloseHandle(m_fileHandle);
@@ -587,7 +691,7 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
     m_lastFrame = RenderedFrame{};
     m_seamTables.clear();
     m_gains.clear();
-    m_parallaxGrids.clear();
+    resetParallaxLocked();
 }
 
 PrefsBlob ImporterInstance::prefs() const {
@@ -687,7 +791,7 @@ std::string ImporterInstance::rendererName() const {
 // ---------------------------------------------------------------------------
 
 Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t index, const OutputGeometry& geometry,
-                                                                bool draft) {
+                                                                bool draft, RenderPurpose purpose) {
     // The caller holds m_mutex (see the header contract); nothing here locks
     // again or the instance would deadlock on itself.
     if (!m_parsed) {
@@ -703,13 +807,16 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     const bool wantSeam = m_prefs.seamSearch != 0 && !draft;
     // The parallax correction runs under exactly the conditions the seam
     // search does - never for a draft request (thumbnails, prefetch, playback
-    // that is already falling behind) - because it costs a couple of hundred
-    // milliseconds of CPU per frame.  Paused frames and export get it.
+    // that is already falling behind).  Its cost is amortised: one
+    // measurement per bucket of frames, off the render thread for an
+    // Interactive request (see RenderPurpose and the block below).
     const bool wantParallax = m_prefs.parallaxEnabled() && !draft;
+    const bool exactWanted = purpose == RenderPurpose::Exact;
 
     // Cache hit: the host asked for the same frame twice (it does, once per
-    // requested pixel format while scrubbing).
-    if (m_lastFrame.matches(index, geometry, m_prefs, wantSeam, wantParallax)) {
+    // requested pixel format while scrubbing).  An Exact request is never
+    // served a frame an Interactive render built with a stand-in analysis.
+    if (m_lastFrame.matches(index, geometry, m_prefs, wantSeam, wantParallax, exactWanted)) {
         return &m_lastFrame.image;
     }
 
@@ -775,50 +882,156 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     // table's cost.  When the grid is refused - featureless content with too
     // little consistent flow - the seam table below is the fallback, so
     // turning parallax on never leaves a frame with LESS correction.
+    // Every analysis is keyed by BUCKET, not frame: see the temporal
+    // schedule in ParallaxWarp.h for why one measurement per
+    // kParallaxBucketFrames frames loses nothing a viewer can see.
+    const std::uint32_t bucket = render::parallaxBucket(index);
     bool parallaxApplied = false;
+    bool frameExact = true;
+
     if (wantParallax) {
-        auto cached = m_parallaxGrids.find(index);
-        if (cached == m_parallaxGrids.end()) {
-            render::ParallaxWarpParams pw;
-            pw.backend = toFlowBackendKind(m_prefs.flow());
-            const auto t0 = std::chrono::steady_clock::now();
-            auto grid = render::buildParallaxWarp(m_rig, pair.value(), m_blend, pw, nullptr, *renderer.pool);
-            const double ms =
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            if (grid.ok()) {
-                const render::ParallaxWarpGrid& g = grid.value();
-                PluginLog::debug("frame {}: parallax {} in {:.0f} ms (flow {:.0f}), consistent {:.0f}%, gated {}/{}, "
-                                 "disparity mean {:.2f} / max {:.2f} deg",
-                                 index, render::flowBackendName(g.usedBackend), ms, g.flowMs,
-                                 100.0 * g.consistentFraction(), g.gatedCells, g.measuredCells,
-                                 g.meanAbsCorrectionDeg, g.maxAbsCorrectionDeg);
-                cached = m_parallaxGrids.emplace(index, std::move(grid).value()).first;
-            } else {
-                PluginLog::debug("frame {}: parallax refused after {:.0f} ms ({}); {}", index, ms,
-                                 grid.error().message,
-                                 wantSeam ? "using the seam table instead" : "rendering without it");
-                cached = m_parallaxGrids.emplace(index, std::nullopt).first;
+        render::ParallaxWarpParams pw;
+        pw.backend = toFlowBackendKind(m_prefs.flow());
+
+        // What is already known: this bucket, the one before it (for the
+        // glide), and whether the worker already has this bucket in hand.
+        bool ownMeasured = false;
+        std::shared_ptr<const render::ParallaxWarpGrid> own;
+        std::shared_ptr<const render::ParallaxWarpGrid> previous;
+        bool alreadyQueued = false;
+        {
+            std::lock_guard<std::mutex> lock(m_parallaxMutex);
+            if (const auto it = m_parallaxGrids.find(bucket); it != m_parallaxGrids.end()) {
+                ownMeasured = true;
+                own = it->second;
             }
-            trimAnalysisCache(m_parallaxGrids, kMaxParallaxCache, index);
+            if (bucket > 0) {
+                if (const auto it = m_parallaxGrids.find(bucket - 1); it != m_parallaxGrids.end()) {
+                    previous = it->second;
+                }
+            }
+            alreadyQueued = (m_parallaxBusyBucket && *m_parallaxBusyBucket == bucket) ||
+                            (m_parallaxPending && m_parallaxPending->bucket == bucket);
         }
-        if (cached != m_parallaxGrids.end() && cached->second.has_value()) {
-            const render::ParallaxWarpGrid& g = *cached->second;
-            builder.warp(g.uv, g.w, g.h, g.latMinRad, g.latMaxRad);
+
+        // ---- measure this bucket, now or in the background ---------------
+        // Cutting the bands is the only step that needs the decoded frame,
+        // and it is cheap (68 rows), so it always happens here.  The flow
+        // solve - ~95 % of the cost - runs here only for an Exact request.
+        if (!ownMeasured && (exactWanted || !alreadyQueued)) {
+            const auto tBand = std::chrono::steady_clock::now();
+            auto bands = render::measureParallaxBands(m_rig, pair.value(), m_blend, pw, nullptr, *renderer.pool);
+            const double bandMs =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tBand).count();
+
+            if (!bands.ok()) {
+                PluginLog::debug("frame {}: parallax bands failed ({}); rendering without", index,
+                                 bands.error().message);
+            } else if (exactWanted) {
+                const auto t0 = std::chrono::steady_clock::now();
+                auto grid = render::parallaxFromBands(bands.value(), pw, renderer.pool.get(), bandMs);
+                const double ms =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() + bandMs;
+                if (grid.ok()) {
+                    const render::ParallaxWarpGrid& g = grid.value();
+                    PluginLog::debug("frame {} (bucket {}): parallax {} in {:.0f} ms (flow {:.0f}), consistent "
+                                     "{:.0f}%, gated {}/{}, disparity mean {:.2f} / max {:.2f} deg",
+                                     index, bucket, render::flowBackendName(g.usedBackend), ms, g.flowMs,
+                                     100.0 * g.consistentFraction(), g.gatedCells, g.measuredCells,
+                                     g.meanAbsCorrectionDeg, g.maxAbsCorrectionDeg);
+                    own = std::make_shared<const render::ParallaxWarpGrid>(std::move(grid).value());
+                } else {
+                    PluginLog::debug("frame {} (bucket {}): parallax refused after {:.0f} ms ({}); {}", index, bucket,
+                                     ms, grid.error().message,
+                                     wantSeam ? "using the seam table instead" : "rendering without it");
+                    own = nullptr;  // a stored nullptr records the refusal
+                }
+                ownMeasured = true;
+                std::lock_guard<std::mutex> lock(m_parallaxMutex);
+                m_parallaxGrids[bucket] = own;
+                trimAnalysisCache(m_parallaxGrids, kMaxParallaxCache, bucket);
+            } else {
+                // Interactive: hand the bands to the worker and move on.  A
+                // single slot, latest wins - while scrubbing only the frame
+                // the user stops on matters.
+                {
+                    std::lock_guard<std::mutex> lock(m_parallaxMutex);
+                    ParallaxJob job;
+                    job.bucket = bucket;
+                    job.generation = m_parallaxGeneration;
+                    job.bands = std::move(bands).value();
+                    job.params = pw;
+                    job.bandMs = bandMs;
+                    m_parallaxPending = std::move(job);
+                }
+                // Started lazily and under m_mutex, which is also what
+                // stopParallaxWorker() runs under, so start and stop can
+                // never race on the std::thread object.
+                if (!m_parallaxWorker.joinable()) {
+                    try {
+                        m_parallaxWorker = std::thread(&ImporterInstance::parallaxWorkerLoop, this);
+                    } catch (const std::exception& e) {
+                        PluginLog::warn("parallax: could not start the background worker ({}); interactive "
+                                        "frames will render without the correction",
+                                        e.what());
+                        std::lock_guard<std::mutex> lock(m_parallaxMutex);
+                        m_parallaxPending.reset();
+                    }
+                }
+                m_parallaxCv.notify_one();
+            }
+        }
+
+        // ---- choose what to apply ------------------------------------------
+        std::shared_ptr<const render::ParallaxWarpGrid> apply;
+        if (ownMeasured) {
+            apply = own;
+            // Glide from the previous bucket's measurement instead of
+            // stepping to this one at the bucket edge.  Only between two
+            // ACCEPTED grids: a refusal falls back to the seam table below,
+            // and blending a grid toward "nothing" would be neither.
+            if (own && previous) {
+                auto blended = render::blendParallaxGrids(*previous, *own, render::parallaxCrossfadeWeight(index));
+                if (blended.ok()) {
+                    apply = std::make_shared<const render::ParallaxWarpGrid>(std::move(blended).value());
+                }
+            }
+        } else {
+            // Interactive, own bucket still being measured: borrow the nearest
+            // ACCEPTED measurement within kParallaxBorrowBuckets, earlier
+            // first (playback runs forward).  This frame is then a stand-in,
+            // and an Exact request for it later must re-render.
+            frameExact = false;
+            std::lock_guard<std::mutex> lock(m_parallaxMutex);
+            for (std::uint32_t d = 1; d <= kParallaxBorrowBuckets && !apply; ++d) {
+                if (bucket >= d) {
+                    if (const auto it = m_parallaxGrids.find(bucket - d); it != m_parallaxGrids.end() && it->second) {
+                        apply = it->second;
+                        break;
+                    }
+                }
+                if (const auto it = m_parallaxGrids.find(bucket + d); it != m_parallaxGrids.end() && it->second) {
+                    apply = it->second;
+                }
+            }
+        }
+        if (apply) {
+            builder.warp(apply->uv, apply->w, apply->h, apply->latMinRad, apply->latMaxRad);
             parallaxApplied = true;
         }
     }
 
     if (wantSeam && !parallaxApplied) {
-        auto cached = m_seamTables.find(index);
+        auto cached = m_seamTables.find(bucket);
         if (cached == m_seamTables.end()) {
             render::SeamSearchParams sp;
             auto profile = render::searchSeam(m_rig, pair.value(), m_blend, sp, *renderer.pool);
             if (profile.ok()) {
-                cached = m_seamTables.emplace(index, std::move(profile).value().shiftDeg).first;
-                trimAnalysisCache(m_seamTables, kMaxAnalysisCache, index);
+                cached = m_seamTables.emplace(bucket, std::move(profile).value().shiftDeg).first;
+                trimAnalysisCache(m_seamTables, kMaxAnalysisCache, bucket);
             } else {
-                PluginLog::debug("frame {}: seam search failed ({}); rendering without a seam table", index,
-                                 profile.error().message);
+                PluginLog::debug("frame {} (bucket {}): seam search failed ({}); rendering without a seam table", index,
+                                 bucket, profile.error().message);
             }
         }
         if (cached != m_seamTables.end()) {
@@ -827,17 +1040,18 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     }
 
     if (m_prefs.gainMatch != 0) {
-        auto cached = m_gains.find(index);
+        auto cached = m_gains.find(bucket);
         if (cached == m_gains.end()) {
             render::BandParams band;
             auto g = render::estimateGain(m_rig, pair.value(), m_blend, band, *renderer.pool);
             if (g.ok()) {
                 std::array<Vec3d, 2> gains{g.value().gain[0], g.value().gain[1]};
-                cached = m_gains.emplace(index, gains).first;
-                trimAnalysisCache(m_gains, kMaxAnalysisCache, index);
+                cached = m_gains.emplace(bucket, gains).first;
+                trimAnalysisCache(m_gains, kMaxAnalysisCache, bucket);
             } else {
-                PluginLog::debug("frame {}: gain estimation failed ({}); rendering without exposure matching", index,
-                                 g.error().message);
+                PluginLog::debug("frame {} (bucket {}): gain estimation failed ({}); rendering without exposure "
+                                 "matching",
+                                 index, bucket, g.error().message);
             }
         }
         if (cached != m_gains.end()) {
@@ -860,9 +1074,19 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     if (!job.ok()) {
         return job.error();
     }
-    auto image = renderer.renderer->render(job.value());
-    if (!image.ok()) {
-        return image.error();
+    // Render INTO the cached image, reusing its allocation.  At native
+    // 6000x3000 a fresh image per frame was 288 MB of allocation and
+    // zero-fill that the kernel then overwrote in full - ~50 ms of an
+    // importer frame, measured - and it bought nothing.
+    //
+    // The key is invalidated FIRST: renderInto() may leave a partially
+    // written frame behind if it fails, and a key still naming the previous
+    // frame must never match that.  The buffer itself survives the failure
+    // and is reused by the next attempt.
+    m_lastFrame.frameIndex = RenderedFrame::kNoFrame;
+    const Status rendered = renderer.renderer->renderInto(job.value(), m_lastFrame.image);
+    if (!rendered.ok()) {
+        return rendered.error();
     }
 
     m_lastFrame.frameIndex = index;
@@ -870,7 +1094,7 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     m_lastFrame.prefs = m_prefs;
     m_lastFrame.seamApplied = wantSeam;
     m_lastFrame.parallaxWanted = wantParallax;
-    m_lastFrame.image = std::move(image).value();
+    m_lastFrame.exact = frameExact;
     return &m_lastFrame.image;
 }
 

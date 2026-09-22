@@ -352,26 +352,33 @@ Result<void*> CudaRenderer::renderToDevice(const RenderJob& job, std::size_t* pi
 }
 
 Result<ImageRGBAf> CudaRenderer::render(const RenderJob& job) {
+    ImageRGBAf image;
+    OSV_TRY(renderInto(job, image));
+    return image;
+}
+
+Status CudaRenderer::renderInto(const RenderJob& job, ImageRGBAf& image) {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
     OSV_TRY(m_impl->launch(job));
 
-    // Readback into pinned memory (fast DMA), then into the result vector.
-    OSV_TRY_ASSIGN(ImageRGBAf image, ImageRGBAf::create(static_cast<std::uint32_t>(job.params.outW),
-                                                        static_cast<std::uint32_t>(job.params.outH)));
+    // Readback into pinned memory (fast DMA), then into the caller's image,
+    // reusing its allocation: the memcpy below overwrites every byte, so the
+    // per-frame allocate + zero-fill that create() did was pure waste.
+    OSV_TRY(image.reshape(static_cast<std::uint32_t>(job.params.outW), static_cast<std::uint32_t>(job.params.outH)));
     const std::size_t rowBytes = image.pitchBytes();
     const std::size_t totalBytes = rowBytes * image.h;
     OSV_TRY(m_impl->staging.ensure(totalBytes));
     cudaError_t err = cudaMemcpy2DAsync(m_impl->staging.ptr, rowBytes, m_impl->out.ptr, m_impl->out.pitch, rowBytes,
                                         image.h, cudaMemcpyDeviceToHost, m_impl->stream);
     if (err != cudaSuccess) {
-        return Error{ErrorCode::Gpu, cudaMessage("readback", err)};
+        return failStatus(ErrorCode::Gpu, cudaMessage("readback", err));
     }
     err = cudaStreamSynchronize(m_impl->stream);
     if (err != cudaSuccess) {
-        return Error{ErrorCode::Gpu, cudaMessage("kernel execution", err)};
+        return failStatus(ErrorCode::Gpu, cudaMessage("kernel execution", err));
     }
     std::memcpy(image.data.data(), m_impl->staging.ptr, totalBytes);
-    return image;
+    return okStatus();
 }
 
 // -----------------------------------------------------------------------------

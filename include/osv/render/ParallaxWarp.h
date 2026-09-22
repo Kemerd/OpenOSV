@@ -308,6 +308,96 @@ struct ParallaxWarpGrid {
                                                          const ParallaxWarpParams& params,
                                                          const std::vector<float>* seamTable, ThreadPool& pool);
 
+/// The first half of buildParallaxWarp: render the two per-lens bands.
+///
+/// WHY IT IS SPLIT OUT: this is the only stage that needs the decoded frame
+/// and the rig, and it is cheap (the band is 68 rows).  Everything after it -
+/// the flow solve, which is ~95 % of the analysis cost, and the grid build -
+/// needs nothing but the bands.  So a caller that cannot afford to wait (the
+/// importer during playback and scrubbing) runs this on the render thread,
+/// hands the small owned result to a background worker, and never blocks on
+/// the expensive half.  The frame it came from can be released the moment
+/// this returns.
+///
+/// Parameters and the `seamTable` rule are exactly buildParallaxWarp's.
+[[nodiscard]] Result<LensBands> measureParallaxBands(const geom::LensRig& rig, const video::FramePair& frames,
+                                                     const geom::BlendParams& blend,
+                                                     const ParallaxWarpParams& params,
+                                                     const std::vector<float>* seamTable, ThreadPool& pool);
+
+/// The second half of buildParallaxWarp: flow, grid and the refusal rule,
+/// from bands produced by measureParallaxBands().
+///
+/// Thread-safe for concurrent calls on different bands: it touches no shared
+/// state beyond what computeFlow() documents.  `pool` may be nullptr, which
+/// is what a background worker should pass - sharing the render pool would
+/// make the worker's parallel sections queue behind (and hold up) the frame
+/// renders it exists to stay out of the way of.  `bandMs` is recorded on the
+/// grid purely for diagnostics.
+///
+/// Returns exactly what buildParallaxWarp returns for the same bands,
+/// including Unsupported for a measurement too inconsistent to use.
+[[nodiscard]] Result<ParallaxWarpGrid> parallaxFromBands(const LensBands& bands, const ParallaxWarpParams& params,
+                                                         ThreadPool* pool, double bandMs = 0.0);
+
+// ===========================================================================
+//  Temporal schedule: measure once per bucket of frames, glide between them
+//
+//  The flow solve costs ~220 ms of CPU per measured frame, and a frame's
+//  parallax differs from its neighbours' by very little: the rig is rigid,
+//  and what sits near the seam (a wing, the ground) moves slowly relative to
+//  it.  Measuring every frame made the importer ~5x slower for no visible
+//  gain and, because every frame was measured independently, let the
+//  correction shimmer.  So a video measures once per BUCKET of
+//  kParallaxBucketFrames frames, and each frame BLENDS from the previous
+//  bucket's grid to its own - a correction that glides instead of stepping
+//  every bucket edge.
+//
+//  These are pure functions so the schedule is pinned by unit tests rather
+//  than inferred from rendered pixels.
+// ===========================================================================
+
+/// Frames per measured bucket.  8 at 60 fps is one measurement every 133 ms
+/// - about 27 ms of flow per exported frame instead of ~220 - while still
+/// following changes a viewer could notice.
+inline constexpr std::uint32_t kParallaxBucketFrames = 8;
+
+/// The bucket frame `frame` belongs to.  A zero bucket size is treated as 1
+/// (every frame its own bucket) rather than dividing by zero.
+[[nodiscard]] constexpr std::uint32_t parallaxBucket(std::uint32_t frame,
+                                                     std::uint32_t bucketFrames = kParallaxBucketFrames) noexcept {
+    return bucketFrames == 0 ? frame : frame / bucketFrames;
+}
+
+/// Weight of the frame's OWN bucket grid when blending from the previous
+/// bucket's grid, in (0, 1].
+///
+/// (frame mod N + 1) / N: the last frame of a bucket is its own grid alone,
+/// and the first frame of the next bucket moves only 1/N of the way to the
+/// new grid - so the correction is continuous across the edge, changing by
+/// at most 1/N of the difference between neighbouring measurements per frame.
+[[nodiscard]] constexpr double parallaxCrossfadeWeight(std::uint32_t frame,
+                                                       std::uint32_t bucketFrames = kParallaxBucketFrames) noexcept {
+    if (bucketFrames <= 1) {
+        return 1.0;
+    }
+    return static_cast<double>(frame % bucketFrames + 1) / static_cast<double>(bucketFrames);
+}
+
+/// Blend two grids: from + (to - from) * t, with t clamped to [0, 1].
+///
+/// Both must share one layout (size and latitude span) - which grids built
+/// with the same parameters always do - and the result carries `to`'s
+/// diagnostic fields.  Blending the corrections, rather than switching
+/// between them, is what removes the step at a bucket edge; the benefit
+/// gate's per-cell decisions blend with them, so a cell one grid gated off
+/// fades out instead of vanishing.
+///
+/// Returns InvalidArgument for mismatched layouts, a malformed grid, or a
+/// non-finite t.
+[[nodiscard]] Result<ParallaxWarpGrid> blendParallaxGrids(const ParallaxWarpGrid& from, const ParallaxWarpGrid& to,
+                                                          double t);
+
 /// Convert a band flow field into the angular grid, without rendering.
 ///
 /// Split out from buildParallaxWarp so the geometry - band rows to latitude,

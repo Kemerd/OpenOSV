@@ -1170,3 +1170,129 @@ TEST_CASE("on the sample clip the correction improves the overlap and does no ha
     INFO("wingtip NCC before " << wingBefore << ", after " << wingAfter);
     REQUIRE(wingAfter >= wingBefore - 0.02);
 }
+
+// =============================================================================
+//  Temporal schedule: one measurement per bucket, blended across bucket edges
+// =============================================================================
+
+namespace {
+
+/// A valid grid whose every correction component is `value`.
+render::ParallaxWarpGrid constantGrid(float value, std::uint32_t w = 16, std::uint32_t h = 6) {
+    render::ParallaxWarpGrid g;
+    g.w = w;
+    g.h = h;
+    g.latMinRad = -0.1f;
+    g.latMaxRad = 0.1f;
+    g.uv.assign(static_cast<std::size_t>(w) * h * 2u, value);
+    return g;
+}
+
+}  // namespace
+
+TEST_CASE("parallaxBucket groups kParallaxBucketFrames frames per measurement", "[parallax][schedule]") {
+    const std::uint32_t n = render::kParallaxBucketFrames;
+    REQUIRE(n >= 2);
+    for (std::uint32_t f = 0; f < n; ++f) {
+        CHECK(render::parallaxBucket(f) == 0u);
+    }
+    CHECK(render::parallaxBucket(n) == 1u);
+    CHECK(render::parallaxBucket(2 * n - 1) == 1u);
+    CHECK(render::parallaxBucket(2 * n) == 2u);
+
+    SECTION("a zero bucket size means every frame is its own bucket, not a division by zero") {
+        CHECK(render::parallaxBucket(0, 0) == 0u);
+        CHECK(render::parallaxBucket(17, 0) == 17u);
+    }
+}
+
+TEST_CASE("parallaxCrossfadeWeight reaches the own grid exactly at the bucket's last frame", "[parallax][schedule]") {
+    const std::uint32_t n = render::kParallaxBucketFrames;
+    // First frame of a bucket moves only 1/N of the way to the new grid; the
+    // last frame is the new grid alone.
+    CHECK(render::parallaxCrossfadeWeight(0) == 1.0 / n);
+    CHECK(render::parallaxCrossfadeWeight(n - 1) == 1.0);
+    CHECK(render::parallaxCrossfadeWeight(n) == 1.0 / n);
+    // Strictly increasing within a bucket, always in (0, 1].
+    for (std::uint32_t f = 1; f < n; ++f) {
+        CHECK(render::parallaxCrossfadeWeight(f) > render::parallaxCrossfadeWeight(f - 1));
+    }
+    for (std::uint32_t f = 0; f < 4 * n; ++f) {
+        const double w = render::parallaxCrossfadeWeight(f);
+        CHECK(w > 0.0);
+        CHECK(w <= 1.0);
+    }
+    SECTION("a bucket of one frame (or none) never blends") {
+        CHECK(render::parallaxCrossfadeWeight(5, 1) == 1.0);
+        CHECK(render::parallaxCrossfadeWeight(5, 0) == 1.0);
+    }
+}
+
+TEST_CASE("blendParallaxGrids interpolates the correction and keeps the newer diagnostics", "[parallax][schedule]") {
+    render::ParallaxWarpGrid from = constantGrid(0.0f);
+    render::ParallaxWarpGrid to = constantGrid(0.8f);
+    to.gatedCells = 42;  // a diagnostic that must come from `to`
+
+    const auto at0 = render::blendParallaxGrids(from, to, 0.0);
+    const auto at1 = render::blendParallaxGrids(from, to, 1.0);
+    const auto half = render::blendParallaxGrids(from, to, 0.5);
+    REQUIRE(at0.ok());
+    REQUIRE(at1.ok());
+    REQUIRE(half.ok());
+    CHECK(at0.value().uv == from.uv);
+    CHECK(at1.value().uv == to.uv);
+    for (const float v : half.value().uv) {
+        CHECK(v == 0.4f);
+    }
+    CHECK(half.value().gatedCells == 42u);
+
+    SECTION("t outside [0, 1] clamps instead of extrapolating") {
+        const auto over = render::blendParallaxGrids(from, to, 3.0);
+        const auto under = render::blendParallaxGrids(from, to, -2.0);
+        REQUIRE(over.ok());
+        REQUIRE(under.ok());
+        CHECK(over.value().uv == to.uv);
+        CHECK(under.value().uv == from.uv);
+    }
+
+    SECTION("mismatched layouts, malformed grids and a non-finite t are refused") {
+        CHECK_FALSE(render::blendParallaxGrids(from, constantGrid(0.8f, 32, 6), 0.5).ok());
+        render::ParallaxWarpGrid shifted = to;
+        shifted.latMaxRad = 0.2f;
+        CHECK_FALSE(render::blendParallaxGrids(from, shifted, 0.5).ok());
+        render::ParallaxWarpGrid broken = to;
+        broken.uv.pop_back();
+        CHECK_FALSE(render::blendParallaxGrids(from, broken, 0.5).ok());
+        CHECK_FALSE(render::blendParallaxGrids(from, to, std::nan("")).ok());
+    }
+}
+
+TEST_CASE("the applied correction glides across bucket edges instead of stepping", "[parallax][schedule]") {
+    // THE property the schedule exists for.  Give each bucket a different
+    // measurement and apply what the importer applies to frame f:
+    //     blend(G(bucket - 1), G(bucket), parallaxCrossfadeWeight(f)).
+    // Between ANY two consecutive frames the applied correction may then move
+    // by at most 1/N of the difference between neighbouring measurements - a
+    // hard step at a bucket edge (the behaviour this replaces) would move by
+    // the whole difference in one frame.
+    const std::uint32_t n = render::kParallaxBucketFrames;
+    const float measured[] = {0.0f, 1.0f, 0.2f, 0.9f, 0.9f, -0.5f};
+    const std::uint32_t buckets = static_cast<std::uint32_t>(std::size(measured));
+
+    float maxNeighbourGap = 0.0f;
+    for (std::uint32_t b = 1; b < buckets; ++b) {
+        maxNeighbourGap = std::max(maxNeighbourGap, std::fabs(measured[b] - measured[b - 1]));
+    }
+
+    float previous = measured[0];
+    for (std::uint32_t f = n; f < buckets * n; ++f) {  // from bucket 1, which has a predecessor
+        const std::uint32_t b = render::parallaxBucket(f);
+        const auto applied = render::blendParallaxGrids(constantGrid(measured[b - 1]), constantGrid(measured[b]),
+                                                        render::parallaxCrossfadeWeight(f));
+        REQUIRE(applied.ok());
+        const float value = applied.value().uv.front();
+        INFO("frame " << f << " bucket " << b << " applied " << value << " previous " << previous);
+        CHECK(std::fabs(value - previous) <= maxNeighbourGap / static_cast<float>(n) + 1e-6f);
+        previous = value;
+    }
+}
