@@ -49,6 +49,7 @@
 #include "osv/meta/MetadataTrack.h"
 #include "osv/meta/Types.h"
 #include "osv/render/ImageRGBAf.h"
+#include "osv/render/ParallaxWarp.h"
 #include "osv/video/DualStreamReader.h"
 
 #include <atomic>
@@ -96,11 +97,17 @@ struct RenderedFrame {
     OutputGeometry geometry;
     PrefsBlob prefs = PrefsBlob::defaults();
     bool seamApplied = false;   ///< Whether the seam search ran for this frame.
+    /// Whether the parallax correction was WANTED for this frame (prefs on and
+    /// not a draft request) - part of the cache key for the same reason
+    /// seamApplied is: the prefs blob alone does not distinguish a draft
+    /// render from a full one, and a draft must never be served in its place.
+    bool parallaxWanted = false;
     render::ImageRGBAf image;
 
-    [[nodiscard]] bool matches(std::uint32_t index, const OutputGeometry& geom, const PrefsBlob& blob,
-                               bool wantSeam) const noexcept {
-        return image.valid() && frameIndex == index && geometry == geom && prefs == blob && seamApplied == wantSeam;
+    [[nodiscard]] bool matches(std::uint32_t index, const OutputGeometry& geom, const PrefsBlob& blob, bool wantSeam,
+                               bool wantParallax) const noexcept {
+        return image.valid() && frameIndex == index && geometry == geom && prefs == blob && seamApplied == wantSeam &&
+               parallaxWanted == wantParallax;
     }
 };
 
@@ -361,6 +368,15 @@ private:
     /// Per-lens linear gains per frame index (gainMatch).
     std::map<std::uint32_t, std::array<Vec3d, 2>> m_gains;
     static constexpr std::size_t kMaxAnalysisCache = 256;
+    /// Parallax warp grid per frame index (parallax on, non-draft requests).
+    /// std::nullopt records a frame whose measurement was REFUSED - too
+    /// little consistent flow, typically open sky - so a revisit falls back
+    /// to the seam table at once instead of paying ~220 ms to be refused
+    /// again.  A grid is ~100 KB, hence a much smaller bound than the other
+    /// caches: 32 grids is ~3 MB and still covers half a second of scrubbing
+    /// at 60 fps.
+    std::map<std::uint32_t, std::optional<render::ParallaxWarpGrid>> m_parallaxGrids;
+    static constexpr std::size_t kMaxParallaxCache = 32;
 
     RenderedFrame m_lastFrame;
     std::string m_rendererName;

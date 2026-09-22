@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -2001,6 +2002,208 @@ TEST_CASE("frame timing on each render backend", "[importer][video][timing][samp
         const double ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / kFrames;
         WARN(backend.name << ": " << ms << " ms per 6000 x 3000 frame (decode + stitch + copy)");
+
+        harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Parallax correction (PrefsBlob::parallax / flowBackend)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Body-frame latitude, in degrees from the seam plane, of the ray through
+/// Standard-layout equirect pixel (x, y) with stabilisation OFF (so body ==
+/// view).  The seam plane is the one perpendicular to the lens axes (+/-Y),
+/// and in the Standard layout the Y component of a direction is
+/// cos(lon) * cos(lat) - exactly the kernel's osvRayForPixel.
+[[nodiscard]] double seamLatitudeDeg(std::uint32_t x, std::uint32_t y, std::uint32_t w, std::uint32_t h) {
+    constexpr double kPi = 3.14159265358979323846;
+    const double lon = (static_cast<double>(x) + 0.5) / w * 2.0 * kPi - kPi;
+    const double lat = 0.5 * kPi - (static_cast<double>(y) + 0.5) / h * kPi;
+    const double dy = std::cos(lon) * std::cos(lat);
+    return std::asin(std::clamp(dy, -1.0, 1.0)) * 180.0 / kPi;
+}
+
+/// Render one frame and read it back; disposes the PPix.
+[[nodiscard]] DecodedFrame renderFrame(ImporterHarness& harness, ImporterHarness::ClipHandle& clip,
+                                       const PrSDKPPixSuite* ppix, const ImporterHarness::SourceVideoRequest& request,
+                                       const PrefsBlob& prefs) {
+    PPixHand hand = nullptr;
+    REQUIRE(harness.getSourceVideo(clip, request, prefs, hand) == imNoErr);
+    REQUIRE(hand != nullptr);
+    DecodedFrame frame = readPPix(harness.host(), ppix, hand);
+    ppix->Dispose(hand);
+    return frame;
+}
+
+}  // namespace
+
+TEST_CASE("parallax correction changes only the overlap band, and only when asked",
+          "[importer][video][parallax][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+
+    // Everything else that touches the seam is OFF, so any difference between
+    // the two renders is the parallax correction and nothing else.  Classical
+    // flow explicitly: the result must not depend on whether a neural model
+    // happens to be installed on the test machine.
+    PrefsBlob off = PrefsBlob::defaults();
+    off.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::Native);
+    off.seamSearch = 0;
+    off.gainMatch = 0;
+    off.stabilization = static_cast<std::uint8_t>(PrefsStabilization::Off);
+    off.parallax = static_cast<std::uint8_t>(PrefsParallax::Off);
+    off.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Classical);
+    PrefsBlob on = off;
+    on.parallax = static_cast<std::uint8_t>(PrefsParallax::On);
+
+    ImporterHarness::SourceVideoRequest request;
+    request.frameTime = 0;
+    request.width = 3000;  // the half step of the native ladder
+    request.height = 1500;
+
+    const DecodedFrame frameOff = renderFrame(harness, clip, ppix, request, off);
+    const DecodedFrame frameOn = renderFrame(harness, clip, ppix, request, on);
+    REQUIRE(frameOff.width == frameOn.width);
+    REQUIRE(frameOff.height == frameOn.height);
+
+    // The grid spans +/-9.1 degrees around the seam plane (a 6 degree band
+    // plus the decay ring) and the kernel returns exactly zero correction
+    // beyond it, so everything outside must be BIT-identical - a tolerance
+    // here would hide a correction leaking out of the overlap.  Inside, the
+    // correction must actually do something.
+    std::uint64_t changedInside = 0;
+    std::uint64_t changedOutside = 0;
+    for (std::uint32_t y = 0; y < frameOn.height; ++y) {
+        for (std::uint32_t x = 0; x < frameOn.width; ++x) {
+            const float* a = frameOff.pixel(x, y);
+            const float* b = frameOn.pixel(x, y);
+            const bool changed = a[0] != b[0] || a[1] != b[1] || a[2] != b[2] || a[3] != b[3];
+            if (!changed) {
+                continue;
+            }
+            if (std::fabs(seamLatitudeDeg(x, y, frameOn.width, frameOn.height)) > 9.5) {
+                ++changedOutside;
+            } else {
+                ++changedInside;
+            }
+        }
+    }
+    INFO("changed pixels: " << changedInside << " inside the overlap, " << changedOutside << " outside");
+    REQUIRE(changedOutside == 0);
+    REQUIRE(changedInside > 10000);
+
+    SECTION("a draft request never pays for it") {
+        // Low quality is a draft request (isDraftRequest), the same rule that
+        // already skips the seam search during struggling playback.
+        harness.host().clearCache();
+        ImporterHarness::SourceVideoRequest draft = request;
+        draft.quality = kPrRenderQuality_Low;
+        const DecodedFrame frameDraft = renderFrame(harness, clip, ppix, draft, on);
+        REQUIRE(maxChannelDiff(frameDraft, frameOff) == 0.0f);
+    }
+
+    SECTION("a project saved before the option existed renders with it off") {
+        // The two fields were carved out of the zero-filled reserved block,
+        // so an old project's blob carries zeros there - which must read as
+        // Off, not as the new default On, or opening an old project would
+        // silently change its pictures.
+        PrefsBlob modern = on;
+        std::uint8_t bytes[PrefsBlob::kSize];
+        std::memcpy(bytes, &modern, PrefsBlob::kSize);
+        bytes[offsetof(PrefsBlob, parallax)] = 0;
+        bytes[offsetof(PrefsBlob, flowBackend)] = 0;
+        const PrefsBlob old = PrefsBlob::fromBytes(bytes, sizeof(bytes));
+        REQUIRE(!old.parallaxEnabled());
+
+        harness.host().clearCache();
+        const DecodedFrame frameOld = renderFrame(harness, clip, ppix, request, old);
+        REQUIRE(maxChannelDiff(frameOld, frameOff) == 0.0f);
+    }
+
+    SECTION("when the grid is available it replaces the seam table") {
+        // Measured: table + grid is worse than the grid alone (see
+        // ImporterInstance::renderFrame), so with both enabled the importer
+        // uses the grid only and the seam search setting makes no difference.
+        PrefsBlob onWithSeam = on;
+        onWithSeam.seamSearch = 1;
+        harness.host().clearCache();
+        const DecodedFrame frameBoth = renderFrame(harness, clip, ppix, request, onWithSeam);
+        REQUIRE(maxChannelDiff(frameBoth, frameOn) == 0.0f);
+    }
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
+TEST_CASE("parallax correction cost in the importer",
+          "[importer][video][timing][parallax][sample][!benchmark]") {
+    REQUIRE_SAMPLE_CLIP();
+
+    // Reported, not asserted - the same policy as the frame timing test
+    // above: a threshold would encode one machine's speed.  Three settings,
+    // the ones a user actually meets:
+    //   * the previous default: seam search + gain, no parallax;
+    //   * the new default: seam search + gain + parallax (the grid replaces
+    //     the seam table whenever it is accepted);
+    //   * the new default revisiting frames it has already measured, which
+    //     is what paused scrubbing mostly does.
+    struct Setting {
+        const char* name;
+        bool parallax;
+    };
+    const Setting settings[] = {{"seam table, parallax off", false}, {"parallax on", true}};
+
+    for (const Setting& setting : settings) {
+        ImporterHarness harness;
+        REQUIRE(harness.loaded());
+        auto clip = harness.openClip(sampleClipPath());
+        REQUIRE(clip.open());
+        const void* suite = nullptr;
+        REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) ==
+                kSPNoError);
+        const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+
+        PrefsBlob prefs = PrefsBlob::defaults();
+        prefs.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::Native);
+        prefs.parallax = static_cast<std::uint8_t>(setting.parallax ? PrefsParallax::On : PrefsParallax::Off);
+        prefs.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Classical);
+
+        ImporterHarness::SourceVideoRequest request;
+        request.width = kSampleWidth;
+        request.height = kSampleHeight;
+
+        // Frame 0 warms the decoder and the renderer; only later frames count.
+        request.frameTime = 0;
+        (void)renderFrame(harness, clip, ppix, request, prefs);
+
+        constexpr int kFrames = 4;
+        const auto timeFrames = [&]() {
+            harness.host().clearCache();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 1; i <= kFrames; ++i) {
+                request.frameTime = kTicksPerFrame5994 * i;
+                PPixHand hand = nullptr;
+                REQUIRE(harness.getSourceVideo(clip, request, prefs, hand) == imNoErr);
+                REQUIRE(hand != nullptr);
+                ppix->Dispose(hand);
+            }
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / kFrames;
+        };
+        const double first = timeFrames();
+        // Same frames again with the HOST cache cleared: the instance's own
+        // analysis caches (seam tables, gains, parallax grids) are still warm.
+        const double revisit = timeFrames();
+        WARN(setting.name << ": " << first << " ms per 6000 x 3000 frame first time, " << revisit
+                          << " ms revisiting (decode + analysis + stitch + copy)");
 
         harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
     }

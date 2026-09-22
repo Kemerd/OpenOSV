@@ -47,22 +47,29 @@
 // This is also the route the existing 1-D mechanism already takes: the seam
 // table is exactly this idea with one component and one dimension.  The grid
 // generalises it rather than replacing it, which is why both can be on at
-// once and why osvShiftTowardAxis is reused verbatim for the meridian
-// component.
+// once: the kernel applies the seam shift first and the warp on top of it,
+// and the flow is measured on bands already rendered WITH the seam table, so
+// the grid carries only the residual the table left behind.
 //
-// THE TWO COMPONENTS
-// ------------------
-// A ray in the overlap needs a correction with two degrees of freedom, and
-// the kernel has exactly two rotations available at a given lens:
+// THE TWO COMPONENTS, AND WHICH WAY THEY POINT
+// ---------------------------------------------
+// A ray in the overlap needs a correction with two degrees of freedom.  The
+// grid stores them in the band's own frame, per cell:
 //
-//   v  along the meridian through the lens axis - the angle FROM the axis.
-//      This is what osvShiftTowardAxis does and what the seam table drives.
-//      It is the epipolar direction: on a back-to-back rig, parallax is
-//      mostly along it.
+//   dLat  along the meridian.  The epipolar direction of a back-to-back
+//         pair, so most real parallax lies along it, and the only direction
+//         the 1-D seam table can already correct.
 //
-//   u  about the lens axis - the angle AROUND it.  No 1-D table can express
-//      this, and it is what leaves a wing tip smeared when only v is
-//      corrected.
+//   dLon  across the meridian.  No 1-D table can express this, and it is
+//         what leaves a wing tip smeared when only the meridian is fixed.
+//
+// Both are the displacement of the MASTER lens's sampling direction; the
+// slave lens takes the negation (see osvShadePixelW).  An earlier version
+// expressed them as rotations about each lens's own axis AND flipped the
+// sign between the lenses - but the two axes already point in opposite
+// directions, so the flip cancelled the geometry and both lenses moved the
+// same way, shifting the picture without closing any disparity.  One shared
+// frame with one explicit sign rule removes the ambiguity.
 //
 // BOUNDARY DECAY IS NOT OPTIONAL
 // ------------------------------
@@ -90,9 +97,13 @@
 // (Anderson et al., SIGGRAPH Asia 2016) searches [0, 224] horizontally
 // against [-16, 16] vertically - a 14:1 ratio.
 //
-// The same asymmetry is applied here by scaling the two components
-// differently before they become angles, and by smoothing the cross-meridian
-// component harder.  See crossMeridianScale and crossMeridianSmooth.
+// The asymmetry is applied here by smoothing the cross-meridian component
+// harder than the along-meridian one (crossMeridianSmooth), and optionally by
+// scaling it down (crossMeridianScale).  The scale defaults to 1 - see its
+// comment for the measurement that overturned the 0.5 first used - because
+// the benefit gate (requiredImprovement) turned out to be the better guard
+// against mismatches: it judges a correction by whether it actually makes
+// the lenses agree, in either direction.
 //
 // WHAT IS NOT DONE
 // ----------------
@@ -100,10 +111,18 @@
 // forgive consistent ghosting but notice ghosting that CHANGES frame to
 // frame, and DJI's stitcher filters its flow over time for it.  This is a
 // per-frame correction with no memory, so on moving footage the correction
-// will shimmer where the flow is marginal.  The interval control
-// (`osvtool render --seam-interval`) reduces the visible shimmer by holding
-// one grid across several frames, which is a blunt instrument rather than a
-// filter.  Named here rather than hidden; it is the obvious next step.
+// can shimmer where the flow is marginal.  `osvtool render --seam-interval`
+// holds one grid across several frames, which is a blunt instrument rather
+// than a filter; the Premiere importer measures every non-draft frame on its
+// own and caches the grid by frame index, which keeps a revisited frame
+// deterministic but does nothing for frame-to-frame stability.  A filter
+// there also has to cope with Premiere asking for frames out of order, so
+// the previous frame is not generally at hand.  Named here rather than
+// hidden; it is the obvious next step.
+//
+// The flow backend's own cost is also untouched here: the classical solver
+// takes ~215 ms of the ~225 ms a grid costs at the default 2048-column band
+// (a 1536-column band measured ~135 ms at essentially the same quality).
 
 #pragma once
 
@@ -157,14 +176,25 @@ struct ParallaxWarpParams {
     /// A/B but produces the torn edge described above.
     std::uint32_t decayRows = 8;
 
-    /// Scale applied to the cross-meridian (u) component, in [0, 1].
+    /// Scale applied to the cross-meridian (dLon) component, in [0, 1].
     ///
-    /// The anisotropy the header describes.  Parallax on a back-to-back rig
-    /// is mostly along meridians; a large perpendicular component is more
-    /// often a mismatch than real motion, so it is trusted less rather than
-    /// discarded - discarding it would give back exactly the 1-D behaviour
-    /// this file exists to improve on.
-    double crossMeridianScale = 0.5;
+    /// 1.0 - full trust - and that is a MEASURED choice, not the literature
+    /// default.  The first version used 0.5 on the argument the header gives
+    /// (perpendicular disparity on a back-to-back rig is more often a
+    /// mismatch than real geometry).  On the sample clip that was wrong: the
+    /// flow finds a genuine cross-meridian misalignment of up to ~0.66
+    /// degrees around the ring - consistent with a small roll error between
+    /// the calibrated lens orientations, which is alignment error whatever
+    /// its cause - and halving it left half of it on screen.  Measured on
+    /// frames 0 / 32 / 64, whole-band NCC 0.912 / 0.909 / 0.916 at 0.5
+    /// against 0.918 / 0.914 / 0.920 at 1.0, and better at 1.0 on the
+    /// textured ground and on the near-field wingtip alike.
+    ///
+    /// What made full trust safe is the benefit gate (requiredImprovement):
+    /// it rejects a mismatched correction by its EFFECT, in either
+    /// direction, which is a better test than distrusting one direction by a
+    /// fixed factor.  The anisotropy survives as the extra smoothing below.
+    double crossMeridianScale = 1.0;
 
     /// Extra smoothing applied to the cross-meridian component only, in grid
     /// cells.  Follows from the same asymmetry: the less trustworthy
@@ -187,6 +217,38 @@ struct ParallaxWarpParams {
     /// the grid is reported as unusable, so the caller renders uncorrected
     /// rather than applying a field that is mostly repaired guesses.
     double minConsistentFraction = 0.25;
+
+    /// Fraction by which a cell's correction must REDUCE the disagreement
+    /// between the two lenses before it is applied at full strength, in
+    /// [0, 1); 0 disables this gate.
+    ///
+    /// WHY THIS EXISTS - "do no harm".  The forward-backward check proves
+    /// that two flow fields agree with each other, not that they describe
+    /// the scene.  Where the lenses see DIFFERENT objects - something a few
+    /// centimetres from one lens, such as a wingtip light cover that the
+    /// other lens cannot see at all - the solver still finds self-consistent
+    /// matches along edges, and warping by them bends real geometry for no
+    /// gain.  On the sample clip that is exactly what happened at the wing:
+    /// the correction made the local agreement WORSE (NCC 0.32 -> 0.28).
+    ///
+    /// So each cell is tested against the thing that actually matters: the
+    /// mean |lens0 - lens1| over its co-visible pixels, warped by the FINAL
+    /// field exactly as the kernel will apply it (after smoothing and decay,
+    /// through osvWarpSample), pooled over its 3 x 3 neighbourhood, against
+    /// the same lenses sampled
+    /// WITHOUT the relative displacement at the same interpolation phases
+    /// (see gridFromFlow for why the phases matter).  At a residual ratio of
+    /// 1 - requiredImprovement or better the cell keeps its full correction;
+    /// at 1 - requiredImprovement / 4 or worse it gets none - a small dead
+    /// zone that absorbs the statistical scatter of a few-dozen-pixel cell -
+    /// and smoothstep in between, so the gate cannot introduce a step of its
+    /// own.
+    double requiredImprovement = 0.2;
+
+    /// Cells whose UNWARPED residual is below this (code values, 0..1 scale)
+    /// have nothing measurable to fix - open sky, flat water - and are left
+    /// uncorrected.  About a third of one 8-bit code step.
+    double minResidual = 0.0015;
 };
 
 /// The grid the kernel samples, plus what was measured while building it.
@@ -195,15 +257,22 @@ struct ParallaxWarpGrid {
     std::uint32_t h = 0;         ///< Rows (latitude), including the decay rings.
     float latMinRad = 0.0f;      ///< Latitude of row 0.
     float latMaxRad = 0.0f;      ///< Latitude of row h - 1.
-    /// Interleaved (u, v) half-corrections in RADIANS, w * h pairs.
+    /// Interleaved (dLon, dLat) in RADIANS, w * h pairs: HALF the measured
+    /// disparity, as the displacement of the master lens's sampling
+    /// direction (the slave takes the negation).
     std::vector<float> uv;
 
     // ---- diagnostics -------------------------------------------------------
     FlowBackendKind usedBackend = FlowBackendKind::Classical;
-    std::uint64_t consistentPixels = 0;  ///< Flow pixels that passed the check.
-    std::uint64_t totalPixels = 0;       ///< Flow pixels examined.
-    double meanAbsCorrectionDeg = 0.0;   ///< Mean |correction| over the measured rows.
-    double maxAbsCorrectionDeg = 0.0;    ///< Largest |correction| after clamping.
+    std::uint64_t consistentPixels = 0;  ///< Co-visible pixels whose flow passed the check.
+    std::uint64_t totalPixels = 0;       ///< Co-visible pixels examined.
+    double bandMs = 0.0;                 ///< Time spent rendering the two lens bands.
+    double flowMs = 0.0;                 ///< Time spent in the flow backend.
+    double gridMs = 0.0;                 ///< Time spent turning flow into the grid.
+    std::uint32_t measuredCells = 0;     ///< Grid cells that received consistent flow.
+    std::uint32_t gatedCells = 0;        ///< Of those, cells the benefit gate switched fully off.
+    double meanAbsCorrectionDeg = 0.0;   ///< Mean FULL disparity corrected, measured rows (deg).
+    double maxAbsCorrectionDeg = 0.0;    ///< Largest FULL disparity corrected, after clamping (deg).
 
     [[nodiscard]] bool valid() const noexcept {
         return w > 0 && h > 0 && uv.size() == static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 2u;
@@ -224,7 +293,11 @@ struct ParallaxWarpGrid {
 ///
 /// `seamTable` (optional) is the 1-D seam profile already in force.  Passing
 /// it makes the flow measure only what the seam table did NOT correct, so
-/// the two compose instead of double-counting the same disparity.
+/// the two compose instead of double-counting the same disparity.  Note that
+/// on the sample clip composing measured WORSE than the grid alone (whole-
+/// band overlap NCC 0.902-0.909 against 0.916-0.921), so the importer and
+/// `osvtool render` pass nullptr and use the grid INSTEAD of the table,
+/// keeping the table only as the fallback when a grid is refused.
 ///
 /// Returns Unsupported when the flow was measured but too little of it passed
 /// the consistency check (see minConsistentFraction) - a normal outcome on

@@ -177,26 +177,35 @@ typedef struct OsvRenderParams {
      * the camera displaces content across meridians too, and a 1-D table can
      * only smear that.  The warp grid carries the missing second component.
      *
-     * It is a coarse (warpW x warpH) lattice over the polar-axis overlap
-     * band, holding a half-disparity in RADIANS per lens.  The kernel
-     * bilinearly samples it for the ray's (longitude, latitude) and rotates
-     * each lens's sampling direction by that amount - symmetrically, so each
-     * lens moves half way toward the other, exactly as the seam table does.
+     * It is a (warpW x warpH) lattice over the polar-axis overlap band, in
+     * the band's own body-frame coordinates - longitude atan2(x, z) across,
+     * latitude asin(y) down - holding (dLon, dLat) in RADIANS: the
+     * displacement applied to the MASTER lens (lens[1]) sampling direction.
+     * The slave lens gets the negation, so the pair meets half way, the same
+     * way the seam table splits its disparity between the two lenses.
      *
-     * Two components, because the two directions are geometrically distinct:
-     *   warpV  along the meridian through the lens axis (the same rotation
-     *          osvShiftTowardAxis already performs for the seam table);
-     *   warpU  about the lens axis itself, i.e. the perpendicular direction
-     *          no 1-D table can express.
+     * It is expressed in (lon, lat) rather than as rotations about each lens
+     * axis because that is the frame the flow is MEASURED in: one band pixel
+     * is one fixed (lon, lat) step, so no assumption about lens orientation
+     * sits between the measurement and its application.
      *
-     * Zero outside the band, which is what makes the correction safe: the
-     * host decays the field to zero across a ring around the band, so a ray
-     * leaving the overlap returns continuously to the uncorrected geometry
-     * rather than stepping to it. */
+     * Zero outside the grid's latitude span, and the host decays the field to
+     * zero at both latitude edges, so a ray leaving the overlap returns
+     * continuously to the uncorrected geometry rather than stepping to it. */
     int warpEnabled;         /* 1 = apply the 2-D warp grid                    */
     int warpW, warpH;        /* grid size (columns = longitude, rows = lat)    */
     float warpLatMinRad;     /* latitude of grid row 0                          */
     float warpLatMaxRad;     /* latitude of grid row warpH - 1                  */
+    /* sin() of the lower and upper latitude limits of the grid, precomputed
+     * on the host so the kernel can reject a ray OUTSIDE the grid with one
+     * comparison on dBody[1] instead of an atan2f + asinf + two lookups.  Most
+     * of a frame lies outside the grid, and on the CPU backend - where this
+     * arithmetic is the whole cost - the warp as a whole measured +30-50 ms
+     * on a ~300 ms 6K equirect render; there is no reason to spend any of
+     * that on rays it cannot affect.  lo >= hi (e.g. a zero-initialised
+     * block) disables the early-out rather than the warp. */
+    float warpSinLatLo;
+    float warpSinLatHi;
     OsvColorParams color;    /* colour pipeline (see ColorMath.h)              */
 } OsvRenderParams;
 
@@ -603,9 +612,9 @@ OSV_HD void osvShiftTowardAxis(const OsvLens* L, const float* dBody, float delta
 
 /* Bilinear fetch of one component of the warp grid.
  *
- * `grid` is interleaved (u, v) pairs, warpW * warpH of them, row-major with
- * rows running from warpLatMinRad to warpLatMaxRad.  `comp` selects 0 = u
- * (about the lens axis) or 1 = v (along the meridian).
+ * `grid` is interleaved (dLon, dLat) pairs, warpW * warpH of them, row-major with
+ * rows running from warpLatMinRad to warpLatMaxRad.  `comp` selects
+ * 0 = dLon (across meridians) or 1 = dLat (along the meridian).
  *
  * Longitude WRAPS: the band is a closed ring around the sphere, and column
  * warpW - 1 is adjacent to column 0.  Clamping there instead would freeze the
@@ -658,26 +667,23 @@ OSV_HD float osvWarpSample(const OsvRenderParams* p, OSV_GLOBAL const float* gri
     return top + (bot - top) * ty;
 }
 
-/* Rotate the body ray ABOUT the optical axis of lens L by `deltaRad`.
+/* Displace a body-frame direction by (dLon, dLat) in the polar-axis frame
+ * (lon = atan2(x, z), lat = asin(y)) and write the unit result to `out`.
  *
- * This is the component osvShiftTowardAxis cannot express.  That function
- * rotates along the meridian through the axis (changing the angle FROM the
- * axis); this one rotates around the axis (changing the angle AROUND it),
- * and the two together span the tangent plane at the ray.  A 2-D parallax
- * displacement needs both, which is the whole reason the warp grid carries
- * two components. */
-OSV_HD void osvRotateAboutLensAxis(const OsvLens* L, const float* dBody, float deltaRad, float* out) {
-    if (deltaRad == 0.0f) {
-        out[0] = dBody[0];
-        out[1] = dBody[1];
-        out[2] = dBody[2];
-        return;
-    }
-    const float z[3] = {0.0f, 0.0f, 1.0f};
-    float axis[3];
-    osvMat3TMulVec(L->R, z, axis);
-    osvNormalize3(axis);
-    osvRotateAboutAxis(dBody, axis, deltaRad, out);
+ * This is how the warp grid is applied.  dLat moves along the meridian - the
+ * one direction the 1-D seam table can already correct - and dLon moves
+ * across it, which no 1-D table can express and which is what leaves a wing
+ * tip smeared when only the meridian is corrected.
+ *
+ * The band sits on the equator, a few degrees either side of it, so this is
+ * nowhere near the polar singularity of atan2 wherever it is actually used. */
+OSV_HD void osvPolarDisplace(const float* d, float dLon, float dLat, float* out) {
+    const float lon = atan2f(d[0], d[2]) + dLon;
+    const float lat = asinf(osvClampf(d[1], -1.0f, 1.0f)) + dLat;
+    const float cl = cosf(lat);
+    out[0] = cl * sinf(lon);
+    out[1] = sinf(lat);
+    out[2] = cl * cosf(lon);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -708,24 +714,21 @@ OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV
         seamDelta = -seam[osvSeamColumn(p, dBody)] * (OSV_KERNEL_PI / 180.0f) * 0.5f;
     }
 
-    /* Optional 2-D parallax warp.  Sampled once per pixel for the ray's
-     * polar-axis coordinates and applied with OPPOSITE sign to the two
-     * lenses, so each moves half way toward the other and the correction is
-     * symmetric - the same reasoning that makes warpToMiddle() warp both
-     * views rather than one (see FlowWarp.h).  A one-sided warp would put
-     * the whole error on one lens and read as a discontinuity.
-     *
-     * The grid already holds HALF the measured disparity, so no further
-     * halving happens here. */
-    float warpU = 0.0f;
-    float warpV = 0.0f;
-    if (p->warpEnabled && warp != 0 && p->warpW > 0 && p->warpH > 0) {
-        /* Polar-axis longitude/latitude of this ray: poles are the two lens
-         * axes (+/-Y), so latitude is measured from the equator plane. */
+    /* Optional 2-D parallax warp: (dLon, dLat) for the master lens at this
+     * ray's polar-axis position; the slave lens takes the negation below.
+     * Sampled once per pixel, at the OUTPUT ray, because the grid describes
+     * where the two lenses disagree about what belongs at this direction.
+     * The grid already holds HALF the measured disparity, so nothing is
+     * halved here. */
+    float warpLon = 0.0f;
+    float warpLat = 0.0f;
+    const int warpInSpan = (p->warpSinLatLo >= p->warpSinLatHi) ||
+                           (dBody[1] >= p->warpSinLatLo && dBody[1] <= p->warpSinLatHi);
+    if (p->warpEnabled && warp != 0 && p->warpW > 0 && p->warpH > 0 && warpInSpan) {
         const float lon = atan2f(dBody[0], dBody[2]);
         const float lat = asinf(osvClampf(dBody[1], -1.0f, 1.0f));
-        warpU = osvWarpSample(p, warp, lon, lat, 0);
-        warpV = osvWarpSample(p, warp, lon, lat, 1);
+        warpLon = osvWarpSample(p, warp, lon, lat, 0);
+        warpLat = osvWarpSample(p, warp, lon, lat, 1);
     }
 
     /* Project into both lenses and compute their weights. */
@@ -752,28 +755,25 @@ OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV
         }
         /* 2-D parallax warp, applied on top of the 1-D seam shift.
          *
-         * The sign flips between the lenses (i == 0 gets +, i == 1 gets -)
-         * so the pair converges on the middle instead of both chasing the
-         * same direction.  Order matters only to second order at these
-         * angles - the two rotations are a few tenths of a degree - so the
-         * meridian component is applied first to keep it consistent with the
-         * seam shift it extends. */
-        if (warpU != 0.0f || warpV != 0.0f) {
-            const float sgn = (i == 0) ? 1.0f : -1.0f;
-            if (warpV != 0.0f) {
-                float tmp[3];
-                osvShiftTowardAxis(L, dl, sgn * warpV, tmp);
-                dl[0] = tmp[0];
-                dl[1] = tmp[1];
-                dl[2] = tmp[2];
-            }
-            if (warpU != 0.0f) {
-                float tmp[3];
-                osvRotateAboutLensAxis(L, dl, sgn * warpU, tmp);
-                dl[0] = tmp[0];
-                dl[1] = tmp[1];
-                dl[2] = tmp[2];
-            }
+         * Master (i == 1) moves by +(dLon, dLat), slave (i == 0) by the
+         * negation, so the two sampling directions separate by the full
+         * measured disparity and the content they fetch meets in the middle.
+         *
+         * The sign really does flip here, unlike the seam shift above.  The
+         * seam shift is expressed relative to EACH lens's own axis, and the
+         * two axes point in opposite directions, so one shared "toward the
+         * axis" angle is already an opposite move on the sphere.  The warp is
+         * expressed in one shared (lon, lat) frame, where opposite moves need
+         * opposite signs.  Mixing the two conventions turns the correction
+         * into a rigid shift of BOTH lenses the same way, which moves the
+         * picture without closing any disparity at all. */
+        if (warpLon != 0.0f || warpLat != 0.0f) {
+            const float sgn = (i == 1) ? 1.0f : -1.0f;
+            float tmp[3];
+            osvPolarDisplace(dl, sgn * warpLon, sgn * warpLat, tmp);
+            dl[0] = tmp[0];
+            dl[1] = tmp[1];
+            dl[2] = tmp[2];
         }
         float theta;
         if (osvProjectLens(L, dl, &px[i], &py[i], &theta)) {

@@ -4,6 +4,7 @@
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/core/Log.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -229,6 +230,14 @@ Result<OsvRenderParams> RenderParamsBuilder::buildParams() const {
     p.warpH = static_cast<int>(m_warpH);
     p.warpLatMinRad = m_warpLatMin;
     p.warpLatMaxRad = m_warpLatMax;
+    // Early-out limits for the kernel (see OsvRenderParams).  Only set when a
+    // grid is present; a zero pair means "no early-out", never "no warp".
+    p.warpSinLatLo = 0.0f;
+    p.warpSinLatHi = 0.0f;
+    if (!m_warp.empty()) {
+        p.warpSinLatLo = std::sin(std::min(m_warpLatMin, m_warpLatMax));
+        p.warpSinLatHi = std::sin(std::max(m_warpLatMin, m_warpLatMax));
+    }
     p.outputAlphaCoverage = m_alphaCoverage ? 1 : 0;
     p.color = *m_color;
     return p;

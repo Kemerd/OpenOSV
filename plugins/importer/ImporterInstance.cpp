@@ -27,7 +27,9 @@
 #include "osv/render/SeamAnalysis.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <iterator>
 
 namespace osv::premiere {
 
@@ -37,10 +39,39 @@ namespace {
 /// frame indices are dropped.  Scrubbing walks forward and backward, so
 /// dropping the numerically smallest keys is as good a policy as any and
 /// costs nothing to implement on a std::map.
+///
+/// `keep` is the key the caller has just inserted and is about to read
+/// through the iterator emplace() returned.  It is NEVER evicted: when it is
+/// itself the smallest key - scrubbing backwards past the limit - the
+/// LARGEST key goes instead.  The first version had no such guard, so that
+/// case erased the fresh entry and left the caller dereferencing a dangling
+/// iterator; the 65-frame sample clip never reaches the limit, which is why
+/// no test saw it.
 template <class MapT>
-void trimAnalysisCache(MapT& cache, std::size_t limit) {
-    while (cache.size() > limit) {
-        cache.erase(cache.begin());
+void trimAnalysisCache(MapT& cache, std::size_t limit, const typename MapT::key_type& keep) {
+    while (cache.size() > limit && !cache.empty()) {
+        auto victim = cache.begin();
+        if (victim->first == keep) {
+            victim = std::prev(cache.end());
+            if (victim->first == keep) {
+                break;  // the only entry left is the one being kept
+            }
+        }
+        cache.erase(victim);
+    }
+}
+
+/// Map the prefs enum onto the library's flow backend.  The numeric values
+/// match by design (PrefsBlob.h says so), but an explicit switch means a
+/// renumbering on either side fails loudly here instead of silently selecting
+/// the wrong solver.
+[[nodiscard]] render::FlowBackendKind toFlowBackendKind(PrefsFlowBackend kind) noexcept {
+    switch (kind) {
+    case PrefsFlowBackend::Classical: return render::FlowBackendKind::Classical;
+    case PrefsFlowBackend::Neural:    return render::FlowBackendKind::Neural;
+    case PrefsFlowBackend::Auto:
+    case PrefsFlowBackend::Count:
+    default:                          return render::FlowBackendKind::Auto;
     }
 }
 
@@ -394,6 +425,7 @@ void ImporterInstance::releaseHeavy() noexcept {
     m_lastFrame = RenderedFrame{};
     m_seamTables.clear();
     m_gains.clear();
+    m_parallaxGrids.clear();
 
     if (m_fileHandle != INVALID_HANDLE_VALUE) {
         ::CloseHandle(m_fileHandle);
@@ -555,6 +587,7 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
     m_lastFrame = RenderedFrame{};
     m_seamTables.clear();
     m_gains.clear();
+    m_parallaxGrids.clear();
 }
 
 PrefsBlob ImporterInstance::prefs() const {
@@ -668,10 +701,15 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     }
 
     const bool wantSeam = m_prefs.seamSearch != 0 && !draft;
+    // The parallax correction runs under exactly the conditions the seam
+    // search does - never for a draft request (thumbnails, prefetch, playback
+    // that is already falling behind) - because it costs a couple of hundred
+    // milliseconds of CPU per frame.  Paused frames and export get it.
+    const bool wantParallax = m_prefs.parallaxEnabled() && !draft;
 
     // Cache hit: the host asked for the same frame twice (it does, once per
     // requested pixel format while scrubbing).
-    if (m_lastFrame.matches(index, geometry, m_prefs, wantSeam)) {
+    if (m_lastFrame.matches(index, geometry, m_prefs, wantSeam, wantParallax)) {
         return &m_lastFrame.image;
     }
 
@@ -721,14 +759,63 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     // truthful pair.
     builder.alphaCoverage(true);
 
-    if (wantSeam) {
+    // ---- 2-D parallax correction (ParallaxWarp.h) --------------------------
+    // When it yields a grid, the grid REPLACES the 1-D seam table instead of
+    // composing with it.  The grid already contains the along-meridian
+    // correction the table makes - spatially resolved rather than one number
+    // per column - plus the cross-meridian one the table cannot express, and
+    // composing the two measured WORSE than the grid alone.  On the sample
+    // clip, whole-band overlap NCC on frames 0 / 32 / 64:
+    //     seam table alone   0.897 / 0.902 / 0.900
+    //     grid alone         0.916 / 0.918 / 0.921
+    //     table + grid       0.906 / 0.902 / 0.909
+    // (after the table the residual is smaller, so the benefit gate keeps
+    // fewer cells, and the table's heavily smoothed per-column shift stays
+    // where the grid would have done better).  Replacing it also saves the
+    // table's cost.  When the grid is refused - featureless content with too
+    // little consistent flow - the seam table below is the fallback, so
+    // turning parallax on never leaves a frame with LESS correction.
+    bool parallaxApplied = false;
+    if (wantParallax) {
+        auto cached = m_parallaxGrids.find(index);
+        if (cached == m_parallaxGrids.end()) {
+            render::ParallaxWarpParams pw;
+            pw.backend = toFlowBackendKind(m_prefs.flow());
+            const auto t0 = std::chrono::steady_clock::now();
+            auto grid = render::buildParallaxWarp(m_rig, pair.value(), m_blend, pw, nullptr, *renderer.pool);
+            const double ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (grid.ok()) {
+                const render::ParallaxWarpGrid& g = grid.value();
+                PluginLog::debug("frame {}: parallax {} in {:.0f} ms (flow {:.0f}), consistent {:.0f}%, gated {}/{}, "
+                                 "disparity mean {:.2f} / max {:.2f} deg",
+                                 index, render::flowBackendName(g.usedBackend), ms, g.flowMs,
+                                 100.0 * g.consistentFraction(), g.gatedCells, g.measuredCells,
+                                 g.meanAbsCorrectionDeg, g.maxAbsCorrectionDeg);
+                cached = m_parallaxGrids.emplace(index, std::move(grid).value()).first;
+            } else {
+                PluginLog::debug("frame {}: parallax refused after {:.0f} ms ({}); {}", index, ms,
+                                 grid.error().message,
+                                 wantSeam ? "using the seam table instead" : "rendering without it");
+                cached = m_parallaxGrids.emplace(index, std::nullopt).first;
+            }
+            trimAnalysisCache(m_parallaxGrids, kMaxParallaxCache, index);
+        }
+        if (cached != m_parallaxGrids.end() && cached->second.has_value()) {
+            const render::ParallaxWarpGrid& g = *cached->second;
+            builder.warp(g.uv, g.w, g.h, g.latMinRad, g.latMaxRad);
+            parallaxApplied = true;
+        }
+    }
+
+    if (wantSeam && !parallaxApplied) {
         auto cached = m_seamTables.find(index);
         if (cached == m_seamTables.end()) {
             render::SeamSearchParams sp;
             auto profile = render::searchSeam(m_rig, pair.value(), m_blend, sp, *renderer.pool);
             if (profile.ok()) {
                 cached = m_seamTables.emplace(index, std::move(profile).value().shiftDeg).first;
-                trimAnalysisCache(m_seamTables, kMaxAnalysisCache);
+                trimAnalysisCache(m_seamTables, kMaxAnalysisCache, index);
             } else {
                 PluginLog::debug("frame {}: seam search failed ({}); rendering without a seam table", index,
                                  profile.error().message);
@@ -747,7 +834,7 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
             if (g.ok()) {
                 std::array<Vec3d, 2> gains{g.value().gain[0], g.value().gain[1]};
                 cached = m_gains.emplace(index, gains).first;
-                trimAnalysisCache(m_gains, kMaxAnalysisCache);
+                trimAnalysisCache(m_gains, kMaxAnalysisCache, index);
             } else {
                 PluginLog::debug("frame {}: gain estimation failed ({}); rendering without exposure matching", index,
                                  g.error().message);
@@ -782,6 +869,7 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     m_lastFrame.geometry = geometry;
     m_lastFrame.prefs = m_prefs;
     m_lastFrame.seamApplied = wantSeam;
+    m_lastFrame.parallaxWanted = wantParallax;
     m_lastFrame.image = std::move(image).value();
     return &m_lastFrame.image;
 }

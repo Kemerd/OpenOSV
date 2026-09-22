@@ -335,7 +335,41 @@ int runRender(const RenderOptions& o) {
         // Optional per-frame analysis (every seamInterval frames).
         const bool analyse = (o.seamSearch || o.gain || o.parallax) &&
                              ((f - first) % static_cast<std::uint32_t>(std::max(1, o.seamInterval)) == 0);
-        if (analyse && o.seamSearch) {
+        // 2-D parallax correction first.  When it yields a grid, the grid
+        // REPLACES the seam table rather than composing with it - the same
+        // policy as the Premiere importer, so this command's A/B shows the
+        // picture a user actually gets there.  Measured on the sample clip
+        // (whole-band overlap NCC, frames 0 / 32 / 64): table alone
+        // 0.897 / 0.902 / 0.900, grid alone 0.916 / 0.918 / 0.921, table +
+        // grid 0.906 / 0.902 / 0.909.  See ImporterInstance::renderFrame.
+        //
+        // A refused grid is NOT fatal: on featureless content the flow cannot
+        // be trusted and buildParallaxWarp says so, and the seam table (when
+        // --seam-search is on) becomes the fallback for that stretch.
+        if (analyse && o.parallax) {
+            render::ParallaxWarpParams pw;
+            pw.backend = parallaxBackend;
+            const auto tWarp0 = std::chrono::steady_clock::now();
+            auto grid = render::buildParallaxWarp(P.rig, pair.value(), P.blendParams, pw, nullptr, *P.pool);
+            const double warpMs =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tWarp0).count();
+            if (grid.ok()) {
+                warpGrid = std::move(grid).value();
+                haveWarp = true;
+                log::info("frame {}: parallax {} in {:.0f} ms (flow {:.0f}), consistent {:.1f}%, gated {}/{}, "
+                          "disparity mean {:.3f} / max {:.3f} deg",
+                          f, render::flowBackendName(warpGrid.usedBackend), warpMs, warpGrid.flowMs,
+                          100.0 * warpGrid.consistentFraction(), warpGrid.gatedCells, warpGrid.measuredCells,
+                          warpGrid.meanAbsCorrectionDeg, warpGrid.maxAbsCorrectionDeg);
+            } else {
+                haveWarp = false;
+                log::warn("frame {}: parallax correction refused ({}){}", f, log::safe(grid.error().message),
+                          o.seamSearch ? "; using the seam table" : "; rendering without it");
+            }
+        }
+        const bool useWarp = o.parallax && haveWarp;
+
+        if (analyse && o.seamSearch && !useWarp) {
             render::SeamSearchParams sp;
             auto profile = render::searchSeam(P.rig, pair.value(), P.blendParams, sp, *P.pool);
             if (profile.ok()) {
@@ -353,38 +387,16 @@ int runRender(const RenderOptions& o) {
                 builder.gain(g.value().gain[0], g.value().gain[1]);
             }
         }
-        if (o.seamSearch) {
-            builder.seam(seamTable);
-        }
-        // 2-D parallax correction.  Measured on the residual left by the seam
-        // table (which is why seamTable is passed in), so the two compose.
-        //
-        // A failure here is NOT fatal: on featureless content the flow cannot
-        // be trusted and buildParallaxWarp says so, in which case the frame
-        // renders with whatever correction was already in force rather than
-        // with a field of repaired guesses.
-        if (analyse && o.parallax) {
-            render::ParallaxWarpParams pw;
-            pw.backend = parallaxBackend;
-            const std::vector<float>* seamIn = (o.seamSearch && !seamTable.empty()) ? &seamTable : nullptr;
-            const auto tWarp0 = std::chrono::steady_clock::now();
-            auto grid = render::buildParallaxWarp(P.rig, pair.value(), P.blendParams, pw, seamIn, *P.pool);
-            const double warpMs =
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tWarp0).count();
-            if (grid.ok()) {
-                warpGrid = std::move(grid).value();
-                haveWarp = true;
-                log::info("frame {}: parallax {} grid {}x{}, consistent {:.1f}%, mean {:.3f} deg, max {:.3f} deg, {:.0f} ms",
-                          f, render::flowBackendName(warpGrid.usedBackend), warpGrid.w, warpGrid.h,
-                          100.0 * warpGrid.consistentFraction(), warpGrid.meanAbsCorrectionDeg,
-                          warpGrid.maxAbsCorrectionDeg, warpMs);
-            } else {
-                log::warn("frame {}: parallax correction unavailable ({}); rendering without it", f,
-                          log::safe(grid.error().message));
-            }
-        }
-        if (o.parallax && haveWarp) {
+        // The builder persists across frames, so both corrections are set
+        // explicitly every frame: whichever is in force, the other is off.
+        if (useWarp) {
             builder.warp(warpGrid.uv, warpGrid.w, warpGrid.h, warpGrid.latMinRad, warpGrid.latMaxRad);
+            builder.seam(std::vector<float>{});
+        } else {
+            builder.clearWarp();
+            if (o.seamSearch) {
+                builder.seam(seamTable);
+            }
         }
         builder.stabilization(P.stabilizationFor(f));
 
@@ -456,7 +468,8 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
     outGeom->add_option("--size", opt->size, "Output size WxH")->default_str("1920x1080");
     outGeom->add_flag("--seam-search", opt->seamSearch, "Per-column seam disparity correction");
     outGeom->add_flag("--parallax", opt->parallax,
-                      "2-D optical-flow parallax correction at the seam (fixes ghosting on close objects)");
+                      "2-D optical-flow parallax correction at the seam; when accepted it replaces --seam-search, "
+                      "which remains the fallback");
     outGeom->add_option("--flow-backend", opt->flowBackend, "auto|classical|neural")->default_str("auto");
     outGeom->add_flag("--gain", opt->gain, "Exposure matching between lenses");
     outGeom->add_option("--seam-interval", opt->seamInterval, "Re-run the analyses every N frames")->default_val(1);

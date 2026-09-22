@@ -52,6 +52,46 @@ double nccMasked(const float* a, const float* b, const std::uint8_t* mask, std::
     return num / std::sqrt(da * db);
 }
 
+/// Shade only rows [row0, row1) of `job` into a tightly packed RGBA buffer.
+///
+/// Every analysis here needs a thin band around the equator of a polar-axis
+/// map - 68 rows of 1024 at the default size - and they used to render the
+/// WHOLE map and throw the rest away, i.e. ~94% of the work was discarded.
+/// That was tolerable for a one-off seam search; it is not once the parallax
+/// correction runs it every frame.
+///
+/// The per-pixel call is exactly the one CpuRenderer makes, with the same
+/// ABSOLUTE row index, so each band pixel is bit-identical to the matching
+/// pixel of a full-map render.  Only the rows nobody read are skipped.
+Result<std::vector<float>> shadeRows(const RenderJob& job, std::uint32_t row0, std::uint32_t row1, ThreadPool& pool) {
+    if (!job.valid()) {
+        return Error{ErrorCode::InvalidArgument, "shadeRows: invalid render job"};
+    }
+    const OsvRenderParams params = job.params;
+    if (row1 <= row0 || row1 > static_cast<std::uint32_t>(params.outH)) {
+        return Error{ErrorCode::InvalidArgument, "shadeRows: row range outside the map"};
+    }
+    const OsvPlane planes[2] = {job.planes[0], job.planes[1]};
+    const float* seam = (params.seamShiftEnabled && !job.seamShiftDeg.empty()) ? job.seamShiftDeg.data() : nullptr;
+    const float* warp = (params.warpEnabled && !job.warpGrid.empty()) ? job.warpGrid.data() : nullptr;
+    const std::size_t width = static_cast<std::size_t>(params.outW);
+    std::vector<float> rgba(width * (row1 - row0) * 4u, 0.0f);
+    float* base = rgba.data();
+
+    // One row per task: a band is only a few dozen rows, and coarser grains
+    // would leave most of the pool idle.
+    Status st = pool.parallelFor(row0, row1, 1, [&](std::size_t rBegin, std::size_t rEnd) {
+        for (std::size_t y = rBegin; y < rEnd; ++y) {
+            float* row = base + (y - row0) * width * 4u;
+            for (int x = 0; x < params.outW; ++x) {
+                osvShadePixelW(&params, planes, seam, warp, x, static_cast<int>(y), row + static_cast<std::size_t>(x) * 4u);
+            }
+        }
+    });
+    OSV_TRY(st);
+    return rgba;
+}
+
 }  // namespace
 
 Result<LensBands> renderLensBands(const geom::LensRig& rig, const video::FramePair& frames,
@@ -60,8 +100,8 @@ Result<LensBands> renderLensBands(const geom::LensRig& rig, const video::FramePa
     if (band.equirectW < 64 || band.equirectW > 16384 || band.bandHalfDeg <= 0.0 || band.bandHalfDeg > 45.0) {
         return Error{ErrorCode::InvalidArgument, "renderLensBands: bad band parameters"};
     }
-    // Full polar-axis map; we only keep the band rows but rendering the whole
-    // map is cheap at 2048 wide and keeps the mapping identical to production.
+    // Full polar-axis map GEOMETRY, so the mapping is identical to production,
+    // but only the band rows are actually shaded (see shadeRows).
     geom::EquirectMap map;
     map.layout = geom::EquirectLayout::PolarAxis;
     map.w = static_cast<int>(band.equirectW);
@@ -77,7 +117,9 @@ Result<LensBands> renderLensBands(const geom::LensRig& rig, const video::FramePa
                                                      linear ? color::OutputTransfer::Linear
                                                             : color::OutputTransfer::Passthrough,
                                                      0.0f);
-    CpuRenderer cpu(pool);
+    if (row1 <= row0) {
+        return Error{ErrorCode::InvalidArgument, "renderLensBands: band has no rows"};
+    }
     LensBands out;
     out.w = band.equirectW;
     out.h = row1 - row0;
@@ -101,11 +143,11 @@ Result<LensBands> renderLensBands(const geom::LensRig& rig, const video::FramePa
                          warp->latMaxRad);
         }
         OSV_TRY_ASSIGN(RenderJob job, builder.build(frames));
-        OSV_TRY_ASSIGN(ImageRGBAf img, cpu.render(job));
+        OSV_TRY_ASSIGN(std::vector<float> rgba, shadeRows(job, row0, row1, pool));
         out.luma[lens].resize(static_cast<std::size_t>(out.w) * out.h);
         out.alpha[lens].resize(out.luma[lens].size());
         for (std::uint32_t r = 0; r < out.h; ++r) {
-            const float* src = img.row(row0 + r);
+            const float* src = rgba.data() + static_cast<std::size_t>(r) * out.w * 4u;
             for (std::uint32_t c = 0; c < out.w; ++c) {
                 out.luma[lens][static_cast<std::size_t>(r) * out.w + c] = lumaOf(src + c * 4);
                 out.alpha[lens][static_cast<std::size_t>(r) * out.w + c] = src[c * 4 + 3];
@@ -287,22 +329,29 @@ Result<GainEstimate> estimateGain(const geom::LensRig& rig, const video::FramePa
     const int row0 = std::max(0, centre - halfRows);
     const int row1 = std::min(map.h, centre + halfRows);
 
+    if (row1 <= row0) {
+        return Error{ErrorCode::InvalidArgument, "estimateGain: band has no rows"};
+    }
+
+    // Only the band rows are shaded (see shadeRows); the sums below walk the
+    // same rows in the same order as before, so the estimate is unchanged.
     const OsvColorParams cp = color::makeColorParams(color::kDefaultDlogMFit, color::OutputTransfer::Linear, 0.0f);
-    CpuRenderer cpu(pool);
-    ImageRGBAf imgs[2];
+    std::vector<float> bandRgba[2];
     for (int lens = 0; lens < 2; ++lens) {
         RenderParamsBuilder builder;
         builder.rig(rig).equirect(map).blend(blend, true).color(cp).lensEnabled(1 - lens, false);
         OSV_TRY_ASSIGN(RenderJob job, builder.build(frames));
-        OSV_TRY_ASSIGN(imgs[lens], cpu.render(job));
+        OSV_TRY_ASSIGN(bandRgba[lens], shadeRows(job, static_cast<std::uint32_t>(row0),
+                                                  static_cast<std::uint32_t>(row1), pool));
     }
 
     GainEstimate g;
     double sum[2][3] = {{0, 0, 0}, {0, 0, 0}};
     std::uint64_t n = 0;
+    const std::size_t rowFloats = static_cast<std::size_t>(map.w) * 4u;
     for (int r = row0; r < row1; ++r) {
-        const float* a = imgs[0].row(static_cast<std::uint32_t>(r));
-        const float* b = imgs[1].row(static_cast<std::uint32_t>(r));
+        const float* a = bandRgba[0].data() + static_cast<std::size_t>(r - row0) * rowFloats;
+        const float* b = bandRgba[1].data() + static_cast<std::size_t>(r - row0) * rowFloats;
         for (int c = 0; c < map.w; ++c) {
             if (a[c * 4 + 3] > 0.5f && b[c * 4 + 3] > 0.5f) {
                 for (int k = 0; k < 3; ++k) {
