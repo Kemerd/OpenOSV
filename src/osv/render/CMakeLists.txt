@@ -14,6 +14,17 @@ add_library(osv::render_cpu ALIAS osv_render_cpu)
 target_link_libraries(osv_render_cpu PUBLIC osv_core osv_geom osv_color osv_video)
 set_target_properties(osv_render_cpu PROPERTIES FOLDER "osv")
 
+# Neural flow backend (FlowBackendOnnx.cpp, part of the GLOB above).  ONNX
+# Runtime is optional: without it OSV_HAVE_ONNXRUNTIME stays undefined, that
+# file compiles to nothing, and the Neural backend reports itself absent.
+# Only headers are needed here - the DLL is loaded at runtime by full path
+# (see cmake/OsvOnnxRuntime.cmake for why no import library is linked).
+include(OsvOnnxRuntime)
+if(TARGET osv_onnxruntime)
+  target_link_libraries(osv_render_cpu PRIVATE osv_onnxruntime)
+  add_dependencies(osv_render_cpu osv_flow_model)
+endif()
+
 # ---------------------------------------------------------------------------
 #  CUDA backend
 # ---------------------------------------------------------------------------
