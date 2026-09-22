@@ -250,7 +250,15 @@ void PluginLog::write(Level level, std::string_view text) noexcept {
         line += timestamp();
         line += " [";
         line += levelName(level);
-        line += "] [tid ";
+        // The process id comes first because several processes append to
+        // the SAME file: Premiere starts helper processes that load the
+        // plug-ins too (a single launch produced sixteen "HostContext created"
+        // lines within one minute).  Without the pid, those interleaved
+        // lines read as one process creating its singleton sixteen times,
+        // which looks exactly like a leak and sent a diagnosis the wrong way.
+        line += "] [pid ";
+        line += std::to_string(GetCurrentProcessId());
+        line += " tid ";
         line += std::to_string(GetCurrentThreadId());
         line += "] ";
         line.append(text.data(), text.size());

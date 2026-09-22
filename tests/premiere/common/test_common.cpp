@@ -674,13 +674,16 @@ TEST_CASE("PluginLog writes, filters by level and rotates", "[common][log]") {
     std::filesystem::remove(std::filesystem::path(path + L".1"), ec);
     REQUIRE(PluginLog::init(name));
 
-    SECTION("a written line carries the level, a timestamp and a thread id") {
+    SECTION("a written line carries the level, a timestamp, a process id and a thread id") {
         PluginLog::setLevel(PluginLog::Level::Info);
         PluginLog::info("hello {} number {}", "world", 42);
         const std::string text = readFile(path);
         REQUIRE(text.find("hello world number 42") != std::string::npos);
         REQUIRE(text.find("[INFO ]") != std::string::npos);
-        REQUIRE(text.find("[tid ") != std::string::npos);
+        // The pid is what separates the several processes that append to one
+        // log file; it must be THIS process's id, not merely present.
+        const std::string pidTag = "[pid " + std::to_string(GetCurrentProcessId()) + " tid ";
+        REQUIRE(text.find(pidTag) != std::string::npos);
         // One record per line: embedded newlines are flattened.
         PluginLog::info("two\nlines");
         const std::string text2 = readFile(path);
