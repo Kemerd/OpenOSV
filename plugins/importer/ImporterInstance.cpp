@@ -1217,6 +1217,8 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     const std::uint32_t bucket = render::parallaxBucket(index);
     bool parallaxApplied = false;
     bool frameExact = true;
+    // [WP-PHOTO] photometric seam field: measured first, so its usable rim is the carved seam's Rim cost below
+    const render::PhotoRimPenaltyScope photoRimScope = preparePhotoSeam(index, pair, draft, pool);
 
     if (wantParallax) {
         render::ParallaxWarpParams pw;
@@ -1395,7 +1397,138 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
         }
     }
 
+    frameExact = applyPhotoSeam(builder) && frameExact;  // [WP-PHOTO] rim + gain field (after the global gain)
     return AnalysisOutcome{parallaxApplied, frameExact};
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-PHOTO] photometric seam field
+// ---------------------------------------------------------------------------
+namespace {
+
+/// The rig flattened into the numbers the photometric field depends on: both
+/// lenses' intrinsics and body-to-lens rotations.  Two rigs with the same key
+/// see every band pixel identically.
+[[nodiscard]] std::vector<double> photoRigKey(const geom::LensRig& rig) {
+    std::vector<double> key;
+    key.reserve(2u * (4u + 5u + 1u + 9u) + 2u);
+    for (std::size_t i = 0; i < 2; ++i) {
+        const geom::KannalaBrandt5& L = rig.lens[i];
+        key.insert(key.end(), {L.fx, L.fy, L.cx, L.cy, L.thetaMaxRad});
+        key.insert(key.end(), L.k.begin(), L.k.end());
+        key.insert(key.end(), std::begin(rig.bodyToLens[i].m), std::end(rig.bodyToLens[i].m));
+    }
+    key.push_back(static_cast<double>(rig.streamW));
+    key.push_back(static_cast<double>(rig.streamH));
+    return key;
+}
+
+}  // namespace
+
+render::PhotoSeamParams ImporterInstance::photoParamsLocked() const noexcept {
+    render::PhotoSeamParams params;
+    // The prefs enum and the library enum share their values (PrefsBlob.h).
+    switch (m_prefs.photoSeamMode()) {
+    case PrefsPhotoSeam::RimOnly: params.mode = render::PhotoSeamMode::RimOnly; break;
+    case PrefsPhotoSeam::RimAndGain: params.mode = render::PhotoSeamMode::RimAndGain; break;
+    case PrefsPhotoSeam::Off:
+    case PrefsPhotoSeam::Count:
+    default: params.mode = render::PhotoSeamMode::Off; break;
+    }
+    params.strength = m_prefs.photoStrengthPercent() / 100.0;
+    return params;
+}
+
+render::PhotoRimPenaltyScope ImporterInstance::preparePhotoSeam(std::uint32_t index, const video::FramePair& pair,
+                                                               bool draft, ThreadPool& pool) {
+    // The caller (applyAnalyses) holds m_mutex, which guards all of this.
+    m_photoFrame.reset();
+    m_photoFrameExact = true;
+    const render::PhotoSeamParams params = photoParamsLocked();
+    if (params.mode == render::PhotoSeamMode::Off) {
+        return render::PhotoRimPenaltyScope(nullptr, nullptr);
+    }
+    try {
+        // A different rig (calibration slot, lens-protector correction)
+        // invalidates every rim and gain measured with the old one.
+        std::vector<double> key = photoRigKey(m_rig);
+        if (key != m_photoRigKey) {
+            m_photo.clear();
+            m_photoLast.reset();
+            m_photoRigKey = std::move(key);
+        }
+
+        // ---- measure this bucket (never for a draft) ------------------------
+        // Synchronous for Exact and Interactive alike: it is a band shade
+        // (GPU from device frames, CPU from host frames) plus a few ms of
+        // statistics per bucket of eight frames.
+        const std::uint32_t bucket = render::parallaxBucket(index);
+        if (!draft && !m_photo.measured(bucket)) {
+            auto field = render::measurePhotoSeam(m_rig, pair, m_blend, params, pool);
+            if (field.ok()) {
+                const render::PhotoSeamField& f = field.value();
+                PluginLog::debug("frame {} (bucket {}): photometric seam field in {:.1f} ms (bands {:.1f}, stats "
+                                 "{:.1f}), trusted {:.1f}%, usable rim {:.2f} / {:.2f} deg, median gain "
+                                 "{:+.3f} / {:+.3f} / {:+.3f} stops",
+                                 index, bucket, f.bandMs + f.statsMs, f.bandMs, f.statsMs,
+                                 f.bandPixels ? 100.0 * static_cast<double>(f.trustedPixels) /
+                                                    static_cast<double>(f.bandPixels)
+                                              : 0.0,
+                                 f.rimMedianDeg[0], f.rimMedianDeg[1], f.medianLog2Gain[0], f.medianLog2Gain[1],
+                                 f.medianLog2Gain[2]);
+                m_photo.store(bucket, std::make_shared<const render::PhotoSeamField>(std::move(field).value()),
+                              params);
+            } else {
+                PluginLog::debug("frame {} (bucket {}): photometric seam field refused ({}); keeping the seam edge "
+                                 "inset and the global gain",
+                                 index, bucket, field.error().message);
+                m_photo.store(bucket, nullptr, params);  // not measured again
+            }
+            m_photo.trim(kMaxAnalysisCache, bucket);
+        }
+
+        // ---- the field this frame renders with --------------------------------
+        std::shared_ptr<const render::PhotoSeamField> field = m_photo.fieldFor(index, params);
+        if (field) {
+            if (!draft) {
+                m_photoLast = field;
+            }
+        } else if (draft && m_photoLast) {
+            // A draft never measures; the last accepted field stands in, and
+            // the frame is not final.
+            field = m_photoLast;
+            m_photoFrameExact = false;
+        }
+        m_photoFrame = field;
+        // The usable rim as the carved seam's Rim cost, for this thread, for
+        // the rest of applyAnalyses (render::PhotoRimPenaltyScope).
+        render::installPhotoRimPenaltyHook();
+        return render::PhotoRimPenaltyScope(&m_rig, std::move(field));
+    } catch (const std::exception& e) {
+        // Allocation failure is the realistic case: render without the field.
+        PluginLog::warn("photometric seam field: {}; rendering without it", e.what());
+        m_photoFrame.reset();
+        return render::PhotoRimPenaltyScope(nullptr, nullptr);
+    }
+}
+
+bool ImporterInstance::applyPhotoSeam(render::RenderParamsBuilder& builder) {
+    const render::PhotoSeamParams params = photoParamsLocked();
+    std::shared_ptr<const render::PhotoSeamField> field = std::move(m_photoFrame);
+    m_photoFrame.reset();
+    if (params.mode == render::PhotoSeamMode::Off || !field) {
+        return true;  // stage 1 (inset + global gain) stays in force
+    }
+    builder.photo(*field, params);
+    // The per-longitude rim replaces the fixed stage-1 inset: back to the
+    // calibrated FOV and its feather, which the kernel then ends at the rim.
+    builder.blend(m_blend, true);
+    // The field carries the whole lens ratio, so the global gain would count
+    // it twice.
+    if (params.mode == render::PhotoSeamMode::RimAndGain) {
+        builder.gain(Vec3d{1.0, 1.0, 1.0}, Vec3d{1.0, 1.0, 1.0});
+    }
+    return m_photoFrameExact;
 }
 
 // ---------------------------------------------------------------------------

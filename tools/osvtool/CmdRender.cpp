@@ -62,6 +62,11 @@ struct RenderOptions {
     double blendFov = 0.0;
     bool blendFovSet = false;
     double blendFeather = osv::render::kSeamInsetFeatherDeg;
+    // [WP-PHOTO] The photometric seam field, measured per bucket of frames
+    // with the importer's own temporal filter (PhotoSeamHistory).
+    std::string photo = "off";     ///< off | rim | full
+    double photoStrength = 1.0;    ///< 0..1, the gain field only
+    double photoDecay = 20.0;      ///< degrees beyond the overlap
     int seamInterval = 1;
     std::string out;
     std::string ffmpeg;
@@ -139,7 +144,7 @@ int runRender(const RenderOptions& o) {
     // The per-frame analyses shade bands from host planes, so they decide
     // whether a CUDA decode may keep its frames on the GPU.
     PipelineOptions pipelineOptions = o.pipeline;
-    pipelineOptions.hostFramesRequired = o.seamSearch || o.gain || o.parallax || o.seamCarve;
+    pipelineOptions.hostFramesRequired = o.seamSearch || o.gain || o.parallax || o.seamCarve || o.photo != "off";
     auto pipe = Pipeline::open(pipelineOptions, true);
     if (!pipe.ok()) {
         std::fprintf(stderr, "error: %s\n", log::safe(pipe.value() ? "" : pipe.error().toString()).c_str());
@@ -361,6 +366,28 @@ int runRender(const RenderOptions& o) {
     render::ParallaxWarpGrid warpGrid;
     bool haveWarp = false;
     render::BlendSeam blendSeam;  // the carved seam in force (--seam-carve)
+    // [WP-PHOTO] --photo: the parameters, the per-clip field history (EMA,
+    // cross-fade, accumulated rim - exactly the importer's) and the global
+    // gain in force, which a full field replaces and a refusal restores.
+    render::PhotoSeamParams photoParams;
+    if (o.photo == "rim") {
+        photoParams.mode = render::PhotoSeamMode::RimOnly;
+    } else if (o.photo == "full") {
+        photoParams.mode = render::PhotoSeamMode::RimAndGain;
+    } else if (o.photo == "off") {
+        photoParams.mode = render::PhotoSeamMode::Off;
+    } else {
+        std::fprintf(stderr, "error: unknown --photo '%s' (off|rim|full)\n", log::safe(o.photo).c_str());
+        return kExitUsage;
+    }
+    if (!(o.photoStrength >= 0.0 && o.photoStrength <= 1.0) || !(o.photoDecay >= 0.0 && o.photoDecay <= 90.0)) {
+        std::fprintf(stderr, "error: --photo-strength must be within 0..1 and --photo-decay within 0..90\n");
+        return kExitUsage;
+    }
+    photoParams.strength = o.photoStrength;
+    photoParams.decayDeg = o.photoDecay;
+    render::PhotoSeamHistory photoHistory;
+    Vec3d globalGain[2] = {Vec3d{1, 1, 1}, Vec3d{1, 1, 1}};
     bool haveBlendSeam = false;
     for (std::uint32_t f = first; f <= last && !writerFailed; ++f) {
         auto pair = P.reader->read(f);
@@ -451,7 +478,43 @@ int runRender(const RenderOptions& o) {
             render::BandParams band;
             auto g = render::estimateGain(P.rig, pair.value(), P.blendParams, band, *P.pool);
             if (g.ok()) {
-                builder.gain(g.value().gain[0], g.value().gain[1]);
+                globalGain[0] = g.value().gain[0];  // [WP-PHOTO] remembered for frames a field overrides
+                globalGain[1] = g.value().gain[1];
+            }
+        }
+        builder.gain(globalGain[0], globalGain[1]);
+        // [WP-PHOTO] The photometric seam field: one measurement per bucket
+        // (the analysis blend, never the inset render blend), then the
+        // bucket's field cross-faded from the previous one.  Applied, its rim
+        // replaces the inset and - in full mode - its gain the global one.
+        builder.clearPhoto();
+        builder.blend(renderBlend, o.pipeline.blend);
+        if (photoParams.mode != render::PhotoSeamMode::Off) {
+            const std::uint32_t bucket = render::parallaxBucket(f);
+            if (!photoHistory.measured(bucket)) {
+                auto field = render::measurePhotoSeam(P.rig, pair.value(), P.blendParams, photoParams, *P.pool);
+                if (field.ok()) {
+                    const render::PhotoSeamField& pf = field.value();
+                    log::info("frame {}: photometric seam field in {:.1f} ms (bands {:.1f}), trusted {:.1f}%, usable "
+                              "rim {:.2f} / {:.2f} deg, median gain {:+.3f} / {:+.3f} / {:+.3f} stops",
+                              f, pf.bandMs + pf.statsMs, pf.bandMs,
+                              100.0 * static_cast<double>(pf.trustedPixels) / static_cast<double>(pf.bandPixels),
+                              pf.rimMedianDeg[0], pf.rimMedianDeg[1], pf.medianLog2Gain[0], pf.medianLog2Gain[1],
+                              pf.medianLog2Gain[2]);
+                    photoHistory.store(bucket, std::make_shared<const render::PhotoSeamField>(std::move(field).value()),
+                                       photoParams);
+                } else {
+                    log::warn("frame {}: photometric seam field refused ({}); keeping the inset and the global gain",
+                              f, log::safe(field.error().message));
+                    photoHistory.store(bucket, nullptr, photoParams);
+                }
+            }
+            if (const auto field = photoHistory.fieldFor(f, photoParams)) {
+                builder.photo(*field, photoParams);
+                builder.blend(P.blendParams, o.pipeline.blend);
+                if (photoParams.mode == render::PhotoSeamMode::RimAndGain) {
+                    builder.gain(Vec3d{1, 1, 1}, Vec3d{1, 1, 1});
+                }
             }
         }
         // The builder persists across frames, so both corrections are set
@@ -554,6 +617,14 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
         ->each([opt](const std::string&) { opt->blendFovSet = true; });
     outGeom->add_option("--blend-feather", opt->blendFeather, "Render-blend feather in degrees (analyses: --feather)")
         ->default_val(osv::render::kSeamInsetFeatherDeg);
+    outGeom->add_option("--photo", opt->photo,
+                        "Photometric seam field: off | rim (per-longitude usable rim) | full (rim + 2-D gain; "
+                        "replaces --gain)")
+        ->default_str("off");
+    outGeom->add_option("--photo-strength", opt->photoStrength, "Gain-field strength 0..1 (--photo full)")
+        ->default_val(1.0);
+    outGeom->add_option("--photo-decay", opt->photoDecay, "Gain-field decay beyond the overlap, degrees")
+        ->default_val(20.0);
     outGeom->add_option("--seam-interval", opt->seamInterval, "Re-run the analyses every N frames")->default_val(1);
     outGeom->add_option("--out", opt->out, "Output: image (.png/.tif/.exr, %05d pattern) or .mp4")->required();
     outGeom->add_option("--ffmpeg", opt->ffmpeg, "ffmpeg executable for .mp4 output");

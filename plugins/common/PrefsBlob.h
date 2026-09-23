@@ -179,6 +179,19 @@ enum class PrefsRenderDevice : std::uint8_t {
     Count
 };
 
+/// [WP-PHOTO] The photometric seam fix ("Sky seam fix" in Source Settings):
+/// what the per-clip field corrects (osv::render::PhotoSeamMode, same values).
+///
+/// Off is 0 so an older blob - whose byte is zero - keeps rendering exactly
+/// as it did, the way `parallax` was introduced; a fresh blob gets RimAndGain
+/// from defaults().
+enum class PrefsPhotoSeam : std::uint8_t {
+    Off = 0,         ///< No field (the seam edge inset and the global gain still apply).
+    RimOnly = 1,     ///< The per-longitude usable rim only.
+    RimAndGain = 2,  ///< Rim plus the 2-D gain field (replaces the global gain).
+    Count
+};
+
 #pragma pack(push, 1)
 
 /// The 128-byte preferences record.  Use defaults() to construct one,
@@ -241,8 +254,17 @@ struct PrefsBlob {
     /// tenths of a degree, 1 = no inset (the render blend before this field
     /// existed) up to kMaxSeamInsetCode = 6.0 deg.  See seamInsetDeg().
     std::uint8_t seamInset = 0;
+    /// PrefsPhotoSeam; 0 = Off, so an older blob renders as it did.
+    std::uint8_t photoSeam = 0;
+    /// Strength of the gain field: 0 = the default (100 %), otherwise
+    /// (value - 1) percent, so 1 is 0 % and 101 is 100 %.  See
+    /// photoStrengthPercent().
+    std::uint8_t photoStrength = 0;
+    /// Offsets 35-37: the rest of WP-PHOTO's range.  Zero, and zeroed by
+    /// sanitise().
+    std::uint8_t photoReserved[3] = {};
     // ---- [/WP-PHOTO] --------------------------------------------------------
-    std::uint8_t reserved[95] = {};    ///< Zero; future fields.
+    std::uint8_t reserved[90] = {};    ///< Zero; future fields.
 
     /// seamInset: the default inset in tenths of a degree (2.6 deg - the
     /// render weight then ends at 95.0 deg on the calibrated 97.59 deg lens;
@@ -250,6 +272,8 @@ struct PrefsBlob {
     static constexpr std::uint8_t kDefaultSeamInsetTenths = 26;
     /// seamInset: the largest stored code (61 = 6.0 deg).
     static constexpr std::uint8_t kMaxSeamInsetCode = 61;
+    /// photoStrength: the largest stored code (101 = 100 %).
+    static constexpr std::uint8_t kMaxPhotoStrengthCode = 101;
 
     /// A blob with every field at its documented default.
     [[nodiscard]] static PrefsBlob defaults() noexcept {
@@ -289,6 +313,10 @@ struct PrefsBlob {
         // know the option exists should still get the better picture.
         p.parallax = static_cast<std::uint8_t>(PrefsParallax::On);
         p.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Auto);
+        // [WP-PHOTO] The sky seam fix ON by default: rim and gain at full
+        // strength; the inset stays at its default (code 0).
+        p.photoSeam = static_cast<std::uint8_t>(PrefsPhotoSeam::RimAndGain);
+        p.photoStrength = 0;
         return p;
     }
 
@@ -390,8 +418,22 @@ struct PrefsBlob {
                 clean = false;
             }
         }
-        // [WP-PHOTO] An out-of-range inset code falls back to the default
-        // (code 0), the setting a fresh blob would have.
+        // [WP-PHOTO] A corrupt mode lands on the DEFAULT (RimAndGain), like
+        // parallax; a corrupt strength on the default 100 %.
+        clampEnum(photoSeam, static_cast<std::uint8_t>(PrefsPhotoSeam::Count),
+                  static_cast<std::uint8_t>(PrefsPhotoSeam::RimAndGain));
+        if (photoStrength > kMaxPhotoStrengthCode) {
+            photoStrength = 0;
+            clean = false;
+        }
+        for (std::uint8_t& b : photoReserved) {
+            if (b != 0) {
+                b = 0;
+                clean = false;
+            }
+        }
+        // An out-of-range inset code falls back to the default (code 0), the
+        // setting a fresh blob would have.
         if (seamInset > kMaxSeamInsetCode) {
             seamInset = 0;
             clean = false;
@@ -505,6 +547,28 @@ struct PrefsBlob {
         }
         seamInset = tenths == kDefaultSeamInsetTenths ? std::uint8_t{0} : static_cast<std::uint8_t>(tenths + 1);
     }
+    /// [WP-PHOTO] The sky seam fix mode.
+    [[nodiscard]] PrefsPhotoSeam photoSeamMode() const noexcept { return static_cast<PrefsPhotoSeam>(photoSeam); }
+    /// [WP-PHOTO] Gain-field strength in percent (code 0 = the default 100).
+    [[nodiscard]] double photoStrengthPercent() const noexcept {
+        if (photoStrength == 0 || photoStrength > kMaxPhotoStrengthCode) {
+            return 100.0;
+        }
+        return static_cast<double>(photoStrength - 1);
+    }
+    /// [WP-PHOTO] Store a strength in percent (rounded, clamped to 0..100);
+    /// 100 is stored as code 0 so it keeps tracking the default.
+    void setPhotoStrengthPercent(double percent) noexcept {
+        if (!(percent >= 0.0) || percent > 1e6) {
+            photoStrength = 0;  // NaN, infinities, negatives: the default
+            return;
+        }
+        long p = static_cast<long>(percent + 0.5);
+        if (p > 100) {
+            p = 100;
+        }
+        photoStrength = p == 100 ? std::uint8_t{0} : static_cast<std::uint8_t>(p + 1);
+    }
 };
 
 #pragma pack(pop)
@@ -547,6 +611,11 @@ static_assert(offsetof(PrefsBlob, padAfterFlare) == 31, "PrefsBlob layout drifte
 // zero means the default inset, so an old project gets the thinner seam band
 // without a Source Settings visit.
 static_assert(offsetof(PrefsBlob, seamInset) == 32, "PrefsBlob layout drifted");
-static_assert(offsetof(PrefsBlob, reserved) == 33, "PrefsBlob layout drifted");
+// photoSeam's zero in an old blob reads as Off, so an old project renders as
+// before (like parallax); a fresh blob gets RimAndGain.
+static_assert(offsetof(PrefsBlob, photoSeam) == 33, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, photoStrength) == 34, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, photoReserved) == 35, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, reserved) == 38, "PrefsBlob layout drifted");
 
 }  // namespace osv::premiere

@@ -22,6 +22,35 @@
 namespace osv::premiere {
 
 // ---------------------------------------------------------------------------
+//  [WP-PHOTO] the sky seam fix <-> its three controls
+// ---------------------------------------------------------------------------
+namespace {
+
+/// Blob -> controls: the mode as its combo index, the two numbers through
+/// the blob's own decoders (code 0 = the default).
+void photoControlsFromPrefs(const PrefsBlob& prefs, DialogControls& c) noexcept {
+    c.photoSeam = static_cast<int>(prefs.photoSeam);
+    c.photoStrengthPercent = prefs.photoStrengthPercent();
+    c.seamInsetDeg = prefs.seamInsetDeg();
+}
+
+/// Controls -> blob.  An out-of-range mode lands on the default (Rim and
+/// colour); the numbers go through the blob's setters, which round, clamp
+/// and store the default value as code 0 so it keeps tracking the default.
+void applyPhotoControls(const DialogControls& c, PrefsBlob& blob) noexcept {
+    if (c.photoSeam < 0 || c.photoSeam >= static_cast<int>(PrefsPhotoSeam::Count)) {
+        blob.photoSeam = static_cast<std::uint8_t>(PrefsPhotoSeam::RimAndGain);
+    } else {
+        blob.photoSeam = static_cast<std::uint8_t>(c.photoSeam);
+    }
+    blob.setPhotoStrengthPercent(c.photoStrengthPercent);
+    blob.setSeamInsetDeg(c.seamInsetDeg);
+}
+
+}  // namespace
+// ---- [/WP-PHOTO] -------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 //  PrefsBlob -> controls
 // ---------------------------------------------------------------------------
 
@@ -40,6 +69,7 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.dlogmFit = static_cast<int>(prefs.dlogmFit);
     c.exposureStops = static_cast<double>(prefs.exposureStops);
     c.renderDevice = static_cast<int>(prefs.renderDevice);
+    photoControlsFromPrefs(prefs, c);  // [WP-PHOTO]
     return c;
 }
 
@@ -93,6 +123,7 @@ PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& bas
     // anyway, but being explicit is cheaper to read); finite ones are clamped
     // by sanitise() to the documented +/- 6 stops.
     blob.exposureStops = std::isfinite(controls.exposureStops) ? static_cast<float>(controls.exposureStops) : 0.0f;
+    applyPhotoControls(controls, blob);  // [WP-PHOTO]
 
     blob.sanitise();
     return blob;

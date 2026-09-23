@@ -29,6 +29,7 @@ namespace {
 /// Floor of every logarithm below, as in the research scripts (EPS = 1e-5):
 /// a black pixel must not turn into -inf and dominate an RMS.
 constexpr double kLogFloor = 1e-5;
+constexpr float kLogFloorF = 1e-5f;
 
 /// BT.2020 luma of a linear RGB triple - the same weights the research
 /// (bandio.luma) and SeamAnalysis.cpp use.
@@ -454,6 +455,69 @@ using PhotoClock = std::chrono::steady_clock;
            nonNeg(p.minTrustedFraction);
 }
 
+/// Everything photoSeamFromBands needs per band pixel, kept between calls:
+/// ~6 MB for the default band, allocated once rather than page-faulted in
+/// fresh for every bucket.
+struct PhotoScratch {
+    std::vector<float> lum;          ///< 2 x N: log2 luma per lens.
+    std::vector<float> lr;           ///< N x 3: log2(master / slave) per channel.
+    std::vector<float> gmax;         ///< N: the largest of the four gradients.
+    std::vector<float> wgt;          ///< N: gain weight, 0 = untrusted.
+    std::vector<std::uint8_t> flags; ///< N: validity and texture bits.
+    std::vector<std::uint32_t> rowTrusted;
+    std::vector<double> numL;        ///< Latitude pass partial sums.
+    std::vector<double> denL;
+    std::vector<double> geoL;
+};
+
+/// A tiny free list of scratch sets: concurrent measurements (several clips
+/// on several render threads) each take their own; at most kKeep are kept.
+struct PhotoScratchPool {
+    std::mutex mutex;
+    std::vector<std::unique_ptr<PhotoScratch>> free;
+    static constexpr std::size_t kKeep = 2;
+};
+
+PhotoScratchPool& photoScratchPool() {
+    static PhotoScratchPool* pool = new PhotoScratchPool();  // intentionally leaked (no teardown order)
+    return *pool;
+}
+
+/// RAII: takes a scratch set from the pool (or makes one), gives it back.
+class PhotoScratchLease {
+public:
+    PhotoScratchLease() {
+        PhotoScratchPool& p = photoScratchPool();
+        {
+            std::lock_guard<std::mutex> lock(p.mutex);
+            if (!p.free.empty()) {
+                m_scratch = std::move(p.free.back());
+                p.free.pop_back();
+            }
+        }
+        if (!m_scratch) {
+            m_scratch = std::make_unique<PhotoScratch>();
+        }
+    }
+    ~PhotoScratchLease() {
+        try {
+            PhotoScratchPool& p = photoScratchPool();
+            std::lock_guard<std::mutex> lock(p.mutex);
+            if (p.free.size() < PhotoScratchPool::kKeep) {
+                p.free.push_back(std::move(m_scratch));
+            }
+        } catch (...) {
+            // A failed push only means the set is freed instead of kept.
+        }
+    }
+    PhotoScratchLease(const PhotoScratchLease&) = delete;
+    PhotoScratchLease& operator=(const PhotoScratchLease&) = delete;
+    [[nodiscard]] PhotoScratch& get() noexcept { return *m_scratch; }
+
+private:
+    std::unique_ptr<PhotoScratch> m_scratch;
+};
+
 /// Run `body` over [0, n) on `pool` when there is one, inline otherwise.
 template <class Body>
 Status forRange(ThreadPool* pool, std::size_t n, std::size_t grain, const Body& body) {
@@ -482,6 +546,79 @@ Status forRange(ThreadPool* pool, std::size_t n, std::size_t grain, const Body& 
 [[nodiscard]] double lensTheta(const geom::LensRig& rig, int i, const Vec3d& dBody) noexcept {
     const Vec3d dl = rig.bodyToLens[static_cast<std::size_t>(i)] * dBody;
     return std::atan2(std::hypot(dl.x, dl.y), dl.z);
+}
+
+/// Per-pixel angles from both lens axes over one band geometry.
+struct ThetaTable {
+    std::vector<double> key;                              ///< Both rotations, then w, h, rowOffset, mapH.
+    std::shared_ptr<const std::vector<float>> theta[2];   ///< Radians, w * h each.
+};
+
+/// A handful of recently used theta tables, shared by every clip in the
+/// process (a table is ~2 MB; a project rarely stitches more than a few
+/// rigs at once).  Guarded by its own mutex; entries are immutable.
+struct ThetaCache {
+    std::mutex mutex;
+    std::deque<std::shared_ptr<const ThetaTable>> entries;  ///< Most recent first.
+    static constexpr std::size_t kMax = 4;
+};
+
+ThetaCache& thetaCache() {
+    static ThetaCache* cache = new ThetaCache();  // intentionally leaked: no teardown-order hazards
+    return *cache;
+}
+
+/// The theta table of `rig` over a band `w` x `h` starting at map row
+/// `rowOffset` of a `mapH` tall polar map: from the cache, or computed now.
+Result<std::shared_ptr<const ThetaTable>> thetaTableFor(const geom::LensRig& rig, std::uint32_t w, std::uint32_t h,
+                                                        std::uint32_t rowOffset, std::uint32_t mapH,
+                                                        ThreadPool& pool) {
+    std::vector<double> key;
+    key.reserve(22);
+    for (std::size_t i = 0; i < 2; ++i) {
+        key.insert(key.end(), std::begin(rig.bodyToLens[i].m), std::end(rig.bodyToLens[i].m));
+    }
+    key.insert(key.end(), {static_cast<double>(w), static_cast<double>(h), static_cast<double>(rowOffset),
+                           static_cast<double>(mapH)});
+    ThetaCache& cache = thetaCache();
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
+            if ((*it)->key == key) {
+                std::shared_ptr<const ThetaTable> hit = *it;
+                cache.entries.erase(it);
+                cache.entries.push_front(hit);
+                return hit;
+            }
+        }
+    }
+    // Not cached: compute outside the lock (two threads may race to build
+    // the same table; both results are identical, one wins the slot).
+    auto table = std::make_shared<ThetaTable>();
+    table->key = key;
+    const std::size_t n = static_cast<std::size_t>(w) * h;
+    auto t0 = std::make_shared<std::vector<float>>(n, 0.0f);
+    auto t1 = std::make_shared<std::vector<float>>(n, 0.0f);
+    Status st = pool.parallelFor(0, h, 4, [&](std::size_t r0, std::size_t r1) {
+        for (std::size_t r = r0; r < r1; ++r) {
+            for (std::uint32_t c = 0; c < w; ++c) {
+                const Vec3d d = polarDirection(static_cast<double>(c), static_cast<double>(r), w, rowOffset, mapH);
+                const std::size_t i = r * w + c;
+                (*t0)[i] = static_cast<float>(lensTheta(rig, 0, d));
+                (*t1)[i] = static_cast<float>(lensTheta(rig, 1, d));
+            }
+        }
+    });
+    OSV_TRY(st);
+    table->theta[0] = std::move(t0);
+    table->theta[1] = std::move(t1);
+    std::shared_ptr<const ThetaTable> done = std::move(table);
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.entries.push_front(done);
+    while (cache.entries.size() > ThetaCache::kMax) {
+        cache.entries.pop_back();
+    }
+    return done;
 }
 
 }  // namespace
@@ -648,7 +785,19 @@ Result<RgbLensBands> renderPhotoBands(const geom::LensRig& rig, const video::Fra
     // the raw fall-off rather than on a feather that already hides it.
     geom::BlendParams occlusionOnly = blend;
     occlusionOnly.featherDeg = 0.0;
-    const OsvColorParams linear = color::makeColorParams(color::kDefaultDlogMFit, color::OutputTransfer::Linear, 0.0f);
+    // Scene-linear in the camera's NATIVE primaries: the kernel applies the
+    // field per channel inside its lens loop, before osvLinearToOutput's
+    // native -> working matrix, so it must be measured in that same space.
+    // (A diagonal gain does not commute with the matrix: measured in Rec.2020
+    // and applied in native, the colour term came out 0.31x instead of 0.20x
+    // on the sample.)  Native is also where a per-channel lens difference
+    // physically lives - it is a sensor/optics property.
+    OsvColorParams linear = color::makeColorParams(color::kDefaultDlogMFit, color::OutputTransfer::Linear, 0.0f);
+    for (int k = 0; k < 9; ++k) {
+        const float id = (k % 4 == 0) ? 1.0f : 0.0f;
+        linear.nativeToWorking.m[k] = id;
+        linear.workingToOutput.m[k] = id;
+    }
 
     RgbLensBands out;
     out.w = band.equirectW;
@@ -680,23 +829,14 @@ Result<RgbLensBands> renderPhotoBands(const geom::LensRig& rig, const video::Fra
         }
         out.rgba[lens] = std::move(rgba);
         out.thetaMaxRad[lens] = static_cast<float>(geom::effectiveThetaMax(lens, blend));
-        out.thetaRad[lens].assign(n, 0.0f);
     }
 
-    // Each pixel's angle from both lens axes, from the rig in double (the
-    // bands' own geometry; independent of the frames).
-    Status st = pool.parallelFor(0, out.h, 4, [&](std::size_t r0, std::size_t r1) {
-        for (std::size_t r = r0; r < r1; ++r) {
-            for (std::uint32_t c = 0; c < out.w; ++c) {
-                const Vec3d d = polarDirection(static_cast<double>(c), static_cast<double>(r), out.w, out.rowOffset,
-                                               out.mapH);
-                const std::size_t i = r * out.w + c;
-                out.thetaRad[0][i] = static_cast<float>(lensTheta(rig, 0, d));
-                out.thetaRad[1][i] = static_cast<float>(lensTheta(rig, 1, d));
-            }
-        }
-    });
-    OSV_TRY(st);
+    // Each pixel's angle from both lens axes, from the rig in double.  It
+    // depends only on the rig's rotations and the band geometry - constant
+    // for a clip - so it is computed once and reused by every bucket.
+    OSV_TRY_ASSIGN(std::shared_ptr<const ThetaTable> theta, thetaTableFor(rig, out.w, out.h, out.rowOffset, out.mapH, pool));
+    out.thetaRad[0] = theta->theta[0];  // shared, not copied
+    out.thetaRad[1] = theta->theta[1];
     return out;
 }
 
@@ -715,7 +855,8 @@ Result<PhotoSeamField> photoSeamFromBands(const RgbLensBands& b, const PhotoSeam
         return Error{ErrorCode::InvalidArgument, "photoSeamFromBands: bad band geometry"};
     }
     for (int i = 0; i < 2; ++i) {
-        if (b.rgba[i].size() != N * 4u || b.thetaRad[i].size() != N || !std::isfinite(b.thetaMaxRad[i]) ||
+        if (b.rgba[i].size() != N * 4u || !b.thetaRad[i] || b.thetaRad[i]->size() != N ||
+            !std::isfinite(b.thetaMaxRad[i]) ||
             !(b.thetaMaxRad[i] > static_cast<float>(kHalfPi))) {
             return Error{ErrorCode::InvalidArgument, "photoSeamFromBands: band buffers do not match the band"};
         }
@@ -728,62 +869,82 @@ Result<PhotoSeamField> photoSeamFromBands(const RgbLensBands& b, const PhotoSeam
     const double thetaMaxDeg[2] = {rad2deg(static_cast<double>(b.thetaMaxRad[0])),
                                    rad2deg(static_cast<double>(b.thetaMaxRad[1]))};
     const float flat = static_cast<float>(P.flatLog2PerDeg);
+    const float* theta0 = b.thetaRad[0]->data();
+    const float* theta1 = b.thetaRad[1]->data();
 
-    // ---- 1. per pixel: logs, luma, theta, validity ----------------------------------
-    // lg: log2 RGB per lens (lens-major), lum: log2 BT.2020 luma per lens.
-    std::vector<float> lg(2u * N * 3u, 0.0f);
-    std::vector<float> lum(2u * N, 0.0f);
-    std::vector<float> thDeg(2u * N, 0.0f);
-    std::vector<std::uint8_t> valid(N, 0);
+    // Scratch for this call, reused across calls (a band's worth of floats
+    // is ~6 MB; allocating it fresh every bucket cost more in page faults
+    // than the arithmetic below).
+    PhotoScratchLease scratch;
+    PhotoScratch& S = scratch.get();
+    S.lum.resize(2u * N);
+    S.lr.resize(N * 3u);
+    S.gmax.resize(N);
+    S.wgt.resize(N);
+    S.flags.resize(N);
+    S.rowTrusted.assign(H, 0u);
+
+    // ---- 1. per pixel: log luma per lens, log2(master / slave), validity ------------
+    // flags bit 0: co-valid (both occlusion factors >= trustAlpha, all finite).
+    constexpr std::uint8_t kValid = 1u;
+    constexpr std::uint8_t kFlatLon = 2u;   // |d log2 L / d lon| < flat in BOTH lenses
+    constexpr std::uint8_t kFlatLat0 = 4u;  // |d log2 L / d lat| < flat in lens 0
+    constexpr std::uint8_t kFlatLat1 = 8u;  // ... in lens 1
+    const float trustAlpha = static_cast<float>(P.trustAlpha);
     OSV_TRY(forRange(pool, H, 4, [&](std::size_t r0, std::size_t r1) {
         for (std::size_t r = r0; r < r1; ++r) {
             for (std::size_t c = 0; c < W; ++c) {
                 const std::size_t i = r * W + c;
-                bool ok = true;
-                for (int lens = 0; lens < 2; ++lens) {
-                    const float* px = b.rgba[lens].data() + i * 4u;
-                    const std::size_t li = static_cast<std::size_t>(lens) * N + i;
-                    for (int ch = 0; ch < 3; ++ch) {
-                        ok = ok && std::isfinite(px[ch]);
-                        lg[li * 3u + static_cast<std::size_t>(ch)] =
-                            static_cast<float>(log2Floor(static_cast<double>(px[ch])));
-                    }
-                    lum[li] = static_cast<float>(log2Floor(luma2020(px)));
-                    const float th = b.thetaRad[lens][i];
-                    thDeg[li] = static_cast<float>(rad2deg(static_cast<double>(th)));
-                    ok = ok && std::isfinite(th) && std::isfinite(px[3]) &&
-                         static_cast<double>(px[3]) >= P.trustAlpha;
+                const float* a = b.rgba[0].data() + i * 4u;
+                const float* m = b.rgba[1].data() + i * 4u;
+                // Single precision is ample for statistics over thousands of
+                // pixels.  log2 of the floored channels, as the research.
+                bool ok = std::isfinite(a[0]) && std::isfinite(a[1]) && std::isfinite(a[2]) && std::isfinite(m[0]) &&
+                          std::isfinite(m[1]) && std::isfinite(m[2]) && a[3] >= trustAlpha && m[3] >= trustAlpha &&
+                          std::isfinite(theta0[i]) && std::isfinite(theta1[i]);
+                for (std::size_t ch = 0; ch < 3; ++ch) {
+                    S.lr[i * 3u + ch] =
+                        ok ? std::log2(std::max(m[ch], kLogFloorF)) - std::log2(std::max(a[ch], kLogFloorF)) : 0.0f;
                 }
-                valid[i] = ok ? 1u : 0u;
+                const float y0 = 0.2627f * a[0] + 0.6780f * a[1] + 0.0593f * a[2];
+                const float y1 = 0.2627f * m[0] + 0.6780f * m[1] + 0.0593f * m[2];
+                S.lum[i] = std::isfinite(y0) ? std::log2(std::max(y0, kLogFloorF)) : 0.0f;
+                S.lum[N + i] = std::isfinite(y1) ? std::log2(std::max(y1, kLogFloorF)) : 0.0f;
+                S.flags[i] = ok ? kValid : std::uint8_t{0};
             }
         }
     }));
 
-    // ---- 2. gradients, stops per degree ------------------------------------------------
+    // ---- 2. gradients, stops per degree: the texture flags and the gain weight's g ------
     const int kx = std::max(1, static_cast<int>(std::lround(P.gradStepDeg / degPerCol)));
     const int ky = std::max(1, static_cast<int>(std::lround(P.gradStepDeg / degPerRow)));
-    std::vector<float> gLon(2u * N, 0.0f);
-    std::vector<float> gLat(2u * N, 0.0f);
+    const float invLon = static_cast<float>(1.0 / (2.0 * kx * degPerCol));
     OSV_TRY(forRange(pool, H, 4, [&](std::size_t r0, std::size_t r1) {
         const int Wi = static_cast<int>(W);
         const int Hi = static_cast<int>(H);
         for (std::size_t r = r0; r < r1; ++r) {
             const int ru = std::max(static_cast<int>(r) - ky, 0);
             const int rd = std::min(static_cast<int>(r) + ky, Hi - 1);
+            const float invLat = rd > ru ? static_cast<float>(1.0 / (static_cast<double>(rd - ru) * degPerRow)) : 0.0f;
             for (int c = 0; c < Wi; ++c) {
                 const std::size_t i = r * W + static_cast<std::size_t>(c);
                 const std::size_t cl = r * W + static_cast<std::size_t>(wrapIndex(c - kx, Wi));
                 const std::size_t cr = r * W + static_cast<std::size_t>(wrapIndex(c + kx, Wi));
-                for (int lens = 0; lens < 2; ++lens) {
-                    const float* L = lum.data() + static_cast<std::size_t>(lens) * N;
-                    gLon[static_cast<std::size_t>(lens) * N + i] =
-                        std::fabs(L[cr] - L[cl]) / static_cast<float>(2.0 * kx * degPerCol);
-                    gLat[static_cast<std::size_t>(lens) * N + i] =
-                        rd > ru ? std::fabs(L[static_cast<std::size_t>(rd) * W + static_cast<std::size_t>(c)] -
-                                            L[static_cast<std::size_t>(ru) * W + static_cast<std::size_t>(c)]) /
-                                      static_cast<float>(static_cast<double>(rd - ru) * degPerRow)
-                                : std::numeric_limits<float>::infinity();
-                }
+                const std::size_t iu = static_cast<std::size_t>(ru) * W + static_cast<std::size_t>(c);
+                const std::size_t id = static_cast<std::size_t>(rd) * W + static_cast<std::size_t>(c);
+                const float gLon0 = std::fabs(S.lum[cr] - S.lum[cl]) * invLon;
+                const float gLon1 = std::fabs(S.lum[N + cr] - S.lum[N + cl]) * invLon;
+                // A one-row band has no latitude gradient: infinitely textured.
+                const float gLat0 = rd > ru ? std::fabs(S.lum[id] - S.lum[iu]) * invLat
+                                            : std::numeric_limits<float>::infinity();
+                const float gLat1 = rd > ru ? std::fabs(S.lum[N + id] - S.lum[N + iu]) * invLat
+                                            : std::numeric_limits<float>::infinity();
+                std::uint8_t f = S.flags[i];
+                f |= (gLon0 < flat && gLon1 < flat) ? kFlatLon : std::uint8_t{0};
+                f |= gLat0 < flat ? kFlatLat0 : std::uint8_t{0};
+                f |= gLat1 < flat ? kFlatLat1 : std::uint8_t{0};
+                S.flags[i] = f;
+                S.gmax[i] = std::max(std::max(gLon0, gLon1), std::max(gLat0, gLat1));
             }
         }
     }));
@@ -792,40 +953,43 @@ Result<PhotoSeamField> photoSeamFromBands(const RgbLensBands& b, const PhotoSeam
     // rim_experiments.py:rim_limits(): per block, the median log2(me / other)
     // (green) over FLAT co-valid pixels in theta bins; the rim is the first
     // bin past the core whose median departs rimDropStops from the core's.
+    // log2(me / other) is +lr_G for the master and -lr_G for the slave.
     const std::size_t block = std::max<std::size_t>(1, static_cast<std::size_t>(std::lround(P.rimBlockDeg / degPerCol)));
     const std::size_t nBlocks = (W + block - 1) / block;
     std::vector<double> rimRaw[2] = {std::vector<double>(W, std::numeric_limits<double>::quiet_NaN()),
                                      std::vector<double>(W, std::numeric_limits<double>::quiet_NaN())};
     OSV_TRY(forRange(pool, nBlocks, 1, [&](std::size_t k0, std::size_t k1) {
-        std::vector<std::pair<double, double>> entries;  // (theta deg, log ratio)
+        std::vector<std::pair<float, float>> entries;  // (theta deg, log ratio)
         std::vector<double> sample;
         for (std::size_t k = k0; k < k1; ++k) {
             const std::size_t c0 = k * block;
             const std::size_t c1 = std::min(W, c0 + block);
             for (int me = 0; me < 2; ++me) {
-                const int other = 1 - me;
-                const std::size_t meOff = static_cast<std::size_t>(me) * N;
-                const std::size_t otOff = static_cast<std::size_t>(other) * N;
+                // Flat along longitude in BOTH lenses and along latitude in
+                // the OTHER lens only: the tested lens's own radial fall-off
+                // is the signal.
+                const std::uint8_t need = kValid | kFlatLon | (me == 0 ? kFlatLat1 : kFlatLat0);
+                const float sign = me == 1 ? 1.0f : -1.0f;
+                const float* th = me == 0 ? theta0 : theta1;
+                // Only the angles the search reads: the core and the bins
+                // above it (about half the band; the rest is never sorted).
+                const float thLo = static_cast<float>(deg2rad(P.rimCoreLoDeg));
                 entries.clear();
                 for (std::size_t r = 0; r < H; ++r) {
                     for (std::size_t c = c0; c < c1; ++c) {
                         const std::size_t i = r * W + c;
-                        // Co-valid, flat along longitude in BOTH lenses and
-                        // along latitude in the OTHER lens only: the tested
-                        // lens's own radial fall-off is the signal.
-                        if (!valid[i] || !(gLon[i] < flat) || !(gLon[N + i] < flat) || !(gLat[otOff + i] < flat)) {
+                        if ((S.flags[i] & need) != need || th[i] < thLo) {
                             continue;
                         }
-                        const double ratio = static_cast<double>(lg[(meOff + i) * 3u + 1u]) -
-                                             static_cast<double>(lg[(otOff + i) * 3u + 1u]);
-                        entries.emplace_back(static_cast<double>(thDeg[meOff + i]), ratio);
+                        entries.emplace_back(th[i] * static_cast<float>(180.0 / kPi), sign * S.lr[i * 3u + 1u]);
                     }
                 }
                 std::sort(entries.begin(), entries.end());
-                // The lens's own core ratio.
                 const auto lower = [&entries](double theta) {
-                    return std::lower_bound(entries.begin(), entries.end(), std::make_pair(theta, -1e300));
+                    return std::lower_bound(entries.begin(), entries.end(),
+                                            std::make_pair(static_cast<float>(theta), -3.0e38f));
                 };
+                // The lens's own core ratio.
                 sample.clear();
                 for (auto it = lower(P.rimCoreLoDeg); it != entries.end() && it->first < P.rimCoreHiDeg; ++it) {
                     sample.push_back(it->second);
@@ -860,37 +1024,36 @@ Result<PhotoSeamField> photoSeamFromBands(const RgbLensBands& b, const PhotoSeam
     // ---- 4. trusted pixels and their weights -------------------------------------------
     // Trusted: co-valid AND inside both usable rims by the margin (unless the
     // guard is switched off to reproduce the research's negative result).
-    // The GAIN weight is soft in texture: 1 / (1 + (g / flat)^2).
-    std::vector<float> wTex(N, 0.0f);
-    std::vector<std::uint8_t> trusted(N, 0);
-    std::vector<float> lr(N * 3u, 0.0f);
+    // The GAIN weight is soft in texture: 1 / (1 + (g / flat)^2); 0 = untrusted.
+    std::vector<float> rimLimitRad[2] = {std::vector<float>(W), std::vector<float>(W)};
+    for (std::size_t c = 0; c < W; ++c) {
+        for (int lens = 0; lens < 2; ++lens) {
+            rimLimitRad[lens][c] = P.trustMask ? static_cast<float>(deg2rad(rimBand[lens][c] - P.trustMarginDeg))
+                                               : std::numeric_limits<float>::infinity();
+        }
+    }
     OSV_TRY(forRange(pool, H, 4, [&](std::size_t r0, std::size_t r1) {
         for (std::size_t r = r0; r < r1; ++r) {
+            std::uint32_t count = 0;
             for (std::size_t c = 0; c < W; ++c) {
                 const std::size_t i = r * W + c;
-                if (!valid[i]) {
+                const bool trusted = (S.flags[i] & kValid) != 0 && theta0[i] < rimLimitRad[0][c] &&
+                                     theta1[i] < rimLimitRad[1][c];
+                if (!trusted) {
+                    S.wgt[i] = 0.0f;
                     continue;
                 }
-                if (P.trustMask) {
-                    const bool inside0 = static_cast<double>(thDeg[i]) < rimBand[0][c] - P.trustMarginDeg;
-                    const bool inside1 = static_cast<double>(thDeg[N + i]) < rimBand[1][c] - P.trustMarginDeg;
-                    if (!inside0 || !inside1) {
-                        continue;
-                    }
-                }
-                const float g = std::max(std::max(gLon[i], gLon[N + i]), std::max(gLat[i], gLat[N + i]));
+                const float g = S.gmax[i];
                 const float t = std::isfinite(g) ? g / flat : 1e6f;
-                trusted[i] = 1u;
-                wTex[i] = 1.0f / (1.0f + t * t);
-                // log2(master / slave) per channel: lens 1 minus lens 0.
-                for (std::size_t ch = 0; ch < 3; ++ch) {
-                    lr[i * 3u + ch] = lg[(N + i) * 3u + ch] - lg[i * 3u + ch];
-                }
+                // Never exactly 0 for a trusted pixel (0 means untrusted).
+                S.wgt[i] = std::max(1.0f / (1.0f + t * t), 1e-12f);
+                ++count;
             }
+            S.rowTrusted[r] = count;
         }
     }));
     std::uint64_t trustedCount = 0;
-    for (const std::uint8_t t : trusted) {
+    for (const std::uint32_t t : S.rowTrusted) {
         trustedCount += t;
     }
     if (static_cast<double>(trustedCount) < P.minTrustedFraction * static_cast<double>(N) || trustedCount < 64) {
@@ -915,80 +1078,91 @@ Result<PhotoSeamField> photoSeamFromBands(const RgbLensBands& b, const PhotoSeam
     // Pass 1 (latitude), per band column: gh x W partial sums.
     const double sigRows = P.sigmaLatDeg / degPerRow;
     const double radRows = 3.0 * sigRows;
-    std::vector<double> numL(gh * W * 3u, 0.0), denL(gh * W, 0.0), geoL(gh * W, 0.0);
+    // The taps of every grid row, computed once: (band row, weight) pairs
+    // inside the band, and the kernel mass over ALL rows (rows outside the
+    // band count as unsupported, not as missing).
+    std::vector<std::vector<std::pair<std::uint32_t, double>>> latTaps(gh);
     std::vector<double> massLat(gh, 0.0);
-    std::vector<double> rowPos(gh, 0.0);
     for (std::size_t j = 0; j < gh; ++j) {
         // Continuous band row of grid row j (row centres at integer + 0.5).
-        rowPos[j] = (90.0 - gridLat[j]) / degPerRow - static_cast<double>(b.rowOffset) - 0.5;
-        for (int r = static_cast<int>(std::ceil(rowPos[j] - radRows)); r <= static_cast<int>(std::floor(rowPos[j] + radRows));
+        const double rowPos = (90.0 - gridLat[j]) / degPerRow - static_cast<double>(b.rowOffset) - 0.5;
+        for (int r = static_cast<int>(std::ceil(rowPos - radRows)); r <= static_cast<int>(std::floor(rowPos + radRows));
              ++r) {
-            const double d = (static_cast<double>(r) - rowPos[j]) / sigRows;
-            massLat[j] += std::exp(-0.5 * d * d);  // over ALL rows: outside the band counts as unsupported
+            const double d = (static_cast<double>(r) - rowPos) / sigRows;
+            const double k = std::exp(-0.5 * d * d);
+            massLat[j] += k;
+            if (r >= 0 && r < static_cast<int>(H)) {
+                latTaps[j].emplace_back(static_cast<std::uint32_t>(r), k);
+            }
         }
     }
-    OSV_TRY(forRange(pool, W, 16, [&](std::size_t cBegin, std::size_t cEnd) {
-        for (std::size_t c = cBegin; c < cEnd; ++c) {
-            for (std::size_t j = 0; j < gh; ++j) {
-                const int rA = std::max(0, static_cast<int>(std::ceil(rowPos[j] - radRows)));
-                const int rB = std::min(static_cast<int>(H) - 1, static_cast<int>(std::floor(rowPos[j] + radRows)));
-                double num[3] = {0.0, 0.0, 0.0};
-                double den = 0.0;
-                double geo = 0.0;
-                for (int r = rA; r <= rB; ++r) {
-                    const std::size_t i = static_cast<std::size_t>(r) * W + c;
-                    if (!trusted[i]) {
-                        continue;
+    // Row-major accumulation over column chunks: every tap row is read as a
+    // contiguous run, which is what keeps this pass cache friendly.
+    S.numL.assign(gh * W * 3u, 0.0);
+    S.denL.assign(gh * W, 0.0);
+    S.geoL.assign(gh * W, 0.0);
+    std::vector<double>& numL = S.numL;
+    std::vector<double>& denL = S.denL;
+    std::vector<double>& geoL = S.geoL;
+    OSV_TRY(forRange(pool, W, 64, [&](std::size_t cBegin, std::size_t cEnd) {
+        for (std::size_t j = 0; j < gh; ++j) {
+            double* num = numL.data() + j * W * 3u;
+            double* den = denL.data() + j * W;
+            double* geo = geoL.data() + j * W;
+            for (const auto& [r, k] : latTaps[j]) {
+                const std::size_t rowBase = static_cast<std::size_t>(r) * W;
+                for (std::size_t c = cBegin; c < cEnd; ++c) {
+                    const std::size_t i = rowBase + c;
+                    const float w = S.wgt[i];
+                    if (!(w > 0.0f)) {
+                        continue;  // untrusted
                     }
-                    const double d = (static_cast<double>(r) - rowPos[j]) / sigRows;
-                    const double k = std::exp(-0.5 * d * d);
-                    const double kw = k * static_cast<double>(wTex[i]);
-                    for (std::size_t ch = 0; ch < 3; ++ch) {
-                        num[ch] += kw * static_cast<double>(lr[i * 3u + ch]);
-                    }
-                    den += kw;
-                    geo += k;
+                    const double kw = k * static_cast<double>(w);
+                    num[c * 3u + 0u] += kw * static_cast<double>(S.lr[i * 3u + 0u]);
+                    num[c * 3u + 1u] += kw * static_cast<double>(S.lr[i * 3u + 1u]);
+                    num[c * 3u + 2u] += kw * static_cast<double>(S.lr[i * 3u + 2u]);
+                    den[c] += kw;
+                    geo[c] += k;
                 }
-                const std::size_t o = j * W + c;
-                numL[o * 3u + 0u] = num[0];
-                numL[o * 3u + 1u] = num[1];
-                numL[o * 3u + 2u] = num[2];
-                denL[o] = den;
-                geoL[o] = geo;
             }
         }
     }));
-    // Pass 2 (longitude, periodic), per grid row: the cell values.
+    // Pass 2 (longitude, periodic), per grid row: the cell values.  Taps per
+    // grid column, computed once.  Grid column g sits at lon = -180 + g 360 /
+    // gw (the kernel's convention).
     const double sigCols = P.sigmaLonDeg / degPerCol;
     const double radCols = 3.0 * sigCols;
+    std::vector<std::vector<std::pair<std::uint32_t, double>>> lonTaps(gw);
+    std::vector<double> massLon(gw, 0.0);
+    for (std::size_t g = 0; g < gw; ++g) {
+        const double lonG = -180.0 + 360.0 * static_cast<double>(g) / static_cast<double>(gw);
+        const double fc = (lonG + 180.0) / degPerCol - 0.5;
+        for (int c = static_cast<int>(std::ceil(fc - radCols)); c <= static_cast<int>(std::floor(fc + radCols)); ++c) {
+            const double d = (static_cast<double>(c) - fc) / sigCols;
+            const double k = std::exp(-0.5 * d * d);
+            massLon[g] += k;
+            lonTaps[g].emplace_back(static_cast<std::uint32_t>(wrapIndex(c, static_cast<int>(W))), k);
+        }
+    }
     std::vector<double> D(gh * gw * 3u, 0.0);
     std::vector<std::uint8_t> have(gh * gw, 0);
     OSV_TRY(forRange(pool, gh, 1, [&](std::size_t j0, std::size_t j1) {
-        const int Wi = static_cast<int>(W);
         for (std::size_t j = j0; j < j1; ++j) {
             for (std::size_t g = 0; g < gw; ++g) {
-                // Grid column g sits at lon = -180 + g 360 / gw (the kernel's
-                // convention); its continuous band column:
-                const double lonG = -180.0 + 360.0 * static_cast<double>(g) / static_cast<double>(gw);
-                const double fc = (lonG + 180.0) / degPerCol - 0.5;
                 double num[3] = {0.0, 0.0, 0.0};
                 double den = 0.0;
                 double geo = 0.0;
-                double mass = 0.0;
-                for (int c = static_cast<int>(std::ceil(fc - radCols)); c <= static_cast<int>(std::floor(fc + radCols));
-                     ++c) {
-                    const double d = (static_cast<double>(c) - fc) / sigCols;
-                    const double k = std::exp(-0.5 * d * d);
-                    const std::size_t o = j * W + static_cast<std::size_t>(wrapIndex(c, Wi));
+                for (const auto& [c, k] : lonTaps[g]) {
+                    const std::size_t o = j * W + c;
                     num[0] += k * numL[o * 3u + 0u];
                     num[1] += k * numL[o * 3u + 1u];
                     num[2] += k * numL[o * 3u + 2u];
                     den += k * denL[o];
                     geo += k * geoL[o];
-                    mass += k;
                 }
                 const std::size_t cell = j * gw + g;
-                const double support = (massLat[j] > 0.0 && mass > 0.0) ? geo / (massLat[j] * mass) : 0.0;
+                const double mass = massLat[j] * massLon[g];
+                const double support = mass > 0.0 ? geo / mass : 0.0;
                 if (support >= P.minSupport && den > 1e-12) {
                     have[cell] = 1u;
                     for (std::size_t ch = 0; ch < 3; ++ch) {
@@ -1263,7 +1437,7 @@ void PhotoSeamHistory::store(std::uint32_t bucket, const std::shared_ptr<const P
         return;
     }
     m_rim.add(*measured);
-    std::shared_ptr<const PhotoSeamField> stored = measured;
+    PhotoSeamField stored = *measured;
     // EMA against the previous bucket's STORED field, so noise from one
     // measurement is carried at temporalAlpha weight rather than in full.
     const double alpha = std::isfinite(params.temporalAlpha) ? std::clamp(params.temporalAlpha, 0.0, 1.0) : 1.0;
@@ -1271,11 +1445,17 @@ void PhotoSeamHistory::store(std::uint32_t bucket, const std::shared_ptr<const P
         if (const auto it = m_fields.find(bucket - 1); it != m_fields.end() && it->second) {
             auto ema = blendPhotoSeamFields(*it->second, *measured, alpha);
             if (ema.ok()) {
-                stored = std::make_shared<const PhotoSeamField>(std::move(ema).value());
+                stored = std::move(ema).value();
             }
         }
     }
-    m_fields[bucket] = std::move(stored);
+    // The bucket carries the clip's accumulated rim AS IT STANDS NOW, so
+    // fieldFor() cross-fades the rim between buckets exactly like the gain.
+    // Applying the accumulator at render time instead made every newly
+    // measured bucket move every frame's rim at once (0.85 deg in one step
+    // on the sample, while the median settled).
+    m_rim.apply(stored, params);
+    m_fields[bucket] = std::make_shared<const PhotoSeamField>(std::move(stored));
 }
 
 bool PhotoSeamHistory::measured(std::uint32_t bucket) const { return m_fields.find(bucket) != m_fields.end(); }
@@ -1287,19 +1467,21 @@ std::shared_ptr<const PhotoSeamField> PhotoSeamHistory::fieldFor(std::uint32_t f
     if (own == m_fields.end() || !own->second) {
         return nullptr;
     }
-    PhotoSeamField out = *own->second;
+    (void)params;  // the rim was fixed when the bucket was stored
+    // The last frame of a bucket is its own field, exactly: no copy.
+    if (bucket == 0 || parallaxCrossfadeWeight(frame) >= 1.0) {
+        return own->second;
+    }
     // Glide from the previous bucket's field inside this bucket - the
-    // parallax grid's schedule, so every per-bucket correction moves together.
-    if (bucket > 0) {
-        if (const auto prev = m_fields.find(bucket - 1); prev != m_fields.end() && prev->second) {
-            auto blended = blendPhotoSeamFields(*prev->second, *own->second, parallaxCrossfadeWeight(frame));
-            if (blended.ok()) {
-                out = std::move(blended).value();
-            }
+    // parallax grid's schedule, so every per-bucket correction moves
+    // together - gain AND rim (each bucket carries its rim snapshot).
+    if (const auto prev = m_fields.find(bucket - 1); prev != m_fields.end() && prev->second) {
+        auto blended = blendPhotoSeamFields(*prev->second, *own->second, parallaxCrossfadeWeight(frame));
+        if (blended.ok()) {
+            return std::make_shared<const PhotoSeamField>(std::move(blended).value());
         }
     }
-    m_rim.apply(out, params);
-    return std::make_shared<const PhotoSeamField>(std::move(out));
+    return own->second;
 }
 
 std::shared_ptr<const PhotoSeamField> PhotoSeamHistory::nearest(std::uint32_t bucket, std::uint32_t maxBuckets,
@@ -1314,9 +1496,8 @@ std::shared_ptr<const PhotoSeamField> PhotoSeamHistory::nearest(std::uint32_t bu
             }
             const std::uint32_t b = sign < 0 ? bucket - d : bucket + d;
             if (const auto it = m_fields.find(b); it != m_fields.end() && it->second) {
-                PhotoSeamField out = *it->second;
-                m_rim.apply(out, params);
-                return std::make_shared<const PhotoSeamField>(std::move(out));
+                (void)params;  // the stored field already carries its rim
+                return it->second;
             }
         }
     }

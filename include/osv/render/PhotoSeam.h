@@ -214,9 +214,13 @@ enum class PhotoSeamMode : int {
 /// the research's (NEURAL_STITCHING.md 8.3), re-measured through the kernel.
 struct PhotoSeamParams {
     PhotoSeamMode mode = PhotoSeamMode::RimAndGain;
-    /// Analysis band: 2048 columns x +-10 deg (the +-7.59 deg overlap plus a
-    /// margin for the gradients).  0.18 deg per pixel.
-    BandParams band{2048, 10.0};
+    /// Analysis band: 1536 columns (0.23 deg per pixel) x +-9 deg (the
+    /// +-7.59 deg overlap, the lens axes' tilt off +-Y and the gradient
+    /// step).  Measured on the sample through the kernel, 1536 scores the
+    /// same as 2048 (line / band / broad / dE 0.46 / 0.48 / 0.59 / 0.19 vs
+    /// 0.47 / 0.49 / 0.60 / 0.18) at 56 % of the pixels; 1024 leaves under
+    /// one row per 0.25 deg rim bin and the rim search fails.
+    BandParams band{1536, 9.0};
     std::uint32_t gridW = 256;       ///< Field columns over 360 deg of longitude (wraps).
     std::uint32_t gridH = 16;        ///< Field rows across the OVERLAP only (the decay is analytic).
 
@@ -253,7 +257,12 @@ struct PhotoSeamParams {
     double sigmaLonDeg = 4.2;        ///< Normalised-convolution sigma along longitude.
     double sigmaLatDeg = 1.5;        ///< ... and along latitude.
     double fillSigmaLonDeg = 8.4;    ///< Columns with no trusted support: wide longitude fill.
-    double minSupport = 0.05;        ///< Fraction of the kernel mass that must be trusted for a cell to count.
+    /// Fraction of a cell's kernel mass that must be trusted for the cell to
+    /// count; weaker cells take the nearest counted row's value.  0.25, not
+    /// the research's 0.05: a cell on the grid's edge row that only the
+    /// Gaussian's tail reaches was the one cell that moved more than 0.02 stop
+    /// per frame on the sample (0.024, section 8.4 test 10).
+    double minSupport = 0.25;
     double maxAbsLog2Gain = 1.5;     ///< Clamp per cell, stops.
     double minTrustedFraction = 0.02;///< Refuse the field below this fraction of trusted band pixels.
 
@@ -308,7 +317,10 @@ struct RgbLensBands {
     std::uint32_t rowOffset = 0;  ///< First map row of the band.
     std::uint32_t mapH = 0;       ///< Full polar map height.
     std::vector<float> rgba[2];   ///< Scene-linear RGBA per lens, w * h * 4.
-    std::vector<float> thetaRad[2];  ///< Each pixel's angle from each lens's axis, w * h.
+    /// Each pixel's angle from each lens's axis, w * h radians.  Shared and
+    /// immutable: it depends only on the rig and the band geometry, so every
+    /// bucket of a clip reads the same table.
+    std::shared_ptr<const std::vector<float>> thetaRad[2];
     float thetaMaxRad[2] = {0.0f, 0.0f};  ///< The analysis blend's half FOV per lens.
 };
 
@@ -386,10 +398,11 @@ private:
 /// so an osvtool A/B shows the picture a user gets).
 ///
 ///   * store(bucket, measured): an EMA against the previous bucket's STORED
-///     field (temporalAlpha), and the rim fed to the accumulator;
+///     field (temporalAlpha); the rim is fed to the accumulator and the
+///     stored field carries the accumulated rim as it stands then;
 ///   * fieldFor(frame): the bucket's field cross-faded from the previous
 ///     bucket's (parallaxCrossfadeWeight, exactly like the parallax grid),
-///     with the clip-wide accumulated rim.
+///     gain and rim alike, so neither steps at a bucket edge.
 ///
 /// Not thread-safe; the importer holds its instance lock around it.
 class PhotoSeamHistory {

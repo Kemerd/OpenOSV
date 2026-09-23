@@ -460,3 +460,58 @@ TEST_CASE("a changed OK names the file to refresh, from the instance or the acce
         REQUIRE(prefsRefreshTarget(before, after, L"", L"").empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+//  [WP-PHOTO] the sky seam fix rows
+// ---------------------------------------------------------------------------
+
+TEST_CASE("the sky seam fix controls round trip and refuse garbage", "[importer][prefs][mapping][photoseam]") {
+    // Defaults: rim and colour at 100 %, the 2.6 degree seam edge inset.
+    const DialogControls shown = controlsFromPrefs(PrefsBlob::defaults());
+    REQUIRE(shown.photoSeam == static_cast<int>(PrefsPhotoSeam::RimAndGain));
+    REQUIRE(shown.photoStrengthPercent == 100.0);
+    REQUIRE(shown.seamInsetDeg == 2.6);
+
+    // Every mode x a spread of strengths and insets survives the round trip.
+    for (int mode = 0; mode < static_cast<int>(PrefsPhotoSeam::Count); ++mode) {
+        for (const double strength : {0.0, 1.0, 35.0, 99.0, 100.0}) {
+            for (const double inset : {0.0, 0.1, 1.5, 2.6, 6.0}) {
+                PrefsBlob original = PrefsBlob::defaults();
+                original.photoSeam = static_cast<std::uint8_t>(mode);
+                original.setPhotoStrengthPercent(strength);
+                original.setSeamInsetDeg(inset);
+                const DialogControls controls = controlsFromPrefs(original);
+                INFO("mode " << mode << " strength " << strength << " inset " << inset);
+                REQUIRE(controls.photoSeam == mode);
+                REQUIRE(controls.photoStrengthPercent == strength);
+                REQUIRE(std::abs(controls.seamInsetDeg - inset) < 1e-9);
+                REQUIRE(prefsFromControls(controls) == original);
+            }
+        }
+    }
+
+    // An old project (both bytes zero): Off, and OK keeps it Off.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.photoSeam = 0;
+    REQUIRE(controlsFromPrefs(old).photoSeam == static_cast<int>(PrefsPhotoSeam::Off));
+    REQUIRE(prefsFromControls(controlsFromPrefs(old), old) == old);
+
+    // Garbage from a broken dialog lands on the defaults, never on a bad blob.
+    DialogControls bad = controlsFromPrefs(PrefsBlob::defaults());
+    bad.photoSeam = -1;
+    bad.photoStrengthPercent = std::numeric_limits<double>::quiet_NaN();
+    bad.seamInsetDeg = -3.0;
+    PrefsBlob blob = prefsFromControls(bad);
+    REQUIRE(blob.photoSeamMode() == PrefsPhotoSeam::RimAndGain);
+    REQUIRE(blob.photoStrength == 0);
+    REQUIRE(blob.seamInset == 0);
+    REQUIRE(blob.sanitise());
+    bad.photoSeam = 9;
+    bad.photoStrengthPercent = 1e9;
+    bad.seamInsetDeg = std::numeric_limits<double>::infinity();
+    blob = prefsFromControls(bad);
+    REQUIRE(blob.photoSeamMode() == PrefsPhotoSeam::RimAndGain);
+    REQUIRE(blob.photoStrengthPercent() == 100.0);
+    REQUIRE(blob.seamInsetDeg() == 2.6);
+    REQUIRE(blob.sanitise());
+}

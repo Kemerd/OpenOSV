@@ -52,6 +52,7 @@
 #include "osv/meta/Types.h"
 #include "osv/render/ImageRGBAf.h"
 #include "osv/render/ParallaxWarp.h"
+#include "osv/render/PhotoSeam.h"
 #include "osv/render/SeamCarve.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/video/DualStreamReader.h"
@@ -658,6 +659,46 @@ private:
     void applyCarvedSeam(std::uint32_t index, const video::FramePair& pair, bool wantParallax, RenderPurpose purpose,
                          ThreadPool& pool, render::RenderParamsBuilder& builder, bool& frameExact);
     // ---- [/WP-SEAM] ----------------------------------------------------------
+
+    // ---- [WP-PHOTO] photometric seam field, keyed by bucket ------------------
+    // (docs/research/NEURAL_STITCHING.md section 8, render/PhotoSeam.h.)  All
+    // guarded by m_mutex: the field is measured synchronously on the render
+    // thread (a band shade plus a few ms of statistics per bucket), so no
+    // worker ever touches it.
+
+    /// Per-bucket fields (EMA'd) and the clip's accumulated usable rim.
+    render::PhotoSeamHistory m_photo;
+    /// The rig the fields were measured with (intrinsics and extrinsics,
+    /// flattened); a different rig - another calibration set, a protector
+    /// correction - clears m_photo, because every rim and gain is a property
+    /// of the lenses as calibrated.
+    std::vector<double> m_photoRigKey;
+    /// The field chosen for the frame being built (preparePhotoSeam ->
+    /// applyPhotoSeam), and whether it is the frame's own (false: a draft
+    /// borrowed the last accepted one).
+    std::shared_ptr<const render::PhotoSeamField> m_photoFrame;
+    bool m_photoFrameExact = true;
+    /// The last field a non-draft frame used: what a draft renders with.
+    std::shared_ptr<const render::PhotoSeamField> m_photoLast;
+
+    /// The analysis parameters for the current prefs (mode, strength).
+    [[nodiscard]] render::PhotoSeamParams photoParamsLocked() const noexcept;
+
+    /// First half of the per-frame hook, called at the top of applyAnalyses:
+    /// measure this frame's bucket if it has not been (never for a draft),
+    /// choose the field the frame renders with, and return the scope that
+    /// makes its usable rim the carved seam's Rim cost on this thread for
+    /// the rest of applyAnalyses.  Failures are logged and leave the frame
+    /// on the stage-1 inset and the global gain.
+    [[nodiscard]] render::PhotoRimPenaltyScope preparePhotoSeam(std::uint32_t index, const video::FramePair& pair,
+                                                                bool draft, ThreadPool& pool);
+
+    /// Second half, the last line of applyAnalyses: hand the chosen field to
+    /// `builder` - its rim replaces the stage-1 inset (the analysis blend is
+    /// restored) and, in RimAndGain, its gain replaces the global one.
+    /// Returns false when the frame used a stand-in field.
+    [[nodiscard]] bool applyPhotoSeam(render::RenderParamsBuilder& builder);
+    // ---- [/WP-PHOTO] ----------------------------------------------------------
 
     RenderedFrame m_lastFrame;
     std::string m_rendererName;

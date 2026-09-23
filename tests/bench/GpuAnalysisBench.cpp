@@ -46,6 +46,7 @@
 #include "osv/render/CudaAnalysis.h"
 #include "osv/render/FlowBackend.h"
 #include "osv/render/ParallaxWarp.h"
+#include "osv/render/PhotoSeam.h"
 #include "osv/video/DualStreamReader.h"
 
 #include <algorithm>
@@ -212,6 +213,50 @@ Row timeFrame(const Clip& clip, const video::FramePair& pair, FlowBackendKind ba
     return row;
 }
 
+// [WP-PHOTO] One photometric seam field measurement: the per-lens RGB bands
+// (GPU band shader for device frames, CPU rows for host frames) and the
+// statistics, each a median; budget (NEURAL_STITCHING.md 8.1): <= 3 ms per
+// bucket from device frames, <= 10 ms from host frames.
+struct PhotoRow {
+    double bands = -1.0;
+    double stats = -1.0;
+    double total = -1.0;
+};
+
+PhotoRow timePhoto(const Clip& clip, const video::FramePair& pair, ThreadPool& pool, int reps) {
+    PhotoRow row;
+    const geom::BlendParams blend;
+    const render::PhotoSeamParams params;
+    render::RgbLensBands bands;
+    row.bands = medianMs(
+        reps,
+        [&]() -> Status {
+            OSV_TRY_ASSIGN(bands, render::renderPhotoBands(clip.rig, pair, blend, params, pool));
+            return okStatus();
+        },
+        "photo bands");
+    if (row.bands < 0.0) {
+        return row;
+    }
+    row.stats = medianMs(
+        reps,
+        [&]() -> Status {
+            OSV_TRY_ASSIGN(render::PhotoSeamField f, render::photoSeamFromBands(bands, params, &pool));
+            (void)f;
+            return okStatus();
+        },
+        "photo stats");
+    row.total = medianMs(
+        reps,
+        [&]() -> Status {
+            OSV_TRY_ASSIGN(render::PhotoSeamField f, render::measurePhotoSeam(clip.rig, pair, blend, params, pool));
+            (void)f;
+            return okStatus();
+        },
+        "photo total");
+    return row;
+}
+
 void printRow(const char* path, std::uint32_t frame, const Row& r) {
     std::printf("  %-4s  frame %2u   bands %7.3f   flow %7.3f   grid %7.3f (1 thread %6.3f)   total %7.3f ms"
                 "   (consistent %5.1f %%, gated %u/%u)\n",
@@ -288,6 +333,13 @@ int main(int argc, char** argv) {
             std::printf("        speed-up: bands %.1fx, flow %.1fx, total %.1fx\n\n", cpu.bands / gpu.bands,
                         cpu.flow / gpu.flow, cpu.total / gpu.total);
         }
+        // [WP-PHOTO] the photometric seam field on the same frames.
+        const PhotoRow pc = timePhoto(clip.value(), hostPair.value(), pool, reps);
+        const PhotoRow pg = timePhoto(clip.value(), devPair.value(), pool, reps);
+        std::printf("  photo CPU frame %2u   bands %7.3f   stats %7.3f   total %7.3f ms\n", frame, pc.bands, pc.stats,
+                    pc.total);
+        std::printf("  photo GPU frame %2u   bands %7.3f   stats %7.3f   total %7.3f ms\n\n", frame, pg.bands,
+                    pg.stats, pg.total);
     }
     render::uninstallCudaAnalyses();
     return 0;

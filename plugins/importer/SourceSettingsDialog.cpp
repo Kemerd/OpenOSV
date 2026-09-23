@@ -201,6 +201,118 @@ void fillComboStrings(HWND dialog, int control, const std::wstring* items, int c
     }
 }
 
+// ---------------------------------------------------------------------------
+//  [WP-PHOTO] the sky seam fix rows
+// ---------------------------------------------------------------------------
+// Three rows appended below the template's own at WM_INITDIALOG: the dialog
+// grows by their height and OK / Cancel move down with it.  Creating them in
+// code rather than in OpenOSVImporter.rc keeps the template - and every
+// other control's position - exactly as it is.
+
+/// Control ids of the rows.  Clear of every id in resource.h (1000-1017,
+/// 1100-1107) and of each other.
+constexpr int kIdcPhotoSeam = 1040;
+constexpr int kIdcPhotoStrength = 1041;
+constexpr int kIdcSeamInset = 1042;
+constexpr int kIdcStaticPhotoSeam = 1140;
+constexpr int kIdcStaticPhotoStrength = 1141;
+constexpr int kIdcStaticPhotoPercent = 1142;
+constexpr int kIdcStaticSeamInset = 1143;
+constexpr int kIdcStaticSeamInsetDeg = 1144;
+
+/// Create one child control at a rectangle in DIALOG units, in the
+/// dialog's own font.  Returns null on failure (the row is then missing,
+/// which the read-back below tolerates).
+HWND addDialogChild(HWND dialog, const wchar_t* cls, const wchar_t* text, DWORD style, int id, int x, int y, int w,
+                    int h) noexcept {
+    RECT r{x, y, x + w, y + h};
+    ::MapDialogRect(dialog, &r);
+    HWND child = ::CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, r.left, r.top, r.right - r.left,
+                                   r.bottom - r.top, dialog, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                   reinterpret_cast<HINSTANCE>(::GetWindowLongPtrW(dialog, GWLP_HINSTANCE)), nullptr);
+    if (child) {
+        ::SendMessageW(child, WM_SETFONT, static_cast<WPARAM>(::SendMessageW(dialog, WM_GETFONT, 0, 0)), TRUE);
+    }
+    return child;
+}
+
+/// Append the sky seam rows and load `c` into them.  The rows take the
+/// place of the OK / Cancel row (wherever the template puts it), and the
+/// buttons - and the window - move down by the rows' height.
+void addPhotoSeamRows(HWND dialog, const DialogControls& c) noexcept {
+    constexpr int kRowStep = 20;           // the template's row pitch, dialog units
+    constexpr int kGrow = 3 * kRowStep;    // three rows
+    // The first row sits where the OK button is now, in dialog units (the
+    // template's own layout decides; 209 is what it says today).
+    int firstRow = 208;
+    RECT unit{0, 0, 100, 100};
+    HWND ok = ::GetDlgItem(dialog, IDOK);
+    RECT okRect{};
+    if (::MapDialogRect(dialog, &unit) && unit.bottom > 0 && ok && ::GetWindowRect(ok, &okRect)) {
+        POINT okTop{okRect.left, okRect.top};
+        ::ScreenToClient(dialog, &okTop);
+        firstRow = ::MulDiv(okTop.y, 100, unit.bottom) - 1;
+    }
+    const int kFirstRow = firstRow;
+    // Grow the window and move OK / Cancel down by the rows' height.
+    RECT grow{0, 0, 0, kGrow};
+    ::MapDialogRect(dialog, &grow);
+    const int growPx = grow.bottom;
+    RECT win{};
+    if (::GetWindowRect(dialog, &win)) {
+        ::SetWindowPos(dialog, nullptr, 0, 0, win.right - win.left, win.bottom - win.top + growPx,
+                       SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    for (const int id : {IDOK, IDCANCEL}) {
+        HWND button = ::GetDlgItem(dialog, id);
+        RECT br{};
+        if (button && ::GetWindowRect(button, &br)) {
+            POINT topLeft{br.left, br.top};
+            ::ScreenToClient(dialog, &topLeft);
+            ::SetWindowPos(button, nullptr, topLeft.x, topLeft.y + growPx, 0, 0,
+                           SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+    // Row 1: what the fix corrects.  The combo index IS the PrefsPhotoSeam
+    // value, so the list is in enum order.
+    addDialogChild(dialog, L"STATIC", L"Sk&y seam fix:", SS_LEFT, kIdcStaticPhotoSeam, 7, kFirstRow + 3, 70, 8);
+    addDialogChild(dialog, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kIdcPhotoSeam, 82,
+                   kFirstRow, 179, 80);
+    static const wchar_t* const kModes[] = {L"Off", L"Rim only", L"Rim and colour (default)"};
+    static_assert(std::size(kModes) == static_cast<std::size_t>(PrefsPhotoSeam::Count),
+                  "the sky seam combo does not list every PrefsPhotoSeam value");
+    fillCombo(dialog, kIdcPhotoSeam, kModes, static_cast<int>(std::size(kModes)), c.photoSeam);
+    // Row 2: how much of the colour correction.
+    addDialogChild(dialog, L"STATIC", L"Sky seam stren&gth:", SS_LEFT, kIdcStaticPhotoStrength, 7,
+                   kFirstRow + kRowStep + 3, 70, 8);
+    addDialogChild(dialog, L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, kIdcPhotoStrength, 82,
+                   kFirstRow + kRowStep, 50, 14);
+    addDialogChild(dialog, L"STATIC", L"%", SS_LEFT, kIdcStaticPhotoPercent, 137, kFirstRow + kRowStep + 3, 40, 8);
+    wchar_t text[32] = {};
+    ::swprintf_s(text, L"%.0f", c.photoStrengthPercent);
+    ::SetDlgItemTextW(dialog, kIdcPhotoStrength, text);
+    // Row 3: the fixed inset used when the field is off or refused.
+    addDialogChild(dialog, L"STATIC", L"Seam edge &inset:", SS_LEFT, kIdcStaticSeamInset, 7,
+                   kFirstRow + 2 * kRowStep + 3, 70, 8);
+    addDialogChild(dialog, L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, kIdcSeamInset, 82,
+                   kFirstRow + 2 * kRowStep, 50, 14);
+    addDialogChild(dialog, L"STATIC", L"deg", SS_LEFT, kIdcStaticSeamInsetDeg, 137, kFirstRow + 2 * kRowStep + 3, 40,
+                   8);
+    ::swprintf_s(text, L"%.1f", c.seamInsetDeg);
+    ::SetDlgItemTextW(dialog, kIdcSeamInset, text);
+}
+
+/// Read the sky seam rows back.  A missing or unparseable row keeps what the
+/// dialog opened with (the blob setters then clamp whatever was typed).
+void photoWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
+    if (::GetDlgItem(dialog, kIdcPhotoSeam)) {
+        c.photoSeam = comboSelection(dialog, kIdcPhotoSeam);
+    }
+    c.photoStrengthPercent = getEditDouble(dialog, kIdcPhotoStrength, c.photoStrengthPercent);
+    c.seamInsetDeg = getEditDouble(dialog, kIdcSeamInset, c.seamInsetDeg);
+}
+// ---- [/WP-PHOTO] -------------------------------------------------------------
+
 /// Load the controls into the widgets.
 void controlsToWidgets(HWND dialog, const DialogControls& c, const CalibrationUiFacts& calibrationFacts) noexcept {
     // EVERY list below is ordered to match its PrefsBlob enum exactly: the
@@ -283,6 +395,7 @@ void widgetsToControls(HWND dialog, DialogControls& c) noexcept {
     c.seamSearch = ::IsDlgButtonChecked(dialog, IDC_SEAM_SEARCH) == BST_CHECKED;
     c.gainMatch = ::IsDlgButtonChecked(dialog, IDC_GAIN_MATCH) == BST_CHECKED;
     c.exposureStops = getEditDouble(dialog, IDC_EXPOSURE, c.exposureStops);
+    photoWidgetsToControls(dialog, c);  // [WP-PHOTO]
 }
 
 /// The dialog procedure.  It never throws (a C callback crossing back into
@@ -295,6 +408,7 @@ INT_PTR CALLBACK sourceSettingsProc(HWND dialog, UINT message, WPARAM wParam, LP
         ::SetWindowLongPtrW(dialog, GWLP_USERDATA, static_cast<LONG_PTR>(lParam));
         if (state) {
             controlsToWidgets(dialog, state->controls, state->calibrationFacts);
+            addPhotoSeamRows(dialog, state->controls);  // [WP-PHOTO]
         }
         return TRUE;  // Let the dialog manager set the initial focus.
     }
