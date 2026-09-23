@@ -129,8 +129,41 @@ constexpr int kMaxEdge = 65536;
     return static_cast<std::uint16_t>(value * kBgra16uWhite + 0.5f);
 }
 
-/// Store one RGBA float quadruple as BGRA in the requested layout.
+/// Shared validity rule for both frame views.
+[[nodiscard]] bool frameValid(const void* base, std::int32_t rowBytes, int width, int height,
+                              PixelLayout layout) noexcept {
+    if (!base || width <= 0 || height <= 0 || width > kMaxEdge || height > kMaxEdge) {
+        return false;
+    }
+    if (rowBytes == 0) {
+        return false;
+    }
+    // The pitch must cover one whole row whichever way it points.
+    const std::size_t stride = static_cast<std::size_t>(rowBytes < 0 ? -static_cast<std::int64_t>(rowBytes)
+                                                                    : static_cast<std::int64_t>(rowBytes));
+    return stride >= static_cast<std::size_t>(width) * bytesPerPixel(layout);
+}
+
+/// Address of top-down row `y` for a base that may point at either end of
+/// the image and a pitch that may be negative.
+[[nodiscard]] const char* topDownRow(const char* base, std::int32_t rowBytes, int height, bool topDown,
+                                     int y) noexcept {
+    // A bottom-up buffer stores image row (height-1-y) at memory row y.
+    const int memoryRow = topDown ? y : (height - 1 - y);
+    return base + static_cast<std::ptrdiff_t>(rowBytes) * static_cast<std::ptrdiff_t>(memoryRow);
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+//  Pixel store (declared in ReframeCpu.h)
+// ---------------------------------------------------------------------------
 void storePixel(void* dst, PixelLayout layout, const float rgba[4]) noexcept {
+    // A null destination or source is a caller bug; ignoring it is the only
+    // answer that cannot corrupt memory.
+    if (!dst || !rgba) {
+        return;
+    }
     switch (layout) {
         case PixelLayout::Bgra32f: {
             float* p = static_cast<float*>(dst);
@@ -170,32 +203,6 @@ void storePixel(void* dst, PixelLayout layout, const float rgba[4]) noexcept {
         }
     }
 }
-
-/// Shared validity rule for both frame views.
-[[nodiscard]] bool frameValid(const void* base, std::int32_t rowBytes, int width, int height,
-                              PixelLayout layout) noexcept {
-    if (!base || width <= 0 || height <= 0 || width > kMaxEdge || height > kMaxEdge) {
-        return false;
-    }
-    if (rowBytes == 0) {
-        return false;
-    }
-    // The pitch must cover one whole row whichever way it points.
-    const std::size_t stride = static_cast<std::size_t>(rowBytes < 0 ? -static_cast<std::int64_t>(rowBytes)
-                                                                    : static_cast<std::int64_t>(rowBytes));
-    return stride >= static_cast<std::size_t>(width) * bytesPerPixel(layout);
-}
-
-/// Address of top-down row `y` for a base that may point at either end of
-/// the image and a pitch that may be negative.
-[[nodiscard]] const char* topDownRow(const char* base, std::int32_t rowBytes, int height, bool topDown,
-                                     int y) noexcept {
-    // A bottom-up buffer stores image row (height-1-y) at memory row y.
-    const int memoryRow = topDown ? y : (height - 1 - y);
-    return base + static_cast<std::ptrdiff_t>(rowBytes) * static_cast<std::ptrdiff_t>(memoryRow);
-}
-
-}  // namespace
 
 // ---------------------------------------------------------------------------
 //  FrameView / ConstFrameView
@@ -554,15 +561,10 @@ const char* setupRejectName(SetupReject reason) noexcept {
     return "unknown";
 }
 
-KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int outW, int outH,
-                        SizePx sequenceSize) noexcept {
-    KernelSetup setup;
+ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenceSize) noexcept {
+    ViewSetup setup;
 
     // ---- defensive checks on everything that came from the host ----------
-    if (!src.valid()) {
-        setup.reject = SetupReject::SourceInvalid;
-        return setup;
-    }
     if (outW <= 0 || outH <= 0 || outW > kMaxEdge || outH > kMaxEdge) {
         setup.reject = SetupReject::OutputSize;
         return setup;
@@ -761,6 +763,34 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
     // picture covers the whole frame - but a ray that misses the sphere
     // entirely still comes back transparent, which is correct.)
     p.fillAlphaOne = 0;
+
+    setup.valid = true;
+    setup.reject = SetupReject::None;
+    return setup;
+}
+
+KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int outW, int outH,
+                        SizePx sequenceSize) noexcept {
+    KernelSetup setup;
+
+    // ---- defensive checks on everything that came from the host ----------
+    // The source is checked FIRST, exactly as before the camera was split
+    // out, so a call that is wrong in several ways still names the same
+    // reason it always did.
+    if (!src.valid()) {
+        setup.reject = SetupReject::SourceInvalid;
+        return setup;
+    }
+
+    // ---- the camera ---------------------------------------------------------
+    // One function builds it for every renderer; see buildView() for the
+    // cover-fit, the eye offset and the rotation order.
+    const ViewSetup view = buildView(settings, outW, outH, sequenceSize);
+    if (!view.valid) {
+        setup.reject = view.reject;
+        return setup;
+    }
+    setup.params = view.params;
 
     // Integer-coded sources (8u, 16u) are not supported by the kernel's
     // sampler - it reads float or half only - so they are rejected here

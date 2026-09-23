@@ -152,6 +152,54 @@ struct KernelSetup {
     SetupReject reject = SetupReject::SourceInvalid;
 };
 
+/// The virtual camera of one render, independent of what it samples.
+///
+/// This is the VIEW half of KernelSetup: projection, eye offset, focal length
+/// (with the Output Resolution cover-fit folded in), the render rectangle and
+/// the body <- view rotation.  It is split out of buildParams() because two
+/// renderers consume it:
+///
+///   * the equirect path (buildParams / osvReframeEquirectPixel), which looks
+///     the view ray up in an already stitched panorama;
+///   * the direct path (DirectRender.h), which traces the same view ray
+///     straight into the two fisheye lenses.
+///
+/// Both paths read the camera out of this ONE function, so the framing they
+/// produce cannot drift apart: a change to the cover-fit, the preset maths or
+/// the rotation order lands in both at once.
+struct ViewSetup {
+    OsvReframeParams params{};  ///< Projection, viewport, rotation.  fillAlphaOne is 0.
+    bool valid = false;         ///< False when no usable camera could be built.
+    /// Why the view was refused; `None` exactly when `valid` is true.  Only
+    /// OutputSize, Viewport and DegenerateCamera can occur here - the
+    /// source-related reasons belong to buildParams().
+    SetupReject reject = SetupReject::OutputSize;
+};
+
+/// Build the virtual camera for an `outW` x `outH` output frame.
+///
+/// `settings`      the resolved controls (already smoothed, if smoothing is on);
+/// `outW`, `outH`  the output frame size;
+/// `sequenceSize`  pixel size of the sequence frame, invalid when unknown.
+///
+/// Everything buildParams() documents about the camera applies verbatim -
+/// cover-fit instead of letterbox, effectiveEyeOffset(), the default-FOV
+/// retry for a degenerate focal length, Rout = R_source * R_camera - because
+/// buildParams() is now exactly "buildView() plus a source description".
+/// Every non-finite control value is replaced by its documented default, so
+/// the returned block never carries a NaN into a kernel.
+[[nodiscard]] ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenceSize) noexcept;
+
+/// Store one straight-RGBA float quadruple as a BGRA pixel of `layout`.
+///
+/// The one conversion every CPU writer shares (renderCpu and the direct
+/// path's CPU twin), so a 16f or 8u frame is quantised identically whichever
+/// renderer produced it: 32f stores the floats, 16f rounds to nearest even,
+/// 8u clamps to [0, 1] and rounds, 16u clamps and scales to kBgra16uWhite.
+/// NaN becomes 0 in the integer layouts.  `dst` must address one whole pixel
+/// of `layout`; a null `dst` or `rgba` is ignored.
+void storePixel(void* dst, PixelLayout layout, const float rgba[4]) noexcept;
+
 /// True when a source frame's IMAGE rows run forward in memory, which is the
 /// only arrangement the shared sampler can describe.
 ///
@@ -190,6 +238,10 @@ struct KernelSetup {
 /// cannot be pointed at, including a source that fails
 /// sourceRowsRunForward().  On success `sourceRow0` is what must be passed
 /// to the kernel as `pixels` and `source.pitchBytes` is positive.
+///
+/// The camera half comes from buildView(); `params` is bit-for-bit
+/// buildView(settings, outW, outH, sequenceSize).params whenever the setup
+/// is valid.
 [[nodiscard]] KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int outW, int outH,
                                       SizePx sequenceSize) noexcept;
 
