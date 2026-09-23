@@ -2090,7 +2090,17 @@ std::string ImporterInstance::analysisText() const {
     case PrefsColorOutput::DLogM:  outName = "D-Log M passthrough (camera gamut, no transform)"; break;
     default:                       break;
     }
-    line(std::string("Output colour: ") + outName + ", full-range RGB 32-bit float");
+    // The bit depth follows the per-clip format policy in ImporterVideo.cpp
+    // (offeredFormatsFor): HDR never goes below 16 bits, Rec.709 may go to 8
+    // when the sequence asks, and the unbounded log signal is float only.
+    // Which one a given frame uses is the host's pick from that list.
+    const char* depth = "32-bit float, or 16-bit when the sequence's Maximum Bit Depth is off";
+    switch (m_prefs.color()) {
+    case PrefsColorOutput::Rec709: depth = "32-bit float, or 8-bit when the sequence's Maximum Bit Depth is off"; break;
+    case PrefsColorOutput::DLogM:  depth = "32-bit float"; break;
+    default:                       break;
+    }
+    line(std::string("Output colour: ") + outName + ", full-range RGB " + depth);
     if (m_prefs.color() == PrefsColorOutput::DLogM) {
         // Said out loud in the Properties panel, because it is the one output
         // whose numbers are NOT ready to look at: the frame is log, so it
