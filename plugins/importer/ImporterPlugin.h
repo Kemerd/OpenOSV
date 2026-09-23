@@ -31,6 +31,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <iterator>
 #include <mutex>
 #include <string>
 
@@ -264,7 +265,23 @@ struct DialogControls {
     double nearOffsetDeg = 0.0;      ///< Near Offset along the seam, -3..3 deg.
     double farOffsetDeg = 0.0;       ///< Far Offset along the seam, -3..3 deg.
     // ---- [/WP-SEAMTOOLS] -----------------------------------------------------
+    // ---- [WP-STEADY] listed default first, like the Source Settings effect ---
+    int parallaxGrid = 0;  ///< Combo index: 0 Auto, 1 Steady (per clip), 2 Follows scene (per moment).
+    int lensAlign = 0;     ///< Combo index: 0 Auto (fit per clip), 1 Off (calibration only).
+    // ---- [/WP-STEADY] ----------------------------------------------------------
 };
+
+/// [WP-STEADY] The Parallax Grid choice of each dialog combo index (the
+/// default, Auto, listed first; the enum keeps FollowsScene at 0 for older
+/// blobs).  Both mapping directions go through this table.
+inline constexpr PrefsParallaxGrid kDialogParallaxGrid[] = {PrefsParallaxGrid::Auto, PrefsParallaxGrid::Steady,
+                                                            PrefsParallaxGrid::FollowsScene};
+static_assert(std::size(kDialogParallaxGrid) == static_cast<std::size_t>(PrefsParallaxGrid::Count),
+              "the dialog's Parallax Grid combo must list every choice");
+/// [WP-STEADY] The Lens Alignment choice of each dialog combo index.
+inline constexpr PrefsLensAlign kDialogLensAlign[] = {PrefsLensAlign::Auto, PrefsLensAlign::Off};
+static_assert(std::size(kDialogLensAlign) == static_cast<std::size_t>(PrefsLensAlign::Count),
+              "the dialog's Lens Alignment combo must list every choice");
 
 /// PrefsBlob -> control state.  Every field is already in range because the
 /// blob was sanitised.

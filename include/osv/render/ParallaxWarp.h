@@ -107,18 +107,15 @@
 //
 // WHAT IS NOT DONE
 // ----------------
-// TEMPORAL FILTERING IS NOT IMPLEMENTED.  Jump's observation is that viewers
-// forgive consistent ghosting but notice ghosting that CHANGES frame to
-// frame, and DJI's stitcher filters its flow over time for it.  This is a
-// per-frame correction with no memory, so on moving footage the correction
-// can shimmer where the flow is marginal.  `osvtool render --seam-interval`
-// holds one grid across several frames, which is a blunt instrument rather
-// than a filter; the Premiere importer measures every non-draft frame on its
-// own and caches the grid by frame index, which keeps a revisited frame
-// deterministic but does nothing for frame-to-frame stability.  A filter
-// there also has to cope with Premiere asking for frames out of order, so
-// the previous frame is not generally at hand.  Named here rather than
-// hidden; it is the obvious next step.
+// TEMPORAL FILTERING lives above this file.  Jump's observation is that
+// viewers forgive consistent ghosting but notice ghosting that CHANGES frame
+// to frame, and DJI's stitcher filters its flow over time for it.  This file
+// measures one frame with no memory; the schedule below measures once per
+// bucket of frames and glides between buckets, and render/ClipSteady.h goes
+// further for rigid mounts: ONE grid per clip, the per-cell median of a
+// fixed set of sample frames, so the warp does not move at all - and, since
+// those frames are fixed by the clip itself, never depends on the order in
+// which Premiere asked for frames.
 //
 // The flow backend's own cost is also untouched here: the classical solver
 // takes ~215 ms of the ~225 ms a grid costs at the default 2048-column band
@@ -134,6 +131,7 @@
 #include "osv/render/SeamAnalysis.h"
 #include "osv/video/PlanarFrame.h"
 
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -284,6 +282,46 @@ struct ParallaxWarpGrid {
     }
 };
 
+/// What each MEASURED cell of a grid saw, before anything shaped it.
+///
+/// The grid the kernel samples is the flow after the cross-meridian scale,
+/// the safety clamp, the fill of empty cells, the anisotropic blur, the decay
+/// ring and the benefit gate - every one of those is right for RENDERING and
+/// wrong for fitting a model to the measurement: the blur spreads a near
+/// object into its neighbours, the gate zeroes the sky, the fill invents
+/// values.  A global model (the per-clip lens rotation, render/LensAlign.h)
+/// wants the raw per-cell means and a note of which cells the benefit gate
+/// trusted, so gridFromFlow() can hand them out on the side.
+///
+/// Layout: `w` columns (longitude, the grid's own gridW) by `rows` measured
+/// rows (gridRows, no decay rings), row-major.  Cell (c, r) sits at longitude
+/// c * 2 pi / w - pi (the kernel reads cell c at longitude fraction c / w) and
+/// latitude latTopRad - r * latStepRad.
+struct ParallaxCellStats {
+    std::uint32_t w = 0;       ///< Columns (== ParallaxWarpParams::gridW).
+    std::uint32_t rows = 0;    ///< Measured rows (== ParallaxWarpParams::gridRows).
+    double latTopRad = 0.0;    ///< Latitude of measured row 0 (the band's top row centre).
+    double latStepRad = 0.0;   ///< Latitude step per row (rows descend, so this is positive).
+    /// Interleaved (dLon, dLat) in RADIANS per cell: the mean HALF disparity of
+    /// the consistent co-visible pixels - the master lens's displacement, the
+    /// same quantity the grid stores - before scale, clamp, fill, blur, decay
+    /// and gate.  Zero for a cell with no consistent pixel.
+    std::vector<float> halfFlow;
+    /// Consistent co-visible band pixels that fed each cell.
+    std::vector<std::uint32_t> pixels;
+    /// The benefit gate's verdict per cell, in [0, 1] (the pooled 3 x 3
+    /// decision before its smoothing): 1 = warping by the flow measurably
+    /// reduced the lens-to-lens residual here.  All 1 when the gate is off.
+    std::vector<float> gate;
+
+    /// True when every per-cell array matches w * rows.
+    [[nodiscard]] bool valid() const noexcept {
+        const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(rows);
+        return w > 0 && rows > 0 && halfFlow.size() == n * 2u && pixels.size() == n && gate.size() == n &&
+               std::isfinite(latTopRad) && std::isfinite(latStepRad);
+    }
+};
+
 /// Measure the parallax across the overlap band and build the kernel grid.
 ///
 /// Renders the two per-lens bands, computes bidirectional flow across them
@@ -337,8 +375,14 @@ struct ParallaxWarpGrid {
 ///
 /// Returns exactly what buildParallaxWarp returns for the same bands,
 /// including Unsupported for a measurement too inconsistent to use.
+///
+/// `cells` (optional) receives the raw per-cell measurement
+/// (ParallaxCellStats) - filled whenever the grid itself was built, so also
+/// when the grid is then refused as too inconsistent.  Passing it changes
+/// nothing about the grid.
 [[nodiscard]] Result<ParallaxWarpGrid> parallaxFromBands(const LensBands& bands, const ParallaxWarpParams& params,
-                                                         ThreadPool* pool, double bandMs = 0.0);
+                                                         ThreadPool* pool, double bandMs = 0.0,
+                                                         ParallaxCellStats* cells = nullptr);
 
 // ===========================================================================
 //  Temporal schedule: measure once per bucket of frames, glide between them
@@ -411,7 +455,11 @@ inline constexpr std::uint32_t kParallaxBucketFrames = 8;
 /// the benefit gate, ~8 ms single-threaded on a 2048 x 68 band - by grid row.
 /// Each cell still sums its pixels in the sequential order, so the grid is
 /// bit-identical with or without a pool, on any number of threads.
+///
+/// `cells` (optional) receives the raw per-cell measurement before the grid
+/// is shaped (ParallaxCellStats); the grid is identical with or without it.
 [[nodiscard]] Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& flow,
-                                                    const ParallaxWarpParams& params, ThreadPool* pool = nullptr);
+                                                    const ParallaxWarpParams& params, ThreadPool* pool = nullptr,
+                                                    ParallaxCellStats* cells = nullptr);
 
 }  // namespace osv::render

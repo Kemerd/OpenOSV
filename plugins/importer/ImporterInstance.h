@@ -39,6 +39,7 @@
 #include "FlareStage.h"  // [WP-FLARE]
 #include "PixelCopy.h"
 #include "PrefsBlob.h"
+#include "SteadyStage.h"  // [WP-STEADY]
 
 #include "osv/color/ColorParams.h"
 #include "osv/container/OsvFile.h"
@@ -62,6 +63,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
@@ -354,6 +356,14 @@ public:
     [[nodiscard]] FramePath lastFramePath() const noexcept {
         return static_cast<FramePath>(m_lastFramePath.load(std::memory_order_relaxed));
     }
+
+    /// [WP-STEADY] Whether the most recent renderFrameToHost() rendered the
+    /// frame's final pixels (false: an Interactive request made do with a
+    /// stand-in analysis).  The caller holds lock() - the same lock the
+    /// render ran under - so this describes exactly that frame.  A stand-in
+    /// must not go into the host's frame cache, or replaying the section would
+    /// keep showing it after the real analysis landed.
+    [[nodiscard]] bool lastRenderExact() const noexcept { return m_lastRenderExact; }
 
     // ---- the direct GPU path (docs/DIRECT_GPU.md) --------------------------
     /// One frame for the direct renderer: both lenses decoded on NVDEC into a
@@ -846,6 +856,72 @@ private:
     std::shared_ptr<GpuReadback> m_gpuReadback;
     /// FramePath of the last renderFrameToHost(), atomic for lastFramePath().
     std::atomic<int> m_lastFramePath{0};
+
+    // ---- [WP-STEADY] per-clip lens alignment and steady seam corrections -----
+    // (SteadyStage.h, render/LensAlign.h, render/ClipSteady.h).  Guarded by
+    // m_mutex; the stage has its own lock for what its worker publishes.
+
+    /// Where the lens rotation stands for the current rig.
+    enum class LensAlignState : std::uint8_t {
+        Off,      ///< Lens Alignment Off: the calibration alone.
+        Pending,  ///< Auto, not measured yet: the calibration until it lands.
+        Applied,  ///< Auto, folded into m_rig.
+        Refused,  ///< Auto, but no rotation the flow agrees on (or it could not be measured).
+    };
+
+    /// Which schedule serves a frame's seam corrections.
+    enum class SteadyUse : std::uint8_t {
+        PerBucket,  ///< Measured per 8-frame bucket and glided (Follows scene, or Auto's verdict).
+        Clip,       ///< The clip correction, for every frame alike.
+        StandIn,    ///< Interactive while the clip correction is being measured: the nearest sample grid.
+    };
+
+    /// The per-clip analyses' stage (worker, request, published state).
+    SteadyStage m_steady;
+    /// The rig as the calibration (and any protector fold) define it, before
+    /// the lens rotation: what the rotation is measured through, and what
+    /// m_rig becomes again whenever the rotation is dropped.
+    geom::LensRig m_baseRig;
+    LensAlignState m_lensAlignState = LensAlignState::Off;
+    /// The Lens Alignment choice the rig was built for (rebuildRig trigger).
+    PrefsLensAlign m_rigLensAlign = PrefsLensAlign::Off;
+    /// The stage's state for the frame being built (prepareSteadyLocked ->
+    /// applyAnalyses), so the whole frame uses one consistent snapshot.
+    SteadyStage::Snapshot m_steadyFrame;
+    /// The stage serial m_lastFrame was rendered against: a stand-in frame is
+    /// stale once the serial moved on.
+    std::uint64_t m_lastFrameSteadySerial = 0;
+    /// Exactness of the last renderFrameToHost() (lastRenderExact()).
+    bool m_lastRenderExact = true;
+    /// An Exact wait that timed out has been logged for this clip.
+    bool m_steadyWaitWarned = false;
+
+    /// Longest an Exact frame waits for the per-clip analyses before it
+    /// renders with the per-moment corrections instead (and says so).
+    static constexpr std::chrono::milliseconds kSteadyExactWait{60000};
+
+    /// The stage request for the current prefs and rig.  Caller holds m_mutex.
+    [[nodiscard]] SteadyRequest steadyRequestLocked(bool wantRotation, bool wantClip) const;
+
+    /// At the top of every frame build, before anything reads m_rig: hand the
+    /// stage its request (never for a draft), wait for it when the frame is
+    /// Exact, fold a rotation that has just landed into the rig (dropping the
+    /// analyses measured through the old one), and take the snapshot the
+    /// frame renders with.  Caller holds m_mutex.
+    void prepareSteadyLocked(RenderPurpose purpose, bool draft);
+
+    /// Adopt a settled rotation answer: fold it into m_rig (Applied) or keep
+    /// the calibration (Refused).  Caller holds m_mutex.
+    void settleLensAlignLocked(const std::optional<LensAlignVerdict>& rotation, const std::string& failure);
+
+    /// Which schedule serves this frame (see SteadyUse).  Caller holds m_mutex.
+    [[nodiscard]] SteadyUse steadyUseLocked(RenderPurpose purpose) const noexcept;
+
+    /// The parallax measurement's parameters for the current prefs and rig:
+    /// the flow backend, and the benefit gate - render::kAlignedRequiredImprovement
+    /// on a rig with a folded rotation, the default otherwise.
+    [[nodiscard]] render::ParallaxWarpParams parallaxParamsLocked() const noexcept;
+    // ---- [/WP-STEADY] ----------------------------------------------------------
 };
 
 }  // namespace osv::premiere

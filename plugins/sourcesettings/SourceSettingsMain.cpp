@@ -161,8 +161,17 @@ static_assert(kParamIdByIndex[kIndexSeamBlend - 1] == OSV_SS_ID_SEAM_BLEND &&
                   kParamIdByIndex[kIndexNearOffset - 1] == OSV_SS_ID_NEAR_OFFSET &&
                   kParamIdByIndex[kIndexFarOffset - 1] == OSV_SS_ID_FAR_OFFSET,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
-static_assert(kIndexStitchTopicEnd == kIndexFarOffset + 1,
-              "the Stitching group must close immediately after Far Offset");
+// [WP-STEADY] Parallax Grid and Lens Alignment follow Far Offset, and the
+// Stitching group closes right after them.
+static_assert(kIndexParallaxGrid == kIndexFarOffset + 1 && kIndexLensAlign == kIndexParallaxGrid + 1,
+              "Parallax Grid and Lens Alignment follow Far Offset in that order");
+static_assert(kParamIdByIndex[kIndexParallaxGrid - 1] == OSV_SS_ID_PARALLAX_GRID &&
+                  kParamIdByIndex[kIndexLensAlign - 1] == OSV_SS_ID_LENS_ALIGN,
+              "kParamIdByIndex is not aligned with the ParamIndex enum");
+static_assert(OSV_SS_ID_PARALLAX_GRID >= 40 && OSV_SS_ID_LENS_ALIGN <= 45,
+              "WP-STEADY's parameter ids live in 40-45");
+static_assert(kIndexStitchTopicEnd == kIndexLensAlign + 1,
+              "the Stitching group must close immediately after Lens Alignment");
 static_assert(kParamIdByIndex[kIndexPhotoSeam - 1] == OSV_SS_ID_PHOTO_SEAM &&
                   kParamIdByIndex[kIndexPhotoStrength - 1] == OSV_SS_ID_PHOTO_STRENGTH &&
                   kParamIdByIndex[kIndexSeamInset - 1] == OSV_SS_ID_SEAM_INSET,
@@ -348,6 +357,13 @@ private:
     if (const PF_ParamDef* p = def(kIndexFarOffset)) {
         c.farOffsetDeg = static_cast<double>(p->u.fs_d.value);
     }
+    // [WP-STEADY]
+    if (const PF_ParamDef* p = def(kIndexParallaxGrid)) {
+        c.parallaxGrid = static_cast<int>(p->u.pd.value);
+    }
+    if (const PF_ParamDef* p = def(kIndexLensAlign)) {
+        c.lensAlign = static_cast<int>(p->u.pd.value);
+    }
     if (const PF_ParamDef* p = def(kIndexDlogmFit)) {
         c.dlogmFit = static_cast<int>(p->u.pd.value);
     }
@@ -425,6 +441,8 @@ void writeControls(PF_ParamDef* params[], const ControlValues& wanted) noexcept 
     setSlider(kIndexSeamSmoothing, wanted.seamSmoothingDeg);
     setSlider(kIndexNearOffset, wanted.nearOffsetDeg);
     setSlider(kIndexFarOffset, wanted.farOffsetDeg);
+    setPopup(kIndexParallaxGrid, wanted.parallaxGrid);  // [WP-STEADY]
+    setPopup(kIndexLensAlign, wanted.lensAlign);        // [WP-STEADY]
     setPopup(kIndexDlogmFit, wanted.dlogmFit);
     setSlider(kIndexExposure, wanted.exposureStops);
     setPopup(kIndexRenderDevice, wanted.renderDevice);
@@ -653,7 +671,23 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_SEAM_OFFSET_MAX, OSV_SS_SEAM_OFFSET_DEFAULT, PF_Precision_HUNDREDTHS,
                          PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_FAR_OFFSET);
 
-    // ---- 18. Close the Stitching group -------------------------------------
+    // ---- 18. Parallax Grid [WP-STEADY] -----------------------------------------
+    // Whether the seam corrections are held still for the whole clip (a
+    // rigid mount: nothing at the seam moves) or measured per moment
+    // (handheld, near objects moving past); Auto decides from the clip
+    // itself.  Default Auto, as PrefsBlob::defaults().
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUPX("Parallax Grid", OSV_SS_PARALLAX_GRID_COUNT, OSV_SS_PARALLAX_GRID_DEFAULT,
+                  OSV_SS_PARALLAX_GRID_ITEMS, kStaticFlags, OSV_SS_ID_PARALLAX_GRID);
+
+    // ---- 19. Lens Alignment [WP-STEADY] ----------------------------------------
+    // Fit the small rotation between the two lenses once per clip and fold it
+    // into the stitch, or trust the recorded calibration.  Default Auto.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUPX("Lens Alignment", OSV_SS_LENS_ALIGN_COUNT, OSV_SS_LENS_ALIGN_DEFAULT, OSV_SS_LENS_ALIGN_ITEMS,
+                  kStaticFlags, OSV_SS_ID_LENS_ALIGN);
+
+    // ---- 20. Close the Stitching group -------------------------------------
     // PF_END_TOPIC issues its own PF_ADD_PARAM (Param_Utils.h:309-316), so the
     // terminator occupies a parameter slot of its own and everything after it
     // shifts up by one.  Leaving it out would not merely lose a divider: the
@@ -663,16 +697,16 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_STITCH_TOPIC_END);
 
-    // ---- 19. Advanced topic (collapsed: most users never touch it) ----------
+    // ---- 21. Advanced topic (collapsed: most users never touch it) ----------
     AEFX_CLR_STRUCT(def);
     PF_ADD_TOPICX("Advanced", PF_ParamFlag_START_COLLAPSED, OSV_SS_ID_ADVANCED_TOPIC);
 
-    // ---- 20. D-Log M Curve -------------------------------------------------
+    // ---- 22. D-Log M Curve -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("D-Log M Curve", OSV_SS_FIT_COUNT, OSV_SS_FIT_DEFAULT, OSV_SS_FIT_ITEMS, kStaticFlags,
                   OSV_SS_ID_DLOGM_FIT);
 
-    // ---- 21. Exposure ------------------------------------------------------
+    // ---- 23. Exposure ------------------------------------------------------
     // Valid range is the blob's own +/- 6 stops (static_asserted below the
     // handlers); the slider shows the useful +/- 3 so a drag has resolution.
     AEFX_CLR_STRUCT(def);
@@ -680,12 +714,12 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_EXPOSURE_SLIDER_MIN, OSV_SS_EXPOSURE_SLIDER_MAX, OSV_SS_EXPOSURE_DEFAULT,
                          PF_Precision_TENTHS, PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_EXPOSURE);
 
-    // ---- 22. Render Device -------------------------------------------------
+    // ---- 24. Render Device -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Render Device", OSV_SS_DEVICE_COUNT, OSV_SS_DEVICE_DEFAULT, OSV_SS_DEVICE_ITEMS, kStaticFlags,
                   OSV_SS_ID_RENDER_DEVICE);
 
-    // ---- 23. Program Monitor Colour [WP-SETTINGS] --------------------------
+    // ---- 25. Program Monitor Colour [WP-SETTINGS] --------------------------
     // What Open 360 Reframe shows when this clip's Colour Output is not the
     // sequence's working space: the scene rendered straight into it (fast,
     // the default) or Premiere's own conversion of the output (matches the
@@ -695,11 +729,11 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Program Monitor Colour", OSV_SS_DIRECT_COLOUR_COUNT, OSV_SS_DIRECT_COLOUR_DEFAULT,
                   OSV_SS_DIRECT_COLOUR_ITEMS, kStaticFlags, OSV_SS_ID_DIRECT_COLOUR);
 
-    // ---- 24. Close the Advanced group --------------------------------------
+    // ---- 26. Close the Advanced group --------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_ADVANCED_TOPIC_END);
 
-    // ---- 25-28. Defaults [WP-DEFAULTS] -------------------------------------
+    // ---- 27-30. Defaults [WP-DEFAULTS] -------------------------------------
     // Two momentary buttons: store this clip's settings as the defaults every
     // NEW clip starts from, or remove them so new clips start from the
     // built-in defaults again.  Neither changes this clip.  A button carries
@@ -1018,6 +1052,18 @@ static_assert(OSV_SS_PHOTO_SEAM_COUNT == static_cast<int>(osv::premiere::PrefsPh
               "the Sky Seam Fix popup does not list every PrefsPhotoSeam value");
 static_assert(OSV_SS_PHOTO_SEAM_DEFAULT == static_cast<int>(osv::premiere::PrefsPhotoSeam::RimAndGain) + 1,
               "the Sky Seam Fix popup's default is not PrefsBlob::defaults()' RimAndGain");
+// [WP-STEADY] Both popups list every choice, and their defaults are the
+// blob's (item 1 is Auto in both tables; a test also checks defaults()).
+static_assert(OSV_SS_PARALLAX_GRID_COUNT == static_cast<int>(osv::premiere::PrefsParallaxGrid::Count),
+              "the Parallax Grid popup does not list every PrefsParallaxGrid value");
+static_assert(osv::premiere::sourcesettings::kParallaxGridByPopup[OSV_SS_PARALLAX_GRID_DEFAULT - 1] ==
+                  osv::premiere::PrefsParallaxGrid::Auto,
+              "the Parallax Grid popup's default is not PrefsBlob::defaults()' Auto");
+static_assert(OSV_SS_LENS_ALIGN_COUNT == static_cast<int>(osv::premiere::PrefsLensAlign::Count),
+              "the Lens Alignment popup does not list every PrefsLensAlign value");
+static_assert(osv::premiere::sourcesettings::kLensAlignByPopup[OSV_SS_LENS_ALIGN_DEFAULT - 1] ==
+                  osv::premiere::PrefsLensAlign::Auto,
+              "the Lens Alignment popup's default is not PrefsBlob::defaults()' Auto");
 static_assert(OSV_SS_PHOTO_STRENGTH_MIN == 0.0 &&
                   OSV_SS_PHOTO_STRENGTH_MAX == static_cast<double>(osv::premiere::PrefsBlob::kMaxPhotoStrengthCode - 1),
               "the Sky Seam Strength range does not match PrefsBlob::photoStrength");

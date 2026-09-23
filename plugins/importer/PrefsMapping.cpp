@@ -72,8 +72,45 @@ void applySeamToolControls(const DialogControls& c, PrefsBlob& blob) noexcept {
     blob.setFarOffsetDeg(c.farOffsetDeg);
 }
 
-}  // namespace
 // ---- [/WP-SEAMTOOLS] ---------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+//  [WP-STEADY] Parallax Grid and Lens Alignment <-> their two combos
+// ---------------------------------------------------------------------------
+
+/// Blob -> combo indices through the dialog's tables (kDialogParallaxGrid,
+/// kDialogLensAlign); a choice missing from a table - impossible after
+/// sanitise() - shows index 0 (Auto).
+void steadyControlsFromPrefs(const PrefsBlob& prefs, DialogControls& c) noexcept {
+    c.parallaxGrid = 0;
+    for (std::size_t i = 0; i < std::size(kDialogParallaxGrid); ++i) {
+        if (kDialogParallaxGrid[i] == prefs.parallaxGridChoice()) {
+            c.parallaxGrid = static_cast<int>(i);
+            break;
+        }
+    }
+    c.lensAlign = 0;
+    for (std::size_t i = 0; i < std::size(kDialogLensAlign); ++i) {
+        if (kDialogLensAlign[i] == prefs.lensAlignChoice()) {
+            c.lensAlign = static_cast<int>(i);
+            break;
+        }
+    }
+}
+
+/// Combo indices -> blob.  An index outside a table (a combo with no
+/// selection reports -1) lands on Auto, the default.
+void applySteadyControls(const DialogControls& c, PrefsBlob& blob) noexcept {
+    const bool gridOk = c.parallaxGrid >= 0 && static_cast<std::size_t>(c.parallaxGrid) < std::size(kDialogParallaxGrid);
+    blob.parallaxGrid = static_cast<std::uint8_t>(gridOk ? kDialogParallaxGrid[static_cast<std::size_t>(c.parallaxGrid)]
+                                                         : PrefsParallaxGrid::Auto);
+    const bool alignOk = c.lensAlign >= 0 && static_cast<std::size_t>(c.lensAlign) < std::size(kDialogLensAlign);
+    blob.lensAlign = static_cast<std::uint8_t>(alignOk ? kDialogLensAlign[static_cast<std::size_t>(c.lensAlign)]
+                                                       : PrefsLensAlign::Auto);
+}
+// ---- [/WP-STEADY] ------------------------------------------------------------
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 //  PrefsBlob -> controls
@@ -98,6 +135,7 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.flareRemoval = prefs.flareRemoval != 0;  // [WP-FLARE]
     photoControlsFromPrefs(prefs, c);  // [WP-PHOTO]
     seamToolControlsFromPrefs(prefs, c);  // [WP-SEAMTOOLS]
+    steadyControlsFromPrefs(prefs, c);  // [WP-STEADY]
     return c;
 }
 
@@ -157,6 +195,7 @@ PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& bas
     blob.exposureStops = std::isfinite(controls.exposureStops) ? static_cast<float>(controls.exposureStops) : 0.0f;
     applyPhotoControls(controls, blob);  // [WP-PHOTO]
     applySeamToolControls(controls, blob);  // [WP-SEAMTOOLS]
+    applySteadyControls(controls, blob);  // [WP-STEADY]
 
     blob.sanitise();
     return blob;

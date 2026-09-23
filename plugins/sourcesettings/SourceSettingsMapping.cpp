@@ -104,6 +104,16 @@ PrefsBlob prefsFromControls(const ControlValues& controls) noexcept {
     blob.setNearOffsetDeg(controls.nearOffsetDeg);
     blob.setFarOffsetDeg(controls.farOffsetDeg);
 
+    // [WP-STEADY] Both popups go through their tables (the popup lists the
+    // default first; the enums keep the older behaviour at 0).  An
+    // out-of-range value keeps the choice defaults() wrote.
+    if (controls.parallaxGrid >= 1 && controls.parallaxGrid <= OSV_SS_PARALLAX_GRID_COUNT) {
+        blob.parallaxGrid = static_cast<std::uint8_t>(kParallaxGridByPopup[controls.parallaxGrid - 1]);
+    }
+    if (controls.lensAlign >= 1 && controls.lensAlign <= OSV_SS_LENS_ALIGN_COUNT) {
+        blob.lensAlign = static_cast<std::uint8_t>(kLensAlignByPopup[controls.lensAlign - 1]);
+    }
+
     // Clamp everything into range and zero the reserved bytes.  After this
     // the blob is byte-for-byte what the importer expects, which is the
     // property the round-trip test pins.
@@ -157,6 +167,22 @@ ControlValues controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.seamSmoothingDeg = clean.seamSmoothingDeg();
     c.nearOffsetDeg = clean.nearOffsetDeg();
     c.farOffsetDeg = clean.farOffsetDeg();
+    // [WP-STEADY] The popup items whose choices are the blob's; item 1 (Auto)
+    // for a choice missing from a table, which sanitise() rules out.
+    c.parallaxGrid = 1;
+    for (int item = 1; item <= OSV_SS_PARALLAX_GRID_COUNT; ++item) {
+        if (kParallaxGridByPopup[item - 1] == clean.parallaxGridChoice()) {
+            c.parallaxGrid = item;
+            break;
+        }
+    }
+    c.lensAlign = 1;
+    for (int item = 1; item <= OSV_SS_LENS_ALIGN_COUNT; ++item) {
+        if (kLensAlignByPopup[item - 1] == clean.lensAlignChoice()) {
+            c.lensAlign = item;
+            break;
+        }
+    }
     return c;
 }
 

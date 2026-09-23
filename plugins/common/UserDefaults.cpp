@@ -140,6 +140,14 @@ constexpr const char* kDeviceTokens[] = {"auto", "cpu", "cuda", "opencl"};
 constexpr const char* kFlowTokens[] = {"auto", "classical", "neural"};
 constexpr const char* kPhotoTokens[] = {"off", "rim-only", "rim-and-colour"};
 constexpr const char* kDirectTokens[] = {"sequence-space", "match-source"};
+// [WP-STEADY] In ENUM order (the token list is indexed by the stored value),
+// which is not the panel's order: the enums keep the older behaviour at 0.
+constexpr const char* kGridTokens[] = {"follows-scene", "steady", "auto"};
+constexpr const char* kAlignTokens[] = {"off", "auto"};
+static_assert(std::size(kGridTokens) == static_cast<std::size_t>(PrefsParallaxGrid::Count),
+              "parallaxGrid does not spell every PrefsParallaxGrid value");
+static_assert(std::size(kAlignTokens) == static_cast<std::size_t>(PrefsLensAlign::Count),
+              "lensAlignment does not spell every PrefsLensAlign value");
 
 static_assert(std::size(kColourTokens) == static_cast<std::size_t>(PrefsColorOutput::Count),
               "colourOutput does not spell every PrefsColorOutput value");
@@ -447,6 +455,15 @@ const FieldSpec kFields[] = {
          p.setFarOffsetDeg(deg);
          return true;
      }},
+    // [WP-STEADY] Parallax Grid and Lens Alignment, spelled by choice.
+    {{"parallaxGrid", OSV_UD_FIELD(parallaxGrid), 0, 0},
+     [](const PrefsBlob& p) { return tokenJson(p.parallaxGrid, kGridTokens); },
+     [](const Json& v, PrefsBlob& p, std::string& why, bool&) {
+         return tokenFrom(v, kGridTokens, p.parallaxGrid, why);
+     }},
+    {{"lensAlignment", OSV_UD_FIELD(lensAlign), 0, 0},
+     [](const PrefsBlob& p) { return tokenJson(p.lensAlign, kAlignTokens); },
+     [](const Json& v, PrefsBlob& p, std::string& why, bool&) { return tokenFrom(v, kAlignTokens, p.lensAlign, why); }},
     // Not in the Source Settings effect (only the modal dialog's hidden
     // fields and osvtool reach them), but they are settings, so they are
     // defaults too: a field missing here would reset silently on every save.

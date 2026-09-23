@@ -231,6 +231,13 @@ TEST_CASE("the defaults file covers every byte of the blob that holds a setting"
     for (std::size_t i = 0; i < sizeof(PrefsBlob::photoReserved); ++i) {
         padding.insert(offsetof(PrefsBlob, photoReserved) + i);
     }
+    // [WP-STEADY] the padding before its range and the rest of it.
+    for (std::size_t i = 0; i < sizeof(PrefsBlob::padBeforeSteady); ++i) {
+        padding.insert(offsetof(PrefsBlob, padBeforeSteady) + i);
+    }
+    for (std::size_t i = 0; i < sizeof(PrefsBlob::steadyReserved); ++i) {
+        padding.insert(offsetof(PrefsBlob, steadyReserved) + i);
+    }
 
     std::vector<int> owners(PrefsBlob::kSize, 0);
     std::set<std::string> keys;

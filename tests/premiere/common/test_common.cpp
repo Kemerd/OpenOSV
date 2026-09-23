@@ -200,7 +200,11 @@ TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     static_assert(offsetof(PrefsBlob, seamSmoothing) == 40, "seamSmoothing sits at 40");
     static_assert(offsetof(PrefsBlob, nearOffset) == 42, "nearOffset sits at 42");
     static_assert(offsetof(PrefsBlob, farOffset) == 44, "farOffset sits at 44");
-    static_assert(offsetof(PrefsBlob, reserved) == 46, "reserved fills the rest");
+    // [WP-STEADY] Parallax Grid and Lens Alignment at 50-51 (its range is
+    // 50-53); the reserved block now starts at 54.
+    static_assert(offsetof(PrefsBlob, parallaxGrid) == 50, "parallaxGrid sits at 50");
+    static_assert(offsetof(PrefsBlob, lensAlign) == 51, "lensAlign sits at 51");
+    static_assert(offsetof(PrefsBlob, reserved) == 54, "reserved fills the rest");
     static_assert(std::is_trivially_copyable_v<PrefsBlob>, "the blob is memcpy'd to and from the host");
 
     REQUIRE(sizeof(PrefsBlob) == PrefsBlob::kSize);

@@ -173,10 +173,16 @@
 #define OSV_SS_ID_SAVE_DEFAULTS 31
 #define OSV_SS_ID_RESTORE_DEFAULTS 32
 #define OSV_SS_ID_DEFAULTS_TOPIC_END 33
+/* [WP-STEADY] "Parallax Grid" and "Lens Alignment": two NEW ids from this
+ * package's range (40-45), placed inside the Stitching group right after Far
+ * Offset (indices 18-19); everything after them moved up by two - indices are
+ * not persisted, ids are.  The Defaults group stays last. */
+#define OSV_SS_ID_PARALLAX_GRID 40
+#define OSV_SS_ID_LENS_ALIGN 41
 
-/* Total parameters excluding the input layer: 20 value controls + 2 buttons
+/* Total parameters excluding the input layer: 22 value controls + 2 buttons
  * + 6 group markers.  out_data->num_params is this + 1. */
-#define OSV_SOURCE_SETTINGS_PARAM_COUNT 28
+#define OSV_SOURCE_SETTINGS_PARAM_COUNT 30
 
 /* ==========================================================================
  *  Popup item strings
@@ -289,6 +295,35 @@
 #define OSV_SS_PHOTO_SEAM_COUNT 3
 #define OSV_SS_PHOTO_SEAM_DEFAULT 3
 
+/* [WP-STEADY] "Parallax Grid" - PrefsParallaxGrid, in POPUP order
+ * (kParallaxGridByPopup in SourceSettingsMapping.h): Auto, Steady, Follows
+ * scene.
+ *
+ * Whether the seam corrections (the parallax grid, the seam-shift table and
+ * the carved seam) are held still for the whole clip or measured per moment.
+ * "Steady (per clip)" is what a rigid mount wants - a camera on a wing, a
+ * helmet or a car: nothing at the seam moves.  "Follows scene (per moment)"
+ * is what handheld footage with near objects moving past the seam wants, and
+ * what every project saved before the control existed renders with.  "Auto"
+ * holds still unless one of the clip's sample frames shows a near object the
+ * steady correction would lose.  Default 1 = Auto (PrefsParallaxGrid::Auto,
+ * as PrefsBlob::defaults()). */
+#define OSV_SS_PARALLAX_GRID_ITEMS "Auto|Steady (per clip)|Follows scene (per moment)"
+#define OSV_SS_PARALLAX_GRID_COUNT 3
+#define OSV_SS_PARALLAX_GRID_DEFAULT 1
+
+/* [WP-STEADY] "Lens Alignment" - PrefsLensAlign, in POPUP order
+ * (kLensAlignByPopup): Auto, Off.
+ *
+ * "Auto (fit per clip)" fits the small rotation between the two lenses once
+ * per clip, from the seam's own flow on three fixed frames, and folds it into
+ * the stitch (0.36 deg on the sample clip; cached per clip, so a clip is
+ * measured once).  "Off (calibration only)" trusts the recorded calibration,
+ * as every older project does.  Default 1 = Auto. */
+#define OSV_SS_LENS_ALIGN_ITEMS "Auto (fit per clip)|Off (calibration only)"
+#define OSV_SS_LENS_ALIGN_COUNT 2
+#define OSV_SS_LENS_ALIGN_DEFAULT 1
+
 /* ==========================================================================
  *  Checkbox and slider ranges / defaults
  * ========================================================================== */
@@ -390,17 +425,19 @@ namespace osv::premiere::sourcesettings {
 ///  15    Seam Smoothing           [WP-SEAMTOOLS]
 ///  16    Near Offset              [WP-SEAMTOOLS]
 ///  17    Far Offset               [WP-SEAMTOOLS]
-///  18  (GROUP_END, Stitching)
-///  19  Advanced           (GROUP_START, starts collapsed)
-///  20    D-Log M Curve
-///  21    Exposure
-///  22    Render Device
-///  23    Program Monitor Colour   [WP-SETTINGS]
-///  24  (GROUP_END, Advanced)
-///  25  Defaults           (GROUP_START, starts collapsed)   [WP-DEFAULTS]
-///  26    Save       [Save as Default for New Clips]
-///  27    Restore    [Restore Built-in Defaults]
-///  28  (GROUP_END, Defaults)
+///  18    Parallax Grid            [WP-STEADY]
+///  19    Lens Alignment           [WP-STEADY]
+///  20  (GROUP_END, Stitching)
+///  21  Advanced           (GROUP_START, starts collapsed)
+///  22    D-Log M Curve
+///  23    Exposure
+///  24    Render Device
+///  25    Program Monitor Colour   [WP-SETTINGS]
+///  26  (GROUP_END, Advanced)
+///  27  Defaults           (GROUP_START, starts collapsed)   [WP-DEFAULTS]
+///  28    Save       [Save as Default for New Clips]
+///  29    Restore    [Restore Built-in Defaults]
+///  30  (GROUP_END, Defaults)
 enum ParamIndex : int {
     kIndexColorOutput = 1,
     kIndexRec709Look = 2,
@@ -419,13 +456,15 @@ enum ParamIndex : int {
     kIndexSeamSmoothing = 15,   // [WP-SEAMTOOLS]
     kIndexNearOffset = 16,      // [WP-SEAMTOOLS]
     kIndexFarOffset = 17,       // [WP-SEAMTOOLS]
-    kIndexStitchTopicEnd = 18,
-    kIndexAdvancedTopic = 19,
-    kIndexDlogmFit = 20,
-    kIndexExposure = 21,
-    kIndexRenderDevice = 22,
-    kIndexDirectColour = 23,
-    kIndexAdvancedTopicEnd = 24,
+    kIndexParallaxGrid = 18,    // [WP-STEADY]
+    kIndexLensAlign = 19,       // [WP-STEADY]
+    kIndexStitchTopicEnd = 20,
+    kIndexAdvancedTopic = 21,
+    kIndexDlogmFit = 22,
+    kIndexExposure = 23,
+    kIndexRenderDevice = 24,
+    kIndexDirectColour = 25,
+    kIndexAdvancedTopicEnd = 26,
     // [WP-DEFAULTS] Always the last group, so its indices are written
     // relative to the Advanced terminator: a control added to an earlier
     // group moves them with it and nothing here has to be renumbered.
@@ -443,7 +482,10 @@ inline constexpr int kParamIdByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
     OSV_SS_ID_STITCH_TOPIC,     OSV_SS_ID_SEAM_SEARCH,   OSV_SS_ID_GAIN_MATCH,
     OSV_SS_ID_CALIBRATION,      OSV_SS_ID_FLARE_REMOVAL, OSV_SS_ID_PHOTO_SEAM, OSV_SS_ID_PHOTO_STRENGTH,
     OSV_SS_ID_SEAM_INSET,       OSV_SS_ID_SEAM_BLEND,    OSV_SS_ID_PARALLAX_BLEND, OSV_SS_ID_SEAM_SMOOTHING,
-    OSV_SS_ID_NEAR_OFFSET,      OSV_SS_ID_FAR_OFFSET,    OSV_SS_ID_STITCH_TOPIC_END, OSV_SS_ID_ADVANCED_TOPIC,
+    OSV_SS_ID_NEAR_OFFSET,      OSV_SS_ID_FAR_OFFSET,
+    // [WP-STEADY]
+    OSV_SS_ID_PARALLAX_GRID,    OSV_SS_ID_LENS_ALIGN,
+    OSV_SS_ID_STITCH_TOPIC_END, OSV_SS_ID_ADVANCED_TOPIC,
     OSV_SS_ID_DLOGM_FIT,        OSV_SS_ID_EXPOSURE,      OSV_SS_ID_RENDER_DEVICE,
     OSV_SS_ID_DIRECT_COLOUR,    OSV_SS_ID_ADVANCED_TOPIC_END,
     // [WP-DEFAULTS]
@@ -457,8 +499,8 @@ inline constexpr int kParamCount = OSV_SOURCE_SETTINGS_PARAM_COUNT;
 /// GROUP_START / GROUP_END markers and [WP-DEFAULTS] the two Defaults buttons
 /// (a button has no value; it only triggers PF_Cmd_USER_CHANGED_PARAM).
 /// This is the count that has to round trip through a PrefsBlob
-/// ([WP-SEAMTOOLS] five more since the seam tools).
-inline constexpr int kValueParamCount = 20;
+/// ([WP-SEAMTOOLS] five more since the seam tools, [WP-STEADY] two more).
+inline constexpr int kValueParamCount = 22;
 
 /// The parameter names, in index order, so a test can compare the built
 /// module's list without repeating the strings.
@@ -472,6 +514,7 @@ inline constexpr const char* kParamNameByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] 
     "Colour Output", "Look (Rec. 709 only)", "Output Size", "Stabilisation", "Stitching", "Seam Search",
     "Exposure Match", "Calibration",  "Sun Ghost Removal",  "Sky Seam Fix", "Sky Seam Strength",
     "Seam Edge Inset", "Seam Blend",  "Parallax Blend", "Seam Smoothing", "Near Offset", "Far Offset",
+    "Parallax Grid",  "Lens Alignment",  // [WP-STEADY]
     "",               "Advanced",     "D-Log M Curve",
     "Exposure",       "Render Device", "Program Monitor Colour", "",
     // [WP-DEFAULTS]

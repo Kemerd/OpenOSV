@@ -392,4 +392,18 @@ std::uint32_t Pipeline::frameCount() const noexcept { return reader ? reader->fr
 
 double Pipeline::fps() const noexcept { return reader ? reader->fps() : format.fps; }
 
+std::vector<std::uint32_t> Pipeline::syncFrames() const {
+    // The first lens's track (the LRF proxy's single track); both lenses of
+    // a camera-written clip share one GOP structure.
+    if (!file) {
+        return {};
+    }
+    const std::uint32_t id = format.videoTrackIds[0] != 0 ? format.videoTrackIds[0] : 1u;
+    const osv::TrackInfo* video = file->track(id);
+    if (!video || !video->samples.hasSyncTable()) {
+        return {};
+    }
+    return video->samples.syncSamples();
+}
+
 }  // namespace osvtool

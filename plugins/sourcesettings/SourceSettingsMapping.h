@@ -41,6 +41,23 @@ inline constexpr PrefsCalibrationChoice kCalibrationChoiceByPopup[OSV_SS_CALIB_C
     PrefsCalibrationChoice::Native,
 };
 
+/// [WP-STEADY] The Parallax Grid choice each popup item selects, item 1
+/// first.  Not the enum order either: the enum keeps FollowsScene at 0 (what
+/// every older blob's zero byte means) while the popup lists the default,
+/// Auto, first.  Both mapping directions go through this table.
+inline constexpr PrefsParallaxGrid kParallaxGridByPopup[OSV_SS_PARALLAX_GRID_COUNT] = {
+    PrefsParallaxGrid::Auto,
+    PrefsParallaxGrid::Steady,
+    PrefsParallaxGrid::FollowsScene,
+};
+
+/// [WP-STEADY] The Lens Alignment choice each popup item selects, item 1
+/// first (the default, Auto, first; the enum keeps Off at 0).
+inline constexpr PrefsLensAlign kLensAlignByPopup[OSV_SS_LENS_ALIGN_COUNT] = {
+    PrefsLensAlign::Auto,
+    PrefsLensAlign::Off,
+};
+
 /// The value of every control of the Source Settings effect, read out of the
 /// host's PF_ParamDef array and not yet validated.
 ///
@@ -74,6 +91,9 @@ struct ControlValues {
     double seamSmoothingDeg = OSV_SS_SEAM_SMOOTHING_DEFAULT;  ///< Seam Smoothing (0 = off).
     double nearOffsetDeg = OSV_SS_SEAM_OFFSET_DEFAULT;        ///< Near Offset.
     double farOffsetDeg = OSV_SS_SEAM_OFFSET_DEFAULT;         ///< Far Offset.
+    // ---- [WP-STEADY] ------------------------------------------------------------
+    int parallaxGrid = OSV_SS_PARALLAX_GRID_DEFAULT;  ///< 1-based popup value (kParallaxGridByPopup).
+    int lensAlign = OSV_SS_LENS_ALIGN_DEFAULT;        ///< 1-based popup value (kLensAlignByPopup).
 };
 
 /// Control values -> PrefsBlob.

@@ -206,6 +206,38 @@ enum class PrefsPhotoSeam : std::uint8_t {
     Count
 };
 
+/// [WP-STEADY] "Parallax Grid": whether the seam corrections (the parallax
+/// grid, the seam-shift table and the carved seam) are measured per moment
+/// or held still for the whole clip (osv/render/ClipSteady.h).  Persisted,
+/// so append-only.
+///
+/// FollowsScene is 0 so an older blob - whose byte is zero - keeps rendering
+/// exactly as it did (one measurement per bucket of 8 frames, glided); a
+/// fresh blob gets Auto from defaults().
+enum class PrefsParallaxGrid : std::uint8_t {
+    /// Per moment: one measurement per 8-frame bucket, glided between
+    /// buckets.  Follows near objects that move past the seam (handheld).
+    FollowsScene = 0,
+    /// One correction for the whole clip, from fixed sample frames: nothing
+    /// at the seam moves (rigid mounts: a wing, a helmet, a car).
+    Steady = 1,
+    /// Steady unless a sample frame's own correction aligns something the
+    /// clip correction loses (a near object that moved past the seam).
+    Auto = 2,
+    Count
+};
+
+/// [WP-STEADY] "Lens Alignment": whether the importer fits the small
+/// rotation between the two lenses once per clip and folds it into the rig
+/// (osv/render/LensAlign.h), or trusts the recorded calibration alone.
+/// Persisted, so append-only.  Off is 0 so an older blob renders exactly as
+/// it did; a fresh blob gets Auto from defaults().
+enum class PrefsLensAlign : std::uint8_t {
+    Off = 0,   ///< The recorded calibration only.
+    Auto = 1,  ///< Fit the rotation on fixed frames of the clip (cached per clip) and fold it in.
+    Count
+};
+
 #pragma pack(push, 1)
 
 /// The 128-byte preferences record.  Use defaults() to construct one,
@@ -308,7 +340,19 @@ struct PrefsBlob {
     /// Far Offset, the same where they agree.
     std::int16_t farOffset = 0;
     // ---- [/WP-SEAMTOOLS] ------------------------------------------------------
-    std::uint8_t reserved[82] = {};    ///< Zero; future fields.
+    // ---- [WP-STEADY] steady seam corrections and lens alignment --------------
+    /// Offsets 46-49: another package's range (docs/PARALLEL_WORK.md).  Zero,
+    /// and zeroed by sanitise(); the lead folds it into that package's fields.
+    std::uint8_t padBeforeSteady[4] = {};
+    /// PrefsParallaxGrid; 0 = FollowsScene, so an older blob renders as it did.
+    std::uint8_t parallaxGrid = 0;
+    /// PrefsLensAlign; 0 = Off, so an older blob renders as it did.
+    std::uint8_t lensAlign = 0;
+    /// Offsets 52-53: the rest of WP-STEADY's range.  Zero, and zeroed by
+    /// sanitise().
+    std::uint8_t steadyReserved[2] = {};
+    // ---- [/WP-STEADY] ---------------------------------------------------------
+    std::uint8_t reserved[74] = {};    ///< Zero; future fields.
 
     /// seamInset: the default inset in tenths of a degree (2.6 deg - the
     /// render weight then ends at 95.0 deg on the calibrated 97.59 deg lens;
@@ -382,6 +426,15 @@ struct PrefsBlob {
         // strength; the inset stays at its default (code 0).
         p.photoSeam = static_cast<std::uint8_t>(PrefsPhotoSeam::RimAndGain);
         p.photoStrength = 0;
+        // [WP-STEADY] New clips hold the seam corrections still unless the
+        // clip shows a near object moving past the seam, and fit the lens
+        // rotation.  Measured on the sample: the warp's frame-to-frame motion
+        // at the nacelle falls from 2.0 px to 0 at 6K with the same alignment,
+        // and the rotation takes the ground from NCC 0.37 to 0.88 without a
+        // grid and from 0.922-0.932 to 0.932-0.946 with one (docs/PREMIERE.md,
+        // "Steady seam and lens alignment").
+        p.parallaxGrid = static_cast<std::uint8_t>(PrefsParallaxGrid::Auto);
+        p.lensAlign = static_cast<std::uint8_t>(PrefsLensAlign::Auto);
         return p;
     }
 
@@ -538,6 +591,25 @@ struct PrefsBlob {
             farOffset = 0;
             clean = false;
         }
+        // [WP-STEADY] Corrupt choices land on the DEFAULT (Auto), like
+        // parallax and the sky seam fix: a fresh blob's setting.  The padding
+        // and the rest of the range stay zero.
+        clampEnum(parallaxGrid, static_cast<std::uint8_t>(PrefsParallaxGrid::Count),
+                  static_cast<std::uint8_t>(PrefsParallaxGrid::Auto));
+        clampEnum(lensAlign, static_cast<std::uint8_t>(PrefsLensAlign::Count),
+                  static_cast<std::uint8_t>(PrefsLensAlign::Auto));
+        for (std::uint8_t& b : padBeforeSteady) {
+            if (b != 0) {
+                b = 0;
+                clean = false;
+            }
+        }
+        for (std::uint8_t& b : steadyReserved) {
+            if (b != 0) {
+                b = 0;
+                clean = false;
+            }
+        }
         if (magic != kMagic || version != kVersion) {
             magic = kMagic;
             version = kVersion;
@@ -651,6 +723,20 @@ struct PrefsBlob {
     }
     /// [WP-PHOTO] The sky seam fix mode.
     [[nodiscard]] PrefsPhotoSeam photoSeamMode() const noexcept { return static_cast<PrefsPhotoSeam>(photoSeam); }
+    /// [WP-STEADY] The Parallax Grid choice; an out-of-range byte (an
+    /// unsanitised blob) reads as FollowsScene, what the importer did before
+    /// the byte existed.
+    [[nodiscard]] PrefsParallaxGrid parallaxGridChoice() const noexcept {
+        return parallaxGrid < static_cast<std::uint8_t>(PrefsParallaxGrid::Count)
+                   ? static_cast<PrefsParallaxGrid>(parallaxGrid)
+                   : PrefsParallaxGrid::FollowsScene;
+    }
+    /// [WP-STEADY] The Lens Alignment choice; an out-of-range byte reads as
+    /// Off, the calibration alone.
+    [[nodiscard]] PrefsLensAlign lensAlignChoice() const noexcept {
+        return lensAlign < static_cast<std::uint8_t>(PrefsLensAlign::Count) ? static_cast<PrefsLensAlign>(lensAlign)
+                                                                             : PrefsLensAlign::Off;
+    }
     /// [WP-PHOTO] Gain-field strength in percent (code 0 = the default 100).
     [[nodiscard]] double photoStrengthPercent() const noexcept {
         if (photoStrength == 0 || photoStrength > kMaxPhotoStrengthCode) {
@@ -811,7 +897,15 @@ static_assert(offsetof(PrefsBlob, seamSmoothing) == 40, "PrefsBlob layout drifte
 static_assert(offsetof(PrefsBlob, seamToolsPad) == 41, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, nearOffset) == 42, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, farOffset) == 44, "PrefsBlob layout drifted");
-static_assert(offsetof(PrefsBlob, reserved) == 46, "PrefsBlob layout drifted");
+// [WP-STEADY] owns offsets 50-53 (46-49 belong to another package and are
+// padded here).  Both choices' zero reads as the behaviour before they
+// existed - per-moment corrections, the calibration alone - so an old
+// project renders exactly as before; a fresh blob gets Auto for both.
+static_assert(offsetof(PrefsBlob, padBeforeSteady) == 46, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, parallaxGrid) == 50, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, lensAlign) == 51, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, steadyReserved) == 52, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, reserved) == 54, "PrefsBlob layout drifted");
 // The codes' upper bounds are the ranges the controls offer.
 static_assert(PrefsBlob::kMaxSeamBlendCode == 8 * PrefsBlob::kSeamToolStepsPerDeg + 1, "Seam Blend reaches 8 deg");
 static_assert(PrefsBlob::kMinSeamBlendCode == 4 + 1, "Seam Blend starts at 0.2 deg");

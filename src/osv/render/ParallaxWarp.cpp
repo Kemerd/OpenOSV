@@ -314,8 +314,13 @@ void sampleBandPair(const std::vector<float>& planeA, const std::vector<float>& 
 //  Flow field -> angular grid
 // ---------------------------------------------------------------------------
 Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& flow,
-                                      const ParallaxWarpParams& params, ThreadPool* pool) {
+                                      const ParallaxWarpParams& params, ThreadPool* pool, ParallaxCellStats* cellStats) {
     OSV_TRY(checkParams(params));
+    // A caller's stats block is emptied first, so a refusal below never
+    // leaves a previous measurement's numbers looking current.
+    if (cellStats != nullptr) {
+        *cellStats = ParallaxCellStats{};
+    }
     if (bands.w == 0 || bands.h == 0 || bands.mapH == 0) {
         return Error{ErrorCode::InvalidArgument, "gridFromFlow: empty band"};
     }
@@ -497,6 +502,31 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
         const double latv = accLat[gi] / accN[gi];
         measured[gi * 2u + 0u] = static_cast<float>(std::clamp(lonv, -maxRad, maxRad));
         measured[gi * 2u + 1u] = static_cast<float>(std::clamp(latv, -maxRad, maxRad));
+    }
+
+    // ---- the raw per-cell measurement, for a caller that fits a model -------
+    // Taken HERE, before the fill, the blur, the decay and the gate reshape
+    // the field for rendering (ParallaxCellStats says why each of those would
+    // mislead a fit).  The gate's verdict is filled in below, once known; with
+    // the gate off every measured cell counts as trusted.
+    if (cellStats != nullptr) {
+        cellStats->w = gridW;
+        cellStats->rows = gridRows;
+        cellStats->latTopRad = latTop;
+        cellStats->latStepRad = latPerGridRow;
+        cellStats->halfFlow.assign(cells * 2u, 0.0f);
+        cellStats->pixels.assign(cells, 0u);
+        cellStats->gate.assign(cells, params.requiredImprovement > 0.0 ? 0.0f : 1.0f);
+        for (std::size_t gi = 0; gi < cells; ++gi) {
+            if (!(accN[gi] > 0.0)) {
+                continue;  // nothing consistent landed here: zero flow, zero pixels
+            }
+            // The unscaled, unclamped mean half displacement, radians.
+            cellStats->halfFlow[gi * 2u + 0u] = static_cast<float>(accLon[gi] / accN[gi]);
+            cellStats->halfFlow[gi * 2u + 1u] = static_cast<float>(accLat[gi] / accN[gi]);
+            // accN counts pixels one at a time, so it is an exact integer.
+            cellStats->pixels[gi] = static_cast<std::uint32_t>(std::min(accN[gi], 4294967295.0));
+        }
     }
 
     // ---- fill cells nothing measured -------------------------------------
@@ -814,6 +844,11 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
                 ++gatedCells;
             }
         }
+        // The gate's per-cell verdict, before the smoothing below spreads it:
+        // what a model fit should trust (ParallaxCellStats::gate).
+        if (cellStats != nullptr && cellStats->gate.size() == cells) {
+            std::copy(weight.begin(), weight.end(), cellStats->gate.begin());
+        }
 
         // Spread the weights over the full grid (the rings take the weight of
         // the nearest measured row), smooth them, and scale the field.
@@ -890,7 +925,7 @@ Result<ParallaxWarpGrid> buildParallaxWarp(const geom::LensRig& rig, const video
 }
 
 Result<ParallaxWarpGrid> parallaxFromBands(const LensBands& bands, const ParallaxWarpParams& params,
-                                           ThreadPool* pool, double bandMs) {
+                                           ThreadPool* pool, double bandMs, ParallaxCellStats* cells) {
     OSV_TRY(checkParams(params));
     if (bands.w == 0 || bands.h == 0) {
         return Error{ErrorCode::InvalidArgument, "parallaxFromBands: empty bands"};
@@ -921,7 +956,7 @@ Result<ParallaxWarpGrid> parallaxFromBands(const LensBands& bands, const Paralla
     const double flowMs = msSince(tFlow);
 
     const auto tGrid = Clock::now();
-    OSV_TRY_ASSIGN(ParallaxWarpGrid grid, gridFromFlow(bands, flow, params, pool));
+    OSV_TRY_ASSIGN(ParallaxWarpGrid grid, gridFromFlow(bands, flow, params, pool, cells));
     grid.usedBackend = used;
     grid.bandMs = bandMs;
     grid.flowMs = flowMs;

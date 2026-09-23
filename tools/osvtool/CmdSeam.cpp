@@ -10,6 +10,8 @@
 
 #include "osv/core/Log.h"
 #include "osv/geom/StreamScaling.h"
+#include "osv/render/ClipSteady.h"  // [WP-STEADY]
+#include "osv/render/LensAlign.h"   // [WP-STEADY]
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"
 #include "osv/render/RenderParamsBuilder.h"
@@ -20,6 +22,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace osvtool {
 
@@ -55,7 +60,48 @@ struct SeamOptions {
     /// Width of the polar map the metrics are scored on (the research used
     /// 4096; the per-pixel colour noise floor of the dE term depends on it).
     std::uint32_t photoMetricW = 4096;
+    // ---- [WP-STEADY] --------------------------------------------------------
+    /// Fit the per-clip lens rotation on the clip's fixed rotation frames
+    /// (render/LensAlign.h) and fold it into the rig BEFORE every other
+    /// measurement, as the importer's "Lens Alignment: Auto" does.
+    bool lensAlign = false;
+    /// Measure the per-clip steady correction (render/ClipSteady.h) on the
+    /// clip's fixed sample frames and score it next to this frame's own grid.
+    bool steady = false;
+    /// Several named column windows scored with --parallax, e.g.
+    /// "sky:410-900,ground:1110-1700,wing:1880-2040" (of 2048, wraps).
+    std::string regions;
 };
+
+/// [WP-STEADY] One named --regions window.
+struct NamedRegion {
+    std::string name;
+    int c0 = 0;
+    int c1 = 0;
+};
+
+/// [WP-STEADY] Parse "name:c0-c1,name:c0-c1,..." into windows of a band
+/// `width` columns wide; false (with `why`) on anything malformed.
+bool parseRegions(const std::string& text, std::uint32_t width, std::vector<NamedRegion>& out, std::string& why) {
+    out.clear();
+    std::size_t start = 0;
+    while (start < text.size()) {
+        const std::size_t comma = text.find(',', start);
+        const std::string item = text.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        start = comma == std::string::npos ? text.size() : comma + 1;
+        const std::size_t colon = item.find(':');
+        NamedRegion r;
+        if (colon == std::string::npos || colon == 0 ||
+            std::sscanf(item.c_str() + colon + 1, "%d-%d", &r.c0, &r.c1) != 2 || r.c0 < 0 || r.c1 < 0 ||
+            r.c0 >= static_cast<int>(width) || r.c1 >= static_cast<int>(width)) {
+            why = "--regions expects name:c0-c1[,name:c0-c1...] with columns inside 0-" + std::to_string(width - 1);
+            return false;
+        }
+        r.name = item.substr(0, colon);
+        out.push_back(r);
+    }
+    return true;
+}
 
 /// [WP-PHOTO] Measure the field on `pair` and score the four variants.
 /// Returns the JSON block for out["photo"].
@@ -250,6 +296,129 @@ int runSeam(const SeamOptions& o) {
         std::fprintf(stderr, "error: frame %d out of range\n", o.frame);
         return kExitUsage;
     }
+    nlohmann::json out;
+
+    // ---- [WP-STEADY] the flow backend, needed by the per-clip analyses too ----
+    render::FlowBackendKind backend = render::FlowBackendKind::Auto;
+    if (o.flowBackend == "classical") {
+        backend = render::FlowBackendKind::Classical;
+    } else if (o.flowBackend == "neural") {
+        backend = render::FlowBackendKind::Neural;
+    } else if (o.flowBackend != "auto") {
+        std::fprintf(stderr, "error: unknown --flow-backend '%s'\n", log::safe(o.flowBackend).c_str());
+        return kExitUsage;
+    }
+    std::vector<NamedRegion> regions;
+    if (!o.regions.empty()) {
+        std::string why;
+        if (!parseRegions(o.regions, o.parallaxTuning.band.equirectW, regions, why)) {
+            std::fprintf(stderr, "error: %s\n", why.c_str());
+            return kExitUsage;
+        }
+    }
+    // The clip's own frames for the per-clip analyses, in ascending order.
+    const render::ClipFrameSource clipFrames = [&P](std::uint32_t f) { return P.reader->read(f); };
+
+    // ---- [WP-STEADY] --lens-align: fit the clip's lens rotation, fold it ------
+    // First, so every number below - the overlap NCC, the grids, the steady
+    // correction - is measured on the aligned rig, as the importer renders.
+    if (o.lensAlign) {
+        render::ParallaxWarpParams rp = o.parallaxTuning;
+        rp.backend = backend;
+        const std::vector<std::uint32_t> frames = render::clipSampleFrames(
+            P.frameCount(), P.syncFrames(), render::kLensRotationSamples, 0.1, 0.9);
+        const auto t0 = std::chrono::steady_clock::now();
+        auto measured = render::measureLensRotation(P.rig, P.blendParams, frames, clipFrames, rp,
+                                                    render::LensRotationParams{}, *P.pool);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        nlohmann::json lj;
+        lj["frames"] = frames;
+        lj["ms"] = ms;
+        if (!measured.ok()) {
+            lj["error"] = measured.error().message;
+        } else {
+            const render::LensRotationMeasurement& m = measured.value();
+            lj["accepted"] = m.accepted;
+            lj["decodeMs"] = m.decodeMs;
+            lj["analysisMs"] = m.analysisMs;
+            nlohmann::json per = nlohmann::json::array();
+            for (const render::LensRotationFit& f : m.perFrame) {
+                per.push_back({{"w", {f.wRad.x, f.wRad.y, f.wRad.z}},
+                               {"angleDeg", f.angleDeg},
+                               {"residualDeg", f.residualRmsDeg},
+                               {"inliers", f.inliers},
+                               {"cells", f.cells},
+                               {"conditioning", f.conditioning}});
+            }
+            lj["perFrame"] = per;
+            lj["refusals"] = m.refusals;
+            if (m.accepted) {
+                lj["w"] = {m.fit.wRad.x, m.fit.wRad.y, m.fit.wRad.z};
+                lj["angleDeg"] = m.fit.angleDeg;
+                lj["spreadDeg"] = m.fit.spreadDeg;
+                lj["residualDeg"] = m.fit.residualRmsDeg;
+                lj["summary"] = render::describeLensRotation(m.fit);
+                const Status folded = render::applyLensRotation(P.rig, m.fit.wRad);
+                lj["applied"] = folded.ok();
+            } else {
+                lj["reason"] = m.reason;
+                lj["applied"] = false;
+            }
+        }
+        out["lensAlign"] = lj;
+    }
+
+    // ---- [WP-STEADY] --steady: the per-clip correction on the fixed samples ----
+    std::optional<render::ClipSteady> steady;
+    if (o.steady) {
+        render::ClipSteadyParams cp;
+        cp.parallax = o.parallaxTuning;
+        cp.parallax.backend = backend;
+        cp.parallaxOn = true;
+        cp.seamOn = true;
+        const std::vector<std::uint32_t> frames =
+            render::clipSampleFrames(P.frameCount(), P.syncFrames(), render::kClipSteadySamples);
+        const auto t0 = std::chrono::steady_clock::now();
+        auto measured = render::measureClipSteady(P.rig, P.blendParams, frames, clipFrames, cp, *P.pool);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        nlohmann::json sj;
+        sj["frames"] = frames;
+        sj["ms"] = ms;
+        if (!measured.ok()) {
+            sj["error"] = measured.error().message;
+        } else {
+            const render::ClipSteady& c = measured.value();
+            sj["acceptedGrids"] = c.acceptedGrids;
+            sj["decodeMs"] = c.decodeMs;
+            sj["measureMs"] = c.measureMs;
+            sj["finishMs"] = c.finishMs;
+            sj["grid"] = c.grid != nullptr;
+            if (c.grid) {
+                sj["meanDisparityDeg"] = c.grid->meanAbsCorrectionDeg;
+                sj["maxDisparityDeg"] = c.grid->maxAbsCorrectionDeg;
+            }
+            sj["seamTable"] = c.seamTable != nullptr;
+            sj["seam"] = c.seam != nullptr;
+            sj["decision"] = {{"steady", c.decision.steady},
+                              {"textured", c.decision.textured},
+                              {"judged", c.decision.judged},
+                              {"failed", c.decision.failed},
+                              {"worstKeep", c.decision.worstKeep},
+                              {"worstLoss", c.decision.worstLoss},
+                              {"meanLoss", c.decision.meanLoss},
+                              {"worstFrame", c.decision.worstFrame},
+                              {"worstLonDeg", c.decision.worstLonDeg},
+                              {"summary", render::describeSteadyDecision(c.decision)}};
+            nlohmann::json scores = nlohmann::json::array();
+            for (const render::SteadySectorScore& r : c.decision.scores) {
+                scores.push_back({r.frame, r.sector, std::isfinite(r.none) ? r.none : -2.0, r.own, r.clip});
+            }
+            sj["decision"]["scores"] = scores;  // [frame, sector, none, own, clip]
+            steady = measured.value();
+        }
+        out["steady"] = sj;
+    }
+
     auto pair = P.reader->read(static_cast<std::uint32_t>(o.frame));
     if (!pair.ok()) {
         std::fprintf(stderr, "error: %s\n", log::safe(pair.error().toString()).c_str());
@@ -258,7 +427,6 @@ int runSeam(const SeamOptions& o) {
 
     render::BandParams band;
     band.bandHalfDeg = 4.0;
-    nlohmann::json out;
     out["frame"] = o.frame;
 
     auto current = render::overlapNcc(P.rig, pair.value(), P.blendParams, band, *P.pool);
@@ -317,16 +485,7 @@ int runSeam(const SeamOptions& o) {
     // kernel itself, so it measures the real render path.
     if (o.parallax) {
         render::ParallaxWarpParams pw = o.parallaxTuning;
-        if (o.flowBackend == "classical") {
-            pw.backend = render::FlowBackendKind::Classical;
-        } else if (o.flowBackend == "neural") {
-            pw.backend = render::FlowBackendKind::Neural;
-        } else if (o.flowBackend == "auto") {
-            pw.backend = render::FlowBackendKind::Auto;
-        } else {
-            std::fprintf(stderr, "error: unknown --flow-backend '%s'\n", log::safe(o.flowBackend).c_str());
-            return kExitUsage;
-        }
+        pw.backend = backend;  // parsed (and validated) above
         std::vector<float> seamHold;
         const std::vector<float>* seamIn = nullptr;
         if (o.search && out.contains("search")) {
@@ -388,6 +547,53 @@ int runSeam(const SeamOptions& o) {
                 pj["nccAfter"] = after.value();
             } else {
                 pj["nccError"] = after.error().message;
+            }
+            // [WP-STEADY] The same with the clip's steady grid instead of this
+            // frame's own, rendered by the kernel on the same band.
+            render::WarpGridView steadyView;
+            if (steady && steady->grid && steady->grid->valid()) {
+                steadyView.uv = steady->grid->uv.data();
+                steadyView.w = steady->grid->w;
+                steadyView.h = steady->grid->h;
+                steadyView.latMinRad = steady->grid->latMinRad;
+                steadyView.latMaxRad = steady->grid->latMaxRad;
+                auto held = render::overlapNcc(P.rig, pair.value(), P.blendParams, band, *P.pool, seamIn, &steadyView);
+                if (held.ok()) {
+                    pj["nccAfterSteady"] = held.value();
+                }
+            }
+            // [WP-STEADY] --regions: every named window uncorrected, with this
+            // frame's grid and (with --steady) with the clip grid, each
+            // rendered through the kernel on the scored band.
+            if (!regions.empty()) {
+                const auto renderScored = [&](const render::WarpGridView* w) {
+                    return render::renderLensBands(P.rig, pair.value(), P.blendParams, band, false, seamIn, *P.pool,
+                                                   w);
+                };
+                auto none = render::renderLensBands(P.rig, pair.value(), P.blendParams, band, false, nullptr,
+                                                    *P.pool);
+                auto own = renderScored(&view);
+                std::optional<Result<render::LensBands>> held;
+                if (steadyView.valid()) {
+                    held = renderScored(&steadyView);
+                }
+                nlohmann::json rs;
+                for (const NamedRegion& r : regions) {
+                    nlohmann::json one;
+                    const auto put = [&](const char* key, const Result<render::LensBands>& b) {
+                        if (b.ok()) {
+                            const RegionScore s = scoreRegion(b.value(), r.c0, r.c1);
+                            one[key] = {{"ncc", s.ncc}, {"meanAbsDiff", s.meanAbsDiff}, {"samples", s.samples}};
+                        }
+                    };
+                    put("none", none);
+                    put("parallax", own);
+                    if (held) {
+                        put("steady", *held);
+                    }
+                    rs[r.name] = one;
+                }
+                pj["regions"] = rs;
             }
             // Region score: the same column window uncorrected, with the seam
             // table (when searched), and with the parallax grid on top.
@@ -487,6 +693,13 @@ void registerSeamCommand(CLI::App& app, CommandContext& ctx) {
     sub->add_option("--flow-backend", opt->flowBackend, "auto|classical|neural")->default_str("auto");
     sub->add_option("--region", opt->region, "Also score band columns c0-c1 (of 2048, wraps) with --parallax");
     sub->add_option("--dump-bands", opt->dumpBands, "Write raw float32 lens bands to this path prefix (diagnostic)");
+    // [WP-STEADY]
+    sub->add_flag("--lens-align", opt->lensAlign,
+                  "Fit the clip's lens rotation on its fixed rotation frames and fold it into the rig first");
+    sub->add_flag("--steady", opt->steady,
+                  "Measure the per-clip steady correction and score it next to this frame's own grid (--parallax)");
+    sub->add_option("--regions", opt->regions,
+                    "Named column windows scored with --parallax: name:c0-c1[,name:c0-c1...] (of 2048, wraps)");
     sub->add_flag("--photo", opt->photo,
                   "Measure the photometric seam field and score the sky seam (off / inset / rim / full) over --region");
     sub->add_option("--photo-band-w", opt->photoTuning.band.equirectW, "Photo analysis band width (tuning)")
