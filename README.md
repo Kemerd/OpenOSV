@@ -1,6 +1,6 @@
 <div align="center">
 
-# OpenOSV
+<img src="img/banner.png" alt="OpenOSV for Adobe Premiere: natively import .OSV files, automatically grade D-Log M to HDR, better stitching with lens correction and sky banding removal, native Windows support with CUDA GPU acceleration, completely customisable settings. Open source and completely free." width="100%">
 
 ### DJI Osmo 360 footage, straight into Premiere Pro on Windows, with a better stitch and real HDR.
 
