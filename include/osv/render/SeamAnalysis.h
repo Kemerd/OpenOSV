@@ -10,6 +10,12 @@
 // All three render each lens alone into a small polar-axis equirect band with
 // the CPU reference renderer, so they are backend independent and exercise
 // exactly the mapping the final render uses.
+//
+// Frames that live in VRAM (a keepOnDevice decode, RenderJob::planesOnDevice)
+// are shaded by the installed DeviceBandShader instead - the same shared
+// osvShadePixelW on the GPU (see DeviceBandShader.h, installCudaAnalyses()).
+// Without one installed, such frames are refused with InvalidArgument rather
+// than read as host memory.
 #pragma once
 
 #include "osv/core/Result.h"

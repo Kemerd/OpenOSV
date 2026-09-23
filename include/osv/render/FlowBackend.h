@@ -22,6 +22,11 @@
 //                    file, a runtime dependency and a GPU, and its output is
 //                    only as reproducible as the inference stack.
 //
+//   Classical, CUDA  The same DIS with the same constants, run on the GPU so
+//                    the measurement is effectively free and can work from
+//                    frames that never leave VRAM.  Needs the CUDA library to
+//                    have installed itself (see setCudaFlowBackendFactory).
+//
 // DJI ships both kinds and picks one per product; here the user picks,
 // which is strictly more useful.
 //
@@ -58,6 +63,15 @@ enum class FlowBackendKind : int {
     Classical = 1,
     /// A neural network through ONNX Runtime, on CUDA when present.
     Neural = 2,
+    /// Dense Inverse Search on an NVIDIA GPU: the same maths and the same
+    /// DJI constants as Classical, ported to CUDA (osv_render_cuda,
+    /// CudaAnalysis.h).  It lives in the CUDA library, which this one cannot
+    /// link, so it is available only once that library has installed its
+    /// factory (installCudaAnalyses()); until then it reports itself
+    /// unavailable and computeFlow() falls back to Classical.  Never chosen
+    /// by Auto: a caller asks for it explicitly, so no existing selection
+    /// changes behind anyone's back.
+    ClassicalCuda = 3,
     Count
 };
 
@@ -153,5 +167,26 @@ protected:
 /// without ONNX Runtime returns false here, while a build with it returns
 /// true even on a machine with no model file installed.
 [[nodiscard]] bool haveNeuralFlowBackend() noexcept;
+
+/// Factory for a backend implemented OUTSIDE this library.
+///
+/// Must never return null for a kind it was installed for; returning a
+/// backend whose isAvailable() is false is the way to say "cannot run here".
+/// Must be callable from any thread.
+using FlowBackendFactory = std::unique_ptr<FlowBackend> (*)(const FlowBackendParams& params);
+
+/// Install (or, with nullptr, remove) the factory behind
+/// FlowBackendKind::ClassicalCuda.
+///
+/// WHY A HOOK: the CUDA solver lives in osv_render_cuda, which links this
+/// library - the dependency runs cpu -> cuda and must not be inverted - so
+/// this library cannot construct it directly.  The CUDA library installs its
+/// factory here instead (installCudaAnalyses() in CudaAnalysis.h), and
+/// makeFlowBackend() consults it.  Thread-safe; takes effect for every
+/// makeFlowBackend() call that starts after it returns.
+void setCudaFlowBackendFactory(FlowBackendFactory factory) noexcept;
+
+/// The factory currently installed for ClassicalCuda, or nullptr.
+[[nodiscard]] FlowBackendFactory cudaFlowBackendFactory() noexcept;
 
 }  // namespace osv::render
