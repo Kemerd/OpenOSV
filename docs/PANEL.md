@@ -10,6 +10,15 @@ see the timeline, so this is a small Premiere panel called **OpenOSV**:
   Drag Sensitivity for every effect the panel applies.
 * **Apply to selected clips** and **Apply to all OSV clips in this sequence**,
   for clips that were already on the timeline.
+* **Program Monitor controls**: every gesture of the effect's overlay, one
+  line each, open for a new user and folded away once you've read it.
+* **Manual Framing**: DJI Studio's five looks, a Zoom stepper along DJI
+  Studio's zoom path, and live FOV / Correction / Pan / Tilt / Roll of the
+  selected clip at the playhead.
+* **Keyframe Animation**: DJI Studio's seven easing presets, for the selected
+  clips or every OSV clip of the sequence.
+* **Stabilisation**: RockSteady, Horizon Leveling or Off, set on the master
+  clips' OpenOSV Source Settings.
 * A status line with the last action, how many clips it touched, and when.
 
 It ships in two builds, **UXP** and **CEP**, that share everything except the
@@ -170,6 +179,145 @@ effect's group markers. A keyframed parameter is never written. Drag
 Sensitivity is clamped to the effect's 0.1-10 range and written only when it
 differs from the effect's value.
 
+## Framing, easing and stabilisation
+
+Four cards bring DJI Studio's per-clip tools into Premiere: the overlay's
+controls near the top, then Manual Framing, Keyframe Animation and
+Stabilisation under the apply buttons. They work on clips, not through Effect
+Controls, so Keyframe Animation and Stabilisation handle twenty clips as
+easily as one.
+
+### Program Monitor controls
+
+A short card right under the auto-apply switch lists what the effect's overlay
+does, one line per gesture, each with a key-cap label:
+
+| Keys | What it does |
+|---|---|
+| `Drag` | Pan and tilt. Left-right pans, up-down tilts. |
+| `Shift` + drag | Lock to one axis. |
+| `Ctrl` + drag | Zoom. Down widens. On the DJI lens, along DJI Studio's zoom path. |
+| `Alt` + drag | Roll. So does dragging the ring. |
+| `Corner` | Drag a corner grip up or down to zoom. |
+
+and ends with the one thing everybody trips on: the overlay only shows while
+Open 360 Reframe is selected in Effect Controls. Every line is taken from the
+overlay's own code (`ReframeUi.cpp`, `resolveDragMode` and `applyDrag`).
+
+The card is **open the first time the panel opens** and remembers being folded
+from then on (`hintOpen` in the stored settings). Folding springs the height
+and fades the lines; the chevron turns with it.
+
+**What the panel doesn't do, and why:**
+
+* **Scroll-wheel zoom.** The effect SDK has no mouse-wheel event (see
+  `PREMIERE.md`, "Program Monitor overlay"), and the only other route, a
+  global Windows mouse hook inside Premiere's process, is fragile for what it
+  buys. `Ctrl` + drag zooms along the same path. There are no hotkeys either.
+* **Selecting the effect for you.** A toggle that selects Open 360 Reframe in
+  Effect Controls whenever an OSV clip is selected would save a click, but
+  neither API can select a component. UXP's `Component` offers
+  `getDisplayName`, `getMatchName`, `getParam` and `getParamCount`;
+  ExtendScript's has `displayName`, `matchName` and `properties`. The QE DOM
+  is undocumented. So there is no toggle.
+
+### Manual Framing
+
+The card follows the **one selected OSV clip** at the playhead: it re-reads on
+Premiere's selection event (`SequenceEvent.SELECTION_CHANGED` in UXP,
+`onActiveSequenceSelectionChanged` in CEP) and once a second while the panel
+runs, and pauses while an action runs. With nothing to frame it says why (no
+sequence, no selection, more than one clip, not OSV, no effect, playhead
+outside the clip) and dims its buttons.
+
+* **Read-outs**: FOV, Correction (Distortion on Classic), Pan, Tilt and Roll,
+  the host's values at the playhead. The Zoom figure is DJI Studio's read-out
+  on the DJI lens (the effect's own `djiZoomDeg`) and the FOV on Classic.
+* **Crystal Ball, Asteroid, Ultra Wide, Wide, Dewarp**: write exactly what the
+  effect writes when its own Preset popup changes (`EffectMain.cpp`,
+  `USER_CHANGED_PARAM`): both lenses' numbers for the sequence's shape, Tilt,
+  the Zoom read-out, Lens = DJI and the Preset entry. The panel writes them all
+  because nothing documents that a scripted Preset change reaches the
+  effect's supervision.
+* **Zoom -/+**: one press is DJI Studio's zoom path, FOV +/- 6.5 degrees and
+  Correction +/- 0.05, clamped to DJI Studio's limits widened to wherever the
+  lens started (a Crystal Ball's 1.8 isn't snapped to 1.0). On Classic the
+  same 6.5 degree FOV step. Preset becomes Custom, as it does for a hand edit.
+* **Keyframes**: a control that is already keyframed gets a keyframe at the
+  playhead (added, or updated if one is there); any other control is set.
+  The status line says "keyed at the playhead" when that happened. Effect
+  keyframes live on the clip's media time, so the panel keys at
+  `playhead - clip start + in point`.
+
+### Keyframe Animation
+
+Seven tiles, DJI Studio's presets in DJI Studio's order: None, Linear Smooth,
+Fast In / Slow Out, Slow In / Fast Out, Fast In / Fast Out, Slow In /
+Slow Out, Linear. Each tile draws its speed profile between two keyframe dots,
+from the same polynomials the effect renders (`osvcore.js` `easeSpeed` and
+`ReframeEasing.cpp`, held together by a test); None is a crossed circle. Pick
+one, then:
+
+* **Apply to selected clips** or **Apply to all OSV clips in this sequence**
+  set the Keyframe Easing popup of every Open 360 Reframe on those clips.
+  Clips without the effect are skipped and counted ("2 clips have no Open 360
+  Reframe; skipped."), and clips that already had the preset are counted too.
+
+What the presets do, and which are exact, is in `PREMIERE.md`, "Keyframe
+Easing (id 22)".
+
+### Stabilisation
+
+A segmented control with DJI Studio's names, applied to the **master clips**
+of the selected OSV clips, because stabilisation lives in the importer's
+Source Settings, not on the timeline:
+
+| DJI Studio | OpenOSV Source Settings | Why |
+|---|---|---|
+| Off | Off | |
+| RockSteady | Smooth | RockSteady on a 360 clip removes the shake but keeps turning with the camera's heading. Full would lock the view to the first frame's direction. |
+| Horizon Leveling | Horizon Lock | Heading follows, pitch and roll level. |
+
+**How it reaches Source Settings.** The Source Settings effect is a master
+clip's effect, so the panel looks for `OpenOSV.SourceSettings` in the master
+clip's own video effects: `ClipProjectItem.getComponentChain(MediaType.VIDEO)`
+in UXP, `ProjectItem.videoComponents()` in ExtendScript ("Video components
+for the 'Master Clip'"). It writes the Stabilisation popup there, never
+anything else. A Premiere whose API has neither call gets a card that says
+so, and Source Settings stay one right-click away.
+
+### Popup numbering, again
+
+Every new action writes a popup (Keyframe Easing, Preset, Lens,
+Stabilisation), so the panel keeps what it learned about the host's popup
+numbering between sessions (`popupBase`). It learns only from readings that
+settle it: a 0 anywhere, or a popup reading its own entry count. An untouched
+effect on a host that counts from 1 settles nothing, so UXP briefly makes a
+fresh effect component (never added to a clip) and reads its Lens. If the
+numbering is still unknown the action writes nothing and the status line says
+to apply the effect with the panel once.
+
+### Undo, per route
+
+| Action | UXP | CEP |
+|---|---|---|
+| Keyframe Animation, any number of clips | **one** step, "Set Open 360 Reframe keyframe easing" | one step per effect changed |
+| A Manual Framing preset | **one** step, "Frame Open 360 Reframe" | one step per value written (9 at most), one more for each new keyframe |
+| A Zoom press | **one** step, "Frame Open 360 Reframe" | one step per value written (2 to 4), one more for each new keyframe |
+| Stabilisation, any number of clips | **one** step, "Set OpenOSV stabilisation" | one step per master clip changed |
+
+**UXP** builds every write of a press as actions (`createSetValueAction`,
+or `createAddKeyframeAction` for a keyframed control) and commits them in one
+`Project.executeTransaction()` ("Execute undoable transaction by passing
+compound action") inside `lockedAccess()`. One Ctrl+Z undoes the press.
+
+**CEP** has no undo grouping to use: the Scripting Guide's Application,
+Project and ComponentParam pages document none, so each `setValue` /
+`setValueAtKey` is expected to be its own History step (limit 11 below). The
+Keyframe Animation card says
+"This Premiere undoes it one clip at a time", and a multi-clip apply adds
+"Undo takes one Ctrl+Z per clip." to the status line.
+
 ## Which route, and why
 
 The job has three parts, and the two platforms differ on each:
@@ -250,8 +398,13 @@ panel/
 **The adapter contract** (`uxpAdapter.js` has the full comment):
 `init(onEvent)`, `dispose()`, `getActiveSequence()`, `getSequenceIds()`,
 `signature()`, `scan(seq, {selectedOnly})`, `apply(seq, items, settings)` and
-`checkEffect()`. The controller is the only caller, and it runs everything on
-one promise chain, so passes never overlap each other or a button press.
+`checkEffect()`, plus `capabilities()` (`{undoGroups, stabilization}`),
+`setEasing(seq, items, {entry, popupBase})`, `readFraming(seq, {popupBase})`,
+`writeFraming(seq, request)` and `setStabilization(seq, items, {entry,
+popupBase})` for the four cards. The controller is the only caller, and it
+runs everything on one promise chain, so passes never overlap each other or a
+button press. An adapter without one of the newer calls turns a press into a
+status line, never an exception.
 
 **Identity.** The effect's PiPL match name is `OpenOSV.Open360Reframe`, and
 Premiere registers it as `AE.OpenOSV.Open360Reframe`, the name
@@ -269,7 +422,12 @@ build instead of shipping a panel that never finds its effect.
   * a switch for on/off;
   * a segmented control for DJI | Classic;
   * a slider with a live value for drag sensitivity, dimmed while it's off;
-  * a filled button for the likely action and a tinted one for the broader one.
+  * a filled button for the likely action and a tinted one for the broader one;
+  * a disclosure card with a turning chevron for the controls list, key caps
+    for its keys;
+  * a grid of picture tiles for the easing presets (a radio group; Tab to a
+    tile, Enter or Space picks it), chips for the framing looks, a stepper
+    for Zoom, and small read-outs whose Zoom figure glides to a new value.
 * **Inset grouped cards** with hairline separators and a small section title
   ("New effects start with"), on a 12-14 px rhythm. The typeface is SF on a
   Mac and Segoe UI on Windows.
@@ -298,7 +456,7 @@ build instead of shipping a panel that never finds its effect.
 
 ## Tests
 
-`node panel/tests/run.js` (Node 18+, no npm packages) runs 126 tests. ctest
+`node panel/tests/run.js` (Node 18+, no npm packages) runs 162 tests. ctest
 registers them as `panel.js` only when Node 18+ is found, so a machine without
 Node still passes the suite.
 
@@ -310,8 +468,9 @@ Node still passes the suite.
 | `uxpAdapter.test.js` | the UXP route against a mock of the documented UXP DOM that enforces the `lockedAccess` rule; never doubles, refused transactions, the race check, track listeners following new tracks, and a full drop-to-effect run through the real controller |
 | `hostjsx.test.js` | host.jsx in a mock ExtendScript + QE world: ES3-only source, QE items across gaps, the DOM double-check, name-checked writes, JSON escaping, never throwing |
 | `cepAdapter.test.js` | the CEP route end to end: adapter, evalScript bridge, the real host.jsx and the mock DOM, including a drop-to-effect run |
-| `view.test.js` | the interface in a fake DOM: every control reaches the controller, busy and error states, the status stamp, themes, springs landing on exact pixels |
-| `identity.test.js` / `lint.test.js` | constants against the C++ sources and both manifests; no `?.` / `??` (CEP 10 is Chromium 74), no CSS UXP lacks, no raw U+2028 |
+| `easing.test.js` | the four cards: the tile curves against the effect's polynomials, popup numbering learned only from settling readings, the two FOVs told apart by their neighbours, DJI Studio's zoom path and preset values, component time; on UXP one undo step per press, keyframes at the playhead, a fresh effect asked for the numbering, Stabilisation through the master clip's chain; on CEP `addKey` + `setValueAtKey` and `videoComponents()`; the controller's read-out poll, selection event and remembered choices |
+| `view.test.js` | the interface in a fake DOM: every control reaches the controller, busy and error states, the status stamp, themes, springs landing on exact pixels, the controls card open for a new user, the preset grid, the framing read-outs and their reasons, the CEP undo note |
+| `identity.test.js` / `lint.test.js` | constants against the C++ sources and both manifests (the easing popup's entries, DJI Studio's preset table, the zoom path, the Source Settings popups); no `?.` / `??` (CEP 10 is Chromium 74), no CSS UXP lacks, no raw U+2028 |
 
 **Verified without launching Premiere:**
 
@@ -346,6 +505,22 @@ Each of these is documented but hasn't been observed in Premiere yet:
    The script treats 0 as success and prints UPIA's own output either way.
 7. **The Creative Cloud confirmation** for a `.ccx` that isn't from the
    Marketplace is expected, per Adobe's install guide.
+8. **Source Settings in the master clip's effects.** The Stabilisation card
+   relies on Premiere listing the importer's Source Settings effect in
+   `ClipProjectItem.getComponentChain(MediaType.VIDEO)` (UXP) and
+   `ProjectItem.videoComponents()` (ExtendScript), and on a scripted change
+   reaching the importer the way a change in the Source Settings dialog does.
+   If Premiere keeps it elsewhere, the status line says the master clip
+   "shows no OpenOSV Source Settings to the panel" and nothing is written.
+9. **Component time.** Keyframes are placed at
+   `playhead - clip start + in point`, the clip's media time. That ignores
+   clip speed, so on a sped-up or slowed clip a keyframe may land off the
+   playhead.
+10. **Inline SVG in UXP.** The tile icons and chevrons are SVG made with
+    `createElementNS`. Without it a tile shows a text glyph; if UXP has the
+    call but draws nothing, the tiles still carry their names.
+11. **CEP undo.** Measured against the Scripting Guide, not a live History
+    panel: each `setValue` / `setValueAtKey` is expected to be its own step.
 
 ## Sources
 
@@ -358,7 +533,10 @@ Each of these is documented but hasn't been observed in Premiere yet:
   * [EventManager](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/eventmanager/)
   * [Constants](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/constants/) (`VideoTrackEvent`, `SequenceEvent`, `ProjectEvent`, `TrackItemType`)
   * [VideoTrack](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/videotrack/)
-  * [ClipProjectItem](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/clipprojectitem/)
+  * [ClipProjectItem](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/clipprojectitem/) (`getComponentChain(mediaType)`: the master clip's effects)
+  * [Sequence](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/sequence/) (`getPlayerPosition`, `getFrameSize`)
+  * [Keyframe](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/keyframe/) (`position`) and [TickTime](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/ticktime/) (`createWithTicks`)
+  * `Project.executeTransaction`: "Execute undoable transaction by passing compound action"
 * [Premiere UXP changelog](https://developer.adobe.com/premiere-pro/uxp/changelog/): official in 25.6.0; since 26.3, actions must be created inside `lockedAccess`.
 * Adobe's UXP sample panel, premiere-api (repo at 2026-09-22):
   * [eventManager.ts](https://github.com/AdobeDocs/uxp-premiere-pro-samples/blob/main/sample-panels/premiere-api/src/eventManager.ts): what `TRACK_CHANGED` fires for, and the capture phase for project events.
@@ -374,6 +552,11 @@ Each of these is documented but hasn't been observed in Premiere yet:
   * [PProPanel ReadMe](https://github.com/Adobe-CEP/Samples/blob/master/PProPanel/ReadMe.md): CEP superseded as of 25.6, supported for a calendar year; `PlayerDebugMode` per CSXS version.
   * [PProPanel Premiere.jsx](https://github.com/Adobe-CEP/Samples/blob/master/PProPanel/jsx/PPRO/Premiere.jsx): `app.bind('onActiveSequenceTrackItemAdded' / 'onActiveSequenceStructureChanged' / 'onActiveSequenceChanged')`, CSXSEvent dispatch.
 * [Premiere Pro Scripting Guide](https://ppro-scripting.docsforadobe.dev/): `app.bind`, `app.enableQE`, TrackItem, ComponentParam `setValue`.
+  * [ComponentParam](https://ppro-scripting.docsforadobe.dev/sequence/componentparam/): `addKey`, `setValueAtKey`, `findNearestKey`, `getValueAtTime`, `isTimeVarying`; no undo grouping.
+  * [Component](https://ppro-scripting.docsforadobe.dev/sequence/component/): `displayName`, `matchName`, `properties`; nothing selects one.
+  * [ProjectItem.videoComponents()](https://ppro-scripting.docsforadobe.dev/item/projectitem/#projectitemvideocomponents): "Video components for the 'Master Clip'".
+  * [Application](https://ppro-scripting.docsforadobe.dev/application/application/): no undo grouping.
+* Adobe's PProPanel sample binds `onActiveSequenceSelectionChanged`, which the CEP build uses to follow the selection.
 * QE, unofficial:
   * Adobe forum, [ExtendScript: No longer able to add effects using QE DOM](https://community.adobe.com/t5/premiere-pro/extendscript-no-longer-able-to-add-effects-using-qe-dom/m-p/11353312) (Adobe's Bruce Bullis on QE reliability, and the `getVideoEffectByName` + `addVideoEffect` pattern).
   * Adobe forum, [How to find a trackitem with QE scripting](https://community.adobe.com/t5/premiere-pro-discussions/how-to-find-a-trackitem-with-qe-scripting/m-p/12455360): gaps are QE items.
