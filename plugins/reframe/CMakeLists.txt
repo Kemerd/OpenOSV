@@ -124,6 +124,10 @@ osv_add_premiere_plugin(Open360Reframe
     ReframeCpu.cpp
     ReframeCpu.h
     ReframeParams.h
+    # The direct fisheye -> view path (docs/DIRECT_GPU.md, WP-C): the
+    # parameter builder and its CPU twin.
+    DirectRender.cpp
+    DirectRender.h
     # The interactive Program Monitor overlay.  Two translation units on
     # purpose: ReframeUi.cpp is the pure interaction maths and names no Adobe
     # type, so the tests compile the very same source the .aex contains and
@@ -139,6 +143,7 @@ osv_add_premiere_plugin(Open360Reframe
 
 # The generated sources are produced by the custom commands above.
 set_source_files_properties("${_osv_reframe_fatbin_cpp}" PROPERTIES GENERATED TRUE)
+
 
 target_include_directories(Open360Reframe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
