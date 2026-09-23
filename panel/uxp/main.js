@@ -33,33 +33,50 @@
     var uxp = tryRequire('uxp');
 
     /**
+     * Close to Premiere's panel grey per theme, for hosts older than 26.5,
+     * which cannot say the exact colour.  Only a fallback: without it a light
+     * theme would show the light cards on the stylesheet's dark page.
+     */
+    var APPROXIMATE_GREY = {
+        darkest: 'rgb(29,29,29)',
+        dark: 'rgb(35,35,35)',
+        medium: 'rgb(50,50,50)',
+        light: 'rgb(232,232,232)',
+        lightest: 'rgb(245,245,245)'
+    };
+
+    /**
      * Premiere's theme: document.theme.getCurrent() names it ("light",
      * "lightest", "dark", "darkest"), and on 26.5+ uxp.host.getBackgroundColor()
      * gives the exact panel grey so the panel sits flush with its neighbours.
      */
     var theme = {
         read: function () {
-            var name = 'dark';
+            var current = 'dark';
             try {
-                var current = (document.theme && typeof document.theme.getCurrent === 'function')
+                current = (document.theme && typeof document.theme.getCurrent === 'function')
                     ? String(document.theme.getCurrent()) : 'dark';
-                name = current.indexOf('light') !== -1 ? 'light' : 'dark';
             } catch (err) {
-                name = 'dark';
+                current = 'dark';
             }
+            var name = current.indexOf('light') !== -1 ? 'light' : 'dark';
+            var fallback = {
+                name: name,
+                background: APPROXIMATE_GREY[current] || (name === 'light' ? APPROXIMATE_GREY.light : APPROXIMATE_GREY.dark)
+            };
             var host = uxp && uxp.host;
             if (!host || typeof host.getBackgroundColor !== 'function') {
-                return { name: name };
+                return fallback;
             }
             return Promise.resolve(host.getBackgroundColor()).then(function (text) {
                 var parsed = typeof text === 'string' ? JSON.parse(text) : text;
                 var v = parsed && parsed.value;
                 if (!v || !isFinite(v.red) || !isFinite(v.green) || !isFinite(v.blue)) {
-                    return { name: name };
+                    return fallback;
                 }
                 var to255 = function (c) { return Math.round(Math.max(0, Math.min(1, c)) * 255); };
                 return { name: name, background: 'rgb(' + to255(v.red) + ',' + to255(v.green) + ',' + to255(v.blue) + ')' };
-            }).then(null, function () { return { name: name }; });
+            }).then(null, function () { return fallback; });
         },
         subscribe: function (cb) {
             if (document.theme && document.theme.onUpdated && typeof document.theme.onUpdated.addListener === 'function') {

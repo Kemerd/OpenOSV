@@ -812,6 +812,13 @@ var OpenOSVHost = (function () {
                 } catch (e) {
                     label = 'a clip';
                 }
+                // A fresh QE sequence per clip: QE's model is known to lag
+                // behind edits, and the previous clip's effect was one.
+                try {
+                    qeSeq = q.project.getActiveSequence() || qeSeq;
+                } catch (e) {
+                    // Keep the one we have.
+                }
                 var qeItem = qeItemFor(qeSeq, found.trackIndex, found.clip, found.ordinal);
                 if (!qeItem) {
                     fail('couldn\'t find "' + label + '" in Premiere\'s QE timeline');
