@@ -91,8 +91,9 @@ resource 'PiPL' (16000) {
             OSV_REFRAME_OUT_FLAGS_2
         },
 
-        /* [10] The permanent identity.  xGPUFilterEntry reports the same
-         * string, which is how the GPU renderer is bound to this effect. */
+        /* [10] The permanent identity.  xGPUFilterEntry leaves its match
+         * name NULL, which binds the GPU renderer to THIS resource's effect
+         * (registered by Premiere as "AE." + this string). */
         AE_Effect_Match_Name {
             OSV_REFRAME_MATCH_NAME
         },

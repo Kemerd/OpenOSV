@@ -348,16 +348,26 @@ TEST_CASE("xGPUFilterEntry startup fills the whole function table", "[reframe][g
     CHECK(scope.info().outInterfaceVersion == PrSDKGPUFilterInterfaceVersion2);
 }
 
-TEST_CASE("xGPUFilterEntry reports the effect's match name", "[reframe][gpu]") {
+TEST_CASE("xGPUFilterEntry leaves the match name null so the host binds it to this module's PiPL",
+          "[reframe][gpu]") {
     MockHost host;
     GpuEntryScope scope(host);
     REQUIRE(scope.result() == suiteError_NoError);
 
-    // The GPU renderer is bound to the software effect BY THIS STRING.  If
-    // it does not equal the PiPL's AE_Effect_Match_Name, Premiere loads both
-    // and connects neither.
-    const std::string matchName = host.utf8(scope.info().outMatchName);
-    CHECK(matchName == OSV_REFRAME_MATCH_NAME);
+    // A non-null outMatchName "must be equal to a registered software
+    // filter" (PrSDKGPUFilter.h), and Premiere registers an AE-API effect
+    // as "AE." + its PiPL match name.  Reporting the bare PiPL string named
+    // no registered filter at all, so Premiere loaded the GPU entry and never
+    // created an instance - the effect rendered on the CPU in every real
+    // session.  NULL means "the software effect of this module's PiPL",
+    // which is exactly this effect, whatever prefix the host adds.
+    const PrSDKString& name = scope.info().outMatchName;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(&name);
+    bool allZero = true;
+    for (std::size_t i = 0; i < sizeof(PrSDKString); ++i) {
+        allZero = allZero && bytes[i] == 0;
+    }
+    CHECK(allZero);
 }
 
 TEST_CASE("xGPUFilterEntry declines a host interface older than 2", "[reframe][gpu]") {

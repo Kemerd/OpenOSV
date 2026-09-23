@@ -4,9 +4,11 @@
 // GpuFilter.cpp - the xGPUFilterEntry side of Open 360 Reframe.
 //
 // Premiere binds a GPU renderer to a software effect BY MATCH NAME: the
-// module exports xGPUFilterEntry, reports PrGPUFilterInfo with the same
-// string EffectMain's PiPL carries, and from then on every frame the host
-// can accelerate is routed here instead of to PF_Cmd_RENDER.
+// module exports xGPUFilterEntry and reports PrGPUFilterInfo with a NULL
+// match name, which binds it to the effect this module's own PiPL declares
+// (registered by Premiere as "AE." + the PiPL match name - see the startup
+// code for why spelling the name out broke that), and from then on every
+// frame the host can accelerate is routed here instead of to PF_Cmd_RENDER.
 //
 // Deliberate design choices, each with its reason:
 //
@@ -51,7 +53,6 @@
 #include "PrSDKPPix2Suite.h"
 #include "PrSDKPPixSuite.h"
 #include "PrSDKSequenceInfoSuite.h"
-#include "PrSDKStringSuite.h"
 #include "PrSDKVideoSegmentSuite.h"
 
 #include <cuda.h>
@@ -1256,24 +1257,26 @@ extern "C" __declspec(dllexport) prSuiteError xGPUFilterEntry(csSDK_uint32 inHos
         outFilter->Render = &render;
 
         outFilterInfo->outInterfaceVersion = PrSDKGPUFilterInterfaceVersion2;
-        // Leaving outMatchName null would make the host use the module's
-        // PiPL match name, which is the same string - but being explicit
-        // means the binding cannot depend on the resource being found, and
-        // the test can read the value back.
+        // outMatchName is left NULL, which makes the host bind this GPU
+        // filter to the software effect declared by this module's own PiPL.
+        //
+        // It used to be set explicitly to OSV_REFRAME_MATCH_NAME, on the
+        // belief that it was "the same string".  It is not: the header says
+        // it "must be equal to a registered software filter", and Premiere
+        // registers an After Effects-API effect under its PiPL match name
+        // WITH an "AE." prefix - the SDK's own SDK_Segment_Utils.cpp compares
+        // kVideoSegmentProperty_Effect_FilterMatchName against
+        // "AE.ADBE Motion", and GoPro Reframe's GPU crashes are reported as
+        // "AE.GoPro VR Reframe (GPUVideoFilter::CreateInstance)".  Our
+        // explicit "OpenOSV.Open360Reframe" named a filter that does not
+        // exist, so the GPU filter was bound to nothing: every recorded
+        // Premiere session called xGPUFilterEntry at startup and never once
+        // called CreateInstance, and the effect always rendered on the CPU
+        // (the red render bar).  Adobe's GPUVideoFilter samples and the
+        // shipping GoPro plug-in both leave this NULL; so does this one.
         outFilterInfo->outMatchName = PrSDKString();
-        if (piSuites && piSuites->utilFuncs && piSuites->utilFuncs->getSPBasicSuite) {
-            SPBasicSuite* basic = piSuites->utilFuncs->getSPBasicSuite();
-            if (const PrSDKStringSuite* strings =
-                    acquire<PrSDKStringSuite>(basic, kPrSDKStringSuite, kPrSDKStringSuiteVersion)) {
-                if (strings->AllocateFromUTF8) {
-                    // prUTF8Char is an unsigned char typedef; the literal is
-                    // pure ASCII so the reinterpretation is exact.
-                    strings->AllocateFromUTF8(reinterpret_cast<const prUTF8Char*>(OSV_REFRAME_MATCH_NAME),
-                                              &outFilterInfo->outMatchName);
-                }
-                releaseSuite(basic, kPrSDKStringSuite, kPrSDKStringSuiteVersion);
-            }
-        }
+        // The suites were only needed to allocate that string.
+        (void)piSuites;
 
         PluginLog::info("reframe/gpu: startup, host interface version {}", inHostInterfaceVersion);
         return suiteError_NoError;

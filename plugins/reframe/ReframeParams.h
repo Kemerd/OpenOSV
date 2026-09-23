@@ -52,8 +52,10 @@
 #define OSV_REFRAME_CATEGORY "OpenOSV"
 
 /* The permanent identity of this effect.  Premiere stores it in project
- * files and the plug-in cache, and PrGPUFilterInfo::outMatchName must be
- * byte-identical to it or the GPU entry point is never bound to the effect.
+ * files and the plug-in cache - registered, like every AE-API effect, with an
+ * "AE." prefix ("AE.OpenOSV.Open360Reframe").  The GPU entry point binds to
+ * it by leaving PrGPUFilterInfo::outMatchName NULL (see GpuFilter.cpp for why
+ * repeating this bare string there broke the binding).
  * NEVER change this string. */
 #define OSV_REFRAME_MATCH_NAME "OpenOSV.Open360Reframe"
 
