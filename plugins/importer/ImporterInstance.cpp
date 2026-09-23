@@ -2299,6 +2299,104 @@ Result<bool> ImporterInstance::renderFrameOnGpu(std::uint32_t index, const Outpu
 //  Analysis text (File > Properties)
 // ---------------------------------------------------------------------------
 
+void ImporterInstance::appendCameraSettingsLocked(const std::function<void(const std::string&)>& line) const {
+    // What the camera recorded about its own exposure, per frame, in the djmd
+    // track (FrameMetaOfCamera).  Nothing here drives the render - the
+    // camera's auto-exposure already placed mid-grey where D-Log M expects it
+    // - but it is exactly what a user wants to see next to the clip: ISO,
+    // shutter, white balance, the metered light value.
+    //
+    // Three samples (first, middle, last frame) instead of a full scan: the
+    // Properties panel is asked for synchronously, the metadata of a long
+    // clip runs to a hundred thousand frames, and three samples still show
+    // an exposure that the auto-exposure changed during the take as a range.
+    if (m_frameCount == 0) {
+        return;
+    }
+    const std::uint32_t last = m_frameCount - 1;
+    const std::uint32_t samples[3] = {0, last / 2, last};
+    std::vector<meta::CameraFrame> cams;
+    cams.reserve(3);
+    for (const std::uint32_t index : samples) {
+        auto frame = m_track.frame(index);
+        if (frame.ok()) {
+            cams.push_back(frame.value().camera);
+        }
+    }
+    if (cams.empty()) {
+        return;  // metadata unreadable: say nothing rather than something wrong
+    }
+
+    // "142" or "142 - 400": a range only when the samples disagree.
+    auto range = [&cams](auto pick, const char* format) {
+        double lo = pick(cams.front());
+        double hi = lo;
+        for (const meta::CameraFrame& c : cams) {
+            lo = std::min(lo, static_cast<double>(pick(c)));
+            hi = std::max(hi, static_cast<double>(pick(c)));
+        }
+        char a[48] = {};
+        char b[48] = {};
+        std::snprintf(a, sizeof(a), format, lo);
+        if (hi - lo < 1e-6) {
+            return std::string(a);
+        }
+        std::snprintf(b, sizeof(b), format, hi);
+        return std::string(a) + " - " + b;
+    };
+
+    line("Camera settings (as recorded):");
+    // ISO: a positive sensor gain, 0 when the field was absent.
+    if (cams.front().iso > 0.0f) {
+        line("  ISO " + range([](const meta::CameraFrame& c) { return c.iso; }, "%.0f"));
+    }
+    // Shutter: a [num, den] rational in seconds, shown the way cameras print
+    // it, plus the shutter angle at this clip's frame rate - the number that
+    // says how much motion blur is baked in (180 degrees is the film rule).
+    const std::vector<std::int32_t>& et = cams.front().exposureTime;
+    if (et.size() >= 2 && et[0] > 0 && et[1] > 0) {
+        const double seconds = static_cast<double>(et[0]) / static_cast<double>(et[1]);
+        char buf[96] = {};
+        if (et[0] == 1) {
+            std::snprintf(buf, sizeof(buf), "  Shutter 1/%d s", et[1]);
+        } else {
+            std::snprintf(buf, sizeof(buf), "  Shutter %d/%d s", et[0], et[1]);
+        }
+        std::string text = buf;
+        if (m_rateDen > 0 && m_rateNum > 0) {
+            const double angle = 360.0 * seconds * fps();
+            if (std::isfinite(angle) && angle > 0.0) {
+                std::snprintf(buf, sizeof(buf), " (%.0f deg shutter angle at %.2f fps)", angle, fps());
+                text += buf;
+            }
+        }
+        line(text);
+    }
+    // Aperture: fixed on the Osmo 360 and recorded once per clip, as a
+    // rational ([19, 10] = f/1.9).
+    const std::vector<std::uint32_t>& fn = m_track.clip().fNumber;
+    if (fn.size() >= 2 && fn[1] > 0) {
+        char buf[48] = {};
+        std::snprintf(buf, sizeof(buf), "  Aperture f/%.1f", static_cast<double>(fn[0]) / static_cast<double>(fn[1]));
+        line(buf);
+    }
+    if (cams.front().wbCct > 0) {
+        line("  White balance " +
+             range([](const meta::CameraFrame& c) { return static_cast<double>(c.wbCct); }, "%.0f") + " K");
+    }
+    // The auto-exposure's metered light value: what the camera saw through
+    // any ND filter in front of the lens, not the scene's absolute brightness.
+    if (cams.front().aecLv > 0.0f) {
+        line("  Metered light value LV " + range([](const meta::CameraFrame& c) { return c.aecLv; }, "%.1f"));
+    }
+    if (cams.front().sensorTemperature != 0.0f) {
+        line("  Sensor temperature " +
+             range([](const meta::CameraFrame& c) { return c.sensorTemperature; }, "%.0f") + " C");
+    }
+    // Lens Protection Mode is not repeated here: the calibration block
+    // already reports it ("Lens accessory: ...").
+}
+
 std::string ImporterInstance::analysisText() const {
     std::lock_guard<std::mutex> guard(m_mutex);
 
@@ -2335,6 +2433,7 @@ std::string ImporterInstance::analysisText() const {
 
     line(std::string("Source colour mode: ") + meta::colorModeName(m_format.colorMode) +
          (m_format.colorModeFromMetadata ? " (from metadata)" : " (inferred)"));
+    appendCameraSettingsLocked(line);
     const char* outName = "BT.2100 PQ";
     switch (m_prefs.color()) {
     case PrefsColorOutput::HLG:    outName = "BT.2100 HLG"; break;

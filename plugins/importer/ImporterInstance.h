@@ -64,6 +64,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -392,6 +393,13 @@ public:
     /// Human-readable summary for imAnalysis (camera, mode, colour, lens,
     /// frame rate, calibration slot).  CR/LF line endings as the host wants.
     [[nodiscard]] std::string analysisText() const;
+
+    /// The "Camera settings (as recorded)" block of analysisText(): ISO,
+    /// shutter (with its shutter angle at the clip's frame rate), aperture,
+    /// white balance, metered light value and sensor temperature, read from
+    /// the djmd metadata of the first, middle and last frame.  Caller holds
+    /// m_mutex.  `line` appends one line.
+    void appendCameraSettingsLocked(const std::function<void(const std::string&)>& line) const;
 
     /// Diagnostics gathered while opening (calibration warnings, scaling
     /// notes); written to the log once after open().
