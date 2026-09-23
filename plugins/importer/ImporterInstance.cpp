@@ -873,81 +873,18 @@ std::string ImporterInstance::rendererName() const {
 //  Rendering
 // ---------------------------------------------------------------------------
 
-Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t index, const OutputGeometry& geometry,
-                                                                bool draft, RenderPurpose purpose) {
-    // The caller holds m_mutex (see the header contract); nothing here locks
-    // again or the instance would deadlock on itself.
-    if (!m_parsed) {
-        return Error{ErrorCode::InvalidArgument, "renderFrame before the clip was opened"};
-    }
-    if (!geometry.valid()) {
-        return Error{ErrorCode::InvalidArgument, "renderFrame with an empty output geometry"};
-    }
-    if (index >= m_frameCount) {
-        return Error{ErrorCode::InvalidArgument, "frame index " + std::to_string(index) + " beyond the clip"};
-    }
-
+ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t index, const video::FramePair& pair,
+                                                                 bool draft, RenderPurpose purpose, ThreadPool& pool,
+                                                                 render::RenderParamsBuilder& builder) {
+    // The caller holds m_mutex (renderFrame's contract), which is also what
+    // guards the seam and gain caches below; the parallax state has its own
+    // m_parallaxMutex because the background worker touches it.
+    //
+    // The same three conditions renderFrame uses for its cache key, derived
+    // from the same inputs so the two can never disagree.
     const bool wantSeam = m_prefs.seamSearch != 0 && !draft;
-    // The parallax correction runs under exactly the conditions the seam
-    // search does - never for a draft request (thumbnails, prefetch, playback
-    // that is already falling behind).  Its cost is amortised: one
-    // measurement per bucket of frames, off the render thread for an
-    // Interactive request (see RenderPurpose and the block below).
     const bool wantParallax = m_prefs.parallaxEnabled() && !draft;
     const bool exactWanted = purpose == RenderPurpose::Exact;
-
-    // Cache hit: the host asked for the same frame twice (it does, once per
-    // requested pixel format while scrubbing).  An Exact request is never
-    // served a frame an Interactive render built with a stand-in analysis.
-    if (m_lastFrame.matches(index, geometry, m_prefs, wantSeam, wantParallax, exactWanted)) {
-        return &m_lastFrame.image;
-    }
-
-    if (!m_colorBuilt) {
-        rebuildColor();
-    }
-    if (!m_stabBuilt) {
-        rebuildStabilization();
-    }
-
-    Status readerStatus = ensureReader();
-    if (!readerStatus.ok()) {
-        return readerStatus.error();
-    }
-
-    // ---- renderer lease ----------------------------------------------------
-    auto lease = HostContext::instance().acquireRenderer(toDevicePreference(m_prefs.device()));
-    if (!lease.ok()) {
-        return lease.error();
-    }
-    HostContext::RendererLease renderer = std::move(lease).value();
-    if (!renderer.renderer || !renderer.pool) {
-        return Error{ErrorCode::Internal, "HostContext returned an empty renderer lease"};
-    }
-    m_rendererName = renderer.backend;
-
-    // ---- decode ------------------------------------------------------------
-    auto pair = readPair(index);
-    if (!pair.ok()) {
-        return pair.error();
-    }
-
-    // ---- per-frame analyses (exactly as osvtool's render loop does them) ---
-    render::RenderParamsBuilder builder;
-    builder.rig(m_rig).color(m_color).blend(m_blend, true);
-
-    // Alpha = lens coverage (the builder's default, stated here because it
-    // has to agree with the alphaType imGetInfo8 declares).
-    //
-    // A dual-fisheye stitch is NOT opaque everywhere: the kernel writes fully
-    // transparent black wherever neither lens sees a direction, which the
-    // calibration's occlusion polygon really does produce near the camera
-    // body.  Declaring alphaOpaque and emitting coverage would let Premiere
-    // skip the alpha channel and composite garbage into those pixels, and
-    // forcing alpha to 1 would instead paint black over whatever the user
-    // put underneath.  Straight coverage alpha plus alphaStraight is the
-    // truthful pair.
-    builder.alphaCoverage(true);
 
     // ---- 2-D parallax correction (ParallaxWarp.h) --------------------------
     // When it yields a grid, the grid REPLACES the 1-D seam table instead of
@@ -1003,7 +940,7 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
         // solve - ~95 % of the cost - runs here only for an Exact request.
         if (!ownMeasured && (exactWanted || !alreadyQueued)) {
             const auto tBand = std::chrono::steady_clock::now();
-            auto bands = render::measureParallaxBands(m_rig, pair.value(), m_blend, pw, nullptr, *renderer.pool);
+            auto bands = render::measureParallaxBands(m_rig, pair, m_blend, pw, nullptr, pool);
             const double bandMs =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tBand).count();
 
@@ -1012,7 +949,7 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
                                  bands.error().message);
             } else if (exactWanted) {
                 const auto t0 = std::chrono::steady_clock::now();
-                auto grid = render::parallaxFromBands(bands.value(), pw, renderer.pool.get(), bandMs);
+                auto grid = render::parallaxFromBands(bands.value(), pw, &pool, bandMs);
                 const double ms =
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() + bandMs;
                 if (grid.ok()) {
@@ -1108,7 +1045,7 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
         auto cached = m_seamTables.find(bucket);
         if (cached == m_seamTables.end()) {
             render::SeamSearchParams sp;
-            auto profile = render::searchSeam(m_rig, pair.value(), m_blend, sp, *renderer.pool);
+            auto profile = render::searchSeam(m_rig, pair, m_blend, sp, pool);
             if (profile.ok()) {
                 cached = m_seamTables.emplace(bucket, std::move(profile).value().shiftDeg).first;
                 trimAnalysisCache(m_seamTables, kMaxAnalysisCache, bucket);
@@ -1126,7 +1063,7 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
         auto cached = m_gains.find(bucket);
         if (cached == m_gains.end()) {
             render::BandParams band;
-            auto g = render::estimateGain(m_rig, pair.value(), m_blend, band, *renderer.pool);
+            auto g = render::estimateGain(m_rig, pair, m_blend, band, pool);
             if (g.ok()) {
                 std::array<Vec3d, 2> gains{g.value().gain[0], g.value().gain[1]};
                 cached = m_gains.emplace(bucket, gains).first;
@@ -1141,6 +1078,93 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
             builder.gain(cached->second[0], cached->second[1]);
         }
     }
+
+    return AnalysisOutcome{parallaxApplied, frameExact};
+}
+
+Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t index, const OutputGeometry& geometry,
+                                                                bool draft, RenderPurpose purpose) {
+    // The caller holds m_mutex (see the header contract); nothing here locks
+    // again or the instance would deadlock on itself.
+    if (!m_parsed) {
+        return Error{ErrorCode::InvalidArgument, "renderFrame before the clip was opened"};
+    }
+    if (!geometry.valid()) {
+        return Error{ErrorCode::InvalidArgument, "renderFrame with an empty output geometry"};
+    }
+    if (index >= m_frameCount) {
+        return Error{ErrorCode::InvalidArgument, "frame index " + std::to_string(index) + " beyond the clip"};
+    }
+
+    const bool wantSeam = m_prefs.seamSearch != 0 && !draft;
+    // The parallax correction runs under exactly the conditions the seam
+    // search does - never for a draft request (thumbnails, prefetch, playback
+    // that is already falling behind).  Its cost is amortised: one
+    // measurement per bucket of frames, off the render thread for an
+    // Interactive request (see RenderPurpose and the block below).
+    const bool wantParallax = m_prefs.parallaxEnabled() && !draft;
+    const bool exactWanted = purpose == RenderPurpose::Exact;
+
+    // Cache hit: the host asked for the same frame twice (it does, once per
+    // requested pixel format while scrubbing).  An Exact request is never
+    // served a frame an Interactive render built with a stand-in analysis.
+    if (m_lastFrame.matches(index, geometry, m_prefs, wantSeam, wantParallax, exactWanted)) {
+        return &m_lastFrame.image;
+    }
+
+    if (!m_colorBuilt) {
+        rebuildColor();
+    }
+    if (!m_stabBuilt) {
+        rebuildStabilization();
+    }
+
+    Status readerStatus = ensureReader();
+    if (!readerStatus.ok()) {
+        return readerStatus.error();
+    }
+
+    // ---- renderer lease ----------------------------------------------------
+    auto lease = HostContext::instance().acquireRenderer(toDevicePreference(m_prefs.device()));
+    if (!lease.ok()) {
+        return lease.error();
+    }
+    HostContext::RendererLease renderer = std::move(lease).value();
+    if (!renderer.renderer || !renderer.pool) {
+        return Error{ErrorCode::Internal, "HostContext returned an empty renderer lease"};
+    }
+    m_rendererName = renderer.backend;
+
+    // ---- decode ------------------------------------------------------------
+    auto pair = readPair(index);
+    if (!pair.ok()) {
+        return pair.error();
+    }
+
+    // ---- per-frame analyses (exactly as osvtool's render loop does them) ---
+    render::RenderParamsBuilder builder;
+    builder.rig(m_rig).color(m_color).blend(m_blend, true);
+
+    // Alpha = lens coverage (the builder's default, stated here because it
+    // has to agree with the alphaType imGetInfo8 declares).
+    //
+    // A dual-fisheye stitch is NOT opaque everywhere: the kernel writes fully
+    // transparent black wherever neither lens sees a direction, which the
+    // calibration's occlusion polygon really does produce near the camera
+    // body.  Declaring alphaOpaque and emitting coverage would let Premiere
+    // skip the alpha channel and composite garbage into those pixels, and
+    // forcing alpha to 1 would instead paint black over whatever the user
+    // put underneath.  Straight coverage alpha plus alphaStraight is the
+    // truthful pair.
+    builder.alphaCoverage(true);
+
+    // ---- per-frame stitch analyses ------------------------------------------
+    // Seam table, exposure gains and the 2-D parallax grid, bucketed and
+    // cached per instance.  Shared with the direct GPU path, which feeds the
+    // same routine device-resident frames, so both paths use - and fill -
+    // one set of caches (see applyAnalyses).
+    const AnalysisOutcome analyses = applyAnalyses(index, pair.value(), draft, purpose, *renderer.pool, builder);
+    const bool frameExact = analyses.exact;
 
     builder.stabilization(stabilizationFor(index));
 

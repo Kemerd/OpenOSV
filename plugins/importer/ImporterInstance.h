@@ -41,6 +41,7 @@
 #include "osv/color/ColorParams.h"
 #include "osv/container/OsvFile.h"
 #include "osv/core/Result.h"
+#include "osv/core/ThreadPool.h"
 #include "osv/geom/AttitudeTrack.h"
 #include "osv/geom/Blend.h"
 #include "osv/geom/LensRig.h"
@@ -50,6 +51,7 @@
 #include "osv/meta/Types.h"
 #include "osv/render/ImageRGBAf.h"
 #include "osv/render/ParallaxWarp.h"
+#include "osv/render/RenderParamsBuilder.h"
 #include "osv/video/DualStreamReader.h"
 
 #include <array>
@@ -359,6 +361,32 @@ private:
 
     /// Body-from-world correction for a frame index (identity when off).
     [[nodiscard]] Mat3d stabilizationFor(std::uint32_t frameIndex) const;
+
+    /// What applyAnalyses() put into the builder.
+    struct AnalysisOutcome {
+        bool parallaxApplied = false;  ///< A 2-D warp grid (own, blended or borrowed) was applied.
+        /// False when an Interactive request was served a stand-in (a
+        /// neighbouring bucket's grid) because its own measurement is still
+        /// running in the background; an Exact request must never reuse it.
+        bool exact = true;
+    };
+
+    /// Run - or fetch from the per-bucket caches - the per-frame stitch
+    /// analyses for frame `index` and apply them to `builder`: the 2-D
+    /// parallax grid (bucketed, measured synchronously for an Exact request
+    /// and in the background for an Interactive one), else the 1-D seam
+    /// table, and the exposure gains.  `draft` turns the seam search and the
+    /// parallax correction off exactly as renderFrame documents.
+    ///
+    /// `pair` may hold host frames (the equirect path) or device-resident
+    /// frames (the direct GPU path); the analyses shade their bands from
+    /// whichever the frames are, and the two paths share every cache.
+    ///
+    /// The caller MUST hold lock().  Failures of an individual analysis are
+    /// logged and leave that correction out - they never fail the frame.
+    [[nodiscard]] AnalysisOutcome applyAnalyses(std::uint32_t index, const video::FramePair& pair, bool draft,
+                                                RenderPurpose purpose, ThreadPool& pool,
+                                                render::RenderParamsBuilder& builder);
 
     std::filesystem::path m_path;
     HANDLE m_fileHandle = INVALID_HANDLE_VALUE;

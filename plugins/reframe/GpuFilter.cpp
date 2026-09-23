@@ -44,6 +44,7 @@
 
 // Adobe headers are #pragma pack(push, 1); nothing of ours is declared while
 // they are open.
+#include "PrSDKColorManagementSuite.h"
 #include "PrSDKGPUDeviceSuite.h"
 #include "PrSDKGPUFilter.h"
 #include "PrSDKMemoryManagerSuite.h"
@@ -432,6 +433,64 @@ void logNode(const PrSDKVideoSegmentSuite& s, csSDK_int32 node, const char* role
                     static_cast<unsigned>(flags), props);
 }
 
+/// Log the sequence's working colour space - the space the frames an effect
+/// receives, and must return, are expressed in.  A direct render from the
+/// fisheyes bypasses Premiere's source -> working conversion, so it has to
+/// produce this space itself: the SEI codes say which transfer and primaries,
+/// and the graphics-white / tone-map / SDR-gamma settings say how Premiere
+/// scales between HDR and SDR.  Diagnostic only.
+void probeWorkingColorSpace(const Instance& inst) noexcept {
+    try {
+        // GetWorkingColorSpace and the three settings after it sit at the end
+        // of the v9 function table; reading them from an older host's shorter
+        // table would read past it.
+        if (!inst.sequence || inst.sequenceVersion < 9 || !inst.sequence->GetWorkingColorSpace) {
+            PluginLog::info("reframe/gpu/source: the Sequence Info Suite (v{}) cannot report the working colour space",
+                            inst.sequenceVersion);
+            return;
+        }
+        PrSDKColorSpaceID id{};
+        const prSuiteError idErr = inst.sequence->GetWorkingColorSpace(inst.timelineId, &id);
+        csSDK_uint32 white = 0;
+        prBool toneMap = kPrFalse;
+        csSDK_uint32 gamma = 0;
+        const prSuiteError whiteErr =
+            inst.sequence->GetGraphicsWhiteLuminance ? inst.sequence->GetGraphicsWhiteLuminance(inst.timelineId, &white)
+                                                     : suiteError_NotImplemented;
+        const prSuiteError toneErr =
+            inst.sequence->GetAutoToneMapEnabled ? inst.sequence->GetAutoToneMapEnabled(inst.timelineId, &toneMap)
+                                                 : suiteError_NotImplemented;
+        const prSuiteError gammaErr = inst.sequence->GetSDRGamma ? inst.sequence->GetSDRGamma(inst.timelineId, &gamma)
+                                                                 : suiteError_NotImplemented;
+
+        // Resolve the opaque id through the Color Management Suite.
+        PrSDKColorSpaceType type = kPrSDKColorSpaceType_Undefined;
+        prSEIColorCodesRec sei;
+        prSuiteError typeErr = suiteError_NotImplemented;
+        prSuiteError seiErr = suiteError_NotImplemented;
+        if (const PrSDKColorManagementSuite* cm = acquire<PrSDKColorManagementSuite>(
+                inst.basic, kPrSDKColorManagementSuite, kPrSDKColorManagementSuiteVersion)) {
+            if (idErr == suiteError_NoError && cm->GetColorSpaceTypeForColorSpace) {
+                typeErr = cm->GetColorSpaceTypeForColorSpace(&id, &type);
+            }
+            if (idErr == suiteError_NoError && cm->GetSEIColorCodesForColorSpace) {
+                seiErr = cm->GetSEIColorCodesForColorSpace(&id, &sei);
+            }
+            releaseSuite(inst.basic, kPrSDKColorManagementSuite, kPrSDKColorManagementSuiteVersion);
+        }
+        PluginLog::info("reframe/gpu/source: working colour space id err {} type {} (err {}); SEI primaries {} "
+                        "transfer {} matrix {} bits {} full {} rgb {} scene {} (err {}); graphics white {} nits "
+                        "(err {}), auto tone map {} (err {}), SDR gamma {} (err {})",
+                        idErr, static_cast<int>(type), typeErr, sei.colorPrimariesCode,
+                        sei.transferCharacteristicCode, sei.matrixEquationsCode, sei.bitDepth,
+                        static_cast<int>(sei.isFullRange), static_cast<int>(sei.isRGB),
+                        static_cast<int>(sei.isSceneReferred), seiErr, white, whiteErr, static_cast<int>(toneMap),
+                        toneErr, gamma, gammaErr);
+    } catch (...) {
+        // Diagnostics must never take the effect down.
+    }
+}
+
 void probeSourceGraph(const Instance& inst) noexcept {
     try {
         static std::atomic<bool> done{false};
@@ -491,6 +550,8 @@ void probeSourceGraph(const Instance& inst) noexcept {
                             static_cast<long long>(media), terr);
         }
         s->ReleaseVideoNodeID(owner);
+
+        probeWorkingColorSpace(inst);
     } catch (...) {
         // Diagnostics must never take the effect down.
     }
@@ -1002,6 +1063,18 @@ prSuiteError render(PrGPUFilterInstance* instanceData, const PrGPUFilterRenderPa
                              src.height, src.valid, dst.width, dst.height, dst.valid);
             return suiteError_Fail;
         }
+        // Once per process: what the GPU path is actually handed, and the two
+        // clocks, so the clip-time -> media-frame mapping the direct renderer
+        // needs can be checked against a real host.
+        PluginLog::oncef("reframe/gpu/first-frame", PluginLog::Level::Info,
+                         "reframe/gpu: first GPU frame - src {}x{} {}, dst {}x{} {}, clip time {}, sequence time {}, "
+                         "quality {}, downsample {:.3f}x{:.3f}, ticks/frame {}",
+                         src.width, src.height, src.isHalf ? "16f" : "32f", dst.width, dst.height,
+                         dst.isHalf ? "16f" : "32f", static_cast<long long>(renderParams->inClipTime),
+                         static_cast<long long>(renderParams->inSequenceTime),
+                         static_cast<int>(renderParams->inQuality), renderParams->inDownsampleFactorX,
+                         renderParams->inDownsampleFactorY, static_cast<long long>(renderParams->inRenderTicksPerFrame));
+
         // The host hands us an output in the same format as the input; if it
         // ever did not, writing half into a float buffer would corrupt it.
         if (src.isHalf != dst.isHalf) {
