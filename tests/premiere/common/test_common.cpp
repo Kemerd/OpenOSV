@@ -176,7 +176,11 @@ TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     // readable.  Its zero bytes read as parallax Off / backend Auto.
     static_assert(offsetof(PrefsBlob, parallax) == 20, "parallax sits at 20");
     static_assert(offsetof(PrefsBlob, flowBackend) == 21, "flowBackend follows parallax");
-    static_assert(offsetof(PrefsBlob, reserved) == 22, "reserved fills the rest");
+    // [WP-PHOTO] offsets 22-31 are other packages' (padded in this build),
+    // seamInset sits at 32 and the reserved block now starts at 33.
+    static_assert(offsetof(PrefsBlob, padBeforePhoto) == 22, "the other packages' bytes start at 22");
+    static_assert(offsetof(PrefsBlob, seamInset) == 32, "seamInset sits at 32");
+    static_assert(offsetof(PrefsBlob, reserved) == 33, "reserved fills the rest");
     static_assert(std::is_trivially_copyable_v<PrefsBlob>, "the blob is memcpy'd to and from the host");
 
     REQUIRE(sizeof(PrefsBlob) == PrefsBlob::kSize);
@@ -329,7 +333,9 @@ TEST_CASE("PrefsBlob sanitise clamps every out-of-range field", "[common][prefs]
     SECTION("dirty reserved bytes are zeroed so the cache key stays stable") {
         PrefsBlob p = PrefsBlob::defaults();
         p.reserved[0] = 0xFF;
-        p.reserved[107] = 0x01;
+        // The LAST reserved byte, whatever the block's current length (a
+        // literal index here outlived the block shrinking once already).
+        p.reserved[std::size(p.reserved) - 1] = 0x01;
         REQUIRE_FALSE(p.sanitise());
         for (const std::uint8_t b : p.reserved) {
             REQUIRE(b == 0);
@@ -1067,4 +1073,57 @@ TEST_CASE("HostContext hands out renderers and shuts down cleanly", "[common][ho
     // Shutting down twice is a no-op.
     HostContext::shutdown();
     REQUIRE_FALSE(HostContext::exists());
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-PHOTO] photometric seam fix prefs
+// ---------------------------------------------------------------------------
+
+TEST_CASE("PrefsBlob seam edge inset: zero is the default, code 1 is no inset", "[common][prefs][photoseam]") {
+    // An old project's zero byte reads as the DEFAULT inset (2.6 deg), so it
+    // gets the thinner sky seam without a Source Settings visit; the value
+    // that reproduces the render blend from before the field existed is an
+    // explicit 0 deg, stored as code 1.
+    PrefsBlob p = PrefsBlob::defaults();
+    CHECK(p.seamInset == 0);
+    CHECK(p.seamInsetDeg() == 2.6);
+
+    p.setSeamInsetDeg(0.0);
+    CHECK(p.seamInset == 1);
+    CHECK(p.seamInsetDeg() == 0.0);
+
+    p.setSeamInsetDeg(6.0);
+    CHECK(p.seamInset == PrefsBlob::kMaxSeamInsetCode);
+    CHECK(p.seamInsetDeg() == 6.0);
+
+    // The default itself is stored as code 0 so it keeps tracking the default.
+    p.setSeamInsetDeg(2.6);
+    CHECK(p.seamInset == 0);
+
+    // Rounded to a tenth, clamped to the documented range, garbage -> default.
+    p.setSeamInsetDeg(1.04);
+    CHECK(p.seamInsetDeg() == 1.0);
+    p.setSeamInsetDeg(99.0);
+    CHECK(p.seamInsetDeg() == 6.0);
+    p.setSeamInsetDeg(std::numeric_limits<double>::quiet_NaN());
+    CHECK(p.seamInset == 0);
+    p.setSeamInsetDeg(-1.0);
+    CHECK(p.seamInset == 0);
+
+    // An out-of-range code sanitises to the default, as a fresh blob has it,
+    // and so do the other packages' still-reserved bytes.
+    p.seamInset = 200;
+    p.padBeforePhoto[3] = 7;
+    CHECK(p.seamInsetDeg() == 2.6);
+    REQUIRE_FALSE(p.sanitise());
+    CHECK(p.seamInset == 0);
+    CHECK(p.padBeforePhoto[3] == 0);
+
+    // Every valid code survives sanitise untouched.
+    for (int code = 0; code <= PrefsBlob::kMaxSeamInsetCode; ++code) {
+        PrefsBlob q = PrefsBlob::defaults();
+        q.seamInset = static_cast<std::uint8_t>(code);
+        REQUIRE(q.sanitise());
+        CHECK(q.seamInset == code);
+    }
 }

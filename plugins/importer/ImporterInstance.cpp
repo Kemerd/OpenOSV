@@ -25,6 +25,7 @@
 #include "osv/geom/StreamScaling.h"
 #include "osv/meta/CalibrationSelector.h"
 #include "osv/meta/FormatDetector.h"
+#include "osv/render/PhotoSeam.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
 #if defined(OSV_HAVE_CUDA)
@@ -909,6 +910,22 @@ Mat3d ImporterInstance::stabilizationFor(std::uint32_t frameIndex) const {
     return geom::stabilizationBodyFromWorld(wfb, m_stabParams, m_referenceAttitude, m_attitude->worldUp(), smoothed);
 }
 
+// ---------------------------------------------------------------------------
+//  [WP-PHOTO] The render-only blend (photometric seam fix, stage 1)
+// ---------------------------------------------------------------------------
+
+// The blob stores the default inset as tenths of a degree; the library owns
+// the value.  Two statements of one default must not drift apart.
+static_assert(PrefsBlob::kDefaultSeamInsetTenths == 26 && render::kDefaultSeamInsetDeg == 2.6,
+              "PrefsBlob's default seam inset must match render::kDefaultSeamInsetDeg");
+
+void ImporterInstance::refreshRenderBlend() noexcept {
+    // The analysis blend with the Source Settings inset applied.  An inset of
+    // 0 returns m_blend unchanged, bit for bit, so "no inset" renders exactly
+    // as the importer did before the render blend existed.
+    m_renderBlend = render::insetRenderBlend(m_blend, m_prefs.seamInsetDeg());
+}
+
 std::string ImporterInstance::rendererName() const {
     std::lock_guard<std::mutex> guard(m_mutex);
     return m_rendererName;
@@ -1196,7 +1213,8 @@ Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_
     // analysis caches, so a direct view and the importer's equirect of the
     // same frame are stitched identically.
     render::RenderParamsBuilder builder;
-    builder.rig(m_rig).color(color).blend(m_blend, true);
+    refreshRenderBlend();  // [WP-PHOTO] the render-only inset blend; analyses keep m_blend
+    builder.rig(m_rig).color(color).blend(m_renderBlend, true);
     builder.alphaCoverage(true);
     std::shared_ptr<ThreadPool> pool = HostContext::instance().threadPoolShared();
     if (!pool) {
@@ -1291,7 +1309,8 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
 
     // ---- per-frame analyses (exactly as osvtool's render loop does them) ---
     render::RenderParamsBuilder builder;
-    builder.rig(m_rig).color(m_color).blend(m_blend, true);
+    refreshRenderBlend();  // [WP-PHOTO] the render-only inset blend; analyses keep m_blend
+    builder.rig(m_rig).color(m_color).blend(m_renderBlend, true);
 
     // Alpha = lens coverage (the builder's default, stated here because it
     // has to agree with the alphaType imGetInfo8 declares).

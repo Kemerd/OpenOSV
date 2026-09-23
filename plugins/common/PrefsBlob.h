@@ -165,7 +165,24 @@ struct PrefsBlob {
     float exposureStops = 0.0f;        ///< Exposure offset in stops.
     std::uint8_t parallax = 0;         ///< PrefsParallax; flow-based seam correction.
     std::uint8_t flowBackend = 0;      ///< PrefsFlowBackend.
-    std::uint8_t reserved[106] = {};   ///< Zero; future fields.
+    // ---- [WP-PHOTO] ---------------------------------------------------------
+    /// Offsets 22-31 belong to other packages (docs/PARALLEL_WORK.md); zero
+    /// here, and folded into their real fields at merge.
+    std::uint8_t padBeforePhoto[10] = {};
+    /// Seam edge inset of the RENDER blend (the analyses keep the calibrated
+    /// FOV): 0 = the default kDefaultSeamInsetTenths, otherwise (value - 1)
+    /// tenths of a degree, 1 = no inset (the render blend before this field
+    /// existed) up to kMaxSeamInsetCode = 6.0 deg.  See seamInsetDeg().
+    std::uint8_t seamInset = 0;
+    // ---- [/WP-PHOTO] --------------------------------------------------------
+    std::uint8_t reserved[95] = {};    ///< Zero; future fields.
+
+    /// seamInset: the default inset in tenths of a degree (2.6 deg - the
+    /// render weight then ends at 95.0 deg on the calibrated 97.59 deg lens;
+    /// mirrors osv::render::kDefaultSeamInsetDeg).
+    static constexpr std::uint8_t kDefaultSeamInsetTenths = 26;
+    /// seamInset: the largest stored code (61 = 6.0 deg).
+    static constexpr std::uint8_t kMaxSeamInsetCode = 61;
 
     /// A blob with every field at its documented default.
     [[nodiscard]] static PrefsBlob defaults() noexcept {
@@ -270,6 +287,19 @@ struct PrefsBlob {
                 clean = false;
             }
         }
+        // [WP-PHOTO] Other packages' bytes are reserved in this build, and an
+        // out-of-range inset code falls back to the default (code 0), the
+        // setting a fresh blob would have.
+        for (std::uint8_t& b : padBeforePhoto) {
+            if (b != 0) {
+                b = 0;
+                clean = false;
+            }
+        }
+        if (seamInset > kMaxSeamInsetCode) {
+            seamInset = 0;
+            clean = false;
+        }
         if (magic != kMagic || version != kVersion) {
             magic = kMagic;
             version = kVersion;
@@ -303,6 +333,30 @@ struct PrefsBlob {
     [[nodiscard]] PrefsFlowBackend flow() const noexcept { return static_cast<PrefsFlowBackend>(flowBackend); }
     /// True when the flow-based parallax correction should run.
     [[nodiscard]] bool parallaxEnabled() const noexcept { return parallaxMode() == PrefsParallax::On; }
+
+    // [WP-PHOTO]
+    /// The render-blend seam edge inset in degrees: code 0 = the default
+    /// (2.6), code v >= 1 = (v - 1) / 10, so code 1 is exactly 0 (no inset).
+    /// Out-of-range codes read as the default, like sanitise() stores them.
+    [[nodiscard]] double seamInsetDeg() const noexcept {
+        const std::uint8_t code = seamInset > kMaxSeamInsetCode ? 0 : seamInset;
+        const unsigned tenths = code == 0 ? kDefaultSeamInsetTenths : static_cast<unsigned>(code - 1);
+        return static_cast<double>(tenths) / 10.0;
+    }
+    /// Store an inset in degrees (rounded to a tenth, clamped to 0..6); the
+    /// default value is stored as code 0 so it keeps tracking the default.
+    void setSeamInsetDeg(double deg) noexcept {
+        // NaN / infinities: the default, like every other garbage input here.
+        if (!(deg >= 0.0) || deg > 1e6) {
+            seamInset = 0;
+            return;
+        }
+        long tenths = static_cast<long>(deg * 10.0 + 0.5);
+        if (tenths > static_cast<long>(kMaxSeamInsetCode - 1)) {
+            tenths = kMaxSeamInsetCode - 1;
+        }
+        seamInset = tenths == kDefaultSeamInsetTenths ? std::uint8_t{0} : static_cast<std::uint8_t>(tenths + 1);
+    }
 };
 
 #pragma pack(pop)
@@ -319,6 +373,11 @@ static_assert(offsetof(PrefsBlob, exposureStops) == 16, "PrefsBlob layout drifte
 // project renders.  A new blob gets On from defaults().
 static_assert(offsetof(PrefsBlob, parallax) == 20, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, flowBackend) == 21, "PrefsBlob layout drifted");
-static_assert(offsetof(PrefsBlob, reserved) == 22, "PrefsBlob layout drifted");
+// [WP-PHOTO] owns offsets 32-37 (docs/PARALLEL_WORK.md).  seamInset is the
+// photometric seam fix's stage 1; zero means the default inset, so an old
+// project gets the thinner seam band without a Source Settings visit.
+static_assert(offsetof(PrefsBlob, padBeforePhoto) == 22, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, seamInset) == 32, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, reserved) == 33, "PrefsBlob layout drifted");
 
 }  // namespace osv::premiere

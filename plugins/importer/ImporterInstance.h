@@ -395,6 +395,11 @@ private:
     /// Body-from-world correction for a frame index (identity when off).
     [[nodiscard]] Mat3d stabilizationFor(std::uint32_t frameIndex) const;
 
+    /// [WP-PHOTO] Recompute m_renderBlend from m_blend and the prefs' seam
+    /// edge inset.  Cheap (a few assignments); called by the render builders
+    /// so the render blend can never lag a prefs or calibration change.
+    void refreshRenderBlend() noexcept;
+
     /// What applyAnalyses() put into the builder.
     struct AnalysisOutcome {
         bool parallaxApplied = false;  ///< A 2-D warp grid (own, blended or borrowed) was applied.
@@ -433,7 +438,15 @@ private:
     meta::FormatInfo m_format;
     meta::CalibrationSet m_calibration;
     geom::LensRig m_rig;
+    /// The ANALYSIS blend: the calibrated FOV (195.18 deg) and its 4 deg
+    /// feather.  Every measurement (parallax bands, seam search, gain, the
+    /// photometric field) uses this one; narrowing it costs parallax quality.
     geom::BlendParams m_blend;
+    /// [WP-PHOTO] The RENDER blend: m_blend with the Source Settings seam
+    /// edge inset applied (render::insetRenderBlend), used ONLY by the two
+    /// render builders (renderFrame, directFrame).  Refreshed from m_blend and
+    /// the prefs by refreshRenderBlend() right before each use.
+    geom::BlendParams m_renderBlend;
     std::vector<std::string> m_notes;
     std::uint32_t m_frameCount = 0;
     std::uint32_t m_rateNum = 0;

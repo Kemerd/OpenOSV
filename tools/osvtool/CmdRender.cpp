@@ -17,6 +17,7 @@
 #include "osv/io/FfmpegPipe.h"
 #include "osv/io/ImageWriter.h"
 #include "osv/render/ParallaxWarp.h"
+#include "osv/render/PhotoSeam.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
 
@@ -53,6 +54,12 @@ struct RenderOptions {
     bool parallax = false;         ///< 2-D flow-based parallax correction
     std::string flowBackend = "auto";
     bool gain = false;
+    // [WP-PHOTO] The RENDER blend (the analyses keep --lens-fov / --feather).
+    // Unset --blend-fov means the default seam edge inset: --lens-fov minus
+    // 2 x render::kDefaultSeamInsetDeg (189.98 deg at the default 195.18).
+    double blendFov = 0.0;
+    bool blendFovSet = false;
+    double blendFeather = osv::render::kSeamInsetFeatherDeg;
     int seamInterval = 1;
     std::string out;
     std::string ffmpeg;
@@ -175,8 +182,30 @@ int runRender(const RenderOptions& o) {
         std::fprintf(stderr, "error: --size must be WxH\n");
         return kExitUsage;
     }
+    // [WP-PHOTO] The render-only blend: the kernel's FOV feather ends a few
+    // degrees inside the calibrated rim, where the sample's lens 0 is still
+    // within a stop of its core, while every analysis below keeps
+    // P.blendParams - narrowing those costs parallax quality.
+    if (!(o.blendFeather >= 0.0) || o.blendFeather > 30.0) {
+        std::fprintf(stderr, "error: --blend-feather must be within 0..30 degrees\n");
+        return kExitUsage;
+    }
+    geom::BlendParams renderBlend =
+        render::insetRenderBlend(P.blendParams, render::kDefaultSeamInsetDeg, o.blendFeather);
+    if (o.blendFovSet) {
+        if (!(o.blendFov > 90.0) || o.blendFov > P.blendParams.lensFovDeg) {
+            std::fprintf(stderr, "error: --blend-fov must be above 90 and at most --lens-fov (%.2f)\n",
+                         P.blendParams.lensFovDeg);
+            return kExitUsage;
+        }
+        renderBlend = P.blendParams;
+        renderBlend.lensFovDeg = o.blendFov;
+        renderBlend.featherDeg = o.blendFeather;
+    }
+    log::debug("render blend: FOV {:.2f} deg, feather {:.2f} deg (analyses: {:.2f} / {:.2f})", renderBlend.lensFovDeg,
+               renderBlend.featherDeg, P.blendParams.lensFovDeg, P.blendParams.featherDeg);
     render::RenderParamsBuilder builder;
-    builder.rig(P.rig).color(P.color).blend(P.blendParams, o.pipeline.blend);
+    builder.rig(P.rig).color(P.color).blend(renderBlend, o.pipeline.blend);
     geom::VirtualCamera cam;
     geom::EquirectMap map;
     const std::string mode = o.mode;
@@ -476,6 +505,13 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
                       "which remains the fallback");
     outGeom->add_option("--flow-backend", opt->flowBackend, "auto|classical|neural")->default_str("auto");
     outGeom->add_flag("--gain", opt->gain, "Exposure matching between lenses");
+    outGeom
+        ->add_option("--blend-fov", opt->blendFov,
+                     "Render-blend lens FOV in degrees; the analyses keep --lens-fov (default: --lens-fov minus "
+                     "5.2, the 2.6 deg seam edge inset)")
+        ->each([opt](const std::string&) { opt->blendFovSet = true; });
+    outGeom->add_option("--blend-feather", opt->blendFeather, "Render-blend feather in degrees (analyses: --feather)")
+        ->default_val(osv::render::kSeamInsetFeatherDeg);
     outGeom->add_option("--seam-interval", opt->seamInterval, "Re-run the analyses every N frames")->default_val(1);
     outGeom->add_option("--out", opt->out, "Output: image (.png/.tif/.exr, %05d pattern) or .mp4")->required();
     outGeom->add_option("--ffmpeg", opt->ffmpeg, "ffmpeg executable for .mp4 output");
