@@ -18,6 +18,19 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+// POSIX: the child is started with posix_spawnp and fed through a pipe.
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <fcntl.h>
+#include <pthread.h>
+#include <spawn.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <thread>
+#include <unistd.h>
+extern char** environ;
 #endif
 
 namespace osv::io {
@@ -78,6 +91,96 @@ std::string narrow(const std::wstring& s) {
     return std::string(s.begin(), s.end());
 #endif
 }
+
+#if !defined(_WIN32)
+/// Quote one argument the way a POSIX shell would read it back.  Only used
+/// for the logged command line; the child itself receives argv verbatim.
+std::string shellQuote(const std::string& arg) {
+    if (!arg.empty() && arg.find_first_of(" \t\n'\"\\$`*?[]{}()<>|&;#~") == std::string::npos) {
+        return arg;
+    }
+    std::string out = "'";
+    for (const char c : arg) {
+        if (c == '\'') {
+            // Close the quote, emit an escaped quote, reopen.
+            out += "'\\''";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out.push_back('\'');
+    return out;
+}
+
+/// Wait up to `timeoutMs` for `pid` to exit.  Returns true (and the raw wait
+/// status) when it did; false while it is still running.
+bool waitForExit(pid_t pid, unsigned timeoutMs, int* status) noexcept {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;) {
+        int st = 0;
+        const pid_t r = ::waitpid(pid, &st, WNOHANG);
+        if (r == pid) {
+            if (status) {
+                *status = st;
+            }
+            return true;
+        }
+        if (r < 0 && errno != EINTR) {
+            // ECHILD: somebody else reaped it, so it is gone either way.
+            if (status) {
+                *status = 0;
+            }
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+/// Exit code of a wait status: the process's own code, 128 + the signal for a
+/// process that was killed (the shell convention), -1 when neither applies.
+int exitCodeOf(int status) noexcept {
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+    return -1;
+}
+
+/// Search PATH for an executable file called `name` - what SearchPathW does
+/// on Windows.  Empty when there is none.
+std::filesystem::path searchPath(const char* name) {
+    if (!name || !*name) {
+        return {};
+    }
+    const char* path = std::getenv("PATH");
+    if (!path || !*path) {
+        return {};
+    }
+    const std::string all(path);
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t end = all.find(':', start);
+        const std::string dir = all.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (!dir.empty()) {
+            const std::filesystem::path candidate = std::filesystem::path(dir) / name;
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(candidate, ec) && ::access(candidate.c_str(), X_OK) == 0) {
+                return candidate;
+            }
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return {};
+}
+#endif
 
 /// Build the ffmpeg argument vector for the given codec.
 std::vector<std::string> buildArgs(const FfmpegPipeOptions& o, const std::string& codec,
@@ -198,7 +301,19 @@ struct FfmpegPipeWriter::Impl {
 #if defined(_WIN32)
     HANDLE process = nullptr;
     HANDLE stdinWrite = nullptr;
+#else
+    pid_t process = -1;   ///< The ffmpeg child, -1 when there is none.
+    int stdinWrite = -1;  ///< Our end of its stdin pipe, -1 when closed.
 #endif
+
+    /// True while the pipe into the child is open.
+    [[nodiscard]] bool pipeOpen() const noexcept {
+#if defined(_WIN32)
+        return stdinWrite != nullptr;
+#else
+        return stdinWrite >= 0;
+#endif
+    }
 
     ~Impl() { terminate(); }
 
@@ -215,6 +330,21 @@ struct FfmpegPipeWriter::Impl {
             }
             CloseHandle(process);
             process = nullptr;
+        }
+#else
+        if (stdinWrite >= 0) {
+            ::close(stdinWrite);
+            stdinWrite = -1;
+        }
+        if (process > 0) {
+            // The same grace period as on Windows, then SIGKILL - and reap it
+            // either way so no zombie is left behind.
+            int status = 0;
+            if (!waitForExit(process, 2000, &status)) {
+                ::kill(process, SIGKILL);
+                (void)waitForExit(process, 2000, &status);
+            }
+            process = -1;
         }
 #endif
     }
@@ -283,13 +413,79 @@ struct FfmpegPipeWriter::Impl {
         }
         return true;
 #else
-        (void)exe;
-        (void)args;
-        (void)probeMs;
-        if (error) {
-            *error = "FfmpegPipeWriter is Windows-only in this build";
+        // argv: the executable, then every argument verbatim (no shell).
+        commandLine = shellQuote(exe.string());
+        std::vector<std::string> storage;
+        storage.reserve(args.size() + 1);
+        storage.push_back(exe.string());
+        for (const std::string& arg : args) {
+            storage.push_back(arg);
+            commandLine.push_back(' ');
+            commandLine.append(shellQuote(arg));
         }
-        return false;
+        std::vector<char*> argv;
+        argv.reserve(storage.size() + 1);
+        for (std::string& a : storage) {
+            argv.push_back(a.data());
+        }
+        argv.push_back(nullptr);
+
+        int fds[2] = {-1, -1};
+        if (::pipe(fds) != 0) {
+            if (error) {
+                *error = std::string("pipe failed: ") + std::strerror(errno);
+            }
+            return false;
+        }
+        // Our write end must not leak into the child (or into any other child
+        // the process starts later); the read end becomes the child's stdin.
+        (void)::fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+#if defined(F_SETNOSIGPIPE)
+        // macOS: a write into a pipe whose reader died fails with EPIPE
+        // instead of raising SIGPIPE, which would kill the whole process.
+        (void)::fcntl(fds[1], F_SETNOSIGPIPE, 1);
+#endif
+
+        posix_spawn_file_actions_t actions;
+        if (::posix_spawn_file_actions_init(&actions) != 0) {
+            ::close(fds[0]);
+            ::close(fds[1]);
+            if (error) {
+                *error = "posix_spawn_file_actions_init failed";
+            }
+            return false;
+        }
+        (void)::posix_spawn_file_actions_adddup2(&actions, fds[0], STDIN_FILENO);
+        (void)::posix_spawn_file_actions_addclose(&actions, fds[0]);
+        (void)::posix_spawn_file_actions_addclose(&actions, fds[1]);
+
+        // posix_spawnp searches PATH for a bare "ffmpeg", like CreateProcessW.
+        pid_t pid = -1;
+        const int rc = ::posix_spawnp(&pid, storage.front().c_str(), &actions, nullptr, argv.data(), environ);
+        ::posix_spawn_file_actions_destroy(&actions);
+        ::close(fds[0]);  // the child holds its own copy now
+        if (rc != 0) {
+            ::close(fds[1]);
+            if (error) {
+                *error = std::string("posix_spawnp failed: ") + std::strerror(rc);
+            }
+            return false;
+        }
+        process = pid;
+        stdinWrite = fds[1];
+
+        // Probe: a bad codec makes ffmpeg exit almost immediately.
+        int status = 0;
+        if (waitForExit(process, probeMs, &status)) {
+            ::close(stdinWrite);
+            stdinWrite = -1;
+            process = -1;
+            if (error) {
+                *error = "ffmpeg exited early with code " + std::to_string(exitCodeOf(status));
+            }
+            return false;
+        }
+        return true;
 #endif
     }
 
@@ -306,9 +502,43 @@ struct FfmpegPipeWriter::Impl {
         }
         return true;
 #else
-        (void)data;
-        (void)bytes;
-        return false;
+        if (stdinWrite < 0 || (!data && bytes > 0)) {
+            return false;
+        }
+#if !defined(F_SETNOSIGPIPE)
+        // No per-descriptor opt-out on this system: block SIGPIPE on this
+        // thread while writing and swallow the one a failed write raised, so
+        // a dead encoder is a failed write instead of a killed process.
+        sigset_t pipeSet;
+        sigset_t previous;
+        sigemptyset(&pipeSet);
+        sigaddset(&pipeSet, SIGPIPE);
+        const bool masked = ::pthread_sigmask(SIG_BLOCK, &pipeSet, &previous) == 0;
+#endif
+        bool ok = true;
+        while (bytes > 0) {
+            const std::size_t chunk = std::min<std::size_t>(bytes, 1u << 20);
+            const ssize_t written = ::write(stdinWrite, data, chunk);
+            if (written < 0 && errno == EINTR) {
+                continue;
+            }
+            if (written <= 0) {
+                ok = false;
+                break;
+            }
+            data += written;
+            bytes -= static_cast<std::size_t>(written);
+        }
+#if !defined(F_SETNOSIGPIPE)
+        if (masked) {
+            if (!ok && errno == EPIPE) {
+                const timespec zero{0, 0};
+                (void)::sigtimedwait(&pipeSet, nullptr, &zero);
+            }
+            (void)::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+        }
+#endif
+        return ok;
 #endif
     }
 };
@@ -331,6 +561,10 @@ std::filesystem::path FfmpegPipeWriter::resolveExecutable(const std::filesystem:
     wchar_t found[MAX_PATH] = {};
     if (SearchPathW(nullptr, L"ffmpeg", L".exe", MAX_PATH, found, nullptr) > 0) {
         return std::filesystem::path(found);
+    }
+#else
+    if (std::filesystem::path found = searchPath("ffmpeg"); !found.empty()) {
+        return found;
     }
 #endif
     return std::filesystem::path("ffmpeg");
@@ -361,11 +595,9 @@ Result<FfmpegPipeWriter> FfmpegPipeWriter::open(const FfmpegPipeOptions& options
 
 Status FfmpegPipeWriter::writeFrame(const render::ImageRGBAf& image) {
     Impl& impl = *m_impl;
-#if defined(_WIN32)
-    if (!impl.stdinWrite) {
+    if (!impl.pipeOpen()) {
         return failStatus(ErrorCode::Io, "ffmpeg pipe is not open");
     }
-#endif
     if (!image.valid()) {
         return failStatus(ErrorCode::InvalidArgument, "writeFrame: invalid image");
     }
@@ -411,6 +643,25 @@ Status FfmpegPipeWriter::close() {
         GetExitCodeProcess(impl.process, &code);
         CloseHandle(impl.process);
         impl.process = nullptr;
+        if (code != 0) {
+            return failStatus(ErrorCode::Io, "ffmpeg exited with code " + std::to_string(code));
+        }
+    }
+#else
+    if (impl.stdinWrite >= 0) {
+        ::close(impl.stdinWrite);
+        impl.stdinWrite = -1;
+    }
+    if (impl.process > 0) {
+        // A blocking wait, as WaitForSingleObject(INFINITE) above: the encoder
+        // is flushing its last frames and writing the moov atom.
+        int status = 0;
+        pid_t r = -1;
+        do {
+            r = ::waitpid(impl.process, &status, 0);
+        } while (r < 0 && errno == EINTR);
+        impl.process = -1;
+        const int code = r < 0 ? 0 : exitCodeOf(status);
         if (code != 0) {
             return failStatus(ErrorCode::Io, "ffmpeg exited with code " + std::to_string(code));
         }

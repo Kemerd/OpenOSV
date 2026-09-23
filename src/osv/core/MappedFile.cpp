@@ -15,6 +15,13 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+// POSIX: open + fstat + mmap, the same read-only whole-file view.
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace osv {
@@ -84,6 +91,13 @@ void MappedFile::release() noexcept {
         CloseHandle(static_cast<HANDLE>(m_file));
         m_file = nullptr;
     }
+#else
+    // The mapping owns no descriptor (it is closed right after mmap), so the
+    // view is the only thing to give back; the span still holds its length.
+    if (m_view) {
+        ::munmap(const_cast<void*>(m_view), static_cast<std::size_t>(m_span.size()));
+        m_view = nullptr;
+    }
 #endif
     m_buffer.reset();
     m_span = ByteSpan{};
@@ -131,6 +145,32 @@ Result<MappedFile> MappedFile::open(const std::filesystem::path& path) {
             }
         }
         CloseHandle(file);
+        log::debug("MappedFile: mapping failed for {}, falling back to a heap copy", path.string());
+    }
+#else
+    // open + mmap: a MAP_PRIVATE read-only view of the whole file.  The
+    // descriptor can be closed straight away - the mapping keeps the file
+    // alive - so nothing but the view (and its length, in the span) has to
+    // be remembered.
+    int fd = -1;
+    do {
+        fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    } while (fd < 0 && errno == EINTR);
+    if (fd >= 0) {
+        struct stat st{};
+        if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+            const auto length = static_cast<std::size_t>(st.st_size);
+            void* view = ::mmap(nullptr, length, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (view != MAP_FAILED) {
+                // Sequential-scan hint, as FILE_FLAG_SEQUENTIAL_SCAN above.
+                (void)::madvise(view, length, MADV_SEQUENTIAL);
+                ::close(fd);
+                f.m_view = view;
+                f.m_span = ByteSpan{static_cast<const std::uint8_t*>(view), length};
+                return f;
+            }
+        }
+        ::close(fd);
         log::debug("MappedFile: mapping failed for {}, falling back to a heap copy", path.string());
     }
 #endif

@@ -192,14 +192,24 @@ struct CalibrationSelection {
     std::string reason;
 };
 
+/// Selection knobs of CalibrationSelector (all optional), spelled
+/// CalibrationSelector::Options everywhere.
+///
+/// Defined at namespace scope, not nested: select() and choose() default
+/// their `options` argument to `{}` inside the class, and a nested struct
+/// whose members carry default initialisers is not yet complete at that
+/// point, which Clang rejects (C++ core issue 1397).  The alias below keeps
+/// every existing spelling valid.
+struct CalibrationSelectorOptions {
+    std::optional<ExtriLensMode> lensModeOverride;  ///< Ignore StreamMeta.extri_lens_mode and use this.
+    std::optional<double> stitchDistanceM;          ///< Use the far preset nearest to this distance (metres).
+    bool preferRefined = true;                      ///< Native: try the refined pair (1/2) before the raw pair (11/12).
+};
+
 class CalibrationSelector {
 public:
-    /// Selection knobs (all optional).
-    struct Options {
-        std::optional<ExtriLensMode> lensModeOverride;  ///< Ignore StreamMeta.extri_lens_mode and use this.
-        std::optional<double> stitchDistanceM;          ///< Use the far preset nearest to this distance (metres).
-        bool preferRefined = true;                      ///< Native: try the refined pair (1/2) before the raw pair (11/12).
-    };
+    /// Selection knobs (all optional); see CalibrationSelectorOptions.
+    using Options = CalibrationSelectorOptions;
 
     /// One entry of the far-preset table.
     struct FarPreset {

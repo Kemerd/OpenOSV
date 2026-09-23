@@ -29,6 +29,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <cstdio>
+#include <sys/wait.h>
 #endif
 
 namespace {
@@ -86,7 +89,23 @@ RunResult runTool(const std::string& args) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 #else
-    (void)args;
+    // POSIX: the same command line through /bin/sh, stderr folded into
+    // stdout as the Windows branch does with one pipe for both.  The paths
+    // the tests pass are double-quoted, which sh reads the same way.
+    const std::string cmd = std::string("\"") + kToolPath + "\" " + args + " 2>&1";
+    FILE* pipe = ::popen(cmd.c_str(), "r");
+    if (!pipe) {
+        return r;
+    }
+    char buffer[4096];
+    std::size_t got = 0;
+    while ((got = std::fread(buffer, 1, sizeof(buffer), pipe)) > 0) {
+        r.output.append(buffer, got);
+    }
+    const int status = ::pclose(pipe);
+    if (status != -1 && WIFEXITED(status)) {
+        r.exitCode = WEXITSTATUS(status);
+    }
 #endif
     return r;
 }

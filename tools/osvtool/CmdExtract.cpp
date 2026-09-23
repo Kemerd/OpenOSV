@@ -254,8 +254,13 @@ int runFrame(const ExtractOptions& opt) {
     }
     const auto hw = osv::video::parseHwAccel(opt.hw);
     if (!hw) {
+#if defined(__APPLE__)
+        std::fprintf(stderr, "error: unknown --hw '%s' (expected none, videotoolbox or auto)\n",
+                     osv::log::safe(opt.hw).c_str());
+#else
         std::fprintf(stderr, "error: unknown --hw '%s' (expected none, d3d11va, cuda or auto)\n",
                      osv::log::safe(opt.hw).c_str());
+#endif
         return kExitUsage;
     }
     osv::video::DecoderOptions options;
@@ -356,7 +361,11 @@ void registerExtractCommand(CLI::App& app, CommandContext& ctx) {
     sub->add_option("--frame", opt->frame, "Decode this frame index (with --lens and --out)");
     sub->add_option("--lens", opt->lens, "Lens for --frame: 0 (slave) or 1 (master)")->capture_default_str();
     sub->add_option("--out", opt->framePath, "Output for --frame: raw.pgm (16-bit luma) or raw.ppm (16-bit Y/Cb/Cr)");
+#if defined(__APPLE__)
+    sub->add_option("--hw", opt->hw, "Decoder for --frame: none, videotoolbox, auto")->capture_default_str();
+#else
     sub->add_option("--hw", opt->hw, "Decoder for --frame: none, d3d11va, cuda, auto")->capture_default_str();
+#endif
     sub->add_flag("--container-samples", opt->containerSamples,
                   "Feed samples from the OpenOSV container parser instead of libavformat (--frame)");
     sub->add_option("--audio", opt->audioPath, "Write the AAC track as an ADTS .aac file");

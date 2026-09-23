@@ -52,6 +52,8 @@ private:
     std::filesystem::path m_path;
     ByteSpan m_span;
     // Windows mapping handles (opaque here to keep <windows.h> out of headers).
+    // POSIX keeps no handles: only m_view is set, and munmap takes its length
+    // from m_span.
     void* m_file = nullptr;
     void* m_mapping = nullptr;
     const void* m_view = nullptr;

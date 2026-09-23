@@ -133,8 +133,10 @@ jobs:
       - name: Configure
         run: cmake --preset ci-macos -DVCPKG_MANIFEST_INSTALL=OFF
 
+      # -k 0: keep going past the first failing file, so one run reports
+      # every compile error instead of one.
       - name: Build
-        run: cmake --build --preset ci-macos
+        run: cmake --build --preset ci-macos -- -k 0
 
       - name: Test
         run: ctest --preset ci-macos
