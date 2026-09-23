@@ -160,7 +160,10 @@ public:
     [[nodiscard]] Status open();
 
     /// Drop the decoders, the renderer lease, the audio decoder and the OS
-    /// handle but keep the parsed metadata (imQuietFile).  Idempotent.
+    /// handle but keep the parsed metadata (imQuietFile).  The video reader
+    /// is parked in video::ReaderPool rather than destroyed, so the next open
+    /// of the same file - this instance's unquiet or a new instance - takes
+    /// it back warm; the pool releases it after an idle minute.  Idempotent.
     void releaseHeavy() noexcept;
 
     /// True between a successful open() and releaseHeavy().

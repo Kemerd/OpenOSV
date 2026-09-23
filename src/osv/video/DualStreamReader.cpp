@@ -7,13 +7,16 @@
 
 #include "osv/video/DualStreamReader.h"
 
+#include "FileIdentity.h"
 #include "osv/core/Log.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <exception>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -25,6 +28,11 @@ namespace osv::video {
 struct DualStreamReader::Impl {
     HevcStreamDecoder decoders[2];   ///< [0] slave, [1] master ([1] unused when side by side).
     bool sideBySide = false;         ///< Single stream split into halves.
+    // ---- what open() was given (ReaderPool keys on these) ----------------------
+    std::filesystem::path path;                ///< File the reader decodes.
+    DecoderOptions options;                    ///< Options exactly as passed to open().
+    std::array<std::uint32_t, 2> trackIds{};   ///< Tracks decoded (the proxy track twice).
+    std::wstring fileIdentity;                 ///< Path|size|mtime at open (empty = unknown).
     std::uint32_t frameCount = 0;
     std::uint32_t lensWidth = 0;
     std::uint32_t lensHeight = 0;
@@ -94,10 +102,22 @@ Result<DualStreamReader> DualStreamReader::open(const std::filesystem::path& pat
     reader.m_impl = std::make_unique<Impl>();
     Impl& impl = *reader.m_impl;
     impl.sideBySide = format.sideBySideProxy;
+    impl.path = path;
+    impl.options = options;
+    // The file version, taken BEFORE the decoders map it: a reader must be
+    // matched to the bytes it was opened on, never to a later rewrite of the
+    // same path.  A failure only keeps the reader out of pools.
+    {
+        auto identity = detail::fileIdentity(path);
+        if (identity.ok()) {
+            impl.fileIdentity = std::move(identity).value();
+        }
+    }
 
     if (impl.sideBySide) {
         // ---- one track, two halves ------------------------------------------
         const std::uint32_t trackId = format.videoTrackIds[0] != 0 ? format.videoTrackIds[0] : 1u;
+        impl.trackIds = {trackId, trackId};
         OSV_TRY_ASSIGN(impl.decoders[0], HevcStreamDecoder::open(path, trackId, options));
         const HevcStreamDecoder& d = impl.decoders[0];
         if (d.width() < 2 || (d.width() % 2) != 0) {
@@ -115,11 +135,62 @@ Result<DualStreamReader> DualStreamReader::open(const std::filesystem::path& pat
 
     // ---- two tracks ----------------------------------------------------------
     for (int lens = 0; lens < 2; ++lens) {
-        const std::uint32_t trackId = format.videoTrackIds[static_cast<std::size_t>(lens)];
-        if (trackId == 0) {
+        if (format.videoTrackIds[static_cast<std::size_t>(lens)] == 0) {
             return Error{ErrorCode::InvalidArgument, "FormatInfo has no video track id for lens " + std::to_string(lens)};
         }
-        OSV_TRY_ASSIGN(impl.decoders[lens], HevcStreamDecoder::open(path, trackId, options));
+    }
+    impl.trackIds = {format.videoTrackIds[0], format.videoTrackIds[1]};
+    // Each lens gets its own shared-device slot: the two decoders run in
+    // parallel on every read(), and FFmpeg serialises the surface downloads
+    // of one D3D11 device, so one device per lens keeps them concurrent.
+    // Every reader's lens 0 still shares one device (and lens 1 another), so
+    // a second reader of any clip creates no device at all.
+    std::array<DecoderOptions, 2> lensOptions{options, options};
+    for (std::size_t lens = 0; lens < 2; ++lens) {
+        lensOptions[lens].hwDeviceSlot = std::max(0, options.hwDeviceSlot) * 2 + static_cast<int>(lens);
+    }
+    // Both lenses open at the same time (lens 0 on a helper thread), exactly
+    // as read() decodes them: whatever open() still costs - a device on the
+    // first open of the process, the first-frame probe for callers that keep
+    // it - is paid once in wall time instead of twice.
+    Result<HevcStreamDecoder> opened0 = Error{ErrorCode::Internal, "lens 0 was not opened"};
+    std::string threadFailure;
+    try {
+        std::thread worker([&opened0, &threadFailure, &path, &format, &lensOptions]() noexcept {
+            try {
+                opened0 = HevcStreamDecoder::open(path, format.videoTrackIds[0], lensOptions[0]);
+            } catch (const std::exception& e) {
+                threadFailure = e.what();
+            } catch (...) {
+                threadFailure = "unknown exception";
+            }
+        });
+        // Nothing may escape between the thread's start and its join, or the
+        // std::thread destructor would terminate the process.
+        Result<HevcStreamDecoder> opened1 = Error{ErrorCode::Internal, "lens 1 was not opened"};
+        try {
+            opened1 = HevcStreamDecoder::open(path, format.videoTrackIds[1], lensOptions[1]);
+        } catch (const std::exception& e) {
+            opened1 = Error{ErrorCode::Internal, std::string("lens 1 open failed: ") + e.what()};
+        } catch (...) {
+            opened1 = Error{ErrorCode::Internal, "lens 1 open failed: unknown exception"};
+        }
+        worker.join();
+        if (!threadFailure.empty()) {
+            return Error{ErrorCode::Internal, "lens 0 open thread failed: " + threadFailure};
+        }
+        if (!opened0.ok()) {
+            return Error(opened0.error());
+        }
+        if (!opened1.ok()) {
+            return Error(opened1.error());
+        }
+        impl.decoders[0] = std::move(opened0).value();
+        impl.decoders[1] = std::move(opened1).value();
+    } catch (const std::system_error& e) {
+        // std::thread could not start (resource exhaustion): report it rather
+        // than let it escape a function that returns Result.
+        return Error{ErrorCode::Internal, std::string("cannot start the lens 0 open thread: ") + e.what()};
     }
     const HevcStreamDecoder& a = impl.decoders[0];
     const HevcStreamDecoder& b = impl.decoders[1];
@@ -249,6 +320,22 @@ Result<FramePair> DualStreamReader::read(std::uint32_t index) {
 // =============================================================================
 //  Accessors
 // =============================================================================
+const std::filesystem::path& DualStreamReader::path() const noexcept {
+    static const std::filesystem::path kEmpty;
+    return m_impl ? m_impl->path : kEmpty;
+}
+
+DecoderOptions DualStreamReader::options() const noexcept { return m_impl ? m_impl->options : DecoderOptions{}; }
+
+std::array<std::uint32_t, 2> DualStreamReader::trackIds() const noexcept {
+    return m_impl ? m_impl->trackIds : std::array<std::uint32_t, 2>{0u, 0u};
+}
+
+const std::wstring& DualStreamReader::fileIdentity() const noexcept {
+    static const std::wstring kEmpty;
+    return m_impl ? m_impl->fileIdentity : kEmpty;
+}
+
 std::uint32_t DualStreamReader::frameCount() const noexcept { return m_impl ? m_impl->frameCount : 0; }
 
 double DualStreamReader::fps() const noexcept { return m_impl ? m_impl->fps : 0.0; }

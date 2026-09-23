@@ -64,6 +64,16 @@ if(OSV_ENABLE_CUDA AND TARGET CUDA::cuda_driver)
   set_target_properties(osv_gpu_decode_bench PROPERTIES FOLDER "osv/bench")
 endif()
 
+# -----------------------------------------------------------------------------
+#  osv_decoder_open_bench: what opening (and re-opening) a video decoder costs,
+#  phase by phase, per back-end and demux mode.  Run by hand; NOT registered
+#  with ctest for the same reason as the GPU decode bench.
+# -----------------------------------------------------------------------------
+add_executable(osv_decoder_open_bench bench/DecoderOpenBench.cpp)
+target_link_libraries(osv_decoder_open_bench PRIVATE osv_video osv_meta osv_container osv_core)
+target_compile_definitions(osv_decoder_open_bench PRIVATE OSV_SAMPLE_FILE="${OSV_SAMPLE_FILE}")
+set_target_properties(osv_decoder_open_bench PROPERTIES FOLDER "osv/bench")
+
 catch_discover_tests(osv_tests
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   PROPERTIES SKIP_RETURN_CODE 4
