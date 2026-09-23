@@ -1121,12 +1121,13 @@ prSuiteError render(PrGPUFilterInstance* instanceData, const PrGPUFilterRenderPa
         // needs can be checked against a real host.
         PluginLog::oncef("reframe/gpu/first-frame", PluginLog::Level::Info,
                          "reframe/gpu: first GPU frame - src {}x{} {}, dst {}x{} {}, clip time {}, sequence time {}, "
-                         "quality {}, downsample {:.3f}x{:.3f}, ticks/frame {}",
+                         "quality {}, downsample {:.3f}x{:.3f}, ticks/frame {}, host stream {}",
                          src.width, src.height, src.isHalf ? "16f" : "32f", dst.width, dst.height,
                          dst.isHalf ? "16f" : "32f", static_cast<long long>(renderParams->inClipTime),
                          static_cast<long long>(renderParams->inSequenceTime),
                          static_cast<int>(renderParams->inQuality), renderParams->inDownsampleFactorX,
-                         renderParams->inDownsampleFactorY, static_cast<long long>(renderParams->inRenderTicksPerFrame));
+                         renderParams->inDownsampleFactorY, static_cast<long long>(renderParams->inRenderTicksPerFrame),
+                         static_cast<const void*>(inst->stream));
 
         // The host hands us an output in the same format as the input; if it
         // ever did not, writing half into a float buffer would corrupt it.
@@ -1188,14 +1189,39 @@ prSuiteError render(PrGPUFilterInstance* instanceData, const PrGPUFilterRenderPa
         const unsigned gridX = (static_cast<unsigned>(dst.width) + kBlockDimX - 1u) / kBlockDimX;
         const unsigned gridY = (static_cast<unsigned>(dst.height) + kBlockDimY - 1u) / kBlockDimY;
 
-        // Launch on the host's own stream so our work is correctly ordered
-        // against the asynchronous operations that may still be outstanding
-        // on the input frame.  No synchronisation: the host owns the stream
-        // and will sequence the download itself.
-        const CUresult r = cuLaunchKernel(inst->kernel, gridX, gridY, 1u, kBlockDimX, kBlockDimY, 1u, 0u, inst->stream,
-                                          args, nullptr);
+        // ORDERING, on both sides of the kernel - the way Adobe's own CUDA
+        // sample (GPUVideoFilter/Vignette/Vignette.cu) does it: launch on the
+        // context's LEGACY default stream, then wait for it before handing
+        // the frame back.
+        //
+        //  * Before: the legacy stream implicitly waits for all work already
+        //    queued on the context's blocking streams, which is where the
+        //    host uploads and converts our INPUT frame.  A launch on some
+        //    other stream could start sampling an input that was still being
+        //    written.
+        //  * After: Render returning is the host's signal that the OUTPUT is
+        //    ready.  The first real GPU session (the first ever, once the
+        //    match-name binding was fixed) launched on the device's command
+        //    queue and returned at once: the host consumed frames the kernel
+        //    had not finished, and every row the kernel had not reached yet
+        //    showed whatever stale VRAM the recycled buffer held - blocky
+        //    garbage in the lower part of the view while panning.
+        //
+        // The wait costs the kernel's own run time (~0.3 ms for a 2560x1440
+        // view, a few ms for a 6000x3000 frame) and nothing else: only this
+        // stream is synchronised, not the whole context.
+        const CUstream launchStream = CU_STREAM_LEGACY;
+        CUresult r = cuLaunchKernel(inst->kernel, gridX, gridY, 1u, kBlockDimX, kBlockDimY, 1u, 0u, launchStream, args,
+                                    nullptr);
         if (r != CUDA_SUCCESS) {
             PluginLog::error("reframe/gpu: {}", cudaMessage("cuLaunchKernel", r));
+            return suiteError_Fail;
+        }
+        r = cuStreamSynchronize(launchStream);
+        if (r != CUDA_SUCCESS) {
+            // The kernel itself failed (a fault) or the context is broken; the
+            // output cannot be trusted either way.
+            PluginLog::error("reframe/gpu: {}", cudaMessage("cuStreamSynchronize", r));
             return suiteError_Fail;
         }
 
