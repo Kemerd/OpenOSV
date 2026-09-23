@@ -56,8 +56,17 @@
 extern "C" {
 #endif
 
-/** Bumped on ANY change to the structures or entry points below. */
-#define OSV_ENGINE_ABI_VERSION 1u
+/** Bumped on ANY change to the structures or entry points below.
+ *
+ *  History:
+ *    1  the first direct path (stitch block, planes, seam / warp tables).
+ *    2  OsvEngineFrame gained the carved blend-seam table (WP-SEAM) and the
+ *       Source Settings the frame was rendered with (WP-SETTINGS);
+ *       OsvEngine_QuerySettings was added;
+ *       OsvRenderParams grew by the flare (WP-FLARE) and look (WP-LOOK)
+ *       blocks.  A version-1 effect meeting a version-2 importer (or the
+ *       reverse) refuses the engine and renders through the equirect path. */
+#define OSV_ENGINE_ABI_VERSION 2u
 
 /** Module file name of the importer that exports the engine. */
 #define OSV_ENGINE_MODULE_NAME L"OpenOSVImporter.prm"

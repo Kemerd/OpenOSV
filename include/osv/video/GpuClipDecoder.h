@@ -39,6 +39,7 @@
 #include "osv/meta/FormatInfo.h"
 #include "osv/video/PlanarFrame.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -222,8 +223,9 @@ private:
 
 /// NVDEC decoder for both lenses of a dual-track .OSV with a VRAM frame cache.
 ///
-/// Thread safety: acquire(), isCached(), stats(), dropCachedFrames() and the
-/// accessors may be called concurrently from any number of threads.  Leases
+/// Thread safety: acquire(), isCached(), stats(), dropCachedFrames(),
+/// trimForIdle() and the accessors may be called concurrently from any number
+/// of threads.  Leases
 /// may be released on any thread, also after the decoder is destroyed (the
 /// VRAM store stays alive until the last pin is gone).  The destructor must
 /// not run concurrently with a call on the same object.
@@ -318,6 +320,51 @@ public:
 
     /// CUDA device ordinal of that context.
     [[nodiscard]] int deviceIndex() const noexcept;
+
+    // ---- what the decoder was opened on (GpuDecoderPool matches these) -----
+
+    /// The path open() was given (empty when not open).
+    [[nodiscard]] const std::filesystem::path& path() const noexcept;
+
+    /// The options open() was given, exactly as passed.
+    [[nodiscard]] GpuDecoderOptions options() const noexcept;
+
+    /// The two lens tracks open() decodes ({0, 0} when not open).
+    [[nodiscard]] std::array<std::uint32_t, 2> trackIds() const noexcept;
+
+    /// Identity of the file VERSION the decoder reads: absolute path, size
+    /// and modification time as they were at open().  Empty when they could
+    /// not be read, which keeps the decoder out of any pool.
+    [[nodiscard]] const std::wstring& fileIdentity() const noexcept;
+
+    /// True when the decoder runs in the device's primary context and holds
+    /// its own retain on it (GpuDecoderOptions::cuContext was nullptr).  Such
+    /// a context cannot be destroyed while the decoder lives, which is what
+    /// makes the decoder safe to keep after its user is gone.  A decoder in a
+    /// caller's context depends on the caller keeping that context alive.
+    [[nodiscard]] bool usesRetainedPrimaryContext() const noexcept;
+
+    /// True while the decoder's context is usable: for the retained primary
+    /// context, that it is still active (nothing reset the device); for a
+    /// caller's context, that it can be made current.
+    [[nodiscard]] bool contextAlive() const noexcept;
+
+    /// Free and total memory of the decoder's device (cuMemGetInfo in its
+    /// context).  Errors: InvalidArgument (not open), Gpu (the driver call
+    /// failed - the context is probably gone).
+    Status deviceMemory(std::size_t& freeBytes, std::size_t& totalBytes) const noexcept;
+
+    /// Prepare the decoder to sit unused: stop decoding ahead (waiting, at
+    /// most two seconds, for the frame pair in flight), then give back the
+    /// VRAM of every frame-cache slot except `keepFrames` frames - the frame
+    /// requested last and its nearest cached neighbours, forward first (the
+    /// most recently used frames when nothing was requested yet) - and any
+    /// slot a lease still pins.  The NVDEC decoders, the decode position and
+    /// the kept frames stay, so the next acquire() of a kept frame is a cache
+    /// hit and one just past the decode position continues instead of
+    /// restarting its GOP.  The cache grows back on demand, up to its
+    /// original capacity.  Returns the bytes of VRAM released.
+    std::size_t trimForIdle(std::uint32_t keepFrames) noexcept;
 
 private:
     GpuClipDecoder();
