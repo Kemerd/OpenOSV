@@ -154,6 +154,63 @@ typedef struct OsvPlane {
     int chromaInterleaved;         /* 1 = CbCr interleaved (step 2)           */
 } OsvPlane;
 
+/* ========================================================================= */
+/*  [WP-FLARE] lens-flare removal: parameter types                           */
+/* ========================================================================= */
+/* The sun inside a lens's field of view leaves two kinds of stray light on
+ * that lens's frame (docs/research/FLARE.md):
+ *
+ *   * GHOSTS - internal reflections between the lens surfaces, the sensor
+ *     stack and the (ND) filter glass.  Each is a defocused image of the
+ *     aperture, clipped by a rectangular stop, i.e. a soft-edged rounded
+ *     rectangle of nearly flat brightness, displaced from the sun along the
+ *     line through the optical centre.
+ *   * VEIL - light scattered everywhere in the barrel: a near-uniform
+ *     additive floor over the whole frame.
+ *
+ * Both are ADDITIVE in linear light, so the removal is a subtraction in the
+ * lens's native scene-linear RGB, before the lens gain and the blend.  The
+ * host (src/osv/render/Flare.cpp) measures them; the kernel only evaluates
+ * the fitted shapes.  Everything here is in STREAM pixels of the lens it
+ * belongs to, the same frame osvProjectLens returns. */
+
+/* Ghosts the kernel carries per lens.  The sample clip shows four in the
+ * sun's lens; more would cost parameter-block space for rarely-seen faint
+ * reflections (see the 4 KB budget note on OSV_MAX_OCCLUSION_POINTS). */
+#define OSV_FLARE_MAX_GHOSTS 4
+
+/* One ghost: a rotated rounded rectangle with a smoothstep edge.  Its light
+ * at a pixel is, per channel,
+ *     amp * S + rim * E + gradX * S * u + gradY * S * v   (clamped >= 0)
+ * with S the plateau weight (1 inside, smoothstep across +/- soft of the
+ * edge), E a compact bump of half width 3 * soft centred ON the edge (the
+ * caustic rim a defocused ghost carries), and (u, v) the local coordinates
+ * scaled to +/-1 at the half extents (a brightness tilt across the ghost).
+ * Measured on the sample's brightest ghost the rim and tilt terms raise the
+ * explained local variance from 0.78 to 0.86 (0.61 to 0.83 on a fainter
+ * one), and without them its bright rim survives the removal as an outline. */
+typedef struct OsvFlareGhost {
+    float cx, cy;     /* centre (stream px, continuous coordinates)            */
+    float hx, hy;     /* half extents along the rotated local axes (px)        */
+    float radius;     /* corner radius (px), 0 .. min(hx, hy)                  */
+    float cosA, sinA; /* rotation of the local x axis in the image             */
+    float soft;       /* half width of the edge ramp (px), > 0                 */
+    float amp[3];     /* additive native-linear RGB on the plateau             */
+    float rim[3];     /* additive RGB of the edge bump at its crest            */
+    float gradX[3];   /* plateau tilt along local x (RGB at u = +1)            */
+    float gradY[3];   /* plateau tilt along local y (RGB at v = +1)            */
+    float reach2;     /* squared radius beyond which the ghost is exactly 0    */
+} OsvFlareGhost;
+
+/* Everything removed from one lens. */
+typedef struct OsvFlareLens {
+    OsvFlareGhost ghost[OSV_FLARE_MAX_GHOSTS];
+    float veil[3];  /* uniform additive veil, native-linear RGB             */
+    int ghostCount; /* ghosts in use, 0 .. OSV_FLARE_MAX_GHOSTS             */
+} OsvFlareLens;
+
+/* ======================= [/WP-FLARE] types ============================== */
+
 /* Everything the shader needs besides the planes and the seam table. */
 typedef struct OsvRenderParams {
     int outW, outH;          /* output size in pixels                          */
@@ -230,6 +287,11 @@ typedef struct OsvRenderParams {
     int blendSeamColumns;      /* longitude columns in the table (2 floats each) */
     float blendSeamEdgeRad;    /* validity ramp below thetaMax for the seam weights */
     /* ---- [/WP-SEAM] ------------------------------------------------------ */
+
+    /* ---- [WP-FLARE] lens-flare removal (0 = off: render unchanged) ------- */
+    int flareEnabled;        /* 1 = subtract flare[i] from lens i              */
+    OsvFlareLens flare[2];   /* per lens, indexed like lens[]                  */
+    /* ---- [/WP-FLARE] ---------------------------------------------------- */
 } OsvRenderParams;
 
 /* ------------------------------------------------------------------------- */
@@ -879,6 +941,176 @@ OSV_HD float osvBlendSeamApply(const OsvRenderParams* p, OSV_GLOBAL const float*
 }
 /* ---- [/WP-SEAM] ---------------------------------------------------------- */
 
+/* ========================================================================= */
+/*  [WP-FLARE] lens-flare removal: functions                                  */
+/* ========================================================================= */
+
+/* Signed distance from stream pixel (px, py) to the rounded rectangle of
+ * ghost g (negative inside; Inigo Quilez's box SDF with rounded corners),
+ * plus the local coordinates scaled to +/-1 at the half extents. */
+OSV_HD float osvFlareGhostDistance(const OsvFlareGhost* g, float px, float py, float* u, float* v) {
+    const float dx = px - g->cx;
+    const float dy = py - g->cy;
+    /* Into the ghost's own axes. */
+    const float sx = dx * g->cosA + dy * g->sinA;
+    const float sy = -dx * g->sinA + dy * g->cosA;
+    *u = sx / fmaxf(g->hx, 1e-3f);
+    *v = sy / fmaxf(g->hy, 1e-3f);
+    const float qx = fabsf(sx) - (g->hx - g->radius);
+    const float qy = fabsf(sy) - (g->hy - g->radius);
+    const float ox = fmaxf(qx, 0.0f);
+    const float oy = fmaxf(qy, 0.0f);
+    return sqrtf(ox * ox + oy * oy) + fminf(fmaxf(qx, qy), 0.0f) - g->radius;
+}
+
+/* Plateau weight from a signed distance: 1 inside, 0 outside, a smoothstep
+ * across [-soft, +soft].  soft > 0 is guaranteed by the host; the guard
+ * keeps a zeroed block from dividing by zero. */
+OSV_HD float osvFlarePlateau(float d, float soft) {
+    const float s = fmaxf(soft, 1e-3f);
+    return osvSmoothstep((s - d) / (2.0f * s));
+}
+
+/* Rim bump from a signed distance: (1 - (d / 3 soft)^2)^2 inside |d| < 3 soft
+ * and exactly 0 beyond, so the ghost's footprint ends at a hard radius. */
+OSV_HD float osvFlareRim(float d, float soft) {
+    const float t = d / (3.0f * fmaxf(soft, 1e-3f));
+    if (!(t * t < 1.0f)) {
+        return 0.0f;
+    }
+    const float b = 1.0f - t * t;
+    return b * b;
+}
+
+/* Plateau weight of one ghost at stream pixel (px, py) - the shape alone,
+ * without its amplitudes.  Zero past the bounding circle. */
+OSV_HD float osvFlareGhostShape(const OsvFlareGhost* g, float px, float py) {
+    const float dx = px - g->cx;
+    const float dy = py - g->cy;
+    if (dx * dx + dy * dy > g->reach2) {
+        return 0.0f;
+    }
+    float u, v;
+    const float d = osvFlareGhostDistance(g, px, py, &u, &v);
+    return osvFlarePlateau(d, g->soft);
+}
+
+/* Additive light of ghost g at stream pixel (px, py), native-linear RGB,
+ * never negative.  Returns 0 (rgb untouched) past the bounding circle -
+ * one compare for the overwhelming majority of pixels. */
+OSV_HD int osvFlareGhostLight(const OsvFlareGhost* g, float px, float py, float* rgb) {
+    const float dx = px - g->cx;
+    const float dy = py - g->cy;
+    if (dx * dx + dy * dy > g->reach2) {
+        return 0;
+    }
+    float u, v;
+    const float d = osvFlareGhostDistance(g, px, py, &u, &v);
+    const float s = osvFlarePlateau(d, g->soft);
+    const float e = osvFlareRim(d, g->soft);
+    for (int c = 0; c < 3; ++c) {
+        /* Light only adds: a tilt or rim that would dip below zero at one
+         * end of the ghost contributes nothing there instead. */
+        rgb[c] = fmaxf(g->amp[c] * s + g->rim[c] * e + (g->gradX[c] * u + g->gradY[c] * v) * s, 0.0f);
+    }
+    return 1;
+}
+
+/* Remove `g` units of additive light from a value `x` without ever producing
+ * negative light or reversing tones.
+ *
+ *     f(x) = x - g * x^3 / (x^3 + g^3)
+ *
+ * For x >> g it is x - g (the full subtraction).  Where the estimate reaches
+ * the signal itself it backs off smoothly: f(x) >= 0.47 x everywhere and
+ * f'(x) >= 0.16, so an over-estimate can dim a dark pixel but never clip it
+ * to black nor invert a gradient.  Non-positive inputs and estimates pass
+ * through unchanged. */
+OSV_HD float osvFlareSoftSubtract(float x, float g) {
+    if (!(g > 1e-7f) || !(x > 0.0f)) {
+        return x;
+    }
+    const float x3 = x * x * x;
+    const float g3 = g * g * g;
+    return x - g * (x3 / (x3 + g3));
+}
+
+/* Subtract the veil and every ghost of lens flare block F at stream pixel
+ * (px, py) from the native-linear RGB triple `rgb` (in place). */
+OSV_HD void osvFlareRemove(const OsvFlareLens* F, float px, float py, float* rgb) {
+    if (F == 0 || rgb == 0) {
+        return;
+    }
+    /* Total additive estimate per channel: the uniform veil plus every
+     * ghost whose footprint covers this pixel. */
+    float add[3];
+    add[0] = F->veil[0];
+    add[1] = F->veil[1];
+    add[2] = F->veil[2];
+    const int n = F->ghostCount < OSV_FLARE_MAX_GHOSTS ? F->ghostCount : OSV_FLARE_MAX_GHOSTS;
+    for (int k = 0; k < n; ++k) {
+        float light[3];
+        if (osvFlareGhostLight(&F->ghost[k], px, py, light)) {
+            add[0] += light[0];
+            add[1] += light[1];
+            add[2] += light[2];
+        }
+    }
+    rgb[0] = osvFlareSoftSubtract(rgb[0], add[0]);
+    rgb[1] = osvFlareSoftSubtract(rgb[1], add[1]);
+    rgb[2] = osvFlareSoftSubtract(rgb[2], add[2]);
+}
+
+/* Analysis sampler: mean native-linear RGB of the factor x factor block of
+ * lens pixels behind analysis pixel (ox, oy) - the working image the host
+ * detects the sun and fits the ghosts on.  Each lens pixel is decoded on its
+ * own (luma at the pixel, the co-sited 4:2:0 chroma sample) and the linear
+ * values are averaged, because light adds in linear space, not in code.
+ * Pixels of the block beyond the frame edge are left out of the mean. */
+OSV_HD void osvFlareDownsamplePixel(const OsvPlane* P, const OsvColorParams* color, int factor, int ox, int oy,
+                                    float* rgb) {
+    rgb[0] = rgb[1] = rgb[2] = 0.0f;
+    if (P == 0 || color == 0 || factor < 1 || P->w <= 0 || P->h <= 0) {
+        return;
+    }
+    const int step = P->chromaInterleaved ? 2 : 1;
+    const int x0 = ox * factor;
+    const int y0 = oy * factor;
+    float acc[3] = {0.0f, 0.0f, 0.0f};
+    int count = 0;
+    for (int j = 0; j < factor; ++j) {
+        const int y = y0 + j;
+        if (y < 0 || y >= P->h) {
+            continue;
+        }
+        for (int i = 0; i < factor; ++i) {
+            const int x = x0 + i;
+            if (x < 0 || x >= P->w) {
+                continue;
+            }
+            /* 4:2:0: chroma sample (x/2, y/2) covers this luma pixel. */
+            const float yv = osvFetchPlane(P->y, P->strideY, 1, P->w, P->h, x, y, P->bitShift);
+            const float cb = osvFetchPlane(P->u, P->strideC, step, P->cw, P->ch, x >> 1, y >> 1, P->bitShift);
+            const float cr = osvFetchPlane(P->v, P->strideC, step, P->cw, P->ch, x >> 1, y >> 1, P->bitShift);
+            float code[3];
+            osvYuvToCode(color, yv, cb, cr, code);
+            float lin[3];
+            osvCodeToLinear(color, code, lin);
+            acc[0] += lin[0];
+            acc[1] += lin[1];
+            acc[2] += lin[2];
+            ++count;
+        }
+    }
+    if (count > 0) {
+        const float inv = 1.0f / (float)count;
+        rgb[0] = acc[0] * inv;
+        rgb[1] = acc[1] * inv;
+        rgb[2] = acc[2] * inv;
+    }
+}
+/* ======================= [/WP-FLARE] functions ========================== */
+
 /* ------------------------------------------------------------------------- */
 /*  The shader                                                                */
 /* ------------------------------------------------------------------------- */
@@ -1063,6 +1295,12 @@ OSV_HD void osvShadePixelWS(const OsvRenderParams* p, const OsvPlane* planes, OS
             val[2] = code[2];
         } else {
             osvCodeToLinear(&p->color, code, val);
+            /* [WP-FLARE] subtract this lens's measured ghosts and veil in
+             * its own native linear light, before gain and blend. */
+            if (p->flareEnabled) {
+                osvFlareRemove(&p->flare[i], px[i], py[i], val);
+            }
+            /* [/WP-FLARE] */
             val[0] *= p->lens[i].gain[0];
             val[1] *= p->lens[i].gain[1];
             val[2] *= p->lens[i].gain[2];
