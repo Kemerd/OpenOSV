@@ -62,6 +62,7 @@
 #include "osv/meta/MetadataTrack.h"
 #include "osv/render/CpuRenderer.h"
 #include "osv/render/ImageRGBAf.h"
+#include "osv/render/LensShading.h"  // [WP-VIGNETTE]
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"  // [WP-PHOTO]
 #include "osv/render/RenderJob.h"
@@ -2043,6 +2044,109 @@ TEST_CASE("[WP-PHOTO] the direct kernel applies the photometric seam field like 
     WARN("[WP-PHOTO] direct kernel 2560x1440 across the seam: " << offMs << " ms without the photometric field, "
                                                                << onMs << " ms with it (+" << (onMs - offMs)
                                                                << " ms); best of 3 x 50 launches, shared machine");
+    CHECK(onMs > 0.0);
+}
+
+// ===========================================================================
+//  [WP-VIGNETTE] the lens shading correction on the direct path
+// ===========================================================================
+
+TEST_CASE("[WP-VIGNETTE] the direct kernel applies the lens shading correction like its CPU twin, cheaply",
+          "[reframe][direct][cuda][sample][lensshading]") {
+    const std::string noCuda = cudaUnavailableReason();
+    if (!noCuda.empty()) {
+        SKIP("no CUDA device: " << noCuda);
+    }
+    REQUIRE_SAMPLE_CLIP();
+    const auto clip = openSampleClip();
+    constexpr std::uint32_t kFrame = 32;
+    const SampleFrame soft = decodeSampleFrame(*clip, kFrame);
+    GpuRig g;
+    prepareGpuRig(g, *clip, soft, kFrame);
+
+    // The correction the importer measures for this frame, in the stitch
+    // block the engine hands over: no table travels with it.
+    auto model = render::measureLensShading(clip->rig, soft.pair, clip->blend, render::LensShadingParams{}, pool());
+    REQUIRE(model.ok());
+    REQUIRE(model.value().active());
+    geom::EquirectMap map;
+    map.layout = geom::EquirectLayout::Standard;
+    map.w = 6000;
+    map.h = 3000;
+    render::RenderParamsBuilder shadeBuilder = importerBuilder(*clip, soft);
+    shadeBuilder.shading(model.value(), 1.0);
+    auto shadeBlock = shadeBuilder.equirect(map).buildParams();
+    REQUIRE(shadeBlock.ok());
+    REQUIRE(shadeBlock.value().shadeEnabled == 1);
+    StitchState shadeHost;
+    shadeHost.equirect = shadeBlock.value();
+    shadeHost.seamTable = soft.seamTable.data();
+    StitchState shadeDevice = shadeHost;
+    shadeDevice.seamTable = uploadTable(g, soft.seamTable);
+
+    // The block reaches the kernel's parameters untouched.
+    const Settings across = makeSettings(Resolution::MatchSequence, 90.0, 0.0, 0.0, 100.0, 0.0);
+    const DirectSetup carried = buildDirectParams(across, shadeHost, 64, 36, SizePx{});
+    REQUIRE(carried.valid);
+    CHECK(carried.params.shadeEnabled == 1);
+    CHECK(std::memcmp(&carried.params.shade[0], &shadeBlock.value().shade[0], sizeof(shadeBlock.value().shade)) == 0);
+    CHECK(carried.params.shadeTheta0Rad == shadeBlock.value().shadeTheta0Rad);
+    // Refused when it carries something a kernel cannot evaluate.
+    StitchState broken = shadeHost;
+    broken.equirect.shade[1].radial[0][20] = std::numeric_limits<float>::quiet_NaN();
+    CHECK(buildDirectParams(across, broken, 64, 36, SizePx{}).reject == DirectReject::Shading);
+    broken = shadeHost;
+    broken.equirect.shadeDThetaRad = 0.0f;
+    CHECK(buildDirectParams(across, broken, 64, 36, SizePx{}).reject == DirectReject::Shading);
+    broken = shadeHost;
+    broken.equirect.shadeStrength = 1.5f;
+    CHECK(buildDirectParams(across, broken, 64, 36, SizePx{}).reject == DirectReject::Shading);
+    // Off, whatever the factors hold, is never refused: a kernel never reads them.
+    broken = shadeHost;
+    broken.equirect.shadeEnabled = 0;
+    broken.equirect.shade[1].radial[0][20] = std::numeric_limits<float>::quiet_NaN();
+    CHECK(buildDirectParams(across, broken, 64, 36, SizePx{}).valid);
+
+    // ---- parity: GPU vs the CPU twin, across the seam and along it in the sky --
+    const Settings skySeam = makeSettings(Resolution::MatchSequence, 70.0, 25.0, 0.0, 100.0, 0.0);
+    for (const Settings& s : {across, skySeam}) {
+        for (const bool isHalf : {false, true}) {
+            const DirectSetup cpuSetup = buildDirectParams(s, shadeHost, 1920, 1080, SizePx{});
+            const DirectSetup gpuSetup = buildDirectParams(s, shadeDevice, 1920, 1080, SizePx{});
+            REQUIRE(cpuSetup.valid);
+            REQUIRE(gpuSetup.valid);
+            const HostFrame gpu = renderOnGpu(g, gpuSetup, isHalf);
+            HostFrame cpuFrame(1920, 1080, isHalf ? PixelLayout::Bgra16f : PixelLayout::Bgra32f);
+            REQUIRE(renderDirectCpu(cpuSetup, g.hostPlanes, cpuFrame.view(), &pool()));
+            const render::ImageDiffStats stats = render::compareImages16(gpu.toImage(), cpuFrame.toImage());
+            WARN("[WP-VIGNETTE] direct GPU vs CPU twin with the lens shading correction ("
+                 << (isHalf ? "16f" : "32f") << "): PSNR " << stats.psnrDb << " dB, max " << stats.maxAbsCode
+                 << " codes");
+            CHECK(stats.psnrDb >= 60.0);
+        }
+    }
+
+    // ---- cost at 2560 x 1440, back to back with and without it --------------------
+    render::RenderParamsBuilder plainBuilder = importerBuilder(*clip, soft);
+    auto plainBlock = plainBuilder.equirect(map).buildParams();
+    REQUIRE(plainBlock.ok());
+    StitchState plainDevice;
+    plainDevice.equirect = plainBlock.value();
+    plainDevice.seamTable = shadeDevice.seamTable;
+    const DirectSetup off = buildDirectParams(across, plainDevice, 2560, 1440, SizePx{});
+    const DirectSetup on = buildDirectParams(across, shadeDevice, 2560, 1440, SizePx{});
+    REQUIRE(off.valid);
+    REQUIRE(on.valid);
+    double offMs = 1e9;
+    double onMs = 1e9;
+    for (int round = 0; round < 3; ++round) {
+        offMs = std::min(offMs, kernelMs(g, off, 50));
+        onMs = std::min(onMs, kernelMs(g, on, 50));
+    }
+    WARN("[WP-VIGNETTE] direct kernel 2560x1440 across the seam: " << offMs << " ms without the lens shading "
+                                                                   << "correction, " << onMs << " ms with it (+"
+                                                                   << (onMs - offMs)
+                                                                   << " ms); best of 3 x 50 launches, shared machine");
     CHECK(onMs > 0.0);
 }
 

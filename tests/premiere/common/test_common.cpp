@@ -200,7 +200,11 @@ TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     static_assert(offsetof(PrefsBlob, seamSmoothing) == 40, "seamSmoothing sits at 40");
     static_assert(offsetof(PrefsBlob, nearOffset) == 42, "nearOffset sits at 42");
     static_assert(offsetof(PrefsBlob, farOffset) == 44, "farOffset sits at 44");
-    static_assert(offsetof(PrefsBlob, reserved) == 46, "reserved fills the rest");
+    // [WP-VIGNETTE] lensShading and shadingStrength at 46-47, from the front
+    // of the reserved block, which now starts at 48.
+    static_assert(offsetof(PrefsBlob, lensShading) == 46, "lensShading sits at 46");
+    static_assert(offsetof(PrefsBlob, shadingStrength) == 47, "shadingStrength sits at 47");
+    static_assert(offsetof(PrefsBlob, reserved) == 48, "reserved fills the rest");
     static_assert(std::is_trivially_copyable_v<PrefsBlob>, "the blob is memcpy'd to and from the host");
 
     REQUIRE(sizeof(PrefsBlob) == PrefsBlob::kSize);
@@ -1327,6 +1331,65 @@ TEST_CASE("PrefsBlob sky seam fix: on for new clips, off for old blobs, strength
     p.photoReserved[1] = 9;
     REQUIRE_FALSE(p.sanitise());
     CHECK(p.photoReserved[1] == 0);
+}
+
+TEST_CASE("PrefsBlob lens shading: Auto for new clips, Off for old blobs, strength 100 % by default",
+          "[common][prefs][lensshading]") {
+    // A fresh blob gets Auto at full strength.
+    PrefsBlob p = PrefsBlob::defaults();
+    CHECK(p.lensShadingMode() == PrefsLensShading::Auto);
+    CHECK(p.shadingStrength == 0);
+    CHECK(p.shadingStrengthPercent() == 100.0);
+
+    // An older blob's zero bytes read as Off (renders exactly as before) and
+    // the default strength; both are clean values, so sanitise keeps them.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.lensShading = 0;
+    old.shadingStrength = 0;
+    REQUIRE(old.sanitise());
+    CHECK(old.lensShadingMode() == PrefsLensShading::Off);
+    CHECK(old.shadingStrengthPercent() == 100.0);
+
+    // Every mode round-trips through sanitise.
+    for (std::uint8_t m = 0; m < static_cast<std::uint8_t>(PrefsLensShading::Count); ++m) {
+        PrefsBlob q = PrefsBlob::defaults();
+        q.lensShading = m;
+        REQUIRE(q.sanitise());
+        CHECK(q.lensShading == m);
+    }
+
+    // A corrupt mode lands on the default, like the sky seam fix.
+    p.lensShading = 9;
+    REQUIRE_FALSE(p.sanitise());
+    CHECK(p.lensShadingMode() == PrefsLensShading::Auto);
+
+    // Strength: 100 is stored as code 0, 0 % as code 1, rounded and clamped;
+    // garbage is the default.
+    p.setShadingStrengthPercent(0.0);
+    CHECK(p.shadingStrength == 1);
+    CHECK(p.shadingStrengthPercent() == 0.0);
+    p.setShadingStrengthPercent(74.6);
+    CHECK(p.shadingStrengthPercent() == 75.0);
+    p.setShadingStrengthPercent(100.0);
+    CHECK(p.shadingStrength == 0);
+    p.setShadingStrengthPercent(1e9);
+    CHECK(p.shadingStrength == 0);
+    p.setShadingStrengthPercent(std::numeric_limits<double>::infinity());
+    CHECK(p.shadingStrength == 0);
+    p.setShadingStrengthPercent(-1.0);
+    CHECK(p.shadingStrength == 0);
+
+    // An out-of-range strength code reads and sanitises to the default.
+    p.shadingStrength = 150;
+    CHECK(p.shadingStrengthPercent() == 100.0);
+    REQUIRE_FALSE(p.sanitise());
+    CHECK(p.shadingStrength == 0);
+
+    // The two fields leave every other byte alone: the rest of the reserved
+    // block is still zero in a fresh blob.
+    for (const std::uint8_t b : PrefsBlob::defaults().reserved) {
+        CHECK(b == 0);
+    }
 }
 
 // ---------------------------------------------------------------------------

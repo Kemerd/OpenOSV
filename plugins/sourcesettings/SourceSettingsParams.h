@@ -173,10 +173,16 @@
 #define OSV_SS_ID_SAVE_DEFAULTS 31
 #define OSV_SS_ID_RESTORE_DEFAULTS 32
 #define OSV_SS_ID_DEFAULTS_TOPIC_END 33
+/* [WP-VIGNETTE] The lens shading correction: two NEW ids after the last one
+ * in use (34-39 are this package's range), placed inside the Stitching group
+ * right after Far Offset (indices 18-19); everything after them moved up by
+ * two - indices are not persisted, ids are.  The Defaults group stays last. */
+#define OSV_SS_ID_LENS_SHADING 34
+#define OSV_SS_ID_SHADING_STRENGTH 35
 
-/* Total parameters excluding the input layer: 20 value controls + 2 buttons
+/* Total parameters excluding the input layer: 22 value controls + 2 buttons
  * + 6 group markers.  out_data->num_params is this + 1. */
-#define OSV_SOURCE_SETTINGS_PARAM_COUNT 28
+#define OSV_SOURCE_SETTINGS_PARAM_COUNT 30
 
 /* ==========================================================================
  *  Popup item strings
@@ -289,6 +295,19 @@
 #define OSV_SS_PHOTO_SEAM_COUNT 3
 #define OSV_SS_PHOTO_SEAM_DEFAULT 3
 
+/* [WP-VIGNETTE] "Lens Shading" - PrefsLensShading: Off, Auto.
+ *
+ * Each lens's own brightness structure near its rim - on the sample clip a
+ * soft dark ring in the lens facing the sun, which leaves a darker band on
+ * every sky seam crossing - measured from that lens's own sky and added back
+ * before the lenses are blended (docs/research/NEURAL_STITCHING.md, section
+ * 9).  A lens whose sky shows no structure is left untouched.  Default 2 =
+ * Auto (PrefsLensShading::Auto is 1), as PrefsBlob::defaults(); an older
+ * project's zero byte reads as Off. */
+#define OSV_SS_LENS_SHADING_ITEMS "Off|Auto"
+#define OSV_SS_LENS_SHADING_COUNT 2
+#define OSV_SS_LENS_SHADING_DEFAULT 2
+
 /* ==========================================================================
  *  Checkbox and slider ranges / defaults
  * ========================================================================== */
@@ -347,6 +366,13 @@
 #define OSV_SS_SEAM_OFFSET_MAX 3.0
 #define OSV_SS_SEAM_OFFSET_DEFAULT 0.0
 
+/* [WP-VIGNETTE] "Shading Strength", in percent: how much of the measured
+ * lens shading correction is applied.  The blob stores whole percent 0..100
+ * (PrefsBlob::shadingStrengthPercent); static_asserts tie the limits to it. */
+#define OSV_SS_SHADING_STRENGTH_MIN 0.0
+#define OSV_SS_SHADING_STRENGTH_MAX 100.0
+#define OSV_SS_SHADING_STRENGTH_DEFAULT 100.0
+
 /* [WP-DEFAULTS] The Defaults group's two buttons: the parameter names (the
  * panel's left column) and the words on the buttons themselves. */
 #define OSV_SS_DEFAULTS_TOPIC_NAME "Defaults"
@@ -390,17 +416,19 @@ namespace osv::premiere::sourcesettings {
 ///  15    Seam Smoothing           [WP-SEAMTOOLS]
 ///  16    Near Offset              [WP-SEAMTOOLS]
 ///  17    Far Offset               [WP-SEAMTOOLS]
-///  18  (GROUP_END, Stitching)
-///  19  Advanced           (GROUP_START, starts collapsed)
-///  20    D-Log M Curve
-///  21    Exposure
-///  22    Render Device
-///  23    Program Monitor Colour   [WP-SETTINGS]
-///  24  (GROUP_END, Advanced)
-///  25  Defaults           (GROUP_START, starts collapsed)   [WP-DEFAULTS]
-///  26    Save       [Save as Default for New Clips]
-///  27    Restore    [Restore Built-in Defaults]
-///  28  (GROUP_END, Defaults)
+///  18    Lens Shading             [WP-VIGNETTE]
+///  19    Shading Strength         [WP-VIGNETTE]
+///  20  (GROUP_END, Stitching)
+///  21  Advanced           (GROUP_START, starts collapsed)
+///  22    D-Log M Curve
+///  23    Exposure
+///  24    Render Device
+///  25    Program Monitor Colour   [WP-SETTINGS]
+///  26  (GROUP_END, Advanced)
+///  27  Defaults           (GROUP_START, starts collapsed)   [WP-DEFAULTS]
+///  28    Save       [Save as Default for New Clips]
+///  29    Restore    [Restore Built-in Defaults]
+///  30  (GROUP_END, Defaults)
 enum ParamIndex : int {
     kIndexColorOutput = 1,
     kIndexRec709Look = 2,
@@ -419,13 +447,15 @@ enum ParamIndex : int {
     kIndexSeamSmoothing = 15,   // [WP-SEAMTOOLS]
     kIndexNearOffset = 16,      // [WP-SEAMTOOLS]
     kIndexFarOffset = 17,       // [WP-SEAMTOOLS]
-    kIndexStitchTopicEnd = 18,
-    kIndexAdvancedTopic = 19,
-    kIndexDlogmFit = 20,
-    kIndexExposure = 21,
-    kIndexRenderDevice = 22,
-    kIndexDirectColour = 23,
-    kIndexAdvancedTopicEnd = 24,
+    kIndexLensShading = 18,     // [WP-VIGNETTE]
+    kIndexShadingStrength = 19, // [WP-VIGNETTE]
+    kIndexStitchTopicEnd = 20,
+    kIndexAdvancedTopic = 21,
+    kIndexDlogmFit = 22,
+    kIndexExposure = 23,
+    kIndexRenderDevice = 24,
+    kIndexDirectColour = 25,
+    kIndexAdvancedTopicEnd = 26,
     // [WP-DEFAULTS] Always the last group, so its indices are written
     // relative to the Advanced terminator: a control added to an earlier
     // group moves them with it and nothing here has to be renumbered.
@@ -443,7 +473,9 @@ inline constexpr int kParamIdByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
     OSV_SS_ID_STITCH_TOPIC,     OSV_SS_ID_SEAM_SEARCH,   OSV_SS_ID_GAIN_MATCH,
     OSV_SS_ID_CALIBRATION,      OSV_SS_ID_FLARE_REMOVAL, OSV_SS_ID_PHOTO_SEAM, OSV_SS_ID_PHOTO_STRENGTH,
     OSV_SS_ID_SEAM_INSET,       OSV_SS_ID_SEAM_BLEND,    OSV_SS_ID_PARALLAX_BLEND, OSV_SS_ID_SEAM_SMOOTHING,
-    OSV_SS_ID_NEAR_OFFSET,      OSV_SS_ID_FAR_OFFSET,    OSV_SS_ID_STITCH_TOPIC_END, OSV_SS_ID_ADVANCED_TOPIC,
+    OSV_SS_ID_NEAR_OFFSET,      OSV_SS_ID_FAR_OFFSET,
+    OSV_SS_ID_LENS_SHADING,     OSV_SS_ID_SHADING_STRENGTH,  // [WP-VIGNETTE]
+    OSV_SS_ID_STITCH_TOPIC_END, OSV_SS_ID_ADVANCED_TOPIC,
     OSV_SS_ID_DLOGM_FIT,        OSV_SS_ID_EXPOSURE,      OSV_SS_ID_RENDER_DEVICE,
     OSV_SS_ID_DIRECT_COLOUR,    OSV_SS_ID_ADVANCED_TOPIC_END,
     // [WP-DEFAULTS]
@@ -457,8 +489,9 @@ inline constexpr int kParamCount = OSV_SOURCE_SETTINGS_PARAM_COUNT;
 /// GROUP_START / GROUP_END markers and [WP-DEFAULTS] the two Defaults buttons
 /// (a button has no value; it only triggers PF_Cmd_USER_CHANGED_PARAM).
 /// This is the count that has to round trip through a PrefsBlob
-/// ([WP-SEAMTOOLS] five more since the seam tools).
-inline constexpr int kValueParamCount = 20;
+/// ([WP-SEAMTOOLS] five more since the seam tools, [WP-VIGNETTE] two more
+/// since the lens shading correction).
+inline constexpr int kValueParamCount = 22;
 
 /// The parameter names, in index order, so a test can compare the built
 /// module's list without repeating the strings.
@@ -472,6 +505,7 @@ inline constexpr const char* kParamNameByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] 
     "Colour Output", "Look (Rec. 709 only)", "Output Size", "Stabilisation", "Stitching", "Seam Search",
     "Exposure Match", "Calibration",  "Sun Ghost Removal",  "Sky Seam Fix", "Sky Seam Strength",
     "Seam Edge Inset", "Seam Blend",  "Parallax Blend", "Seam Smoothing", "Near Offset", "Far Offset",
+    "Lens Shading",   "Shading Strength",  // [WP-VIGNETTE]
     "",               "Advanced",     "D-Log M Curve",
     "Exposure",       "Render Device", "Program Monitor Colour", "",
     // [WP-DEFAULTS]

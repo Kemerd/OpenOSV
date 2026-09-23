@@ -4,6 +4,7 @@
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/core/Log.h"
 #include "osv/render/Flare.h"
+#include "osv/render/LensShading.h"
 #include "osv/render/PhotoSeam.h"
 #include "osv/render/SeamTools.h"
 
@@ -216,6 +217,36 @@ RenderParamsBuilder& RenderParamsBuilder::clearSeamSmooth() {
     return *this;
 }
 
+// ---------------------------------------------------------------------------
+//  [WP-VIGNETTE] per-lens shading correction
+// ---------------------------------------------------------------------------
+RenderParamsBuilder& RenderParamsBuilder::shading(const LensShadingModel& model, double strength) {
+    // fillLensShadingBlock is the one place a model becomes kernel fields;
+    // a scratch block takes it, and only the shading part is kept.  It
+    // clears the block and reports false for anything it will not apply.
+    OsvRenderParams scratch;
+    std::memset(&scratch, 0, sizeof(scratch));
+    if (!fillLensShadingBlock(model, strength, scratch)) {
+        return clearShading();
+    }
+    m_shadeEnabled = scratch.shadeEnabled;
+    m_shadeTheta0 = scratch.shadeTheta0Rad;
+    m_shadeDTheta = scratch.shadeDThetaRad;
+    m_shadeStrength = scratch.shadeStrength;
+    m_shadeLens[0] = scratch.shade[0];
+    m_shadeLens[1] = scratch.shade[1];
+    return *this;
+}
+
+RenderParamsBuilder& RenderParamsBuilder::clearShading() {
+    m_shadeEnabled = 0;
+    m_shadeTheta0 = 0.0f;
+    m_shadeDTheta = 0.0f;
+    m_shadeStrength = 0.0f;
+    std::memset(m_shadeLens.data(), 0, sizeof(OsvShadeLens) * m_shadeLens.size());
+    return *this;
+}
+
 RenderParamsBuilder& RenderParamsBuilder::color(const OsvColorParams& params) {
     m_color = params;
     return *this;
@@ -425,6 +456,17 @@ Result<OsvRenderParams> RenderParamsBuilder::buildParams() const {
     // which is what keeps every render without smoothing exactly as it was.
     if (m_seamSmoothDeg > 0.0 && !m_blendSeam.empty() && m_blendEnabled) {
         fillSeamSmoothParams(p, m_seamSmoothDeg, m_seamSmoothSigmaDeg);
+    }
+
+    // [WP-VIGNETTE] All zero without a model (the memset above), which is
+    // what keeps every render without one exactly as it was.
+    if (m_shadeEnabled) {
+        p.shadeEnabled = 1;
+        p.shadeTheta0Rad = m_shadeTheta0;
+        p.shadeDThetaRad = m_shadeDTheta;
+        p.shadeStrength = m_shadeStrength;
+        p.shade[0] = m_shadeLens[0];
+        p.shade[1] = m_shadeLens[1];
     }
     return p;
 }

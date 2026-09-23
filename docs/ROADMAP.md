@@ -107,8 +107,9 @@ the presets - remains the one thing a human has to confirm.
 ## Later
 
 * DaVinci Resolve OpenFX plug-in reusing the same kernel.
-* Lens shading (vignetting) correction: a radial gain model fitted from flat
-  or sky frames, so the seam band matches DJI's brightness.
+* Lens shading: a per-camera flat-field calibration (a pan-head sky sweep)
+  for footage without sky.  The per-clip correction measured from each lens's
+  own sky exists (Source Settings "Lens Shading", WP-VIGNETTE).
 * Optical-flow seam refinement for close-range subjects.
 * 4K-mode crop verification and a rotation clip to settle the attitude
   convention once and for all.

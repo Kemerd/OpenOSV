@@ -112,6 +112,10 @@ constexpr PrTime kTicksPerFrame5994 = 4237833600LL;
     // [WP-PHOTO] the photometric seam field is an analysis too (measured
     // from each path's own frames); the float-noise case below turns it on.
     p.photoSeam = static_cast<std::uint8_t>(PrefsPhotoSeam::Off);
+    // [WP-VIGNETTE] the lens shading correction is measured the same way
+    // (device bands on one path, host bands on the other); the float-noise
+    // case below turns it on.
+    p.lensShading = static_cast<std::uint8_t>(PrefsLensShading::Off);
     // Horizon lock stays ON: it only rotates the equirect, identically in
     // both paths, and a stabilised frame is the realistic one.
     return p;
@@ -589,6 +593,7 @@ TEST_CASE("with an analysis on, the two frame paths differ only by that analysis
         bool parallax;
         bool flare;  ///< [WP-FLARE] sun ghost removal
         bool photo;  ///< [WP-PHOTO] the sky seam fix (rim and gain field)
+        bool shading = false;  ///< [WP-VIGNETTE] the lens shading correction
     };
     const Case cases[] = {
         {"seam search", true, false, false, false},
@@ -596,6 +601,7 @@ TEST_CASE("with an analysis on, the two frame paths differ only by that analysis
         {"gain match", false, true, false, false},
         {"sun ghost removal", false, false, false, true, false},  // [WP-FLARE]
         {"sky seam fix", false, false, false, false, true},       // [WP-PHOTO]
+        {"lens shading", false, false, false, false, false, true},  // [WP-VIGNETTE]
     };
     csSDK_int32 id = 311;
     for (const Case& c : cases) {
@@ -605,6 +611,7 @@ TEST_CASE("with an analysis on, the two frame paths differ only by that analysis
         prefs.parallax = static_cast<std::uint8_t>(c.parallax ? PrefsParallax::On : PrefsParallax::Off);
         prefs.flareRemoval = c.flare ? 1 : 0;
         prefs.photoSeam = static_cast<std::uint8_t>(c.photo ? PrefsPhotoSeam::RimAndGain : PrefsPhotoSeam::Off);
+        prefs.lensShading = static_cast<std::uint8_t>(c.shading ? PrefsLensShading::Auto : PrefsLensShading::Off);
         constexpr std::uint32_t kFrame = 20;
 
         Delivered gpu;
@@ -625,7 +632,9 @@ TEST_CASE("with an analysis on, the two frame paths differ only by that analysis
 
         // [WP-PHOTO] the field's rows span +-9 deg and its gain decays over
         // 20 deg beyond them: nothing past 29 deg may differ.
-        const PathDifference d = pathDifference(gpu, host, c.photo ? 30.0 : 9.5);
+        // [WP-VIGNETTE] the correction starts 76 deg from a lens axis, so
+        // it reaches 14 deg from the seam plus the axes' tilt: 16 deg.
+        const PathDifference d = pathDifference(gpu, host, c.photo ? 30.0 : (c.shading ? 16.0 : 9.5));
         INFO(c.name << ": band pixels differing " << d.pixelsInside << " / " << d.bandPixels << " (worst "
                     << d.worstInside << ", mean " << d.meanInside << "), outside the band " << d.pixelsOutside
                     << " (worst " << d.worstOutside << ")");
@@ -657,6 +666,13 @@ TEST_CASE("with an analysis on, the two frame paths differ only by that analysis
             // Per-lens gains from slightly different bands: a global scale a
             // hair apart (measured 8e-6) - below half a 16-bit code anywhere.
             CHECK(d.worstOutside <= 0.5f / 32768.0f);
+            CHECK(d.worstInside <= 0.5f / 32768.0f);
+        } else if (c.shading) {
+            // [WP-VIGNETTE] The correction measured from device bands on one
+            // path and host bands on the other: exactly nothing beyond its
+            // reach, and across it the two estimates' float noise, below half
+            // a 16-bit code anywhere.
+            CHECK(d.pixelsOutside == 0);
             CHECK(d.worstInside <= 0.5f / 32768.0f);
         } else if (c.photo) {
             // [WP-PHOTO] The field from device bands on one path and host bands

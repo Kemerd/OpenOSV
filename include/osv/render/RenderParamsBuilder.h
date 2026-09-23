@@ -30,6 +30,8 @@ struct FlareModel;  // [WP-FLARE] osv/render/Flare.h
 // [WP-PHOTO] Defined in PhotoSeam.h, which includes this header.
 struct PhotoSeamField;
 struct PhotoSeamParams;
+// [WP-VIGNETTE] Defined in LensShading.h, which includes this header.
+struct LensShadingModel;
 
 class RenderParamsBuilder {
 public:
@@ -111,6 +113,17 @@ public:
     /// [WP-SEAMTOOLS] No seam smoothing (the default).
     RenderParamsBuilder& clearSeamSmooth();
 
+    /// [WP-VIGNETTE] Per-lens shading correction (LensShading.h): each
+    /// lens's measured rim structure, added back in its native linear light
+    /// before every gain, at `strength` (0..1).  The model is reduced to the
+    /// kernel's separable block here (fillLensShadingBlock); an inactive or
+    /// invalid model, or a strength that is not above zero, leaves the
+    /// correction off rather than half-configured.
+    RenderParamsBuilder& shading(const LensShadingModel& model, double strength = 1.0);
+
+    /// [WP-VIGNETTE] No shading correction (the default).
+    RenderParamsBuilder& clearShading();
+
     /// Colour pipeline block from osv::color::makeColorParams (required).
     RenderParamsBuilder& color(const OsvColorParams& params);
 
@@ -162,6 +175,12 @@ private:
     // [WP-SEAMTOOLS] seam smoothing (0 = off)
     double m_seamSmoothDeg = 0.0;      ///< Low-band blend half width, degrees.
     double m_seamSmoothSigmaDeg = -1.0;  ///< Low-band blur sigma, degrees; < 0 = the default.
+    // [WP-VIGNETTE] the kernel's shading block, ready to copy (enabled 0 = off)
+    int m_shadeEnabled = 0;
+    float m_shadeTheta0 = 0.0f;          ///< Radians.
+    float m_shadeDTheta = 0.0f;          ///< Radians.
+    float m_shadeStrength = 0.0f;
+    std::array<OsvShadeLens, 2> m_shadeLens{};
     std::optional<OsvColorParams> m_color;
     bool m_alphaCoverage = true;
     std::array<bool, 2> m_lensEnabled{true, true};

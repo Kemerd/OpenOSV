@@ -410,7 +410,8 @@ Result<SeamProfile> searchSeam(const geom::LensRig& rig, const video::FramePair&
 }
 
 Result<GainEstimate> estimateGain(const geom::LensRig& rig, const video::FramePair& frames,
-                                  const geom::BlendParams& blend, const BandParams& band, ThreadPool& pool) {
+                                  const geom::BlendParams& blend, const BandParams& band, ThreadPool& pool,
+                                  const LensShadingModel* shading) {
     // Render linear RGB bands (not just luma): we need per-channel means.
     geom::EquirectMap map;
     map.layout = geom::EquirectLayout::PolarAxis;
@@ -434,6 +435,10 @@ Result<GainEstimate> estimateGain(const geom::LensRig& rig, const video::FramePa
     for (int lens = 0; lens < 2; ++lens) {
         RenderParamsBuilder builder;
         builder.rig(rig).equirect(map).blend(blend, true).color(cp).alphaCoverage(true).lensEnabled(1 - lens, false);
+        // [WP-VIGNETTE] the lens as the kernel will blend it (null: raw).
+        if (shading) {
+            builder.shading(*shading, 1.0);
+        }
         OSV_TRY_ASSIGN(RenderJob job, builder.build(frames));
         OSV_TRY_ASSIGN(bandRgba[lens], shadeRows(job, static_cast<std::uint32_t>(row0),
                                                   static_cast<std::uint32_t>(row1), pool));

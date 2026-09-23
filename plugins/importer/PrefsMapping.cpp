@@ -72,6 +72,28 @@ void applySeamToolControls(const DialogControls& c, PrefsBlob& blob) noexcept {
     blob.setFarOffsetDeg(c.farOffsetDeg);
 }
 
+// ---------------------------------------------------------------------------
+//  [WP-VIGNETTE] the lens shading correction <-> its two rows
+// ---------------------------------------------------------------------------
+
+/// Blob -> controls, through the blob's decoders (code 0 = the default).
+void shadingControlsFromPrefs(const PrefsBlob& prefs, DialogControls& c) noexcept {
+    c.lensShading = static_cast<int>(prefs.lensShading);
+    c.shadingStrengthPercent = prefs.shadingStrengthPercent();
+}
+
+/// Controls -> blob.  An out-of-range mode lands on the default (Auto); the
+/// strength goes through the blob's setter (rounded, clamped, 100 % stored
+/// as code 0 so it keeps tracking the default).
+void applyShadingControls(const DialogControls& c, PrefsBlob& blob) noexcept {
+    if (c.lensShading < 0 || c.lensShading >= static_cast<int>(PrefsLensShading::Count)) {
+        blob.lensShading = static_cast<std::uint8_t>(PrefsLensShading::Auto);
+    } else {
+        blob.lensShading = static_cast<std::uint8_t>(c.lensShading);
+    }
+    blob.setShadingStrengthPercent(c.shadingStrengthPercent);
+}
+
 }  // namespace
 // ---- [/WP-SEAMTOOLS] ---------------------------------------------------------
 
@@ -98,6 +120,7 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.flareRemoval = prefs.flareRemoval != 0;  // [WP-FLARE]
     photoControlsFromPrefs(prefs, c);  // [WP-PHOTO]
     seamToolControlsFromPrefs(prefs, c);  // [WP-SEAMTOOLS]
+    shadingControlsFromPrefs(prefs, c);  // [WP-VIGNETTE]
     return c;
 }
 
@@ -157,6 +180,7 @@ PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& bas
     blob.exposureStops = std::isfinite(controls.exposureStops) ? static_cast<float>(controls.exposureStops) : 0.0f;
     applyPhotoControls(controls, blob);  // [WP-PHOTO]
     applySeamToolControls(controls, blob);  // [WP-SEAMTOOLS]
+    applyShadingControls(controls, blob);  // [WP-VIGNETTE]
 
     blob.sanitise();
     return blob;
