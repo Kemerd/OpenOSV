@@ -197,6 +197,14 @@ DirectLaunchResult launchDirect(CUfunction kernel, CUstream stream, const Direct
             return refused(DirectLaunchReject::Memory);
         }
     }
+    // [WP-SEAM] The carved blend-seam table: two floats per column.
+    if (setup.blendSeam) {
+        const std::uint64_t blendSeamBytes =
+            static_cast<std::uint64_t>(setup.params.blendSeamColumns) * 2u * sizeof(float);
+        if (!deviceRangeOk(setup.blendSeam, blendSeamBytes, device)) {
+            return refused(DirectLaunchReject::Memory);
+        }
+    }
 
     // ---- the arguments, in the order DirectKernelAbi.h pins ----------------
     // cuLaunchKernel copies every argument before it returns, so locals are
@@ -207,10 +215,11 @@ DirectLaunchResult launchDirect(CUfunction kernel, CUstream stream, const Direct
     planes.lens[1] = devicePlanes[1];
     const float* seam = setup.seamTable;
     const float* warp = setup.warpGrid;
+    const float* blendSeam = setup.blendSeam;  // [WP-SEAM]
     unsigned char* dst = static_cast<unsigned char*>(out.data);
     int dstRowBytes = static_cast<int>(out.rowBytes);
     int dstIsHalf = out.isHalf ? 1 : 0;
-    void* args[] = {&params, &planes, &seam, &warp, &dst, &dstRowBytes, &dstIsHalf};
+    void* args[] = {&params, &planes, &seam, &warp, &blendSeam, &dst, &dstRowBytes, &dstIsHalf};
 
     // One thread per output pixel, the grid rounded up to whole blocks (the
     // kernel guards the tail).  Heights up to 65536 need at most 4096 blocks

@@ -374,6 +374,7 @@ void ImporterInstance::stopParallaxWorker() noexcept {
 void ImporterInstance::resetParallaxLocked() noexcept {
     std::lock_guard<std::mutex> lock(m_parallaxMutex);
     m_parallaxGrids.clear();
+    m_blendSeams.clear();  // [WP-SEAM] carved through the corrections just dropped
     m_parallaxPending.reset();
     ++m_parallaxGeneration;
 }
@@ -1312,6 +1313,13 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
         }
     }
 
+    // ---- [WP-SEAM] carved blend seam ---------------------------------------
+    // Under the seam preference: "seam search" now means both halves of the
+    // seam - the disparity correction above and WHERE the two lenses meet.
+    if (wantSeam) {
+        applyCarvedSeam(index, pair, wantParallax, purpose, pool, builder, frameExact);
+    }
+
     if (m_prefs.gainMatch != 0) {
         auto cached = m_gains.find(bucket);
         if (cached == m_gains.end()) {
@@ -1333,6 +1341,124 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     }
 
     return AnalysisOutcome{parallaxApplied, frameExact};
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-SEAM] carved blend seam
+// ---------------------------------------------------------------------------
+void ImporterInstance::applyCarvedSeam(std::uint32_t index, const video::FramePair& pair, bool wantParallax,
+                                       RenderPurpose purpose, ThreadPool& pool, render::RenderParamsBuilder& builder,
+                                       bool& frameExact) {
+    const std::uint32_t bucket = render::parallaxBucket(index);
+
+    // ---- what is known: this bucket's seam, its neighbours', its correction --
+    std::shared_ptr<const render::BlendSeam> own;
+    std::shared_ptr<const render::BlendSeam> previous;
+    std::shared_ptr<const render::BlendSeam> next;
+    std::shared_ptr<const render::ParallaxWarpGrid> ownGrid;
+    // Without the parallax correction the bucket's correction is its seam
+    // table (or nothing), which the caller has already settled.  With it,
+    // the grid must have been measured (or refused) before the seam can be
+    // carved through it.
+    bool correctionKnown = !wantParallax;
+    {
+        std::lock_guard<std::mutex> lock(m_parallaxMutex);
+        if (const auto it = m_blendSeams.find(bucket); it != m_blendSeams.end()) {
+            own = it->second;
+        }
+        if (bucket > 0) {
+            if (const auto it = m_blendSeams.find(bucket - 1); it != m_blendSeams.end()) {
+                previous = it->second;
+            }
+        }
+        if (const auto it = m_blendSeams.find(bucket + 1); it != m_blendSeams.end()) {
+            next = it->second;
+        }
+        if (wantParallax) {
+            if (const auto it = m_parallaxGrids.find(bucket); it != m_parallaxGrids.end()) {
+                correctionKnown = true;
+                ownGrid = it->second;  // nullptr = refused: the seam table is the correction
+            }
+        }
+    }
+
+    // ---- carve this bucket now when its correction is settled --------------
+    // Cheap enough for the render thread (two band renders' worth of shading
+    // plus a DP over 1024 x ~70 cells), so there is no background path: an
+    // Interactive frame whose grid is still being measured borrows below,
+    // and the first frame of the bucket after the grid lands carves it.
+    if (!own && correctionKnown) {
+        render::WarpGridView warpView;
+        render::SeamCorrection correction;
+        if (ownGrid && ownGrid->valid()) {
+            warpView.uv = ownGrid->uv.data();
+            warpView.w = ownGrid->w;
+            warpView.h = ownGrid->h;
+            warpView.latMinRad = ownGrid->latMinRad;
+            warpView.latMaxRad = ownGrid->latMaxRad;
+            correction.warp = &warpView;
+        } else if (const auto table = m_seamTables.find(bucket);
+                   table != m_seamTables.end() && !table->second.empty()) {
+            correction.seamShiftDeg = &table->second;
+        }
+        // Steered by the neighbour that is already on screen: the previous
+        // bucket when playing forward, the next one when stepping back.
+        const render::BlendSeam* prior = previous ? previous.get() : next.get();
+        const render::SeamCarveParams params;
+        const render::BandParams band = render::ParallaxWarpParams{}.band;
+        auto carved = render::carveSeam(m_rig, pair, m_blend, band, correction, params, prior, pool);
+        if (carved.ok()) {
+            const render::BlendSeam& s = carved.value();
+            PluginLog::debug("frame {} (bucket {}): seam carved in {:.1f} ms through {}, latitude mean {:+.2f} / max "
+                             "{:.2f} deg, feather {:.2f} deg mean, {} narrow / {} forced columns{}",
+                             index, bucket, s.carveMs,
+                             correction.warp ? "the parallax grid"
+                                             : (correction.seamShiftDeg ? "the seam table" : "no correction"),
+                             s.meanLatDeg, s.maxAbsLatDeg, s.meanHalfWidthDeg, s.narrowColumns, s.forcedColumns,
+                             s.usedPrior ? ", held to its neighbour" : "");
+            own = std::make_shared<const render::BlendSeam>(std::move(carved).value());
+            std::lock_guard<std::mutex> lock(m_parallaxMutex);
+            m_blendSeams[bucket] = own;
+            trimAnalysisCache(m_blendSeams, kMaxAnalysisCache, bucket);
+        } else {
+            PluginLog::debug("frame {} (bucket {}): seam carve failed ({}); keeping the feather blend", index, bucket,
+                             carved.error().message);
+        }
+    }
+
+    // ---- choose what to apply ------------------------------------------------
+    std::shared_ptr<const render::BlendSeam> apply;
+    if (own) {
+        apply = own;
+        // Glide from the previous bucket's seam instead of stepping to this
+        // one at the bucket edge - the same schedule as the parallax grid, so
+        // the two move together.
+        if (previous) {
+            auto blended = render::blendSeams(*previous, *own, render::parallaxCrossfadeWeight(index));
+            if (blended.ok()) {
+                apply = std::make_shared<const render::BlendSeam>(std::move(blended).value());
+            }
+        }
+    } else if (purpose == RenderPurpose::Interactive) {
+        // Stand-in: the nearest carved neighbour within the parallax borrow
+        // range, earlier first.  The frame is then not final.
+        frameExact = false;
+        std::lock_guard<std::mutex> lock(m_parallaxMutex);
+        for (std::uint32_t d = 1; d <= kParallaxBorrowBuckets && !apply; ++d) {
+            if (bucket >= d) {
+                if (const auto it = m_blendSeams.find(bucket - d); it != m_blendSeams.end() && it->second) {
+                    apply = it->second;
+                    break;
+                }
+            }
+            if (const auto it = m_blendSeams.find(bucket + d); it != m_blendSeams.end() && it->second) {
+                apply = it->second;
+            }
+        }
+    }
+    if (apply) {
+        render::applyBlendSeam(builder, *apply);
+    }
 }
 
 Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_t index, void* cuContext,

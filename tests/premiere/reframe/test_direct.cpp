@@ -66,6 +66,7 @@
 #include "osv/render/RenderJob.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
+#include "osv/render/SeamCarve.h"
 #include "osv/video/DualStreamReader.h"
 
 #include <catch2/catch_approx.hpp>
@@ -853,7 +854,8 @@ TEST_CASE("buildDirectParams takes the camera from buildView and the stitch from
     CHECK(d.warpGrid == warp.data());
 
     // ---- and it fits the kernel's parameter space ----------------------------
-    CHECK(sizeof(OsvRenderParams) + sizeof(OsvDirectPlanes) + 3 * sizeof(void*) + 2 * sizeof(int) <= 4096);
+    // Four pointers since [WP-SEAM]: seam table, warp grid, blend seam, output.
+    CHECK(sizeof(OsvRenderParams) + sizeof(OsvDirectPlanes) + 4 * sizeof(void*) + 2 * sizeof(int) <= 4096);
 }
 
 TEST_CASE("buildDirectParams forwards seam and warp pointers only with their feature", "[reframe][direct]") {
@@ -865,11 +867,23 @@ TEST_CASE("buildDirectParams forwards seam and warp pointers only with their fea
     const float dummy[4] = {0, 0, 0, 0};
     stitch.seamTable = dummy;  // present, but the block says the seam is off
     stitch.warpGrid = dummy;
+    stitch.blendSeam = dummy;  // [WP-SEAM] likewise
     const DirectSetup d = buildDirectParams(makeSettings(Resolution::MatchSequence, 0, 0, 0, 90, 0), stitch, 640, 360,
                                             SizePx{});
     REQUIRE(d.valid);
     CHECK(d.seamTable == nullptr);
     CHECK(d.warpGrid == nullptr);
+    CHECK(d.blendSeam == nullptr);
+
+    // [WP-SEAM] With its feature on, the blend-seam pointer travels.
+    stitch.equirect.blendSeamEnabled = 1;
+    stitch.equirect.blendSeamColumns = 2;
+    stitch.equirect.blendSeamEdgeRad = 0.01f;
+    const DirectSetup on = buildDirectParams(makeSettings(Resolution::MatchSequence, 0, 0, 0, 90, 0), stitch, 640, 360,
+                                             SizePx{});
+    REQUIRE(on.valid);
+    CHECK(on.blendSeam == dummy);
+    CHECK(on.params.blendSeamColumns == 2);
 }
 
 TEST_CASE("buildDirectParams refuses every stitch state a kernel could misbehave on", "[reframe][direct]") {
@@ -971,6 +985,23 @@ TEST_CASE("buildDirectParams refuses every stitch state a kernel could misbehave
         st.equirect.warpLatMaxRad = 0.1f;
         st.warpGrid = grid;
         expectReject(st, DirectReject::WarpGrid);
+    }
+    SECTION("[WP-SEAM] blend seam on with no table") {
+        StitchState st = good;
+        st.equirect.blendSeamEnabled = 1;
+        st.equirect.blendSeamColumns = 1024;
+        expectReject(st, DirectReject::BlendSeam);
+    }
+    SECTION("[WP-SEAM] blend seam on with no columns or a NaN edge ramp") {
+        StitchState st = good;
+        const float table[2] = {0.0f, 0.01f};
+        st.equirect.blendSeamEnabled = 1;
+        st.equirect.blendSeamColumns = 0;
+        st.blendSeam = table;
+        expectReject(st, DirectReject::BlendSeam);
+        st.equirect.blendSeamColumns = 1;
+        st.equirect.blendSeamEdgeRad = std::nanf("");
+        expectReject(st, DirectReject::BlendSeam);
     }
     SECTION("an unusable output size is the camera's refusal, named") {
         const DirectSetup d = buildDirectParams(s, good, 0, 360, SizePx{});
@@ -1719,6 +1750,30 @@ TEST_CASE("the direct kernel matches its CPU twin on the sample clip", "[reframe
     StitchState warpDevice = warpHost;
     warpDevice.warpGrid = uploadTable(g, grid.value().uv);
 
+    // ---- stitch C [WP-SEAM]: warp grid + the carved seam (the importer default
+    // since the carved seam) ----------------------------------------------------
+    render::WarpGridView carveView;
+    carveView.uv = grid.value().uv.data();
+    carveView.w = grid.value().w;
+    carveView.h = grid.value().h;
+    carveView.latMinRad = grid.value().latMinRad;
+    carveView.latMaxRad = grid.value().latMaxRad;
+    render::SeamCorrection carveCorrection;
+    carveCorrection.warp = &carveView;
+    auto carved = render::carveSeam(clip->rig, soft.pair, clip->blend, pw.band, carveCorrection,
+                                    render::SeamCarveParams{}, nullptr, pool());
+    REQUIRE(carved.ok());
+    render::applyBlendSeam(warpBuilder, carved.value());
+    auto carveBlock = warpBuilder.equirect(map).buildParams();
+    REQUIRE(carveBlock.ok());
+    REQUIRE(carveBlock.value().blendSeamEnabled == 1);
+    StitchState carveHost = warpHost;
+    carveHost.equirect = carveBlock.value();
+    carveHost.blendSeam = carved.value().table.data();
+    StitchState carveDevice = warpDevice;
+    carveDevice.equirect = carveBlock.value();
+    carveDevice.blendSeam = uploadTable(g, carved.value().table);
+
     struct GpuCase {
         const char* name;
         Settings settings;
@@ -1734,6 +1789,10 @@ TEST_CASE("the direct kernel matches its CPU twin on the sample clip", "[reframe
         {"rolled + source-rotated eye-offset, warp grid",
          makeSettings(Resolution::MatchSequence, -40.0, 15.0, 25.0, 150.0, 40.0, 30.0, -12.0, 8.0), &warpHost,
          &warpDevice},
+        {"across the seam, warp grid + carved seam",
+         makeSettings(Resolution::MatchSequence, 90.0, 0.0, 0.0, 100.0, 0.0), &carveHost, &carveDevice},
+        {"tiny planet, warp grid + carved seam", asteroidSettings(Resolution::MatchSequence), &carveHost,
+         &carveDevice},
     };
 
     for (const GpuCase& c : cases) {

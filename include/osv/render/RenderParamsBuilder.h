@@ -64,6 +64,18 @@ public:
     /// Remove any previously set warp grid (A/B comparison).
     RenderParamsBuilder& clearWarp();
 
+    /// [WP-SEAM] Carved blend-seam table (see SeamCarve.h and osv_kernel.h).
+    ///
+    /// `table` is interleaved (latitude, feather half width) radian pairs,
+    /// `columns` of them, over the polar-axis longitude ring; `edgeRad` is
+    /// the validity ramp below each lens's thetaMax.  A table whose size does
+    /// not match, a non-finite or out-of-range entry, or a non-finite /
+    /// negative ramp leaves the seam disabled rather than half-configured.
+    RenderParamsBuilder& blendSeam(const std::vector<float>& table, std::uint32_t columns, float edgeRad);
+
+    /// [WP-SEAM] Remove any previously set blend-seam table (A/B comparison).
+    RenderParamsBuilder& clearBlendSeam();
+
     /// Colour pipeline block from osv::color::makeColorParams (required).
     RenderParamsBuilder& color(const OsvColorParams& params);
 
@@ -95,6 +107,10 @@ private:
     std::uint32_t m_warpH = 0;
     float m_warpLatMin = 0.0f;
     float m_warpLatMax = 0.0f;
+    // [WP-SEAM] carved blend seam (empty table = disabled)
+    std::vector<float> m_blendSeam;
+    std::uint32_t m_blendSeamColumns = 0;
+    float m_blendSeamEdgeRad = 0.0f;
     std::optional<OsvColorParams> m_color;
     bool m_alphaCoverage = true;
     std::array<bool, 2> m_lensEnabled{true, true};

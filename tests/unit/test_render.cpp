@@ -488,7 +488,47 @@ void checkParity(render::IRenderer& gpu, const char* label) {
     REQUIRE(jobC.ok());
     REQUIRE(jobC.value().params.projection == OSV_PROJ_EYE_OFFSET);
 
-    for (const render::RenderJob* job : {&jobA.value(), &jobB.value(), &jobC.value()}) {
+    // [WP-SEAM] The carved blend seam: a wavy seam (+/-2.5 degrees) with a
+    // feather that varies from 0.3 to 1.2 degrees, so the lookup's
+    // interpolation, the wrap, the narrow and the wide feather and the
+    // occlusion fill (the sample rig carries the stick polygon) all run -
+    // once in a view straight across the seam, once over the whole
+    // polar-axis band.
+    constexpr std::uint32_t kSeamColumns = 512;
+    std::vector<float> blendSeamTable(kSeamColumns * 2u);
+    for (std::uint32_t c = 0; c < kSeamColumns; ++c) {
+        const double t = osv::kTwoPi * static_cast<double>(c) / kSeamColumns;
+        blendSeamTable[c * 2u] = static_cast<float>(deg2rad(2.5 * std::sin(3.0 * t)));
+        blendSeamTable[c * 2u + 1u] = static_cast<float>(deg2rad(0.3 + 0.9 * (0.5 + 0.5 * std::sin(5.0 * t))));
+    }
+    geom::VirtualCamera across;
+    across.w = 1920;
+    across.h = 1080;
+    across.hfovDeg = 100;
+    across.yawDeg = 90;  // the seam runs through the middle of the view
+    auto jobD = render::RenderParamsBuilder()
+                    .rig(sp.value().rig)
+                    .camera(across)
+                    .color(cp)
+                    .blendSeam(blendSeamTable, kSeamColumns, static_cast<float>(deg2rad(0.5)))
+                    .build(sp.value().pair);
+    REQUIRE(jobD.ok());
+    REQUIRE(jobD.value().params.blendSeamEnabled == 1);
+    geom::EquirectMap polar;
+    polar.layout = geom::EquirectLayout::PolarAxis;
+    polar.w = 2048;
+    polar.h = 1024;
+    auto jobE = render::RenderParamsBuilder()
+                    .rig(sp.value().rig)
+                    .equirect(polar)
+                    .color(cp)
+                    .blendSeam(blendSeamTable, kSeamColumns, static_cast<float>(deg2rad(0.5)))
+                    .build(sp.value().pair);
+    REQUIRE(jobE.ok());
+    REQUIRE(jobE.value().params.blendSeamEnabled == 1);
+
+    for (const render::RenderJob* job :
+         {&jobA.value(), &jobB.value(), &jobC.value(), &jobD.value(), &jobE.value()}) {
         auto ref = cpu.render(*job);
         auto test = gpu.render(*job);
         REQUIRE(ref.ok());
