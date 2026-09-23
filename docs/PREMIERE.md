@@ -10,7 +10,7 @@ SDKs (never committed) and share the milestone 1 library.
 | Binary | Kind | Entry point | What it does |
 |---|---|---|---|
 | `OpenOSVImporter.prm` | standard file importer | `xImportEntry` | Registers `.osv` and `.lrf`; decodes both lenses with FFmpeg, stitches with the CUDA / OpenCL / CPU renderer and hands Premiere an equirectangular 360 x 180 frame in `BGRA_4444_32f`, colour-tagged Rec.2100 PQ, HLG or Rec.709. Decodes the AAC track. Declares the clip as monoscopic equirectangular VR. Per-clip options reach it as a `PrefsBlob`, from either the Source Settings effect or the modal Source Settings dialog. |
-| `OpenOSVSourceSettings.aex` | AE API **source settings** effect | `EffectMain` | "OpenOSV Source Settings", attached by Premiere to the **master clip** automatically. Nine controls - colour output, output size, stabilisation, seam search, exposure match, calibration, D-Log M curve, exposure, render device - visible in the Effect Controls panel instead of behind a dialog. Renders nothing; its values reach the importer as a flat prefs blob, so they **cannot be keyframed**. See "Source Settings effect" below. |
+| `OpenOSVSourceSettings.aex` | AE API **source settings** effect | `EffectMain` | "OpenOSV Source Settings", attached by Premiere to the **master clip** automatically. Twenty controls - colour output and its Rec.709 look, output size, stabilisation, seam search, exposure match, calibration, sun ghost removal, the sky seam fix (mode, strength, edge inset), the seam tools (Seam Blend, Parallax Blend, Seam Smoothing, Near / Far Offset), D-Log M curve, exposure, render device, Program Monitor colour - visible in the Effect Controls panel instead of behind a dialog. Renders nothing; its values reach the importer as a flat prefs blob, so they **cannot be keyframed**. See "Source Settings effect" below. |
 | `Open360Reframe.aex` | After Effects API effect + `PrGPUFilter` | `EffectMain`, `xGPUFilterEntry` | "Open 360 Reframe" in the Effects panel (bin "OpenOSV"). Host-keyframed Pan / Tilt / Roll / FOV / Distortion plus preset perspectives. Renders on the GPU through Premiere's own CUDA device (driver API, embedded fatbin) and falls back to a 32-bit float CPU path that runs the same kernel. |
 
 Install all three (plus their runtime DLLs) in
@@ -20,6 +20,11 @@ Media Encoder and After Effects all scan that folder.
 The repository also ships three **sequence presets** (`presets/`), installed
 per user so `File > New > Sequence > OpenOSV` gives a correct 59.94 fps
 timeline in one click. See "Sequence presets" below.
+
+Plug-ins never see the timeline. Putting Open 360 Reframe on every `.OSV`
+dropped into a sequence is done by the **OpenOSV companion panel**
+(`panel/`, UXP and CEP builds), installed per user by the same script.
+`docs/PANEL.md` covers it.
 
 ## Compatibility rule
 
@@ -82,9 +87,13 @@ plugins/
     HostSuites.h/.cpp         RAII acquire/release of SweetPea suites by name+version
     PluginLog.h/.cpp          file log (%LOCALAPPDATA%\OpenOSV\<plugin>.log) + OutputDebugString
     DelayLoad.h/.cpp          delay-load hook: resolve avcodec/avformat/... /OpenCL.dll from the plug-in's own folder
-    PixelCopy.h/.cpp          RGBA float top-down  ->  BGRA 32f / 8u bottom-up with row bytes (SIMD friendly loops)
+    PixelCopy.h/.cpp          RGBA float top-down  ->  BGRA 32f / 16u / 8u bottom-up with row bytes (SIMD friendly
+                              loops), whole frames or streamed bands (rgbaRowsToHost, packedRowsToHost)
     HostContext.h/.cpp        process-wide lazily created renderer pool + thread pool, torn down explicitly
     PrefsBlob.h               the importer prefs struct (shared with the dialog AND the source settings effect)
+    UserDefaults.h/.cpp       the per-user defaults new clips start from (%APPDATA%\OpenOSV\defaults.json):
+                              named-key JSON, atomic writes, per-module mtime cache; SDK-free, so osvtool
+                              compiles it too (see "User defaults for new clips")
     SourceSettingsIdentity.h  the ONE spelling of the source settings effect's match name, included by
                               the effect's .r/.cpp and by the importer - the binding is a string compare
                               with no diagnostic, so it must not exist twice
@@ -92,6 +101,10 @@ plugins/
     ImporterEntry.cpp         xImportEntry dispatch, DllMain, imInit/imShutdown, open/quiet/close, privateData handle
     ImporterInstance.h/.cpp   per-clip state (privateData): reader, rig, colour, stabilisation, frame + analysis caches, mutex
     ImporterVideo.cpp         imGetInfo8/9, pixel formats, frame sizes, clip frame descriptors, colour spaces, imGetSourceVideo, imAnalysis
+    ImporterGpuFrame.h/.cpp   the importer's own GPU frame path: pinned banded readback (GpuReadback), the lock
+                              around the shared CUDA renderer's output, OPENOSV_IMPORTER_NO_GPU_DECODE
+    ImporterPackKernel.h/.cu  16u / 8u packing on the GPU before the readback (own static library: nvcc never
+                              sees the plug-in's MSVC options)
     ImporterAudio.h/.cpp      AudioDecoder: its own AVFormatContext, AAC -> planar float, exact random + sequential positioning
     ImporterAudioSelectors.cpp  imImportAudio7 / imResetSequentialAudio / imGetSequentialAudio / imGetAudioChannelLayout
     PrefsMapping.cpp          the PURE PrefsBlob <-> dialog-control mapping and the colour-space tokens (compiled into the tests too)
@@ -144,6 +157,8 @@ tests/premiere/               mock-host harness (see Verification); added from p
   importer/                   osv_importer_tests: LoadLibraryW on the built .prm, driven through the mock host
     ImporterHarness.h/.cpp    loads the module, plays host (imInit/imShutdown, ClipHandle RAII, request builders)
     test_importer.cpp         registration, open/quiet/close, imGetInfo8/9, formats, sizes, colour, frames, audio, prefs, timing
+    test_importer_bitdepth.cpp  bit-depth negotiation per signal, 16u delivery, GPU frame path == host path, shared
+                              renderer under concurrency, direct path changes nothing, Rec.709 override stays local
     test_prefs_mapping.cpp    the pure prefs <-> controls mapping (links plugins/importer/PrefsMapping.cpp directly)
   reframe/                    osv_reframe_tests (loads Open360Reframe.aex)
   sourcesettings/             osv_source_settings_tests (loads OpenOSVSourceSettings.aex)
@@ -152,11 +167,15 @@ tests/premiere/               mock-host harness (see Verification); added from p
     test_params.cpp           module, GLOBAL_SETUP (incl. the source-settings declaration), PARAMS_SETUP
     test_prefs.cpp            TRANSLATE_PARAMS_TO_PREFS round trips, SEQUENCE_SETUP seeding, the mapping
     test_pipl.cpp             the PiPL, and its match name against the importer's constant
+    test_defaults.cpp         the Defaults group's buttons, new-clip seeding from the user defaults
 presets/                      three .sqpreset sequence presets + README.md recording the verified schema
+panel/                        the OpenOSV companion panel: auto-applies Open 360 Reframe to OSV clips
+                              (shared/ + uxp/ + cep/ + tests/; see docs/PANEL.md)
 scripts/install_plugins.ps1   copy stage dir -> MediaCore\OpenOSV AND presets/ -> the user's
                               SequencePresets\OpenOSV (-StageDir, -Destination, -Uninstall, -NoElevate,
                               -Force, -NoPresets, -PresetDir, -PresetDestination), self-elevating,
-                              prints the Plugin Loading.log path and the Shift-launch hint
+                              prints the Plugin Loading.log path and the Shift-launch hint; the panel
+                              per user (-NoPanel, -PanelOnly, -PanelFlavor, -PanelDestination)
 ```
 
 Everything that touches Premiere lives under `plugins/`; the library under
@@ -236,11 +255,17 @@ CPU / CUDA / OpenCL exactly like the fisheye path.
   header with `osv::OsvFile` (fails -> close and `imBadFile`); allocate
   privateData (host `newHandle`) holding a pointer to an `ImporterInstance`.
 * `imQuietFile`: close the handle and release renderer references and device
-  memory, keep parsed metadata. The dual decoder is PARKED in
-  `osv::video::ReaderPool` (at most 2 idle readers, 60 s, dropped under memory
-  pressure) rather than destroyed, so the unquiet - or the new instance
-  Premiere opens after a Source Settings change - takes it back warm instead
-  of paying ~200-400 ms for hardware device creation and a frame-0 decode.
+  memory, keep parsed metadata. The decoders are PARKED rather than destroyed,
+  so the unquiet - or the new instance Premiere opens after a Source Settings
+  change - takes them back warm:
+  * the host path's dual reader in `osv::video::ReaderPool` (instead of
+    ~200-400 ms of hardware device creation and a frame-0 decode);
+  * the GPU frame path's NVDEC `GpuClipDecoder` in
+    `osv::video::GpuDecoderPool`, trimmed to 4 cached frames while parked and
+    released when free VRAM drops under 2 GiB (unquiet ~100 ms -> ~14 ms).
+  Both pools hold at most 2 idle items for 60 s on the shared `IdlePool`
+  core. The effect's direct-path decoders live in Premiere's own CUDA
+  context and are never pooled.
 * `imCloseFile`: delete the instance (parking its reader the same way),
   dispose privateData, release suites.
 * `imShutdown`: release the direct-GPU engine, clear the reader pool, then
@@ -283,10 +308,32 @@ CPU / CUDA / OpenCL exactly like the fisheye path.
 
 ### Pixel formats, sizes, colour
 
-* `imGetIndPixelFormat`: 0 -> `PrPixelFormat_BGRA_4444_32f`, 1 -> `PrPixelFormat_BGRA_4444_8u`, 2 -> `imBadFormatIndex`.
+* The importer produces `BGRA_4444_32f`, `BGRA_4444_16u` (0..32768, the SDK's
+  16-bit white) and `BGRA_4444_8u` for any clip, but OFFERS them per clip,
+  by the signal its Source Settings produce (a 10-bit HDR picture must not be
+  offered 8 bits - 8-bit PQ bands in every sky):
+
+  | Colour output | `imGetIndPixelFormat` (preference order) | `imSelectClipFrameDescriptor(2)` |
+  |---|---|---|
+  | Rec.709 (SDR) | 32f, 8u | Maximum Bit Depth off -> 8u; else the host's wish if we make it, else 32f |
+  | PQ / HLG (HDR, clamped to [0, 1]) | 32f, 16u | Maximum Bit Depth off -> **16u, never 8u**; else 32f / 16u as wished, else 32f |
+  | D-Log M passthrough (log, can exceed [0, 1]) | 32f | always 32f |
+
+  SDK basis: "Pixel formats should be returned in the preferred order" and
+  "the host will attempt to always talk to the importer in the preferred
+  pixel format if possible" (the record carries `prefs`, and the host
+  enumerates again when Source Settings change); imSelectClipFrameDescriptor
+  exists to "change pixel formats based on ... source settings, such as HDR";
+  "For high-bit depth support, the 32f formats are the recommended route"
+  (so 32f leads every list).  The 8u that Premiere 26.2.2 asked for on every
+  frame came from this importer's own descriptor answer: it said 8u whenever
+  Maximum Bit Depth was off, which is the sequence default.  Each distinct
+  negotiation is now logged once (`imSelectClipFrameDescriptor2: host wants
+  ..., Maximum Bit Depth ... -> answering ...`) so a real session shows what
+  the host asked for.
 * `imGetPreferredFrameSize`: index 0 native, 1 half, 2 quarter (`imIterateFrameSizes`), then `imOtherErr`.
 * `imSelectClipFrameDescriptor(2)`: return the desired descriptor unchanged
-  except pixel format coerced to one of the two above and size to the nearest
+  except the pixel format (table above) and the size, snapped to the nearest
   advertised size.
 * `imGetIndColorSpace` index 0: `kPrSDKColorSpaceType_Predefined` with
   `ioProfileRec.outName` (String Suite) = `kPrOverranged2100PQ` ("BT.2100 PQ RGB Full"),
@@ -302,18 +349,100 @@ CPU / CUDA / OpenCL exactly like the fisheye path.
   instead, for the runtime comparison on real hosts.
 * `imGetColorSpaceFromOpaqueData` (23.3, undocumented) and every unknown
   selector return `imUnsupported`, logged once.
-* `imGetSourceVideo`: pick the first requested format we support (0 = any ->
-  32f at native size), look the frame up in the PPix cache
+* `imGetSourceVideo`: walk the requested formats in the host's order and take
+  the first we produce (`PrPixelFormat_Any` -> the clip's preferred 32f; an
+  explicit `BGRA_4444_8u` is ALWAYS honoured - "all importers must support
+  BGRA pixel format as well" - and logged once when the clip is HDR or log;
+  16u for the unbounded log output is served as the lossless 32f); nothing
+  usable -> 32f at native size.  Look the frame up in the PPix cache
   (`GetFrameFromCacheWithColorSpace`, key = importerID / stream / frame /
-  quality / prefs blob), else decode + stitch, create with
+  quality / prefs blob), else create the PPix with
   `PPixCreator2Suite::CreateColorManagedPPix(..., opaqueColorSpaceIdentifier)`
-  (plain `CreatePPix` when the id is invalid), copy with `PixelCopy` honouring
-  `GetRowBytes` and bottom-left origin, `AddFrameToCacheWithColorSpace`.
+  (plain `CreatePPix` when the id is invalid), render straight into it
+  (`ImporterInstance::renderFrameToHost`, see "The importer's own frame"
+  below), `AddFrameToCacheWithColorSpace`.
   If `selectedColorProfileName == kPrOverranged709` the host could not use the
-  declared space: render with the Rec.709 transfer regardless of prefs.
+  declared space: render THIS request with the Rec.709 transfer (a
+  request-local `outputTransfer`; the clip's prefs, and so what the direct-path
+  engine renders, are untouched).  The cache key blob says Rec.709 for such a
+  frame, so it is never served to an ordinary request.
   Draft: `inQuality <= kPrRenderQuality_Low` or a scrubbing/playing intent with
   `inPlaybackRatio < 1` disables seam search for that frame.
 * Frame index = `inFrameTime / ticksPerFrame` with rounding, clamped.
+
+### The importer's own frame
+
+Premiere requests the importer's equirect for every clip on the timeline -
+also when the reframe effect renders its view straight from the fisheyes
+(docs/DIRECT_GPU.md) and ignores that input.  So the importer's frame has to
+be cheap, and it has to stay full quality (next paragraph).  Two paths
+produce it, both from one parameter block (`ImporterInstance::buildEquirectJob`,
+the builder chain renderFrame always had):
+
+* **GPU path** (`renderFrameToHost` -> `renderFrameOnGpu`): both lenses
+  decoded by `video::GpuClipDecoder` on NVDEC into VRAM (GOP-aware cache,
+  decode-ahead) in the PRIMARY context of the shared CUDA renderer's device -
+  the context the CUDA runtime, and so `CudaRenderer`, runs in - so the
+  stitch reads the decoded planes in place (`CudaRenderer::renderToDevice`,
+  zero upload).  16u / 8u frames are packed on the GPU
+  (`ImporterPackKernel.cu`, same codes as PixelCopy bit for bit), then
+  `GpuReadback` streams the frame through two 32 MiB pinned bands and copies
+  each band into the PPix (with the row flip) while the next one crosses the
+  bus: one DMA and one host pass, no float image in host memory.  The
+  decoder lives in `m_gpuDecoders` under the primary context, so imQuietFile
+  frees it with the direct path's decoders.  Every use of the shared
+  renderer's output (this path's readback and the host path's `renderInto`)
+  holds `cudaRendererOutputMutex()`: the buffer is shared by all clips.
+* **Host path** (`renderFrame` + PixelCopy): D3D11VA / NVDEC-copy / software
+  decode to host memory, upload, stitch, readback, float image, convert -
+  the path before the GPU one, kept as the fallback for everything the GPU
+  path does not take: CPU / OpenCL render device, no NVIDIA GPU, a stream
+  NVDEC refuses (the LRF proxy), `OPENOSV_IMPORTER_NO_GPU_DECODE=1` (escape
+  hatch; the tests use it to compare the paths), three GPU failures in a row.
+
+With the analyses off the two paths are byte-identical (32f, 16u and 8u,
+tested at 6000 x 3000).  With one on they differ by that analysis' float
+noise only: the analyses shade their bands on the GPU from device frames and
+on the CPU from host frames (108-111 dB apart), so a gain is a hair apart
+(8e-6), a seam table a hair apart moves every column by a hair (8e-5), and
+the parallax grid can gate a flow cell differently (single pixels up to 0.09
+inside the overlap, band mean 1.4e-4, exactly zero outside it).  The GPU
+path's analyses are the ones the effect's direct path computes, so the
+importer's equirect and the direct view now agree with each other.
+
+**Why the frame is never degraded when the direct path is active.**  The
+engine knows when the effect renders a clip directly (`engineDirectPathActive`,
+`engineDirectFrameCount` in Engine.h; the Properties panel says so).  But
+`imSourceVideoRec` names no consumer - no sequence, no track item, no effect -
+and the PPix cache key is importer id / stream / frame / format / quality /
+prefs / colour space.  The same master clip is the Source Monitor's picture,
+every sequence's use of it without the effect, the effect's own fallback
+whenever the direct path refuses a frame (`DirectLaunchReject`, device loss),
+and a bypassed effect's output; all of those send the identical request and
+hit the identical cache entry.  A cheaper frame served "because the effect
+ignores it" would be cached and shown there.  So the signal is diagnostics
+only, and the importer's frame is made cheap instead (tested: the frame is
+byte-identical before and after the engine served the clip).
+
+Measured (RTX 5090, sample clip, `osv_importer_bench --part F`, native
+6000 x 3000, analyses off, importer time per frame from its `frame-cost`
+debug lines - i.e. without the mock host's zero-filled PPix allocation -
+while nine other agents were building, so ratios measured in one process are
+the trustworthy part):
+
+| Path | Format | Park (scattered, Stopped) | Play (sequential) | Stages while playing |
+|---|---|---|---|---|
+| GPU | 32f | 47 ms | 13.6 ms | render 1.4, readback 12.5 |
+| GPU | 16u | 41 ms | 8.8 ms | render 1.4, readback 7.4 |
+| GPU | 8u | 39 ms | 5.4 ms | render 1.4, readback 4.0 |
+| host | 32f | 126 ms | 79 ms | decode+upload+stitch+readback 73, convert 9 |
+| host | 16u | 143 ms | 84 ms | 78, 7.5 |
+| host | 8u | 142 ms | 80 ms | 76, 6 |
+
+Parking is NVDEC catching up inside the GOP (docs/DIRECT_GPU.md, WP-A:
+40-48 ms); playing is the readback.  16u costs 35 % less than 32f on the GPU
+path and carries the clamped PQ / HLG signal 32x finer than the 10-bit
+source.
 
 ### Audio (`imImportAudio7`, `imResetSequentialAudio`, `imGetSequentialAudio`)
 
@@ -343,9 +472,12 @@ share a demuxer, so conforming cannot disturb video seeks.
 | `reserved[..]` | zero | |
 
 `imGetPrefs8` first call sets `prefsLength = sizeof(PrefsBlob)`; later calls
-initialise defaults when `magic` is wrong and show the modal Win32 dialog
-(`DialogBoxParamW` on a DIALOGEX template in the `.rc`, owner = host main
-window). Cancel returns `imCancel`. The blob is part of every PPix cache key so
+start from the user defaults (see "User defaults for new clips") when the
+buffer holds no blob of ours - a `firstTime` call, zeros, another importer's
+bytes - and show the modal Win32 dialog (`DialogBoxParamW` on a DIALOGEX
+template in the `.rc`, owner = host main window). Cancel returns `imCancel`.
+The dialog's "Save as De&fault" button stores what it shows as the user
+defaults without closing it. The blob is part of every PPix cache key so
 changed settings never hit stale frames. `imGetInstancePrefs` mirrors it.
 
 ### Concurrency
@@ -433,28 +565,110 @@ absent, so that fact cannot be forgotten.
 
 As in the reframe effect, `PF_ADD_TOPIC` and `PF_END_TOPIC` each issue their
 own `PF_ADD_PARAM`, so a group occupies two real parameter slots and the
-`GROUP_END` slot sits in the MIDDLE of the list. There are 13 parameters, not
-9. `SourceSettingsParams.h` spells the index table out literally.
+`GROUP_END` slot sits in the MIDDLE of the list. There are 28 parameters: 20
+value controls, 2 buttons and 6 group markers. `SourceSettingsParams.h`
+spells the index table out literally. Ids are permanent and only ever
+appended; indices moved when a control joined a group (the ids did not).
 
-Every popup's items are in `PrefsBlob` enum order and AE popup values are
-**1-based** while the blob's enums are **0-based**, so every conversion is a
-deliberate -1 / +1 in `SourceSettingsMapping.cpp`.
+Popup items are in `PrefsBlob` enum order - AE popup values are **1-based**
+while the blob's enums are **0-based**, so each conversion is a deliberate -1
+/ +1 in `SourceSettingsMapping.cpp` - with ONE exception: Calibration goes
+through `kCalibrationChoiceByPopup`. Its first three items sit where the
+original "Native | Lens Guards | Underwater" items did, and that first item
+never forced anything (calibration 0 always followed the recorded accessory),
+so it is labelled for what it does, Auto, and a saved project keeps its
+meaning; forcing the bare-lens set is new and therefore last.
 
 | Index | ID | Name | Type | Items / range | Default | Prefs field |
 |---|---|---|---|---|---|---|
 | 1 | 1 | Colour Output | popup | BT.2100 PQ \| BT.2100 HLG \| Rec. 709 \| D-Log M (no transform) | PQ | `colorOutput` |
-| 2 | 2 | Output Size | popup | Native \| 4K (3840x1920) \| 2560x1280 \| 2K (1920x960) | 2560x1280 | `outputSize` |
-| 3 | 3 | Stabilisation | popup | Off \| Horizon Lock \| Full \| Smooth | Horizon Lock | `stabilization` |
-| 4 | 4 | Stitching | topic (GROUP_START) | | | |
-| 5 | 5 | Seam Search | checkbox | | on | `seamSearch` |
-| 6 | 6 | Exposure Match | checkbox | | on | `gainMatch` |
-| 7 | 7 | Calibration | popup | Native \| Lens Guards \| Underwater | Native | `calibration` |
-| 8 | 8 | (closes Stitching) | GROUP_END | | | |
-| 9 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
-| 10 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 | DJI Refit | `dlogmFit` |
-| 11 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
-| 12 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
-| 13 | 13 | (closes Advanced) | GROUP_END | | | |
+| 2 | 15 | Look (Rec. 709 only) | popup | DJI (default) \| OpenOSV standard | DJI | `look` |
+| 3 | 2 | Output Size | popup | Native (2 x decoded height) \| 4K (3840 x 1920) \| 2560 x 1280 \| 2K (1920 x 960) | Native | `outputSize` |
+| 4 | 3 | Stabilisation | popup | Off \| Horizon Lock \| Full \| Smooth | Horizon Lock | `stabilization` |
+| 5 | 4 | Stitching | topic (GROUP_START) | | | |
+| 6 | 5 | Seam Search | checkbox (also carves the seam) | | on | `seamSearch` |
+| 7 | 6 | Exposure Match | checkbox | | on | `gainMatch` |
+| 8 | 7 | Calibration | popup | Auto (as recorded) \| Lens Protectors / ND Filters \| Underwater \| Native (bare lenses) | Auto | `calibration` + `calibrationForceNative` |
+| 9 | 16 | Sun Ghost Removal | checkbox | | on | `flareRemoval` |
+| 10 | 17 | Sky Seam Fix | popup | Off \| Rim only \| Rim and colour | Rim and colour | `photoSeam` |
+| 11 | 18 | Sky Seam Strength | float slider | 0..100 %, whole percent | 100 | `photoStrength` |
+| 12 | 19 | Seam Edge Inset | float slider | 0..6 deg, tenths | 2.6 | `seamInset` |
+| 13 | 20 | Seam Blend | float slider | 0.2..8 deg, hundredths shown, twentieths stored | 1.5 | `seamBlend` |
+| 14 | 21 | Parallax Blend | float slider | 0..4 deg (0 = hard cut), as above | 0.35 | `parallaxBlend` |
+| 15 | 22 | Seam Smoothing | float slider | 0..8 deg (0 = off), as above | 0 | `seamSmoothing` |
+| 16 | 23 | Near Offset | float slider | -3..+3 deg, hundredths | 0 | `nearOffset` |
+| 17 | 24 | Far Offset | float slider | -3..+3 deg, hundredths | 0 | `farOffset` |
+| 18 | 8 | (closes Stitching) | GROUP_END | | | |
+| 19 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
+| 20 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 \| Osmo 360 | Osmo 360 | `dlogmFit` |
+| 21 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
+| 22 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
+| 23 | 14 | Program Monitor Colour | popup | Sequence space (fast) \| Match Source monitor | Sequence space | `directColour` |
+| 24 | 13 | (closes Advanced) | GROUP_END | | | |
+| 25 | 30 | Defaults | topic (GROUP_START, starts collapsed) | | | |
+| 26 | 31 | Save | button, `PF_ParamFlag_SUPERVISE` | "Save as Default for New Clips" | | writes the user defaults file |
+| 27 | 32 | Restore | button, `PF_ParamFlag_SUPERVISE` | "Restore Built-in Defaults" | | removes it |
+| 28 | 33 | (closes Defaults) | GROUP_END | | | |
+
+The Defaults group is always last and its indices are defined relative to
+the Advanced terminator, so a control added to an earlier group moves them
+without renumbering; ids 20-29 are left to the Stitching group. See "User
+defaults for new clips" below.
+
+An effect saved before ids 15-19 existed has no stored value for them, so
+it picks up the control defaults above (DJI look, ghost removal and the sky
+seam fix on) - a project opened in this build gets the improved stitch.
+
+#### Seam tools (ids 20-24)
+
+Five tweaks of the carved seam (`include/osv/render/SeamTools.h`). Every
+default is the seam exactly as it rendered before they existed - an older
+project's zero bytes (`PrefsBlob` offsets 38-45) read as those defaults - and
+each changes only the band where both lenses see the scene. They act on the
+carved seam, so they need Seam Search on.
+
+| Control | What it does | Measured on the sample (frames 0 / 32 / 64, x1000 luma) |
+|---|---|---|
+| Seam Blend | Feather half width where the lenses agree. Wider hides colour differences, but shows more of both lenses. | 1.5 -> 3 / 6 deg: band ghost 4.4 -> 7.4 / 11.7, band edge unchanged (0.02); 0.5 deg: ghost 2.0, edge 0.08 (a visible cut). |
+| Parallax Blend | Feather half width where they disagree (never wider than Seam Blend; 0 = a hard cut). | 0.35 -> 1 / 2 deg: the nacelle's seam edge 0.32 -> 0.16 / 0.15, but its sharp double image 1.6 -> 4.9 / 6.2. 0 deg: edge 0.76. |
+| Seam Smoothing | A two-band blend (DJI's multiband): colour and shading blend across this half width, detail still switches at the seam, so a step on a near object becomes a gradient instead of a double image. 0 = off. | 1 / 2 deg: nacelle edge 0.32 -> 0.17 / 0.13, sharp double image 1.6 -> 2.1 / 2.5. From 4 deg on it adds soft halos (edge 0.31 / 0.54). Best at 1-2 deg. |
+| Near Offset | Shifts content ALONG the seam where the lenses disagree (the carve's own disagreement per column). | See below: the mask does not isolate the nacelle on the sample. |
+| Far Offset | The same where they agree. | +1.25 deg improves the ring's lens mismatch 57.8 -> 57.1 (frame 0). |
+
+**Direction of the offsets.** Physical parallax on a back-to-back rig runs
+along meridians, and the parallax grid corrects it where its flow is
+trustworthy; what remains visible at the seam on the sample is ALONG the seam.
+At the engine nacelle the seam runs vertically on a level view, and an NCC
+search on the two lenses there finds them 1.41 deg apart along the seam and
+0.35 deg across it - the flow's benefit gate switches itself off on that
+shiny, texture-poor surface. So both offsets rotate the lenses' pictures
+about their axes, in opposite directions: a positive offset turns the front
+(master) lens's content by +offset / 2 in polar longitude and the rear
+lens's by -offset / 2. On the sample's level view of the nacelle that moves
+the rear lens's side of the seam (the nacelle body) DOWN and the spinner's
+side up, 19 px per degree at 40 px per degree of view; the same rotation
+reads the other way round on the camera's opposite side.
+
+**The near mask on the sample.** The carve's disagreement weight is 0.16-0.19
+on the nacelle's own columns (the dynamic programming routes the seam through
+the few rows where the lenses agree there, so the residual along it is low)
+and 0.49 on average elsewhere (textured ground misregisters by a fraction of
+a degree; 401-402 of 840 other columns score above 0.5). Near Offset
+therefore moves the ground more than the nacelle on this clip; the nacelle's
+lens NCC is best at +0.75..+1.25 deg of Near Offset (0.27-0.30 against
+0.23-0.28 at 0) and keeps improving with Far Offset. No per-column
+photometric measure tried (band-wide gradient residual, 1 - NCC of luma or of
+gradients, contrast-normalised difference) separates the nacelle from the
+ground either: it sits at about the ground's 90th percentile. Telling near
+from far reliably needs disparity, which the flow only measures where it is
+consistent - exactly not on the nacelle.
+
+**Cost of the smoothing.** Its low band is built per frame on the GPU from
+the NVDEC frames (the importer's GPU path, and the engine for the direct
+path, on the effect's stream) and on the host from host frames. CUDA, build
+included: 2560 x 1440 view +0.08-0.14 ms on 0.28-0.40 ms; 6000 x 3000
+equirect +0.12-0.28 ms on 1.5-1.9 ms (shared machine). The direct kernel
+alone: +0.008 ms at 2560 x 1440. Host build 5.5 ms.
 
 #### D-Log M passthrough
 
@@ -627,6 +841,166 @@ ends up showing "2560 x 1280" while decoding at 6000 x 3000.
   record with no buffer, or a buffer shorter than a blob, returns `imOtherErr`
   and writes nothing. The two-step `imGetPrefs8` protocol is untouched.
 
+## User defaults for new clips
+
+Users set the same Source Settings on every clip - Rec.709 with the DJI look,
+2560 x 1280 on a laptop, the D-Log M passthrough for a colourist. They can now
+set them once: every NEWLY imported clip starts from the user's saved
+defaults instead of `PrefsBlob::defaults()`. Clips that already have settings
+keep them, always. `PrefsBlob::defaults()` itself is unchanged: it is the
+built-in reference the code and the tests are written against, and what a new
+clip gets when nothing was saved.
+
+### What the user clicks
+
+* **Source Settings effect** (Effect Controls, master clip): the collapsed
+  **Defaults** group at the end holds two buttons.
+  * **Save as Default for New Clips** writes THIS clip's settings - exactly
+    the blob `PF_Cmd_TRANSLATE_PARAMS_TO_PREFS` produces, i.e. what the clip
+    is decoded with - to the defaults file. The clip itself is unchanged.
+  * **Restore Built-in Defaults** deletes the file; new clips start from the
+    built-in settings again.
+* **Source Settings dialog** (right-click > Source Settings): **Save as
+  De&fault** on the OK / Cancel row stores the settings shown - on top of the
+  blob the dialog was opened with, exactly as OK builds its blob, so the
+  fields the dialog does not show (parallax, flow backend) are saved as the
+  clip has them. The dialog stays open ("Saved." beside the button); only OK
+  changes the clip.
+
+The confirmation is a line in `OpenOSVSourceSettings.log` /
+`OpenOSVImporter.log`. The effect also fills `out_data->return_msg`, but
+raises `PF_OutFlag_DISPLAY_ERROR_MESSAGE` only outside Premiere - which is
+exactly what Adobe's own Paramarama sample does for its button
+(`if (in_data->appl_id != kAppID_Premiere) out_flags |= PF_OutFlag_DISPLAY_ERROR_MESSAGE`),
+and a modal alert after every click of a settings button would be noise.
+
+### Buttons in Premiere: the evidence
+
+`PF_Param_BUTTON` is documented in `AE_Effect.h` as "supported by AE starting
+with CS 5.5 (AE 10.5); may be supported in other hosts", and a click arrives
+as `PF_Cmd_USER_CHANGED_PARAM` when the parameter carries
+`PF_ParamFlag_SUPERVISE`. For Premiere specifically:
+
+* Adobe's **Paramarama** sample (AE SDK `Examples/Effect/Paramarama`) adds its
+  button (`PF_ADD_BUTTON`, flags `PF_ParamFlag_SUPERVISE` only - which is
+  exactly how ours are declared) for every host reporting effect API 13.1 or
+  later, Premiere included - its 3-D point next to it is the one parameter it
+  withholds from Premiere - and its `UserChangedParam` has a Premiere-specific
+  branch, so the button path is one Adobe wrote with Premiere in mind; that
+  branch is the reason the alert flag above is gated.
+* The Premiere SDK documents `PF_Cmd_USER_CHANGED_PARAM` delivery in Premiere
+  for its own AE-API extensions (`PF_TransitionSuite`,
+  `PrSDKAESupport.h:1673-1690`).
+* Third-party Premiere effects ship buttons (an Adobe forum thread on
+  handling `PF_Cmd_USER_CHANGED_PARAM` button clicks in Premiere, and open
+  source Premiere effects with "Choose file" buttons), with one caveat worth
+  keeping in mind: their authors describe Premiere's delivery of button
+  clicks as historically less reliable than After Effects'.
+
+What could not be verified without launching Premiere is the delivery to a
+*source settings* effect in particular. No supported alternative is more
+robust: a "Defaults" popup that resets itself after acting would need the
+same `PF_Cmd_USER_CHANGED_PARAM` to reset, and acting on it from
+`PF_Cmd_TRANSLATE_PARAMS_TO_PREFS` would re-save on every translate. The
+modal dialog's button does not depend on the effect at all, so there is
+always a working route.
+
+### Where a new clip gets its first settings
+
+The SDK guide names the moment: "When a clip is first imported, the effect is
+called with `PF_Cmd_SEQUENCE_SETUP`. It should call
+`PerformSourceSettingsCommand()` ... where it can read the file and set the
+default prefs"; a saved project comes back through
+`PF_Cmd_SEQUENCE_RESETUP` (the Opaque Effect Data section: "when reopening a
+saved project"). User defaults are applied there and only there:
+
+| Where | New clip (no blob of ours) | Clip with a stored blob |
+|---|---|---|
+| `imOpenFile8` (instance created) | seeded with the user defaults, before `open()` builds the rig | the seed is replaced by the stored blob at `imGetInfo8`, before any frame |
+| `imGetInfo8` / every prefs-carrying selector | no blob, zeros or foreign bytes keep the seed (a zero-filled buffer used to be adopted as `PrefsBlob::defaults()`, as if the host had chosen them) | the blob is adopted as before |
+| `imPerformSourceSettingsCommand`, live instance | answers the seed, so the effect's controls show it | answers the stored blob |
+| Source Settings effect `SEQUENCE_SETUP` | untouched controls (translating to `PrefsBlob::defaults()`) are replaced by the user defaults before the importer is asked; with no live instance the importer echoes them | controls that say anything else are the clip's settings and are sent as they are; the importer's stored blob wins anyway |
+| `imGetPrefs8` / `imGetInstancePrefs` | the dialog opens on the user defaults (`firstTime`, zeros, foreign bytes) | the stored blob, unchanged |
+
+A new clip is logged once, with the file: `new clip 'DJI_....OSV'
+(imGetInfo8): no stored Source Settings; starting from the user defaults in
+C:\...\defaults.json - colourOutput rec709, ...`. Nothing is logged for the
+built-in defaults. A clip Premiere holds no settings for at all is, by this
+rule, a new clip; with the Source Settings effect installed every clip has a
+stored blob after its first `PF_Cmd_TRANSLATE_PARAMS_TO_PREFS`.
+
+### The file
+
+`%APPDATA%\OpenOSV\defaults.json` (roaming: a preference that follows the
+user), or the path in `OPENOSV_DEFAULTS_FILE` (render farms, the tests).
+One named key per setting - never a dump of the 128 bytes, so it survives
+`PrefsBlob` layout additions - in the panel's order and words:
+
+```json
+{
+  "format": "openosv-source-settings-defaults",
+  "version": 1,
+  "savedBy": "OpenOSV 0.1.0",
+  "settings": {
+    "colourOutput": "rec709",             // pq | hlg | rec709 | dlogm
+    "rec709Look": "dji",                  // dji | standard
+    "outputSize": "2560x1280",            // native | 3840x1920 | 2560x1280 | 1920x960
+    "stabilisation": "horizon-lock",      // off | horizon-lock | full | smooth
+    "seamSearch": true,
+    "exposureMatch": true,
+    "calibration": "auto",                // auto | native | lens-protectors | underwater
+    "sunGhostRemoval": true,
+    "skySeamFix": "rim-and-colour",       // off | rim-only | rim-and-colour
+    "skySeamStrengthPercent": 100,        // 0..100
+    "seamEdgeInsetDeg": 2.6,              // 0..6, tenths
+    "parallaxCorrection": true,
+    "flowBackend": "auto",                // auto | classical | neural
+    "dlogmCurve": "osmo360",              // dji-refit | pocket3 | osmo360
+    "exposureStops": 0.0,                 // -6..6
+    "renderDevice": "auto",               // auto | cpu | cuda | opencl
+    "programMonitorColour": "sequence-space"  // sequence-space | match-source
+  }
+}
+```
+
+(The comments are this document's; the file as written has none, though a
+hand-added `//` or `/* */` comment is accepted.)
+
+Reading is forgiving, key by key: a missing key keeps the built-in value (an
+older file predates it), an unknown key is ignored, a value this build does
+not understand keeps the built-in value for that key, and an out-of-range
+number is clamped - each noted once in the log. A document that is not JSON,
+not an object, or whose `"format"` names something else is ignored as a
+whole (logged once per state of the file): new clips get the built-in
+defaults, which is always safe. Files over 64 KB are not read.
+
+Writes go to a temporary sibling, are flushed (`FlushFileBuffers`) and
+renamed over the target (`MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`,
+retried briefly while another process holds the old file), so no reader -
+another Premiere, Media Encoder, osvtool - ever sees a torn file. Reads are
+cached per module (the .prm and the .aex each have one) and re-validated per
+call with one attribute-only open: modification time, size and the file's own
+identity (volume serial + file index, which changes on every save because a
+save is a new file). Everything is `noexcept` and thread-safe.
+
+Adding a `PrefsBlob` field means adding one row to `kFields` in
+`UserDefaults.cpp`: the test "the defaults file covers every byte of the blob
+that holds a setting" fails until every non-padding byte before `reserved`
+belongs to a key, so a new field cannot silently never become a default.
+
+### osvtool
+
+`osvtool render --use-user-defaults` starts every Source Settings option that
+is NOT given on the command line from the defaults file (colour, look,
+stabilisation, calibration, D-Log M curve, exposure, device, seam search,
+gain, parallax, flow backend, sky seam fix and strength, seam edge inset, and
+in the equirect modes the output size); anything on the command line wins,
+and `--no-seam-search`, `--no-gain` and `--no-parallax` switch a saved default
+off for one render. Sun ghost removal is an importer stage osvtool does not
+have, and Program Monitor Colour belongs to the reframe effect; both are
+ignored. Without the flag the file is never read, so a plain render is the
+same on every machine.
+
 ## Sequence presets
 
 Premiere copies a new sequence's frame size from the clip it is built from.
@@ -697,15 +1071,12 @@ That path is not documented either, so it was derived:
    `Source Patcher Presets`, `Timecode Presets` and `Track Height Presets`,
    all written by the application itself.
 2. The sequence-preset subfolder is `SequencePresets`, spelled **without** a
-   space. Every one of those folder names appears as a literal string inside
-   `Adobe Premiere Pro 2026\Mezzanine.dll` - the module whose exports include
-   `SequenceSettingsCache::GetSequencePresetsFromCache` and
-   `SequencePreviewPresets::CollectSequencePresets` - and `SequencePresets`
-   appears there too while `Sequence Presets` does not. It is also exactly the
-   folder name the shipped presets live in under Program Files.
-3. `.sqpreset` is confirmed as the extension by the string table in
-   `ScriptLayerPProQE.dll`, where `SequencePresets` and `sqpreset` are
-   adjacent.
+   space. Premiere Pro 2026's own installed files name it that way, alongside
+   every one of the folder names above, and never as `Sequence Presets`. It
+   is also exactly the folder name the shipped presets live in under Program
+   Files.
+3. `.sqpreset` is the extension of the presets Premiere Pro ships, and the
+   application's own installed files pair it with `SequencePresets`.
 
 `scripts/install_plugins.ps1` enumerates the `<version>` folders and picks the
 newest numerically (so "9.0" does not outrank "26.0"), enumerates `Profile-*`
@@ -753,47 +1124,146 @@ the presets would land in a profile nobody ever opens.
 
 `PF_ADD_TOPIC` and `PF_END_TOPIC` each issue their own `PF_ADD_PARAM`
 (`Param_Utils.h:298-320`), so a group terminator is a real parameter holding
-a real index, and it sits in the MIDDLE of the list. There are therefore 15
-parameters, not 13, and a control that follows a closed group has an index
+a real index, and it sits in the MIDDLE of the list. There are therefore 21
+parameters, not 19, and a control that follows a closed group has an index
 one higher than its id per group already closed. `ReframeParams.h` spells the
 index table out literally (`ParamIndex`, with `kParamIdByIndex` beside it)
 rather than deriving it, and `EffectMain.cpp` static_asserts the
 relationship. The GPU path's `GetParam(index - 1)` uses the same table, so
 both halves read the same control.
 
-| Index | ID | Name | Type | Range / items | Default |
-|---|---|---|---|---|---|
-| 1 | 1 | Output Aspect | popup | Match Sequence \| 16:9 \| 9:16 \| 1:1 \| 4:3 \| 3:4 \| 2.35:1 \| Full Frame | Match Sequence |
-| 2 | 2 | Camera | topic (GROUP_START) | | |
-| 3 | 3 | Preset | popup | Custom \| Crystal Ball \| Asteroid \| Wide \| Ultra Wide \| Dewarping | Wide |
-| 4 | 4 | Pan | angle | unbounded | 0 |
-| 5 | 5 | Tilt | angle | unbounded (clamped to +-90 in code) | 0 |
-| 6 | 6 | Roll | angle | unbounded | 0 |
-| 7 | 7 | FOV | float slider | valid 10..350, slider 30..180, tenths, degrees | 120 |
-| 8 | 8 | Distortion | float slider | 0..100 %, slider 0..100 | 15 |
-| 9 | 14 | (closes Camera) | GROUP_END | | |
-| 10 | 9 | Source | topic (GROUP_START, starts collapsed) | | |
-| 11 | 10 | Source Pan | angle | | 0 |
-| 12 | 11 | Source Tilt | angle | | 0 |
-| 13 | 12 | Source Roll | angle | | 0 |
-| 14 | 15 | (closes Source) | GROUP_END | | |
-| 15 | 13 | Smooth Keyframes | checkbox | | off |
+The "Shown" column is what the Effect Controls panel displays for each
+choice of the Lens popup (see "One lens at a time" below).
 
-"Output Aspect" and "Smooth Keyframes" are top-level siblings of the two
-groups, which is only true because both groups close. A test walks the real
-parameter list keeping a nesting depth and asserts exactly that.
+| Index | ID | Name | Type | Range / items | Default | Shown |
+|---|---|---|---|---|---|---|
+| 1 | 1 | Output Resolution | popup | Match Sequence \| 3840 x 2160 \| 2560 x 1440 \| 1920 x 1080 \| 1280 x 720 | Match Sequence | always |
+| 2 | 2 | Camera | topic (GROUP_START) | | | always |
+| 3 | 3 | Preset | popup | Custom \| Crystal Ball \| Asteroid \| Wide \| Ultra Wide \| Dewarping | Wide | always |
+| 4 | 4 | Pan | angle | unbounded | 0 | always |
+| 5 | 5 | Tilt | angle | unbounded (clamped to +-90 in code) | 0 | always |
+| 6 | 6 | Roll | angle | unbounded | 0 | always |
+| 7 | 7 | FOV | float slider | valid 10..350, slider 30..180, tenths, degrees; the visible angle across the width | 120 | Classic |
+| 8 | 8 | Distortion | float slider | 0..100 %, slider 0..100 | 15 | Classic |
+| 9 | 14 | (closes Camera) | GROUP_END | | | |
+| 10 | 9 | Source | topic (GROUP_START, starts collapsed) | | | always |
+| 11 | 10 | Source Pan | angle | | 0 | always |
+| 12 | 11 | Source Tilt | angle | | 0 | always |
+| 13 | 12 | Source Roll | angle | | 0 | always |
+| 14 | 15 | (closes Source) | GROUP_END | | | |
+| 15 | 13 | Smooth Keyframes | checkbox | | off | always |
+| 16 | 16 | Camera Model | checkbox "DJI", registered `PF_PUI_INVISIBLE` | retired: the Lens popup's hidden mirror (ticked = DJI) | on | never |
+| 17 | 17 | Zoom | float slider, not animatable | valid 0..360, slider 30..330, degrees; DJI Studio's Zoom read-out, editing it walks DJI's zoom path | 142.4 | DJI |
+| 18 | 18 | DJI FOV | float slider | valid 1..178, degrees; DJI's vertical pinhole angle. Registered as "DJI FOV", shown as "FOV" | 60 | DJI |
+| 19 | 19 | Correction Angle | float slider | valid 0..1.8, sphere radii the eye sits behind the centre (0 rectilinear, 1 stereographic, >1 crystal ball) | 0.6 | DJI |
+| 20 | 20 | Drag Sensitivity | float slider | valid 0.1..10, slider 0.25..5; Program Monitor grab speed, never rendered from | 2.0 | always |
+| 21 | 21 | Lens | popup, not animatable | DJI \| Classic: which lens renders and which lens's controls are shown | DJI | always |
+
+"Output Resolution" and "Smooth Keyframes" are top-level siblings of the two
+groups, which is only true because both groups close. Ids 16-21 were appended
+after Smooth Keyframes, outside both groups, so every existing index - and
+every saved project - stayed where it was; the DJI model's maths and evidence
+are in `docs/research/DJI_CAMERA.md`. A test walks the real parameter list
+keeping a nesting depth and asserts exactly that.
+
+The Lens popup is appended rather than placed at the top of the Camera group
+on purpose. After Effects matches saved values to parameters by these ids and
+so allows an insertion anywhere (the AE SDK's "Changing Parameter Orders"
+chapter), but nothing in the Premiere Pro SDK guide says Premiere does the
+same, and an insertion that Premiere resolved by index would load every saved
+project's Pan into the popup and shift every control after it. An append is
+the one placement that is safe however the host binds.
+
+A project saved before the Lens popup existed has no value for it and opens
+at the popup's default, DJI - the user's choice. Its old Camera Model
+checkbox, ticked or not, is never rendered from.
 
 Changing Preset (supervised, `PF_Cmd_USER_CHANGED_PARAM`) writes FOV,
-Distortion and Tilt from the preset table and marks them
-`PF_ChangeFlag_CHANGED_VALUE`; editing any of those flips Preset back to
+Distortion, DJI FOV, Correction Angle, Zoom and Tilt from the preset table,
+selects DJI in the Lens popup and marks each changed value
+`PF_ChangeFlag_CHANGED_VALUE`; editing a look control flips Preset back to
 Custom (and does nothing when it is already Custom, so a slider drag does not
-fill the undo stack). `PF_Cmd_UPDATE_PARAMS_UI` greys nothing today; the
-handler and the out-flag exist because adding either later would change the
-PiPL and invalidate the plug-in cache on every installed machine.
+fill the undo stack). Picking a lens converts the current look into that
+lens's controls so the framing does not jump (Classic -> DJI exactly, DJI ->
+Classic exactly unless the Classic ramp or a Correction above 1 makes the DJI
+look unrepresentable), updates the hidden mirror, sets Preset to Custom and
+returns `PF_OutFlag_REFRESH_UI`. The mirror holds the lens that was on screen
+before the edit, which is how a re-pick of the same lens is told from a
+switch: it converts nothing. Classic is always left beside Preset "Custom",
+even on a re-pick, because the GPU path decodes Classic's ambiguous popup
+value on Premiere (1, where popups count from 0 on the GPU side) with the 0
+that Custom reads there; DJI reads 0 itself.
 
-`PF_ParamFlag_SUPERVISE` is set on Output Aspect, Preset, Tilt, FOV and
-Distortion. Output Aspect does not act on the message yet - it carries the
-flag for the same "do not change the PiPL later" reason.
+`PF_ParamFlag_SUPERVISE` is set on Output Resolution, Preset, Tilt, FOV,
+Distortion, Camera Model, Zoom, DJI FOV, Correction Angle and Lens. Output
+Resolution does not act on the message - it carries the flag so adding
+behaviour later does not change the PiPL.
+
+#### One lens at a time (`PF_Cmd_UPDATE_PARAMS_UI`)
+
+The panel shows only the selected lens's controls, so a user never sees two
+"FOV" sliders that mean different angles (Classic's is the visible angle
+across the width, DJI's the vertical pinhole angle):
+
+* **Lens: DJI** (the default) - Output Resolution, Preset, Pan, Tilt, Roll,
+  Source, Smooth Keyframes, **Zoom**, **FOV** (DJI's), **Correction Angle**,
+  Drag Sensitivity, Lens.
+* **Lens: Classic** - Output Resolution, Preset, Pan, Tilt, Roll, **FOV**,
+  **Distortion**, Source, Smooth Keyframes, Drag Sensitivity, Lens.
+
+`PF_Cmd_UPDATE_PARAMS_UI` calls `PF_UpdateParamUI` (PF Param Utils Suite v3)
+for the five lens controls and the Camera Model mirror, setting or clearing
+`PF_PUI_INVISIBLE`, and names DJI FOV "FOV" while it is shown. What says
+Premiere supports this:
+
+* `AE_Effect.h`, `PF_PUI_INVISIBLE`: "in Premiere since earlier than [CS6],
+  this hides the parameter UI in the Effect Controls, which includes the
+  keyframe track; for PPro only, the flag is dynamic and can be cleared to
+  make the parameter visible again". The flag is also documented as the way
+  to keep "hidden data parameters that affect rendering", so a hidden control
+  still reaches the renderer (the GPU probe's one-time dump in the plug-in log
+  shows the host list, should that ever need checking).
+* `AE_EffectSuites.h`, `PF_UpdateParamUI`: the fields it may change are
+  "ui_flags: PF_PUI_ECW_SEPARATOR, PF_PUI_DISABLED only (and
+  PF_PUI_INVISIBLE in Premiere)", the name, `PF_ParamFlag_COLLAPSE_TWIRLY`
+  and a slider's range, precision and display flags.
+* Adobe's Supervisor sample (`Examples/UI/Supervisor/Supervisor.cpp`,
+  `UpdateParameterUI`) hides and shows its advanced controls in Premiere
+  exactly this way, from `PF_Cmd_UPDATE_PARAMS_UI`; its After Effects branch
+  needs the AEGP Dynamic Stream Suite (`AEGP_DynStreamFlag_HIDDEN`) instead,
+  which Premiere does not provide. Adobe's Zac Lam confirms
+  `PF_UpdateParamUI` "can work in Premiere Pro" (Adobe community, "what can I
+  use instead PF_UpdateParamUI for converting After Effects plugin to
+  Premiere Pro plugin?").
+
+Known Premiere behaviours the implementation works around:
+
+* Premiere 25 to 25.2 beta ignored `PF_PUI_INVISIBLE` changes on the FIRST
+  instance of an effect when they were made during
+  `PF_Cmd_USER_CHANGED_PARAM` (Adobe tracking DVARC-3737; the reported
+  workaround is to change visibility only in `PF_Cmd_UPDATE_PARAMS_UI`). The
+  lens switch therefore only returns `PF_OutFlag_REFRESH_UI`, as the
+  Supervisor sample does, and the visibility is set in the refresh.
+* A developer reported a topic that came back nameless after hiding it
+  (Adobe community, "Conditionally hiding topic params in the ECP"); another
+  reported name changes that did not refresh when several parameters were
+  updated at once, which Adobe traced to
+  `PF_OutFlag2_PPRO_DO_NOT_CLONE_SEQUENCE_DATA_FOR_RENDER` (bug 3197343; this
+  effect does not set it). So no topic is ever hidden, and every def passed
+  to `PF_UpdateParamUI` gets its type, name and slider display from the
+  effect's own constants, never from whatever the host's copy held.
+* Undo is reported not to send `PF_Cmd_UPDATE_PARAMS_UI` (same DVARC-3737
+  report): after undoing a lens switch the panel can show the previous lens's
+  controls until the next refresh (selecting the clip, moving the playhead).
+  The picture is right either way - the renderer reads the popup.
+* The update is applied on every call, not only when the host's copy of a
+  def looks different: nothing documents that the params array handed to
+  `PF_Cmd_UPDATE_PARAMS_UI` reflects earlier `PF_UpdateParamUI` calls, and
+  trusting it could leave a control hidden after switching back.
+
+Every failure is non-fatal: without the suite, or when the host refuses an
+update, the panel shows every control - the layout before this - and the
+effect renders exactly the same.
 
 ### Geometry
 
