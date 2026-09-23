@@ -6,15 +6,56 @@
 #include "osv/core/Log.h"
 #include "osv/geom/EquirectMap.h"
 #include "osv/render/CpuRenderer.h"
+#include "osv/render/DeviceBandShader.h"
 #include "osv/render/RenderParamsBuilder.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <mutex>
 
 namespace osv::render {
 
 namespace {
+
+// ---------------------------------------------------------------------------
+//  The installed device band shader (see DeviceBandShader.h)
+// ---------------------------------------------------------------------------
+
+/// Holder for the process-wide shader.  Allocated once and intentionally
+/// never destroyed: the shader belongs to the CUDA library, and running its
+/// destructor from this library's static teardown - in an order nobody
+/// controls, possibly after the CUDA runtime has unloaded - buys nothing the
+/// OS does not do at exit anyway.
+struct ShaderSlot {
+    std::mutex mutex;
+    std::shared_ptr<DeviceBandShader> shader;
+};
+
+ShaderSlot& shaderSlot() {
+    static ShaderSlot* slot = new ShaderSlot();  // intentionally leaked, see above
+    return *slot;
+}
+
+/// True when either lens of `job` lives in device memory.
+[[nodiscard]] bool jobOnDevice(const RenderJob& job) noexcept {
+    return job.planesOnDevice[0] || job.planesOnDevice[1];
+}
+
+/// The shader for a device job, or the error that explains why there is none.
+///
+/// Worded for the person reading a log: a device job with no shader is a
+/// configuration problem (the CUDA analyses were never installed), not a
+/// broken frame.
+Result<std::shared_ptr<DeviceBandShader>> requireDeviceShader() {
+    std::shared_ptr<DeviceBandShader> gpu = deviceBandShader();
+    if (!gpu) {
+        return Error{ErrorCode::InvalidArgument,
+                     "shadeRows: the frames are on the GPU; the band analyses need host frames or an installed "
+                     "device band shader (osv::render::installCudaAnalyses)"};
+    }
+    return gpu;
+}
 
 /// Luma of a code-space or linear RGB triple (BT.2020 weights; for code space
 /// the exact weights do not matter as long as both lenses use the same).
@@ -63,20 +104,24 @@ double nccMasked(const float* a, const float* b, const std::uint8_t* mask, std::
 /// The per-pixel call is exactly the one CpuRenderer makes, with the same
 /// ABSOLUTE row index, so each band pixel is bit-identical to the matching
 /// pixel of a full-map render.  Only the rows nobody read are skipped.
+///
+/// A job whose frames live in VRAM goes to the installed DeviceBandShader
+/// instead - the same osvShadePixelW, run on the GPU - because reading its
+/// device addresses here would fault (an access violation, seen with
+/// `osvtool --hw cuda --device cuda --seam-search` before the GPU path
+/// existed).  Host jobs never take that branch, so their output is unchanged.
 Result<std::vector<float>> shadeRows(const RenderJob& job, std::uint32_t row0, std::uint32_t row1, ThreadPool& pool) {
     if (!job.valid()) {
         return Error{ErrorCode::InvalidArgument, "shadeRows: invalid render job"};
     }
-    // The bands are shaded on the CPU; GPU-resident frames would be read as
-    // host memory and fault (an access violation, seen with
-    // `osvtool --hw cuda --device cuda --seam-search`).
-    if (job.planesOnDevice[0] || job.planesOnDevice[1]) {
-        return Error{ErrorCode::InvalidArgument,
-                     "shadeRows: the frames are on the GPU; the band analyses need host frames"};
-    }
     const OsvRenderParams params = job.params;
     if (row1 <= row0 || row1 > static_cast<std::uint32_t>(params.outH)) {
         return Error{ErrorCode::InvalidArgument, "shadeRows: row range outside the map"};
+    }
+    // Device-resident frames: shade on the GPU or refuse, never read here.
+    if (jobOnDevice(job)) {
+        OSV_TRY_ASSIGN(std::shared_ptr<DeviceBandShader> gpu, requireDeviceShader());
+        return gpu->shadeRowsRgba(job, row0, row1);
     }
     const OsvPlane planes[2] = {job.planes[0], job.planes[1]};
     const float* seam = (params.seamShiftEnabled && !job.seamShiftDeg.empty()) ? job.seamShiftDeg.data() : nullptr;
@@ -100,6 +145,27 @@ Result<std::vector<float>> shadeRows(const RenderJob& job, std::uint32_t row0, s
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+//  Device band shader registry
+// ---------------------------------------------------------------------------
+void setDeviceBandShader(std::shared_ptr<DeviceBandShader> shader) noexcept {
+    ShaderSlot& slot = shaderSlot();
+    std::shared_ptr<DeviceBandShader> previous;
+    {
+        std::lock_guard<std::mutex> lock(slot.mutex);
+        previous = std::move(slot.shader);
+        slot.shader = std::move(shader);
+    }
+    // `previous` is released here, outside the lock, so a shader whose
+    // destructor does real work can never deadlock against a reader.
+}
+
+std::shared_ptr<DeviceBandShader> deviceBandShader() noexcept {
+    ShaderSlot& slot = shaderSlot();
+    std::lock_guard<std::mutex> lock(slot.mutex);
+    return slot.shader;
+}
 
 Result<LensBands> renderLensBands(const geom::LensRig& rig, const video::FramePair& frames,
                                   const geom::BlendParams& blend, const BandParams& band, bool linear,
@@ -150,6 +216,21 @@ Result<LensBands> renderLensBands(const geom::LensRig& rig, const video::FramePa
                          warp->latMaxRad);
         }
         OSV_TRY_ASSIGN(RenderJob job, builder.build(frames));
+        // Frames in VRAM: shade AND reduce to luma / coverage on the GPU, so
+        // only the two planes the analyses keep are downloaded - a quarter of
+        // the RGBA traffic, and no CPU pass over the band at all.
+        if (jobOnDevice(job)) {
+            if (row1 > static_cast<std::uint32_t>(job.params.outH)) {
+                return Error{ErrorCode::InvalidArgument, "renderLensBands: band outside the map"};
+            }
+            OSV_TRY_ASSIGN(std::shared_ptr<DeviceBandShader> gpu, requireDeviceShader());
+            OSV_TRY(gpu->shadeRowsLumaAlpha(job, row0, row1, out.luma[lens], out.alpha[lens]));
+            const std::size_t expected = static_cast<std::size_t>(out.w) * out.h;
+            if (out.luma[lens].size() != expected || out.alpha[lens].size() != expected) {
+                return Error{ErrorCode::Internal, "renderLensBands: the device band shader returned the wrong size"};
+            }
+            continue;
+        }
         OSV_TRY_ASSIGN(std::vector<float> rgba, shadeRows(job, row0, row1, pool));
         out.luma[lens].resize(static_cast<std::size_t>(out.w) * out.h);
         out.alpha[lens].resize(out.luma[lens].size());

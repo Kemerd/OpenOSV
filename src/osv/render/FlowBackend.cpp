@@ -13,6 +13,7 @@
 
 #include "osv/core/Log.h"
 
+#include <atomic>
 #include <utility>
 
 namespace osv::render {
@@ -89,14 +90,31 @@ private:
     std::string m_reason;
 };
 
+/// The factory osv_render_cuda installed for ClassicalCuda, or nullptr.
+///
+/// A plain function pointer in an atomic: installation happens once at
+/// start-up while analyses may already be running on other threads, and a
+/// pointer-sized atomic is the cheapest thing that makes that race benign.
+/// A function pointer (rather than a std::function) also means there is no
+/// destructor to run at process exit, where the CUDA library may already be
+/// gone.
+std::atomic<FlowBackendFactory> g_cudaFactory{nullptr};
+
 }  // namespace
+
+void setCudaFlowBackendFactory(FlowBackendFactory factory) noexcept {
+    g_cudaFactory.store(factory, std::memory_order_release);
+}
+
+FlowBackendFactory cudaFlowBackendFactory() noexcept { return g_cudaFactory.load(std::memory_order_acquire); }
 
 const char* flowBackendName(FlowBackendKind kind) noexcept {
     switch (kind) {
-        case FlowBackendKind::Auto:      return "auto";
-        case FlowBackendKind::Classical: return "classical";
-        case FlowBackendKind::Neural:    return "neural";
-        case FlowBackendKind::Count:     break;
+        case FlowBackendKind::Auto:          return "auto";
+        case FlowBackendKind::Classical:     return "classical";
+        case FlowBackendKind::Neural:        return "neural";
+        case FlowBackendKind::ClassicalCuda: return "classical-cuda";
+        case FlowBackendKind::Count:         break;
     }
     // Unreachable for any enumerator; a value from a corrupt preferences
     // byte lands here rather than off the end of a table.
@@ -129,6 +147,25 @@ std::unique_ptr<FlowBackend> makeFlowBackend(FlowBackendKind kind, const FlowBac
             return std::make_unique<UnavailableFlowBackend>(
                 FlowBackendKind::Neural, "this build has no neural backend (built without ONNX Runtime)");
 #endif
+        }
+
+        case FlowBackendKind::ClassicalCuda: {
+            // Implemented in osv_render_cuda and reachable only through the
+            // factory that library installs; see setCudaFlowBackendFactory.
+            const FlowBackendFactory factory = cudaFlowBackendFactory();
+            if (factory != nullptr) {
+                std::unique_ptr<FlowBackend> gpu = factory(params);
+                if (gpu) {
+                    return gpu;
+                }
+                // The factory broke its never-null promise; report it as an
+                // unavailable backend instead of handing null to the caller.
+                return std::make_unique<UnavailableFlowBackend>(FlowBackendKind::ClassicalCuda,
+                                                                "the CUDA flow backend could not be constructed");
+            }
+            return std::make_unique<UnavailableFlowBackend>(
+                FlowBackendKind::ClassicalCuda,
+                "the CUDA analyses are not installed in this process (osv::render::installCudaAnalyses)");
         }
 
         case FlowBackendKind::Auto: {

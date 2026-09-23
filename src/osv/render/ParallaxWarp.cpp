@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <functional>
 
 namespace osv::render {
 
@@ -41,12 +42,42 @@ namespace {
     return c * c * (3.0 - 2.0 * c);
 }
 
+/// Run `body(task)` for every task in [0, count), across `pool` when there is
+/// one worth using, otherwise inline.
+///
+/// Returns false only when a parallel run failed part-way; the caller then
+/// clears whatever the bodies accumulate into and runs every task itself.
+/// (Bodies that only overwrite their own output can simply be rerun.)
+[[nodiscard]] bool forTasks(ThreadPool* pool, std::size_t count, const std::function<void(std::size_t)>& body) {
+    if (pool != nullptr && pool->size() > 1 && count > 1) {
+        return pool->parallelRows(count, 1, body).ok();
+    }
+    for (std::size_t t = 0; t < count; ++t) {
+        body(t);
+    }
+    return true;
+}
+
+/// Multiply-adds per blur pass below which blurComponent stays on the
+/// calling thread: waking the pool costs tens of microseconds, which a small
+/// blur never earns back.
+constexpr double kBlurParallelMacs = 4.0e6;
+
 /// Separable Gaussian blur of one interleaved component of the grid.
 ///
 /// Longitude wraps and latitude clamps, matching how the kernel samples the
 /// same table - if the smoothing used different addressing than the fetch,
 /// the two would disagree exactly at the wrap meridian.
-void blurComponent(std::vector<float>& uv, std::uint32_t w, std::uint32_t h, int comp, double sigma) {
+///
+/// Restructured for speed without changing a bit of the result: the wrapped
+/// columns are stepped round the ring instead of recomputed with two integer
+/// modulos per tap, and both passes run tap-major (see below), so every
+/// output sums the same products in the same order as the original
+/// output-major loop.  Both passes write whole output rows from inputs
+/// nobody writes during the pass, so `pool` (optional) splits large blurs by
+/// row, again with bit-identical results.
+void blurComponent(std::vector<float>& uv, std::uint32_t w, std::uint32_t h, int comp, double sigma,
+                   ThreadPool* pool) {
     if (sigma <= 0.0 || w == 0 || h == 0) {
         return;
     }
@@ -67,35 +98,108 @@ void blurComponent(std::vector<float>& uv, std::uint32_t w, std::uint32_t h, int
 
     const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
     std::vector<float> tmp(n, 0.0f);
+    const int W = static_cast<int>(w);
+    const std::size_t taps = static_cast<std::size_t>(2 * radius + 1);
 
-    // Horizontal pass: longitude wraps.
-    for (std::uint32_t y = 0; y < h; ++y) {
-        for (std::uint32_t x = 0; x < w; ++x) {
-            double acc = 0.0;
-            for (int i = -radius; i <= radius; ++i) {
-                const int xx = ((static_cast<int>(x) + i) % static_cast<int>(w) + static_cast<int>(w)) %
-                               static_cast<int>(w);
-                acc += static_cast<double>(uv[(static_cast<std::size_t>(y) * w + static_cast<std::uint32_t>(xx)) * 2u +
-                                              static_cast<std::size_t>(comp)]) *
-                       kernel[static_cast<std::size_t>(i + radius)];
+    // Both passes run tap-major: every output of a row advances by one tap
+    // before any advances by the next.  Each output still accumulates
+    // acc += value * kernel[tap] for taps -radius .. +radius in that order,
+    // starting from 0.0 - exactly the sum the output-major loop formed - but
+    // the outputs are now independent operations the compiler can run side by
+    // side, instead of one long chain of dependent double additions.
+
+    // Horizontal pass: longitude wraps.  The row is first unrolled onto a
+    // padded line (radius columns of wrap each side, already widened to
+    // double - an exact conversion), so every tap reads a contiguous run.
+    const auto horizontal = [&](std::size_t y) {
+        const float* row = uv.data() + y * w * 2u + static_cast<std::size_t>(comp);
+        std::vector<double> line(static_cast<std::size_t>(w) + taps - 1u);
+        std::vector<double> acc(w, 0.0);
+        // Column of line[0] is -radius, by the original wrap expression;
+        // each later entry is the next column round the ring.
+        int xx = ((0 - radius) % W + W) % W;
+        for (double& value : line) {
+            value = static_cast<double>(row[static_cast<std::size_t>(xx) * 2u]);
+            if (++xx == W) {
+                xx = 0;
             }
-            tmp[static_cast<std::size_t>(y) * w + x] = static_cast<float>(acc / ksum);
         }
-    }
-
+        for (std::size_t t = 0; t < taps; ++t) {
+            const double k = kernel[t];
+            const double* src = line.data() + t;
+            for (std::uint32_t x = 0; x < w; ++x) {
+                acc[x] += src[x] * k;
+            }
+        }
+        for (std::uint32_t x = 0; x < w; ++x) {
+            tmp[y * w + x] = static_cast<float>(acc[x] / ksum);
+        }
+    };
     // Vertical pass: latitude clamps, because the band genuinely ends.
-    for (std::uint32_t y = 0; y < h; ++y) {
-        for (std::uint32_t x = 0; x < w; ++x) {
-            double acc = 0.0;
-            for (int i = -radius; i <= radius; ++i) {
-                const int yy = std::clamp(static_cast<int>(y) + i, 0, static_cast<int>(h) - 1);
-                acc += static_cast<double>(tmp[static_cast<std::size_t>(yy) * w + x]) *
-                       kernel[static_cast<std::size_t>(i + radius)];
+    const auto vertical = [&](std::size_t y) {
+        std::vector<double> acc(w, 0.0);
+        for (int i = -radius; i <= radius; ++i) {
+            const int yy = std::clamp(static_cast<int>(y) + i, 0, static_cast<int>(h) - 1);
+            const double k = kernel[static_cast<std::size_t>(i + radius)];
+            const float* src = tmp.data() + static_cast<std::size_t>(yy) * w;
+            for (std::uint32_t x = 0; x < w; ++x) {
+                acc[x] += static_cast<double>(src[x]) * k;
             }
-            uv[(static_cast<std::size_t>(y) * w + x) * 2u + static_cast<std::size_t>(comp)] =
-                static_cast<float>(acc / ksum);
         }
+        for (std::uint32_t x = 0; x < w; ++x) {
+            uv[(y * w + x) * 2u + static_cast<std::size_t>(comp)] = static_cast<float>(acc[x] / ksum);
+        }
+    };
+    // Each pass only overwrites its own rows, so a failed parallel run is
+    // simply redone on this thread.  A grid-sized blur (256 x 48 at the
+    // defaults) is a few hundred thousand multiply-adds - less than the cost
+    // of waking a pool - so the pool is only used for a much larger one.
+    ThreadPool* const passPool =
+        static_cast<double>(n) * static_cast<double>(2 * radius + 1) >= kBlurParallelMacs ? pool : nullptr;
+    if (!forTasks(passPool, h, horizontal)) {
+        (void)forTasks(nullptr, h, horizontal);
     }
+    if (!forTasks(passPool, h, vertical)) {
+        (void)forTasks(nullptr, h, vertical);
+    }
+}
+
+/// Column blocks each grid row's per-pixel work is split into when a pool
+/// is available.  One task per grid row left the gate pass unbalanced (a
+/// grid row gets two or three band rows) and 32 tasks cannot keep a large
+/// pool busy; four blocks per row gives 128 even tasks at the default size.
+constexpr std::uint32_t kCellBlocksPerRow = 4;
+
+/// The per-pixel passes of gridFromFlow (accumulation and the benefit gate)
+/// were ~8 ms of single-threaded work per measurement - more than the band
+/// render and the GPU flow together - so they run as tasks of CELLS.
+///
+/// A task owns one grid row and a contiguous range of its columns, i.e. a
+/// fixed set of cells, and walks every band pixel that falls in those cells
+/// in the sequential loop's order (band rows ascending, columns ascending).
+/// Every band pixel feeds exactly one cell, so no two tasks ever write the
+/// same accumulator, and each cell adds its pixels in exactly the order the
+/// single-threaded loop did: the per-cell double sums - and therefore the
+/// grid - are bit-identical with or without a pool, on any number of
+/// threads.  The same guarantee DisFlow.cpp gives for the flow.
+struct CellTask {
+    std::size_t cellRow = 0;  ///< Grid row the task owns.
+    int firstCol = 0;         ///< First grid column it owns.
+    int endCol = 0;           ///< One past its last grid column.
+};
+
+/// Number of cell tasks for this grid, and the task behind an index.
+[[nodiscard]] std::uint32_t cellBlocks(ThreadPool* pool) noexcept {
+    return (pool != nullptr && pool->size() > 1) ? kCellBlocksPerRow : 1u;
+}
+
+[[nodiscard]] CellTask cellTask(std::size_t index, std::uint32_t blocks, std::uint32_t gridW) noexcept {
+    CellTask t;
+    t.cellRow = index / blocks;
+    const std::size_t block = index % blocks;
+    t.firstCol = static_cast<int>(block * gridW / blocks);
+    t.endCol = static_cast<int>((block + 1) * gridW / blocks);
+    return t;
 }
 
 /// Validate the tuning block once, so every later step can assume it is sane.
@@ -159,13 +263,58 @@ void blurComponent(std::vector<float>& uv, std::uint32_t w, std::uint32_t h, int
     return static_cast<float>(top + (bot - top) * ty);
 }
 
+/// sampleBand() of two same-sized planes at one position.
+///
+/// The benefit gate samples both lenses at the same two positions for every
+/// band pixel; the wrap, clamp and weight arithmetic depends only on the
+/// position, so it is done once here and applied to both planes with
+/// sampleBand's own expressions - each result is exactly what sampleBand()
+/// returns for that plane.  Anything sampleBand would refuse is handed to it
+/// plane by plane, so even the degenerate cases agree.
+void sampleBandPair(const std::vector<float>& planeA, const std::vector<float>& planeB, std::uint32_t w,
+                    std::uint32_t h, double x, double y, float& outA, float& outB) noexcept {
+    const std::size_t n = static_cast<std::size_t>(w) * h;
+    if (w == 0 || h == 0 || planeA.size() != n || planeB.size() != n || !std::isfinite(x) || !std::isfinite(y)) {
+        outA = sampleBand(planeA, w, h, x, y);
+        outB = sampleBand(planeB, w, h, x, y);
+        return;
+    }
+    const double fx = x - 0.5;
+    const double fy = y - 0.5;
+    const double flx = std::floor(fx);
+    const double fly = std::floor(fy);
+    const double tx = fx - flx;
+    const double ty = fy - fly;
+    const int W = static_cast<int>(w);
+    const int H = static_cast<int>(h);
+    const int x0 = ((static_cast<int>(flx) % W) + W) % W;
+    const int x1 = (x0 + 1) % W;
+    const int y0 = std::clamp(static_cast<int>(fly), 0, H - 1);
+    const int y1 = std::clamp(static_cast<int>(fly) + 1, 0, H - 1);
+    const std::size_t i00 = static_cast<std::size_t>(y0) * w + static_cast<std::size_t>(x0);
+    const std::size_t i10 = static_cast<std::size_t>(y0) * w + static_cast<std::size_t>(x1);
+    const std::size_t i01 = static_cast<std::size_t>(y1) * w + static_cast<std::size_t>(x0);
+    const std::size_t i11 = static_cast<std::size_t>(y1) * w + static_cast<std::size_t>(x1);
+    const auto lerp2 = [&](const std::vector<float>& p) {
+        const double a = p[i00];
+        const double b = p[i10];
+        const double c = p[i01];
+        const double d = p[i11];
+        const double top = a + (b - a) * tx;
+        const double bot = c + (d - c) * tx;
+        return static_cast<float>(top + (bot - top) * ty);
+    };
+    outA = lerp2(planeA);
+    outB = lerp2(planeB);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
 //  Flow field -> angular grid
 // ---------------------------------------------------------------------------
 Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& flow,
-                                      const ParallaxWarpParams& params) {
+                                      const ParallaxWarpParams& params, ThreadPool* pool) {
     OSV_TRY(checkParams(params));
     if (bands.w == 0 || bands.h == 0 || bands.mapH == 0) {
         return Error{ErrorCode::InvalidArgument, "gridFromFlow: empty band"};
@@ -239,51 +388,96 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
     std::vector<double> accLon(cells, 0.0);
     std::vector<double> accLat(cells, 0.0);
     std::vector<double> accN(cells, 0.0);
-    std::uint64_t consistent = 0;
-    std::uint64_t covisible = 0;
     const double colsPerCell = static_cast<double>(bands.w) / static_cast<double>(gridW);
     const double rowsPerCell =
         bands.h > 1 ? static_cast<double>(bands.h - 1) / static_cast<double>(gridRows - 1) : 1.0;
 
+    // The cell each band row and each band column falls in, computed once:
+    // they depend on one coordinate each, and the per-pixel lround they
+    // replace was a measurable share of this function's time.  Same
+    // expressions, so the same cells.
+    //
+    // Row: nearest measured grid row to the band row's centre.
+    std::vector<int> cellRowOf(bands.h);
     for (std::uint32_t r = 0; r < bands.h; ++r) {
-        // Nearest measured grid row to this band row's centre.
-        int gr = static_cast<int>(std::lround(static_cast<double>(r) / rowsPerCell));
-        gr = std::clamp(gr, 0, static_cast<int>(gridRows) - 1);
-        for (std::uint32_t c = 0; c < bands.w; ++c) {
-            const std::size_t i = static_cast<std::size_t>(r) * bands.w + c;
-            if (!(bands.alpha[0][i] > 0.5f) || !(bands.alpha[1][i] > 0.5f)) {
+        const int gr = static_cast<int>(std::lround(static_cast<double>(r) / rowsPerCell));
+        cellRowOf[r] = std::clamp(gr, 0, static_cast<int>(gridRows) - 1);
+    }
+    // Column: nearest grid column to the band column's centre.  The kernel
+    // reads cell gc at longitude fraction gc / gridW, which is band position
+    // gc * colsPerCell; ROUNDING keeps each cell centred on the position it
+    // is read back at.  Flooring - the first version - put every cell half a
+    // cell (0.7 degrees at 256 columns) east of where it had been measured.
+    std::vector<int> cellColOf(bands.w);
+    for (std::uint32_t c = 0; c < bands.w; ++c) {
+        const int gc = static_cast<int>(std::lround((static_cast<double>(c) + 0.5) / colsPerCell));
+        cellColOf[c] = ((gc % static_cast<int>(gridW)) + static_cast<int>(gridW)) % static_cast<int>(gridW);
+    }
+
+    // Tasks of cells (see CellTask): each owns its cells outright and walks
+    // their pixels in the sequential row-major order, so every cell's sums
+    // are bit-identical to the single-threaded loop's.  The two counters are
+    // integers, summed per task and then added, which no order changes.
+    const std::uint32_t blocks = cellBlocks(pool);
+    const std::size_t taskCount = static_cast<std::size_t>(gridRows) * blocks;
+    std::vector<std::uint64_t> covisibleOf(taskCount, 0u);
+    std::vector<std::uint64_t> consistentOf(taskCount, 0u);
+    const auto accumulateTask = [&](std::size_t index) {
+        const CellTask task = cellTask(index, blocks, gridW);
+        std::uint64_t covisible = 0;
+        std::uint64_t consistent = 0;
+        for (std::uint32_t r = 0; r < bands.h; ++r) {
+            if (static_cast<std::size_t>(cellRowOf[r]) != task.cellRow) {
                 continue;
             }
-            ++covisible;
-            if (flow.ok[i] == 0u) {
-                continue;
+            const std::size_t rowBase = task.cellRow * gridW;
+            for (std::uint32_t c = 0; c < bands.w; ++c) {
+                if (cellColOf[c] < task.firstCol || cellColOf[c] >= task.endCol) {
+                    continue;  // another task's cell
+                }
+                const std::size_t i = static_cast<std::size_t>(r) * bands.w + c;
+                if (!(bands.alpha[0][i] > 0.5f) || !(bands.alpha[1][i] > 0.5f)) {
+                    continue;
+                }
+                ++covisible;
+                if (flow.ok[i] == 0u) {
+                    continue;
+                }
+                const double fu =
+                    0.5 * (static_cast<double>(flow.forward.u[i]) - static_cast<double>(flow.backward.u[i]));
+                const double fv =
+                    0.5 * (static_cast<double>(flow.forward.v[i]) - static_cast<double>(flow.backward.v[i]));
+                if (!std::isfinite(fu) || !std::isfinite(fv)) {
+                    continue;
+                }
+                ++consistent;
+                const std::size_t gi = rowBase + static_cast<std::size_t>(cellColOf[c]);
+                // Pixels -> the MASTER lens's half displacement in radians.
+                //
+                // The master (lens 1) must sample at q + f/2 and the slave at
+                // q - f/2.  A column step is +longitude; a ROW step is
+                // -latitude (row 0 is the +90 pole), hence the minus on dLat.
+                accLon[gi] += 0.5 * fu * radPerCol;
+                accLat[gi] += -0.5 * fv * radPerRow;
+                accN[gi] += 1.0;
             }
-            const double fu =
-                0.5 * (static_cast<double>(flow.forward.u[i]) - static_cast<double>(flow.backward.u[i]));
-            const double fv =
-                0.5 * (static_cast<double>(flow.forward.v[i]) - static_cast<double>(flow.backward.v[i]));
-            if (!std::isfinite(fu) || !std::isfinite(fv)) {
-                continue;
-            }
-            ++consistent;
-            // Nearest grid column to this band column's centre.  The kernel
-            // reads cell gc at longitude fraction gc / gridW, which is band
-            // position gc * colsPerCell; ROUNDING keeps each cell centred on
-            // the position it is read back at.  Flooring - the first version
-            // - put every cell half a cell (0.7 degrees at 256 columns) east
-            // of where it had been measured.
-            int gc = static_cast<int>(std::lround((static_cast<double>(c) + 0.5) / colsPerCell));
-            gc = ((gc % static_cast<int>(gridW)) + static_cast<int>(gridW)) % static_cast<int>(gridW);
-            const std::size_t gi = static_cast<std::size_t>(gr) * gridW + static_cast<std::size_t>(gc);
-            // Pixels -> the MASTER lens's half displacement in radians.
-            //
-            // The master (lens 1) must sample at q + f/2 and the slave at
-            // q - f/2.  A column step is +longitude; a ROW step is -latitude
-            // (row 0 is the +90 pole), hence the minus on dLat.
-            accLon[gi] += 0.5 * fu * radPerCol;
-            accLat[gi] += -0.5 * fv * radPerRow;
-            accN[gi] += 1.0;
         }
+        covisibleOf[index] = covisible;
+        consistentOf[index] = consistent;
+    };
+    if (!forTasks(pool, taskCount, accumulateTask)) {
+        // A parallel run that failed part-way leaves partial sums: start
+        // again from zero on this thread, which gives the same result.
+        std::fill(accLon.begin(), accLon.end(), 0.0);
+        std::fill(accLat.begin(), accLat.end(), 0.0);
+        std::fill(accN.begin(), accN.end(), 0.0);
+        (void)forTasks(nullptr, taskCount, accumulateTask);
+    }
+    std::uint64_t consistent = 0;
+    std::uint64_t covisible = 0;
+    for (std::size_t t = 0; t < taskCount; ++t) {
+        covisible += covisibleOf[t];
+        consistent += consistentOf[t];
     }
     grid.consistentPixels = consistent;
     grid.totalPixels = covisible;
@@ -312,37 +506,61 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
     // then whole empty rows from the nearest row that has data - which is
     // what happens at the band's top and bottom, where one lens's coverage
     // has already dropped below the co-visibility threshold.
+    //
+    // Each empty cell copies the nearest measured cell of its row, looking
+    // outward one step at a time and preferring the LEFT neighbour when both
+    // are equally near.  That rule is evaluated with two sweeps round the
+    // ring - the nearest measured cell to each side of every empty one -
+    // rather than by searching outward from each empty cell, which cost
+    // O(gridW^2) modulo steps on a sparsely measured row.  Same sources,
+    // same copies.
     std::vector<std::uint8_t> rowHasData(gridRows, 0u);
+    std::vector<std::uint32_t> leftSrc(gridW);
+    std::vector<std::uint32_t> rightSrc(gridW);
     for (std::uint32_t gr = 0; gr < gridRows; ++gr) {
         const std::size_t base = static_cast<std::size_t>(gr) * gridW;
+        const auto has = [&](std::uint32_t gc) { return accN[base + gc] > 0.0; };
+        std::uint32_t anchor = gridW;  // any measured column of this row
         for (std::uint32_t gc = 0; gc < gridW; ++gc) {
-            if (accN[base + gc] > 0.0) {
-                rowHasData[gr] = 1u;
+            if (has(gc)) {
+                anchor = gc;
                 break;
             }
         }
-        if (!rowHasData[gr]) {
-            continue;
+        if (anchor == gridW) {
+            continue;  // an empty row: filled from its neighbours below
+        }
+        rowHasData[gr] = 1u;
+        // Walk right from the anchor: the last measured column passed is the
+        // nearest one to the LEFT of each empty column reached.
+        std::uint32_t last = anchor;
+        for (std::uint32_t step = 1; step < gridW; ++step) {
+            const std::uint32_t gc = (anchor + step) % gridW;
+            if (has(gc)) {
+                last = gc;
+            } else {
+                leftSrc[gc] = last;
+            }
+        }
+        // Walk left from the anchor for the nearest one to the RIGHT.
+        last = anchor;
+        for (std::uint32_t step = 1; step < gridW; ++step) {
+            const std::uint32_t gc = (anchor + gridW - step) % gridW;
+            if (has(gc)) {
+                last = gc;
+            } else {
+                rightSrc[gc] = last;
+            }
         }
         for (std::uint32_t gc = 0; gc < gridW; ++gc) {
-            if (accN[base + gc] > 0.0) {
+            if (has(gc)) {
                 continue;
             }
-            for (std::uint32_t d = 1; d < gridW; ++d) {
-                const std::uint32_t left = (gc + gridW - d) % gridW;
-                const std::uint32_t right = (gc + d) % gridW;
-                std::uint32_t src = gridW;  // sentinel: nothing found yet
-                if (accN[base + left] > 0.0) {
-                    src = left;
-                } else if (accN[base + right] > 0.0) {
-                    src = right;
-                }
-                if (src != gridW) {
-                    measured[(base + gc) * 2u + 0u] = measured[(base + src) * 2u + 0u];
-                    measured[(base + gc) * 2u + 1u] = measured[(base + src) * 2u + 1u];
-                    break;
-                }
-            }
+            const std::uint32_t distLeft = (gc + gridW - leftSrc[gc]) % gridW;
+            const std::uint32_t distRight = (rightSrc[gc] + gridW - gc) % gridW;
+            const std::uint32_t src = distLeft <= distRight ? leftSrc[gc] : rightSrc[gc];  // ties go left
+            measured[(base + gc) * 2u + 0u] = measured[(base + src) * 2u + 0u];
+            measured[(base + gc) * 2u + 1u] = measured[(base + src) * 2u + 1u];
         }
     }
     for (std::uint32_t gr = 0; gr < gridRows; ++gr) {
@@ -394,8 +612,8 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
     // that distrust is expressed without discarding its amplitude.  The
     // light blur on dLat removes cell-to-cell noise, which would otherwise
     // show as a fine ripple once it becomes a rotation.
-    blurComponent(grid.uv, grid.w, grid.h, 0, params.crossMeridianSmooth);
-    blurComponent(grid.uv, grid.w, grid.h, 1, 1.0);
+    blurComponent(grid.uv, grid.w, grid.h, 0, params.crossMeridianSmooth, pool);
+    blurComponent(grid.uv, grid.w, grid.h, 1, 1.0, pool);
 
     // ---- boundary decay ----------------------------------------------------
     // The correction must reach EXACTLY zero at the outermost grid rows,
@@ -478,54 +696,96 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
         std::vector<double> errNull(cells, 0.0);
         std::vector<double> errWarped(cells, 0.0);
         std::vector<double> errN(cells, 0.0);
-        for (std::uint32_t r = 0; r < bands.h; ++r) {
-            int gr = static_cast<int>(std::lround(static_cast<double>(r) / rowsPerCell));
-            gr = std::clamp(gr, 0, static_cast<int>(gridRows) - 1);
-            const float lat = static_cast<float>(latOfBandRow(static_cast<double>(r)));
-            for (std::uint32_t c = 0; c < bands.w; ++c) {
-                const std::size_t i = static_cast<std::size_t>(r) * bands.w + c;
-                if (!(bands.alpha[0][i] > 0.5f) || !(bands.alpha[1][i] > 0.5f)) {
+        // Longitude of each band column's centre, as the kernel will see it
+        // (float, like the ray it derives from) - computed once per column
+        // instead of once per pixel, with the identical expression.
+        std::vector<float> lonOf(bands.w);
+        for (std::uint32_t c = 0; c < bands.w; ++c) {
+            lonOf[c] = static_cast<float>((static_cast<double>(c) + 0.5) * radPerCol - osv::kPi);
+        }
+        // The same cell tasks as the accumulation above, for the same reason:
+        // each cell's three sums keep the sequential pixel order.
+        const auto gateTask = [&](std::size_t index) {
+            const CellTask task = cellTask(index, blocks, gridW);
+            const std::size_t rowBase = task.cellRow * gridW;
+            for (std::uint32_t r = 0; r < bands.h; ++r) {
+                if (static_cast<std::size_t>(cellRowOf[r]) != task.cellRow) {
                     continue;
                 }
-                int gc = static_cast<int>(std::lround((static_cast<double>(c) + 0.5) / colsPerCell));
-                gc = ((gc % static_cast<int>(gridW)) + static_cast<int>(gridW)) % static_cast<int>(gridW);
-                const std::size_t gi = static_cast<std::size_t>(gr) * gridW + static_cast<std::size_t>(gc);
+                const float lat = static_cast<float>(latOfBandRow(static_cast<double>(r)));
+                for (std::uint32_t c = 0; c < bands.w; ++c) {
+                    if (cellColOf[c] < task.firstCol || cellColOf[c] >= task.endCol) {
+                        continue;  // another task's cell
+                    }
+                    const std::size_t i = static_cast<std::size_t>(r) * bands.w + c;
+                    if (!(bands.alpha[0][i] > 0.5f) || !(bands.alpha[1][i] > 0.5f)) {
+                        continue;
+                    }
+                    const std::size_t gi = rowBase + static_cast<std::size_t>(cellColOf[c]);
 
-                // The displacement the kernel will apply at this pixel, in
-                // band pixels.  A longitude step is a column step; a latitude
-                // step is a NEGATIVE row step (row 0 is the +90 pole).
-                const float lon =
-                    static_cast<float>((static_cast<double>(c) + 0.5) * radPerCol - osv::kPi);
-                const double dLon = osvWarpSample(&kp, grid.uv.data(), lon, lat, 0);
-                const double dLat = osvWarpSample(&kp, grid.uv.data(), lon, lat, 1);
-                const double dx = dLon / radPerCol;
-                const double dy = -dLat / radPerRow;
-                const double x = static_cast<double>(c) + 0.5;
-                const double y = static_cast<double>(r) + 0.5;
-                const double slaveMinus = sampleBand(bands.luma[0], bands.w, bands.h, x - dx, y - dy);
-                const double masterPlus = sampleBand(bands.luma[1], bands.w, bands.h, x + dx, y + dy);
-                const double slavePlus = sampleBand(bands.luma[0], bands.w, bands.h, x + dx, y + dy);
-                const double masterMinus = sampleBand(bands.luma[1], bands.w, bands.h, x - dx, y - dy);
-                errNull[gi] += 0.5 * (std::fabs(slaveMinus - masterMinus) + std::fabs(slavePlus - masterPlus));
-                errWarped[gi] += std::fabs(slaveMinus - masterPlus);
-                errN[gi] += 1.0;
+                    // The displacement the kernel will apply at this pixel,
+                    // in band pixels.  A longitude step is a column step; a
+                    // latitude step is a NEGATIVE row step (row 0 is the +90
+                    // pole).
+                    const float lon = lonOf[c];
+                    const double dLon = osvWarpSample(&kp, grid.uv.data(), lon, lat, 0);
+                    const double dLat = osvWarpSample(&kp, grid.uv.data(), lon, lat, 1);
+                    const double dx = dLon / radPerCol;
+                    const double dy = -dLat / radPerRow;
+                    const double x = static_cast<double>(c) + 0.5;
+                    const double y = static_cast<double>(r) + 0.5;
+                    // Both lenses at p - d, then both at p + d.
+                    float sampled[4];
+                    sampleBandPair(bands.luma[0], bands.luma[1], bands.w, bands.h, x - dx, y - dy, sampled[0],
+                                   sampled[1]);
+                    sampleBandPair(bands.luma[0], bands.luma[1], bands.w, bands.h, x + dx, y + dy, sampled[2],
+                                   sampled[3]);
+                    const double slaveMinus = sampled[0];
+                    const double masterMinus = sampled[1];
+                    const double slavePlus = sampled[2];
+                    const double masterPlus = sampled[3];
+                    errNull[gi] += 0.5 * (std::fabs(slaveMinus - masterMinus) + std::fabs(slavePlus - masterPlus));
+                    errWarped[gi] += std::fabs(slaveMinus - masterPlus);
+                    errN[gi] += 1.0;
+                }
             }
+        };
+        if (!forTasks(pool, taskCount, gateTask)) {
+            // Partial sums from a failed parallel run: redo from zero here.
+            std::fill(errNull.begin(), errNull.end(), 0.0);
+            std::fill(errWarped.begin(), errWarped.end(), 0.0);
+            std::fill(errN.begin(), errN.end(), 0.0);
+            (void)forTasks(nullptr, taskCount, gateTask);
         }
 
-        // 3 x 3 pooling (longitude wraps, latitude clamps).
-        const auto pooled = [&](const std::vector<double>& v, std::size_t gi) {
+        // 3 x 3 pooling (longitude wraps, latitude clamps) of all three sums
+        // in one walk of the neighbourhood.  Each sum still adds the same
+        // nine cells in the same order (rows, then columns, -1 to +1), so it
+        // is the sum a separate walk per array gave.  The wrap is one
+        // conditional add or subtract - gridW >= 8, so a +/-1 step never
+        // wraps twice - where it was two integer modulos per tap.
+        const int gridWi = static_cast<int>(gridW);
+        const auto pooled3 = [&](std::size_t gi, double& n, double& sumNull, double& sumWarped) {
             const int gr = static_cast<int>(gi / gridW);
             const int gc = static_cast<int>(gi % gridW);
-            double sum = 0.0;
+            n = 0.0;
+            sumNull = 0.0;
+            sumWarped = 0.0;
             for (int dr = -1; dr <= 1; ++dr) {
                 const int rr = std::clamp(gr + dr, 0, static_cast<int>(gridRows) - 1);
                 for (int dc = -1; dc <= 1; ++dc) {
-                    const int cc =
-                        ((gc + dc) % static_cast<int>(gridW) + static_cast<int>(gridW)) % static_cast<int>(gridW);
-                    sum += v[static_cast<std::size_t>(rr) * gridW + static_cast<std::size_t>(cc)];
+                    int cc = gc + dc;
+                    if (cc < 0) {
+                        cc += gridWi;
+                    } else if (cc >= gridWi) {
+                        cc -= gridWi;
+                    }
+                    const std::size_t k = static_cast<std::size_t>(rr) * gridW + static_cast<std::size_t>(cc);
+                    n += errN[k];
+                    sumNull += errNull[k];
+                    sumWarped += errWarped[k];
                 }
             }
-            return sum;
         };
 
         // Per-cell weight: ratio 1 - requiredImprovement or better -> 1;
@@ -537,11 +797,14 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
         const double fullAt = 1.0 - params.requiredImprovement;
         std::vector<float> weight(cells, 0.0f);
         for (std::size_t gi = 0; gi < cells; ++gi) {
-            const double n = pooled(errN, gi);
+            double n = 0.0;
+            double sumNull = 0.0;
+            double sumWarped = 0.0;
+            pooled3(gi, n, sumNull, sumWarped);
             double w = 0.0;
             if (n > 0.0) {
-                const double eu = pooled(errNull, gi) / n;
-                const double ew = pooled(errWarped, gi) / n;
+                const double eu = sumNull / n;
+                const double ew = sumWarped / n;
                 if (eu >= params.minResidual) {
                     w = smoothstep01((zeroAt - ew / eu) / (zeroAt - fullAt));
                 }
@@ -562,7 +825,7 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
                     weight[static_cast<std::size_t>(k) * gridW + gc];
             }
         }
-        blurComponent(wGrid, grid.w, grid.h, 0, 1.0);
+        blurComponent(wGrid, grid.w, grid.h, 0, 1.0, pool);
         for (std::size_t k = 0; k < static_cast<std::size_t>(grid.w) * grid.h; ++k) {
             const float w = std::clamp(wGrid[k * 2u], 0.0f, 1.0f);
             grid.uv[k * 2u + 0u] *= w;
@@ -658,7 +921,7 @@ Result<ParallaxWarpGrid> parallaxFromBands(const LensBands& bands, const Paralla
     const double flowMs = msSince(tFlow);
 
     const auto tGrid = Clock::now();
-    OSV_TRY_ASSIGN(ParallaxWarpGrid grid, gridFromFlow(bands, flow, params));
+    OSV_TRY_ASSIGN(ParallaxWarpGrid grid, gridFromFlow(bands, flow, params, pool));
     grid.usedBackend = used;
     grid.bandMs = bandMs;
     grid.flowMs = flowMs;

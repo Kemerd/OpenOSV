@@ -406,7 +406,12 @@ inline constexpr std::uint32_t kParallaxBucketFrames = 8;
 ///
 /// `bands` supplies the band geometry (size, row offset, map height) and
 /// `flow` the measured field, which must match the band's dimensions.
+///
+/// `pool` (optional) splits the two per-pixel passes - the accumulation and
+/// the benefit gate, ~8 ms single-threaded on a 2048 x 68 band - by grid row.
+/// Each cell still sums its pixels in the sequential order, so the grid is
+/// bit-identical with or without a pool, on any number of threads.
 [[nodiscard]] Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& flow,
-                                                    const ParallaxWarpParams& params);
+                                                    const ParallaxWarpParams& params, ThreadPool* pool = nullptr);
 
 }  // namespace osv::render
