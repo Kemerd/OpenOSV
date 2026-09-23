@@ -8,7 +8,12 @@
 // registered with ctest (numbers depend on the machine and on what else runs
 // on it).  Run it by hand:
 //
-//     build\<dir>\bin\osv_seam_carve_bench.exe [clip.OSV] [--out DIR] [--frames 0,32,64]
+//     build\<dir>\bin\osv_seam_carve_bench.exe [clip.OSV] [--out DIR] [--frames 0,32,64] [--tools]
+//
+// [WP-SEAMTOOLS] --tools measures the Source Settings seam tools instead:
+// each at a few settings against the defaults, the Near / Far Offset scans
+// (the lenses' mismatch as the offset grid shows them), how cleanly the
+// carve's near mask isolates the wing, and the smoothing's cost.
 //
 // The clip defaults to OSV_SAMPLE_FILE (environment first, then the path the
 // build was configured with).  Output is plain ASCII.
@@ -65,6 +70,7 @@
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamCarve.h"
+#include "osv/render/SeamTools.h"
 #if defined(OSV_HAVE_CUDA)
 #include "osv/render/CudaAnalysis.h"
 #include "osv/render/CudaRenderer.h"
@@ -126,6 +132,7 @@ struct Blend {
     const render::ParallaxWarpGrid* grid = nullptr;  ///< Parallax grid in force (or none).
     const render::BlendSeam* seam = nullptr;         ///< Carved / fixed seam (or none = FOV feather).
     int onlyLens = -1;                               ///< 0 / 1 = that lens alone.
+    double smoothingDeg = 0.0;                       ///< [WP-SEAMTOOLS] Seam Smoothing half width (0 = off).
 };
 
 /// Builder for one configuration; the caller adds the output geometry.
@@ -137,6 +144,9 @@ render::RenderParamsBuilder makeBuilder(const Clip& clip, const OsvColorParams& 
     }
     if (b.seam) {
         render::applyBlendSeam(builder, *b.seam);
+    }
+    if (b.smoothingDeg > 0.0) {
+        builder.seamSmooth(b.smoothingDeg);  // [WP-SEAMTOOLS] a no-op without the seam
     }
     if (b.onlyLens == 0 || b.onlyLens == 1) {
         builder.lensEnabled(1 - b.onlyLens, false);
@@ -180,6 +190,12 @@ float luma(const float* px) noexcept {
 struct Metrics {
     double ghost = 0.0;     ///< x1000
     double seamEdge = 0.0;  ///< x1000
+    double mismatch = 0.0;  ///< [WP-SEAMTOOLS] mean |S0 - S1| x1000: how far apart the two lenses are
+    /// [WP-SEAMTOOLS] the ghost formula on HIGH-PASSED luma (each image minus
+    /// its 5 x 5 box mean), x1000: the sharp double image a viewer reads as
+    /// "two of it", without the soft low-frequency blend the seam smoothing
+    /// adds on purpose.
+    double hfGhost = 0.0;
     std::size_t pixels = 0;
 };
 
@@ -206,8 +222,21 @@ Metrics measure(const render::ImageRGBAf& B, const render::ImageRGBAf& S0, const
         const double gy = 0.5 * (lumaAt(im, x, y + 1) - lumaAt(im, x, y - 1));
         return std::sqrt(gx * gx + gy * gy);
     };
+    // Luma minus its 5 x 5 box mean (rows clamp, columns wrap).
+    const auto highAt = [&](const render::ImageRGBAf& im, int x, int y) {
+        double s = 0.0;
+        for (int dy = -2; dy <= 2; ++dy) {
+            const int yy = std::clamp(y + dy, 0, H - 1);
+            for (int dx = -2; dx <= 2; ++dx) {
+                s += lumaAt(im, x + dx, yy);
+            }
+        }
+        return lumaAt(im, x, y) - s / 25.0;
+    };
     double ghost = 0.0;
     double edge = 0.0;
+    double mismatch = 0.0;
+    double hfGhost = 0.0;
     for (int y = r0; y <= r1; ++y) {
         for (int x = 0; x < W; ++x) {
             if (!inWindow(x)) {
@@ -222,6 +251,7 @@ Metrics measure(const render::ImageRGBAf& B, const render::ImageRGBAf& S0, const
             const double l1 = luma(p1);
             const double lb = lumaAt(B, x, y);
             const double d = l0 - l1;
+            mismatch += std::fabs(d);
             if (std::fabs(d) > 0.02) {
                 const double a = std::clamp((lb - l1) / d, 0.0, 1.0);
                 ghost += 2.0 * std::min(a, 1.0 - a) * std::fabs(d);
@@ -229,12 +259,22 @@ Metrics measure(const render::ImageRGBAf& B, const render::ImageRGBAf& S0, const
             const double gb = gradAt(B, x, y);
             const double gs = std::max(gradAt(S0, x, y), gradAt(S1, x, y));
             edge += std::max(0.0, gb - gs - 0.004);
+            // The same mix solve on the high-passed images.
+            const double h0 = highAt(S0, x, y);
+            const double h1 = highAt(S1, x, y);
+            const double hd = h0 - h1;
+            if (std::fabs(hd) > 0.01) {
+                const double ha = std::clamp((highAt(B, x, y) - h1) / hd, 0.0, 1.0);
+                hfGhost += 2.0 * std::min(ha, 1.0 - ha) * std::fabs(hd);
+            }
             ++m.pixels;
         }
     }
     if (m.pixels > 0) {
         m.ghost = 1000.0 * ghost / static_cast<double>(m.pixels);
         m.seamEdge = 1000.0 * edge / static_cast<double>(m.pixels);
+        m.mismatch = 1000.0 * mismatch / static_cast<double>(m.pixels);
+        m.hfGhost = 1000.0 * hfGhost / static_cast<double>(m.pixels);
     }
     return m;
 }
@@ -348,6 +388,351 @@ render::BlendSeam fixedSeam(const render::SeamCarveParams& p) {
     return s;
 }
 
+// ===========================================================================
+//  [WP-SEAMTOOLS] --tools: what each Source Settings seam tool does, in numbers
+// ===========================================================================
+
+/// Normalised cross-correlation of the two lenses' luma over the pixels both
+/// cover in columns [x0, x1) (wrapping) and rows [y0, y1] of a polar map:
+/// how well they line up where they overlap (1 = identical up to gain).
+double lensNcc(const render::ImageRGBAf& S0, const render::ImageRGBAf& S1, int x0, int x1, int y0, int y1) {
+    const int W = static_cast<int>(S0.w);
+    double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+    std::size_t n = 0;
+    const int cols = x0 <= x1 ? x1 - x0 : W - x0 + x1;
+    for (int y = std::max(0, y0); y <= std::min(static_cast<int>(S0.h) - 1, y1); ++y) {
+        for (int k = 0; k < cols; ++k) {
+            const int x = (x0 + k) % W;
+            const float* p0 = S0.pixel(static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
+            const float* p1 = S1.pixel(static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
+            if (!(p0[3] > 0.5f) || !(p1[3] > 0.5f)) {
+                continue;
+            }
+            const double a = luma(p0);
+            const double b = luma(p1);
+            sa += a;
+            sb += b;
+            saa += a * a;
+            sbb += b * b;
+            sab += a * b;
+            ++n;
+        }
+    }
+    if (n < 100) {
+        return 0.0;
+    }
+    const double N = static_cast<double>(n);
+    const double cov = sab / N - (sa / N) * (sb / N);
+    const double va = saa / N - (sa / N) * (sa / N);
+    const double vb = sbb / N - (sb / N) * (sb / N);
+    return (va > 0.0 && vb > 0.0) ? cov / std::sqrt(va * vb) : 0.0;
+}
+
+/// Mean of a per-column weight over the columns inside / outside a longitude
+/// window [c0, c1) of the ring (wrapping), and how many outside columns are
+/// above one half - how cleanly the near mask isolates the window.
+struct MaskStats {
+    double inside = 0.0;
+    double outside = 0.0;
+    std::uint32_t outsideHigh = 0;
+    std::uint32_t outsideCount = 0;
+};
+
+MaskStats maskStats(const std::vector<float>& w, std::uint32_t c0, std::uint32_t c1) {
+    MaskStats s;
+    const auto n = static_cast<std::uint32_t>(w.size());
+    std::uint32_t in = 0;
+    for (std::uint32_t c = 0; c < n; ++c) {
+        const bool inside = c0 <= c1 ? (c >= c0 && c < c1) : (c >= c0 || c < c1);
+        if (inside) {
+            s.inside += w[c];
+            ++in;
+        } else {
+            s.outside += w[c];
+            ++s.outsideCount;
+            s.outsideHigh += w[c] > 0.5f ? 1u : 0u;
+        }
+    }
+    s.inside = in ? s.inside / in : 0.0;
+    s.outside = s.outsideCount ? s.outside / s.outsideCount : 0.0;
+    return s;
+}
+
+/// The --tools run: per frame, the carve's near mask over the wing, every
+/// tool at a few settings against the defaults (band and wing metrics), the
+/// Near / Far Offset scans, crops; then the cost of the smoothing.
+int runSeamTools(const Clip& clip, render::IRenderer& renderer, video::DualStreamReader& reader,
+                 const std::filesystem::path& clipPath, const std::vector<std::uint32_t>& frames,
+                 const std::filesystem::path& outDir, ThreadPool& pool, const OsvColorParams& cp, double viewYaw,
+                 double viewPitch) {
+    const int PW = 4096;
+    const int PH = 2048;
+    const int wingX0 = PW * 1800 / 2048;
+    const int wingX1 = PW * 120 / 2048;
+    // The same window in carve columns (1024 over the ring).
+    const std::uint32_t wingC0 = 1024u * 1800u / 2048u;
+    const std::uint32_t wingC1 = 1024u * 120u / 2048u;
+
+    std::printf("\nseam tools (x1000 display luma; band = |lat| <= 8 deg co-visible, wing = the wing-tip longitudes;\n"
+                "mismatch = mean |S0 - S1|, how far apart the two lenses are as rendered)\n");
+    for (const std::uint32_t f : frames) {
+        auto pair = reader.read(f);
+        if (!pair.ok()) {
+            std::printf("  frame %u: decode failed: %s\n", f, pair.error().message.c_str());
+            continue;
+        }
+        render::ParallaxWarpParams pw;
+        pw.backend = render::FlowBackendKind::Classical;
+        auto grid = render::buildParallaxWarp(clip.rig, pair.value(), geom::BlendParams{}, pw, nullptr, pool);
+        const render::ParallaxWarpGrid* gridPtr = grid.ok() ? &grid.value() : nullptr;
+        render::WarpGridView view;
+        render::SeamCorrection corr;
+        if (gridPtr) {
+            view.uv = gridPtr->uv.data();
+            view.w = gridPtr->w;
+            view.h = gridPtr->h;
+            view.latMinRad = gridPtr->latMinRad;
+            view.latMaxRad = gridPtr->latMaxRad;
+            corr.warp = &view;
+        }
+        // One carve per blend-width setting (the path is the same; the widths
+        // are what differ).
+        const auto carveWith = [&](const render::SeamTools& t) -> Result<render::BlendSeam> {
+            render::SeamCarveParams p;
+            render::applySeamBlendWidths(t, p);
+            return render::carveSeam(clip.rig, pair.value(), geom::BlendParams{}, render::ParallaxWarpParams{}.band,
+                                     corr, p, nullptr, pool);
+        };
+        auto base = carveWith(render::SeamTools{});
+        if (!base.ok()) {
+            std::printf("  frame %u: carve failed\n", f);
+            continue;
+        }
+        // ---- the near mask over the wing ----------------------------------------
+        const MaskStats ms = maskStats(base.value().nearWeight, wingC0, wingC1);
+        std::printf("  frame %2u: grid %s; near mask mean %.2f over the wing columns, %.2f elsewhere (%u of %u "
+                    "other columns above 0.5)\n",
+                    f, gridPtr ? "applied" : "refused", ms.inside, ms.outside, ms.outsideHigh, ms.outsideCount);
+        // The nacelle's own columns (the NCC window below, in carve columns).
+        const MaskStats nac = maskStats(base.value().nearWeight, (wingC0 + 90u) % 1024u, (wingC0 + 280u) % 1024u);
+        std::printf("            near mask mean %.2f over the nacelle's own columns\n", nac.inside);
+
+        // ---- every tool at a few settings -------------------------------------------
+        struct Config {
+            const char* name;
+            render::SeamTools tools;
+        };
+        std::vector<Config> configs;
+        configs.push_back({"defaults", {}});
+        for (const double v : {0.5, 3.0, 6.0}) {
+            render::SeamTools t;
+            t.seamBlendDeg = v;
+            configs.push_back({v == 0.5 ? "blend 0.5" : (v == 3.0 ? "blend 3" : "blend 6"), t});
+        }
+        for (const double v : {0.0, 1.0, 2.0}) {
+            render::SeamTools t;
+            t.parallaxBlendDeg = v;
+            configs.push_back({v == 0.0 ? "parallax 0" : (v == 1.0 ? "parallax 1" : "parallax 2"), t});
+        }
+        for (const double v : {1.0, 2.0, 4.0, 8.0}) {
+            render::SeamTools t;
+            t.smoothingDeg = v;
+            configs.push_back({v == 1.0 ? "smooth 1" : (v == 2.0 ? "smooth 2" : (v == 4.0 ? "smooth 4" : "smooth 8")), t});
+        }
+        auto s0 = renderPolar(renderer, clip, pair.value(), cp, Blend{gridPtr, nullptr, 0}, PW, PH);
+        auto s1 = renderPolar(renderer, clip, pair.value(), cp, Blend{gridPtr, nullptr, 1}, PW, PH);
+        if (!s0.ok() || !s1.ok()) {
+            std::printf("  frame %u: single-lens render failed\n", f);
+            continue;
+        }
+        // The two lenses' +/- 12 deg band around the seam, for offline study
+        // of near-content masks (OSV_SEAMTOOLS_DUMP set).
+        if (std::getenv("OSV_SEAMTOOLS_DUMP")) {
+            char name[96];
+            std::snprintf(name, sizeof(name), "band_f%02u_lens0", f);
+            save(outDir, name, cropWrap(s0.value(), 0, PW, 140));
+            std::snprintf(name, sizeof(name), "band_f%02u_lens1", f);
+            save(outDir, name, cropWrap(s1.value(), 0, PW, 140));
+        }
+        std::printf("         %-12s  ghost(band)  edge(band)   ghost(wing)  edge(wing)  hf-ghost(band) hf-ghost(wing)\n",
+                    "setting");
+        for (const Config& c : configs) {
+            const bool widths = c.tools.seamBlendDeg != render::kDefaultSeamBlendDeg ||
+                                c.tools.parallaxBlendDeg != render::kDefaultParallaxBlendDeg;
+            Result<render::BlendSeam> seam = widths ? carveWith(c.tools) : Result<render::BlendSeam>(base.value());
+            if (!seam.ok()) {
+                std::printf("         %-12s  carve failed\n", c.name);
+                continue;
+            }
+            auto b = renderPolar(renderer, clip, pair.value(), cp,
+                                 Blend{gridPtr, &seam.value(), -1, c.tools.smoothingDeg}, PW, PH);
+            if (!b.ok()) {
+                std::printf("         %-12s  render failed: %s\n", c.name, b.error().message.c_str());
+                continue;
+            }
+            const Metrics band = measure(b.value(), s0.value(), s1.value(), 8.0, -1, -1);
+            const Metrics wing = measure(b.value(), s0.value(), s1.value(), 8.0, wingX0, wingX1);
+            std::printf("         %-12s  %11.3f  %10.3f   %11.3f  %10.3f  %14.3f %14.3f\n", c.name, band.ghost,
+                        band.seamEdge, wing.ghost, wing.seamEdge, band.hfGhost, wing.hfGhost);
+            char name[96];
+            std::string tag = c.name;
+            std::replace(tag.begin(), tag.end(), ' ', '_');
+            std::replace(tag.begin(), tag.end(), '.', 'p');
+            std::snprintf(name, sizeof(name), "wing_f%02u_%s", f, tag.c_str());
+            save(outDir, name, cropWrap(b.value(), wingX0, wingX1, 240));
+            geom::VirtualCamera cam;
+            cam.w = 1600;
+            cam.h = 900;
+            cam.hfovDeg = 50;
+            cam.yawDeg = viewYaw;
+            cam.pitchDeg = viewPitch;
+            auto v = renderView(renderer, clip, pair.value(), cp, Blend{gridPtr, &seam.value(), -1, c.tools.smoothingDeg},
+                                cam);
+            if (v.ok()) {
+                std::snprintf(name, sizeof(name), "view_f%02u_%s", f, tag.c_str());
+                save(outDir, name, v.value());
+            }
+        }
+
+        // ---- the Near / Far Offset scans ---------------------------------------------
+        // The two lenses and the blend all rendered through the offset grid, so
+        // the mismatch is how far apart the lenses are as the kernel shows them.
+        // The nacelle itself: the polar columns and rows where the engine
+        // nacelle, its spinner and the propeller cross the seam on the sample
+        // (inside the +/- 2.6 deg the selfie-stick mount leaves co-visible).
+        const int nacX0 = (wingX0 + 180) % PW;
+        const int nacX1 = (wingX0 + 560) % PW;
+        const int nacY0 = PH / 2 - 25;
+        const int nacY1 = PH / 2 + 25;
+        const auto scan = [&](bool nearScan, double lo, double hi, double step, int x0, int x1) {
+            double best = 0.0;
+            double bestMismatch = 1e30;
+            double bestNcc = -2.0;
+            double bestNccOffset = 0.0;
+            std::printf("         %s offset scan (%s):  offset  mismatch   ghost    edge   ncc(nacelle)\n",
+                        nearScan ? "near" : "far", x0 < 0 ? "band" : "wing");
+            for (double o = lo; o <= hi + 1e-9; o += step) {
+                auto g = render::seamOffsetGrid(gridPtr, base.value(), nearScan ? o : 0.0, nearScan ? 0.0 : o);
+                if (!g.ok()) {
+                    continue;
+                }
+                auto a0 = renderPolar(renderer, clip, pair.value(), cp, Blend{&g.value(), nullptr, 0}, PW, PH);
+                auto a1 = renderPolar(renderer, clip, pair.value(), cp, Blend{&g.value(), nullptr, 1}, PW, PH);
+                auto bb = renderPolar(renderer, clip, pair.value(), cp, Blend{&g.value(), &base.value(), -1}, PW, PH);
+                if (!a0.ok() || !a1.ok() || !bb.ok()) {
+                    continue;
+                }
+                const Metrics m = measure(bb.value(), a0.value(), a1.value(), 8.0, x0, x1);
+                const double ncc = lensNcc(a0.value(), a1.value(), nacX0, nacX1, nacY0, nacY1);
+                std::printf("                                  %+6.2f  %8.3f  %6.3f  %6.3f   %6.3f\n", o, m.mismatch,
+                            m.ghost, m.seamEdge, ncc);
+                if (m.mismatch < bestMismatch) {
+                    bestMismatch = m.mismatch;
+                    best = o;
+                }
+                if (ncc > bestNcc) {
+                    bestNcc = ncc;
+                    bestNccOffset = o;
+                }
+            }
+            std::printf("         -> best %s offset %+.2f deg by mismatch (%.3f), %+.2f deg by nacelle NCC (%.3f)\n",
+                        nearScan ? "near" : "far", best, bestMismatch, bestNccOffset, bestNcc);
+            return nearScan ? bestNccOffset : best;
+        };
+        const double bestNear = scan(true, -3.0, 3.0, 0.25, wingX0, wingX1);
+        scan(false, -1.0, 3.0, 0.25, -1, -1);
+        // The best near offset's crops, for eyeballing.
+        auto g = render::seamOffsetGrid(gridPtr, base.value(), bestNear, 0.0);
+        if (g.ok()) {
+            auto b = renderPolar(renderer, clip, pair.value(), cp, Blend{&g.value(), &base.value(), -1}, PW, PH);
+            char name[96];
+            if (b.ok()) {
+                std::snprintf(name, sizeof(name), "wing_f%02u_near_best", f);
+                save(outDir, name, cropWrap(b.value(), wingX0, wingX1, 240));
+            }
+        }
+    }
+
+#if defined(OSV_HAVE_CUDA)
+    // ---- the cost of the smoothing -------------------------------------------------
+    std::printf("\nseam smoothing cost (CUDA, NVDEC frames in VRAM, launch + sync, median of 30; the low band is\n"
+                "built inside each render, as on the importer's GPU path and the direct path's engine)\n");
+    video::DecoderOptions devOpt;
+    devOpt.hw = video::HwAccel::Cuda;
+    devOpt.keepOnDevice = true;
+    auto devReader = video::DualStreamReader::open(clipPath, clip.format, devOpt);
+    auto cuda = render::CudaRenderer::create(0);
+    const std::uint32_t f0 = frames.empty() ? 0u : frames.front();
+    if (devReader.ok() && cuda.ok() && render::installCudaAnalyses().ok()) {
+        auto devPair = devReader.value().read(f0);
+        auto hostPair = reader.read(f0);
+        if (devPair.ok() && hostPair.ok()) {
+            auto seam = render::carveSeam(clip.rig, hostPair.value(), geom::BlendParams{},
+                                          render::ParallaxWarpParams{}.band, {}, render::SeamCarveParams{}, nullptr,
+                                          pool);
+            const auto timeWith = [&](const char* what, double smoothing, bool equirect) {
+                render::RenderParamsBuilder b =
+                    makeBuilder(clip, cp, Blend{nullptr, seam.ok() ? &seam.value() : nullptr, -1, smoothing});
+                if (equirect) {
+                    geom::EquirectMap map;
+                    map.w = 6000;
+                    map.h = 3000;
+                    b.equirect(map);
+                } else {
+                    geom::VirtualCamera cam;
+                    cam.w = 2560;
+                    cam.h = 1440;
+                    cam.hfovDeg = 90;
+                    cam.yawDeg = 90;  // the seam runs vertically through the middle
+                    b.camera(cam);
+                }
+                auto job = b.build(devPair.value());
+                if (!job.ok()) {
+                    std::printf("  %-40s build failed\n", what);
+                    return;
+                }
+                const double ms = medianMs(30, [&]() {
+                    std::size_t pitch = 0;
+                    return cuda.value()->renderToDevice(job.value(), &pitch).ok();
+                });
+                std::printf("  %-40s %8.3f ms\n", what, ms);
+            };
+            timeWith("2560x1440 view, carved seam", 0.0, false);
+            timeWith("2560x1440 view, carved + smoothing 2 deg", 2.0, false);
+            timeWith("2560x1440 view, carved + smoothing 8 deg", 8.0, false);
+            timeWith("6000x3000 equirect, carved seam", 0.0, true);
+            timeWith("6000x3000 equirect, carved + smoothing 2 deg", 2.0, true);
+            timeWith("6000x3000 equirect, carved + smoothing 8 deg", 8.0, true);
+
+            // The host build of the low band alone (host frames, the pool).
+            render::RenderParamsBuilder hb =
+                makeBuilder(clip, cp, Blend{nullptr, seam.ok() ? &seam.value() : nullptr, -1, 8.0});
+            geom::EquirectMap map;
+            map.w = 2048;
+            map.h = 1024;
+            hb.equirect(map);
+            auto hostJob = hb.build(hostPair.value());
+            if (hostJob.ok()) {
+                std::vector<float> low;
+                std::vector<float> scratch;
+                const OsvPlane planes[2] = {hostJob.value().planes[0], hostJob.value().planes[1]};
+                const double ms = medianMs(9, [&]() {
+                    return render::buildSeamLowBand(hostJob.value().params, planes, low, scratch, &pool).ok();
+                });
+                std::printf("  %-40s %8.3f ms (radius %d taps, %d x %d x 2 texels)\n", "host low band build, 8 deg",
+                            ms, hostJob.value().params.seamLowRadius, hostJob.value().params.seamLowW,
+                            hostJob.value().params.seamLowH);
+            }
+        }
+    } else {
+        std::printf("  (NVDEC / CUDA unavailable)\n");
+    }
+#else
+    (void)clipPath;
+#endif
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -363,6 +748,7 @@ int main(int argc, char** argv) {
     double viewYaw = -90.0;  // looks at the wing tip on the sample clip
     double viewPitch = -72.0;
     bool quick = false;             // quality section only, no crops
+    bool tools = false;             // [WP-SEAMTOOLS] the seam tools' scan instead of the carve comparison
     std::vector<std::string> sets;  // --set key=value overrides of the carve
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
@@ -382,6 +768,8 @@ int main(int argc, char** argv) {
             viewPitch = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--quick") == 0) {
             quick = true;
+        } else if (std::strcmp(argv[i], "--tools") == 0) {
+            tools = true;  // [WP-SEAMTOOLS]
         } else if (std::strcmp(argv[i], "--set") == 0 && i + 1 < argc) {
             sets.push_back(argv[++i]);
         } else {
@@ -431,6 +819,11 @@ int main(int argc, char** argv) {
         std::printf("set %s\n", kv.c_str());
     }
     const render::BlendSeam fixed = fixedSeam(carveParams);
+    // [WP-SEAMTOOLS] --tools replaces the carve comparison with the tools' scan.
+    if (tools) {
+        return runSeamTools(clip.value(), *renderer, reader.value(), clipPath, frames, outDir, pool, cp, viewYaw,
+                            viewPitch);
+    }
 
     // Polar map for the metrics and the wing crops.
     const int PW = 4096;

@@ -89,6 +89,12 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
     p.photoSeam = static_cast<std::uint8_t>(PrefsPhotoSeam::RimOnly);
     p.setPhotoStrengthPercent(37.0);
     p.setSeamInsetDeg(4.3);
+    // [WP-SEAMTOOLS] the carved seam's tweaks
+    p.setSeamBlendDeg(3.25);
+    p.setParallaxBlendDeg(0.8);
+    p.setSeamSmoothingDeg(2.5);
+    p.setNearOffsetDeg(1.37);
+    p.setFarOffsetDeg(-0.42);
     p.parallax = static_cast<std::uint8_t>(PrefsParallax::Off);
     p.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Classical);
     p.dlogmFit = static_cast<std::uint8_t>(PrefsDlogmFit::Pocket3);
@@ -217,7 +223,8 @@ TEST_CASE("the defaults file covers every byte of the blob that holds a setting"
     // appended to PrefsBlob without a row in UserDefaults.cpp's table fails
     // here, instead of silently never becoming a default.
     std::set<std::size_t> padding = {offsetof(PrefsBlob, padAfterCalibration), offsetof(PrefsBlob, padAfterLook),
-                                     offsetof(PrefsBlob, padAfterFlare)};
+                                     offsetof(PrefsBlob, padAfterFlare),
+                                     offsetof(PrefsBlob, seamToolsPad)};  // [WP-SEAMTOOLS]
     for (std::size_t i = 0; i < sizeof(PrefsBlob::padBeforeFlare); ++i) {
         padding.insert(offsetof(PrefsBlob, padBeforeFlare) + i);
     }
@@ -267,6 +274,11 @@ TEST_CASE("the written file is the documented, human-readable format", "[userdef
     CHECK(text.find("\"skySeamFix\": \"rim-only\"") != std::string::npos);
     CHECK(text.find("\"skySeamStrengthPercent\": 37") != std::string::npos);
     CHECK(text.find("\"seamEdgeInsetDeg\": 4.3") != std::string::npos);
+    CHECK(text.find("\"seamBlendDeg\": 3.25") != std::string::npos);  // [WP-SEAMTOOLS]
+    CHECK(text.find("\"parallaxBlendDeg\": 0.8") != std::string::npos);
+    CHECK(text.find("\"seamSmoothingDeg\": 2.5") != std::string::npos);
+    CHECK(text.find("\"nearOffsetDeg\": 1.37") != std::string::npos);
+    CHECK(text.find("\"farOffsetDeg\": -0.42") != std::string::npos);
     CHECK(text.find("\"exposureStops\": -1.7") != std::string::npos);
     CHECK(text.find("\"programMonitorColour\": \"match-source\"") != std::string::npos);
     // Plain ASCII text ending with a newline.

@@ -19,6 +19,7 @@
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"
 #include "osv/render/SeamCarve.h"
+#include "osv/render/SeamTools.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
 
@@ -75,6 +76,10 @@ struct RenderOptions {
     std::string photo = "off";     ///< off | rim | full
     double photoStrength = 1.0;    ///< 0..1, the gain field only
     double photoDecay = 20.0;      ///< degrees beyond the overlap
+    // [WP-SEAMTOOLS] The carved seam's tweaks (--seam-carve), exactly the
+    // Source Settings controls of the same names; defaults = the seam as is.
+    osv::render::SeamTools seamTools;
+    double seamLowSigma = -1.0;    ///< Research: low-band blur sigma, degrees (< 0 = the default).
     int seamInterval = 1;
     std::string out;
     std::string ffmpeg;
@@ -192,6 +197,22 @@ void applyUserDefaults(RenderOptions& o, const CLI::App& sub) {
     }
     if (!given("--blend-fov")) {
         o.seamInsetDeg = p.seamInsetDeg();
+    }
+    // [WP-SEAMTOOLS] the carved seam's tweaks (they act with --seam-carve).
+    if (!given("--seam-blend")) {
+        o.seamTools.seamBlendDeg = p.seamBlendDeg();
+    }
+    if (!given("--parallax-blend")) {
+        o.seamTools.parallaxBlendDeg = p.parallaxBlendDeg();
+    }
+    if (!given("--seam-smoothing")) {
+        o.seamTools.smoothingDeg = p.seamSmoothingDeg();
+    }
+    if (!given("--near-offset")) {
+        o.seamTools.nearOffsetDeg = p.nearOffsetDeg();
+    }
+    if (!given("--far-offset")) {
+        o.seamTools.farOffsetDeg = p.farOffsetDeg();
     }
 
     // ---- the equirect size -------------------------------------------------------
@@ -533,6 +554,20 @@ int runRender(const RenderOptions& o) {
     }
     photoParams.strength = o.photoStrength;
     photoParams.decayDeg = o.photoDecay;
+    // [WP-SEAMTOOLS] The ranges the Source Settings sliders offer.
+    const render::SeamTools& tools = o.seamTools;
+    const auto inRange = [](double v, double lo, double hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+    if (!inRange(tools.seamBlendDeg, render::kMinSeamBlendDeg, render::kMaxSeamBlendDeg) ||
+        !inRange(tools.parallaxBlendDeg, 0.0, render::kMaxParallaxBlendDeg) ||
+        !inRange(tools.smoothingDeg, 0.0, render::kMaxSeamSmoothingDeg) ||
+        !inRange(tools.nearOffsetDeg, -render::kMaxSeamOffsetDeg, render::kMaxSeamOffsetDeg) ||
+        !inRange(tools.farOffsetDeg, -render::kMaxSeamOffsetDeg, render::kMaxSeamOffsetDeg)) {
+        std::fprintf(stderr, "error: --seam-blend 0.2..8, --parallax-blend 0..4, --seam-smoothing 0..8 and "
+                             "--near-offset / --far-offset -3..3 degrees\n");
+        return kExitUsage;
+    }
+    render::SeamCarveParams carveParams;
+    render::applySeamBlendWidths(tools, carveParams);
     render::PhotoSeamHistory photoHistory;
     Vec3d globalGain[2] = {Vec3d{1, 1, 1}, Vec3d{1, 1, 1}};
     bool haveBlendSeam = false;
@@ -641,8 +676,7 @@ int runRender(const RenderOptions& o) {
                 correction.seamShiftDeg = &seamTable;
             }
             auto carved = render::carveSeam(P.rig, pair.value(), P.blendParams, render::ParallaxWarpParams{}.band,
-                                            correction, render::SeamCarveParams{}, haveBlendSeam ? &blendSeam : nullptr,
-                                            *P.pool);
+                                            correction, carveParams, haveBlendSeam ? &blendSeam : nullptr, *P.pool);
             if (carved.ok()) {
                 blendSeam = std::move(carved).value();
                 haveBlendSeam = true;
@@ -688,8 +722,26 @@ int runRender(const RenderOptions& o) {
         }
         if (o.seamCarve && haveBlendSeam) {
             render::applyBlendSeam(builder, blendSeam);
+            // [WP-SEAMTOOLS] Near / Far Offset into the warp grid in force,
+            // Seam Smoothing on the seam - both no-ops at their defaults.
+            if (tools.offsetOn()) {
+                auto shifted = render::seamOffsetGrid(useWarp ? &warpGrid : nullptr, blendSeam, tools.nearOffsetDeg,
+                                                      tools.farOffsetDeg);
+                if (shifted.ok()) {
+                    const render::ParallaxWarpGrid& g = shifted.value();
+                    builder.warp(g.uv, g.w, g.h, g.latMinRad, g.latMaxRad);
+                } else {
+                    log::warn("frame {}: seam offset refused ({})", f, log::safe(shifted.error().message));
+                }
+            }
+            if (tools.smoothingOn()) {
+                builder.seamSmooth(tools.smoothingDeg, o.seamLowSigma);
+            } else {
+                builder.clearSeamSmooth();
+            }
         } else {
             builder.clearBlendSeam();
+            builder.clearSeamSmooth();  // [WP-SEAMTOOLS]
         }
         builder.stabilization(P.stabilizationFor(f));
 
@@ -785,6 +837,25 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
         ->default_val(1.0);
     outGeom->add_option("--photo-decay", opt->photoDecay, "Gain-field decay beyond the overlap, degrees")
         ->default_val(20.0);
+    // [WP-SEAMTOOLS] The Source Settings seam tools (with --seam-carve).
+    outGeom->add_option("--seam-blend", opt->seamTools.seamBlendDeg,
+                        "Seam Blend: carved-seam feather where the lenses agree, degrees 0.2..8")
+        ->default_val(osv::render::kDefaultSeamBlendDeg);
+    outGeom->add_option("--parallax-blend", opt->seamTools.parallaxBlendDeg,
+                        "Parallax Blend: feather where they disagree, degrees 0..4 (0 = hard cut)")
+        ->default_val(osv::render::kDefaultParallaxBlendDeg);
+    outGeom->add_option("--seam-smoothing", opt->seamTools.smoothingDeg,
+                        "Seam Smoothing: two-band blend half width, degrees 0..8 (0 = off)")
+        ->default_val(0.0);
+    outGeom->add_option("--near-offset", opt->seamTools.nearOffsetDeg,
+                        "Near Offset: shift along the seam where the lenses disagree, degrees -3..3")
+        ->default_val(0.0);
+    outGeom->add_option("--far-offset", opt->seamTools.farOffsetDeg,
+                        "Far Offset: shift along the seam where they agree, degrees -3..3")
+        ->default_val(0.0);
+    outGeom->add_option("--seam-low-sigma", opt->seamLowSigma,
+                        "Seam Smoothing low-band blur sigma, degrees (research; default: a third of the width)")
+        ->default_val(-1.0);
     outGeom->add_option("--seam-interval", opt->seamInterval, "Re-run the analyses every N frames")->default_val(1);
     outGeom->add_option("--out", opt->out, "Output: image (.png/.tif/.exr, %05d pattern) or .mp4")->required();
     outGeom->add_option("--ffmpeg", opt->ffmpeg, "ffmpeg executable for .mp4 output");

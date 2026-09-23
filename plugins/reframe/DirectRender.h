@@ -126,6 +126,13 @@ struct StitchState {
     /// or nullptr when `equirect.photoEnabled` is 0.  Device or host pointer
     /// by the same rule as `seamTable`; never dereferenced here.
     const float* photoField = nullptr;
+
+    /// [WP-SEAMTOOLS] The seam smoothing's two-lens low band (2 x
+    /// `equirect.seamLowW` x `equirect.seamLowH` RGBA texels, see
+    /// osv_kernel.h), or nullptr when `equirect.seamSmoothEnabled` is 0.
+    /// Device or host pointer by the same rule as `seamTable`; never
+    /// dereferenced here.
+    const float* seamLow = nullptr;
 };
 
 // ===========================================================================
@@ -147,6 +154,7 @@ enum class DirectReject {
     Composed,      ///< The composed view block came out non-finite (defensive backstop).
     BlendSeam,     ///< [WP-SEAM] The blend seam is on but its table is missing or its shape implausible.
     PhotoField,    ///< [WP-PHOTO] The photo table is on but missing, degenerate or non-finite in its span.
+    SeamLow,       ///< [WP-SEAMTOOLS] Seam smoothing is on but its low band is missing or its fields malformed.
 };
 
 /// Human-readable name of a refusal reason, for the log line.
@@ -165,6 +173,7 @@ struct DirectSetup {
     const float* warpGrid = nullptr;    ///< Warp grid (host or device), or nullptr.
     const float* blendSeam = nullptr;   ///< [WP-SEAM] Blend-seam table (host or device), or nullptr.
     const float* photoField = nullptr;  ///< [WP-PHOTO] Photometric seam table (host or device), or nullptr.
+    const float* seamLow = nullptr;     ///< [WP-SEAMTOOLS] Seam smoothing low band (host or device), or nullptr.
     bool valid = false;                 ///< False when any input was unusable.
     DirectReject reject = DirectReject::View;  ///< `None` exactly when `valid`.
     /// The camera's own refusal reason when `reject == DirectReject::View`;
@@ -215,7 +224,7 @@ struct DirectSetup {
 //  The CPU twin
 // ===========================================================================
 
-/// One pixel of the direct render on the CPU: osvShadePixelWSP() in
+/// One pixel of the direct render on the CPU: osvShadePixelWSPL() in
 /// OSV_MODE_REFRAME, with no layout conversion.  `planes` must be HOST
 /// descriptors (and the setup's seam/warp pointers host pointers).  Writes
 /// transparent black and returns false for an invalid setup, unusable planes

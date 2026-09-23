@@ -3,6 +3,9 @@
 
 #include "osv/render/CpuRenderer.h"
 #include "osv/core/Log.h"
+#include "osv/render/SeamTools.h"
+
+#include <vector>
 
 namespace osv::render {
 
@@ -42,6 +45,17 @@ Status CpuRenderer::renderInto(const RenderJob& job, ImageRGBAf& image) {
     const float* blendSeam = (params.blendSeamEnabled && !job.blendSeam.empty()) ? job.blendSeam.data() : nullptr;
     // [WP-PHOTO] The photometric seam table, size-checked by job.valid().
     const float* photo = (params.photoEnabled && !job.photoField.empty()) ? job.photoField.data() : nullptr;
+    // [WP-SEAMTOOLS] The seam smoothing's low band, built here from the host
+    // planes (three passes over a 375 x 375 x 2 table on the pool).  Only
+    // with a carved seam to smooth; without it the pointer stays null and
+    // the shader is exactly the one before seam smoothing existed.
+    std::vector<float> seamLowTable;
+    std::vector<float> seamLowScratch;
+    const float* seamLow = nullptr;
+    if (params.seamSmoothEnabled && blendSeam) {
+        OSV_TRY(buildSeamLowBand(params, planes, seamLowTable, seamLowScratch, &m_pool));
+        seamLow = seamLowTable.data();
+    }
     const int width = params.outW;
     float* pixels = image.data.data();
 
@@ -51,8 +65,8 @@ Status CpuRenderer::renderInto(const RenderJob& job, ImageRGBAf& image) {
                                        for (std::size_t y = rowBegin; y < rowEnd; ++y) {
                                            float* row = pixels + y * static_cast<std::size_t>(width) * 4u;
                                            for (int x = 0; x < width; ++x) {
-                                               osvShadePixelWSP(&params, planes, seam, warp, blendSeam, photo,
-                                                                x, static_cast<int>(y), row + x * 4);
+                                               osvShadePixelWSPL(&params, planes, seam, warp, blendSeam, photo,
+                                                                 seamLow, x, static_cast<int>(y), row + x * 4);
                                            }
                                        }
                                    });

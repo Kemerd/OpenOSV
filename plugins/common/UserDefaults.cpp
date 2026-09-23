@@ -253,6 +253,32 @@ static_assert(std::size(kDirectTokens) == static_cast<std::size_t>(PrefsDirectCo
     return Json(asDouble);
 }
 
+// [WP-SEAMTOOLS] The seam tools' ranges, in degrees: exactly what the blob's
+// codes store (PrefsBlob.h), and so what the Source Settings sliders offer.
+constexpr double kSeamBlendMinDeg =
+    static_cast<double>(PrefsBlob::kMinSeamBlendCode - 1) / PrefsBlob::kSeamToolStepsPerDeg;
+constexpr double kSeamBlendMaxDeg =
+    static_cast<double>(PrefsBlob::kMaxSeamBlendCode - 1) / PrefsBlob::kSeamToolStepsPerDeg;
+constexpr double kParallaxBlendMaxDeg =
+    static_cast<double>(PrefsBlob::kMaxParallaxBlendCode - 1) / PrefsBlob::kSeamToolStepsPerDeg;
+constexpr double kSeamSmoothingMaxDeg =
+    static_cast<double>(PrefsBlob::kMaxSeamSmoothingCode - 1) / PrefsBlob::kSeamToolStepsPerDeg;
+constexpr double kSeamOffsetMaxDeg = static_cast<double>(PrefsBlob::kMaxSeamOffsetHundredths) / 100.0;
+
+/// [WP-SEAMTOOLS] Read a seam tool's degrees, brought into [lo, hi] (and
+/// `clamped` set when that moved it); false with the reason for anything
+/// that is not a finite number.
+[[nodiscard]] bool seamToolDegrees(const Json& value, double lo, double hi, double& out, std::string& why,
+                                   bool& clamped) {
+    double deg = 0.0;
+    if (!numberFrom(value, deg, why)) {
+        return false;
+    }
+    clamped = deg < lo || deg > hi;
+    out = std::clamp(deg, lo, hi);
+    return true;
+}
+
 // ===========================================================================
 //  The field table
 // ===========================================================================
@@ -366,6 +392,59 @@ const FieldSpec kFields[] = {
          const double maxDeg = static_cast<double>(PrefsBlob::kMaxSeamInsetCode - 1) / 10.0;
          clamped = deg < 0.0 || deg > maxDeg;
          p.setSeamInsetDeg(std::clamp(deg, 0.0, maxDeg));
+         return true;
+     }},
+    // [WP-SEAMTOOLS] The carved seam's tweaks, degrees, each through the
+    // blob's own setter (which rounds to its stored step) after the range
+    // the panel's slider offers.
+    {{"seamBlendDeg", OSV_UD_FIELD(seamBlend), 0, 0},
+     [](const PrefsBlob& p) { return Json(p.seamBlendDeg()); },
+     [](const Json& v, PrefsBlob& p, std::string& why, bool& clamped) {
+         double deg = 0.0;
+         if (!seamToolDegrees(v, kSeamBlendMinDeg, kSeamBlendMaxDeg, deg, why, clamped)) {
+             return false;
+         }
+         p.setSeamBlendDeg(deg);
+         return true;
+     }},
+    {{"parallaxBlendDeg", OSV_UD_FIELD(parallaxBlend), 0, 0},
+     [](const PrefsBlob& p) { return Json(p.parallaxBlendDeg()); },
+     [](const Json& v, PrefsBlob& p, std::string& why, bool& clamped) {
+         double deg = 0.0;
+         if (!seamToolDegrees(v, 0.0, kParallaxBlendMaxDeg, deg, why, clamped)) {
+             return false;
+         }
+         p.setParallaxBlendDeg(deg);
+         return true;
+     }},
+    {{"seamSmoothingDeg", OSV_UD_FIELD(seamSmoothing), 0, 0},
+     [](const PrefsBlob& p) { return Json(p.seamSmoothingDeg()); },
+     [](const Json& v, PrefsBlob& p, std::string& why, bool& clamped) {
+         double deg = 0.0;
+         if (!seamToolDegrees(v, 0.0, kSeamSmoothingMaxDeg, deg, why, clamped)) {
+             return false;
+         }
+         p.setSeamSmoothingDeg(deg);
+         return true;
+     }},
+    {{"nearOffsetDeg", OSV_UD_FIELD(nearOffset), 0, 0},
+     [](const PrefsBlob& p) { return Json(p.nearOffsetDeg()); },
+     [](const Json& v, PrefsBlob& p, std::string& why, bool& clamped) {
+         double deg = 0.0;
+         if (!seamToolDegrees(v, -kSeamOffsetMaxDeg, kSeamOffsetMaxDeg, deg, why, clamped)) {
+             return false;
+         }
+         p.setNearOffsetDeg(deg);
+         return true;
+     }},
+    {{"farOffsetDeg", OSV_UD_FIELD(farOffset), 0, 0},
+     [](const PrefsBlob& p) { return Json(p.farOffsetDeg()); },
+     [](const Json& v, PrefsBlob& p, std::string& why, bool& clamped) {
+         double deg = 0.0;
+         if (!seamToolDegrees(v, -kSeamOffsetMaxDeg, kSeamOffsetMaxDeg, deg, why, clamped)) {
+             return false;
+         }
+         p.setFarOffsetDeg(deg);
          return true;
      }},
     // Not in the Source Settings effect (only the modal dialog's hidden

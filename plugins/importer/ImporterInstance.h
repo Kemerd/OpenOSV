@@ -55,6 +55,7 @@
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"
 #include "osv/render/SeamCarve.h"
+#include "osv/render/SeamTools.h"  // [WP-SEAMTOOLS]
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/video/DualStreamReader.h"
 #include "osv/video/GpuClipDecoder.h"
@@ -717,10 +718,28 @@ private:
     /// grid is still being measured) borrows a nearby bucket's seam and
     /// clears `frameExact`.  Called by applyAnalyses with m_mutex held;
     /// takes m_parallaxMutex itself.  Failures are logged and leave the frame
-    /// on the ordinary feather.
-    void applyCarvedSeam(std::uint32_t index, const video::FramePair& pair, bool wantParallax, RenderPurpose purpose,
-                         ThreadPool& pool, render::RenderParamsBuilder& builder, bool& frameExact);
+    /// on the ordinary feather.  [WP-SEAMTOOLS] Carves with the Source
+    /// Settings Seam Blend / Parallax Blend, and returns the seam it applied
+    /// (null when none) for the seam tools that follow it.
+    std::shared_ptr<const render::BlendSeam> applyCarvedSeam(std::uint32_t index, const video::FramePair& pair,
+                                                             bool wantParallax, RenderPurpose purpose,
+                                                             ThreadPool& pool, render::RenderParamsBuilder& builder,
+                                                             bool& frameExact);
     // ---- [/WP-SEAM] ----------------------------------------------------------
+
+    // ---- [WP-SEAMTOOLS] the carved seam's tweaks (SeamTools.h) ----------------
+    /// The five seam tools the current prefs ask for.
+    [[nodiscard]] render::SeamTools seamToolsLocked() const noexcept;
+
+    /// After the carve: add the Near / Far Offset to the frame's warp grid
+    /// (`grid`, the parallax grid applied, or null) along `seam`, and switch
+    /// on the Seam Smoothing - both only with a carved seam in force (`seam`
+    /// non-null), both no-ops at their defaults, so a frame with default
+    /// prefs is built exactly as before.  Failures are logged and leave the
+    /// frame without that tool.
+    void applySeamTools(std::uint32_t index, const render::BlendSeam* seam, const render::ParallaxWarpGrid* grid,
+                        render::RenderParamsBuilder& builder);
+    // ---- [/WP-SEAMTOOLS] --------------------------------------------------------
 
     // ---- [WP-FLARE] sun ghost removal (FlareStage.h) --------------------------
     /// Per-bucket ghost models, their background worker and the seam penalty.

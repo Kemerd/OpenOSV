@@ -45,6 +45,11 @@
 #include "OsvEngineAbi.h"
 #include "PluginLog.h"
 
+#include "osv/render/SeamTools.h"
+#if defined(OSV_HAVE_CUDA)
+#include "osv/render/CudaRenderer.h"
+#endif
+
 #include <cuda.h>
 
 #include <algorithm>
@@ -482,9 +487,20 @@ struct EngineLease {
     CUdeviceptr warp = 0;                    ///< Device copy of the warp grid.
     CUdeviceptr blendSeam = 0;               ///< [WP-SEAM] Device copy of the carved blend-seam table.
     CUdeviceptr photo = 0;                   ///< [WP-PHOTO] Device copy of the photometric seam table.
+    CUdeviceptr seamLow = 0;                 ///< [WP-SEAMTOOLS] The seam smoothing's low band.
+    CUdeviceptr seamLowScratch = 0;          ///< [WP-SEAMTOOLS] Its blur's middle pass (read by the build only).
 
     /// Free the device tables.  The caller has pushed `context`.
     void freeTables() noexcept {
+        // [WP-SEAMTOOLS]
+        if (seamLow) {
+            (void)cuMemFree(seamLow);
+            seamLow = 0;
+        }
+        if (seamLowScratch) {
+            (void)cuMemFree(seamLowScratch);
+            seamLowScratch = 0;
+        }
         if (seam) {
             (void)cuMemFree(seam);
             seam = 0;
@@ -528,6 +544,39 @@ struct EngineLease {
         return failStatus(ErrorCode::Gpu, cudaText("cuMemcpyHtoD", r));
     }
     return okStatus();
+}
+
+/// [WP-SEAMTOOLS] Build the seam smoothing's low band for `job` into fresh
+/// device allocations of the lease (the context is current), on `stream` -
+/// the stream the caller will render on, so its kernel reads the finished
+/// table without any synchronisation here.  The planes are the lease's
+/// pinned NVDEC frames, valid until the release has passed that stream.
+[[nodiscard]] Status buildSeamLow(const render::RenderJob& job, EngineLease& lease, void* stream) {
+#if defined(OSV_HAVE_CUDA)
+    const std::size_t bytes = render::seamLowTableFloats(job.params) * sizeof(float);
+    if (bytes == 0) {
+        return failStatus(ErrorCode::InvalidArgument, "seam low band: malformed smoothing fields");
+    }
+    CUresult r = cuMemAlloc(&lease.seamLow, bytes);
+    if (r != CUDA_SUCCESS) {
+        lease.seamLow = 0;
+        return failStatus(ErrorCode::Gpu, cudaText("cuMemAlloc (seam low band)", r));
+    }
+    r = cuMemAlloc(&lease.seamLowScratch, bytes);
+    if (r != CUDA_SUCCESS) {
+        lease.seamLowScratch = 0;
+        return failStatus(ErrorCode::Gpu, cudaText("cuMemAlloc (seam low scratch)", r));
+    }
+    return render::cudaBuildSeamLowBand(job.params, job.planes.data(),
+                                        reinterpret_cast<float*>(static_cast<std::uintptr_t>(lease.seamLow)),
+                                        reinterpret_cast<float*>(static_cast<std::uintptr_t>(lease.seamLowScratch)),
+                                        stream);
+#else
+    (void)job;
+    (void)lease;
+    (void)stream;
+    return failStatus(ErrorCode::Unsupported, "seam low band: built without CUDA");
+#endif
 }
 
 /// The live-lease count, for the log and the tests' leak checks.
@@ -889,6 +938,28 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
             return OSV_ENGINE_ERR_GPU;
         }
 
+        // [WP-SEAMTOOLS] The seam smoothing's low band, built from this
+        // frame's planes on the caller's stream.  A build that fails costs
+        // the frame its smoothing, never the frame: the block is switched
+        // back to single-band, which is exactly the render without it.
+        if (job.params.seamSmoothEnabled) {
+            const Status built = buildSeamLow(job, *lease, request->cuStream);
+            if (!built.ok()) {
+                if (lease->seamLow) {
+                    (void)cuMemFree(lease->seamLow);
+                    lease->seamLow = 0;
+                }
+                if (lease->seamLowScratch) {
+                    (void)cuMemFree(lease->seamLowScratch);
+                    lease->seamLowScratch = 0;
+                }
+                job.params.seamSmoothEnabled = 0;
+                PluginLog::oncef("direct/seam-low-failed", PluginLog::Level::Warn,
+                                 "direct: seam smoothing's low band could not be built ({}); rendering without it",
+                                 built.error().message);
+            }
+        }
+
         // ---- hand it over -----------------------------------------------------------------
         out->stitch = job.params;
         out->planes[0] = job.planes[0];
@@ -899,6 +970,8 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
         out->blendSeamDevice = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(lease->blendSeam));
         // [WP-PHOTO]
         out->photoDevice = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(lease->photo));
+        // [WP-SEAMTOOLS]
+        out->seamLowDevice = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(lease->seamLow));
         // The stitch block is an equirect block, whose Rout is exactly the
         // frame's body-from-world stabilisation.
         std::memcpy(out->bodyFromWorld, job.params.Rout, sizeof(out->bodyFromWorld));
@@ -915,10 +988,11 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
 
         PluginLog::oncef("direct/first-frame", PluginLog::Level::Info,
                          "direct: first frame served - '{}' frame {} (media {} ticks), transfer {}, seam {}, warp {}, "
-                         "blend seam {}, Source Settings generation {}",
+                         "blend seam {}, seam smoothing {}, Source Settings generation {}",
                          nameOf(path), index, static_cast<long long>(request->mediaTicks), out->stitch.color.transfer,
                          out->seamDevice ? "yes" : "no", out->warpDevice ? "yes" : "no",
-                         out->blendSeamDevice ? "yes" : "no", out->settings.generation);
+                         out->blendSeamDevice ? "yes" : "no", out->seamLowDevice ? "yes" : "no",
+                         out->settings.generation);
         return OSV_ENGINE_OK;
     } catch (const std::exception& e) {
         writeError(error, errorCapacity, std::string("internal error: ") + e.what());

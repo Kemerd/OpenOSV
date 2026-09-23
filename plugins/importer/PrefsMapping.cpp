@@ -47,8 +47,33 @@ void applyPhotoControls(const DialogControls& c, PrefsBlob& blob) noexcept {
     blob.setSeamInsetDeg(c.seamInsetDeg);
 }
 
-}  // namespace
 // ---- [/WP-PHOTO] -------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+//  [WP-SEAMTOOLS] the seam tools <-> their five rows
+// ---------------------------------------------------------------------------
+
+/// Blob -> controls, through the blob's decoders (code 0 = the default).
+void seamToolControlsFromPrefs(const PrefsBlob& prefs, DialogControls& c) noexcept {
+    c.seamBlendDeg = prefs.seamBlendDeg();
+    c.parallaxBlendDeg = prefs.parallaxBlendDeg();
+    c.seamSmoothingDeg = prefs.seamSmoothingDeg();
+    c.nearOffsetDeg = prefs.nearOffsetDeg();
+    c.farOffsetDeg = prefs.farOffsetDeg();
+}
+
+/// Controls -> blob, through the blob's setters: rounded to their steps,
+/// clamped to their ranges, the default stored as code 0, NaN as the default.
+void applySeamToolControls(const DialogControls& c, PrefsBlob& blob) noexcept {
+    blob.setSeamBlendDeg(c.seamBlendDeg);
+    blob.setParallaxBlendDeg(c.parallaxBlendDeg);
+    blob.setSeamSmoothingDeg(c.seamSmoothingDeg);
+    blob.setNearOffsetDeg(c.nearOffsetDeg);
+    blob.setFarOffsetDeg(c.farOffsetDeg);
+}
+
+}  // namespace
+// ---- [/WP-SEAMTOOLS] ---------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 //  PrefsBlob -> controls
@@ -72,6 +97,7 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.look = static_cast<int>(prefs.look);  // [WP-LOOK]
     c.flareRemoval = prefs.flareRemoval != 0;  // [WP-FLARE]
     photoControlsFromPrefs(prefs, c);  // [WP-PHOTO]
+    seamToolControlsFromPrefs(prefs, c);  // [WP-SEAMTOOLS]
     return c;
 }
 
@@ -130,6 +156,7 @@ PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& bas
     // by sanitise() to the documented +/- 6 stops.
     blob.exposureStops = std::isfinite(controls.exposureStops) ? static_cast<float>(controls.exposureStops) : 0.0f;
     applyPhotoControls(controls, blob);  // [WP-PHOTO]
+    applySeamToolControls(controls, blob);  // [WP-SEAMTOOLS]
 
     blob.sanitise();
     return blob;

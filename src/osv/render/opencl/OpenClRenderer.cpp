@@ -6,6 +6,7 @@
 
 #include "osv/render/OpenClRenderer.h"
 #include "osv/core/Log.h"
+#include "osv/render/SeamTools.h"
 
 #include <CL/cl.h>
 
@@ -121,13 +122,21 @@ struct OpenClRenderer::Impl {
     cl_command_queue queue = nullptr;
     cl_program program = nullptr;
     cl_kernel kernel = nullptr;
+    cl_kernel lowDecimate = nullptr;  // [WP-SEAMTOOLS] seam low band, stage 1
+    cl_kernel lowBlur = nullptr;      // [WP-SEAMTOOLS] seam low band, stages 2 and 3
     std::string buildLog;
     ClBuffer y[2], u[2], v[2];
     ClBuffer seam;
     ClBuffer warp;
     ClBuffer blendSeam;  // [WP-SEAM] carved blend-seam table
     ClBuffer photo;      // [WP-PHOTO] photometric seam table
+    ClBuffer seamLow;         // [WP-SEAMTOOLS] seam smoothing low band
+    ClBuffer seamLowScratch;  // [WP-SEAMTOOLS] its blur's middle pass
     ClBuffer out;
+    /// The device-side plane descriptors of the last upload, per lens (the
+    /// eight integers and the Cr buffer every plane-reading kernel takes).
+    int planeInts[2][8] = {};
+    cl_mem planeV[2] = {nullptr, nullptr};
     std::mutex mutex;
 
     ~Impl() {
@@ -143,7 +152,15 @@ struct OpenClRenderer::Impl {
         warp.release();
         blendSeam.release();
         photo.release();
+        seamLow.release();
+        seamLowScratch.release();
         out.release();
+        if (lowDecimate) {
+            clReleaseKernel(lowDecimate);
+        }
+        if (lowBlur) {
+            clReleaseKernel(lowBlur);
+        }
         if (kernel) {
             clReleaseKernel(kernel);
         }
@@ -188,6 +205,71 @@ struct OpenClRenderer::Impl {
         if (err != CL_SUCCESS || !kernel) {
             return failStatus(ErrorCode::Gpu, clMessage("clCreateKernel", err));
         }
+        // [WP-SEAMTOOLS] The seam low band's two build kernels.
+        lowDecimate = clCreateKernel(program, "osvSeamLowDecimate", &err);
+        if (err != CL_SUCCESS || !lowDecimate) {
+            return failStatus(ErrorCode::Gpu, clMessage("clCreateKernel (seam low decimate)", err));
+        }
+        lowBlur = clCreateKernel(program, "osvSeamLowBlur", &err);
+        if (err != CL_SUCCESS || !lowBlur) {
+            return failStatus(ErrorCode::Gpu, clMessage("clCreateKernel (seam low blur)", err));
+        }
+        return okStatus();
+    }
+
+    /// Bind lens `lens`'s uploaded plane buffers and descriptor integers as
+    /// the next eleven arguments of `k` (y, u, v, then the eight integers) -
+    /// the layout every plane-reading kernel in kernel.cl takes.
+    Status bindPlane(cl_kernel k, int lens, cl_uint& argIndex) {
+        cl_int err = clSetKernelArg(k, argIndex++, sizeof(cl_mem), &y[lens].mem);
+        err |= clSetKernelArg(k, argIndex++, sizeof(cl_mem), &u[lens].mem);
+        err |= clSetKernelArg(k, argIndex++, sizeof(cl_mem), &planeV[lens]);
+        for (int i = 0; i < 8; ++i) {
+            err |= clSetKernelArg(k, argIndex++, sizeof(int), &planeInts[lens][i]);
+        }
+        if (err != CL_SUCCESS) {
+            return failStatus(ErrorCode::Gpu, clMessage("clSetKernelArg (plane)", err));
+        }
+        return okStatus();
+    }
+
+    /// [WP-SEAMTOOLS] Build the seam low band on the device from the planes
+    /// just uploaded: decimate into seamLow, blur along x into the scratch
+    /// buffer, along y back into seamLow - three launches on the in-order
+    /// queue, so the stitch launched after them reads the finished table.
+    Status buildSeamLow(const OsvRenderParams& params, std::size_t floats) {
+        const std::size_t bytes = floats * sizeof(float);
+        OSV_TRY(seamLowScratch.ensure(context, bytes, CL_MEM_READ_WRITE));
+        const size_t local[3] = {16, 16, 1};
+        const size_t global[3] = {(static_cast<size_t>(params.seamLowW) + 15) / 16 * 16,
+                                  (static_cast<size_t>(params.seamLowH) + 15) / 16 * 16, 2};
+        // ---- stage 1: decimate ------------------------------------------------
+        cl_uint arg = 0;
+        cl_int err = clSetKernelArg(lowDecimate, arg++, sizeof(OsvRenderParams), &params);
+        if (err != CL_SUCCESS) {
+            return failStatus(ErrorCode::Gpu, clMessage("clSetKernelArg (seam low params)", err));
+        }
+        OSV_TRY(bindPlane(lowDecimate, 0, arg));
+        OSV_TRY(bindPlane(lowDecimate, 1, arg));
+        err = clSetKernelArg(lowDecimate, arg++, sizeof(cl_mem), &seamLow.mem);
+        err |= clEnqueueNDRangeKernel(queue, lowDecimate, 3, nullptr, global, local, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            return failStatus(ErrorCode::Gpu, clMessage("seam low decimate", err));
+        }
+        // ---- stages 2 and 3: the separable blur --------------------------------
+        const auto blurPass = [&](cl_mem src, cl_mem dst, int horizontal) -> Status {
+            cl_int e = clSetKernelArg(lowBlur, 0, sizeof(OsvRenderParams), &params);
+            e |= clSetKernelArg(lowBlur, 1, sizeof(cl_mem), &src);
+            e |= clSetKernelArg(lowBlur, 2, sizeof(cl_mem), &dst);
+            e |= clSetKernelArg(lowBlur, 3, sizeof(int), &horizontal);
+            e |= clEnqueueNDRangeKernel(queue, lowBlur, 3, nullptr, global, local, 0, nullptr, nullptr);
+            if (e != CL_SUCCESS) {
+                return failStatus(ErrorCode::Gpu, clMessage("seam low blur", e));
+            }
+            return okStatus();
+        };
+        OSV_TRY(blurPass(seamLow.mem, seamLowScratch.mem, 1));
+        OSV_TRY(blurPass(seamLowScratch.mem, seamLow.mem, 0));
         return okStatus();
     }
 
@@ -244,19 +326,15 @@ struct OpenClRenderer::Impl {
         // kernel adds +1 through OsvPlane::v == u + 1 ... except that OpenCL
         // buffers cannot be offset by pointer arithmetic on the host, so we
         // pass the same buffer and set v = u + 1 inside the kernel wrapper.
-        cl_mem vMem = host.chromaInterleaved ? u[lens].mem : v[lens].mem;
+        // Recorded per lens so every plane-reading kernel (the stitch and, with
+        // [WP-SEAMTOOLS], the seam low band's decimation) binds the same.
+        planeV[lens] = host.chromaInterleaved ? u[lens].mem : v[lens].mem;
         const int ints[8] = {host.w, host.h, host.cw, host.ch, strideY, strideC, host.bitShift,
                              host.chromaInterleaved};
-        err = clSetKernelArg(kernel, argIndex++, sizeof(cl_mem), &y[lens].mem);
-        err |= clSetKernelArg(kernel, argIndex++, sizeof(cl_mem), &u[lens].mem);
-        err |= clSetKernelArg(kernel, argIndex++, sizeof(cl_mem), &vMem);
         for (int k = 0; k < 8; ++k) {
-            err |= clSetKernelArg(kernel, argIndex++, sizeof(int), &ints[k]);
+            planeInts[lens][k] = ints[k];
         }
-        if (err != CL_SUCCESS) {
-            return failStatus(ErrorCode::Gpu, clMessage("clSetKernelArg (plane)", err));
-        }
-        return okStatus();
+        return bindPlane(kernel, lens, argIndex);
     }
 };
 
@@ -392,6 +470,19 @@ Result<ImageRGBAf> OpenClRenderer::render(const RenderJob& job) {
         }
     }
     err |= clSetKernelArg(impl.kernel, arg++, sizeof(cl_mem), &impl.photo.mem);
+
+    // [WP-SEAMTOOLS] The seam smoothing's low band: built on the device from
+    // the planes just uploaded when smoothing is on with a carved seam,
+    // otherwise a valid one-float buffer bound for OpenCL's sake and never
+    // read (params.seamSmoothEnabled decides).
+    const std::size_t lowFloats = (job.params.seamSmoothEnabled && job.params.blendSeamEnabled && !job.blendSeam.empty())
+                                      ? seamLowTableFloats(job.params)
+                                      : 0;
+    OSV_TRY(impl.seamLow.ensure(impl.context, std::max<std::size_t>(lowFloats, 1) * sizeof(float), CL_MEM_READ_WRITE));
+    if (lowFloats > 0) {
+        OSV_TRY(impl.buildSeamLow(job.params, lowFloats));
+    }
+    err |= clSetKernelArg(impl.kernel, arg++, sizeof(cl_mem), &impl.seamLow.mem);
 
     // Output buffer (tightly packed float4 rows).
     OSV_TRY_ASSIGN(ImageRGBAf image, ImageRGBAf::create(static_cast<std::uint32_t>(job.params.outW),

@@ -260,12 +260,15 @@ HWND addDialogChild(HWND dialog, const wchar_t* cls, const wchar_t* text, DWORD 
     return child;
 }
 
-/// Append the sky seam rows and load `c` into them.  The rows take the
-/// place of the OK / Cancel row (wherever the template puts it), and the
-/// buttons - and the window - move down by the rows' height.
-void addPhotoSeamRows(HWND dialog, const DialogControls& c) noexcept {
-    constexpr int kRowStep = 20;           // the template's row pitch, dialog units
-    constexpr int kGrow = 3 * kRowStep;    // three rows
+/// The template's row pitch, dialog units.
+constexpr int kRowStep = 20;
+
+/// Make room for `rows` appended rows where the OK / Cancel row is now
+/// (wherever the template - or an earlier call - put it): the window grows
+/// by their height and the buttons move down with it.  Returns the first
+/// row's top in dialog units.
+int growDialogForRows(HWND dialog, int rows) noexcept {
+    const int kGrow = rows * kRowStep;
     // The first row sits where the OK button is now, in dialog units (the
     // template's own layout decides; 209 is what it says today).
     int firstRow = 208;
@@ -277,7 +280,6 @@ void addPhotoSeamRows(HWND dialog, const DialogControls& c) noexcept {
         ::ScreenToClient(dialog, &okTop);
         firstRow = ::MulDiv(okTop.y, 100, unit.bottom) - 1;
     }
-    const int kFirstRow = firstRow;
     // Grow the window and move OK / Cancel down by the rows' height.
     RECT grow{0, 0, 0, kGrow};
     ::MapDialogRect(dialog, &grow);
@@ -297,6 +299,14 @@ void addPhotoSeamRows(HWND dialog, const DialogControls& c) noexcept {
                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
+    return firstRow;
+}
+
+/// Append the sky seam rows and load `c` into them.  The rows take the
+/// place of the OK / Cancel row (wherever the template puts it), and the
+/// buttons - and the window - move down by the rows' height.
+void addPhotoSeamRows(HWND dialog, const DialogControls& c) noexcept {
+    const int kFirstRow = growDialogForRows(dialog, 3);
     // Row 1: what the fix corrects.  The combo index IS the PrefsPhotoSeam
     // value, so the list is in enum order.
     addDialogChild(dialog, L"STATIC", L"Sk&y seam fix:", SS_LEFT, kIdcStaticPhotoSeam, 7, kFirstRow + 3, 70, 8);
@@ -336,6 +346,69 @@ void photoWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
     c.seamInsetDeg = getEditDouble(dialog, kIdcSeamInset, c.seamInsetDeg);
 }
 // ---- [/WP-PHOTO] -------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+//  [WP-SEAMTOOLS] the seam tool rows
+// ---------------------------------------------------------------------------
+// Five number rows appended below the sky seam rows, the same way.  Ids are
+// clear of resource.h and of the sky seam rows (1040-1042, 1140-1144).
+
+/// One row: its label and the control ids of the label, the edit box and the
+/// "deg" unit after it.
+struct SeamToolRow {
+    const wchar_t* label;
+    int editId;
+    int labelId;
+    int unitId;
+};
+
+/// The rows, in the order the Effect Controls panel lists them (Seam Blend,
+/// Parallax Blend, Seam Smoothing, Near Offset, Far Offset).
+constexpr SeamToolRow kSeamToolRows[] = {
+    {L"Seam &blend:", 1043, 1145, 1150},     {L"&Parallax blend:", 1044, 1146, 1151},
+    {L"Seam s&moothing:", 1045, 1147, 1152}, {L"&Near offset:", 1046, 1148, 1153},
+    {L"&Far offset:", 1047, 1149, 1154},
+};
+
+/// The value of row `i` in `c` (the same order as kSeamToolRows).
+double* seamToolValue(DialogControls& c, std::size_t i) noexcept {
+    switch (i) {
+    case 0: return &c.seamBlendDeg;
+    case 1: return &c.parallaxBlendDeg;
+    case 2: return &c.seamSmoothingDeg;
+    case 3: return &c.nearOffsetDeg;
+    case 4: return &c.farOffsetDeg;
+    default: return nullptr;
+    }
+}
+
+/// Append the seam tool rows and load `c` into them.
+void addSeamToolRows(HWND dialog, const DialogControls& c) noexcept {
+    const int firstRow = growDialogForRows(dialog, static_cast<int>(std::size(kSeamToolRows)));
+    DialogControls values = c;  // seamToolValue hands out pointers into a copy
+    for (std::size_t i = 0; i < std::size(kSeamToolRows); ++i) {
+        const SeamToolRow& row = kSeamToolRows[i];
+        const int y = firstRow + static_cast<int>(i) * kRowStep;
+        addDialogChild(dialog, L"STATIC", row.label, SS_LEFT, row.labelId, 7, y + 3, 70, 8);
+        addDialogChild(dialog, L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, row.editId, 82, y, 50, 14);
+        addDialogChild(dialog, L"STATIC", L"deg", SS_LEFT, row.unitId, 137, y + 3, 40, 8);
+        const double* v = seamToolValue(values, i);
+        wchar_t text[32] = {};
+        ::swprintf_s(text, L"%.2f", v ? *v : 0.0);
+        ::SetDlgItemTextW(dialog, row.editId, text);
+    }
+}
+
+/// Read the seam tool rows back.  A missing or unparseable row keeps what the
+/// dialog opened with; the blob setters then round and clamp what was typed.
+void seamToolWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
+    for (std::size_t i = 0; i < std::size(kSeamToolRows); ++i) {
+        if (double* v = seamToolValue(c, i)) {
+            *v = getEditDouble(dialog, kSeamToolRows[i].editId, *v);
+        }
+    }
+}
+// ---- [/WP-SEAMTOOLS] ---------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 //  [WP-DEFAULTS] "Save as Default"
@@ -487,6 +560,7 @@ void widgetsToControls(HWND dialog, DialogControls& c) noexcept {
     c.exposureStops = getEditDouble(dialog, IDC_EXPOSURE, c.exposureStops);
     c.look = comboSelection(dialog, IDC_REC709_LOOK);  // [WP-LOOK]
     photoWidgetsToControls(dialog, c);  // [WP-PHOTO]
+    seamToolWidgetsToControls(dialog, c);  // [WP-SEAMTOOLS]
 }
 
 /// The dialog procedure.  It never throws (a C callback crossing back into
@@ -500,6 +574,7 @@ INT_PTR CALLBACK sourceSettingsProc(HWND dialog, UINT message, WPARAM wParam, LP
         if (state) {
             controlsToWidgets(dialog, state->controls, state->calibrationFacts);
             addPhotoSeamRows(dialog, state->controls);  // [WP-PHOTO]
+            addSeamToolRows(dialog, state->controls);   // [WP-SEAMTOOLS]
         }
         placeDefaultsRow(dialog);  // [WP-DEFAULTS] after every block that moves OK
         return TRUE;  // Let the dialog manager set the initial focus.

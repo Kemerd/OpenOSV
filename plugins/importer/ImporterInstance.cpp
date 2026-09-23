@@ -1340,6 +1340,9 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     const std::uint32_t bucket = render::parallaxBucket(index);
     bool parallaxApplied = false;
     bool frameExact = true;
+    // [WP-SEAMTOOLS] The parallax grid this frame renders with (glided or
+    // borrowed), for the Near / Far Offset to add to after the carve.
+    std::shared_ptr<const render::ParallaxWarpGrid> appliedGrid;
     // [WP-PHOTO] photometric seam field: measured first, so its usable rim is the carved seam's Rim cost below
     const render::PhotoRimPenaltyScope photoRimScope = preparePhotoSeam(index, pair, draft, pool);
 
@@ -1472,6 +1475,7 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
         if (apply) {
             builder.warp(apply->uv, apply->w, apply->h, apply->latMinRad, apply->latMaxRad);
             parallaxApplied = true;
+            appliedGrid = apply;  // [WP-SEAMTOOLS]
         }
     }
 
@@ -1502,9 +1506,12 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     // ---- [WP-SEAM] carved blend seam ---------------------------------------
     // Under the seam preference: "seam search" now means both halves of the
     // seam - the disparity correction above and WHERE the two lenses meet.
+    std::shared_ptr<const render::BlendSeam> carvedSeam;
     if (wantSeam) {
-        applyCarvedSeam(index, pair, wantParallax, purpose, pool, builder, frameExact);
+        carvedSeam = applyCarvedSeam(index, pair, wantParallax, purpose, pool, builder, frameExact);
     }
+    // ---- [WP-SEAMTOOLS] Near / Far Offset and Seam Smoothing, on that seam ---
+    applySeamTools(index, carvedSeam.get(), appliedGrid.get(), builder);
 
     if (m_prefs.gainMatch != 0) {
         auto cached = m_gains.find(bucket);
@@ -1663,9 +1670,12 @@ bool ImporterInstance::applyPhotoSeam(render::RenderParamsBuilder& builder) {
 // ---------------------------------------------------------------------------
 //  [WP-SEAM] carved blend seam
 // ---------------------------------------------------------------------------
-void ImporterInstance::applyCarvedSeam(std::uint32_t index, const video::FramePair& pair, bool wantParallax,
-                                       RenderPurpose purpose, ThreadPool& pool, render::RenderParamsBuilder& builder,
-                                       bool& frameExact) {
+std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::uint32_t index,
+                                                                           const video::FramePair& pair,
+                                                                           bool wantParallax, RenderPurpose purpose,
+                                                                           ThreadPool& pool,
+                                                                           render::RenderParamsBuilder& builder,
+                                                                           bool& frameExact) {
     const std::uint32_t bucket = render::parallaxBucket(index);
 
     // ---- what is known: this bucket's seam, its neighbours', its correction --
@@ -1723,6 +1733,10 @@ void ImporterInstance::applyCarvedSeam(std::uint32_t index, const video::FramePa
         const render::BlendSeam* prior = previous ? previous.get() : next.get();
         render::SeamCarveParams params;
         params.penalty = m_flare.seamPenalty();  // [WP-FLARE] steer away from this frame's ghosts
+        // [WP-SEAMTOOLS] Seam Blend / Parallax Blend: the feather widths only
+        // (the seam's path is measured over its own window).  Default prefs
+        // leave the parameters exactly at their defaults.
+        render::applySeamBlendWidths(seamToolsLocked(), params);
         const render::BandParams band = render::ParallaxWarpParams{}.band;
         auto carved = render::carveSeam(m_rig, pair, m_blend, band, correction, params, prior, pool);
         if (carved.ok()) {
@@ -1776,6 +1790,61 @@ void ImporterInstance::applyCarvedSeam(std::uint32_t index, const video::FramePa
     }
     if (apply) {
         render::applyBlendSeam(builder, *apply);
+    }
+    return apply;  // [WP-SEAMTOOLS] for the tools that follow the carve
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-SEAMTOOLS] the carved seam's tweaks
+// ---------------------------------------------------------------------------
+
+// The blob stores the seam tools' defaults; the library owns them.  Two
+// statements of one default must not drift apart.
+static_assert(PrefsBlob::kDefaultSeamBlendDeg == render::kDefaultSeamBlendDeg &&
+                  PrefsBlob::kDefaultParallaxBlendDeg == render::kDefaultParallaxBlendDeg,
+              "PrefsBlob's seam blend defaults must match SeamTools.h");
+static_assert(static_cast<double>(PrefsBlob::kMaxSeamOffsetHundredths) / 100.0 == render::kMaxSeamOffsetDeg,
+              "PrefsBlob's offset range must match SeamTools.h");
+
+render::SeamTools ImporterInstance::seamToolsLocked() const noexcept {
+    // The blob's decoders turn code 0 into the defaults, so default prefs are
+    // default tools field for field.
+    render::SeamTools tools;
+    tools.seamBlendDeg = m_prefs.seamBlendDeg();
+    tools.parallaxBlendDeg = m_prefs.parallaxBlendDeg();
+    tools.smoothingDeg = m_prefs.seamSmoothingDeg();
+    tools.nearOffsetDeg = m_prefs.nearOffsetDeg();
+    tools.farOffsetDeg = m_prefs.farOffsetDeg();
+    return tools;
+}
+
+void ImporterInstance::applySeamTools(std::uint32_t index, const render::BlendSeam* seam,
+                                      const render::ParallaxWarpGrid* grid, render::RenderParamsBuilder& builder) {
+    // Both tools act on the carved seam; without one there is nothing to
+    // nudge or smooth, and the frame stays exactly as it is.
+    if (!seam) {
+        return;
+    }
+    const render::SeamTools tools = seamToolsLocked();
+    try {
+        // ---- Near / Far Offset: into the warp grid in force -----------------
+        if (tools.offsetOn()) {
+            auto shifted = render::seamOffsetGrid(grid, *seam, tools.nearOffsetDeg, tools.farOffsetDeg);
+            if (shifted.ok()) {
+                const render::ParallaxWarpGrid& g = shifted.value();
+                builder.warp(g.uv, g.w, g.h, g.latMinRad, g.latMaxRad);
+            } else {
+                PluginLog::debug("frame {}: seam offset refused ({}); rendering without it", index,
+                                 shifted.error().message);
+            }
+        }
+        // ---- Seam Smoothing: the renderer builds the low band --------------
+        if (tools.smoothingOn()) {
+            builder.seamSmooth(tools.smoothingDeg);
+        }
+    } catch (const std::exception& e) {
+        // Allocation failure is the realistic case: render without the tools.
+        PluginLog::warn("seam tools: {}; rendering without them", e.what());
     }
 }
 

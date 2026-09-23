@@ -21,6 +21,7 @@
 #include "DirectRender.h"
 
 #include "osv/color/ColorParams.h"
+#include "osv/render/SeamTools.h"
 
 #include <cmath>
 #include <cstddef>
@@ -178,6 +179,7 @@ const char* directRejectName(DirectReject reason) noexcept {
     case DirectReject::Composed:     return "the composed view block came out non-finite";
     case DirectReject::BlendSeam:    return "the blend seam is enabled without a usable table";
     case DirectReject::PhotoField:   return "the photometric seam field is enabled without a usable table";
+    case DirectReject::SeamLow:      return "seam smoothing is enabled without a usable low band";
     }
     // Unreachable for any enumerator above; a corrupt value lands here
     // rather than off the end of a table.
@@ -290,6 +292,16 @@ DirectSetup buildDirectParams(const Settings& settings, const StitchState& stitc
         }
     }
 
+    // ---- [WP-SEAMTOOLS] the seam smoothing's low band ----------------------
+    // Same rule again: on means the importer stitched with it.  The kernels
+    // index the table by its size and the taps by the radius, so the fields
+    // must describe a table that covers both lenses (seamSmoothParamsValid,
+    // the library's own rule) and the table itself must be there.
+    const bool seamLowOn = eq.seamSmoothEnabled != 0;
+    if (seamLowOn && (!render::seamSmoothParamsValid(eq) || stitch.seamLow == nullptr)) {
+        return refuse(DirectReject::SeamLow);
+    }
+
     // ---- the camera --------------------------------------------------------
     // Built by the equirect path's own function.  Non-finite controls are
     // replaced by their defaults inside it, exactly as the equirect path
@@ -346,6 +358,7 @@ DirectSetup buildDirectParams(const Settings& settings, const StitchState& stitc
     setup.warpGrid = warpOn ? stitch.warpGrid : nullptr;
     setup.blendSeam = blendSeamOn ? stitch.blendSeam : nullptr;  // [WP-SEAM]
     setup.photoField = photoOn ? stitch.photoField : nullptr;     // [WP-PHOTO]
+    setup.seamLow = seamLowOn ? stitch.seamLow : nullptr;         // [WP-SEAMTOOLS]
 
     // ---- final backstop ----------------------------------------------------
     // buildView() already guarantees a finite camera; this repeats the check
@@ -440,8 +453,8 @@ bool renderDirectPixel(const DirectSetup& setup, const OsvPlane* planes, int x, 
     if (x < 0 || y < 0 || x >= setup.params.outW || y >= setup.params.outH) {
         return false;
     }
-    osvShadePixelWSP(&setup.params, planes, setup.seamTable, setup.warpGrid, setup.blendSeam, setup.photoField,
-                     x, y, out);
+    osvShadePixelWSPL(&setup.params, planes, setup.seamTable, setup.warpGrid, setup.blendSeam, setup.photoField,
+                      setup.seamLow, x, y, out);
     return true;
 }
 
@@ -472,8 +485,8 @@ bool renderDirectCpu(const DirectSetup& setup, const OsvPlane* planes, const Fra
         char* dstRow = static_cast<char*>(dst.rowTopDown(y));
         for (int x = 0; x < dst.width; ++x) {
             float rgba[4];
-            osvShadePixelWSP(&setup.params, planes, setup.seamTable, setup.warpGrid, setup.blendSeam,
-                             setup.photoField, x, y, rgba);
+            osvShadePixelWSPL(&setup.params, planes, setup.seamTable, setup.warpGrid, setup.blendSeam,
+                              setup.photoField, setup.seamLow, x, y, rgba);
             storePixel(dstRow + static_cast<std::ptrdiff_t>(x) * static_cast<std::ptrdiff_t>(bpp), dst.layout, rgba);
         }
     };

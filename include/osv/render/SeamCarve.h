@@ -182,11 +182,20 @@ struct SeamCarveParams {
     // ---- feather ----------------------------------------------------------
     /// Feather half width where the lenses disagree (degrees): two band rows,
     /// enough to hide the pixel step of a hard cut, far too little for a
-    /// second copy of anything to show through.
+    /// second copy of anything to show through.  0 is a hard cut.
+    /// [WP-SEAMTOOLS] "Parallax Blend" in Source Settings.
     double narrowHalfWidthDeg = 0.35;
     /// Feather half width where they agree (degrees): wide enough to hide the
     /// residual colour / vignetting difference between the lenses.
+    /// [WP-SEAMTOOLS] "Seam Blend" in Source Settings.
     double wideHalfWidthDeg = 1.5;
+    /// [WP-SEAMTOOLS] Half width (degrees) of the window the seam's cost and
+    /// each column's structural disagreement are measured over.  It was the
+    /// narrow feather until the feather widths became user controls; kept
+    /// separate so those controls change how WIDE the lenses mix and never
+    /// WHERE the seam runs.  The default is the narrow feather's, so a carve
+    /// with default parameters is bit-identical to the one before the split.
+    double costWindowDeg = 0.35;
     /// Structural disagreement (mean gradient difference over the feather
     /// window, code values per band pixel) at or below which a column gets
     /// the wide feather, and at or above which it gets the narrow one.
@@ -233,6 +242,13 @@ struct SeamCarveParams {
     double stepPenalty = 0.03;     ///< Cost per band row moved between neighbouring columns.
     double smoothSigmaCols = 1.5;  ///< Gaussian smoothing of the DP path along longitude (columns).
     double widthSigmaCols = 3.0;   ///< Gaussian smoothing of the per-column feather width.
+    /// [WP-SEAMTOOLS] Gaussian smoothing of the per-column near weight
+    /// (BlendSeam::nearWeight) along longitude, in columns.  Wider than the
+    /// feather's: the Near / Far Offset it steers MOVES content, and a shift
+    /// that changes from column to column tears straight lines along the
+    /// seam, where a feather that changes only softens them.  8 columns is
+    /// ~2.8 degrees - about the grid pitch the offset is applied through.
+    double nearSigmaCols = 8.0;
 
     /// Optional per-lens penalty of this carve alone, on top of the installed
     /// slot hooks.
@@ -246,6 +262,15 @@ struct BlendSeam {
     /// polar-axis layout's latitude (+ = the master lens's side).
     std::vector<float> table;
     float edgeRad = 0.0f;  ///< Kernel validity ramp (OsvRenderParams::blendSeamEdgeRad).
+    /// [WP-SEAMTOOLS] Per column, how much the lenses DISAGREE along the seam,
+    /// 0 (agree: far content) .. 1 (disagree: near content) - the same
+    /// agreeResidual / disagreeResidual smoothstep that picks the feather,
+    /// measured on the bands through the frame's correction (never through
+    /// a Near / Far Offset, so the mask cannot chase its own shift) and
+    /// smoothed by nearSigmaCols.  Steers the Near / Far Offset
+    /// (SeamTools.h).  Empty on a seam built by hand; `columns` long
+    /// otherwise.
+    std::vector<float> nearWeight;
 
     // ---- diagnostics ---------------------------------------------------------
     double carveMs = 0.0;             ///< Time spent in carveSeamFromBands.
@@ -261,7 +286,9 @@ struct BlendSeam {
     std::uint32_t forcedColumns = 0;  ///< Columns where the path had to cross a forbidden cell.
     bool usedPrior = false;           ///< A neighbouring bucket's seam steered this one.
 
-    /// True when the table is complete and every entry is finite.
+    /// True when the table is complete and every entry is finite, and the
+    /// near weight [WP-SEAMTOOLS] is either absent or one value in [0, 1]
+    /// per column.
     [[nodiscard]] bool valid() const noexcept;
 };
 
@@ -303,6 +330,9 @@ struct BlendSeam {
 /// Blend two seams column by column: from + (to - from) * t, t clamped to
 /// [0, 1].  Both must have the same column count; the result carries `to`'s
 /// kernel parameters and diagnostics.  This is the glide between buckets.
+/// [WP-SEAMTOOLS] The near weight glides the same way when both seams carry
+/// one (so a Near / Far Offset moves with the seam, never jumps at a bucket
+/// edge); otherwise the result keeps `to`'s.
 [[nodiscard]] Result<BlendSeam> blendSeams(const BlendSeam& from, const BlendSeam& to, double t);
 
 /// Hand a seam to a render: builder.blendSeam(...) with its table and kernel
