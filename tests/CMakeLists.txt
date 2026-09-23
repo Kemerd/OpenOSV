@@ -89,3 +89,20 @@ if(TARGET osv_render_cuda)
             $<TARGET_FILE_DIR:osv_gpu_analysis_bench>
     COMMAND_EXPAND_LISTS)
 endif()
+
+# -----------------------------------------------------------------------------
+#  osv_seam_carve_bench - [WP-SEAM] the carved seam against the feather blend
+#  on the sample clip: ghost / seam-edge metrics, TIFF crops, seam jitter over
+#  time and the render / carve cost (see bench/SeamCarveBench.cpp).
+#
+#  A measurement tool, NOT a test: it asserts nothing and is never registered
+#  with ctest.
+# -----------------------------------------------------------------------------
+add_executable(osv_seam_carve_bench bench/SeamCarveBench.cpp)
+target_link_libraries(osv_seam_carve_bench PRIVATE ${_osv_test_libs})
+target_compile_definitions(osv_seam_carve_bench PRIVATE OSV_SAMPLE_FILE="${OSV_SAMPLE_FILE}")
+set_target_properties(osv_seam_carve_bench PROPERTIES FOLDER "tests")
+add_custom_command(TARGET osv_seam_carve_bench POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:osv_seam_carve_bench>
+          $<TARGET_FILE_DIR:osv_seam_carve_bench>
+  COMMAND_EXPAND_LISTS)
