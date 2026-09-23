@@ -5,6 +5,7 @@
 
 #include "osv/color/ColorParams.h"
 
+#include "osv/color/Look.h"
 #include "osv/color/Matrices.h"
 
 #include <cmath>
@@ -67,6 +68,14 @@ const char* inputEncodingName(InputEncoding encoding) noexcept {
     case InputEncoding::DLogM: return "dlogm";
     case InputEncoding::HLG: return "hlg";
     case InputEncoding::Rec709Normal: return "709";
+    }
+    return "unknown";
+}
+
+const char* lookName(Look look) noexcept {
+    switch (look) {
+    case Look::DjiStudio: return "dji";
+    case Look::Standard: return "standard";
     }
     return "unknown";
 }
@@ -137,6 +146,21 @@ bool parseInputEncoding(std::string_view text, InputEncoding& out) noexcept {
     return false;
 }
 
+bool parseLook(std::string_view text, Look& out) noexcept {
+    const std::string t = lowerAscii(text);
+    // The DJI Studio look under the names a user is likely to type.
+    if (t == "dji" || t == "dji-studio" || t == "djistudio" || t == "studio") {
+        out = Look::DjiStudio;
+        return true;
+    }
+    // The pre-look rendering (the HLG signal in Rec.709 primaries).
+    if (t == "standard" || t == "std" || t == "hlg709" || t == "none") {
+        out = Look::Standard;
+        return true;
+    }
+    return false;
+}
+
 const OsvDlogMCurve& dlogmCurve(DlogMFit fit) noexcept {
     switch (fit) {
     case DlogMFit::Pocket3: return kDlogMPocket3;
@@ -195,7 +219,7 @@ OsvColorParams makeDisabledColorParams() noexcept {
 
 OsvColorParams makeColorParams(DlogMFit fit, OutputTransfer transfer, float exposureStops, InputEncoding input,
                                bool narrowInput, std::uint32_t bitDepth, const OsvDlogMCurve* curveOverride,
-                               float sceneScale) noexcept {
+                               float sceneScale, Look look) noexcept {
     OsvColorParams p = makeDisabledColorParams();
     p.enabled = 1;
 
@@ -271,6 +295,13 @@ OsvColorParams makeColorParams(DlogMFit fit, OutputTransfer transfer, float expo
     for (int i = 0; i < 9; ++i) {
         p.yuvToRgb[i] = yuv.m[i];
     }
+
+    // --- display look ---------------------------------------------------------
+    // Filled for the (sanitised) transfer actually stored above, so a look can
+    // never land on an output it was not fitted for; makeLookParams returns a
+    // zeroed "no look" block for every other combination and for an
+    // out-of-range Look value.
+    p.look = makeLookParams(look, static_cast<OutputTransfer>(p.transfer));
     return p;
 }
 
@@ -302,6 +333,10 @@ bool colorParamsValid(const OsvColorParams& params) noexcept {
             !std::isfinite(params.yuvToRgb[i])) {
             return false;
         }
+    }
+    // The look block: either "no look" or a complete, finite one.
+    if (!lookParamsValid(params.look)) {
+        return false;
     }
     return params.sceneScale > 0.0f && params.exposureGain > 0.0f && params.peakNits > 0.0f;
 }
