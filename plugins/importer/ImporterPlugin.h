@@ -265,6 +265,10 @@ struct DialogControls {
     double nearOffsetDeg = 0.0;      ///< Near Offset along the seam, -3..3 deg.
     double farOffsetDeg = 0.0;       ///< Far Offset along the seam, -3..3 deg.
     // ---- [/WP-SEAMTOOLS] -----------------------------------------------------
+    // ---- [WP-VIGNETTE] the lens shading correction -----------------------------
+    int lensShading = 1;                  ///< Combo index = PrefsLensShading: 0 Off, 1 Auto.
+    double shadingStrengthPercent = 100;  ///< Correction strength, 0..100 %.
+    // ---- [/WP-VIGNETTE] ------------------------------------------------------
     // ---- [WP-STEADY] listed default first, like the Source Settings effect ---
     int parallaxGrid = 0;  ///< Combo index: 0 Auto, 1 Steady (per clip), 2 Follows scene (per moment).
     int lensAlign = 0;     ///< Combo index: 0 Auto (fit per clip), 1 Off (calibration only).

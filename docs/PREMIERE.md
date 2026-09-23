@@ -10,7 +10,7 @@ SDKs (never committed) and share the milestone 1 library.
 | Binary | Kind | Entry point | What it does |
 |---|---|---|---|
 | `OpenOSVImporter.prm` | standard file importer | `xImportEntry` | Registers `.osv` and `.lrf`; decodes both lenses with FFmpeg, stitches with the CUDA / OpenCL / CPU renderer and hands Premiere an equirectangular 360 x 180 frame in `BGRA_4444_32f`, colour-tagged Rec.2100 PQ, HLG or Rec.709. Decodes the AAC track. Declares the clip as monoscopic equirectangular VR. Per-clip options reach it as a `PrefsBlob`, from either the Source Settings effect or the modal Source Settings dialog. |
-| `OpenOSVSourceSettings.aex` | AE API **source settings** effect | `EffectMain` | "OpenOSV Source Settings", attached by Premiere to the **master clip** automatically. Twenty controls - colour output and its Rec.709 look, output size, stabilisation, seam search, exposure match, calibration, sun ghost removal, the sky seam fix (mode, strength, edge inset), the seam tools (Seam Blend, Parallax Blend, Seam Smoothing, Near / Far Offset), D-Log M curve, exposure, render device, Program Monitor colour - visible in the Effect Controls panel instead of behind a dialog. Renders nothing; its values reach the importer as a flat prefs blob, so they **cannot be keyframed**. See "Source Settings effect" below. |
+| `OpenOSVSourceSettings.aex` | AE API **source settings** effect | `EffectMain` | "OpenOSV Source Settings", attached by Premiere to the **master clip** automatically. Twenty-two controls - colour output and its Rec.709 look, output size, stabilisation, seam search, exposure match, calibration, sun ghost removal, the sky seam fix (mode, strength, edge inset), the seam tools (Seam Blend, Parallax Blend, Seam Smoothing, Near / Far Offset), the lens shading correction (mode, strength), D-Log M curve, exposure, render device, Program Monitor colour - visible in the Effect Controls panel instead of behind a dialog. Renders nothing; its values reach the importer as a flat prefs blob, so they **cannot be keyframed**. See "Source Settings effect" below. |
 | `Open360Reframe.aex` | After Effects API effect + `PrGPUFilter` | `EffectMain`, `xGPUFilterEntry` | "Open 360 Reframe" in the Effects panel (bin "OpenOSV"). Host-keyframed Pan / Tilt / Roll / FOV / Distortion plus preset perspectives. Renders on the GPU through Premiere's own CUDA device (driver API, embedded fatbin) and falls back to a 32-bit float CPU path that runs the same kernel. |
 
 Install all three (plus their runtime DLLs) in
@@ -565,7 +565,7 @@ absent, so that fact cannot be forgotten.
 
 As in the reframe effect, `PF_ADD_TOPIC` and `PF_END_TOPIC` each issue their
 own `PF_ADD_PARAM`, so a group occupies two real parameter slots and the
-`GROUP_END` slot sits in the MIDDLE of the list. There are 28 parameters: 20
+`GROUP_END` slot sits in the MIDDLE of the list. There are 30 parameters: 22
 value controls, 2 buttons and 6 group markers. `SourceSettingsParams.h`
 spells the index table out literally. Ids are permanent and only ever
 appended; indices moved when a control joined a group (the ids did not).
@@ -598,26 +598,54 @@ meaning; forcing the bare-lens set is new and therefore last.
 | 15 | 22 | Seam Smoothing | float slider | 0..8 deg (0 = off), as above | 0 | `seamSmoothing` |
 | 16 | 23 | Near Offset | float slider | -3..+3 deg, hundredths | 0 | `nearOffset` |
 | 17 | 24 | Far Offset | float slider | -3..+3 deg, hundredths | 0 | `farOffset` |
-| 18 | 8 | (closes Stitching) | GROUP_END | | | |
-| 19 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
-| 20 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 \| Osmo 360 | Osmo 360 | `dlogmFit` |
-| 21 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
-| 22 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
-| 23 | 14 | Program Monitor Colour | popup | Sequence space (fast) \| Match Source monitor | Sequence space | `directColour` |
-| 24 | 13 | (closes Advanced) | GROUP_END | | | |
-| 25 | 30 | Defaults | topic (GROUP_START, starts collapsed) | | | |
-| 26 | 31 | Save | button, `PF_ParamFlag_SUPERVISE` | "Save as Default for New Clips" | | writes the user defaults file |
-| 27 | 32 | Restore | button, `PF_ParamFlag_SUPERVISE` | "Restore Built-in Defaults" | | removes it |
-| 28 | 33 | (closes Defaults) | GROUP_END | | | |
+| 18 | 34 | Lens Shading | popup | Off \| Auto | Auto | `lensShading` |
+| 19 | 35 | Shading Strength | float slider | 0..100 %, whole percent | 100 | `shadingStrength` |
+| 20 | 8 | (closes Stitching) | GROUP_END | | | |
+| 21 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
+| 22 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 \| Osmo 360 | Osmo 360 | `dlogmFit` |
+| 23 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
+| 24 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
+| 25 | 14 | Program Monitor Colour | popup | Sequence space (fast) \| Match Source monitor | Sequence space | `directColour` |
+| 26 | 13 | (closes Advanced) | GROUP_END | | | |
+| 27 | 30 | Defaults | topic (GROUP_START, starts collapsed) | | | |
+| 28 | 31 | Save | button, `PF_ParamFlag_SUPERVISE` | "Save as Default for New Clips" | | writes the user defaults file |
+| 29 | 32 | Restore | button, `PF_ParamFlag_SUPERVISE` | "Restore Built-in Defaults" | | removes it |
+| 30 | 33 | (closes Defaults) | GROUP_END | | | |
 
 The Defaults group is always last and its indices are defined relative to
 the Advanced terminator, so a control added to an earlier group moves them
-without renumbering; ids 20-29 are left to the Stitching group. See "User
-defaults for new clips" below.
+without renumbering; ids 20-29 are left to the Stitching group. The lens
+shading correction's ids (34-35) come after every id already shipped. See
+"User defaults for new clips" below.
 
-An effect saved before ids 15-19 existed has no stored value for them, so
-it picks up the control defaults above (DJI look, ghost removal and the sky
-seam fix on) - a project opened in this build gets the improved stitch.
+An effect saved before ids 15-19 (or 34-35) existed has no stored value for
+them, so it picks up the control defaults above (DJI look, ghost removal, the
+sky seam fix and the lens shading correction on) - a project opened in this
+build gets the improved stitch.
+
+#### Lens shading (ids 34-35)
+
+Each lens's own brightness structure near its rim, measured from that lens's
+own sky and added back before the lenses are blended
+(`include/osv/render/LensShading.h`, docs/research/NEURAL_STITCHING.md
+section 9). On the sample clip it is a soft dark ring in the lens facing the
+sun, 83-89 deg from its axis: after the sky seam fix it was the soft darker
+band left on every sky seam crossing, on the front lens's side.
+
+| Control | What it does | Measured on the sample (default stitch, frames 0 / 32 / 64) |
+|---|---|---|
+| Lens Shading | Auto measures the ring per bucket of eight frames and adds the missing light back in the lens's native linear light, before every gain; Off leaves the lenses as decoded. A lens whose sky shows no structure, and every sector of a lens that shows no sky (the ground), is left untouched. | The band's dip below the sky's own trend at the seam 158 -> 21 millistops (open sky elsewhere scores 57-67); seam metrics line x0.40, band x0.32, broad x0.94, colour x0.86; the ground unchanged. |
+| Shading Strength | How much of the measured correction is added. | Linear: 50 % leaves half the ring. |
+
+Auto for new clips, and for a project whose Source Settings effect was
+saved before the control existed (the control's default, like every control
+added after the effect shipped).  A prefs blob written before it existed -
+the modal dialog's - holds a zero at `PrefsBlob` offset 46, which reads as
+Off: that clip renders as before until the control is set. The
+correction travels inside the stitch block, so the importer's equirect, the
+Source monitor and the Program monitor's direct path show the same picture.
+Cost: 7-10 ms of analysis per bucket of eight frames; the render kernels do
+not measurably slow down (+0.00 ms at 2560x1440 on the direct path).
 
 #### Seam tools (ids 20-24)
 
@@ -953,6 +981,8 @@ One named key per setting - never a dump of the 128 bytes, so it survives
     "skySeamFix": "rim-and-colour",       // off | rim-only | rim-and-colour
     "skySeamStrengthPercent": 100,        // 0..100
     "seamEdgeInsetDeg": 2.6,              // 0..6, tenths
+    "lensShading": "auto",                // off | auto
+    "shadingStrengthPercent": 100,        // 0..100
     "parallaxCorrection": true,
     "flowBackend": "auto",                // auto | classical | neural
     "dlogmCurve": "osmo360",              // dji-refit | pocket3 | osmo360

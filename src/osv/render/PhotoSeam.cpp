@@ -5,6 +5,7 @@
 // metrics (see PhotoSeam.h and docs/research/NEURAL_STITCHING.md, section 8).
 
 #include "osv/render/PhotoSeam.h"
+#include "osv/render/LensShading.h"
 
 #include "osv/color/ColorMath.h"
 #include "osv/color/ColorParams.h"
@@ -758,7 +759,7 @@ std::vector<float> photoRimColumnsDeg(const PhotoSeamField& field, int lens, std
 
 Result<RgbLensBands> renderPhotoBands(const geom::LensRig& rig, const video::FramePair& frames,
                                       const geom::BlendParams& blend, const PhotoSeamParams& params,
-                                      ThreadPool& pool) {
+                                      ThreadPool& pool, const LensShadingModel* shading) {
     const BandParams& band = params.band;
     if (band.equirectW < 256 || band.equirectW > 16384 || (band.equirectW % 2u) != 0 || !(band.bandHalfDeg > 0.0) ||
         band.bandHalfDeg > 45.0) {
@@ -809,6 +810,10 @@ Result<RgbLensBands> renderPhotoBands(const geom::LensRig& rig, const video::Fra
         RenderParamsBuilder builder;
         builder.rig(rig).equirect(map).blend(occlusionOnly, true).color(linear).alphaCoverage(true);
         builder.lensEnabled(lens, true).lensEnabled(1 - lens, false);
+        // [WP-VIGNETTE] the lens as the kernel will blend it (null: raw).
+        if (shading) {
+            builder.shading(*shading, 1.0);
+        }
         OSV_TRY_ASSIGN(RenderJob job, builder.build(frames));
         std::vector<float> rgba;
         if (job.planesOnDevice[0] || job.planesOnDevice[1]) {
@@ -1330,9 +1335,9 @@ Result<PhotoSeamField> photoSeamFromBands(const RgbLensBands& b, const PhotoSeam
 
 Result<PhotoSeamField> measurePhotoSeam(const geom::LensRig& rig, const video::FramePair& frames,
                                         const geom::BlendParams& blend, const PhotoSeamParams& params,
-                                        ThreadPool& pool) {
+                                        ThreadPool& pool, const LensShadingModel* shading) {
     const auto t0 = PhotoClock::now();
-    OSV_TRY_ASSIGN(RgbLensBands bands, renderPhotoBands(rig, frames, blend, params, pool));
+    OSV_TRY_ASSIGN(RgbLensBands bands, renderPhotoBands(rig, frames, blend, params, pool, shading));
     const double bandMs = msSince(t0);
     OSV_TRY_ASSIGN(PhotoSeamField field, photoSeamFromBands(bands, params, &pool));
     field.bandMs = bandMs;

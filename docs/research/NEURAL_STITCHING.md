@@ -265,6 +265,11 @@ and `flat_res`. Whether the .OSV metadata actually carries a vignette opcode
 has not been checked (WP-CALIB / WP-LOOK territory). If it does, that is the
 common-mode term for free.
 
+*Answered (WP-VIGNETTE, section 9):* it does not - the sample carries only a
+shading mode number, no curve or table.  And the band that remained after
+the photometric field turned out not to be common-mode vignetting at all,
+but a ring in ONE lens: section 9.
+
 ### 1.6 Flow backends on sky, ground and wing (`osvtool seam --parallax --region`)
 
 Local NCC between the lenses before -> after the 2-D parallax grid, frames
@@ -1160,7 +1165,10 @@ belongs to one lens. With the light line gone the stripe is the most visible
 thing left, and the crops' column-profile roughness is x1.04 on the carved
 stitch (x0.67 on the plain blend). Removing it needs a per-lens,
 common-mode correction - the vignetting work of section 1.5 and candidate 4
-of section 6 - not a better seam field.
+of section 6 - not a better seam field.  *Follow-up:* it is a ring in the
+master lens's own image, additive, and the lens shading correction of
+section 9 removes it (the seam's dip below the sky trend 158 -> 21
+millistops on the default stitch).
 
 **Everything else:**
 
@@ -1176,6 +1184,160 @@ of section 6 - not a better seam field.
   borderline) and 5.7-6.7 ms from host frames (budget 10); the direct kernel
   at 2560x1440 is +0.018 ms with the field (0.288 -> 0.307 ms, budget
   +0.05).
+
+---
+
+## 9. Lens shading: the master lens's own ring (WP-VIGNETTE, as built)
+
+### 9.1 What the band was
+
+The band section 8.7 left - soft, darker, on the master side of every sky
+seam crossing, the two vertical bands of a wide view toward the sun - is in
+the master lens's own image.  Measured with `research/vignette/analyse_ring.py`
+on each lens alone (vigprobe dumps, the sky longitudes -165..-15 of the polar
+map, a quadratic in the lens's own theta fitted over 70-94 deg with 82.5-90
+left out):
+
+| Polar longitude | -165 | -135 | -105 | -90..-75 | -60 | -30 |
+|---|---|---|---|---|---|---|
+| master: dip centre (deg) | 85.4-85.6 | 85.6-86.1 | 85.9-86.4 | 86.4 | 85.6-85.9 | 84.9-85.6 |
+| master: depth in luma (stop) | -0.09 | -0.15 | -0.26..-0.30 | -0.33..-0.34 | -0.16..-0.17 | -0.04..-0.05 |
+| slave: depth (stop) | -0.01..-0.02 | -0.01 | 0.00 | 0.00 | -0.01 | -0.01 |
+
+(frames 0 / 32 / 64, which agree to 0.03 stop.)
+
+* **A ring, not a gradient.** 83-89 deg from the master's axis, centred at
+  86, the same angle in every azimuth sector; the slave has nothing there.
+* **Deepest on the side facing the sun.** The sun sits ~15 deg from the
+  master's axis toward polar longitude -95; the ring is deepest at -90..-75
+  and fades toward the horizon on both sides.
+* **Additive, not a vignette.**  At its deepest the ring takes 0.52 / 0.31 /
+  0.10 stop from R / G / B - but 0.025 / 0.025 / 0.018 of scene-linear light.
+  A multiplicative vignette would dim every channel by the same number of
+  stops; the same LIGHT missing from each channel is a deficit in the veiling
+  glare (the master carries a +0.04 veil, FLARE.md 2.3), slightly warm like
+  sunlight after the white balance.  The same test of the channels is how
+  `lensShadingFromBands` learns the correction's colour.
+* **Why the photometric field could not see it.**  Theta 83-89 in the master
+  is 91-97 deg in the slave, the slave's untrusted rim: the field's
+  statistics stop short of it, and the carved seam shows the master there.
+  Table 1.2's lens ratio rising 0.25 stop between theta0 90 and 93 is this
+  ring.
+
+### 9.2 What the metadata and the motion offer
+
+* **No shading table.**  Every node of every metadata track of the sample
+  (`osvtool probe --raw`, both djmd tracks and the nested ones) was walked:
+  the only float arrays are the lens model and the stick polygon.
+  `shading_calib_mode_num` is one mode number (7).  The DNG-style opcode
+  values the schema names are not referenced by any message this camera
+  writes.  Whatever lens-shading correction exists happens in the camera.
+* **Constant exposure.**  ISO 142 and 1/208 s on every frame, the metered
+  light value 9.8867-9.8874: no auto-exposure change to separate from
+  shading on this clip.
+* **Too little rotation for temporal self-calibration.**  The attitude track
+  rotates the camera by 1.35 deg over the clip (65 frames, 1.08 s), and the
+  attitude convention probe is inconclusive on it.  Goldman & Chen's and Kim &
+  Pollefeys' calibrations, and Bergmann et al.'s online one, need each
+  direction to cross the structure; 1.35 deg moves a 6 deg ring by a fifth of
+  its width.  And a structure that follows the sun is not a fixed property of
+  the lens that a one-off calibration could store.
+* **So the lens's own sky it is.**  Single-image vignetting estimation (Zheng
+  et al., CVPR 2006 / PAMI 2009) specialised to the one smooth thing a 360
+  camera almost always sees: along each meridian of a lens the sky is smooth,
+  a ring is not.
+
+### 9.3 The correction
+
+`include/osv/render/LensShading.h` (measurement, time) and the kernel's
+`[WP-VIGNETTE]` region (application):
+
+* **Bands**: each lens alone over a +-27 deg polar band, 1024 columns,
+  native linear, occlusion alpha (the photometric field's band shader).
+* **Per column** (a meridian of the lens from 64 deg to thetaMax - 4): a
+  log-quadratic sky per channel, least squares then Tukey's biweight (Beaton
+  & Tukey 1974), on flat pixels only (0.15 stop/deg along the ring, 0.6
+  along theta), the column kept when its pixel noise (second differences)
+  is under 0.04 stop and its robust scatter under 0.08.
+* **Per (0.5 deg knot, 15 deg sector) cell**: the median light missing
+  against the sky, kept when at least 24 samples from 4 columns agree, it is
+  under 30 % of the sky, and R, G and B move the same way; a sector needs 70 %
+  of its cells.  No sky, no correction: on the sample 13 of each lens's 24
+  sectors (the ground, the wing) stay at zero.
+* **Back-fitting** (Hastie & Tibshirani 1990): the sky is refitted with the
+  correction added; 3, 4 and 8 rounds agree to 0.3 % of the sky.
+* **Colour**: each channel's residual regressed on the luma amount.
+* **Time**: per bucket of 8 frames, EMA 0.35 against the previous bucket's
+  stored model, glide within the bucket - `LensShadingHistory`, frozen at
+  store time like `PhotoSeamHistory`.
+* **Kernel**: `val_c += colour_c * sum_r radial_r(theta) * azimuth_r(phi)`,
+  native linear, after the flare removal and before every gain; the table's
+  best rank-2 separable form (Eckart & Young 1936) rides in OsvRenderParams
+  (1064 bytes, no new table), so every renderer, the engine's stitch block
+  and the direct kernel carry it.  Passthrough moves each code through the
+  input curve and back.
+* **Order in the importer**: the correction is measured first; the
+  photometric field and the exposure match are measured on the corrected
+  lenses (median gain 0.377 -> 0.373 stop, rims unchanged, exposure match
+  1.1334 -> 1.1345 on frame 32).
+
+### 9.4 Measured (the sample, the importer's default stitch)
+
+`tests/unit/test_lensshading.cpp` and `research/vignette/make_figures.py`,
+frames 0 / 32 / 64, bands through the real kernel.  "Dip" is how far the
+blended sky falls below its own trend (a quadratic through the sky outside
++-10 deg) on the master side of the seam, per block of 32 sky columns,
+median; "open sky" is the same statistic between -12 and -23 deg, away from
+the seam:
+
+| Frame | dip off -> on (millistops) | open sky off -> on | line | band | broad | dE |
+|---|---|---|---|---|---|---|
+| 0 | 168 -> 22 | 66 -> 53 | 24.0 -> 9.6 | 49.7 -> 15.3 | 48.9 -> 46.1 | 62.7 -> 51.6 |
+| 32 | 156 -> 21 | 61 -> 55 | 24.0 -> 9.5 | 50.0 -> 15.5 | 48.8 -> 45.2 | 70.9 -> 61.9 |
+| 64 | 148 -> 22 | 65 -> 56 | 23.4 -> 9.6 | 49.4 -> 16.3 | 48.0 -> 45.2 | 65.5 -> 57.2 |
+
+* **The band is gone to below the sky's own shape**: the seam now dips less
+  than open sky deviates from a quadratic.  Section 1.4's metrics: line
+  x0.40, band x0.32, broad x0.94, dE x0.86.
+* **Nothing else moves**: the ground (0.54w-0.83w) changes by exactly 0
+  (no sky, no correction); every render with the correction off is
+  bit-identical to before.
+* **Stable**: over all 65 frames the applied table moves at most 8e-5 linear
+  between consecutive frames, 0.4 % of the ring.
+* **Parity**: CUDA 108-113 dB, OpenCL 106-108 dB against the CPU, PQ and
+  passthrough; the direct kernel 95-110 dB against its CPU twin (the same
+  single-pixel edge differences the photometric field's test shows).
+* **Synthetic**: a 0.020 ring at 86 deg with a known colour is recovered as
+  0.0187 at 86 deg, colour within 0.01; the corrected lens is within 12 % of
+  a ring-free render (RMS 0.0058 -> 0.0007); a textured world and a sharp
+  horizon at 90 deg produce no correction.
+* **Cost** (shared machine): 7-10 ms per bucket of 8 frames - 1 ms of bands
+  from device frames or 4.5 ms from host frames, 6 ms of statistics; the
+  kernels +0.00 ms at 2560x1440 on the direct path.
+
+Figures in `research/vignette/`: `wide_sun_view_f32.tif` (the wide view
+toward the sun that crosses both seam lines, off above, on below),
+`seam_crossings_x4.tif` (its two sky crossings, frames 0 / 32 / 64, off | on,
+contrast x4: the dark arc along the seam in every "off" panel, none in the
+"on" ones) and `seam_profiles.csv` (the polar map's profile across the seam
+and its deviation from the sky trend, per frame, off and on).
+
+### 9.5 What is left
+
+* **A broad lens-ratio ramp.**  The photometric field splits the master's
+  veil (+0.7 stop in the sky) half and half and decays it over 20 deg: the
+  sky runs ~0.1 stop brighter on the slave side of the seam than the trend
+  from beyond +-10 deg, fading over 15-25 deg.  A gradient, not a band;
+  removing it means subtracting the veil (FLARE.md 6.3, gated).
+* **Side lobes**: the correction dims the ring's flanks (80-82 and 89-91 deg)
+  by 1-4 % of the sky - the quadratic sky model's own misfit, 0.02-0.03 stop.
+* **The master's second dip at 94.5 deg** (0.1-0.2 stop) is past the
+  correction's domain (thetaMax - 4 = 93.6 deg); on the default stitch the
+  slave covers it.
+* **One clip.**  The ring follows the sun; clips with the sun elsewhere, no
+  sky, or a moving camera are untested.  Measuring every bucket follows a
+  moving sun; if a stride is ever wanted, the table moves 0.4 % per frame
+  here.
 
 ---
 
@@ -1208,4 +1370,11 @@ python research\neural\fisheye_rim.py %TEMP%\lensinfo
 
 rem 5. flow backends by region (section 1.6)
 osvtool seam example_footage_dlogm.OSV --frame 32 --parallax --flow-backend classical --region 410-900 --json
+
+rem 6. the master lens's ring and the lens shading correction (section 9)
+scripts\vsdev.cmd research\vignette\build_vigprobe.cmd
+research\vignette\bin\vigprobe.exe lens example_footage_dlogm.OSV %TEMP%\lens2048 2048 0 0 32 64
+python research\vignette\analyse_ring.py %TEMP%\lens2048
+rem the renders make_figures.py's docstring lists, then
+python research\vignette\make_figures.py %TEMP%\vignette
 ```

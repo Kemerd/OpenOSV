@@ -611,7 +611,20 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
             }
         }
         if (params.seamOn && params.rimCost) {
-            auto field = measurePhotoSeam(rig, pair.value(), blend, params.photo, pool);
+            // The rim on the lenses the render will blend: shading-corrected
+            // first when the lens shading correction is on, exactly as the
+            // importer's per-bucket field is measured.
+            std::optional<LensShadingModel> shading;
+            if (params.shadingOn && params.shading.mode == LensShadingMode::Auto) {
+                auto model = measureLensShading(rig, pair.value(), blend, params.shading, pool);
+                if (model.ok() && model.value().active()) {
+                    shading = params.shading.strength >= 1.0
+                                  ? std::move(model).value()
+                                  : scaledLensShadingModel(model.value(), params.shading.strength);
+                }
+            }
+            auto field = measurePhotoSeam(rig, pair.value(), blend, params.photo, pool,
+                                          shading ? &*shading : nullptr);
             if (field.ok()) {
                 s.rim = std::make_shared<const PhotoSeamField>(std::move(field).value());
             }

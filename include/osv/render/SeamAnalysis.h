@@ -30,6 +30,8 @@
 
 namespace osv::render {
 
+struct LensShadingModel;  // [WP-VIGNETTE] osv/render/LensShading.h
+
 /// Band geometry shared by the three analyses.
 struct BandParams {
     std::uint32_t equirectW = 2048;  ///< Width of the polar-axis map (columns = longitude).
@@ -116,7 +118,13 @@ struct GainEstimate {
 /// sample clip, lens 0 is 1 stop dark at 95 deg while the old alpha > 0.5
 /// rule still counted it, which the estimate read as "lens 1 is too bright"
 /// (docs/research/NEURAL_STITCHING.md, sections 1.2 and 1.4).
+///
+/// [WP-VIGNETTE] `shading`, when given and active, is applied to both lenses
+/// exactly as the kernel applies it (LensShading.h), so the gains match the
+/// lenses the blend will see; null (the default) is the raw lenses, bit for
+/// bit as before.
 Result<GainEstimate> estimateGain(const geom::LensRig& rig, const video::FramePair& frames,
-                                  const geom::BlendParams& blend, const BandParams& band, ThreadPool& pool);
+                                  const geom::BlendParams& blend, const BandParams& band, ThreadPool& pool,
+                                  const LensShadingModel* shading = nullptr);
 
 }  // namespace osv::render

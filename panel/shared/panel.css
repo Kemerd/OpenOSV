@@ -414,12 +414,33 @@ body {
 
 /* ---- focus (keyboard users) ------------------------------------------------------------------ */
 
+/* A click must never draw a ring: the browser's own focus outline is a
+   square box, and around the segmented control's rounded pill it read as a
+   stray blue rectangle.  The ring is for keyboard focus only (:focus-visible)
+   and is a box-shadow, which follows each control's own rounded corners
+   instead of the element's square box. */
 .osv-switch:focus,
 .osv-seg:focus,
 .osv-slider:focus,
 .osv-button:focus {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
+    outline: none;
+}
+
+.osv-switch:focus-visible,
+.osv-seg:focus-visible,
+.osv-slider:focus-visible,
+.osv-button:focus-visible {
+    box-shadow: 0 0 0 2px var(--accent);
+}
+
+/* The segment and the slider row have no corners of their own; give the
+   keyboard ring the pill's and the thumb's radius so it hugs what is drawn. */
+.osv-seg:focus-visible {
+    border-radius: 6px;
+}
+
+.osv-slider:focus-visible {
+    border-radius: 11px;
 }
 
 /* ---- responsive --------------------------------------------------------------------------------- */

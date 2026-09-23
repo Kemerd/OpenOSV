@@ -16,6 +16,7 @@
 #include "osv/geom/VirtualCamera.h"
 #include "osv/io/FfmpegPipe.h"
 #include "osv/io/ImageWriter.h"
+#include "osv/render/LensShading.h"
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"
 #include "osv/render/SeamCarve.h"
@@ -76,6 +77,10 @@ struct RenderOptions {
     std::string photo = "off";     ///< off | rim | full
     double photoStrength = 1.0;    ///< 0..1, the gain field only
     double photoDecay = 20.0;      ///< degrees beyond the overlap
+    // [WP-VIGNETTE] The per-lens shading correction, measured per bucket of
+    // frames with the importer's own temporal filter (LensShadingHistory).
+    std::string shading = "off";   ///< off | auto
+    double shadingStrength = 1.0;  ///< 0..1
     // [WP-SEAMTOOLS] The carved seam's tweaks (--seam-carve), exactly the
     // Source Settings controls of the same names; defaults = the seam as is.
     osv::render::SeamTools seamTools;
@@ -113,6 +118,7 @@ constexpr const char* kCliDevice[] = {"auto", "cpu", "cuda", "opencl"};
 constexpr const char* kCliLook[] = {"dji", "standard"};
 constexpr const char* kCliFlow[] = {"auto", "classical", "neural"};
 constexpr const char* kCliPhoto[] = {"off", "rim", "full"};
+constexpr const char* kCliShading[] = {"off", "auto"};  // [WP-VIGNETTE]
 static_assert(std::size(kCliColor) == static_cast<std::size_t>(osv::premiere::PrefsColorOutput::Count));
 static_assert(std::size(kCliStab) == static_cast<std::size_t>(osv::premiere::PrefsStabilization::Count));
 static_assert(std::size(kCliCalib) == static_cast<std::size_t>(osv::premiere::PrefsCalibrationChoice::Count));
@@ -121,6 +127,7 @@ static_assert(std::size(kCliDevice) == static_cast<std::size_t>(osv::premiere::P
 static_assert(std::size(kCliLook) == static_cast<std::size_t>(osv::premiere::PrefsLook::Count));
 static_assert(std::size(kCliFlow) == static_cast<std::size_t>(osv::premiere::PrefsFlowBackend::Count));
 static_assert(std::size(kCliPhoto) == static_cast<std::size_t>(osv::premiere::PrefsPhotoSeam::Count));
+static_assert(std::size(kCliShading) == static_cast<std::size_t>(osv::premiere::PrefsLensShading::Count));
 
 /// The token for an enum byte; the list's first entry for a value past it
 /// (the blob is sanitised, so that is a guard, not a path).
@@ -197,6 +204,13 @@ void applyUserDefaults(RenderOptions& o, const CLI::App& sub) {
     }
     if (!given("--blend-fov")) {
         o.seamInsetDeg = p.seamInsetDeg();
+    }
+    // [WP-VIGNETTE] the lens shading correction.
+    if (!given("--shading")) {
+        o.shading = cliToken(kCliShading, p.lensShading);
+    }
+    if (!given("--shading-strength")) {
+        o.shadingStrength = p.shadingStrengthPercent() / 100.0;
     }
     // [WP-SEAMTOOLS] the carved seam's tweaks (they act with --seam-carve).
     if (!given("--seam-blend")) {
@@ -304,7 +318,8 @@ int runRender(const RenderOptions& o) {
     // The per-frame analyses shade bands from host planes, so they decide
     // whether a CUDA decode may keep its frames on the GPU.
     PipelineOptions pipelineOptions = o.pipeline;
-    pipelineOptions.hostFramesRequired = o.seamSearch || o.gain || o.parallax || o.seamCarve || o.photo != "off";
+    pipelineOptions.hostFramesRequired =
+        o.seamSearch || o.gain || o.parallax || o.seamCarve || o.photo != "off" || o.shading != "off";
     auto pipe = Pipeline::open(pipelineOptions, true);
     if (!pipe.ok()) {
         std::fprintf(stderr, "error: %s\n", log::safe(pipe.value() ? "" : pipe.error().toString()).c_str());
@@ -554,6 +569,22 @@ int runRender(const RenderOptions& o) {
     }
     photoParams.strength = o.photoStrength;
     photoParams.decayDeg = o.photoDecay;
+    // [WP-VIGNETTE] --shading / --shading-strength.
+    render::LensShadingParams shadingParams;
+    if (o.shading == "auto") {
+        shadingParams.mode = render::LensShadingMode::Auto;
+    } else if (o.shading == "off") {
+        shadingParams.mode = render::LensShadingMode::Off;
+    } else {
+        std::fprintf(stderr, "error: unknown --shading '%s' (off|auto)\n", log::safe(o.shading).c_str());
+        return kExitUsage;
+    }
+    if (!(o.shadingStrength >= 0.0 && o.shadingStrength <= 1.0)) {
+        std::fprintf(stderr, "error: --shading-strength must be within 0..1\n");
+        return kExitUsage;
+    }
+    shadingParams.strength = o.shadingStrength;
+    render::LensShadingHistory shadingHistory;
     // [WP-SEAMTOOLS] The ranges the Source Settings sliders offer.
     const render::SeamTools& tools = o.seamTools;
     const auto inRange = [](double v, double lo, double hi) { return std::isfinite(v) && v >= lo && v <= hi; };
@@ -626,6 +657,37 @@ int runRender(const RenderOptions& o) {
                 log::warn("frame {}: seam search failed: {}", f, profile.error().message);
             }
         }
+        // [WP-VIGNETTE] The lens shading correction for this frame, FIRST:
+        // the photometric field and the exposure match below are measured
+        // on the corrected lenses, as the importer does.  One measurement
+        // per bucket, then the bucket's model cross-faded from the previous.
+        std::shared_ptr<const render::LensShadingModel> shadingFrame;
+        if (shadingParams.mode != render::LensShadingMode::Off) {
+            const std::uint32_t bucket = render::parallaxBucket(f);
+            if (!shadingHistory.measured(bucket)) {
+                auto model = render::measureLensShading(P.rig, pair.value(), P.blendParams, shadingParams, *P.pool);
+                if (model.ok()) {
+                    const render::LensShadingModel& m = model.value();
+                    log::info("frame {}: lens shading in {:.1f} ms (bands {:.1f}); slave: {} sky columns, {} "
+                              "sectors, peak {:+.4f} ({:+.3f} stop at {:.1f} deg); master: {} sky columns, {} "
+                              "sectors, peak {:+.4f} ({:+.3f} stop at {:.1f} deg)",
+                              f, m.bandMs + m.statsMs, m.bandMs, m.lens[0].skyColumns, m.lens[0].measuredSectors,
+                              m.lens[0].peakAmount, m.lens[0].peakStops, m.lens[0].peakThetaDeg,
+                              m.lens[1].skyColumns, m.lens[1].measuredSectors, m.lens[1].peakAmount,
+                              m.lens[1].peakStops, m.lens[1].peakThetaDeg);
+                    shadingHistory.store(bucket, std::make_shared<const render::LensShadingModel>(std::move(model).value()),
+                                         shadingParams);
+                } else {
+                    log::warn("frame {}: lens shading refused ({}); rendering without it", f,
+                              log::safe(model.error().message));
+                    shadingHistory.store(bucket, nullptr, shadingParams);
+                }
+            }
+            shadingFrame = shadingHistory.modelFor(f, shadingParams);
+        }
+        const render::LensShadingModel* shadingNow =
+            (shadingFrame && shadingFrame->active()) ? shadingFrame.get() : nullptr;
+
         // [WP-PHOTO] The photometric seam field for this frame, chosen BEFORE
         // the carve like the importer does: its usable rim is the carved
         // seam's Rim cost (SeamPenaltySlot::Rim), in force on this thread
@@ -636,7 +698,8 @@ int runRender(const RenderOptions& o) {
         if (photoParams.mode != render::PhotoSeamMode::Off) {
             const std::uint32_t bucket = render::parallaxBucket(f);
             if (!photoHistory.measured(bucket)) {
-                auto field = render::measurePhotoSeam(P.rig, pair.value(), P.blendParams, photoParams, *P.pool);
+                auto field =
+                    render::measurePhotoSeam(P.rig, pair.value(), P.blendParams, photoParams, *P.pool, shadingNow);
                 if (field.ok()) {
                     const render::PhotoSeamField& pf = field.value();
                     log::info("frame {}: photometric seam field in {:.1f} ms (bands {:.1f}), trusted {:.1f}%, usable "
@@ -691,7 +754,7 @@ int runRender(const RenderOptions& o) {
         }
         if (analyse && o.gain) {
             render::BandParams band;
-            auto g = render::estimateGain(P.rig, pair.value(), P.blendParams, band, *P.pool);
+            auto g = render::estimateGain(P.rig, pair.value(), P.blendParams, band, *P.pool, shadingNow);
             if (g.ok()) {
                 globalGain[0] = g.value().gain[0];  // [WP-PHOTO] remembered for frames a field overrides
                 globalGain[1] = g.value().gain[1];
@@ -742,6 +805,12 @@ int runRender(const RenderOptions& o) {
         } else {
             builder.clearBlendSeam();
             builder.clearSeamSmooth();  // [WP-SEAMTOOLS]
+        }
+        // [WP-VIGNETTE] set explicitly every frame (the builder persists).
+        if (shadingNow) {
+            builder.shading(*shadingNow, shadingParams.strength);
+        } else {
+            builder.clearShading();
         }
         builder.stabilization(P.stabilizationFor(f));
 
@@ -837,6 +906,14 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
         ->default_val(1.0);
     outGeom->add_option("--photo-decay", opt->photoDecay, "Gain-field decay beyond the overlap, degrees")
         ->default_val(20.0);
+    // [WP-VIGNETTE] The Source Settings "Lens Shading" / "Shading Strength".
+    outGeom->add_option("--shading", opt->shading,
+                        "Lens shading correction: off | auto (each lens's rim structure measured from its own sky "
+                        "and added back before the blend; the photometric field and --gain are then measured on the "
+                        "corrected lenses)")
+        ->default_str("off");
+    outGeom->add_option("--shading-strength", opt->shadingStrength, "Lens shading strength 0..1 (--shading auto)")
+        ->default_val(1.0);
     // [WP-SEAMTOOLS] The Source Settings seam tools (with --seam-carve).
     outGeom->add_option("--seam-blend", opt->seamTools.seamBlendDeg,
                         "Seam Blend: carved-seam feather where the lenses agree, degrees 0.2..8")

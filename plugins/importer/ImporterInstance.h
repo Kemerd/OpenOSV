@@ -53,6 +53,7 @@
 #include "osv/meta/MetadataTrack.h"
 #include "osv/meta/Types.h"
 #include "osv/render/ImageRGBAf.h"
+#include "osv/render/LensShading.h"  // [WP-VIGNETTE]
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"
 #include "osv/render/SeamCarve.h"
@@ -799,6 +800,44 @@ private:
     /// Returns false when the frame used a stand-in field.
     [[nodiscard]] bool applyPhotoSeam(render::RenderParamsBuilder& builder);
     // ---- [/WP-PHOTO] ----------------------------------------------------------
+
+    // ---- [WP-VIGNETTE] lens shading correction, keyed by bucket --------------
+    // (docs/research/NEURAL_STITCHING.md section 9, render/LensShading.h.)  All
+    // guarded by m_mutex, measured synchronously on the render thread like
+    // the photometric field (a band shade plus a few ms of statistics per
+    // bucket of eight frames).
+
+    /// Per-bucket models, each frozen when stored (EMA and glide partner).
+    render::LensShadingHistory m_shading;
+    /// The rig the models were measured with (photoRigKey); a different rig
+    /// clears m_shading.
+    std::vector<double> m_shadingRigKey;
+    /// The mode and strength the stored photometric fields were measured
+    /// under: the field is measured on the CORRECTED lenses, so a change of
+    /// either clears m_photo too.  Empty until the first frame.
+    std::vector<double> m_shadingPhotoKey;
+    /// The model the frame being built renders with, already scaled by the
+    /// strength (prepareLensShading -> the analyses -> applyLensShading), and
+    /// whether it is the frame's own (false: a draft borrowed the last one).
+    std::shared_ptr<const render::LensShadingModel> m_shadingFrame;
+    bool m_shadingFrameExact = true;
+    /// The last model a non-draft frame used: what a draft renders with.
+    std::shared_ptr<const render::LensShadingModel> m_shadingLast;
+
+    /// The analysis parameters for the current prefs (mode, strength).
+    [[nodiscard]] render::LensShadingParams shadingParamsLocked() const noexcept;
+
+    /// First half, the first line of applyAnalyses: measure this frame's
+    /// bucket if it has not been (never for a draft) and choose the model the
+    /// frame renders with.  The photometric field and the exposure match
+    /// are then measured on lenses corrected by it (m_shadingFrame).
+    /// Failures are logged and leave the frame uncorrected.
+    void prepareLensShading(std::uint32_t index, const video::FramePair& pair, bool draft, ThreadPool& pool);
+
+    /// Second half, the last line of applyAnalyses: hand the chosen model to
+    /// `builder`.  Returns false when the frame used a stand-in model.
+    [[nodiscard]] bool applyLensShading(render::RenderParamsBuilder& builder);
+    // ---- [/WP-VIGNETTE] -------------------------------------------------------
 
     RenderedFrame m_lastFrame;
     std::string m_rendererName;

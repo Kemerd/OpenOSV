@@ -169,6 +169,9 @@ void hashClipParams(Hasher& h, const render::ClipSteadyParams& p) noexcept {
     h.u64(p.rimCost ? 1u : 0u);
     h.u64(static_cast<std::uint64_t>(p.photo.mode));
     h.f64(p.photo.strength);
+    h.u64(p.shadingOn ? 1u : 0u);
+    h.u64(static_cast<std::uint64_t>(p.shading.mode));
+    h.f64(p.shading.strength);
     const render::SteadyDecisionParams& d = p.decision;
     h.u64(d.sectors);
     h.u64(d.minPixels);

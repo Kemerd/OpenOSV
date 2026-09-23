@@ -161,10 +161,17 @@ static_assert(kParamIdByIndex[kIndexSeamBlend - 1] == OSV_SS_ID_SEAM_BLEND &&
                   kParamIdByIndex[kIndexNearOffset - 1] == OSV_SS_ID_NEAR_OFFSET &&
                   kParamIdByIndex[kIndexFarOffset - 1] == OSV_SS_ID_FAR_OFFSET,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
-// [WP-STEADY] Parallax Grid and Lens Alignment follow Far Offset, and the
-// Stitching group closes right after them.
-static_assert(kIndexParallaxGrid == kIndexFarOffset + 1 && kIndexLensAlign == kIndexParallaxGrid + 1,
-              "Parallax Grid and Lens Alignment follow Far Offset in that order");
+// [WP-VIGNETTE] the lens shading correction's two controls follow Far
+// Offset, and the Stitching group closes right after them.
+static_assert(kIndexLensShading == kIndexFarOffset + 1 && kIndexShadingStrength == kIndexLensShading + 1,
+              "Lens Shading and Shading Strength follow Far Offset in that order");
+static_assert(kParamIdByIndex[kIndexLensShading - 1] == OSV_SS_ID_LENS_SHADING &&
+                  kParamIdByIndex[kIndexShadingStrength - 1] == OSV_SS_ID_SHADING_STRENGTH,
+              "kParamIdByIndex is not aligned with the ParamIndex enum");
+// [WP-STEADY] Parallax Grid and Lens Alignment follow Shading Strength, and
+// the Stitching group closes right after them.
+static_assert(kIndexParallaxGrid == kIndexShadingStrength + 1 && kIndexLensAlign == kIndexParallaxGrid + 1,
+              "Parallax Grid and Lens Alignment follow Shading Strength in that order");
 static_assert(kParamIdByIndex[kIndexParallaxGrid - 1] == OSV_SS_ID_PARALLAX_GRID &&
                   kParamIdByIndex[kIndexLensAlign - 1] == OSV_SS_ID_LENS_ALIGN,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
@@ -357,6 +364,13 @@ private:
     if (const PF_ParamDef* p = def(kIndexFarOffset)) {
         c.farOffsetDeg = static_cast<double>(p->u.fs_d.value);
     }
+    // [WP-VIGNETTE]
+    if (const PF_ParamDef* p = def(kIndexLensShading)) {
+        c.lensShading = static_cast<int>(p->u.pd.value);
+    }
+    if (const PF_ParamDef* p = def(kIndexShadingStrength)) {
+        c.shadingStrengthPercent = static_cast<double>(p->u.fs_d.value);
+    }
     // [WP-STEADY]
     if (const PF_ParamDef* p = def(kIndexParallaxGrid)) {
         c.parallaxGrid = static_cast<int>(p->u.pd.value);
@@ -441,6 +455,8 @@ void writeControls(PF_ParamDef* params[], const ControlValues& wanted) noexcept 
     setSlider(kIndexSeamSmoothing, wanted.seamSmoothingDeg);
     setSlider(kIndexNearOffset, wanted.nearOffsetDeg);
     setSlider(kIndexFarOffset, wanted.farOffsetDeg);
+    setPopup(kIndexLensShading, wanted.lensShading);  // [WP-VIGNETTE]
+    setSlider(kIndexShadingStrength, wanted.shadingStrengthPercent);
     setPopup(kIndexParallaxGrid, wanted.parallaxGrid);  // [WP-STEADY]
     setPopup(kIndexLensAlign, wanted.lensAlign);        // [WP-STEADY]
     setPopup(kIndexDlogmFit, wanted.dlogmFit);
@@ -671,7 +687,22 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_SEAM_OFFSET_MAX, OSV_SS_SEAM_OFFSET_DEFAULT, PF_Precision_HUNDREDTHS,
                          PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_FAR_OFFSET);
 
-    // ---- 18. Parallax Grid [WP-STEADY] -----------------------------------------
+    // ---- 18. Lens Shading [WP-VIGNETTE] --------------------------------------
+    // Each lens's own brightness structure near its rim, measured from its
+    // own sky and added back before the blend (docs/research/
+    // NEURAL_STITCHING.md, section 9).  Default Auto, as PrefsBlob::defaults().
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUPX("Lens Shading", OSV_SS_LENS_SHADING_COUNT, OSV_SS_LENS_SHADING_DEFAULT, OSV_SS_LENS_SHADING_ITEMS,
+                  kStaticFlags, OSV_SS_ID_LENS_SHADING);
+
+    // ---- 19. Shading Strength [WP-VIGNETTE] ----------------------------------
+    // How much of the measured correction applies, in whole percent (the
+    // blob's step), shown with the host's percent sign.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Shading Strength", OSV_SS_SHADING_STRENGTH_MIN, OSV_SS_SHADING_STRENGTH_MAX,
+                         OSV_SS_SHADING_STRENGTH_MIN, OSV_SS_SHADING_STRENGTH_MAX, OSV_SS_SHADING_STRENGTH_DEFAULT,
+                         PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT, kStaticFlags, OSV_SS_ID_SHADING_STRENGTH);
+    // ---- 20. Parallax Grid [WP-STEADY] -----------------------------------------
     // Whether the seam corrections are held still for the whole clip (a
     // rigid mount: nothing at the seam moves) or measured per moment
     // (handheld, near objects moving past); Auto decides from the clip
@@ -680,14 +711,14 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Parallax Grid", OSV_SS_PARALLAX_GRID_COUNT, OSV_SS_PARALLAX_GRID_DEFAULT,
                   OSV_SS_PARALLAX_GRID_ITEMS, kStaticFlags, OSV_SS_ID_PARALLAX_GRID);
 
-    // ---- 19. Lens Alignment [WP-STEADY] ----------------------------------------
+    // ---- 21. Lens Alignment [WP-STEADY] ----------------------------------------
     // Fit the small rotation between the two lenses once per clip and fold it
     // into the stitch, or trust the recorded calibration.  Default Auto.
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Lens Alignment", OSV_SS_LENS_ALIGN_COUNT, OSV_SS_LENS_ALIGN_DEFAULT, OSV_SS_LENS_ALIGN_ITEMS,
                   kStaticFlags, OSV_SS_ID_LENS_ALIGN);
 
-    // ---- 20. Close the Stitching group -------------------------------------
+    // ---- 22. Close the Stitching group -------------------------------------
     // PF_END_TOPIC issues its own PF_ADD_PARAM (Param_Utils.h:309-316), so the
     // terminator occupies a parameter slot of its own and everything after it
     // shifts up by one.  Leaving it out would not merely lose a divider: the
@@ -697,16 +728,16 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_STITCH_TOPIC_END);
 
-    // ---- 21. Advanced topic (collapsed: most users never touch it) ----------
+    // ---- 23. Advanced topic (collapsed: most users never touch it) ----------
     AEFX_CLR_STRUCT(def);
     PF_ADD_TOPICX("Advanced", PF_ParamFlag_START_COLLAPSED, OSV_SS_ID_ADVANCED_TOPIC);
 
-    // ---- 22. D-Log M Curve -------------------------------------------------
+    // ---- 24. D-Log M Curve -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("D-Log M Curve", OSV_SS_FIT_COUNT, OSV_SS_FIT_DEFAULT, OSV_SS_FIT_ITEMS, kStaticFlags,
                   OSV_SS_ID_DLOGM_FIT);
 
-    // ---- 23. Exposure ------------------------------------------------------
+    // ---- 25. Exposure ------------------------------------------------------
     // Valid range is the blob's own +/- 6 stops (static_asserted below the
     // handlers); the slider shows the useful +/- 3 so a drag has resolution.
     AEFX_CLR_STRUCT(def);
@@ -714,12 +745,12 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_EXPOSURE_SLIDER_MIN, OSV_SS_EXPOSURE_SLIDER_MAX, OSV_SS_EXPOSURE_DEFAULT,
                          PF_Precision_TENTHS, PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_EXPOSURE);
 
-    // ---- 24. Render Device -------------------------------------------------
+    // ---- 26. Render Device -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Render Device", OSV_SS_DEVICE_COUNT, OSV_SS_DEVICE_DEFAULT, OSV_SS_DEVICE_ITEMS, kStaticFlags,
                   OSV_SS_ID_RENDER_DEVICE);
 
-    // ---- 25. Program Monitor Colour [WP-SETTINGS] --------------------------
+    // ---- 27. Program Monitor Colour [WP-SETTINGS] --------------------------
     // What Open 360 Reframe shows when this clip's Colour Output is not the
     // sequence's working space: the scene rendered straight into it (fast,
     // the default) or Premiere's own conversion of the output (matches the
@@ -729,11 +760,11 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Program Monitor Colour", OSV_SS_DIRECT_COLOUR_COUNT, OSV_SS_DIRECT_COLOUR_DEFAULT,
                   OSV_SS_DIRECT_COLOUR_ITEMS, kStaticFlags, OSV_SS_ID_DIRECT_COLOUR);
 
-    // ---- 26. Close the Advanced group --------------------------------------
+    // ---- 28. Close the Advanced group --------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_ADVANCED_TOPIC_END);
 
-    // ---- 27-30. Defaults [WP-DEFAULTS] -------------------------------------
+    // ---- 29-32. Defaults [WP-DEFAULTS] -------------------------------------
     // Two momentary buttons: store this clip's settings as the defaults every
     // NEW clip starts from, or remove them so new clips start from the
     // built-in defaults again.  Neither changes this clip.  A button carries
@@ -993,12 +1024,12 @@ PF_Err translateParamsToPrefs(PF_InData* in_data, PF_ParamDef* params[],
     PluginLog::debug("source settings: translated - colour {}, look {}, size {}, stab {}, seam {}, gain {}, "
                      "calib {}, fit {}, exposure {:+.2f}, device {}, sun ghost removal {}, sky seam fix {} at "
                      "{:.0f} %, seam edge inset {:.1f} deg, seam blend {:.2f} / parallax blend {:.2f} / smoothing "
-                     "{:.2f} deg, near / far offset {:+.2f} / {:+.2f} deg",
+                     "{:.2f} deg, near / far offset {:+.2f} / {:+.2f} deg, lens shading {} at {:.0f} %",
                      blob.colorOutput, blob.look, blob.outputSize, blob.stabilization, blob.seamSearch,
                      blob.gainMatch, blob.calibration, blob.dlogmFit, static_cast<double>(blob.exposureStops),
                      blob.renderDevice, blob.flareRemoval, blob.photoSeam, blob.photoStrengthPercent(),
                      blob.seamInsetDeg(), blob.seamBlendDeg(), blob.parallaxBlendDeg(), blob.seamSmoothingDeg(),
-                     blob.nearOffsetDeg(), blob.farOffsetDeg());
+                     blob.nearOffsetDeg(), blob.farOffsetDeg(), blob.lensShading, blob.shadingStrengthPercent());
     return PF_Err_NONE;
 }
 
@@ -1097,6 +1128,18 @@ static_assert(OSV_SS_SEAM_SMOOTHING_MIN == 0.0 && OSV_SS_SEAM_SMOOTHING_DEFAULT 
 static_assert(OSV_SS_SEAM_OFFSET_MAX == static_cast<double>(osv::premiere::PrefsBlob::kMaxSeamOffsetHundredths) / 100.0 &&
                   OSV_SS_SEAM_OFFSET_MIN == -OSV_SS_SEAM_OFFSET_MAX && OSV_SS_SEAM_OFFSET_DEFAULT == 0.0,
               "the Near / Far Offset range does not match PrefsBlob::nearOffset / farOffset");
+// [WP-VIGNETTE] The lens shading correction: the popup covers
+// PrefsLensShading with defaults()' Auto, and the slider offers exactly the
+// whole percent 0..100 (codes 1..101) the blob stores.
+static_assert(OSV_SS_LENS_SHADING_COUNT == static_cast<int>(osv::premiere::PrefsLensShading::Count),
+              "the Lens Shading popup does not list every PrefsLensShading value");
+static_assert(OSV_SS_LENS_SHADING_DEFAULT == static_cast<int>(osv::premiere::PrefsLensShading::Auto) + 1,
+              "the Lens Shading popup's default is not PrefsBlob::defaults()' Auto");
+static_assert(OSV_SS_SHADING_STRENGTH_MIN == 0.0 &&
+                  OSV_SS_SHADING_STRENGTH_MAX ==
+                      static_cast<double>(osv::premiere::PrefsBlob::kMaxShadingStrengthCode - 1),
+              "the Shading Strength range does not match PrefsBlob::shadingStrength");
+static_assert(OSV_SS_SHADING_STRENGTH_DEFAULT == 100.0, "Shading Strength defaults to 100 %, stored as code 0");
 
 // ===========================================================================
 //  The exported entry point

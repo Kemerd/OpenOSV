@@ -411,11 +411,57 @@ void seamToolWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
 // ---- [/WP-SEAMTOOLS] ---------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+//  [WP-VIGNETTE] the lens shading rows
+// ---------------------------------------------------------------------------
+// Two rows appended below the seam tool rows, the same way.  Ids are clear of
+// resource.h, of the sky seam rows (1040-1042, 1140-1144) and of the seam
+// tool rows (1043-1047, 1145-1154).
+constexpr int kIdcLensShading = 1048;
+constexpr int kIdcShadingStrength = 1049;
+constexpr int kIdcStaticLensShading = 1155;
+constexpr int kIdcStaticShadingStrength = 1156;
+constexpr int kIdcStaticShadingPercent = 1157;
+
+/// Append the lens shading rows and load `c` into them.
+void addLensShadingRows(HWND dialog, const DialogControls& c) noexcept {
+    const int firstRow = growDialogForRows(dialog, 2);
+    // Row 1: the mode.  The combo index IS the PrefsLensShading value, so the
+    // list is in enum order.
+    addDialogChild(dialog, L"STATIC", L"&Lens shading:", SS_LEFT, kIdcStaticLensShading, 7, firstRow + 3, 70, 8);
+    addDialogChild(dialog, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kIdcLensShading, 82,
+                   firstRow, 179, 60);
+    static const wchar_t* const kModes[] = {L"Off", L"Auto (default)"};
+    static_assert(std::size(kModes) == static_cast<std::size_t>(PrefsLensShading::Count),
+                  "the lens shading combo does not list every PrefsLensShading value");
+    fillCombo(dialog, kIdcLensShading, kModes, static_cast<int>(std::size(kModes)), c.lensShading);
+    // Row 2: how much of the measured correction.
+    addDialogChild(dialog, L"STATIC", L"Shading s&trength:", SS_LEFT, kIdcStaticShadingStrength, 7,
+                   firstRow + kRowStep + 3, 70, 8);
+    addDialogChild(dialog, L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, kIdcShadingStrength, 82,
+                   firstRow + kRowStep, 50, 14);
+    addDialogChild(dialog, L"STATIC", L"%", SS_LEFT, kIdcStaticShadingPercent, 137, firstRow + kRowStep + 3, 40, 8);
+    wchar_t text[32] = {};
+    ::swprintf_s(text, L"%.0f", c.shadingStrengthPercent);
+    ::SetDlgItemTextW(dialog, kIdcShadingStrength, text);
+}
+
+/// Read the lens shading rows back.  A missing or unparseable row keeps what
+/// the dialog opened with (the blob setter then clamps whatever was typed).
+void shadingWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
+    if (::GetDlgItem(dialog, kIdcLensShading)) {
+        c.lensShading = comboSelection(dialog, kIdcLensShading);
+    }
+    c.shadingStrengthPercent = getEditDouble(dialog, kIdcShadingStrength, c.shadingStrengthPercent);
+}
+// ---- [/WP-VIGNETTE] ----------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 //  [WP-STEADY] the Parallax Grid and Lens Alignment rows
 // ---------------------------------------------------------------------------
-// Two combo rows appended below the seam tool rows, the same way.  Ids clear
-// of resource.h, the sky seam rows (1040-1042, 1140-1144) and the seam tool
-// rows (1043-1047, 1145-1154).
+// Two combo rows appended below the lens shading rows, the same way.  Ids
+// clear of resource.h, the sky seam rows (1040-1042, 1140-1144), the seam
+// tool rows (1043-1047, 1145-1154) and the lens shading rows (1048-1049,
+// 1155-1157).
 constexpr int kIdcParallaxGrid = 1060;
 constexpr int kIdcLensAlign = 1061;
 constexpr int kIdcStaticParallaxGrid = 1160;
@@ -430,14 +476,16 @@ void addSteadyRows(HWND dialog, const DialogControls& c) noexcept {
                                            L"Follows scene (per moment)"};
     static_assert(std::size(kGrid) == std::size(kDialogParallaxGrid),
                   "the Parallax Grid combo does not list every choice");
-    addDialogChild(dialog, L"STATIC", L"Parallax &grid:", SS_LEFT, kIdcStaticParallaxGrid, 7, firstRow + 3, 70, 8);
+    // "a" is the one letter of the label no other row of the dialog uses.
+    addDialogChild(dialog, L"STATIC", L"P&arallax grid:", SS_LEFT, kIdcStaticParallaxGrid, 7, firstRow + 3, 70, 8);
     addDialogChild(dialog, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kIdcParallaxGrid, 82,
                    firstRow, 179, 80);
     fillCombo(dialog, kIdcParallaxGrid, kGrid, static_cast<int>(std::size(kGrid)), c.parallaxGrid);
     static const wchar_t* const kAlign[] = {L"Auto (fit per clip)", L"Off (calibration only)"};
     static_assert(std::size(kAlign) == std::size(kDialogLensAlign),
                   "the Lens Alignment combo does not list every choice");
-    addDialogChild(dialog, L"STATIC", L"&Lens alignment:", SS_LEFT, kIdcStaticLensAlign, 7, firstRow + kRowStep + 3,
+    // Every letter of "Lens alignment" already has a row, so no accelerator.
+    addDialogChild(dialog, L"STATIC", L"Lens alignment:", SS_LEFT, kIdcStaticLensAlign, 7, firstRow + kRowStep + 3,
                    70, 8);
     addDialogChild(dialog, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kIdcLensAlign, 82,
                    firstRow + kRowStep, 179, 80);
@@ -606,6 +654,7 @@ void widgetsToControls(HWND dialog, DialogControls& c) noexcept {
     c.look = comboSelection(dialog, IDC_REC709_LOOK);  // [WP-LOOK]
     photoWidgetsToControls(dialog, c);  // [WP-PHOTO]
     seamToolWidgetsToControls(dialog, c);  // [WP-SEAMTOOLS]
+    shadingWidgetsToControls(dialog, c);  // [WP-VIGNETTE]
     steadyWidgetsToControls(dialog, c);    // [WP-STEADY]
 }
 
@@ -621,7 +670,8 @@ INT_PTR CALLBACK sourceSettingsProc(HWND dialog, UINT message, WPARAM wParam, LP
             controlsToWidgets(dialog, state->controls, state->calibrationFacts);
             addPhotoSeamRows(dialog, state->controls);  // [WP-PHOTO]
             addSeamToolRows(dialog, state->controls);   // [WP-SEAMTOOLS]
-            addSteadyRows(dialog, state->controls);     // [WP-STEADY]
+            addLensShadingRows(dialog, state->controls);  // [WP-VIGNETTE]
+            addSteadyRows(dialog, state->controls);       // [WP-STEADY]
         }
         placeDefaultsRow(dialog);  // [WP-DEFAULTS] after every block that moves OK
         return TRUE;  // Let the dialog manager set the initial focus.

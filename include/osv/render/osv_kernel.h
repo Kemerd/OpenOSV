@@ -217,6 +217,48 @@ typedef struct OsvFlareLens {
  * rim of the Osmo 360's fisheye - the widest Seam Smoothing on offer. */
 #define OSV_SEAM_LOW_MAX_RADIUS 15
 
+/* ========================================================================= */
+/*  [WP-VIGNETTE] per-lens shading correction: parameter types               */
+/* ========================================================================= */
+/* A lens's own brightness structure near its rim, which the lens-to-lens
+ * ratio of the photometric seam field cannot see because it belongs to ONE
+ * lens (docs/research/NEURAL_STITCHING.md, section 9).  On the sample clip
+ * it is a soft dark ring at ~86 deg from the master lens's axis, 0.1-0.3
+ * stop deep, strongest on the side facing the sun and neutral in LINEAR
+ * light (R, G and B lose the same amount, which makes the log dip three
+ * times deeper in red than in blue): an additive deficit of the veiling
+ * glare, not a multiplicative vignette.  The kernel therefore ADDS light
+ * back, in the lens's native scene-linear RGB, before any gain.
+ *
+ * The correction of lens i at angle theta from its axis and azimuth phi
+ * around it is, per channel c,
+ *
+ *     add_c = strength * colour[c] * sum_r radial[r](theta) * azimuth[r](phi)
+ *
+ * a rank-OSV_SHADE_RANK separable approximation of the measured
+ * (theta, phi) table (LensShading.h builds it by SVD): radial knots every
+ * shadeDThetaRad from shadeTheta0Rad, linear between knots and held at the
+ * last one; azimuth sectors centred at -pi + (s + 0.5) 2pi / OSV_SHADE_PHI_N,
+ * linear between sector centres and wrapping.  phi = atan2(y, x) of the
+ * sample direction in the lens frame (+x image right, +y image down).
+ *
+ * Sizes: 131 floats per lens, 1048 bytes for both - inside the 4 KB
+ * parameter budget with ~650 bytes to spare (tests assert it), and no table
+ * to upload: the correction travels with the parameter block through every
+ * renderer and the direct path. */
+#define OSV_SHADE_THETA_N 40
+#define OSV_SHADE_PHI_N 24
+#define OSV_SHADE_RANK 2
+
+/* One lens's separable shading correction (all zero = none). */
+typedef struct OsvShadeLens {
+    float colour[3];                                 /* per-channel factor of the amount */
+    float radial[OSV_SHADE_RANK][OSV_SHADE_THETA_N]; /* scene-linear amount per knot     */
+    float azimuth[OSV_SHADE_RANK][OSV_SHADE_PHI_N];  /* unitless weight per sector       */
+} OsvShadeLens;
+
+/* ======================= [/WP-VIGNETTE] types =========================== */
+
 /* Everything the shader needs besides the planes and the seam table. */
 typedef struct OsvRenderParams {
     int outW, outH;          /* output size in pixels                          */
@@ -364,6 +406,18 @@ typedef struct OsvRenderParams {
      * the same numbers instead of its own expf. */
     float seamLowTaps[OSV_SEAM_LOW_MAX_RADIUS + 1];
     /* ---- [/WP-SEAMTOOLS] ----------------------------------------------------- */
+
+    /* ---- [WP-VIGNETTE] per-lens shading correction (LensShading.h) ---------
+     * Each lens's measured rim structure, added back in its native linear
+     * light after the flare removal and before every gain (see the types
+     * above).  All zero (the builder's default) = nothing is added and every
+     * render is exactly what it was without it. */
+    int shadeEnabled;        /* 1 = add shade[i]'s amount to lens i's samples  */
+    float shadeTheta0Rad;    /* radial knot 0; no correction at or below it    */
+    float shadeDThetaRad;    /* radial knot spacing (radians, > 0)             */
+    float shadeStrength;     /* user strength, 0..1                            */
+    OsvShadeLens shade[2];   /* per lens, indexed like lens[]                  */
+    /* ---- [/WP-VIGNETTE] ------------------------------------------------------ */
 } OsvRenderParams;
 
 /* ------------------------------------------------------------------------- */
@@ -1401,6 +1455,109 @@ OSV_HD void osvPhotoApplyGain(const OsvRenderParams* p, const OsvPhotoPixel* ph,
 /* ---- [/WP-PHOTO] --------------------------------------------------------- */
 
 /* ------------------------------------------------------------------------- */
+/*  [WP-VIGNETTE] Per-lens shading correction                                */
+/* ------------------------------------------------------------------------- */
+/* The two hooks the shader calls (and the seam smoothing's low band, which
+ * must see its lens exactly as the full sample does), in front of both for
+ * the same reason as the [WP-SEAM] helpers.  The model, its measurement and
+ * the reasoning are in include/osv/render/LensShading.h; the parameter
+ * layout is documented at OsvShadeLens above.  Nothing here runs unless
+ * OsvRenderParams::shadeEnabled is set. */
+
+/* Amount lens i adds at angle `theta` (radians) from its axis for the
+ * sample it projected to (px, py), in its native scene-linear light (the
+ * model's luma units; OsvShadeLens::colour spreads it over the channels).
+ * 0 when the correction is off or theta is at or below the first knot -
+ * which is most of every frame, rejected with one comparison. */
+OSV_HD float osvShadeAmount(const OsvRenderParams* p, int i, float theta, float px, float py) {
+    if (!p->shadeEnabled || !(p->shadeDThetaRad > 0.0f) || i < 0 || i > 1) {
+        return 0.0f;
+    }
+    const float t = (theta - p->shadeTheta0Rad) / p->shadeDThetaRad;
+    /* The negated test also rejects a NaN angle. */
+    if (!(t > 0.0f)) {
+        return 0.0f;
+    }
+    const OsvLens* L = &p->lens[i];
+    const OsvShadeLens* S = &p->shade[i];
+
+    /* ---- radial: linear between knots, held at the last one ------------- */
+    const float tc = fminf(t, (float)(OSV_SHADE_THETA_N - 1));
+    int k0 = (int)floorf(tc);
+    if (k0 > OSV_SHADE_THETA_N - 2) {
+        k0 = OSV_SHADE_THETA_N - 2;
+    }
+    const float ft = tc - (float)k0;
+
+    /* ---- azimuth around the lens axis ------------------------------------
+     * osvProjectLens placed the sample at (cx, cy) + (fx, fy) * rd * (x, y) /
+     * rho, so the image offset with each axis divided by its focal length
+     * points along (x, y) of the lens-frame ray.  Multiplying both atan2
+     * arguments by fx * fy > 0 instead of dividing keeps the same angle. */
+    const float phi = atan2f((py - L->cy) * L->fx, (px - L->cx) * L->fy);
+    const float u = ((phi + OSV_KERNEL_PI) / OSV_KERNEL_TWO_PI) * (float)OSV_SHADE_PHI_N - 0.5f;
+    const float fu = floorf(u);
+    const float wu = u - fu;
+    int s0 = (int)fu;
+    s0 = ((s0 % OSV_SHADE_PHI_N) + OSV_SHADE_PHI_N) % OSV_SHADE_PHI_N;
+    const int s1 = (s0 + 1) % OSV_SHADE_PHI_N;
+
+    /* ---- the separable sum ---------------------------------------------- */
+    float amount = 0.0f;
+    for (int r = 0; r < OSV_SHADE_RANK; ++r) {
+        const float ra = S->radial[r][k0];
+        const float rb = S->radial[r][k0 + 1];
+        const float aa = S->azimuth[r][s0];
+        const float ab = S->azimuth[r][s1];
+        amount += (ra + (rb - ra) * ft) * (aa + (ab - aa) * wu);
+    }
+    return amount * p->shadeStrength;
+}
+
+/* Scene-linear `lin + add` back to the input encoding's code value, the
+ * exact inverse of osvCodeToLinear per channel (passthrough output blends
+ * in code space).  Light below the curve's code-0 level stays at code 0
+ * rather than leaving the curve's domain. */
+OSV_HD float osvShadeCodeAdd(const OsvColorParams* color, float code, float add) {
+    if (color == 0 || color->enabled == 0) {
+        return code + add; /* identity decode: code is light */
+    }
+    if (color->inputEncoding == OSV_INPUT_HLG) {
+        const float scale = (color->sceneScale > 1e-12f) ? color->sceneScale : 1.0f;
+        const float lin = osvHlgInverseOetf(code) / scale;
+        return osvHlgOetf(fmaxf(lin + add, 0.0f) * scale);
+    }
+    if (color->inputEncoding == OSV_INPUT_REC709_NORMAL) {
+        return osvRec709Oetf(fmaxf(osvRec709InverseOetf(code) + add, 0.0f));
+    }
+    /* D-Log M */
+    const float floorLin = osvDlogmToLinear(&color->curve, 0.0f);
+    const float lin = osvDlogmToLinear(&color->curve, code);
+    return osvDlogmToCode(&color->curve, fmaxf(lin + add, floorLin));
+}
+
+/* Add lens i's shading amount to one decoded sample: val_c += colour[c] x
+ * amount in scene-linear light, or - for passthrough, where `val` holds
+ * code values - move each code to the code of its light plus that amount.
+ * An amount of exactly 0 leaves the sample untouched, bit for bit. */
+OSV_HD void osvShadeApply(const OsvRenderParams* p, int i, float amount, int passthrough, float* val) {
+    if (amount == 0.0f || i < 0 || i > 1) {
+        return;
+    }
+    const OsvShadeLens* S = &p->shade[i];
+    if (passthrough) {
+        for (int c = 0; c < 3; ++c) {
+            val[c] = osvShadeCodeAdd(&p->color, val[c], S->colour[c] * amount);
+        }
+        return;
+    }
+    for (int c = 0; c < 3; ++c) {
+        val[c] += S->colour[c] * amount;
+    }
+}
+/* ---- [/WP-VIGNETTE] ------------------------------------------------------ */
+
+/* ------------------------------------------------------------------------- */
 /*  [WP-SEAMTOOLS] Two-band seam smoothing                                    */
 /* ------------------------------------------------------------------------- */
 /* The low band's build stages and its lookup, in front of the shader for the
@@ -1643,18 +1800,23 @@ OSV_HD int osvSeamSmoothWeights(const OsvRenderParams* p, OSV_GLOBAL const float
 }
 
 /* Put a low-band sample of lens i through exactly what its full sample goes
- * through after the decode - the flare removal, the lens gain, the photo
- * gain - so the two bands of one lens stay in one space and the difference
- * the shader adds is a difference of like with like. */
+ * through after the decode - the flare removal, [WP-VIGNETTE] the shading
+ * correction (`shadeAmount`, the one osvShadeAmount gave the full sample at
+ * the same lens position), the lens gain, the photo gain - so the two bands
+ * of one lens stay in one space and the difference the shader adds is a
+ * difference of like with like. */
 OSV_HD void osvSeamLowShade(const OsvRenderParams* p, const OsvPhotoPixel* photoPx, int i, int passthrough,
-                            float px, float py, float* val) {
+                            float px, float py, float shadeAmount, float* val) {
     if (!passthrough) {
         if (p->flareEnabled) {
             osvFlareRemove(&p->flare[i], px, py, val);
         }
+        osvShadeApply(p, i, shadeAmount, 0, val); /* [WP-VIGNETTE] */
         val[0] *= p->lens[i].gain[0];
         val[1] *= p->lens[i].gain[1];
         val[2] *= p->lens[i].gain[2];
+    } else {
+        osvShadeApply(p, i, shadeAmount, 1, val); /* [WP-VIGNETTE] code values */
     }
     osvPhotoApplyGain(p, photoPx, i, passthrough, val);
 }
@@ -1730,6 +1892,8 @@ OSV_HD void osvShadePixelWSPL(const OsvRenderParams* p, const OsvPlane* planes, 
     /* [WP-SEAM] each lens's angle from its axis, for the carved seam's
      * visibility (osvSeamVisibility); unused without a blend-seam table. */
     float thetaL[2] = {0.0f, 0.0f};
+    /* [WP-VIGNETTE] each lens's shading correction at its sample (0 = none). */
+    float shadeAmt[2] = {0.0f, 0.0f};
     for (int i = 0; i < 2; ++i) {
         const OsvLens* L = &p->lens[i];
         if (!L->enabled) {
@@ -1772,6 +1936,7 @@ OSV_HD void osvShadePixelWSPL(const OsvRenderParams* p, const OsvPlane* planes, 
             projected[i] = 1;
             thetaL[i] = theta;
             osvPhotoLensWeight(p, &photoPx, i, theta, w[i]); /* [WP-PHOTO] rim-limited twin of w[i] */
+            shadeAmt[i] = osvShadeAmount(p, i, theta, px[i], py[i]); /* [WP-VIGNETTE] */
         }
     }
     osvPhotoPickWeights(&photoPx, w); /* [WP-PHOTO] rim-limited weights unless both vanish */
@@ -1865,6 +2030,7 @@ OSV_HD void osvShadePixelWSPL(const OsvRenderParams* p, const OsvPlane* planes, 
             val[0] = code[0];
             val[1] = code[1];
             val[2] = code[2];
+            osvShadeApply(p, i, shadeAmt[i], 1, val); /* [WP-VIGNETTE] code values */
         } else {
             osvCodeToLinear(&p->color, code, val);
             /* [WP-FLARE] subtract this lens's measured ghosts and veil in
@@ -1873,6 +2039,7 @@ OSV_HD void osvShadePixelWSPL(const OsvRenderParams* p, const OsvPlane* planes, 
                 osvFlareRemove(&p->flare[i], px[i], py[i], val);
             }
             /* [/WP-FLARE] */
+            osvShadeApply(p, i, shadeAmt[i], 0, val); /* [WP-VIGNETTE] native linear, before the gains */
             val[0] *= p->lens[i].gain[0];
             val[1] *= p->lens[i].gain[1];
             val[2] *= p->lens[i].gain[2];
@@ -1902,8 +2069,8 @@ OSV_HD void osvShadePixelWSPL(const OsvRenderParams* p, const OsvPlane* planes, 
             /* A lens with no image data nearby contributes no difference:
              * the pixel stays single-band rather than inventing colour. */
             if (cov0 > 0.0f && cov1 > 0.0f) {
-                osvSeamLowShade(p, &photoPx, 0, passthrough, px[0], py[0], low0);
-                osvSeamLowShade(p, &photoPx, 1, passthrough, px[1], py[1], low1);
+                osvSeamLowShade(p, &photoPx, 0, passthrough, px[0], py[0], shadeAmt[0], low0);
+                osvSeamLowShade(p, &photoPx, 1, passthrough, px[1], py[1], shadeAmt[1], low1);
                 for (int c = 0; c < 3; ++c) {
                     acc[c] += d1 * (low1[c] - low0[c]);
                     /* Linear light cannot go negative; a dark detail under a

@@ -104,6 +104,10 @@ PrefsBlob prefsFromControls(const ControlValues& controls) noexcept {
     blob.setNearOffsetDeg(controls.nearOffsetDeg);
     blob.setFarOffsetDeg(controls.farOffsetDeg);
 
+    // [WP-VIGNETTE] The lens shading correction: a popup and a percent
+    // slider through the blob's setter, exactly like the sky seam fix.
+    blob.lensShading = fromPopup(controls.lensShading, OSV_SS_LENS_SHADING_COUNT, blob.lensShading);
+    blob.setShadingStrengthPercent(controls.shadingStrengthPercent);
     // [WP-STEADY] Both popups go through their tables (the popup lists the
     // default first; the enums keep the older behaviour at 0).  An
     // out-of-range value keeps the choice defaults() wrote.
@@ -167,6 +171,9 @@ ControlValues controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.seamSmoothingDeg = clean.seamSmoothingDeg();
     c.nearOffsetDeg = clean.nearOffsetDeg();
     c.farOffsetDeg = clean.farOffsetDeg();
+    // [WP-VIGNETTE] Code 0 decodes to the default strength.
+    c.lensShading = toPopup(clean.lensShading, OSV_SS_LENS_SHADING_COUNT);
+    c.shadingStrengthPercent = clean.shadingStrengthPercent();
     // [WP-STEADY] The popup items whose choices are the blob's; item 1 (Auto)
     // for a choice missing from a table, which sanitise() rules out.
     c.parallaxGrid = 1;

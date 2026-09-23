@@ -91,6 +91,9 @@ struct ControlValues {
     double seamSmoothingDeg = OSV_SS_SEAM_SMOOTHING_DEFAULT;  ///< Seam Smoothing (0 = off).
     double nearOffsetDeg = OSV_SS_SEAM_OFFSET_DEFAULT;        ///< Near Offset.
     double farOffsetDeg = OSV_SS_SEAM_OFFSET_DEFAULT;         ///< Far Offset.
+    // ---- [WP-VIGNETTE] the lens shading correction ----------------------------
+    int lensShading = OSV_SS_LENS_SHADING_DEFAULT;                    ///< 1-based popup value.
+    double shadingStrengthPercent = OSV_SS_SHADING_STRENGTH_DEFAULT;  ///< Shading Strength, percent.
     // ---- [WP-STEADY] ------------------------------------------------------------
     int parallaxGrid = OSV_SS_PARALLAX_GRID_DEFAULT;  ///< 1-based popup value (kParallaxGridByPopup).
     int lensAlign = OSV_SS_LENS_ALIGN_DEFAULT;        ///< 1-based popup value (kLensAlignByPopup).

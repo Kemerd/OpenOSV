@@ -78,6 +78,7 @@
 #include "osv/geom/Blend.h"
 #include "osv/geom/LensRig.h"
 #include "osv/render/LensAlign.h"
+#include "osv/render/LensShading.h"
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"
 #include "osv/render/SeamAnalysis.h"
@@ -277,6 +278,11 @@ struct ClipSteadyParams {
     /// importer's per-bucket carve does with its photometric field.
     bool rimCost = false;
     PhotoSeamParams photo;        ///< The field the rim comes from (rimCost only).
+    /// Measure that field on shading-corrected lenses, as the importer's
+    /// per-bucket field is (each sample's own model, scaled by
+    /// `shading.strength`); rimCost only.
+    bool shadingOn = false;
+    LensShadingParams shading;
     SteadyDecisionParams decision;
     /// Accepted sample grids needed for a clip grid: fewer is a clip the
     /// flow mostly refused (open sky), which the seam table then serves.

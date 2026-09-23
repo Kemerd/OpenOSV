@@ -45,6 +45,7 @@
 #include "osv/meta/MetadataTrack.h"
 #include "osv/render/CudaAnalysis.h"
 #include "osv/render/FlowBackend.h"
+#include "osv/render/LensShading.h"
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"
 #include "osv/video/DualStreamReader.h"
@@ -257,6 +258,43 @@ PhotoRow timePhoto(const Clip& clip, const video::FramePair& pair, ThreadPool& p
     return row;
 }
 
+// [WP-VIGNETTE] One lens shading measurement: the per-lens bands (the same
+// band shader as the photometric field, over the +-27 deg shading band) and
+// the back-fitted estimate, each a median.
+PhotoRow timeShading(const Clip& clip, const video::FramePair& pair, ThreadPool& pool, int reps) {
+    PhotoRow row;
+    const geom::BlendParams blend;
+    const render::LensShadingParams params;
+    render::RgbLensBands bands;
+    row.bands = medianMs(
+        reps,
+        [&]() -> Status {
+            OSV_TRY_ASSIGN(bands, render::renderShadingBands(clip.rig, pair, blend, params, pool));
+            return okStatus();
+        },
+        "shading bands");
+    if (row.bands < 0.0) {
+        return row;
+    }
+    row.stats = medianMs(
+        reps,
+        [&]() -> Status {
+            OSV_TRY_ASSIGN(render::LensShadingModel m, render::lensShadingFromBands(bands, clip.rig, params, &pool));
+            (void)m;
+            return okStatus();
+        },
+        "shading stats");
+    row.total = medianMs(
+        reps,
+        [&]() -> Status {
+            OSV_TRY_ASSIGN(render::LensShadingModel m, render::measureLensShading(clip.rig, pair, blend, params, pool));
+            (void)m;
+            return okStatus();
+        },
+        "shading total");
+    return row;
+}
+
 void printRow(const char* path, std::uint32_t frame, const Row& r) {
     std::printf("  %-4s  frame %2u   bands %7.3f   flow %7.3f   grid %7.3f (1 thread %6.3f)   total %7.3f ms"
                 "   (consistent %5.1f %%, gated %u/%u)\n",
@@ -340,6 +378,13 @@ int main(int argc, char** argv) {
                     pc.total);
         std::printf("  photo GPU frame %2u   bands %7.3f   stats %7.3f   total %7.3f ms\n\n", frame, pg.bands,
                     pg.stats, pg.total);
+        // [WP-VIGNETTE] the lens shading correction on the same frames.
+        const PhotoRow sc = timeShading(clip.value(), hostPair.value(), pool, reps);
+        const PhotoRow sg = timeShading(clip.value(), devPair.value(), pool, reps);
+        std::printf("  shading CPU frame %2u bands %7.3f   stats %7.3f   total %7.3f ms\n", frame, sc.bands, sc.stats,
+                    sc.total);
+        std::printf("  shading GPU frame %2u bands %7.3f   stats %7.3f   total %7.3f ms\n\n", frame, sg.bands,
+                    sg.stats, sg.total);
     }
     render::uninstallCudaAnalyses();
     return 0;

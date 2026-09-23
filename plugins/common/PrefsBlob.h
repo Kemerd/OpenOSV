@@ -206,6 +206,17 @@ enum class PrefsPhotoSeam : std::uint8_t {
     Count
 };
 
+/// [WP-VIGNETTE] The per-lens shading correction ("Lens Shading" in Source
+/// Settings): osv::render::LensShadingMode, same values.
+///
+/// Off is 0 so an older blob - whose byte is zero - keeps rendering exactly
+/// as it did, the `photoSeam` rule; a fresh blob gets Auto from defaults().
+enum class PrefsLensShading : std::uint8_t {
+    Off = 0,   ///< Nothing is measured or added.
+    Auto = 1,  ///< Each lens's rim structure measured from its own sky and added back.
+    Count
+};
+
 /// [WP-STEADY] "Parallax Grid": whether the seam corrections (the parallax
 /// grid, the seam-shift table and the carved seam) are measured per moment
 /// or held still for the whole clip (osv/render/ClipSteady.h).  Persisted,
@@ -340,10 +351,19 @@ struct PrefsBlob {
     /// Far Offset, the same where they agree.
     std::int16_t farOffset = 0;
     // ---- [/WP-SEAMTOOLS] ------------------------------------------------------
+    // ---- [WP-VIGNETTE] the lens shading correction (osv/render/LensShading.h) --
+    /// PrefsLensShading; 0 = Off, so an older blob renders as it did.
+    std::uint8_t lensShading = 0;
+    /// Strength of the correction: 0 = the default (100 %), otherwise
+    /// (value - 1) percent, so 1 is 0 % and 101 is 100 %.  See
+    /// shadingStrengthPercent().
+    std::uint8_t shadingStrength = 0;
+    // ---- [/WP-VIGNETTE] -------------------------------------------------------
     // ---- [WP-STEADY] steady seam corrections and lens alignment --------------
-    /// Offsets 46-49: another package's range (docs/PARALLEL_WORK.md).  Zero,
-    /// and zeroed by sanitise(); the lead folds it into that package's fields.
-    std::uint8_t padBeforeSteady[4] = {};
+    /// Offsets 48-49: the rest of the range before WP-STEADY's
+    /// (docs/PARALLEL_WORK.md).  Zero, and zeroed by sanitise(); the lead
+    /// folds it at merge.
+    std::uint8_t padBeforeSteady[2] = {};
     /// PrefsParallaxGrid; 0 = FollowsScene, so an older blob renders as it did.
     std::uint8_t parallaxGrid = 0;
     /// PrefsLensAlign; 0 = Off, so an older blob renders as it did.
@@ -362,6 +382,8 @@ struct PrefsBlob {
     static constexpr std::uint8_t kMaxSeamInsetCode = 61;
     /// photoStrength: the largest stored code (101 = 100 %).
     static constexpr std::uint8_t kMaxPhotoStrengthCode = 101;
+    /// [WP-VIGNETTE] shadingStrength: the largest stored code (101 = 100 %).
+    static constexpr std::uint8_t kMaxShadingStrengthCode = 101;
     // [WP-SEAMTOOLS] The seam tools' codes: (code - 1) / kSeamToolStepsPerDeg
     // degrees, 0 = the default.  Twentieths of a degree, because the
     // defaults are 1.5 and 0.35 and both must be exactly representable.
@@ -426,6 +448,12 @@ struct PrefsBlob {
         // strength; the inset stays at its default (code 0).
         p.photoSeam = static_cast<std::uint8_t>(PrefsPhotoSeam::RimAndGain);
         p.photoStrength = 0;
+        // [WP-VIGNETTE] The lens shading correction ON for new clips: on the
+        // sample it removes the soft dark band the master lens's rim ring
+        // leaves on every sky seam crossing (NEURAL_STITCHING.md, section 9),
+        // and a lens whose sky shows no structure is left untouched.
+        p.lensShading = static_cast<std::uint8_t>(PrefsLensShading::Auto);
+        p.shadingStrength = 0;
         // [WP-STEADY] New clips hold the seam corrections still unless the
         // clip shows a near object moving past the seam, and fit the lens
         // rotation.  Measured on the sample: the warp's frame-to-frame motion
@@ -589,6 +617,14 @@ struct PrefsBlob {
         }
         if (farOffset > kMaxSeamOffsetHundredths || farOffset < -kMaxSeamOffsetHundredths) {
             farOffset = 0;
+            clean = false;
+        }
+        // [WP-VIGNETTE] A corrupt mode lands on the DEFAULT (Auto), like
+        // photoSeam; a corrupt strength on the default 100 %.
+        clampEnum(lensShading, static_cast<std::uint8_t>(PrefsLensShading::Count),
+                  static_cast<std::uint8_t>(PrefsLensShading::Auto));
+        if (shadingStrength > kMaxShadingStrengthCode) {
+            shadingStrength = 0;
             clean = false;
         }
         // [WP-STEADY] Corrupt choices land on the DEFAULT (Auto), like
@@ -794,6 +830,32 @@ struct PrefsBlob {
     /// Store a Far Offset.
     void setFarOffsetDeg(double deg) noexcept { farOffset = encodeSeamOffset(deg); }
 
+    // ---- [WP-VIGNETTE] ---------------------------------------------------------
+    /// The lens shading correction mode.
+    [[nodiscard]] PrefsLensShading lensShadingMode() const noexcept {
+        return static_cast<PrefsLensShading>(lensShading);
+    }
+    /// Its strength in percent (code 0 or out of range = the default 100).
+    [[nodiscard]] double shadingStrengthPercent() const noexcept {
+        if (shadingStrength == 0 || shadingStrength > kMaxShadingStrengthCode) {
+            return 100.0;
+        }
+        return static_cast<double>(shadingStrength - 1);
+    }
+    /// Store a strength in percent (rounded, clamped to 0..100); 100 is
+    /// stored as code 0 so it keeps tracking the default.
+    void setShadingStrengthPercent(double percent) noexcept {
+        if (!(percent >= 0.0) || percent > 1e6) {
+            shadingStrength = 0;  // NaN, infinities, negatives: the default
+            return;
+        }
+        long p = static_cast<long>(percent + 0.5);
+        if (p > 100) {
+            p = 100;
+        }
+        shadingStrength = p == 100 ? std::uint8_t{0} : static_cast<std::uint8_t>(p + 1);
+    }
+
 private:
     /// A seam tool code as degrees: 0 or anything outside [minCode, maxCode]
     /// is the default, otherwise (code - 1) / kSeamToolStepsPerDeg - a
@@ -897,11 +959,16 @@ static_assert(offsetof(PrefsBlob, seamSmoothing) == 40, "PrefsBlob layout drifte
 static_assert(offsetof(PrefsBlob, seamToolsPad) == 41, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, nearOffset) == 42, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, farOffset) == 44, "PrefsBlob layout drifted");
-// [WP-STEADY] owns offsets 50-53 (46-49 belong to another package and are
-// padded here).  Both choices' zero reads as the behaviour before they
-// existed - per-moment corrections, the calibration alone - so an old
-// project renders exactly as before; a fresh blob gets Auto for both.
-static_assert(offsetof(PrefsBlob, padBeforeSteady) == 46, "PrefsBlob layout drifted");
+// [WP-VIGNETTE] The lens shading correction takes offsets 46-47 from the
+// front of the reserved block.  lensShading's zero in an older blob reads as
+// Off, so an old project renders as before; a fresh blob gets Auto.
+static_assert(offsetof(PrefsBlob, lensShading) == 46, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, shadingStrength) == 47, "PrefsBlob layout drifted");
+// [WP-STEADY] owns offsets 50-53 (48-49 are padded).  Both choices' zero
+// reads as the behaviour before they existed - per-moment corrections, the
+// calibration alone - so an old project renders exactly as before; a fresh
+// blob gets Auto for both.
+static_assert(offsetof(PrefsBlob, padBeforeSteady) == 48, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, parallaxGrid) == 50, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, lensAlign) == 51, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, steadyReserved) == 52, "PrefsBlob layout drifted");
