@@ -28,6 +28,7 @@ struct LutOptions {
     std::string fit = "osmo360";
     std::string outTransfer = "pq";
     std::string input = "dlogm";
+    std::string look = "dji";  ///< Rec.709 display look: dji (default) | standard.
     std::string title;
     std::string outPath;
     unsigned size = 65;
@@ -58,6 +59,12 @@ int runLut(const LutOptions& opt) {
                      osv::log::safe(opt.input).c_str());
         return kExitUsage;
     }
+    Look look = kDefaultLook;
+    if (!parseLook(opt.look, look)) {
+        std::fprintf(stderr, "error: unknown --look '%s' (expected dji or standard)\n",
+                     osv::log::safe(opt.look).c_str());
+        return kExitUsage;
+    }
     // --- numeric sanity ------------------------------------------------------
     if (opt.size < 2 || opt.size > 256) {
         std::fprintf(stderr, "error: --size must be in [2, 256]\n");
@@ -76,7 +83,8 @@ int runLut(const LutOptions& opt) {
     // The LUT input is R'G'B' (already expanded to 0..1), so the YCbCr part
     // of the block is unused; narrow-input handling is done by the cube
     // writer on the LUT axis instead.
-    const OsvColorParams params = makeColorParams(fit, transfer, static_cast<float>(opt.exposure), input);
+    const OsvColorParams params = makeColorParams(fit, transfer, static_cast<float>(opt.exposure), input, true, 10,
+                                                  nullptr, kBt2408SceneScale, look);
     if (!colorParamsValid(params)) {
         std::fprintf(stderr, "error: internal colour parameter block is invalid\n");
         return kExitRuntime;
@@ -106,6 +114,9 @@ int runLut(const LutOptions& opt) {
     std::printf("  input     : %s%s\n", inputEncodingName(input), opt.narrowInput ? " (narrow-range axis)" : "");
     std::printf("  fit       : %s\n", dlogMFitName(fit));
     std::printf("  output    : %s\n", outputTransferName(transfer));
+    if (transfer == OutputTransfer::Rec709) {
+        std::printf("  look      : %s\n", lookName(look));
+    }
     std::printf("  exposure  : %+.2f stops\n", opt.exposure);
     std::printf("  size      : %u^3 = %llu entries\n", opt.size, entries);
     // A grey anchor so the user can sanity check the LUT in their NLE.
@@ -128,6 +139,8 @@ void registerLutCommand(CLI::App& app, CommandContext& ctx) {
     sub->add_option("--out-transfer", opt->outTransfer, "Output encoding: pq (default), hlg, 709, linear, dlogm")
         ->capture_default_str();
     sub->add_option("--input", opt->input, "Source encoding: dlogm (default), hlg, 709")->capture_default_str();
+    sub->add_option("--look", opt->look, "Rec.709 look: dji (DJI Studio, default) or standard")
+        ->capture_default_str();
     sub->add_option("--size", opt->size, "Grid points per axis (2..256)")->capture_default_str();
     sub->add_option("--exposure", opt->exposure, "Exposure offset in stops")->capture_default_str();
     sub->add_option("--title", opt->title, "TITLE line written to the file");

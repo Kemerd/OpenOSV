@@ -114,6 +114,8 @@ void addPipelineOptions(CLI::App* sub, PipelineOptions& opt) {
     colorGroup->add_option("--fit", opt.fit, "D-Log M curve: osmo360|dji|pocket3")->default_str("osmo360");
     colorGroup->add_option("--input-encoding", opt.inputEncoding, "auto|dlogm|hlg|normal")->default_str("auto");
     colorGroup->add_option("--exposure", opt.exposureStops, "Exposure offset in stops")->default_val(0.0);
+    colorGroup->add_option("--look", opt.look, "Rec.709 look: dji (DJI Studio, default) | standard")
+        ->default_str("dji");
 
     auto* backendGroup = sub->add_option_group("Backends");
     backendGroup->add_option("--hw", opt.hw, "Decoder acceleration: none|d3d11va|cuda|auto")->default_str("none");
@@ -250,8 +252,15 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     if (!color::parseDlogMFit(lower(options.fit), fit)) {
         return Error{ErrorCode::InvalidArgument, "unknown --fit '" + options.fit + "'"};
     }
+    // The Rec.709 display look (ignored by every other output): DJI Studio's
+    // rendering unless the standard one is asked for.
+    color::Look look = color::kDefaultLook;
+    if (!color::parseLook(lower(options.look), look)) {
+        return Error{ErrorCode::InvalidArgument, "unknown --look '" + options.look + "' (expected dji or standard)"};
+    }
     p->color = color::makeColorParams(fit, p->outputTransfer, static_cast<float>(options.exposureStops),
-                                      p->inputEncoding, true, p->format.bitDepth ? p->format.bitDepth : 10);
+                                      p->inputEncoding, true, p->format.bitDepth ? p->format.bitDepth : 10, nullptr,
+                                      color::kBt2408SceneScale, look);
 
     // ---- stabilisation ----------------------------------------------------------------
     const std::string stab = lower(options.stab);

@@ -429,7 +429,7 @@ TEST_CASE("The committed LUTs match the current pipeline", "[color][cube]") {
         {"OpenOSV_Osmo360_DLogM_to_Rec2100_HLG.cube", OutputTransfer::HLG,
          "OpenOSV Osmo 360 D-Log M to Rec.2100 HLG (osmo360 curve)"},
         {"OpenOSV_Osmo360_DLogM_to_Rec709.cube", OutputTransfer::Rec709,
-         "OpenOSV Osmo 360 D-Log M to Rec.709 (osmo360 curve)"},
+         "OpenOSV Osmo 360 D-Log M to Rec.709 (osmo360 curve, DJI Studio look)"},
     };
 
     const std::filesystem::path dir = osvtest::lutsDir();

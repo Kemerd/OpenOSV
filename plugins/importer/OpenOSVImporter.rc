@@ -49,6 +49,13 @@ BEGIN
     COMBOBOX        IDC_COLOR_OUTPUT, 82, 7, 179, 80,
                     CBS_DROPDOWNLIST | WS_VSCROLL | WS_GROUP | WS_TABSTOP
 
+    // ---- [WP-LOOK] Rec.709 look, in the free row under Colour output ------
+    // Greyed by the dialog code whenever Colour output is not Rec.709, the
+    // only output that has a look.
+    LTEXT           "Rec.709 &look:", IDC_STATIC_LOOK, 7, 30, 70, 8
+    COMBOBOX        IDC_REC709_LOOK, 82, 27, 179, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
     // ---- Geometry ---------------------------------------------------------
     LTEXT           "Output &size:", IDC_STATIC_SIZE, 7, 50, 70, 8
     COMBOBOX        IDC_OUTPUT_SIZE, 82, 47, 179, 80,
