@@ -462,6 +462,10 @@ csSDK_int32 handleGetInfo8(imStdParms* stdParms, imFileAccessRec8* fileAccess, i
     }
 
     instance->applyPrefs(info->prefs, PrefsBlob::kSize);
+    // [WP-DEFAULTS] No stored blob here - the first prefs-carrying selector
+    // after imOpenFile8 - means a new clip on the user's saved defaults;
+    // say so (once per clip, and only when a defaults file supplied them).
+    noteNewClipDefaults(instance, "imGetInfo8");
     const PrefsBlob prefs = instance->prefs();
     const OutputGeometry geometry = instance->geometryFor(prefs);
     if (!geometry.valid()) {

@@ -228,6 +228,13 @@ csSDK_int32 handleGetInstancePrefs(imStdParms* stdParms, imFileAccessRec8* fileA
 csSDK_int32 handlePerformSourceSettingsCommand(imStdParms* stdParms, imFileAccessRec8* fileAccess,
                                                imSourceSettingsCommandRec* rec);
 
+/// [WP-DEFAULTS] Log - once per clip - that `instance` is a NEW clip decoded
+/// with the user's saved Source Settings defaults, and from which file.
+/// Does nothing for a clip with stored settings, for the built-in defaults
+/// and for a null instance.  `where` names the selector, for the log.
+/// (SourceSettingsDialog.cpp, beside the other prefs selectors.)
+void noteNewClipDefaults(ImporterInstance* instance, const char* where) noexcept;
+
 /// The pure mapping the dialog uses, exposed so it can be unit-tested without
 /// ever creating a window.  `controls` is the state of the dialog's widgets.
 struct DialogControls {

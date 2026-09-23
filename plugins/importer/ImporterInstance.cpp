@@ -1058,7 +1058,20 @@ void ImporterInstance::applyPrefs(const void* bytes, std::size_t length) {
 void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
     // A selector that carries no prefs (or a blob written by something else)
     // leaves the current settings alone; fromBytes() already sanitises.
-    if (!bytes || length < PrefsBlob::kSize) {
+    //
+    // [WP-DEFAULTS] "A blob written by something else" includes the
+    // zero-filled buffer a host holds for a clip that has no settings yet.
+    // It used to fall through to fromBytes(), which turns it into
+    // PrefsBlob::defaults() - adopted, and published to the engine, as if
+    // the host had chosen them - so a new clip lost the user defaults it was
+    // seeded with (seedStartingPrefs) on its very first selector.  A buffer
+    // that is not ours is now exactly what it means: no settings.
+    auto holdsOurBlob = [](const void* candidate) noexcept {
+        PrefsBlob probe;
+        std::memcpy(&probe, candidate, PrefsBlob::kSize);
+        return probe.isValid();
+    };
+    if (!bytes || length < PrefsBlob::kSize || !holdsOurBlob(bytes)) {
         if (!m_colorBuilt) {
             rebuildColor();
         }
@@ -1148,6 +1161,40 @@ void ImporterInstance::publishSettingsLocked(bool fromHost) noexcept {
     if (fromHost) {
         m_settingsPublishedFromHost = true;
     }
+}
+
+// [WP-DEFAULTS]
+bool ImporterInstance::seedStartingPrefs(const PrefsBlob& prefs, std::string source) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    // Too late once the clip is parsed (the rig was built from the prefs in
+    // force), once anything else was built from them, or once the host has
+    // handed over a blob: re-seeding then would change a clip nobody touched.
+    if (m_parsed || m_colorBuilt || m_rigBuilt || m_stabBuilt || m_settingsPublishedFromHost) {
+        return false;
+    }
+    // A blob that did not come from us is never trusted, even from this
+    // module's own defaults file: sanitise, or fall back to the built-in.
+    PrefsBlob clean = prefs;
+    if (!clean.isValid()) {
+        clean = PrefsBlob::defaults();
+    }
+    clean.sanitise();
+    m_prefs = clean;
+    m_defaultsSource = std::move(source);
+    return true;
+}
+
+// [WP-DEFAULTS]
+bool ImporterInstance::takeUserDefaultsNotice(std::string& source) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    // Nothing to announce for the built-in defaults, for a clip the host has
+    // given stored settings (those replaced the seed), or a second time.
+    if (m_defaultsSource.empty() || m_defaultsNoticeTaken || m_settingsPublishedFromHost) {
+        return false;
+    }
+    m_defaultsNoticeTaken = true;
+    source = m_defaultsSource;
+    return true;
 }
 
 AudioDecoder* ImporterInstance::audioLocked() { return audioImpl(); }

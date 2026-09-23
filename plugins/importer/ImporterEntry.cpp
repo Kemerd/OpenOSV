@@ -28,6 +28,7 @@
 #include "Engine.h"
 #include "HostContext.h"
 #include "PluginLog.h"
+#include "UserDefaults.h"
 #include "osv/video/GpuDecoderPool.h"
 #include "osv/video/ReaderPool.h"
 
@@ -104,12 +105,31 @@ ImporterGlobals& globalsImpl() noexcept {
 //  imInit
 // ---------------------------------------------------------------------------
 
+/// [WP-DEFAULTS] The UserDefaults log sink of this module: every message of
+/// plugins/common/UserDefaults.cpp lands in OpenOSVImporter.log.
+void logUserDefaultsMessage(UserDefaultsLogLevel level, std::string_view message) noexcept {
+    PluginLog::Level mapped = PluginLog::Level::Debug;
+    switch (level) {
+    case UserDefaultsLogLevel::Info:  mapped = PluginLog::Level::Info; break;
+    case UserDefaultsLogLevel::Warn:  mapped = PluginLog::Level::Warn; break;
+    case UserDefaultsLogLevel::Error: mapped = PluginLog::Level::Error; break;
+    case UserDefaultsLogLevel::Debug:
+    default:                          mapped = PluginLog::Level::Debug; break;
+    }
+    if (PluginLog::enabled(mapped)) {
+        PluginLog::write(mapped, message);
+    }
+}
+
 csSDK_int32 doInit(imStdParms* stdParms, imImportInfoRec* info) {
     if (!info) {
         return imOtherErr;
     }
 
     PluginLog::init(kLogName);
+    // [WP-DEFAULTS] The defaults file's own messages (read, saved, ignored as
+    // corrupt) belong in this module's log, not on a stderr nobody sees.
+    setUserDefaultsLogSink(&logUserDefaultsMessage);
     // Copy the version struct under the lock that publishes it: ensureSuites()
     // has already run for this selector, but on another thread it may be
     // running for a different one right now.
@@ -249,6 +269,18 @@ csSDK_int32 doOpenFile8(imStdParms* stdParms, imFileRef* fileRef, imFileOpenRec8
             return imMemErr;
         }
         created = true;
+
+        // [WP-DEFAULTS] A new instance starts from the user's saved Source
+        // Settings defaults instead of the built-in ones.  For a clip with
+        // stored settings that is only the starting point - the host hands
+        // the stored blob to imGetInfo8, next, and it replaces the seed
+        // before anything is rendered - but for a NEW clip, which has no
+        // blob, it is what the clip is decoded with.  Seeded before open(),
+        // because open() builds the lens rig from the calibration in force.
+        // noteNewClipDefaults() logs the new-clip case once it is certain.
+        const UserDefaults startFrom = currentUserDefaults();
+        instance->seedStartingPrefs(startFrom.prefs,
+                                    startFrom.fromFile ? userDefaultsPathForLog(startFrom.path) : std::string());
     }
 
     const Status st = instance->open();
