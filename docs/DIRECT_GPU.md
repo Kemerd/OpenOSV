@@ -450,14 +450,17 @@ newest instance's settings).
 
 **Known limitations and hand-offs.** Two master clips of the same file with
 different Source Settings share one set on the direct path (the newest
-instance's). The modal dialog (`SourceSettingsDialog.cpp`, WP-CALIB) calls
-`RefreshFileAsync` only when it has an instance (`imGetInstancePrefs`), not
-from `imGetPrefs8`, and has no Direct Path Colour combo yet (it preserves the
-field). The connection-space override in `imGetSourceVideo` (host selects
-"BT.709 RGB Full") goes through `applyPrefsLocked` and is therefore
-published like a user change (WP-IMPORTER). Effects placed BEFORE Open 360
-Reframe on the clip are bypassed by the direct path (it never reads its
-input frame).
+instance's). The modal dialog (`SourceSettingsDialog.cpp` / `PrefsMapping.cpp`,
+WP-CALIB) calls `RefreshFileAsync` only when it has an instance
+(`imGetInstancePrefs`), not from `imGetPrefs8`; it has no Direct Path Colour
+combo yet, and because `prefsFromControls` rebuilds the blob from
+`PrefsBlob::defaults()`, clicking OK resets every field it shows no control
+for (Direct Path Colour, and already parallax / flow backend) - it should
+start from the incoming blob. The connection-space override in
+`imGetSourceVideo` (host selects "BT.709 RGB Full") goes through
+`applyPrefsLocked` and is therefore published like a user change
+(WP-IMPORTER). Effects placed BEFORE Open 360 Reframe on the clip are
+bypassed by the direct path (it never reads its input frame).
 
 ## Rules for every package
 
