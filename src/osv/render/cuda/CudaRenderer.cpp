@@ -7,6 +7,7 @@
 #include "osv/render/CudaRenderer.h"
 #include "CudaLaunch.h"
 #include "osv/core/Log.h"
+#include "osv/render/SeamTools.h"
 
 #include <cuda_runtime.h>
 
@@ -110,6 +111,8 @@ struct CudaRenderer::Impl {
     DeviceBuffer warp;
     DeviceBuffer blendSeam;  // [WP-SEAM] carved blend-seam table
     DeviceBuffer photo;      // [WP-PHOTO] photometric seam table
+    DeviceBuffer seamLow;         // [WP-SEAMTOOLS] seam smoothing low band
+    DeviceBuffer seamLowScratch;  // [WP-SEAMTOOLS] its blur's middle pass
     DeviceBuffer out;
     PinnedBuffer staging;
     std::mutex mutex;  // one render at a time per renderer
@@ -128,6 +131,8 @@ struct CudaRenderer::Impl {
         warp.release();
         blendSeam.release();
         photo.release();
+        seamLow.release();
+        seamLowScratch.release();
         out.release();
         staging.release();
     }
@@ -294,11 +299,33 @@ struct CudaRenderer::Impl {
         OSV_TRY(out.ensure(outWidthBytes, static_cast<std::size_t>(job.params.outH)));
         const int outPitchFloats = static_cast<int>(out.pitch / sizeof(float));
 
-        // Launch through the nvcc-compiled translation unit.
         OsvPlanePair pair;
         pair.p[0] = devPlanes[0];
         pair.p[1] = devPlanes[1];
-        err = osvCudaLaunchReframe(job.params, pair, seamPtr, warpPtr, blendSeamPtr, photoPtr,
+
+        // [WP-SEAMTOOLS] The seam smoothing's low band, built on the device
+        // from the planes the stitch reads (in place for NVDEC frames), on
+        // the same stream so the stitch kernel sees it finished.  Only with a
+        // carved seam to smooth; otherwise the pointer stays null and the
+        // kernel is exactly the one before seam smoothing existed.
+        const float* seamLowPtr = nullptr;
+        if (job.params.seamSmoothEnabled && blendSeamPtr) {
+            const std::size_t bytes = seamLowTableFloats(job.params) * sizeof(float);
+            if (bytes == 0) {
+                return failStatus(ErrorCode::InvalidArgument, "CudaRenderer: malformed seam smoothing fields");
+            }
+            OSV_TRY(seamLow.ensure(bytes, 1));
+            OSV_TRY(seamLowScratch.ensure(bytes, 1));
+            err = osvCudaBuildSeamLow(job.params, pair, static_cast<float*>(seamLow.ptr),
+                                      static_cast<float*>(seamLowScratch.ptr), stream);
+            if (err != cudaSuccess) {
+                return failStatus(ErrorCode::Gpu, cudaMessage("seam low band", err));
+            }
+            seamLowPtr = static_cast<const float*>(seamLow.ptr);
+        }
+
+        // Launch through the nvcc-compiled translation unit.
+        err = osvCudaLaunchReframe(job.params, pair, seamPtr, warpPtr, blendSeamPtr, photoPtr, seamLowPtr,
                                    static_cast<float*>(out.ptr), outPitchFloats, stream);
         if (err != cudaSuccess) {
             return failStatus(ErrorCode::Gpu, cudaMessage("kernel launch", err));
@@ -481,6 +508,36 @@ Result<ImageRGBAf> cudaReframeEquirect(int deviceIndex, const OsvReframeParams& 
         return Error{ErrorCode::Gpu, cudaMessage("equirect readback", err)};
     }
     return image;
+}
+
+// -----------------------------------------------------------------------------
+//  [WP-SEAMTOOLS] The seam smoothing's low band for the direct path
+// -----------------------------------------------------------------------------
+Status cudaBuildSeamLowBand(const OsvRenderParams& params, const OsvPlane planes[2], float* dst, float* scratch,
+                            void* stream) {
+    // Everything the kernels index with is checked before a launch: a fault
+    // in the host's own context would poison every later GPU call there.
+    if (!params.seamSmoothEnabled || !seamSmoothParamsValid(params) || seamLowTableFloats(params) == 0) {
+        return failStatus(ErrorCode::InvalidArgument, "cudaBuildSeamLowBand: smoothing is off or malformed");
+    }
+    if (!planes || !dst || !scratch) {
+        return failStatus(ErrorCode::InvalidArgument, "cudaBuildSeamLowBand: null planes or buffers");
+    }
+    OsvPlanePair pair;
+    for (int i = 0; i < 2; ++i) {
+        const OsvPlane& P = planes[i];
+        if (params.lens[i].enabled && (!P.y || !P.u || !P.v || P.w <= 0 || P.h <= 0)) {
+            return failStatus(ErrorCode::InvalidArgument, "cudaBuildSeamLowBand: an empty plane");
+        }
+        pair.p[i] = P;
+    }
+    // The context is the caller's (the engine pushed it); the runtime runs
+    // in whatever context is current, so nothing is selected here.
+    const cudaError_t err = osvCudaBuildSeamLow(params, pair, dst, scratch, static_cast<cudaStream_t>(stream));
+    if (err != cudaSuccess) {
+        return failStatus(ErrorCode::Gpu, cudaMessage("seam low band", err));
+    }
+    return okStatus();
 }
 
 }  // namespace osv::render

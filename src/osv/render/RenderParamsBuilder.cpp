@@ -5,6 +5,7 @@
 #include "osv/core/Log.h"
 #include "osv/render/Flare.h"
 #include "osv/render/PhotoSeam.h"
+#include "osv/render/SeamTools.h"
 
 #include <algorithm>
 #include <cmath>
@@ -192,6 +193,26 @@ RenderParamsBuilder& RenderParamsBuilder::clearPhoto() {
     m_photoChromaDecay = 0.0f;
     m_photoRimFeather = 0.0f;
     m_photoStrength = 0.0f;
+    return *this;
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-SEAMTOOLS] seam smoothing
+// ---------------------------------------------------------------------------
+RenderParamsBuilder& RenderParamsBuilder::seamSmooth(double halfWidthDeg, double sigmaDeg) {
+    // Garbage turns the feature off rather than configuring it half way; the
+    // width is clamped to its range when the block is built.
+    if (!std::isfinite(halfWidthDeg) || !(halfWidthDeg > 0.0)) {
+        return clearSeamSmooth();
+    }
+    m_seamSmoothDeg = halfWidthDeg;
+    m_seamSmoothSigmaDeg = std::isfinite(sigmaDeg) ? sigmaDeg : -1.0;
+    return *this;
+}
+
+RenderParamsBuilder& RenderParamsBuilder::clearSeamSmooth() {
+    m_seamSmoothDeg = 0.0;
+    m_seamSmoothSigmaDeg = -1.0;
     return *this;
 }
 
@@ -396,6 +417,14 @@ Result<OsvRenderParams> RenderParamsBuilder::buildParams() const {
         const double hi = std::min(static_cast<double>(std::max(m_photoLatMin, m_photoLatMax)) + pad, kHalfPi);
         p.photoSinLatLo = static_cast<float>(std::sin(lo));
         p.photoSinLatHi = static_cast<float>(std::sin(hi));
+    }
+
+    // [WP-SEAMTOOLS] Seam smoothing only where there is a carved seam to
+    // smooth (the kernel would ignore it otherwise, and a renderer would
+    // build a low band for nothing).  All zero without it (the memset above),
+    // which is what keeps every render without smoothing exactly as it was.
+    if (m_seamSmoothDeg > 0.0 && !m_blendSeam.empty() && m_blendEnabled) {
+        fillSeamSmoothParams(p, m_seamSmoothDeg, m_seamSmoothSigmaDeg);
     }
     return p;
 }

@@ -18,10 +18,20 @@ struct OsvPlanePair {
 
 /// Launch the reframe kernel asynchronously on `stream`.  `blendSeam` is the
 /// device copy of the carved blend-seam table ([WP-SEAM]) or null; `photo`
-/// the device copy of the photometric seam table ([WP-PHOTO]) or null.
+/// the device copy of the photometric seam table ([WP-PHOTO]) or null;
+/// `seamLow` the seam smoothing's low band ([WP-SEAMTOOLS],
+/// osvCudaBuildSeamLow) or null.
 cudaError_t osvCudaLaunchReframe(const OsvRenderParams& params, const OsvPlanePair& planes, const float* seam,
-                                 const float* warp, const float* blendSeam, const float* photo, float* out,
-                                 int outPitchFloats, cudaStream_t stream);
+                                 const float* warp, const float* blendSeam, const float* photo, const float* seamLow,
+                                 float* out, int outPitchFloats, cudaStream_t stream);
+
+/// [WP-SEAMTOOLS] Build the seam smoothing's two-lens low band from DEVICE
+/// planes, asynchronously on `stream`: decimate into `dst`, then the two
+/// blur passes through `scratch` back into `dst`.  Both buffers hold
+/// seamLowTableFloats(params) floats.  cudaErrorInvalidValue for a null
+/// buffer or smoothing that is off.
+cudaError_t osvCudaBuildSeamLow(const OsvRenderParams& params, const OsvPlanePair& planes, float* dst,
+                                float* scratch, cudaStream_t stream);
 
 /// Launch the equirect reframe kernel (osvReframeEquirectPixel) asynchronously
 /// on `stream`.  `pixels` is the device copy of the source equirect described

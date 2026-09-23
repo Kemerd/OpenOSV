@@ -99,6 +99,18 @@ public:
     /// [WP-PHOTO] Remove any previously set photometric seam field.
     RenderParamsBuilder& clearPhoto();
 
+    /// [WP-SEAMTOOLS] Seam Smoothing (SeamTools.h): blend the lenses' low
+    /// frequencies over `halfWidthDeg` around the carved seam while the high
+    /// frequencies keep the seam's own feather.  `sigmaDeg` < 0 picks the
+    /// measured default blur (kSeamLowSigmaPerHalfWidth x the width).  Only
+    /// takes effect together with a blend seam (blendSeam()): without one
+    /// there is no seam to smooth and the block stays exactly as before.  A
+    /// width that is not above zero - or not finite - turns it off.
+    RenderParamsBuilder& seamSmooth(double halfWidthDeg, double sigmaDeg = -1.0);
+
+    /// [WP-SEAMTOOLS] No seam smoothing (the default).
+    RenderParamsBuilder& clearSeamSmooth();
+
     /// Colour pipeline block from osv::color::makeColorParams (required).
     RenderParamsBuilder& color(const OsvColorParams& params);
 
@@ -147,6 +159,9 @@ private:
     float m_photoChromaDecay = 0.0f;   ///< Chroma decay distance, radians.
     float m_photoRimFeather = 0.0f;    ///< Feather below the rim, radians; 0 = no rim.
     float m_photoStrength = 0.0f;      ///< Gain strength 0..1; 0 = no gain.
+    // [WP-SEAMTOOLS] seam smoothing (0 = off)
+    double m_seamSmoothDeg = 0.0;      ///< Low-band blend half width, degrees.
+    double m_seamSmoothSigmaDeg = -1.0;  ///< Low-band blur sigma, degrees; < 0 = the default.
     std::optional<OsvColorParams> m_color;
     bool m_alphaCoverage = true;
     std::array<bool, 2> m_lensEnabled{true, true};
