@@ -82,7 +82,8 @@ plugins/
     HostSuites.h/.cpp         RAII acquire/release of SweetPea suites by name+version
     PluginLog.h/.cpp          file log (%LOCALAPPDATA%\OpenOSV\<plugin>.log) + OutputDebugString
     DelayLoad.h/.cpp          delay-load hook: resolve avcodec/avformat/... /OpenCL.dll from the plug-in's own folder
-    PixelCopy.h/.cpp          RGBA float top-down  ->  BGRA 32f / 8u bottom-up with row bytes (SIMD friendly loops)
+    PixelCopy.h/.cpp          RGBA float top-down  ->  BGRA 32f / 16u / 8u bottom-up with row bytes (SIMD friendly
+                              loops), whole frames or streamed bands (rgbaRowsToHost, packedRowsToHost)
     HostContext.h/.cpp        process-wide lazily created renderer pool + thread pool, torn down explicitly
     PrefsBlob.h               the importer prefs struct (shared with the dialog AND the source settings effect)
     SourceSettingsIdentity.h  the ONE spelling of the source settings effect's match name, included by
@@ -92,6 +93,10 @@ plugins/
     ImporterEntry.cpp         xImportEntry dispatch, DllMain, imInit/imShutdown, open/quiet/close, privateData handle
     ImporterInstance.h/.cpp   per-clip state (privateData): reader, rig, colour, stabilisation, frame + analysis caches, mutex
     ImporterVideo.cpp         imGetInfo8/9, pixel formats, frame sizes, clip frame descriptors, colour spaces, imGetSourceVideo, imAnalysis
+    ImporterGpuFrame.h/.cpp   the importer's own GPU frame path: pinned banded readback (GpuReadback), the lock
+                              around the shared CUDA renderer's output, OPENOSV_IMPORTER_NO_GPU_DECODE
+    ImporterPackKernel.h/.cu  16u / 8u packing on the GPU before the readback (own static library: nvcc never
+                              sees the plug-in's MSVC options)
     ImporterAudio.h/.cpp      AudioDecoder: its own AVFormatContext, AAC -> planar float, exact random + sequential positioning
     ImporterAudioSelectors.cpp  imImportAudio7 / imResetSequentialAudio / imGetSequentialAudio / imGetAudioChannelLayout
     PrefsMapping.cpp          the PURE PrefsBlob <-> dialog-control mapping and the colour-space tokens (compiled into the tests too)
@@ -144,6 +149,8 @@ tests/premiere/               mock-host harness (see Verification); added from p
   importer/                   osv_importer_tests: LoadLibraryW on the built .prm, driven through the mock host
     ImporterHarness.h/.cpp    loads the module, plays host (imInit/imShutdown, ClipHandle RAII, request builders)
     test_importer.cpp         registration, open/quiet/close, imGetInfo8/9, formats, sizes, colour, frames, audio, prefs, timing
+    test_importer_bitdepth.cpp  bit-depth negotiation per signal, 16u delivery, GPU frame path == host path, shared
+                              renderer under concurrency, direct path changes nothing, Rec.709 override stays local
     test_prefs_mapping.cpp    the pure prefs <-> controls mapping (links plugins/importer/PrefsMapping.cpp directly)
   reframe/                    osv_reframe_tests (loads Open360Reframe.aex)
   sourcesettings/             osv_source_settings_tests (loads OpenOSVSourceSettings.aex)
@@ -277,10 +284,32 @@ CPU / CUDA / OpenCL exactly like the fisheye path.
 
 ### Pixel formats, sizes, colour
 
-* `imGetIndPixelFormat`: 0 -> `PrPixelFormat_BGRA_4444_32f`, 1 -> `PrPixelFormat_BGRA_4444_8u`, 2 -> `imBadFormatIndex`.
+* The importer produces `BGRA_4444_32f`, `BGRA_4444_16u` (0..32768, the SDK's
+  16-bit white) and `BGRA_4444_8u` for any clip, but OFFERS them per clip,
+  by the signal its Source Settings produce (a 10-bit HDR picture must not be
+  offered 8 bits - 8-bit PQ bands in every sky):
+
+  | Colour output | `imGetIndPixelFormat` (preference order) | `imSelectClipFrameDescriptor(2)` |
+  |---|---|---|
+  | Rec.709 (SDR) | 32f, 8u | Maximum Bit Depth off -> 8u; else the host's wish if we make it, else 32f |
+  | PQ / HLG (HDR, clamped to [0, 1]) | 32f, 16u | Maximum Bit Depth off -> **16u, never 8u**; else 32f / 16u as wished, else 32f |
+  | D-Log M passthrough (log, can exceed [0, 1]) | 32f | always 32f |
+
+  SDK basis: "Pixel formats should be returned in the preferred order" and
+  "the host will attempt to always talk to the importer in the preferred
+  pixel format if possible" (the record carries `prefs`, and the host
+  enumerates again when Source Settings change); imSelectClipFrameDescriptor
+  exists to "change pixel formats based on ... source settings, such as HDR";
+  "For high-bit depth support, the 32f formats are the recommended route"
+  (so 32f leads every list).  The 8u that Premiere 26.2.2 asked for on every
+  frame came from this importer's own descriptor answer: it said 8u whenever
+  Maximum Bit Depth was off, which is the sequence default.  Each distinct
+  negotiation is now logged once (`imSelectClipFrameDescriptor2: host wants
+  ..., Maximum Bit Depth ... -> answering ...`) so a real session shows what
+  the host asked for.
 * `imGetPreferredFrameSize`: index 0 native, 1 half, 2 quarter (`imIterateFrameSizes`), then `imOtherErr`.
 * `imSelectClipFrameDescriptor(2)`: return the desired descriptor unchanged
-  except pixel format coerced to one of the two above and size to the nearest
+  except the pixel format (table above) and the size, snapped to the nearest
   advertised size.
 * `imGetIndColorSpace` index 0: `kPrSDKColorSpaceType_Predefined` with
   `ioProfileRec.outName` (String Suite) = `kPrOverranged2100PQ` ("BT.2100 PQ RGB Full"),
@@ -296,18 +325,100 @@ CPU / CUDA / OpenCL exactly like the fisheye path.
   instead, for the runtime comparison on real hosts.
 * `imGetColorSpaceFromOpaqueData` (23.3, undocumented) and every unknown
   selector return `imUnsupported`, logged once.
-* `imGetSourceVideo`: pick the first requested format we support (0 = any ->
-  32f at native size), look the frame up in the PPix cache
+* `imGetSourceVideo`: walk the requested formats in the host's order and take
+  the first we produce (`PrPixelFormat_Any` -> the clip's preferred 32f; an
+  explicit `BGRA_4444_8u` is ALWAYS honoured - "all importers must support
+  BGRA pixel format as well" - and logged once when the clip is HDR or log;
+  16u for the unbounded log output is served as the lossless 32f); nothing
+  usable -> 32f at native size.  Look the frame up in the PPix cache
   (`GetFrameFromCacheWithColorSpace`, key = importerID / stream / frame /
-  quality / prefs blob), else decode + stitch, create with
+  quality / prefs blob), else create the PPix with
   `PPixCreator2Suite::CreateColorManagedPPix(..., opaqueColorSpaceIdentifier)`
-  (plain `CreatePPix` when the id is invalid), copy with `PixelCopy` honouring
-  `GetRowBytes` and bottom-left origin, `AddFrameToCacheWithColorSpace`.
+  (plain `CreatePPix` when the id is invalid), render straight into it
+  (`ImporterInstance::renderFrameToHost`, see "The importer's own frame"
+  below), `AddFrameToCacheWithColorSpace`.
   If `selectedColorProfileName == kPrOverranged709` the host could not use the
-  declared space: render with the Rec.709 transfer regardless of prefs.
+  declared space: render THIS request with the Rec.709 transfer (a
+  request-local `outputTransfer`; the clip's prefs, and so what the direct-path
+  engine renders, are untouched).  The cache key blob says Rec.709 for such a
+  frame, so it is never served to an ordinary request.
   Draft: `inQuality <= kPrRenderQuality_Low` or a scrubbing/playing intent with
   `inPlaybackRatio < 1` disables seam search for that frame.
 * Frame index = `inFrameTime / ticksPerFrame` with rounding, clamped.
+
+### The importer's own frame
+
+Premiere requests the importer's equirect for every clip on the timeline -
+also when the reframe effect renders its view straight from the fisheyes
+(docs/DIRECT_GPU.md) and ignores that input.  So the importer's frame has to
+be cheap, and it has to stay full quality (next paragraph).  Two paths
+produce it, both from one parameter block (`ImporterInstance::buildEquirectJob`,
+the builder chain renderFrame always had):
+
+* **GPU path** (`renderFrameToHost` -> `renderFrameOnGpu`): both lenses
+  decoded by `video::GpuClipDecoder` on NVDEC into VRAM (GOP-aware cache,
+  decode-ahead) in the PRIMARY context of the shared CUDA renderer's device -
+  the context the CUDA runtime, and so `CudaRenderer`, runs in - so the
+  stitch reads the decoded planes in place (`CudaRenderer::renderToDevice`,
+  zero upload).  16u / 8u frames are packed on the GPU
+  (`ImporterPackKernel.cu`, same codes as PixelCopy bit for bit), then
+  `GpuReadback` streams the frame through two 32 MiB pinned bands and copies
+  each band into the PPix (with the row flip) while the next one crosses the
+  bus: one DMA and one host pass, no float image in host memory.  The
+  decoder lives in `m_gpuDecoders` under the primary context, so imQuietFile
+  frees it with the direct path's decoders.  Every use of the shared
+  renderer's output (this path's readback and the host path's `renderInto`)
+  holds `cudaRendererOutputMutex()`: the buffer is shared by all clips.
+* **Host path** (`renderFrame` + PixelCopy): D3D11VA / NVDEC-copy / software
+  decode to host memory, upload, stitch, readback, float image, convert -
+  the path before the GPU one, kept as the fallback for everything the GPU
+  path does not take: CPU / OpenCL render device, no NVIDIA GPU, a stream
+  NVDEC refuses (the LRF proxy), `OPENOSV_IMPORTER_NO_GPU_DECODE=1` (escape
+  hatch; the tests use it to compare the paths), three GPU failures in a row.
+
+With the analyses off the two paths are byte-identical (32f, 16u and 8u,
+tested at 6000 x 3000).  With one on they differ by that analysis' float
+noise only: the analyses shade their bands on the GPU from device frames and
+on the CPU from host frames (108-111 dB apart), so a gain is a hair apart
+(8e-6), a seam table a hair apart moves every column by a hair (8e-5), and
+the parallax grid can gate a flow cell differently (single pixels up to 0.09
+inside the overlap, band mean 1.4e-4, exactly zero outside it).  The GPU
+path's analyses are the ones the effect's direct path computes, so the
+importer's equirect and the direct view now agree with each other.
+
+**Why the frame is never degraded when the direct path is active.**  The
+engine knows when the effect renders a clip directly (`engineDirectPathActive`,
+`engineDirectFrameCount` in Engine.h; the Properties panel says so).  But
+`imSourceVideoRec` names no consumer - no sequence, no track item, no effect -
+and the PPix cache key is importer id / stream / frame / format / quality /
+prefs / colour space.  The same master clip is the Source Monitor's picture,
+every sequence's use of it without the effect, the effect's own fallback
+whenever the direct path refuses a frame (`DirectLaunchReject`, device loss),
+and a bypassed effect's output; all of those send the identical request and
+hit the identical cache entry.  A cheaper frame served "because the effect
+ignores it" would be cached and shown there.  So the signal is diagnostics
+only, and the importer's frame is made cheap instead (tested: the frame is
+byte-identical before and after the engine served the clip).
+
+Measured (RTX 5090, sample clip, `osv_importer_bench --part F`, native
+6000 x 3000, analyses off, importer time per frame from its `frame-cost`
+debug lines - i.e. without the mock host's zero-filled PPix allocation -
+while nine other agents were building, so ratios measured in one process are
+the trustworthy part):
+
+| Path | Format | Park (scattered, Stopped) | Play (sequential) | Stages while playing |
+|---|---|---|---|---|
+| GPU | 32f | 47 ms | 13.6 ms | render 1.4, readback 12.5 |
+| GPU | 16u | 41 ms | 8.8 ms | render 1.4, readback 7.4 |
+| GPU | 8u | 39 ms | 5.4 ms | render 1.4, readback 4.0 |
+| host | 32f | 126 ms | 79 ms | decode+upload+stitch+readback 73, convert 9 |
+| host | 16u | 143 ms | 84 ms | 78, 7.5 |
+| host | 8u | 142 ms | 80 ms | 76, 6 |
+
+Parking is NVDEC catching up inside the GOP (docs/DIRECT_GPU.md, WP-A:
+40-48 ms); playing is the readback.  16u costs 35 % less than 32f on the GPU
+path and carries the clamped PQ / HLG signal 32x finer than the 10-bit
+source.
 
 ### Audio (`imImportAudio7`, `imResetSequentialAudio`, `imGetSequentialAudio`)
 
