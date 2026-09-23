@@ -486,7 +486,28 @@ void packRefcon(A_intptr_t refcon[4], int index, std::uint64_t generation) noexc
     if (params[kIndexFov]) {
         v.fovDeg = static_cast<double>(params[kIndexFov]->u.fs_d.value);
     }
+    // [WP-CAMERA] DJI's lens, and which of the two lenses renders.  A host
+    // array without these entries (a short array, an old caller) reads as
+    // Classic with DJI's defaults - exactly what the renderer would draw.
+    if (params[kIndexCameraModel]) {
+        v.dji = cameraModelFromCheckbox(params[kIndexCameraModel]->u.bd.value) == CameraModel::Dji;
+    }
+    if (params[kIndexDjiFov]) {
+        v.djiFovDeg = static_cast<double>(params[kIndexDjiFov]->u.fs_d.value);
+    }
+    if (params[kIndexCorrection]) {
+        v.correction = static_cast<double>(params[kIndexCorrection]->u.fs_d.value);
+    }
     return sanitise(v);
+}
+
+/// [WP-CAMERA] The Drag Sensitivity control, or its default when the host
+/// array does not carry it.  Clamped by effectiveSensitivity() at use.
+[[nodiscard]] double readSensitivity(PF_ParamDef* params[]) noexcept {
+    if (!params || !params[kIndexDragSensitivity]) {
+        return kPanTiltSensitivity;
+    }
+    return effectiveSensitivity(static_cast<double>(params[kIndexDragSensitivity]->u.fs_d.value));
 }
 
 /// Start a "grab the sphere" for a pan / tilt gesture.
@@ -526,6 +547,11 @@ void packRefcon(A_intptr_t refcon[4], int index, std::uint64_t generation) noexc
     s.sourcePanDeg = fixedToDeg(params[kIndexSourcePan]->u.ad.value);
     s.sourceTiltDeg = fixedToDeg(params[kIndexSourceTilt]->u.ad.value);
     s.sourceRollDeg = fixedToDeg(params[kIndexSourceRoll]->u.ad.value);
+    // [WP-CAMERA] The lens the picture is actually rendered with, so the
+    // grab casts the pointer through DJI's camera when that is on screen.
+    s.cameraModel = start.dji ? CameraModel::Dji : CameraModel::Classic;
+    s.djiFovDeg = start.djiFovDeg;
+    s.correction = start.correction;
 
     // The viewport IS the picture (cover-fit always fills the frame), so the
     // camera is built for a frame of the viewport's own size.
@@ -554,7 +580,11 @@ void packRefcon(A_intptr_t refcon[4], int index, std::uint64_t generation) noexc
 /// Returns true when at least one value was written, which is what tells the
 /// caller to set PF_EO_HANDLED_EVENT.  A null array writes nothing and
 /// returns false.
-[[nodiscard]] bool commitValues(PF_ParamDef* params[], const CameraValues& values, std::uint32_t changed) noexcept {
+///
+/// `aspect` (width / height of the frame the overlay draws on) is only used
+/// to refresh DJI's Zoom read-out after a DJI zoom; 0 skips that refresh.
+[[nodiscard]] bool commitValues(PF_ParamDef* params[], const CameraValues& values, std::uint32_t changed,
+                                double aspect) noexcept {
     if (!params || changed == kChangedNone) {
         return false;
     }
@@ -586,6 +616,32 @@ void packRefcon(A_intptr_t refcon[4], int index, std::uint64_t generation) noexc
         params[kIndexFov]->u.fs_d.value = static_cast<PF_FpShort>(values.fovDeg);
         params[kIndexFov]->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
         wrote = true;
+    }
+
+    // [WP-CAMERA] DJI's lens: the zoom gesture moves both controls.
+    bool djiLensMoved = false;
+    if ((changed & kChangedDjiFov) != 0u && params[kIndexDjiFov]) {
+        params[kIndexDjiFov]->u.fs_d.value = static_cast<PF_FpShort>(values.djiFovDeg);
+        params[kIndexDjiFov]->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
+        wrote = true;
+        djiLensMoved = true;
+    }
+    if ((changed & kChangedCorrection) != 0u && params[kIndexCorrection]) {
+        params[kIndexCorrection]->u.fs_d.value = static_cast<PF_FpShort>(values.correction);
+        params[kIndexCorrection]->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
+        wrote = true;
+        djiLensMoved = true;
+    }
+    // The Zoom read-out belongs to the lens: refresh it with the lens so the
+    // Effect Controls never show a stale Zoom after an overlay zoom.  Zoom is
+    // not animatable, so this records no keyframe.  The shape is the frame's
+    // (the overlay's viewport), which is what Match Sequence frames for.
+    if (djiLensMoved && params[kIndexZoom] && aspect > 0.0) {
+        const double zoom = djiZoomDeg(DjiLens{values.djiFovDeg, values.correction}, aspect);
+        if (std::isfinite(zoom)) {
+            params[kIndexZoom]->u.fs_d.value = static_cast<PF_FpShort>(zoom);
+            params[kIndexZoom]->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
+        }
     }
 
     return wrote;
@@ -1220,10 +1276,25 @@ void drawOverlay(const DRAWBOT_Suites& suites, DRAWBOT_DrawRef drawRef, const La
         if (font && inkBrush) {
             // snprintf, not std::format: this runs on the UI thread inside a
             // repaint and must not allocate.
-            char line[96] = {};
-            const int written =
-                std::snprintf(line, sizeof(line), "Pan %.1f  Tilt %.1f  Roll %.1f  FOV %.1f", values.panDeg,
-                              values.tiltDeg, values.rollDeg, values.fovDeg);
+            char line[128] = {};
+            int written = 0;
+            if (values.dji) {
+                // [WP-CAMERA] DJI's lens: the three numbers DJI Studio shows,
+                // in its order and precision (Zoom and FOV to a tenth of a
+                // degree, Correction Angle to a hundredth), so a framing can
+                // be read straight across.  Zoom is derived for the shape of
+                // the picture on screen, exactly as DJI derives it for its
+                // canvas.
+                const double aspect = (layout.viewport.h > 0.0) ? layout.viewport.w / layout.viewport.h : 0.0;
+                const double zoom = djiZoomDeg(DjiLens{values.djiFovDeg, values.correction}, aspect);
+                written = std::snprintf(line, sizeof(line),
+                                        "Pan %.1f  Tilt %.1f  Roll %.1f  Zoom %.1f  FOV %.1f  Correction %.2f",
+                                        values.panDeg, values.tiltDeg, values.rollDeg, zoom, values.djiFovDeg,
+                                        values.correction);
+            } else {
+                written = std::snprintf(line, sizeof(line), "Pan %.1f  Tilt %.1f  Roll %.1f  FOV %.1f",
+                                        values.panDeg, values.tiltDeg, values.rollDeg, values.fovDeg);
+            }
             if (written > 0 && static_cast<std::size_t>(written) < sizeof(line)) {
                 const double margin = std::max(8.0, 0.02 * layout.viewport.w);
                 drawTextWithShadow(suites, surface, font, shadowBrush, inkBrush, line, layout.viewport.x + margin,
@@ -1490,6 +1561,8 @@ PF_Err onDoClick(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* extra
     // Pin the coordinate transform for the gesture; see DragState::geometry.
     state.geometry = geometry;
     state.start = readCamera(params);
+    // [WP-CAMERA] The Drag Sensitivity control, fixed for the whole gesture.
+    state.sensitivity = readSensitivity(params);
     state.mode = resolveDragMode(handle, static_cast<std::uint32_t>(click.modifiers));
     state.axisLocked = false;
     // Pan / tilt drags grab the sphere: remember which direction is under
@@ -1564,14 +1637,19 @@ PF_Err onDrag(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* extra) n
     const std::uint32_t modifiers = static_cast<std::uint32_t>(drag.modifiers);
 
     const CameraValues updated = applyDrag(state, where, modifiers);
-    const std::uint32_t changed = changedFieldsFor(state.mode);
+    // [WP-CAMERA] Which parameters moved depends on the lens: a zoom on
+    // DJI's lens moves DJI FOV and Correction Angle, not the Classic FOV.
+    const std::uint32_t changed = changedFieldsFor(state.mode, state.start.dji);
 
     // Persist the state (applyDrag updated the axis lock and the last
     // position) BEFORE the last-time check, so a gesture that ends on this
     // very event still had its final position accounted for.
     writeDragSlot(slot, generation, state);
 
-    if (commitValues(params, updated, changed)) {
+    const double frameAspect = (state.layout.valid && state.layout.viewport.h > 0.0)
+                                   ? state.layout.viewport.w / state.layout.viewport.h
+                                   : 0.0;
+    if (commitValues(params, updated, changed, frameAspect)) {
         // Required by the SDK whenever CHANGED_VALUE is set during an event
         // (AE_Effect.h:2380): "If set during PF_Cmd_EVENT, be sure to also
         // set PF_EO_HANDLED_EVENT before returning."

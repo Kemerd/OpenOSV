@@ -14,7 +14,9 @@
 #include <cstdio>
 #include <iterator>
 #include <cstring>
+#include <limits>
 #include <string_view>
+#include <utility>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -754,15 +756,35 @@ PrParam interpolate(const PrParam& a, const PrParam& b, double t) {
     return out;
 }
 
-prSuiteError vsGetParam(csSDK_int32 nodeId, csSDK_int32 index, PrTime time, PrParam* out) {
-    MockHost::Impl* p = impl();
-    if (!p || !out) {
-        return suiteError_InvalidParms;
+/// Append one GetParam call to the inspection log (bounded, see the Impl).
+void recordParamRead(MockHost::Impl& p, csSDK_int32 nodeId, csSDK_int32 index, PrTime time, prSuiteError result) {
+    if (p.paramReads.size() >= MockHost::Impl::kMaxParamReads) {
+        ++p.paramReadsDropped;
+        return;
     }
-    std::lock_guard<std::recursive_mutex> lock(p->mutex);
-    auto nodeIt = p->nodes.find(nodeId);
-    if (nodeIt == p->nodes.end()) {
+    ParamReadRecord r;
+    r.nodeId = nodeId;
+    r.index = index;
+    r.time = time;
+    r.result = result;
+    p.paramReads.push_back(r);
+}
+
+/// The value of a (node, index) track at `time`, or the error a real host
+/// would give.  Split out of vsGetParam so every exit is recorded once.
+prSuiteError readParamLocked(MockHost::Impl& p, csSDK_int32 nodeId, csSDK_int32 index, PrTime time, PrParam* out) {
+    auto nodeIt = p.nodes.find(nodeId);
+    if (nodeIt == p.nodes.end()) {
         return suiteError_IDNotValid;
+    }
+    // An injected failure wins over the keyframes, at every time or only at
+    // the one time it names.
+    const auto failIt = nodeIt->second.readFailures.find(index);
+    if (failIt != nodeIt->second.readFailures.end()) {
+        const ParamReadFailure& f = failIt->second;
+        if (!f.onlyAtTime || f.time == time) {
+            return f.error;
+        }
     }
     auto trackIt = nodeIt->second.params.find(index);
     if (trackIt == nodeIt->second.params.end() || trackIt->second.keys.empty()) {
@@ -786,6 +808,17 @@ prSuiteError vsGetParam(csSDK_int32 nodeId, csSDK_int32 index, PrTime time, PrPa
     return suiteError_NoError;
 }
 
+prSuiteError vsGetParam(csSDK_int32 nodeId, csSDK_int32 index, PrTime time, PrParam* out) {
+    MockHost::Impl* p = impl();
+    if (!p || !out) {
+        return suiteError_InvalidParms;
+    }
+    std::lock_guard<std::recursive_mutex> lock(p->mutex);
+    const prSuiteError result = readParamLocked(*p, nodeId, index, time, out);
+    recordParamRead(*p, nodeId, index, time, result);
+    return result;
+}
+
 prSuiteError vsGetParamCount(csSDK_int32 nodeId, csSDK_int32* out) {
     MockHost::Impl* p = impl();
     if (!p || !out) {
@@ -795,6 +828,12 @@ prSuiteError vsGetParamCount(csSDK_int32 nodeId, csSDK_int32* out) {
     auto nodeIt = p->nodes.find(nodeId);
     if (nodeIt == p->nodes.end()) {
         return suiteError_IDNotValid;
+    }
+    // A test that pinned the count (a host reporting entries it cannot
+    // serve) gets exactly that answer.
+    if (nodeIt->second.paramCountOverride >= 0) {
+        *out = nodeIt->second.paramCountOverride;
+        return suiteError_NoError;
     }
     csSDK_int32 count = 0;
     for (const auto& track : nodeIt->second.params) {
@@ -837,11 +876,21 @@ prSuiteError vsGetNodeInfo(csSDK_int32 nodeId, char* outType, prPluginID* outHas
         return suiteError_InvalidParms;
     }
     std::lock_guard<std::recursive_mutex> lock(p->mutex);
-    if (!p->nodes.count(nodeId)) {
+    const auto nodeIt = p->nodes.find(nodeId);
+    if (nodeIt == p->nodes.end()) {
         return suiteError_IDNotValid;
     }
+    // The node's modelled type, or the effect type every node reported
+    // before the segment graph existed.  Truncated to the documented buffer
+    // size (kMaxNodeTypeStringSize, terminator included).
     std::memset(outType, 0, kMaxNodeTypeStringSize);
-    std::memcpy(outType, kVideoSegment_NodeType_Effect, sizeof(kVideoSegment_NodeType_Effect));
+    const std::string& type = nodeIt->second.type;
+    if (type.empty()) {
+        std::memcpy(outType, kVideoSegment_NodeType_Effect, sizeof(kVideoSegment_NodeType_Effect));
+    } else {
+        const std::size_t n = std::min<std::size_t>(type.size(), kMaxNodeTypeStringSize - 1);
+        std::memcpy(outType, type.data(), n);
+    }
     if (outHash) {
         std::memset(outHash->mGUID, 0, sizeof(outHash->mGUID));
         std::snprintf(outHash->mGUID, sizeof(outHash->mGUID), "%08x-0000-0000-0000-000000000000",
@@ -859,10 +908,29 @@ prSuiteError vsTransformNodeTime(csSDK_int32 nodeId, PrTime time, PrTime* out) {
         return suiteError_InvalidParms;
     }
     std::lock_guard<std::recursive_mutex> lock(p->mutex);
-    if (!p->nodes.count(nodeId)) {
+    const auto nodeIt = p->nodes.find(nodeId);
+    if (nodeIt == p->nodes.end()) {
         return suiteError_IDNotValid;
     }
-    *out = time;  // no speed change / time remap in the mock
+    const NodeRecord& node = nodeIt->second;
+    if (node.transformError != suiteError_NoError) {
+        return node.transformError;
+    }
+    // media = origin + time * num / den, in integer ticks.  The product is
+    // checked before it is formed: a wrapped int64 would hand the plug-in a
+    // plausible-looking but wrong media time, which is exactly the kind of
+    // failure a mapping test must never manufacture by itself.
+    if (node.rateDen <= 0) {
+        return suiteError_InvalidParms;
+    }
+    const std::int64_t num = node.rateNum;
+    const std::int64_t magnitude = num < 0 ? -num : num;
+    const std::int64_t absTime = time < 0 ? -time : time;
+    if (magnitude != 0 && absTime > std::numeric_limits<std::int64_t>::max() / magnitude) {
+        return suiteError_InvalidParms;
+    }
+    const std::int64_t scaled = (time * num) / node.rateDen;
+    *out = node.timeOrigin + scaled;
     return suiteError_NoError;
 }
 
@@ -872,10 +940,128 @@ prSuiteError vsGetNodeTimeScale(csSDK_int32 nodeId, PrTime, double* out) {
         return suiteError_InvalidParms;
     }
     std::lock_guard<std::recursive_mutex> lock(p->mutex);
-    if (!p->nodes.count(nodeId)) {
+    const auto nodeIt = p->nodes.find(nodeId);
+    if (nodeIt == p->nodes.end()) {
         return suiteError_IDNotValid;
     }
-    *out = 1.0;
+    // The instantaneous rate of the transform above ("the rate of change of
+    // TransformNodeTime"), negative for a reversed clip.
+    const NodeRecord& node = nodeIt->second;
+    *out = node.rateDen > 0 ? static_cast<double>(node.rateNum) / static_cast<double>(node.rateDen) : 1.0;
+    return suiteError_NoError;
+}
+
+// -----------------------------------------------------------------------------
+//  Segment-graph walk (operator -> owner -> inputs, properties, releases)
+// -----------------------------------------------------------------------------
+
+prSuiteError vsAcquireOperatorOwner(csSDK_int32 operatorNodeId, csSDK_int32* out) {
+    MockHost::Impl* p = impl();
+    if (!p || !out) {
+        return suiteError_InvalidParms;
+    }
+    *out = 0;
+    std::lock_guard<std::recursive_mutex> lock(p->mutex);
+    const auto nodeIt = p->nodes.find(operatorNodeId);
+    if (nodeIt == p->nodes.end()) {
+        return suiteError_IDNotValid;
+    }
+    // No owner modelled: the call fails, as it would for a node that is not
+    // an operator of anything.
+    const csSDK_int32 owner = nodeIt->second.owner;
+    const auto ownerIt = owner != 0 ? p->nodes.find(owner) : p->nodes.end();
+    if (ownerIt == p->nodes.end()) {
+        return suiteError_InvalidParms;
+    }
+    ++ownerIt->second.refs;
+    *out = owner;
+    return suiteError_NoError;
+}
+
+prSuiteError vsGetNodeInputCount(csSDK_int32 nodeId, csSDK_int32* out) {
+    MockHost::Impl* p = impl();
+    if (!p || !out) {
+        return suiteError_InvalidParms;
+    }
+    *out = 0;
+    std::lock_guard<std::recursive_mutex> lock(p->mutex);
+    const auto nodeIt = p->nodes.find(nodeId);
+    if (nodeIt == p->nodes.end()) {
+        return suiteError_IDNotValid;
+    }
+    *out = static_cast<csSDK_int32>(nodeIt->second.inputs.size());
+    return suiteError_NoError;
+}
+
+prSuiteError vsAcquireInputNodeId(csSDK_int32 nodeId, csSDK_int32 index, PrTime* outOffset, csSDK_int32* out) {
+    MockHost::Impl* p = impl();
+    if (!p || !out) {
+        return suiteError_InvalidParms;
+    }
+    *out = 0;
+    std::lock_guard<std::recursive_mutex> lock(p->mutex);
+    const auto nodeIt = p->nodes.find(nodeId);
+    if (nodeIt == p->nodes.end()) {
+        return suiteError_IDNotValid;
+    }
+    const std::vector<NodeInput>& inputs = nodeIt->second.inputs;
+    if (index < 0 || static_cast<std::size_t>(index) >= inputs.size()) {
+        return suiteError_InvalidParms;
+    }
+    const NodeInput& input = inputs[static_cast<std::size_t>(index)];
+    const auto inputIt = p->nodes.find(input.node);
+    if (inputIt == p->nodes.end()) {
+        return suiteError_IDNotValid;
+    }
+    ++inputIt->second.refs;
+    if (outOffset) {
+        *outOffset = input.offset;
+    }
+    *out = input.node;
+    return suiteError_NoError;
+}
+
+prSuiteError vsReleaseNodeId(csSDK_int32 nodeId) {
+    MockHost::Impl* p = impl();
+    if (!p) {
+        return suiteError_InvalidCall;
+    }
+    std::lock_guard<std::recursive_mutex> lock(p->mutex);
+    const auto nodeIt = p->nodes.find(nodeId);
+    // Releasing what was never acquired (or twice) is a plug-in bug; it is
+    // counted so a test can assert there were none, and refused.
+    if (nodeIt == p->nodes.end() || nodeIt->second.refs <= 0) {
+        ++p->invalidNodeReleases;
+        return suiteError_InvalidParms;
+    }
+    --nodeIt->second.refs;
+    return suiteError_NoError;
+}
+
+prSuiteError vsIterateNodeProperties(csSDK_int32 nodeId, SegmentNodePropertyCallback callback,
+                                     csSDK_int32 pluginObject) {
+    MockHost::Impl* p = impl();
+    if (!p || !callback) {
+        return suiteError_InvalidParms;
+    }
+    // Copy the properties out and call back WITHOUT the host lock: the
+    // callback is plug-in code and may call into other suites.
+    std::vector<std::pair<std::string, std::string>> properties;
+    {
+        std::lock_guard<std::recursive_mutex> lock(p->mutex);
+        const auto nodeIt = p->nodes.find(nodeId);
+        if (nodeIt == p->nodes.end()) {
+            return suiteError_IDNotValid;
+        }
+        properties.assign(nodeIt->second.properties.begin(), nodeIt->second.properties.end());
+    }
+    for (const auto& [key, value] : properties) {
+        const prSuiteError err =
+            callback(pluginObject, key.c_str(), reinterpret_cast<const prUTF8Char*>(value.c_str()));
+        if (err != suiteError_NoError) {
+            return err;  // the plug-in asked to stop
+        }
+    }
     return suiteError_NoError;
 }
 
@@ -899,14 +1085,6 @@ prSuiteError vsGetSegmentInfo(csSDK_int32, csSDK_int32, PrTime*, PrTime*, PrTime
     return suiteError_NotImplemented;
 }
 prSuiteError vsAcquireNodeId(csSDK_int32, prPluginID*, csSDK_int32*) { return suiteError_NotImplemented; }
-prSuiteError vsReleaseNodeId(csSDK_int32) { return suiteError_NotImplemented; }
-prSuiteError vsGetNodeInputCount(csSDK_int32, csSDK_int32* out) {
-    if (out) {
-        *out = 0;
-    }
-    return suiteError_NotImplemented;
-}
-prSuiteError vsAcquireInputNodeId(csSDK_int32, csSDK_int32, PrTime*, csSDK_int32*) { return suiteError_NotImplemented; }
 prSuiteError vsGetNodeOperatorCount(csSDK_int32, csSDK_int32* out) {
     if (out) {
         *out = 0;
@@ -914,9 +1092,6 @@ prSuiteError vsGetNodeOperatorCount(csSDK_int32, csSDK_int32* out) {
     return suiteError_NotImplemented;
 }
 prSuiteError vsAcquireOperatorNodeId(csSDK_int32, csSDK_int32, csSDK_int32*) { return suiteError_NotImplemented; }
-prSuiteError vsIterateNodeProperties(csSDK_int32, SegmentNodePropertyCallback, csSDK_int32) {
-    return suiteError_NotImplemented;
-}
 prSuiteError vsGetNextKeyframeTime(csSDK_int32, csSDK_int32, PrTime, PrTime*, csSDK_int32*) {
     return suiteError_NotImplemented;
 }
@@ -928,7 +1103,6 @@ prSuiteError vsAcquireSegmentsIdLabel(PrTimelineID, PrSDKStreamLabel, csSDK_int3
 prSuiteError vsAcquireFirstNodeInRange(csSDK_int32, PrTime, PrTime, csSDK_int32*, PrTime*) {
     return suiteError_NotImplemented;
 }
-prSuiteError vsAcquireOperatorOwner(csSDK_int32, csSDK_int32*) { return suiteError_NotImplemented; }
 prSuiteError vsGetGraphicsTransformedParams(csSDK_int32, PrTime, prFPoint64*, prFPoint64*, prFPoint64*, float*) {
     return suiteError_NotImplemented;
 }

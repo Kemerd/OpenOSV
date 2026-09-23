@@ -36,7 +36,13 @@ struct FormatInfo {
     double fps = 0.0;                              ///< Frame rate (container sample table, else metadata).
     ColorMode colorMode = ColorMode::Unknown;      ///< Colour mode of the streams.
     bool colorModeFromMetadata = false;            ///< True when colorMode was read from StreamMeta.
-    ExtriLensMode lensMode = ExtriLensMode::Native;///< Accessory calibration set in use.
+    /// The lens accessory the camera recorded (StreamMeta.extri_lens_mode):
+    /// what the in-camera "Lens Protection Mode" was set to.  Native when
+    /// the field is absent - see lensModeFromMetadata.  An ND filter has no
+    /// representation of its own; it is recorded only if the user declared
+    /// it as a lens protector in the camera.
+    ExtriLensMode lensMode = ExtriLensMode::Native;
+    bool lensModeFromMetadata = false;             ///< True when lensMode was read from StreamMeta field 7.
     std::uint32_t bitDepth = 0;                    ///< Luma bit depth (10 for HEVC Main10, 8 for the LRF).
     bool dualFisheye = false;                      ///< Two lens streams (or one side-by-side track).
     std::array<std::uint32_t, 2> videoTrackIds{};  ///< [0] slave (stream 0), [1] master (stream 1); equal for LRF.

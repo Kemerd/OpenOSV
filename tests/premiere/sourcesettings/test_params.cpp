@@ -220,7 +220,7 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
 
     const std::vector<PF_ParamDef> params = addedParams(fixture);
 
-    // Thirteen: nine controls plus the four group markers.  PF_ADD_TOPIC and
+    // Fourteen: ten controls plus the four group markers.  PF_ADD_TOPIC and
     // PF_END_TOPIC each issue their own PF_ADD_PARAM, so a group occupies two
     // real slots - counting only the controls is the mistake that shifts
     // every index after the first group.
@@ -253,7 +253,7 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
             {kIndexCalibration, PF_Param_POPUP},     {kIndexStitchTopicEnd, PF_Param_GROUP_END},
             {kIndexAdvancedTopic, PF_Param_GROUP_START}, {kIndexDlogmFit, PF_Param_POPUP},
             {kIndexExposure, PF_Param_FLOAT_SLIDER}, {kIndexRenderDevice, PF_Param_POPUP},
-            {kIndexAdvancedTopicEnd, PF_Param_GROUP_END},
+            {kIndexDirectColour, PF_Param_POPUP},    {kIndexAdvancedTopicEnd, PF_Param_GROUP_END},
         };
         for (const auto& [index, type] : expected) {
             INFO("index " << index);
@@ -275,7 +275,7 @@ TEST_CASE("every value-carrying control refuses to vary over time", "[sourcesett
     // control and every keyframe a user set would silently do nothing.
     const int valueIndices[kValueParamCount] = {
         kIndexColorOutput, kIndexOutputSize, kIndexStabilization, kIndexSeamSearch, kIndexGainMatch,
-        kIndexCalibration, kIndexDlogmFit,   kIndexExposure,      kIndexRenderDevice,
+        kIndexCalibration, kIndexDlogmFit,   kIndexExposure,      kIndexRenderDevice, kIndexDirectColour,
     };
     for (const int index : valueIndices) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");
@@ -328,14 +328,14 @@ TEST_CASE("the two groups are balanced and every control is inside the intended 
     CHECK(depth == 0);        // every group closed
     CHECK(maxDepth == 1);     // no nesting: the two groups are siblings
 
-    // The three top-level controls really are top level, and the six grouped
+    // The three top-level controls really are top level, and the seven grouped
     // ones really are one level in.
     for (const int index : {kIndexColorOutput, kIndexOutputSize, kIndexStabilization}) {
         INFO("top-level index " << index);
         CHECK(depthAt[static_cast<std::size_t>(index)] == 0);
     }
     for (const int index : {kIndexSeamSearch, kIndexGainMatch, kIndexCalibration, kIndexDlogmFit, kIndexExposure,
-                            kIndexRenderDevice}) {
+                            kIndexRenderDevice, kIndexDirectColour}) {
         INFO("grouped index " << index);
         CHECK(depthAt[static_cast<std::size_t>(index)] == 1);
     }
@@ -354,6 +354,7 @@ TEST_CASE("the popup item lists are the documented ones", "[sourcesettings][para
         {kIndexColorOutput, OSV_SS_COLOR_ITEMS},   {kIndexOutputSize, OSV_SS_SIZE_ITEMS},
         {kIndexStabilization, OSV_SS_STAB_ITEMS},  {kIndexCalibration, OSV_SS_CALIB_ITEMS},
         {kIndexDlogmFit, OSV_SS_FIT_ITEMS},        {kIndexRenderDevice, OSV_SS_DEVICE_ITEMS},
+        {kIndexDirectColour, OSV_SS_DIRECT_COLOUR_ITEMS},
     };
     for (const auto& [index, items] : expected) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");
@@ -404,6 +405,7 @@ TEST_CASE("every control's default is PrefsBlob::defaults()", "[sourcesettings][
     CHECK(params[kIndexCalibration - 1].u.pd.dephault == static_cast<A_long>(defaults.calibration) + 1);
     CHECK(params[kIndexDlogmFit - 1].u.pd.dephault == static_cast<A_long>(defaults.dlogmFit) + 1);
     CHECK(params[kIndexRenderDevice - 1].u.pd.dephault == static_cast<A_long>(defaults.renderDevice) + 1);
+    CHECK(params[kIndexDirectColour - 1].u.pd.dephault == static_cast<A_long>(defaults.directColour) + 1);
 
     CHECK(params[kIndexSeamSearch - 1].u.bd.dephault == static_cast<A_long>(defaults.seamSearch));
     CHECK(params[kIndexGainMatch - 1].u.bd.dephault == static_cast<A_long>(defaults.gainMatch));
@@ -433,6 +435,7 @@ TEST_CASE("the popups list every value of their prefs enum", "[sourcesettings][p
         {kIndexCalibration, static_cast<int>(PrefsCalibration::Count)},
         {kIndexDlogmFit, static_cast<int>(PrefsDlogmFit::Count)},
         {kIndexRenderDevice, static_cast<int>(PrefsRenderDevice::Count)},
+        {kIndexDirectColour, static_cast<int>(PrefsDirectColour::Count)},
     };
     for (const auto& [index, count] : expected) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");

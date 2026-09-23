@@ -20,7 +20,12 @@
 //     on NVDEC into Premiere's CUDA context and returns them with the clip's
 //     stitch state;
 //   * the fused kernel and its parameter builder (DirectRender.h,
-//     DirectLaunch.h).
+//     DirectLaunch.h);
+//   * [WP-SETTINGS] the clip's Source Settings as the engine will render
+//     them, and the rule (DirectPathSettings.h) that hands a clip to the
+//     equirect route whenever the direct path could not reproduce what that
+//     route would show - unknown settings, the D-Log M passthrough, or a
+//     colour output other than the working space.
 //
 // Everything here is best effort by design: any missing piece is reported
 // once in the log and the caller falls back to the equirect path, which is
@@ -28,6 +33,7 @@
 #pragma once
 
 #include "DirectLaunch.h"
+#include "DirectPathSettings.h"
 #include "DirectRender.h"
 #include "OsvEngineAbi.h"
 #include "ReframeCpu.h"
@@ -48,6 +54,10 @@ struct EngineApi {
     OsvEngineAbiVersionFn version = nullptr;
     OsvEngineAcquireFrameFn acquire = nullptr;
     OsvEngineReleaseFrameFn release = nullptr;
+    /// [WP-SETTINGS] Optional: the cheap "which Source Settings would you
+    /// render" question.  Without it the settings reported with each frame
+    /// decide instead, after the decode rather than before it.
+    OsvEngineQuerySettingsFn querySettings = nullptr;
     [[nodiscard]] bool ok() const noexcept { return version && acquire && release; }
 };
 
@@ -63,6 +73,19 @@ struct SourceBinding {
     csSDK_int32 ownerNode = 0;  ///< The owning clip node, ACQUIRED; release with releaseSource().
     bool ok = false;
     std::string reason;         ///< Why not, when !ok.
+    /// Frames of this instance whose clip time -> media time -> frame mapping
+    /// renderDirect() has logged (the first few of every instance, so a field
+    /// session can check trimmed / sped-up / reversed clips).  A diagnostic
+    /// counter: read and written only under the mapping logger's own lock.
+    mutable int mappingFramesLogged = 0;
+
+    // ---- [WP-SETTINGS] how Premiere identifies the clip's media ------------
+    // Evidence for the log, read in the same property pass as the path: does
+    // Premiere's own identity of the media change when its Source Settings
+    // do?  (That is what decides whether it re-renders the effect.)
+    std::string mediaHash;      ///< GetNodeInfo's hash of the media node (a GUID string).
+    std::string modState;       ///< "MediaNode::MediaModState".
+    std::string clipId;         ///< "MediaNode::ClipID" (compare with the importer id the importer logs).
 };
 
 /// Walk effect node -> owner clip node -> input media node and read the
@@ -99,6 +122,12 @@ struct DirectRequest {
 /// wait for it (the same completion contract as the equirect kernel).
 /// Returns true on success; false with `reason` filled on any failure, in
 /// which case the output has not been written and the caller falls back.
+///
+/// [WP-SETTINGS] Before decoding anything it asks the engine which Source
+/// Settings it would render the clip with and applies decideSettings()
+/// (DirectPathSettings.h); a clip the rule hands to the equirect route
+/// returns false with a reason for which isPolicyFallback() is true - not a
+/// failure, already logged once per change, and to be re-asked next frame.
 [[nodiscard]] bool renderDirect(const DirectRequest& request, std::string& reason) noexcept;
 
 }  // namespace osv::reframe::direct

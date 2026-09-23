@@ -137,10 +137,14 @@
 #define OSV_SS_ID_EXPOSURE 11
 #define OSV_SS_ID_RENDER_DEVICE 12
 #define OSV_SS_ID_ADVANCED_TOPIC_END 13
+/* [WP-SETTINGS] Added after the list above was shipped: a NEW id rather than a
+ * reused one, placed inside the Advanced group (so its index is 13 and the
+ * group terminator moved to 14 - indices are not persisted, ids are). */
+#define OSV_SS_ID_DIRECT_COLOUR 14
 
-/* Total parameters excluding the input layer: 9 controls + 4 group markers.
+/* Total parameters excluding the input layer: 10 controls + 4 group markers.
  * out_data->num_params is this + 1. */
-#define OSV_SOURCE_SETTINGS_PARAM_COUNT 13
+#define OSV_SOURCE_SETTINGS_PARAM_COUNT 14
 
 /* ==========================================================================
  *  Popup item strings
@@ -205,6 +209,21 @@
 #define OSV_SS_DEVICE_COUNT 4
 #define OSV_SS_DEVICE_DEFAULT 1
 
+/* [WP-SETTINGS] "Program Monitor Colour" - PrefsDirectColour: SequenceSpace,
+ * MatchSource.
+ *
+ * What Open 360 Reframe shows when this clip's Colour Output is not the
+ * sequence's working colour space.  "Sequence space (fast)" renders straight
+ * from the fisheyes into the working space with OpenOSV's own tone mapping -
+ * the fast, sharp route, and in a Rec.709 sequence the DJI-matched look.
+ * "Match Source monitor" hands such a clip to the importer's equirect so the
+ * Program monitor shows exactly Premiere's conversion of the chosen output,
+ * as the Source monitor does - slower and one resampling softer.
+ * Default 1 = Sequence space (PrefsDirectColour::SequenceSpace is 0). */
+#define OSV_SS_DIRECT_COLOUR_ITEMS "Sequence space (fast)|Match Source monitor"
+#define OSV_SS_DIRECT_COLOUR_COUNT 2
+#define OSV_SS_DIRECT_COLOUR_DEFAULT 1
+
 /* ==========================================================================
  *  Checkbox and slider ranges / defaults
  * ========================================================================== */
@@ -250,7 +269,8 @@ namespace osv::premiere::sourcesettings {
 ///  10    D-Log M Curve
 ///  11    Exposure
 ///  12    Render Device
-///  13  (GROUP_END, Advanced)
+///  13    Program Monitor Colour   [WP-SETTINGS]
+///  14  (GROUP_END, Advanced)
 enum ParamIndex : int {
     kIndexColorOutput = 1,
     kIndexOutputSize = 2,
@@ -264,7 +284,8 @@ enum ParamIndex : int {
     kIndexDlogmFit = 10,
     kIndexExposure = 11,
     kIndexRenderDevice = 12,
-    kIndexAdvancedTopicEnd = 13,
+    kIndexDirectColour = 13,
+    kIndexAdvancedTopicEnd = 14,
 };
 
 /// The permanent id stored at each index, in index order (index 1 first).
@@ -275,7 +296,7 @@ inline constexpr int kParamIdByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
     OSV_SS_ID_STITCH_TOPIC,     OSV_SS_ID_SEAM_SEARCH,   OSV_SS_ID_GAIN_MATCH,
     OSV_SS_ID_CALIBRATION,      OSV_SS_ID_STITCH_TOPIC_END, OSV_SS_ID_ADVANCED_TOPIC,
     OSV_SS_ID_DLOGM_FIT,        OSV_SS_ID_EXPOSURE,      OSV_SS_ID_RENDER_DEVICE,
-    OSV_SS_ID_ADVANCED_TOPIC_END,
+    OSV_SS_ID_DIRECT_COLOUR,    OSV_SS_ID_ADVANCED_TOPIC_END,
 };
 
 /// Number of user-visible parameters (excludes the input layer).
@@ -284,7 +305,7 @@ inline constexpr int kParamCount = OSV_SOURCE_SETTINGS_PARAM_COUNT;
 /// Number of controls that actually carry a value, i.e. everything except the
 /// four GROUP_START / GROUP_END markers.  This is the count that has to round
 /// trip through a PrefsBlob.
-inline constexpr int kValueParamCount = 9;
+inline constexpr int kValueParamCount = 10;
 
 /// The parameter names, in index order, so a test can compare the built
 /// module's list without repeating the strings.
@@ -295,9 +316,9 @@ inline constexpr int kValueParamCount = 9;
 /// rather than a labelled control.  Writing "Stitching" here would have
 /// described a field the SDK never fills.
 inline constexpr const char* kParamNameByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
-    "Colour Output", "Output Size",   "Stabilisation", "Stitching", "Seam Search",
-    "Exposure Match", "Calibration",  "",              "Advanced",  "D-Log M Curve",
-    "Exposure",       "Render Device", "",
+    "Colour Output", "Output Size",   "Stabilisation",      "Stitching", "Seam Search",
+    "Exposure Match", "Calibration",  "",                   "Advanced",  "D-Log M Curve",
+    "Exposure",       "Render Device", "Program Monitor Colour", "",
 };
 
 }  // namespace osv::premiere::sourcesettings

@@ -25,8 +25,12 @@ osv_add_premiere_plugin(OpenOSVImporter
     ImporterAudioSelectors.cpp
     ImporterPlugin.h
     PrefsMapping.cpp
+    ProtectorGuard.cpp
+    ProtectorGuard.h
     Engine.cpp
     Engine.h
+    ImporterGpuFrame.cpp
+    ImporterGpuFrame.h
     SourceSettingsDialog.cpp
     OpenOSVImporter.rc
     resource.h
@@ -47,6 +51,26 @@ target_link_libraries(OpenOSVImporter PRIVATE comctl32 user32 gdi32)
 # delay-loaded below, so a machine without an NVIDIA driver still loads the
 # importer and simply never serves the direct path.
 target_link_libraries(OpenOSVImporter PRIVATE CUDA::cuda_driver)
+
+# The importer's own GPU frame path packs 16u / 8u frames on the device before
+# the readback (ImporterPackKernel.h).  The kernel lives in its own small
+# static library so that nvcc never sees the plug-in's MSVC-only compile
+# options, and it takes the project's CUDA flags (-fmad=false: the codes must
+# match PixelCopy's host conversion bit for bit).  The runtime it launches
+# through is the statically linked cudart the CUDA renderer already brings
+# into this module - no new DLL dependency.
+if(TARGET osv_render_cuda)
+  add_library(osv_importer_pack STATIC ImporterPackKernel.cu ImporterPackKernel.h)
+  target_link_libraries(osv_importer_pack PRIVATE osv_cuda_flags CUDA::cudart_static)
+  set_target_properties(osv_importer_pack PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+    CUDA_SEPARABLE_COMPILATION OFF
+    POSITION_INDEPENDENT_CODE ON
+    FOLDER "plugins"
+  )
+  target_link_libraries(OpenOSVImporter PRIVATE osv_importer_pack)
+  target_compile_definitions(OpenOSVImporter PRIVATE OSV_IMPORTER_HAVE_PACK_KERNEL=1)
+endif()
 
 # -----------------------------------------------------------------------------
 #  Delay loading

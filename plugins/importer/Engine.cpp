@@ -14,6 +14,19 @@
 //                            plus the stitch block and a lease.
 //   OsvEngine_ReleaseFrame   give the frame slot back once the effect's
 //                            stream has finished reading it.
+//   OsvEngine_QuerySettings  [WP-SETTINGS] the Source Settings the engine
+//                            would render a file with, and their generation -
+//                            no decode, no GPU - so the effect can decide
+//                            before it decodes anything.
+//
+// SOURCE SETTINGS [WP-SETTINGS].  The engine renders with its own instance of
+// each file; Premiere's instances publish the settings the user chose
+// (enginePublishPrefs, from ImporterInstance::applyPrefsLocked) and every
+// acquire applies the ones in force.  Files are keyed by their identity on
+// disk (volume serial + file index), never by path spelling, and the newest
+// Premiere instance of a file wins over older ones still holding an old
+// blob.  Each change bumps a per-file generation that is reported with every
+// frame, so a field log shows exactly which settings reached the screen.
 //
 // Every export is noexcept and catches everything: these are called from
 // Premiere's render threads through a C function pointer, and an exception
@@ -38,12 +51,21 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 
 namespace osv::premiere {
 
@@ -76,17 +98,263 @@ void writeError(char* buffer, std::int32_t capacity, const std::string& message)
     buffer[n] = '\0';
 }
 
-/// The registry key of a file: its lexically normalised path, lower-cased.
-/// Windows paths are case-insensitive, and Premiere and the effect may spell
-/// the same file differently (the media node's instance string versus the
-/// path imOpenFile8 was given); normalising both sides makes them meet.
-[[nodiscard]] std::wstring keyFor(const std::filesystem::path& path) {
-    std::wstring key = path.lexically_normal().wstring();
-    for (wchar_t& c : key) {
+// ===========================================================================
+//  [WP-SETTINGS] File identity
+//
+//  Two parties name the same file: Premiere's importer instances (the path
+//  imOpenFile8 was handed) and the effect (the media node's
+//  "MediaNode::MediaInstanceString").  Nothing guarantees they spell it the
+//  same way - case, '/' versus '\', a "\\?\" long-path prefix, an 8.3 short
+//  name, a drive letter versus a UNC share, a hard link - and a mismatch
+//  means the direct path renders with settings nobody published for it,
+//  silently.  So a file is keyed by what the file system says it IS: the
+//  volume serial number and the file index (GetFileInformationByHandle).
+//  Only when that cannot be read (the file vanished, a file system without
+//  stable ids) does the key fall back to the normalised spelling.
+// ===========================================================================
+
+/// What the file system says a file is.
+struct FileIdentity {
+    std::uint64_t volume = 0;  ///< dwVolumeSerialNumber.
+    std::uint64_t index = 0;   ///< nFileIndexHigh:nFileIndexLow.
+    bool valid = false;        ///< False: the identity could not be read.
+    std::uint32_t error = 0;   ///< GetLastError() of the failed read, for the log.
+};
+
+/// Strip the Win32 namespace prefixes, turn '/' into '\' and make the path
+/// absolute with "." and ".." resolved (GetFullPathNameW, no disk access).
+/// The case is kept: this is the spelling the file is OPENED with, and a
+/// directory can be case-sensitive (the per-directory flag WSL sets).
+[[nodiscard]] std::wstring canonicalPath(const std::filesystem::path& path) {
+    std::wstring s = path.wstring();
+    // "\\?\UNC\server\share\x" -> "\\server\share\x"; "\\?\C:\x" -> "C:\x".
+    if (s.rfind(L"\\\\?\\UNC\\", 0) == 0) {
+        s = L"\\\\" + s.substr(8);
+    } else if (s.rfind(L"\\\\?\\", 0) == 0 || s.rfind(L"\\??\\", 0) == 0) {
+        s = s.substr(4);
+    }
+    std::replace(s.begin(), s.end(), L'/', L'\\');
+
+    // Absolute and canonical.  A failure keeps the spelling as it is: the
+    // key is then merely less forgiving, never wrong.
+    const DWORD need = GetFullPathNameW(s.c_str(), 0, nullptr, nullptr);
+    if (need > 0 && need <= kMaxPathChars + 1) {
+        std::wstring full(static_cast<std::size_t>(need), L'\0');
+        const DWORD got = GetFullPathNameW(s.c_str(), need, full.data(), nullptr);
+        if (got > 0 && got < need) {
+            full.resize(got);
+            s = std::move(full);
+        }
+    }
+    return s;
+}
+
+/// The canonical path lower-cased: the form two spellings are compared in.
+/// Windows compares names case-insensitively, and every character a real
+/// path uses lower-cases the way NTFS's upcase table does.
+[[nodiscard]] std::wstring loweredPath(std::wstring s) {
+    for (wchar_t& c : s) {
         c = static_cast<wchar_t>(std::towlower(static_cast<wint_t>(c)));
     }
-    return key;
+    return s;
 }
+
+/// Read a file's identity.  Opens for attributes only, sharing everything,
+/// so it never conflicts with the importer's own GENERIC_READ handle or
+/// with anything else that has the clip open.
+[[nodiscard]] FileIdentity readFileIdentity(const std::wstring& path) noexcept {
+    FileIdentity id;
+    if (path.empty()) {
+        return id;
+    }
+    // FILE_FLAG_BACKUP_SEMANTICS lets the open succeed on a directory too,
+    // which is harmless (a directory is never a clip) and avoids a special
+    // error path for it.
+    HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        id.error = static_cast<std::uint32_t>(GetLastError());
+        return id;
+    }
+    BY_HANDLE_FILE_INFORMATION info{};
+    const BOOL ok = GetFileInformationByHandle(h, &info);
+    const DWORD infoError = ok ? 0u : GetLastError();
+    CloseHandle(h);
+    if (!ok) {
+        id.error = static_cast<std::uint32_t>(infoError);
+        return id;
+    }
+    id.volume = static_cast<std::uint64_t>(info.dwVolumeSerialNumber);
+    id.index = (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32) | static_cast<std::uint64_t>(info.nFileIndexLow);
+    // A file system that reports neither (some network redirectors) gives no
+    // usable identity; every file would share one key.
+    id.valid = (id.volume != 0 || id.index != 0);
+    return id;
+}
+
+/// A path as UTF-8 for a log line; never throws.
+[[nodiscard]] std::string utf8Of(const std::wstring& wide) noexcept {
+    try {
+        if (wide.empty()) {
+            return {};
+        }
+        const int n = WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), nullptr, 0,
+                                          nullptr, nullptr);
+        if (n <= 0) {
+            return "?";
+        }
+        std::string out(static_cast<std::size_t>(n), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), out.data(), n, nullptr, nullptr);
+        return out;
+    } catch (...) {
+        return "?";
+    }
+}
+
+/// A path's file name as UTF-8 for a log line; never throws.
+[[nodiscard]] std::string nameOf(const std::filesystem::path& path) noexcept {
+    try {
+        return utf8Of(path.filename().wstring());
+    } catch (...) {
+        return "?";
+    }
+}
+
+/// Identities already read, by canonical spelling (case kept: in a
+/// case-sensitive directory "A.OSV" and "a.osv" are two files).  Every
+/// acquire (one per rendered frame) and every publication asks, and an open
+/// + query costs tens of microseconds - more with an on-access virus scanner
+/// - so each spelling is resolved once per process.  Only successful reads
+/// are kept: a file that does not exist yet is looked up again next time.
+struct IdentityCache {
+    std::mutex mutex;
+    std::unordered_map<std::wstring, FileIdentity> byPath;
+};
+
+/// Created on first use, never destroyed (see the file header).
+[[nodiscard]] IdentityCache& identityCache() {
+    static IdentityCache* instance = new IdentityCache();
+    return *instance;
+}
+
+/// Upper bound on cached spellings; the cache is simply emptied when a
+/// session somehow names more files than this.
+constexpr std::size_t kMaxIdentityCache = 4096;
+
+/// The identity of `path` (cached), and its normalised (canonical,
+/// lower-cased) spelling in `normalisedOut` when given.
+[[nodiscard]] FileIdentity identityOf(const std::filesystem::path& path, std::wstring* normalisedOut = nullptr) {
+    const std::wstring canonical = canonicalPath(path);
+    const std::wstring normal = loweredPath(canonical);
+    if (normalisedOut) {
+        *normalisedOut = normal;
+    }
+    IdentityCache& cache = identityCache();
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        const auto it = cache.byPath.find(canonical);
+        if (it != cache.byPath.end()) {
+            return it->second;
+        }
+    }
+    // The disk is asked OUTSIDE the lock: another thread's lookup of a
+    // cached file must not wait behind this one's open.
+    const FileIdentity id = readFileIdentity(canonical);
+    if (id.valid) {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.byPath.size() >= kMaxIdentityCache) {
+            cache.byPath.clear();
+        }
+        const bool inserted = cache.byPath.emplace(canonical, id).second;
+        // Once per spelling: the line that shows, in a field log, whether
+        // Premiere's importer and the effect named the file the same way.
+        if (inserted) {
+            PluginLog::info("direct: '{}' is file {:08x}:{:016x}", utf8Of(path.wstring()), id.volume, id.index);
+        }
+    } else {
+        PluginLog::oncef("direct/no-identity/" + utf8Of(normal), PluginLog::Level::Warn,
+                         "direct: '{}' has no readable file identity (Win32 error {}); it is keyed by its "
+                         "normalised path",
+                         utf8Of(path.wstring()), id.error);
+    }
+    return id;
+}
+
+/// The registry key for an identity (or, when it could not be read, for the
+/// normalised spelling).  The two forms can never collide ("id:" / "path:").
+[[nodiscard]] std::wstring keyForIdentity(const FileIdentity& id, const std::wstring& normalised) {
+    if (id.valid) {
+        wchar_t buffer[64] = {};
+        std::swprintf(buffer, std::size(buffer), L"id:%016llx:%016llx", static_cast<unsigned long long>(id.volume),
+                      static_cast<unsigned long long>(id.index));
+        return buffer;
+    }
+    return L"path:" + normalised;
+}
+
+/// The registry key for a file: its identity when readable, otherwise its
+/// normalised spelling.
+[[nodiscard]] std::wstring keyFor(const std::filesystem::path& path) {
+    std::wstring normal;
+    const FileIdentity id = identityOf(path, &normal);
+    return keyForIdentity(id, normal);
+}
+
+// ===========================================================================
+//  [WP-SETTINGS] Published Source Settings
+// ===========================================================================
+
+/// The Source Settings in force for one file, and who put them there.
+struct PublishedSettings {
+    PrefsBlob prefs = PrefsBlob::defaults();
+    /// Token of the publishing instance (see SettingsPublisher).
+    std::uint64_t publisher = 0;
+    /// False while the only publication is an instance's defaults (the host
+    /// handed it no blob); any host blob then replaces it.
+    bool fromHost = false;
+    /// Bumped on every change of `prefs`; the first publication is 1.
+    std::uint32_t generation = 0;
+    /// Refused publications logged since the last change, bounded so a
+    /// lingering instance cannot flood the log.
+    std::uint32_t refusalsLogged = 0;
+    /// The file the settings belong to, for the effect's log lines.
+    FileIdentity identity;
+};
+
+/// OSV_TRANSFER_* the clip's colour output encodes the importer's frames in.
+/// Mirrors the importer's own mapping (toOutputTransfer in
+/// ImporterInstance.cpp); the engine tests pin the two together by comparing
+/// this with the transfer of the clip's own colour block.
+[[nodiscard]] std::int32_t clipTransferFor(const PrefsBlob& prefs) noexcept {
+    switch (prefs.color()) {
+    case PrefsColorOutput::HLG:    return OSV_TRANSFER_HLG;
+    case PrefsColorOutput::Rec709: return OSV_TRANSFER_REC709;
+    case PrefsColorOutput::DLogM:  return OSV_TRANSFER_PASSTHROUGH;
+    case PrefsColorOutput::PQ:
+    case PrefsColorOutput::Count:
+    default:                       return OSV_TRANSFER_PQ;
+    }
+}
+
+/// Fill the ABI block from a blob.  structSize is set to this build's size.
+void fillClipSettings(OsvEngineClipSettings& out, const PrefsBlob& prefs, std::uint32_t generation,
+                      const FileIdentity& identity) noexcept {
+    std::memset(&out, 0, sizeof(out));
+    out.structSize = static_cast<std::uint32_t>(sizeof(OsvEngineClipSettings));
+    out.generation = generation;
+    out.clipTransfer = clipTransferFor(prefs);
+    out.exposureStops = prefs.exposureStops;
+    out.colorOutput = prefs.colorOutput;
+    out.calibration = prefs.calibration;
+    out.dlogmFit = prefs.dlogmFit;
+    out.stabilization = prefs.stabilization;
+    out.directColour = prefs.directColour;
+    out.fileVolume = identity.valid ? identity.volume : 0u;
+    out.fileIndex = identity.valid ? identity.index : 0u;
+}
+
+/// Next publisher token (0 is reserved for "anonymous").
+std::atomic<std::uint64_t> g_nextPublisherToken{1};
 
 /// Frame index for a media time, rounded to nearest and clamped - the same
 /// rule the importer's own imGetSourceVideo applies, so the direct path and
@@ -141,10 +409,12 @@ private:
 
 struct Registry {
     std::mutex mutex;
-    /// The engine's own instance of each file it has been asked for.
+    /// The engine's own instance of each file it has been asked for, keyed
+    /// by keyFor() (the file's identity).
     std::unordered_map<std::wstring, std::shared_ptr<ImporterInstance>> clips;
-    /// The latest Source Settings Premiere's instances published per file.
-    std::unordered_map<std::wstring, PrefsBlob> prefs;
+    /// [WP-SETTINGS] The Source Settings in force per file (keyFor()), as
+    /// the newest of Premiere's instances of it published them.
+    std::unordered_map<std::wstring, PublishedSettings> prefs;
 };
 
 /// Created on first use, never destroyed (see the file header).
@@ -153,10 +423,11 @@ struct Registry {
     return *instance;
 }
 
-/// The engine's instance of `path`, opened on first use.  Returns null with
-/// `error` filled when the file cannot be opened as a dual-fisheye OSV.
-[[nodiscard]] std::shared_ptr<ImporterInstance> clipFor(const std::filesystem::path& path, std::string& error) {
-    const std::wstring key = keyFor(path);
+/// The engine's instance of `path` (registry key `key`, from keyFor()),
+/// opened on first use.  Returns null with `error` filled when the file
+/// cannot be opened as a dual-fisheye OSV.
+[[nodiscard]] std::shared_ptr<ImporterInstance> clipFor(const std::filesystem::path& path, const std::wstring& key,
+                                                        std::string& error) {
     Registry& r = registry();
     {
         std::lock_guard<std::mutex> lock(r.mutex);
@@ -184,11 +455,12 @@ struct Registry {
     return it->second;
 }
 
-/// The Source Settings published for `path`, if any.
-[[nodiscard]] bool publishedPrefs(const std::filesystem::path& path, PrefsBlob& out) {
+/// [WP-SETTINGS] The Source Settings in force for the file with registry key
+/// `key`, if any were published.
+[[nodiscard]] bool publishedPrefs(const std::wstring& key, PublishedSettings& out) {
     Registry& r = registry();
     std::lock_guard<std::mutex> lock(r.mutex);
-    const auto it = r.prefs.find(keyFor(path));
+    const auto it = r.prefs.find(key);
     if (it == r.prefs.end()) {
         return false;
     }
@@ -208,8 +480,9 @@ struct EngineLease {
     CUcontext context = nullptr;
     CUdeviceptr seam = 0;                    ///< Device copy of the seam table.
     CUdeviceptr warp = 0;                    ///< Device copy of the warp grid.
+    CUdeviceptr blendSeam = 0;               ///< [WP-SEAM] Device copy of the carved blend-seam table.
 
-    /// Free the two device tables.  The caller has pushed `context`.
+    /// Free the device tables.  The caller has pushed `context`.
     void freeTables() noexcept {
         if (seam) {
             (void)cuMemFree(seam);
@@ -218,6 +491,11 @@ struct EngineLease {
         if (warp) {
             (void)cuMemFree(warp);
             warp = 0;
+        }
+        // [WP-SEAM]
+        if (blendSeam) {
+            (void)cuMemFree(blendSeam);
+            blendSeam = 0;
         }
     }
 };
@@ -255,28 +533,108 @@ std::atomic<long> g_liveLeases{0};
 //  Importer-internal hooks
 // ===========================================================================
 
-void enginePublishPrefs(const std::filesystem::path& path, const PrefsBlob& prefs) noexcept {
+// ---- [WP-SETTINGS] ------------------------------------------------------------
+
+std::uint64_t engineNewPublisherToken() noexcept {
+    return g_nextPublisherToken.fetch_add(1);
+}
+
+void enginePublishPrefs(const std::filesystem::path& path, const PrefsBlob& prefs,
+                        const SettingsPublisher& publisher) noexcept {
     try {
-        Registry& r = registry();
-        bool changed = false;
+        // The key (a cached identity lookup) is computed before the registry
+        // lock is taken: a first lookup opens the file.
+        std::wstring normal;
+        const FileIdentity identity = identityOf(path, &normal);
+        const std::wstring key = keyForIdentity(identity, normal);
+
+        // What happened, decided under the lock and logged after it.
+        enum class Outcome { Unchanged, Adopted, Refused };
+        Outcome outcome = Outcome::Unchanged;
+        PublishedSettings now;
         {
+            Registry& r = registry();
             std::lock_guard<std::mutex> lock(r.mutex);
-            PrefsBlob& slot = r.prefs[keyFor(path)];
-            changed = !(slot == prefs);
-            slot = prefs;
+            auto it = r.prefs.find(key);
+            if (it == r.prefs.end()) {
+                // Nothing known for the file yet: any publication fills the
+                // blank, the defaults of a blob-less instance included.
+                PublishedSettings fresh;
+                fresh.prefs = prefs;
+                fresh.publisher = publisher.token;
+                fresh.fromHost = publisher.fromHost;
+                fresh.generation = 1;
+                fresh.identity = identity;
+                it = r.prefs.emplace(key, fresh).first;
+                outcome = Outcome::Adopted;
+            } else {
+                PublishedSettings& slot = it->second;
+                // The precedence rule (see SettingsPublisher):
+                //  * an instance's defaults never override a host blob, and
+                //    replace other defaults only when they are its own age
+                //    or newer;
+                //  * a host blob replaces defaults always, and another host
+                //    blob when its instance is at least as new.
+                const bool newerOrSame = publisher.token >= slot.publisher;
+                const bool accept = publisher.fromHost ? (!slot.fromHost || newerOrSame)
+                                                       : (!slot.fromHost && newerOrSame);
+                if (accept) {
+                    const bool changed = !(slot.prefs == prefs);
+                    slot.prefs = prefs;
+                    slot.publisher = publisher.token;
+                    slot.fromHost = publisher.fromHost;
+                    slot.identity = identity;
+                    if (changed) {
+                        ++slot.generation;
+                        // Each change may show its own few refusals.
+                        slot.refusalsLogged = 0;
+                        outcome = Outcome::Adopted;
+                    }
+                } else if (!(slot.prefs == prefs) && slot.refusalsLogged < 5) {
+                    // Only a DIFFERENT blob from an older instance is worth a
+                    // line; the same blob republished changes nothing.
+                    ++slot.refusalsLogged;
+                    outcome = Outcome::Refused;
+                }
+            }
+            now = it->second;
         }
+
         // Only real changes are logged: every Premiere instance of the clip
-        // publishes the same blob when it opens, and those repeats say nothing.
-        if (changed) {
-            PluginLog::info("direct: Source Settings published for '{}' - colour {}, fit {}, exposure {:+.2f}",
-                            path.filename().string(), static_cast<int>(prefs.colorOutput),
-                            static_cast<int>(prefs.dlogmFit), static_cast<double>(prefs.exposureStops));
+        // publishes the same blob when it opens, and those repeats say
+        // nothing.  This line and the effect's "Source Settings generation"
+        // line are the two ends of one change.
+        if (outcome == Outcome::Adopted) {
+            PluginLog::info("direct: Source Settings generation {} for '{}' (file {:08x}:{:016x}) from importer "
+                            "instance #{}{} (importer id {}): colour {}, fit {}, exposure {:+.2f}, calibration {}, "
+                            "stabilisation {}, seam {}, gain {}, parallax {}, Program Monitor Colour {}",
+                            now.generation, nameOf(path), identity.volume, identity.index, publisher.token,
+                            publisher.fromHost ? "" : " (its defaults: the host gave it no settings)",
+                            publisher.importerId, static_cast<int>(prefs.colorOutput),
+                            static_cast<int>(prefs.dlogmFit), static_cast<double>(prefs.exposureStops),
+                            static_cast<int>(prefs.calibration), static_cast<int>(prefs.stabilization),
+                            static_cast<int>(prefs.seamSearch), static_cast<int>(prefs.gainMatch),
+                            static_cast<int>(prefs.parallax),
+                            prefs.directColourMode() == PrefsDirectColour::MatchSource ? "match Source monitor"
+                                                                                       : "sequence space");
+        } else if (outcome == Outcome::Refused) {
+            // Two reasons to refuse, worded apart so a field log says which.
+            PluginLog::info("direct: kept Source Settings generation {} for '{}' (colour {}, exposure {:+.2f}) from "
+                            "importer instance #{}: instance #{} {} colour {}, exposure {:+.2f} - {}",
+                            now.generation, nameOf(path), static_cast<int>(now.prefs.colorOutput),
+                            static_cast<double>(now.prefs.exposureStops), now.publisher, publisher.token,
+                            publisher.fromHost ? "is older and holds" : "was given no settings; its defaults are",
+                            static_cast<int>(prefs.colorOutput), static_cast<double>(prefs.exposureStops),
+                            publisher.fromHost ? "the direct path follows the newest instance"
+                                               : "defaults never override settings the host handed over");
         }
     } catch (...) {
         // A failed publish only means the engine renders this clip with the
         // settings it had; never worth failing the importer call over.
     }
 }
+
+// ---- [/WP-SETTINGS] -----------------------------------------------------------
 
 void engineShutdown() noexcept {
     try {
@@ -294,6 +652,84 @@ void engineShutdown() noexcept {
         // instance a live lease still references is freed with that lease.
         clips.clear();
     } catch (...) {
+    }
+}
+
+// ===========================================================================
+//  [WP-IMPORTER] direct-path activity per file (see Engine.h)
+// ===========================================================================
+
+namespace {
+
+/// When each file last had a direct frame served, and how many so far.
+/// Created on first use and never destroyed, like the registry: it holds no
+/// CUDA state, but it is reached from render threads that may outlive a
+/// static destructor's ordering at process exit.
+struct DirectActivity {
+    struct Entry {
+        std::chrono::steady_clock::time_point last{};
+        std::uint64_t frames = 0;
+    };
+    std::mutex mutex;
+    std::unordered_map<std::wstring, Entry> files;
+};
+
+[[nodiscard]] DirectActivity& directActivity() {
+    static DirectActivity* instance = new DirectActivity();
+    return *instance;
+}
+
+}  // namespace
+
+void engineNoteDirectFrame(const std::filesystem::path& path) noexcept {
+    try {
+        const std::wstring key = keyFor(path);
+        bool first = false;
+        {
+            DirectActivity& a = directActivity();
+            std::lock_guard<std::mutex> lock(a.mutex);
+            DirectActivity::Entry& entry = a.files[key];
+            first = entry.frames == 0;
+            entry.last = std::chrono::steady_clock::now();
+            ++entry.frames;
+        }
+        if (first) {
+            PluginLog::info("direct: the effect renders '{}' from the fisheyes; the importer's equirect of it stays "
+                            "full quality (it is the effect's fallback and every other view's picture)",
+                            path.filename().string());
+        }
+    } catch (...) {
+        // Diagnostics only: a failed note must never fail a frame.
+    }
+}
+
+bool engineDirectPathActive(const std::filesystem::path& path, std::chrono::milliseconds window) noexcept {
+    try {
+        if (window.count() < 0) {
+            return false;
+        }
+        const std::wstring key = keyFor(path);
+        DirectActivity& a = directActivity();
+        std::lock_guard<std::mutex> lock(a.mutex);
+        const auto it = a.files.find(key);
+        if (it == a.files.end() || it->second.frames == 0) {
+            return false;
+        }
+        return std::chrono::steady_clock::now() - it->second.last <= window;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::uint64_t engineDirectFrameCount(const std::filesystem::path& path) noexcept {
+    try {
+        const std::wstring key = keyFor(path);
+        DirectActivity& a = directActivity();
+        std::lock_guard<std::mutex> lock(a.mutex);
+        const auto it = a.files.find(key);
+        return it == a.files.end() ? 0u : it->second.frames;
+    } catch (...) {
+        return 0;
     }
 }
 
@@ -355,10 +791,12 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
             return OSV_ENGINE_ERR_ARGUMENT;
         }
         const std::filesystem::path path(std::wstring(request->path, pathLen));
+        // [WP-SETTINGS] One identity lookup for both the clip and its settings.
+        const std::wstring key = keyFor(path);
 
         // ---- the clip -------------------------------------------------------------
         std::string openError;
-        std::shared_ptr<ImporterInstance> clip = clipFor(path, openError);
+        std::shared_ptr<ImporterInstance> clip = clipFor(path, key, openError);
         if (!clip) {
             writeError(error, errorCapacity, openError);
             return OSV_ENGINE_ERR_SOURCE;
@@ -378,23 +816,37 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
         std::uint32_t index = 0;
         bool exact = true;
         render::RenderJob job;
+        // [WP-SETTINGS] The settings this frame is rendered with, for the caller.
+        OsvEngineClipSettings frameSettings{};
         {
             std::lock_guard<std::mutex> lock(clip->lock());
 
-            // The user's Source Settings for this file, as Premiere's own
-            // instance last saw them (a no-op when nothing changed).
-            PrefsBlob prefs;
-            if (publishedPrefs(path, prefs)) {
+            // ---- [WP-SETTINGS] the user's Source Settings for this file -----------
+            // As the newest of Premiere's instances published them (a no-op
+            // when nothing changed).  Read once: the generation reported with
+            // the frame is exactly the one applied to it, even if another
+            // publication lands while the frame is being built.
+            PublishedSettings published;
+            const bool known = publishedPrefs(key, published);
+            if (known) {
                 const PrefsBlob before = clip->prefsLocked();
-                clip->applyPrefsLocked(&prefs, PrefsBlob::kSize);
+                clip->applyPrefsLocked(&published.prefs, PrefsBlob::kSize);
                 if (!(before == clip->prefsLocked())) {
-                    PluginLog::info("direct: engine now renders '{}' with exposure {:+.2f}, fit {} (was {:+.2f}, "
-                                    "fit {})",
-                                    path.filename().string(), static_cast<double>(prefs.exposureStops),
-                                    static_cast<int>(prefs.dlogmFit), static_cast<double>(before.exposureStops),
-                                    static_cast<int>(before.dlogmFit));
+                    PluginLog::info("direct: engine now renders '{}' with Source Settings generation {}: colour {}, "
+                                    "exposure {:+.2f}, fit {}, calibration {}, stabilisation {} (was colour {}, "
+                                    "exposure {:+.2f}, fit {}, calibration {}, stabilisation {})",
+                                    nameOf(path), published.generation, static_cast<int>(published.prefs.colorOutput),
+                                    static_cast<double>(published.prefs.exposureStops),
+                                    static_cast<int>(published.prefs.dlogmFit),
+                                    static_cast<int>(published.prefs.calibration),
+                                    static_cast<int>(published.prefs.stabilization),
+                                    static_cast<int>(before.colorOutput), static_cast<double>(before.exposureStops),
+                                    static_cast<int>(before.dlogmFit), static_cast<int>(before.calibration),
+                                    static_cast<int>(before.stabilization));
                 }
             }
+            fillClipSettings(frameSettings, clip->prefsLocked(), known ? published.generation : 0u,
+                             known ? published.identity : identityOf(path));
 
             index = frameIndexForTicks(*clip, request->mediaTicks);
             const RenderPurpose purpose =
@@ -415,6 +867,11 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
         if (uploaded.ok()) {
             uploaded = uploadTable(job.params.warpEnabled ? job.warpGrid : std::vector<float>{}, lease->warp);
         }
+        // [WP-SEAM] the carved blend-seam table, a few KB like the others.
+        if (uploaded.ok()) {
+            uploaded = uploadTable(job.params.blendSeamEnabled ? job.blendSeam : std::vector<float>{},
+                                   lease->blendSeam);
+        }
         if (!uploaded.ok()) {
             lease->freeTables();
             writeError(error, errorCapacity, uploaded.error().message);
@@ -427,18 +884,28 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
         out->planes[1] = job.planes[1];
         out->seamDevice = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(lease->seam));
         out->warpDevice = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(lease->warp));
+        // [WP-SEAM]
+        out->blendSeamDevice = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(lease->blendSeam));
         // The stitch block is an equirect block, whose Rout is exactly the
         // frame's body-from-world stabilisation.
         std::memcpy(out->bodyFromWorld, job.params.Rout, sizeof(out->bodyFromWorld));
         out->frameIndex = index;
         out->exact = exact ? 1 : 0;
+        out->settings = frameSettings;  // [WP-SETTINGS]
         out->lease = lease.release();
         g_liveLeases.fetch_add(1);
 
+        // [WP-IMPORTER] the importer's side learns that this file is being
+        // rendered directly (diagnostics only - see Engine.h for why the
+        // importer's own frame must not change because of it).
+        engineNoteDirectFrame(path);
+
         PluginLog::oncef("direct/first-frame", PluginLog::Level::Info,
-                         "direct: first frame served - '{}' frame {} (media {} ticks), transfer {}, seam {}, warp {}",
-                         path.filename().string(), index, static_cast<long long>(request->mediaTicks),
-                         out->stitch.color.transfer, out->seamDevice ? "yes" : "no", out->warpDevice ? "yes" : "no");
+                         "direct: first frame served - '{}' frame {} (media {} ticks), transfer {}, seam {}, warp {}, "
+                         "blend seam {}, Source Settings generation {}",
+                         nameOf(path), index, static_cast<long long>(request->mediaTicks), out->stitch.color.transfer,
+                         out->seamDevice ? "yes" : "no", out->warpDevice ? "yes" : "no",
+                         out->blendSeamDevice ? "yes" : "no", out->settings.generation);
         return OSV_ENGINE_OK;
     } catch (const std::exception& e) {
         writeError(error, errorCapacity, std::string("internal error: ") + e.what());
@@ -448,6 +915,53 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
         return OSV_ENGINE_ERR_INTERNAL;
     }
 }
+
+// ---- [WP-SETTINGS] ------------------------------------------------------------
+
+extern "C" __declspec(dllexport) std::int32_t OsvEngine_QuerySettings(const wchar_t* pathPtr,
+                                                                       OsvEngineClipSettings* out, char* error,
+                                                                       std::int32_t errorCapacity) {
+    using namespace osv::premiere;
+    try {
+        // ---- the caller's structures ------------------------------------------
+        if (!pathPtr || !out) {
+            writeError(error, errorCapacity, "null path or settings block");
+            return OSV_ENGINE_ERR_ARGUMENT;
+        }
+        if (out->structSize < sizeof(OsvEngineClipSettings)) {
+            writeError(error, errorCapacity, "settings block size mismatch (built from a different ABI)");
+            return OSV_ENGINE_ERR_VERSION;
+        }
+        const std::size_t pathLen = wcsnlen(pathPtr, kMaxPathChars + 1);
+        if (pathLen == 0 || pathLen > kMaxPathChars) {
+            writeError(error, errorCapacity, "empty or unterminated path");
+            return OSV_ENGINE_ERR_ARGUMENT;
+        }
+        const std::filesystem::path path(std::wstring(pathPtr, pathLen));
+
+        // ---- what is in force -----------------------------------------------------
+        // No clip is opened and nothing touches the GPU: this is the cheap
+        // question the effect asks before deciding whether to decode at all.
+        const std::wstring key = keyFor(path);
+        PublishedSettings published;
+        if (publishedPrefs(key, published)) {
+            fillClipSettings(*out, published.prefs, published.generation, published.identity);
+        } else {
+            // Generation 0: what the engine WOULD render (its defaults), and
+            // the file's identity so the caller's log can still name it.
+            fillClipSettings(*out, PrefsBlob::defaults(), 0u, identityOf(path));
+        }
+        return OSV_ENGINE_OK;
+    } catch (const std::exception& e) {
+        writeError(error, errorCapacity, std::string("internal error: ") + e.what());
+        return OSV_ENGINE_ERR_INTERNAL;
+    } catch (...) {
+        writeError(error, errorCapacity, "internal error");
+        return OSV_ENGINE_ERR_INTERNAL;
+    }
+}
+
+// ---- [/WP-SETTINGS] -----------------------------------------------------------
 
 extern "C" __declspec(dllexport) void OsvEngine_ReleaseFrame(void* leasePtr, void* cuStream) {
     try {

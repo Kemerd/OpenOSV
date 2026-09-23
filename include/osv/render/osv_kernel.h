@@ -154,6 +154,63 @@ typedef struct OsvPlane {
     int chromaInterleaved;         /* 1 = CbCr interleaved (step 2)           */
 } OsvPlane;
 
+/* ========================================================================= */
+/*  [WP-FLARE] lens-flare removal: parameter types                           */
+/* ========================================================================= */
+/* The sun inside a lens's field of view leaves two kinds of stray light on
+ * that lens's frame (docs/research/FLARE.md):
+ *
+ *   * GHOSTS - internal reflections between the lens surfaces, the sensor
+ *     stack and the (ND) filter glass.  Each is a defocused image of the
+ *     aperture, clipped by a rectangular stop, i.e. a soft-edged rounded
+ *     rectangle of nearly flat brightness, displaced from the sun along the
+ *     line through the optical centre.
+ *   * VEIL - light scattered everywhere in the barrel: a near-uniform
+ *     additive floor over the whole frame.
+ *
+ * Both are ADDITIVE in linear light, so the removal is a subtraction in the
+ * lens's native scene-linear RGB, before the lens gain and the blend.  The
+ * host (src/osv/render/Flare.cpp) measures them; the kernel only evaluates
+ * the fitted shapes.  Everything here is in STREAM pixels of the lens it
+ * belongs to, the same frame osvProjectLens returns. */
+
+/* Ghosts the kernel carries per lens.  The sample clip shows four in the
+ * sun's lens; more would cost parameter-block space for rarely-seen faint
+ * reflections (see the 4 KB budget note on OSV_MAX_OCCLUSION_POINTS). */
+#define OSV_FLARE_MAX_GHOSTS 4
+
+/* One ghost: a rotated rounded rectangle with a smoothstep edge.  Its light
+ * at a pixel is, per channel,
+ *     amp * S + rim * E + gradX * S * u + gradY * S * v   (clamped >= 0)
+ * with S the plateau weight (1 inside, smoothstep across +/- soft of the
+ * edge), E a compact bump of half width 3 * soft centred ON the edge (the
+ * caustic rim a defocused ghost carries), and (u, v) the local coordinates
+ * scaled to +/-1 at the half extents (a brightness tilt across the ghost).
+ * Measured on the sample's brightest ghost the rim and tilt terms raise the
+ * explained local variance from 0.78 to 0.86 (0.61 to 0.83 on a fainter
+ * one), and without them its bright rim survives the removal as an outline. */
+typedef struct OsvFlareGhost {
+    float cx, cy;     /* centre (stream px, continuous coordinates)            */
+    float hx, hy;     /* half extents along the rotated local axes (px)        */
+    float radius;     /* corner radius (px), 0 .. min(hx, hy)                  */
+    float cosA, sinA; /* rotation of the local x axis in the image             */
+    float soft;       /* half width of the edge ramp (px), > 0                 */
+    float amp[3];     /* additive native-linear RGB on the plateau             */
+    float rim[3];     /* additive RGB of the edge bump at its crest            */
+    float gradX[3];   /* plateau tilt along local x (RGB at u = +1)            */
+    float gradY[3];   /* plateau tilt along local y (RGB at v = +1)            */
+    float reach2;     /* squared radius beyond which the ghost is exactly 0    */
+} OsvFlareGhost;
+
+/* Everything removed from one lens. */
+typedef struct OsvFlareLens {
+    OsvFlareGhost ghost[OSV_FLARE_MAX_GHOSTS];
+    float veil[3];  /* uniform additive veil, native-linear RGB             */
+    int ghostCount; /* ghosts in use, 0 .. OSV_FLARE_MAX_GHOSTS             */
+} OsvFlareLens;
+
+/* ======================= [/WP-FLARE] types ============================== */
+
 /* Everything the shader needs besides the planes and the seam table. */
 typedef struct OsvRenderParams {
     int outW, outH;          /* output size in pixels                          */
@@ -207,6 +264,34 @@ typedef struct OsvRenderParams {
     float warpSinLatLo;
     float warpSinLatHi;
     OsvColorParams color;    /* colour pipeline (see ColorMath.h)              */
+
+    /* ---- [WP-SEAM] carved blend seam (optional) ---------------------------
+     * The FOV feather above cross-fades the two lenses over the whole overlap
+     * band - with the default 4 degree feather both lenses sit at 50 % over
+     * a ~7 degree strip.  Wherever the lenses disagree (a wing fin a few
+     * centimetres from the camera, which no warp can align because each lens
+     * sees a different side of it) that strip shows BOTH copies.
+     *
+     * The blend-seam table replaces the wide cross-fade with a seam carved by
+     * dynamic programming through the places the lenses agree (SeamCarve.h):
+     * per longitude column of the polar-axis layout it holds the seam
+     * latitude and a feather half width, both in radians, interleaved
+     * (lat, halfWidth).  Inside the overlap each lens is used on its own side
+     * of that seam and the two are mixed only within the (narrow) feather.
+     * Coverage still rules: where the chosen lens cannot see a direction
+     * (stick occlusion, past its field of view) the other lens fills in.
+     *
+     * All zero (the builder's default) = the table is ignored and every
+     * render is exactly what it was without it. */
+    int blendSeamEnabled;      /* 1 = lens weights follow the blend-seam table */
+    int blendSeamColumns;      /* longitude columns in the table (2 floats each) */
+    float blendSeamEdgeRad;    /* validity ramp below thetaMax for the seam weights */
+    /* ---- [/WP-SEAM] ------------------------------------------------------ */
+
+    /* ---- [WP-FLARE] lens-flare removal (0 = off: render unchanged) ------- */
+    int flareEnabled;        /* 1 = subtract flare[i] from lens i              */
+    OsvFlareLens flare[2];   /* per lens, indexed like lens[]                  */
+    /* ---- [/WP-FLARE] ---------------------------------------------------- */
 } OsvRenderParams;
 
 /* ------------------------------------------------------------------------- */
@@ -336,6 +421,21 @@ OSV_HD float osvEyeOffsetTheta(float r, float focalPx, float d) {
     return theta;
 }
 
+/* ---- [WP-CAMERA] DJI sphere camera: id and forward declaration ------------
+ * The projection DJI's reframe tools render with (DJI Studio and DJI's own
+ * Premiere plug-in): a pinhole camera with a VERTICAL field of view, placed
+ * `eyeZ` sphere radii behind the centre of the unit panorama sphere and
+ * looking through it.  The sphere point it sees is the FAR intersection of
+ * the pinhole ray with the sphere.  In OsvReframeParams / OsvRenderParams the
+ * existing fields carry it: focalPx = the PINHOLE focal length in pixels
+ * ((H / 2) / tan(vfov / 2)), eyeOffset = eyeZ (any value >= 0; above 1 the
+ * eye is outside the sphere and rays that miss it are uncovered).  The
+ * function itself lives in the [WP-CAMERA] region at the end of this file.
+ * See docs/research/DJI_CAMERA.md for the recovery of the model. */
+#define OSV_PROJ_DJI_SPHERE 4
+OSV_HD int osvDjiSphereRay(float focalPx, float eyeZ, float nx, float ny, float* d);
+/* ---- end [WP-CAMERA] ------------------------------------------------------ */
+
 /* Unit view ray for a centred pixel offset (nx right, ny up, in pixels) of a
  * W x H viewport under one of the OSV_PROJ_* camera models.  Shared by the
  * fisheye stitching shader and the equirect reframe entry point so both
@@ -343,6 +443,11 @@ OSV_HD float osvEyeOffsetTheta(float r, float focalPx, float d) {
  * pixel maps to no direction (outside the image circle / valid radius). */
 OSV_HD int osvViewRay(int projection, float focalPx, float eyeOffset, float tanHalfH, float tanHalfV, float W,
                       float H, float nx, float ny, float* d) {
+    /* [WP-CAMERA] DJI's pinhole-behind-the-sphere camera has its own ray
+     * construction (a ray / sphere intersection, not a radial angle map). */
+    if (projection == OSV_PROJ_DJI_SPHERE) {
+        return osvDjiSphereRay(focalPx, eyeOffset, nx, ny, d);
+    }
     if (projection == OSV_PROJ_RECTILINEAR) {
         const float u = (nx / (0.5f * W)) * tanHalfH;
         const float v = (ny / (0.5f * H)) * tanHalfV;
@@ -687,16 +792,339 @@ OSV_HD void osvPolarDisplace(const float* d, float dLon, float dLat, float* out)
 }
 
 /* ------------------------------------------------------------------------- */
+/*  [WP-SEAM] Carved blend seam                                               */
+/* ------------------------------------------------------------------------- */
+/* These helpers sit directly in front of the shader that calls them rather
+ * than in a region at the end of the file: every dialect needs a function
+ * defined before its first use, and a forward declaration would have to be
+ * spelled three different ways (static inline, __forceinline__, OpenCL's C99
+ * inline) to stay legal in all of them.  Nothing here runs unless
+ * OsvRenderParams::blendSeamEnabled is set. */
+
+/* How much lens L can be TRUSTED for a ray, independent of the blend.
+ *
+ * The lens weight the shader computes (osvLensWeight) is the FOV feather
+ * times the occlusion factor.  The feather is a blending device - with a
+ * carved seam it is exactly what must NOT decide the mix - but the occlusion
+ * factor (the selfie stick) and the hard end of the field of view are facts
+ * about the lens.  So the feather is divided back out, and replaced by a
+ * much shorter ramp (blendSeamEdgeRad) that only keeps the very rim, where
+ * the image is soft and vignetted, from switching on as a hard edge.
+ *
+ * `theta` is the ray's angle from the optical axis and `w` the shader's
+ * lens weight for it (0 when the lens does not see the ray at all). */
+OSV_HD float osvSeamVisibility(const OsvRenderParams* p, const OsvLens* L, float theta, float w) {
+    if (!(w > 0.0f)) {
+        return 0.0f;
+    }
+    /* The FOV feather osvLensWeight applied, recomputed with its own
+     * expression so the division below recovers the occlusion factor. */
+    float fov = 1.0f;
+    if (L->featherRad > 0.0f) {
+        fov = osvSmoothstep((L->thetaMax - theta) / L->featherRad);
+    }
+    /* At the very rim the feather is ~0 and the quotient meaningless; the
+     * edge ramp below is ~0 there as well, so 1 is a safe stand-in. */
+    const float occl = (fov > 1e-3f) ? osvClampf(w / fov, 0.0f, 1.0f) : 1.0f;
+    float edge = 1.0f;
+    if (p->blendSeamEdgeRad > 0.0f) {
+        edge = osvSmoothstep((L->thetaMax - theta) / p->blendSeamEdgeRad);
+    }
+    return occl * edge;
+}
+
+/* Blend weights for a seam that asks for master weight `t1` (slave 1 - t1),
+ * given what each lens can actually see (`vis`, from osvSeamVisibility).
+ *
+ *     a_i = vis_i * t_i                  what the seam asks for and gets
+ *     w_i = a_i + (1 - sum a) * vis_i / sum vis
+ *
+ * The second term hands whatever the chosen lens cannot see to the lens that
+ * can, in proportion to what it sees - so an occluded or out-of-field side
+ * never leaves a hole or a dark smear, and the weights always sum to 1 and
+ * vary continuously with every input.  Where both lenses see the ray fully
+ * (the normal case) it is simply (1 - t1, t1). */
+OSV_HD void osvSeamMix(const float* vis, float t1, float* w) {
+    const float a0 = vis[0] * (1.0f - t1);
+    const float a1 = vis[1] * t1;
+    const float deficit = fmaxf(1.0f - (a0 + a1), 0.0f);
+    const float visSum = vis[0] + vis[1];
+    if (!(visSum > 0.0f)) {
+        /* Defensive: the caller only gets here with both lenses visible. */
+        w[0] = 1.0f - t1;
+        w[1] = t1;
+        return;
+    }
+    w[0] = a0 + deficit * (vis[0] / visSum);
+    w[1] = a1 + deficit * (vis[1] / visSum);
+}
+
+/* Seam latitude and feather half width (radians) at longitude `lon`.
+ *
+ * The table holds one (lat, halfWidth) pair per longitude column, sampled at
+ * the column CENTRES, and is interpolated linearly between them with the
+ * longitude wrapping - a nearest-column lookup would draw the seam as a
+ * staircase once a view is zoomed in far enough for one column to span a
+ * few dozen output pixels. */
+OSV_HD void osvBlendSeamLookup(const OsvRenderParams* p, OSV_GLOBAL const float* table, float lon, float* lat,
+                               float* halfWidth) {
+    const int n = p->blendSeamColumns;
+    /* Continuous column position with centres at integer + 0.5. */
+    const float fx = ((lon + OSV_KERNEL_PI) / OSV_KERNEL_TWO_PI) * (float)n - 0.5f;
+    const float flx = floorf(fx);
+    const float t = fx - flx;
+    int c0 = (int)flx;
+    int c1 = c0 + 1;
+    /* Wrap both taps into [0, n): column n - 1 is adjacent to column 0. */
+    c0 = ((c0 % n) + n) % n;
+    c1 = ((c1 % n) + n) % n;
+    const float s0 = table[c0 * 2];
+    const float s1 = table[c1 * 2];
+    const float h0 = table[c0 * 2 + 1];
+    const float h1 = table[c1 * 2 + 1];
+    *lat = s0 + (s1 - s0) * t;
+    *halfWidth = h0 + (h1 - h0) * t;
+}
+
+/* Weight of the master lens for a ray at latitude `lat` of a seam at `s`
+ * with feather half width `hw`: 0 at s - hw, 1 at s + hw, smoothstep in
+ * between (the master lens, lens[1], owns the +Y pole, i.e. the north side
+ * of the polar-axis layout).  A zero width is a hard cut. */
+OSV_HD float osvSeamSide(float lat, float s, float hw) {
+    if (!(hw > 0.0f)) {
+        return (lat >= s) ? 1.0f : 0.0f;
+    }
+    return osvSmoothstep(0.5f + 0.5f * (lat - s) / hw);
+}
+
+/* Re-weight the blend of one ray by the carved seam; the shader's single
+ * [WP-SEAM] call.
+ *
+ * `dBody` is the output ray in the body frame (where the table is defined,
+ * before any seam shift or warp moves the sampling direction), `theta` each
+ * lens's angle from its axis for that ray and `w` the shader's lens weights,
+ * which are REPLACED by the seam's weights.  Returns their sum - the value
+ * the shader normalises the colour by - or `wsum` unchanged (and `w`
+ * untouched) for a ray the seam does not concern: one only a single lens
+ * sees, a nearest-lens render, or no table.
+ *
+ * Why only rays BOTH lenses see: everywhere else one lens is all there is,
+ * and the coverage weights already say so - the carved seam changes nothing
+ * outside the overlap, by construction. */
+OSV_HD float osvBlendSeamApply(const OsvRenderParams* p, OSV_GLOBAL const float* table, const float* dBody,
+                               const float* theta, float* w, float wsum) {
+    if (!p->blendSeamEnabled || table == 0 || p->blendSeamColumns <= 0 || !p->blendEnabled || !(w[0] > 0.0f) ||
+        !(w[1] > 0.0f)) {
+        return wsum;
+    }
+    /* Polar-axis longitude / latitude of the ray (see osvSeamColumn). */
+    const float lon = atan2f(dBody[0], dBody[2]);
+    const float lat = asinf(osvClampf(dBody[1], -1.0f, 1.0f));
+    float s = 0.0f;
+    float hw = 0.0f;
+    osvBlendSeamLookup(p, table, lon, &s, &hw);
+
+    /* What each lens can be trusted for, without the FOV feather, then the
+     * seam's choice filled in by coverage (osvSeamMix sums to 1). */
+    float vis[2];
+    vis[0] = osvSeamVisibility(p, &p->lens[0], theta[0], w[0]);
+    vis[1] = osvSeamVisibility(p, &p->lens[1], theta[1], w[1]);
+    float seamW[2];
+    osvSeamMix(vis, osvSeamSide(lat, s, hw), seamW);
+    const float sum = seamW[0] + seamW[1];
+    if (!(sum > 1e-6f)) {
+        return wsum; /* defensive: cannot happen with both lenses visible */
+    }
+    w[0] = seamW[0];
+    w[1] = seamW[1];
+    return sum;
+}
+/* ---- [/WP-SEAM] ---------------------------------------------------------- */
+
+/* ========================================================================= */
+/*  [WP-FLARE] lens-flare removal: functions                                  */
+/* ========================================================================= */
+
+/* Signed distance from stream pixel (px, py) to the rounded rectangle of
+ * ghost g (negative inside; Inigo Quilez's box SDF with rounded corners),
+ * plus the local coordinates scaled to +/-1 at the half extents. */
+OSV_HD float osvFlareGhostDistance(const OsvFlareGhost* g, float px, float py, float* u, float* v) {
+    const float dx = px - g->cx;
+    const float dy = py - g->cy;
+    /* Into the ghost's own axes. */
+    const float sx = dx * g->cosA + dy * g->sinA;
+    const float sy = -dx * g->sinA + dy * g->cosA;
+    *u = sx / fmaxf(g->hx, 1e-3f);
+    *v = sy / fmaxf(g->hy, 1e-3f);
+    const float qx = fabsf(sx) - (g->hx - g->radius);
+    const float qy = fabsf(sy) - (g->hy - g->radius);
+    const float ox = fmaxf(qx, 0.0f);
+    const float oy = fmaxf(qy, 0.0f);
+    return sqrtf(ox * ox + oy * oy) + fminf(fmaxf(qx, qy), 0.0f) - g->radius;
+}
+
+/* Plateau weight from a signed distance: 1 inside, 0 outside, a smoothstep
+ * across [-soft, +soft].  soft > 0 is guaranteed by the host; the guard
+ * keeps a zeroed block from dividing by zero. */
+OSV_HD float osvFlarePlateau(float d, float soft) {
+    const float s = fmaxf(soft, 1e-3f);
+    return osvSmoothstep((s - d) / (2.0f * s));
+}
+
+/* Rim bump from a signed distance: (1 - (d / 3 soft)^2)^2 inside |d| < 3 soft
+ * and exactly 0 beyond, so the ghost's footprint ends at a hard radius. */
+OSV_HD float osvFlareRim(float d, float soft) {
+    const float t = d / (3.0f * fmaxf(soft, 1e-3f));
+    if (!(t * t < 1.0f)) {
+        return 0.0f;
+    }
+    const float b = 1.0f - t * t;
+    return b * b;
+}
+
+/* Plateau weight of one ghost at stream pixel (px, py) - the shape alone,
+ * without its amplitudes.  Zero past the bounding circle. */
+OSV_HD float osvFlareGhostShape(const OsvFlareGhost* g, float px, float py) {
+    const float dx = px - g->cx;
+    const float dy = py - g->cy;
+    if (dx * dx + dy * dy > g->reach2) {
+        return 0.0f;
+    }
+    float u, v;
+    const float d = osvFlareGhostDistance(g, px, py, &u, &v);
+    return osvFlarePlateau(d, g->soft);
+}
+
+/* Additive light of ghost g at stream pixel (px, py), native-linear RGB,
+ * never negative.  Returns 0 (rgb untouched) past the bounding circle -
+ * one compare for the overwhelming majority of pixels. */
+OSV_HD int osvFlareGhostLight(const OsvFlareGhost* g, float px, float py, float* rgb) {
+    const float dx = px - g->cx;
+    const float dy = py - g->cy;
+    if (dx * dx + dy * dy > g->reach2) {
+        return 0;
+    }
+    float u, v;
+    const float d = osvFlareGhostDistance(g, px, py, &u, &v);
+    const float s = osvFlarePlateau(d, g->soft);
+    const float e = osvFlareRim(d, g->soft);
+    for (int c = 0; c < 3; ++c) {
+        /* Light only adds: a tilt or rim that would dip below zero at one
+         * end of the ghost contributes nothing there instead. */
+        rgb[c] = fmaxf(g->amp[c] * s + g->rim[c] * e + (g->gradX[c] * u + g->gradY[c] * v) * s, 0.0f);
+    }
+    return 1;
+}
+
+/* Remove `g` units of additive light from a value `x` without ever producing
+ * negative light or reversing tones.
+ *
+ *     f(x) = x - g * x^3 / (x^3 + g^3)
+ *
+ * For x >> g it is x - g (the full subtraction).  Where the estimate reaches
+ * the signal itself it backs off smoothly: f(x) >= 0.47 x everywhere and
+ * f'(x) >= 0.16, so an over-estimate can dim a dark pixel but never clip it
+ * to black nor invert a gradient.  Non-positive inputs and estimates pass
+ * through unchanged. */
+OSV_HD float osvFlareSoftSubtract(float x, float g) {
+    if (!(g > 1e-7f) || !(x > 0.0f)) {
+        return x;
+    }
+    const float x3 = x * x * x;
+    const float g3 = g * g * g;
+    return x - g * (x3 / (x3 + g3));
+}
+
+/* Subtract the veil and every ghost of lens flare block F at stream pixel
+ * (px, py) from the native-linear RGB triple `rgb` (in place). */
+OSV_HD void osvFlareRemove(const OsvFlareLens* F, float px, float py, float* rgb) {
+    if (F == 0 || rgb == 0) {
+        return;
+    }
+    /* Total additive estimate per channel: the uniform veil plus every
+     * ghost whose footprint covers this pixel. */
+    float add[3];
+    add[0] = F->veil[0];
+    add[1] = F->veil[1];
+    add[2] = F->veil[2];
+    const int n = F->ghostCount < OSV_FLARE_MAX_GHOSTS ? F->ghostCount : OSV_FLARE_MAX_GHOSTS;
+    for (int k = 0; k < n; ++k) {
+        float light[3];
+        if (osvFlareGhostLight(&F->ghost[k], px, py, light)) {
+            add[0] += light[0];
+            add[1] += light[1];
+            add[2] += light[2];
+        }
+    }
+    rgb[0] = osvFlareSoftSubtract(rgb[0], add[0]);
+    rgb[1] = osvFlareSoftSubtract(rgb[1], add[1]);
+    rgb[2] = osvFlareSoftSubtract(rgb[2], add[2]);
+}
+
+/* Analysis sampler: mean native-linear RGB of the factor x factor block of
+ * lens pixels behind analysis pixel (ox, oy) - the working image the host
+ * detects the sun and fits the ghosts on.  Each lens pixel is decoded on its
+ * own (luma at the pixel, the co-sited 4:2:0 chroma sample) and the linear
+ * values are averaged, because light adds in linear space, not in code.
+ * Pixels of the block beyond the frame edge are left out of the mean. */
+OSV_HD void osvFlareDownsamplePixel(const OsvPlane* P, const OsvColorParams* color, int factor, int ox, int oy,
+                                    float* rgb) {
+    rgb[0] = rgb[1] = rgb[2] = 0.0f;
+    if (P == 0 || color == 0 || factor < 1 || P->w <= 0 || P->h <= 0) {
+        return;
+    }
+    const int step = P->chromaInterleaved ? 2 : 1;
+    const int x0 = ox * factor;
+    const int y0 = oy * factor;
+    float acc[3] = {0.0f, 0.0f, 0.0f};
+    int count = 0;
+    for (int j = 0; j < factor; ++j) {
+        const int y = y0 + j;
+        if (y < 0 || y >= P->h) {
+            continue;
+        }
+        for (int i = 0; i < factor; ++i) {
+            const int x = x0 + i;
+            if (x < 0 || x >= P->w) {
+                continue;
+            }
+            /* 4:2:0: chroma sample (x/2, y/2) covers this luma pixel. */
+            const float yv = osvFetchPlane(P->y, P->strideY, 1, P->w, P->h, x, y, P->bitShift);
+            const float cb = osvFetchPlane(P->u, P->strideC, step, P->cw, P->ch, x >> 1, y >> 1, P->bitShift);
+            const float cr = osvFetchPlane(P->v, P->strideC, step, P->cw, P->ch, x >> 1, y >> 1, P->bitShift);
+            float code[3];
+            osvYuvToCode(color, yv, cb, cr, code);
+            float lin[3];
+            osvCodeToLinear(color, code, lin);
+            acc[0] += lin[0];
+            acc[1] += lin[1];
+            acc[2] += lin[2];
+            ++count;
+        }
+    }
+    if (count > 0) {
+        const float inv = 1.0f / (float)count;
+        rgb[0] = acc[0] * inv;
+        rgb[1] = acc[1] * inv;
+        rgb[2] = acc[2] * inv;
+    }
+}
+/* ======================= [/WP-FLARE] functions ========================== */
+
+/* ------------------------------------------------------------------------- */
 /*  The shader                                                                */
 /* ------------------------------------------------------------------------- */
 
 /* Compute output pixel (x, y).  `planes` holds the two lens frames, `seam`
  * the optional per-column seam shift table in degrees (may be 0 when
  * seamShiftEnabled == 0), `warp` the optional 2-D parallax grid (may be 0
- * when warpEnabled == 0).  `out` receives R, G, B in the output encoding and
- * A = coverage (or 1).  Pixels seen by neither lens are (0,0,0,0). */
-OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
-                           OSV_GLOBAL const float* warp, int x, int y, float* out) {
+ * when warpEnabled == 0), `blendSeam` the optional carved blend-seam table
+ * (may be 0 when blendSeamEnabled == 0).  `out` receives R, G, B in the
+ * output encoding and A = coverage (or 1).  Pixels seen by neither lens are
+ * (0,0,0,0). */
+OSV_HD void osvShadePixelWS(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
+                            OSV_GLOBAL const float* warp, OSV_GLOBAL const float* blendSeam, int x, int y,
+                            float* out) {
     float dView[3];
     if (!osvRayForPixel(p, (float)x, (float)y, dView)) {
         out[0] = out[1] = out[2] = out[3] = 0.0f;
@@ -739,6 +1167,9 @@ OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV
      * early - leaving them untouched - for a ray past thetaMax, so a rescue
      * that read px/py without checking this would sample pixel (0, 0). */
     int projected[2] = {0, 0};
+    /* [WP-SEAM] each lens's angle from its axis, for the carved seam's
+     * visibility (osvSeamVisibility); unused without a blend-seam table. */
+    float thetaL[2] = {0.0f, 0.0f};
     for (int i = 0; i < 2; ++i) {
         const OsvLens* L = &p->lens[i];
         if (!L->enabled) {
@@ -779,6 +1210,7 @@ OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV
         if (osvProjectLens(L, dl, &px[i], &py[i], &theta)) {
             w[i] = osvLensWeight(L, theta, px[i], py[i]);
             projected[i] = 1;
+            thetaL[i] = theta;
         }
     }
 
@@ -839,6 +1271,10 @@ OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV
         return;
     }
 
+    /* [WP-SEAM] carved seam: re-weights the blend; alpha keeps the coverage. */
+    const float coverage = wsum;
+    wsum = osvBlendSeamApply(p, blendSeam, dBody, thetaL, w, wsum);
+
     /* Fetch, decode and accumulate.  Passthrough blends in code space
      * because the log curve has no device-side inverse; every other transfer
      * blends in scene-linear light. */
@@ -859,6 +1295,12 @@ OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV
             val[2] = code[2];
         } else {
             osvCodeToLinear(&p->color, code, val);
+            /* [WP-FLARE] subtract this lens's measured ghosts and veil in
+             * its own native linear light, before gain and blend. */
+            if (p->flareEnabled) {
+                osvFlareRemove(&p->flare[i], px[i], py[i], val);
+            }
+            /* [/WP-FLARE] */
             val[0] *= p->lens[i].gain[0];
             val[1] *= p->lens[i].gain[1];
             val[2] *= p->lens[i].gain[2];
@@ -878,7 +1320,16 @@ OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV
     } else {
         osvLinearToOutput(&p->color, acc, out);
     }
-    out[3] = p->outputAlphaCoverage ? fminf(wsum, 1.0f) : 1.0f;
+    out[3] = p->outputAlphaCoverage ? fminf(coverage, 1.0f) : 1.0f; /* [WP-SEAM] coverage */
+}
+
+/* [WP-SEAM] The entry point every caller used before the carved seam
+ * existed: shade with no blend-seam table.  Kept under its old name so the
+ * band analyses (which render each lens ALONE and must never see a seam) and
+ * every existing call site keep their exact behaviour and signature. */
+OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
+                           OSV_GLOBAL const float* warp, int x, int y, float* out) {
+    osvShadePixelWS(p, planes, seam, warp, (OSV_GLOBAL const float*)0, x, y, out);
 }
 
 /* Back-compatible entry point: shade with no 2-D warp grid.
@@ -1059,5 +1510,72 @@ OSV_FN void osvReframeEquirectPixel(const OsvReframeParams* p, const OsvRgbaSour
         out[3] = 1.0f;
     }
 }
+
+/* ========================================================================= */
+/*  [WP-CAMERA] DJI sphere camera                                            */
+/* ========================================================================= */
+
+/* View ray of DJI's reframe camera for a centred pixel offset (nx right,
+ * ny up, pixels).
+ *
+ * THE MODEL (matching DJI Studio and DJI's Premiere plug-in, see
+ * docs/research/DJI_CAMERA.md): the panorama is a unit sphere at the origin;
+ * the camera is an ordinary pinhole with focal length `focalPx` (pixels),
+ * looking along +Y (view frame: X right, Y forward, Z up), with its eye at
+ * E = (0, -eyeZ, 0), i.e. eyeZ radii BEHIND the centre.  A pixel sees the
+ * point where its pinhole ray leaves the sphere - the far root of
+ * |E + t u| = 1 - which is also the only face DJI's renderer keeps (it culls
+ * the faces seen from outside).  The returned direction is that sphere
+ * point, which on a unit sphere is already the direction from the centre.
+ *
+ *   eyeZ = 0      plain rectilinear (pinhole at the centre);
+ *   eyeZ = 1      stereographic (DJI's "Asteroid");
+ *   eyeZ > 1      the eye is OUTSIDE the sphere ("Crystal Ball"): rays that
+ *                 miss it are uncovered and the function returns 0.
+ *
+ * For eyeZ <= 1 this is the same map as OSV_PROJ_EYE_OFFSET with
+ * f_eye = focalPx / (1 + eyeZ); it is written as an intersection instead of
+ * an angle inversion because that form needs no trigonometry, stays exact
+ * past eyeZ = 1 and is parameterised the way DJI's controls are (a pinhole
+ * field of view, not a visible angle).
+ *
+ * Numerics: sin^2 of the ray's angle is formed as (nx^2 + ny^2) / |ray|^2
+ * rather than 1 - cos^2, so the discriminant keeps full precision near the
+ * view axis; the result is renormalised to absorb the last ulp of drift. */
+OSV_HD int osvDjiSphereRay(float focalPx, float eyeZ, float nx, float ny, float* d) {
+    /* Every comparison is written so a NaN fails it. */
+    if (!(focalPx > 0.0f) || !(eyeZ >= 0.0f)) {
+        return 0;
+    }
+    const float r2 = nx * nx + ny * ny;
+    const float len2 = r2 + focalPx * focalPx;
+    if (!(len2 > 0.0f)) {
+        return 0;
+    }
+    const float invLen = 1.0f / sqrtf(len2);
+    /* Unit pinhole ray. */
+    const float ux = nx * invLen;
+    const float uy = focalPx * invLen;
+    const float uz = ny * invLen;
+    /* |E + t u|^2 = 1 with E = (0, -e, 0):
+     *   t^2 - 2 e uy t + (e^2 - 1) = 0
+     *   t = e uy + sqrt(1 - e^2 sin^2(alpha)),  sin^2(alpha) = r2 / len2. */
+    const float sin2 = r2 / len2;
+    const float disc = 1.0f - eyeZ * eyeZ * sin2;
+    if (!(disc >= 0.0f)) {
+        return 0; /* eye outside the sphere and the ray passes it by */
+    }
+    const float t = eyeZ * uy + sqrtf(disc);
+    if (!(t > 0.0f)) {
+        return 0;
+    }
+    d[0] = t * ux;
+    d[1] = t * uy - eyeZ;
+    d[2] = t * uz;
+    osvNormalize3(d);
+    return 1;
+}
+
+/* ---- end [WP-CAMERA] ------------------------------------------------------ */
 
 #endif /* OSV_KERNEL_H */

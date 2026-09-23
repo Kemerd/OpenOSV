@@ -188,6 +188,17 @@ struct ViewSetup {
 /// buildParams() is now exactly "buildView() plus a source description".
 /// Every non-finite control value is replaced by its documented default, so
 /// the returned block never carries a NaN into a kernel.
+///
+/// [WP-CAMERA] The lens follows `settings.cameraModel`:
+///
+///   * Classic - the eye-offset projection above (OSV_PROJ_EYE_OFFSET), FOV
+///     the visible angle across the requested width.  Bit for bit what the
+///     effect rendered before the DJI lens existed; the DJI controls are not
+///     read at all.
+///   * Dji - DJI's camera (OSV_PROJ_DJI_SPHERE): focalPx is the PINHOLE focal
+///     length for DJI FOV across the requested picture's HEIGHT (cover-fitted
+///     like Classic), eyeOffset is the Correction Angle as typed (it may
+///     exceed 1: the eye outside the sphere), no automatic ramp.
 [[nodiscard]] ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenceSize) noexcept;
 
 /// Store one straight-RGBA float quadruple as a BGRA pixel of `layout`.

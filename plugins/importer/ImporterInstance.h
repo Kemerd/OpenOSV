@@ -36,6 +36,7 @@
 // invalidated (colour parameters, output size, seam cache).
 #pragma once
 
+#include "PixelCopy.h"
 #include "PrefsBlob.h"
 
 #include "osv/color/ColorParams.h"
@@ -51,6 +52,7 @@
 #include "osv/meta/Types.h"
 #include "osv/render/ImageRGBAf.h"
 #include "osv/render/ParallaxWarp.h"
+#include "osv/render/SeamCarve.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/video/DualStreamReader.h"
 #include "osv/video/GpuClipDecoder.h"
@@ -81,6 +83,10 @@ namespace osv::premiere {
 // Forward declaration: the audio side lives in its own translation unit and
 // owns a second AVFormatContext on the same file.
 class AudioDecoder;
+
+// Forward declaration: the pinned banded readback of the importer's GPU
+// frame path (ImporterGpuFrame.h), shared by every clip on one device.
+class GpuReadback;
 
 /// Output geometry derived from the prefs and the clip's native size.
 struct OutputGeometry {
@@ -134,12 +140,18 @@ struct RenderedFrame {
     /// paused frame or an export would inherit whatever happened to be ready
     /// while the user was scrubbing.
     bool exact = true;
+    /// The OSV_TRANSFER_* the frame was rendered with when a single request
+    /// overrode the clip's own (the host's "BT.709 RGB Full" connection
+    /// space), -1 for the clip's own.  Part of the key: the override never
+    /// touches `prefs`, so without this a Rec.709 fallback frame would be
+    /// served to the next ordinary request of the same frame.
+    int outputTransfer = -1;
     render::ImageRGBAf image;
 
     [[nodiscard]] bool matches(std::uint32_t index, const OutputGeometry& geom, const PrefsBlob& blob, bool wantSeam,
-                               bool wantParallax, bool needExact) const noexcept {
+                               bool wantParallax, bool needExact, int transfer) const noexcept {
         return image.valid() && frameIndex == index && geometry == geom && prefs == blob && seamApplied == wantSeam &&
-               parallaxWanted == wantParallax && (exact || !needExact);
+               parallaxWanted == wantParallax && (exact || !needExact) && outputTransfer == transfer;
     }
 };
 
@@ -160,7 +172,10 @@ public:
     [[nodiscard]] Status open();
 
     /// Drop the decoders, the renderer lease, the audio decoder and the OS
-    /// handle but keep the parsed metadata (imQuietFile).  Idempotent.
+    /// handle but keep the parsed metadata (imQuietFile).  The video reader
+    /// is parked in video::ReaderPool rather than destroyed, so the next open
+    /// of the same file - this instance's unquiet or a new instance - takes
+    /// it back warm; the pool releases it after an idle minute.  Idempotent.
     void releaseHeavy() noexcept;
 
     /// True between a successful open() and releaseHeavy().
@@ -274,15 +289,60 @@ public:
     /// one allocation across frames, so a stale pointer would read the NEXT
     /// frame's pixels, not freed memory - still wrong, hence the rule.
     ///
+    /// `outputTransfer` is an OSV_TRANSFER_* id that overrides the clip's own
+    /// output transfer for THIS frame only (the host's Rec.709 connection
+    /// space), or a negative value for the clip's Source Settings choice.
+    /// It never touches the prefs: an override that went through
+    /// applyPrefsLocked() would be published to the direct-path engine as
+    /// if the user had changed the clip, and would reset every analysis.
+    ///
     /// The caller MUST hold lock() for the whole call and for its use of the
     /// returned reference.
     [[nodiscard]] Result<const render::ImageRGBAf*> renderFrame(std::uint32_t index, const OutputGeometry& geometry,
                                                                 bool draft,
-                                                                RenderPurpose purpose = RenderPurpose::Exact);
+                                                                RenderPurpose purpose = RenderPurpose::Exact,
+                                                                int outputTransfer = -1);
 
     /// Backend that served the last renderFrame() ("cpu", "cuda", "opencl";
     /// empty before the first frame).
     [[nodiscard]] std::string rendererName() const;
+
+    // ---- [WP-IMPORTER] the importer's own frame, straight into the PPix ----
+    /// How the importer's own frames reach the host (see renderFrameToHost).
+    enum class FramePath : int {
+        None = 0,  ///< No frame rendered yet.
+        Gpu = 1,   ///< NVDEC -> VRAM -> CUDA stitch in place -> pinned banded readback into the PPix.
+        Host = 2,  ///< Decoded to host memory (D3D11VA / NVDEC copy-back / software), uploaded, rendered, copied.
+    };
+
+    /// Decode + stitch frame `index` at `geometry` and write it into the host
+    /// frame `dst` (a PPix's pixels: bottom-left, `format`).
+    ///
+    /// Prefers the GPU path: both lenses decoded on NVDEC into VRAM
+    /// (video::GpuClipDecoder, in the primary context of the shared CUDA
+    /// renderer's device), stitched by that renderer from the device planes
+    /// with no upload, and streamed back through GpuReadback's pinned bands,
+    /// each band converted into `dst` while the next is in flight.  The
+    /// parameter block is built exactly as renderFrame() builds it, from the
+    /// same analysis caches, so both paths stitch identically.
+    ///
+    /// Falls back to renderFrame() + PixelCopy (the host path) whenever the
+    /// GPU path cannot serve the clip: no CUDA renderer (prefs choose CPU /
+    /// OpenCL, or no NVIDIA GPU), a stream NVDEC does not take (the LRF
+    /// proxy, 8-bit), OPENOSV_IMPORTER_NO_GPU_DECODE=1, or a GPU failure on
+    /// this frame (three in a row switch the clip to the host path for good).
+    ///
+    /// The caller MUST hold lock() for the whole call.  `draft`, `purpose`
+    /// and `outputTransfer` mean exactly what they mean for renderFrame().
+    [[nodiscard]] Status renderFrameToHost(std::uint32_t index, const OutputGeometry& geometry, bool draft,
+                                           RenderPurpose purpose, const pixelcopy::HostFrame& dst,
+                                           pixelcopy::HostPixelFormat format, int outputTransfer = -1);
+
+    /// The path that served the most recent renderFrameToHost() - readable
+    /// without the lock (imAnalysis reports it).
+    [[nodiscard]] FramePath lastFramePath() const noexcept {
+        return static_cast<FramePath>(m_lastFramePath.load(std::memory_order_relaxed));
+    }
 
     // ---- the direct GPU path (docs/DIRECT_GPU.md) --------------------------
     /// One frame for the direct renderer: both lenses decoded on NVDEC into a
@@ -444,9 +504,10 @@ private:
     std::int64_t m_audioDuration = 0;
     std::uint32_t m_audioTrackId = 0;
 
-    /// The calibration slot the current rig was built for, so rebuildRig()
-    /// can skip the work when the prefs did not touch it.
-    PrefsCalibration m_rigCalibration = PrefsCalibration::Native;
+    /// The calibration choice the current rig was built for, so rebuildRig()
+    /// can skip the work when the prefs did not touch it.  The choice rather
+    /// than the stored byte: Auto and a forced Native share calibration 0.
+    PrefsCalibrationChoice m_rigCalibration = PrefsCalibrationChoice::Auto;
     bool m_rigBuilt = false;
 
     /// Set once a hardware decoder has failed on this clip: every reader
@@ -463,6 +524,23 @@ private:
     std::map<void*, std::unique_ptr<video::GpuClipDecoder>> m_gpuDecoders;
     /// True for the engine registry's own instance (see setEngineOwned).
     bool m_engineOwned = false;
+
+    // ---- [WP-SETTINGS] Source Settings publication (Engine.h) -------------
+    /// This instance's publisher token, taken at its first publication
+    /// (right after imOpenFile8); 0 until then.  Larger means opened later,
+    /// which is how the engine lets the newest instance of a file win.
+    std::uint64_t m_settingsPublisher = 0;
+    /// True once a blob the HOST handed over has been published from here.
+    /// Until then the instance may have run on its defaults (a selector
+    /// without prefs) and must publish the host's blob even when it happens
+    /// to equal them, or an older instance's settings would stay in force.
+    bool m_settingsPublishedFromHost = false;
+    /// Publish m_prefs to the engine registry.  `fromHost`: the blob came
+    /// from the host (false: the host gave none and the defaults are in
+    /// force).  Never publishes from the engine's own instance.  The caller
+    /// holds m_mutex.
+    void publishSettingsLocked(bool fromHost) noexcept;
+    // ---- [/WP-SETTINGS] ----------------------------------------------------
     std::unique_ptr<AudioDecoder> m_audio;
     bool m_audioProbed = false;
 
@@ -548,6 +626,26 @@ private:
     /// and bump the generation.  Takes m_parallaxMutex.
     void resetParallaxLocked() noexcept;
 
+    // ---- [WP-SEAM] carved blend seam, keyed by bucket ------------------------
+    /// Carved seams per bucket (SeamCarve.h), each measured through its own
+    /// bucket's correction (its parallax grid, else its seam table).  Guarded
+    /// by m_parallaxMutex and cleared with the parallax state in
+    /// resetParallaxLocked(), because a seam is only as current as the
+    /// correction it was carved through.  ~8 KB each.
+    std::map<std::uint32_t, std::shared_ptr<const render::BlendSeam>> m_blendSeams;
+
+    /// Carve (or fetch) the blend seam for frame `index` and hand it to
+    /// `builder`: glided from the previous bucket's seam like the parallax
+    /// grid, steered by a neighbouring bucket's seam when one is cached.  An
+    /// Interactive request whose bucket cannot be carved yet (its parallax
+    /// grid is still being measured) borrows a nearby bucket's seam and
+    /// clears `frameExact`.  Called by applyAnalyses with m_mutex held;
+    /// takes m_parallaxMutex itself.  Failures are logged and leave the frame
+    /// on the ordinary feather.
+    void applyCarvedSeam(std::uint32_t index, const video::FramePair& pair, bool wantParallax, RenderPurpose purpose,
+                         ThreadPool& pool, render::RenderParamsBuilder& builder, bool& frameExact);
+    // ---- [/WP-SEAM] ----------------------------------------------------------
+
     RenderedFrame m_lastFrame;
     std::string m_rendererName;
     // Atomic because both are touched by selectors that do NOT hold m_mutex
@@ -557,6 +655,53 @@ private:
     // an atomic is sufficient - see the accessors above.
     std::atomic<std::uint64_t> m_videoRequests{0};
     std::atomic<std::uint32_t> m_importerId{0};
+
+    // ---- [WP-IMPORTER] the importer's own frame on the GPU -----------------
+    /// Build the equirect stitch job for frame `index` at `geometry` from
+    /// `pair` (host or device frames): rig, colour, blend, coverage alpha,
+    /// the per-bucket analyses, stabilisation and the equirect map, in
+    /// exactly the order renderFrame() has always used.  Shared by both
+    /// paths so they can never assemble different parameter blocks.
+    /// `outputTransfer` as for renderFrame().  `outcome` receives what
+    /// applyAnalyses() did.  Caller holds m_mutex.
+    [[nodiscard]] Result<render::RenderJob> buildEquirectJob(std::uint32_t index, const video::FramePair& pair,
+                                                             const OutputGeometry& geometry, bool draft,
+                                                             RenderPurpose purpose, ThreadPool& pool,
+                                                             AnalysisOutcome& outcome, int outputTransfer);
+
+    /// The colour block for one frame: the clip's own (m_color) for a
+    /// negative `outputTransfer`, otherwise the same block rebuilt with that
+    /// OSV_TRANSFER_* id - built exactly as rebuildColor() builds m_color,
+    /// so the two can only ever differ by the transfer.  Caller holds m_mutex.
+    [[nodiscard]] OsvColorParams colorForTransfer(int outputTransfer) const;
+
+    /// The GPU path of renderFrameToHost().  Returns true when it served the
+    /// frame, false when it does not apply to this clip or request (the caller
+    /// then takes the host path).  A failure after the path was chosen is an
+    /// Error the caller logs before falling back.  Caller holds m_mutex.
+    [[nodiscard]] Result<bool> renderFrameOnGpu(std::uint32_t index, const OutputGeometry& geometry, bool draft,
+                                                RenderPurpose purpose, const pixelcopy::HostFrame& dst,
+                                                pixelcopy::HostPixelFormat format, int outputTransfer);
+
+    /// Where the GPU path stands for this clip.
+    enum class GpuFrameState : std::uint8_t {
+        Untried,   ///< Not attempted yet.
+        Active,    ///< Serving frames.
+        Disabled,  ///< Refused for good (reason logged once): the host path serves every frame.
+    };
+    GpuFrameState m_gpuFrameState = GpuFrameState::Untried;
+    /// Consecutive GPU-path failures; three switch the clip to the host path.
+    std::uint32_t m_gpuFrameFailures = 0;
+    /// Key of this path's decoder in m_gpuDecoders (the retained primary
+    /// context of the renderer's device).  Kept in that map on purpose:
+    /// releaseHeavy() already frees every decoder there on imQuietFile, which
+    /// is exactly when this one's VRAM should go back too.
+    void* m_gpuFrameContext = nullptr;
+    /// The shared pinned readback; held so it lives exactly as long as some
+    /// clip may still use it (released with the instance).
+    std::shared_ptr<GpuReadback> m_gpuReadback;
+    /// FramePath of the last renderFrameToHost(), atomic for lastFramePath().
+    std::atomic<int> m_lastFramePath{0};
 };
 
 }  // namespace osv::premiere
