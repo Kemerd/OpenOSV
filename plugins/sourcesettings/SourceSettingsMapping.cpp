@@ -108,6 +108,15 @@ PrefsBlob prefsFromControls(const ControlValues& controls) noexcept {
     // slider through the blob's setter, exactly like the sky seam fix.
     blob.lensShading = fromPopup(controls.lensShading, OSV_SS_LENS_SHADING_COUNT, blob.lensShading);
     blob.setShadingStrengthPercent(controls.shadingStrengthPercent);
+    // [WP-STEADY] Both popups go through their tables (the popup lists the
+    // default first; the enums keep the older behaviour at 0).  An
+    // out-of-range value keeps the choice defaults() wrote.
+    if (controls.parallaxGrid >= 1 && controls.parallaxGrid <= OSV_SS_PARALLAX_GRID_COUNT) {
+        blob.parallaxGrid = static_cast<std::uint8_t>(kParallaxGridByPopup[controls.parallaxGrid - 1]);
+    }
+    if (controls.lensAlign >= 1 && controls.lensAlign <= OSV_SS_LENS_ALIGN_COUNT) {
+        blob.lensAlign = static_cast<std::uint8_t>(kLensAlignByPopup[controls.lensAlign - 1]);
+    }
 
     // [WP-HDRPEAK] The PQ output's peak (ignored by the other outputs); an
     // out-of-range popup value keeps the default from defaults(), 1000 nits.
@@ -170,6 +179,22 @@ ControlValues controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.lensShading = toPopup(clean.lensShading, OSV_SS_LENS_SHADING_COUNT);
     c.shadingStrengthPercent = clean.shadingStrengthPercent();
     c.hdrPeak = toPopup(clean.hdrPeak, OSV_SS_HDR_PEAK_COUNT);  // [WP-HDRPEAK]
+    // [WP-STEADY] The popup items whose choices are the blob's; item 1 (Auto)
+    // for a choice missing from a table, which sanitise() rules out.
+    c.parallaxGrid = 1;
+    for (int item = 1; item <= OSV_SS_PARALLAX_GRID_COUNT; ++item) {
+        if (kParallaxGridByPopup[item - 1] == clean.parallaxGridChoice()) {
+            c.parallaxGrid = item;
+            break;
+        }
+    }
+    c.lensAlign = 1;
+    for (int item = 1; item <= OSV_SS_LENS_ALIGN_COUNT; ++item) {
+        if (kLensAlignByPopup[item - 1] == clean.lensAlignChoice()) {
+            c.lensAlign = item;
+            break;
+        }
+    }
     return c;
 }
 

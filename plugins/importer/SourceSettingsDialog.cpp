@@ -503,6 +503,55 @@ void hdrPeakWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
 // ---- [/WP-HDRPEAK] -----------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+//  [WP-STEADY] the Parallax Grid and Lens Alignment rows
+// ---------------------------------------------------------------------------
+// Two combo rows appended below the HDR peak row, the same way.  Ids clear
+// of resource.h (1000-1018, 1030, 1060, 1100-1107, 1130, 1160), the sky seam
+// rows (1040-1042, 1140-1144), the seam tool rows (1043-1047, 1145-1154),
+// the lens shading rows (1048-1049, 1155-1157) and the HDR peak row (1070,
+// 1170).
+constexpr int kIdcParallaxGrid = 1080;
+constexpr int kIdcLensAlign = 1081;
+constexpr int kIdcStaticParallaxGrid = 1180;
+constexpr int kIdcStaticLensAlign = 1181;
+
+/// Append the two rows and load `c` into them.  The lists are in the order
+/// of kDialogParallaxGrid / kDialogLensAlign (the default first), and the
+/// combo index is the index into those tables.
+void addSteadyRows(HWND dialog, const DialogControls& c) noexcept {
+    const int firstRow = growDialogForRows(dialog, 2);
+    static const wchar_t* const kGrid[] = {L"Auto (steady unless the scene moves)", L"Steady (per clip)",
+                                           L"Follows scene (per moment)"};
+    static_assert(std::size(kGrid) == std::size(kDialogParallaxGrid),
+                  "the Parallax Grid combo does not list every choice");
+    // "a" is the one letter of the label no other row of the dialog uses.
+    addDialogChild(dialog, L"STATIC", L"P&arallax grid:", SS_LEFT, kIdcStaticParallaxGrid, 7, firstRow + 3, 70, 8);
+    addDialogChild(dialog, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kIdcParallaxGrid, 82,
+                   firstRow, 179, 80);
+    fillCombo(dialog, kIdcParallaxGrid, kGrid, static_cast<int>(std::size(kGrid)), c.parallaxGrid);
+    static const wchar_t* const kAlign[] = {L"Auto (fit per clip)", L"Off (calibration only)"};
+    static_assert(std::size(kAlign) == std::size(kDialogLensAlign),
+                  "the Lens Alignment combo does not list every choice");
+    // Every letter of "Lens alignment" already has a row, so no accelerator.
+    addDialogChild(dialog, L"STATIC", L"Lens alignment:", SS_LEFT, kIdcStaticLensAlign, 7, firstRow + kRowStep + 3,
+                   70, 8);
+    addDialogChild(dialog, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kIdcLensAlign, 82,
+                   firstRow + kRowStep, 179, 80);
+    fillCombo(dialog, kIdcLensAlign, kAlign, static_cast<int>(std::size(kAlign)), c.lensAlign);
+}
+
+/// Read the two rows back; a missing row keeps what the dialog opened with.
+void steadyWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
+    if (::GetDlgItem(dialog, kIdcParallaxGrid)) {
+        c.parallaxGrid = comboSelection(dialog, kIdcParallaxGrid);
+    }
+    if (::GetDlgItem(dialog, kIdcLensAlign)) {
+        c.lensAlign = comboSelection(dialog, kIdcLensAlign);
+    }
+}
+// ---- [/WP-STEADY] ------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 //  [WP-DEFAULTS] "Save as Default"
 // ---------------------------------------------------------------------------
 // The template puts the button and its status line at the left of the OK /
@@ -655,6 +704,7 @@ void widgetsToControls(HWND dialog, DialogControls& c) noexcept {
     seamToolWidgetsToControls(dialog, c);  // [WP-SEAMTOOLS]
     shadingWidgetsToControls(dialog, c);  // [WP-VIGNETTE]
     hdrPeakWidgetsToControls(dialog, c);  // [WP-HDRPEAK]
+    steadyWidgetsToControls(dialog, c);    // [WP-STEADY]
 }
 
 /// The dialog procedure.  It never throws (a C callback crossing back into
@@ -671,6 +721,7 @@ INT_PTR CALLBACK sourceSettingsProc(HWND dialog, UINT message, WPARAM wParam, LP
             addSeamToolRows(dialog, state->controls);   // [WP-SEAMTOOLS]
             addLensShadingRows(dialog, state->controls);  // [WP-VIGNETTE]
             addHdrPeakRow(dialog, state->controls);       // [WP-HDRPEAK]
+            addSteadyRows(dialog, state->controls);       // [WP-STEADY]
         }
         placeDefaultsRow(dialog);  // [WP-DEFAULTS] after every block that moves OK
         return TRUE;  // Let the dialog manager set the initial focus.

@@ -98,6 +98,9 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
     // [WP-VIGNETTE] the lens shading correction
     p.lensShading = static_cast<std::uint8_t>(PrefsLensShading::Off);
     p.setShadingStrengthPercent(63.0);
+    // [WP-STEADY] steady seam and lens alignment, both away from Auto
+    p.parallaxGrid = static_cast<std::uint8_t>(PrefsParallaxGrid::Steady);
+    p.lensAlign = static_cast<std::uint8_t>(PrefsLensAlign::Off);
     p.parallax = static_cast<std::uint8_t>(PrefsParallax::Off);
     p.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Classical);
     p.dlogmFit = static_cast<std::uint8_t>(PrefsDlogmFit::Pocket3);
@@ -190,6 +193,10 @@ TEST_CASE("the defaults file round-trips every value of every setting bit for bi
         each([](PrefsBlob& p, std::uint8_t v) { p.photoSeam = v; }, static_cast<int>(PrefsPhotoSeam::Count));
         each([](PrefsBlob& p, std::uint8_t v) { p.lensShading = v; },
              static_cast<int>(PrefsLensShading::Count));  // [WP-VIGNETTE]
+        each([](PrefsBlob& p, std::uint8_t v) { p.parallaxGrid = v; },
+             static_cast<int>(PrefsParallaxGrid::Count));  // [WP-STEADY]
+        each([](PrefsBlob& p, std::uint8_t v) { p.lensAlign = v; },
+             static_cast<int>(PrefsLensAlign::Count));  // [WP-STEADY]
         each([](PrefsBlob& p, std::uint8_t v) { p.directColour = v; }, static_cast<int>(PrefsDirectColour::Count));
         each([](PrefsBlob& p, std::uint8_t v) { p.hdrPeak = v; }, static_cast<int>(PrefsHdrPeak::Count));  // [WP-HDRPEAK]
         each([](PrefsBlob& p, std::uint8_t v) { p.seamSearch = v; }, 2);
@@ -245,10 +252,14 @@ TEST_CASE("the defaults file covers every byte of the blob that holds a setting"
     for (std::size_t i = 0; i < sizeof(PrefsBlob::photoReserved); ++i) {
         padding.insert(offsetof(PrefsBlob, photoReserved) + i);
     }
-    // [WP-HDRPEAK] the other packages' bytes before hdrPeak, and its own spare.
-    for (std::size_t i = 0; i < sizeof(PrefsBlob::padBeforeHdrPeak); ++i) {
-        padding.insert(offsetof(PrefsBlob, padBeforeHdrPeak) + i);
+    // [WP-STEADY] the padding before its range and the rest of it.
+    for (std::size_t i = 0; i < sizeof(PrefsBlob::padBeforeSteady); ++i) {
+        padding.insert(offsetof(PrefsBlob, padBeforeSteady) + i);
     }
+    for (std::size_t i = 0; i < sizeof(PrefsBlob::steadyReserved); ++i) {
+        padding.insert(offsetof(PrefsBlob, steadyReserved) + i);
+    }
+    // [WP-HDRPEAK] its own spare byte.
     padding.insert(offsetof(PrefsBlob, padAfterHdrPeak));
 
     std::vector<int> owners(PrefsBlob::kSize, 0);

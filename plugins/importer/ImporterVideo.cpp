@@ -1023,7 +1023,14 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
     }
 
     // ---- cache + hand over -------------------------------------------------
-    if (importerId != 0 && g.suites.ppixCache) {
+    // [WP-STEADY] Only a frame with its final pixels is cached.  An
+    // Interactive frame that made do with a stand-in analysis (its bucket's
+    // grid, or the clip's steady correction, still being measured) would
+    // otherwise be served from the cache every time the section is replayed -
+    // and to a later Exact request for the same frame - long after the real
+    // correction landed.  The instance lock is still held, so this is exactly
+    // the frame just rendered.
+    if (importerId != 0 && g.suites.ppixCache && instance->lastRenderExact()) {
         if (g.suites.ppixCache->AddFrameToCacheWithColorSpace) {
             g.suites.ppixCache->AddFrameToCacheWithColorSpace(importerId, 0, frame,
                                                               static_cast<csSDK_int32>(frameIndex), rec->inQuality,

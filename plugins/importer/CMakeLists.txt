@@ -31,6 +31,8 @@ osv_add_premiere_plugin(OpenOSVImporter
     Engine.h
     FlareStage.cpp
     FlareStage.h
+    SteadyStage.cpp
+    SteadyStage.h
     ImporterGpuFrame.cpp
     ImporterGpuFrame.h
     SourceSettingsDialog.cpp

@@ -47,6 +47,7 @@
 #include <exception>
 #include <format>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -663,18 +664,51 @@ Status ImporterInstance::rebuildRig() {
         }
     }
 
+    // ---- [WP-STEADY] the per-clip lens rotation ------------------------------------
+    //
+    // AFTER the protector fold: the fold reshapes each lens's field-angle
+    // curve, the rotation is a rigid turn of the lens pair measured THROUGH
+    // that curve, so it is fitted to (and cached for) the rig the fold made.
+    // Here only a remembered verdict is used (memory, then the disk cache -
+    // microseconds); an unknown clip keeps the calibration until the steady
+    // stage has measured it on its first non-draft frame (prepareSteadyLocked).
+    const PrefsLensAlign alignChoice = m_prefs.lensAlignChoice();
+    geom::LensRig baseRig = builtRig;
+    LensAlignState alignState = LensAlignState::Off;
+    std::string alignNote;
+    if (alignChoice == PrefsLensAlign::Auto) {
+        const std::optional<LensAlignVerdict> known = cachedLensAlign(m_path, baseRig);
+        if (!known) {
+            alignState = LensAlignState::Pending;
+            alignNote = "lens alignment: to be fitted on the clip's first frames";
+        } else if (known->accepted && render::applyLensRotation(builtRig, known->wRad).ok()) {
+            alignState = LensAlignState::Applied;
+            alignNote = "lens alignment: " + known->summary;
+        } else {
+            alignState = LensAlignState::Refused;
+            alignNote = "lens alignment: keeping the calibration - " + known->summary;
+        }
+    }
+
     // ---- commit ----------------------------------------------------------------
     m_calibration = calibration;
+    m_baseRig = std::move(baseRig);  // [WP-STEADY]
     m_rig = std::move(builtRig);
     m_blend = blend;
+    m_lensAlignState = alignState;   // [WP-STEADY]
+    m_rigLensAlign = alignChoice;    // [WP-STEADY]
 
     // The notes feed the Properties panel.  A rebuild REPLACES the previous
     // calibration / scaling / rig notes instead of piling another copy on
     // top of them each time the user flips the setting.
     std::erase_if(m_notes, [](const std::string& n) {
-        return n.starts_with("calibration: ") || n.starts_with("scaling: ") || n.starts_with("rig: ");
+        return n.starts_with("calibration: ") || n.starts_with("scaling: ") || n.starts_with("rig: ") ||
+               n.starts_with("lens alignment: ");  // [WP-STEADY]
     });
     m_notes.push_back("calibration: " + reason);
+    if (!alignNote.empty()) {
+        m_notes.push_back(alignNote);  // [WP-STEADY]
+    }
     if (!protectorNote.empty()) {
         m_notes.push_back("calibration: " + protectorNote);
     }
@@ -702,6 +736,11 @@ Status ImporterInstance::rebuildRig() {
         // The three scores and the pick, so a protector clip's stitch can be
         // explained from the log alone.
         PluginLog::info("calibration: '{}': {}", m_path.filename().string(), protectorNote);
+    }
+    if (!alignNote.empty()) {
+        // [WP-STEADY] The rotation in force for this rig, from the cache (a
+        // measurement logs its own line when it lands).
+        PluginLog::info("{} ('{}')", alignNote, m_path.filename().string());
     }
 
     // The CHOICE, not the calibration byte: Auto and a forced Native share
@@ -859,7 +898,8 @@ void ImporterInstance::releaseHeavy() noexcept {
     // about to lose its decoders.  (Joining with m_mutex held is safe - the
     // worker never takes m_mutex; see the LOCK ORDER note in the header.)
     stopParallaxWorker();
-    m_flare.stop();  // [WP-FLARE] the same rule: its worker never takes m_mutex
+    m_flare.stop();   // [WP-FLARE] the same rule: its worker never takes m_mutex
+    m_steady.stop();  // [WP-STEADY] likewise; what it measured stays in the process-wide caches
 
     // Order matters: the audio decoder owns its own AVFormatContext and OS
     // handle, the reader owns two decoders; both must go before the mapping
@@ -1113,8 +1153,10 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
         rebuildColor();
     }
 
-    // The rig only depends on the calibration choice.
-    if (m_parsed && (!m_rigBuilt || m_rigCalibration != incoming.calibrationChoice())) {
+    // The rig only depends on the calibration choice and [WP-STEADY] on
+    // whether the lens rotation is folded into it.
+    if (m_parsed && (!m_rigBuilt || m_rigCalibration != incoming.calibrationChoice() ||
+                     m_rigLensAlign != incoming.lensAlignChoice())) {
         const Status st = rebuildRig();
         if (!st.ok()) {
             PluginLog::warn("prefs: calibration slot {} could not be applied: {}",
@@ -1352,9 +1394,50 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     // [WP-PHOTO] photometric seam field: measured first, so its usable rim is the carved seam's Rim cost below
     const render::PhotoRimPenaltyScope photoRimScope = preparePhotoSeam(index, pair, draft, pool);
 
-    if (wantParallax) {
-        render::ParallaxWarpParams pw;
-        pw.backend = toFlowBackendKind(m_prefs.flow());
+    // ---- [WP-STEADY] which schedule serves this frame's seam corrections ----
+    // The clip correction (Parallax Grid Steady, or Auto's verdict) replaces
+    // all three per-bucket analyses - grid, seam table, carve - with one
+    // measured on the clip's fixed sample frames, so nothing at the seam
+    // moves from frame to frame.  Follows scene keeps the per-bucket code
+    // below exactly as it was.
+    const SteadyUse steadyUse = (wantParallax || wantSeam) ? steadyUseLocked(purpose) : SteadyUse::PerBucket;
+    const std::shared_ptr<const render::ClipSteady> clipSteady =
+        steadyUse == SteadyUse::Clip ? m_steadyFrame.clip : nullptr;
+    if (steadyUse == SteadyUse::Clip && clipSteady) {
+        // The clip grid for every frame alike (none when the clip's flow was
+        // refused - the clip seam table below is then the correction).
+        if (wantParallax && clipSteady->grid && clipSteady->grid->valid()) {
+            const render::ParallaxWarpGrid& g = *clipSteady->grid;
+            builder.warp(g.uv, g.w, g.h, g.latMinRad, g.latMaxRad);
+            parallaxApplied = true;
+            appliedGrid = clipSteady->grid;  // [WP-SEAMTOOLS]
+        }
+    } else if (steadyUse == SteadyUse::StandIn) {
+        // Interactive while the clip correction is being measured: the sample
+        // grid nearest this frame, if one exists yet.  Not final either way.
+        frameExact = false;
+        if (wantParallax) {
+            std::shared_ptr<const render::ParallaxWarpGrid> nearest;
+            std::uint32_t best = std::numeric_limits<std::uint32_t>::max();
+            for (const auto& [frame, grid] : m_steadyFrame.samples) {
+                const std::uint32_t d = frame > index ? frame - index : index - frame;
+                if (grid && grid->valid() && d < best) {
+                    best = d;
+                    nearest = grid;
+                }
+            }
+            if (nearest) {
+                builder.warp(nearest->uv, nearest->w, nearest->h, nearest->latMinRad, nearest->latMaxRad);
+                parallaxApplied = true;
+                appliedGrid = nearest;  // [WP-SEAMTOOLS]
+            }
+        }
+    }
+
+    if (wantParallax && steadyUse == SteadyUse::PerBucket) {
+        // [WP-STEADY] the backend, and the benefit gate for the rig in force
+        // (the default unless a lens rotation is folded into it).
+        render::ParallaxWarpParams pw = parallaxParamsLocked();
 
         // What is already known: this bucket, the one before it (for the
         // glide), and whether the worker already has this bucket in hand.
@@ -1485,7 +1568,12 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
         }
     }
 
-    if (wantSeam && !parallaxApplied) {
+    if (wantSeam && !parallaxApplied && steadyUse == SteadyUse::Clip) {
+        // [WP-STEADY] the clip seam table, where the clip has no grid.
+        if (clipSteady && clipSteady->seamTable && !clipSteady->seamTable->empty()) {
+            builder.seam(*clipSteady->seamTable);
+        }
+    } else if (wantSeam && !parallaxApplied && steadyUse == SteadyUse::PerBucket) {
         auto cached = m_seamTables.find(bucket);
         if (cached == m_seamTables.end()) {
             render::SeamSearchParams sp;
@@ -1513,9 +1601,16 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     // Under the seam preference: "seam search" now means both halves of the
     // seam - the disparity correction above and WHERE the two lenses meet.
     std::shared_ptr<const render::BlendSeam> carvedSeam;
-    if (wantSeam) {
+    if (wantSeam && steadyUse == SteadyUse::Clip) {
+        // [WP-STEADY] the clip's carved seam: one line for every frame.
+        if (clipSteady && clipSteady->seam && clipSteady->seam->valid()) {
+            render::applyBlendSeam(builder, *clipSteady->seam);
+            carvedSeam = clipSteady->seam;
+        }
+    } else if (wantSeam && steadyUse == SteadyUse::PerBucket) {
         carvedSeam = applyCarvedSeam(index, pair, wantParallax, purpose, pool, builder, frameExact);
     }
+    // (StandIn: the feather blend until the clip's seam is carved.)
     // ---- [WP-SEAMTOOLS] Near / Far Offset and Seam Smoothing, on that seam ---
     applySeamTools(index, carvedSeam.get(), appliedGrid.get(), builder);
 
@@ -1959,6 +2054,159 @@ void ImporterInstance::applySeamTools(std::uint32_t index, const render::BlendSe
     }
 }
 
+// ---------------------------------------------------------------------------
+//  [WP-STEADY] per-clip lens alignment and steady seam corrections
+// ---------------------------------------------------------------------------
+
+render::ParallaxWarpParams ImporterInstance::parallaxParamsLocked() const noexcept {
+    render::ParallaxWarpParams pw;
+    pw.backend = toFlowBackendKind(m_prefs.flow());
+    // A rig with the lens rotation folded in carries only a small residual
+    // per cell, which the default 20 % benefit bar would mostly refuse
+    // (render::kAlignedRequiredImprovement has the measurements).  Every
+    // other rig keeps the default, so it renders exactly as before.
+    if (m_lensAlignState == LensAlignState::Applied) {
+        pw.requiredImprovement = render::kAlignedRequiredImprovement;
+    }
+    return pw;
+}
+
+SteadyRequest ImporterInstance::steadyRequestLocked(bool wantRotation, bool wantClip) const {
+    SteadyRequest r;
+    r.path = m_path;
+    r.format = m_format;
+    r.frameCount = m_frameCount;
+    // The sync frames the sample frames snap to on a long clip - the first
+    // lens's track, as the stage's decoder reads it.
+    if (m_file) {
+        const std::uint32_t id = m_format.videoTrackIds[0] != 0 ? m_format.videoTrackIds[0] : 1u;
+        if (const TrackInfo* video = m_file->track(id); video && video->samples.hasSyncTable()) {
+            r.syncFrames = video->samples.syncSamples();
+        }
+    }
+    r.baseRig = m_baseRig;
+    r.blend = m_blend;  // the ANALYSIS blend, as every per-bucket measurement uses
+    r.containerSamples = containerSamplesUsable(m_file.get(), m_format);
+    r.wantRotation = wantRotation;
+    r.wantClip = wantClip;
+    // The clip correction exactly as the per-bucket analyses measure theirs:
+    // the flow backend of the prefs (the stage sets the aligned gate itself
+    // once it knows the rotation), the seam switches, the Seam Blend /
+    // Parallax Blend widths and the photometric rim as the carve's rim cost.
+    r.clip.parallax = render::ParallaxWarpParams{};
+    r.clip.parallax.backend = toFlowBackendKind(m_prefs.flow());
+    r.clip.parallaxOn = m_prefs.parallaxEnabled();
+    r.clip.seamOn = m_prefs.seamSearch != 0;
+    render::applySeamBlendWidths(seamToolsLocked(), r.clip.carve);
+    const render::PhotoSeamParams photo = photoParamsLocked();
+    r.clip.rimCost = photo.mode != render::PhotoSeamMode::Off;
+    r.clip.photo = photo;
+    // [WP-VIGNETTE] that rim on shading-corrected lenses, like the per-bucket field.
+    r.clip.shading = shadingParamsLocked();
+    r.clip.shadingOn = r.clip.shading.mode == render::LensShadingMode::Auto;
+    return r;
+}
+
+void ImporterInstance::settleLensAlignLocked(const std::optional<LensAlignVerdict>& rotation,
+                                             const std::string& failure) {
+    const std::string name = m_path.filename().string();
+    std::string note;
+    if (rotation && rotation->accepted) {
+        geom::LensRig rig = m_baseRig;
+        const Status folded = render::applyLensRotation(rig, rotation->wRad);
+        if (folded.ok()) {
+            m_rig = std::move(rig);
+            m_lensAlignState = LensAlignState::Applied;
+            note = "lens alignment: " + rotation->summary;
+            // Everything measured so far was measured through the old rig:
+            // the rendered frame, the per-bucket grids, tables, seams, gains
+            // and ghost models (the photometric fields go by themselves, keyed
+            // by the rig).  Stand-ins rendered before this point were
+            // non-exact, so no Exact frame ever saw the old rig.
+            m_lastFrame = RenderedFrame{};
+            m_seamTables.clear();
+            m_gains.clear();
+            resetParallaxLocked();
+            PluginLog::info("lens alignment: '{}': folded into the rig from now on", name);
+        } else {
+            m_lensAlignState = LensAlignState::Refused;
+            note = "lens alignment: keeping the calibration - " + folded.error().message;
+        }
+    } else {
+        m_lensAlignState = LensAlignState::Refused;
+        note = "lens alignment: keeping the calibration - " +
+               (rotation ? rotation->summary : (failure.empty() ? std::string("not measured") : failure));
+    }
+    // The Properties panel's note describes the rig actually in force.
+    std::erase_if(m_notes, [](const std::string& n) { return n.starts_with("lens alignment: "); });
+    m_notes.push_back(note);
+}
+
+void ImporterInstance::prepareSteadyLocked(RenderPurpose purpose, bool draft) {
+    m_steadyFrame = SteadyStage::Snapshot{};
+    m_steadyFrame.serial = m_steady.serial();  // what a frame built without the stage is current against
+    // ---- what this clip's prefs ask for ----------------------------------------
+    const bool alignAuto = m_prefs.lensAlignChoice() == PrefsLensAlign::Auto;
+    const bool corrections = m_prefs.parallaxEnabled() || m_prefs.seamSearch != 0;
+    const bool wantClip = m_prefs.parallaxGridChoice() != PrefsParallaxGrid::FollowsScene && corrections;
+    if (!alignAuto && !wantClip) {
+        return;  // the per-bucket schedule and the calibration, exactly as before
+    }
+
+    // ---- the request, and for an Exact frame the wait ----------------------------
+    // Drafts (thumbnails, prefetch) never start a measurement: importing a
+    // folder of clips must not decode every one of them in the background.
+    if (!draft) {
+        m_steady.request(steadyRequestLocked(alignAuto, wantClip), m_path.filename().string());
+        if (purpose == RenderPurpose::Exact) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool settled = m_steady.waitSettled(wantClip, kSteadyExactWait);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (!settled && !m_steadyWaitWarned) {
+                m_steadyWaitWarned = true;
+                PluginLog::warn("steady: '{}': the per-clip analyses were not ready after {:.0f} ms; this frame "
+                                "renders with the per-moment corrections",
+                                m_path.filename().string(), ms);
+            } else if (settled && ms > 1.0) {
+                PluginLog::debug("steady: '{}': an exact frame waited {:.0f} ms for the per-clip analyses",
+                                 m_path.filename().string(), ms);
+            }
+        }
+    }
+
+    // ---- the snapshot this frame renders with ------------------------------------
+    SteadyStage::Snapshot snap = m_steady.snapshot();
+    // A rotation that has just been answered: fold it into the rig (or give
+    // up on it) BEFORE anything below reads m_rig.
+    if (m_lensAlignState == LensAlignState::Pending && snap.active && snap.rotationSettled) {
+        settleLensAlignLocked(snap.rotation, snap.failure);
+    }
+    m_steadyFrame = std::move(snap);
+}
+
+ImporterInstance::SteadyUse ImporterInstance::steadyUseLocked(RenderPurpose purpose) const noexcept {
+    const PrefsParallaxGrid mode = m_prefs.parallaxGridChoice();
+    if (mode == PrefsParallaxGrid::FollowsScene || !m_steadyFrame.active) {
+        return SteadyUse::PerBucket;
+    }
+    if (m_steadyFrame.clipSettled) {
+        // Settled without a result: the measurement failed (logged), and the
+        // per-moment corrections are the graceful fallback.
+        if (!m_steadyFrame.clip) {
+            return SteadyUse::PerBucket;
+        }
+        // Auto follows its verdict; Steady always holds.
+        if (mode == PrefsParallaxGrid::Auto && !m_steadyFrame.clip->decision.steady) {
+            return SteadyUse::PerBucket;
+        }
+        return SteadyUse::Clip;
+    }
+    // Still being measured.  An Exact frame only gets here when its wait timed
+    // out: it takes the per-bucket analyses, which it can measure on the spot,
+    // rather than a stand-in.
+    return purpose == RenderPurpose::Exact ? SteadyUse::PerBucket : SteadyUse::StandIn;
+}
+
 Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_t index, void* cuContext,
                                                                    RenderPurpose purpose, int outputTransfer) {
     // The caller holds m_mutex (the header contract) and has cuContext
@@ -2033,6 +2281,7 @@ Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_
     // Assembled exactly as renderFrame assembles the equirect's, from the same
     // analysis caches, so a direct view and the importer's equirect of the
     // same frame are stitched identically.
+    prepareSteadyLocked(purpose, /*draft=*/false);  // [WP-STEADY] before anything reads m_rig
     render::RenderParamsBuilder builder;
     refreshRenderBlend();  // [WP-PHOTO] the render-only inset blend; analyses keep m_blend
     builder.rig(m_rig).color(color).blend(m_renderBlend, true);
@@ -2099,10 +2348,17 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     const bool wantFlare = m_prefs.flareRemoval != 0 && !draft;  // [WP-FLARE]
     const bool exactWanted = purpose == RenderPurpose::Exact;
 
+    // [WP-STEADY] A stand-in frame is stale once the per-clip analyses have
+    // published something since it was rendered: even an Interactive request
+    // must then get the real correction, not the cached stand-in.
+    if (!m_lastFrame.exact && m_lastFrameSteadySerial != m_steady.serial()) {
+        m_lastFrame = RenderedFrame{};
+    }
     // Cache hit: the host asked for the same frame twice (it does, once per
     // requested pixel format while scrubbing).  An Exact request is never
     // served a frame an Interactive render built with a stand-in analysis.
     if (m_lastFrame.matches(index, geometry, m_prefs, wantSeam, wantParallax, wantFlare, exactWanted, transfer)) {
+        m_lastRenderExact = m_lastFrame.exact;  // [WP-STEADY]
         return &m_lastFrame.image;
     }
 
@@ -2181,6 +2437,8 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     m_lastFrame.flareWanted = wantFlare;  // [WP-FLARE]
     m_lastFrame.exact = frameExact;
     m_lastFrame.outputTransfer = transfer;
+    m_lastFrameSteadySerial = m_steadyFrame.serial;  // [WP-STEADY] what the stand-in test compares
+    m_lastRenderExact = frameExact;                  // [WP-STEADY]
     return &m_lastFrame.image;
 }
 
@@ -2218,6 +2476,7 @@ Result<render::RenderJob> ImporterInstance::buildEquirectJob(std::uint32_t index
     // The colour block is the clip's own unless this one request overrides
     // the transfer (colorForTransfer); the analyses never depend on it.
     const OsvColorParams frameColor = colorForTransfer(outputTransfer);
+    prepareSteadyLocked(purpose, draft);  // [WP-STEADY] before anything reads m_rig
     render::RenderParamsBuilder builder;
     refreshRenderBlend();  // [WP-PHOTO] the render-only inset blend; analyses keep m_blend
     builder.rig(m_rig).color(frameColor).blend(m_renderBlend, true);
@@ -2476,6 +2735,7 @@ Result<bool> ImporterInstance::renderFrameOnGpu(std::uint32_t index, const Outpu
     AnalysisOutcome analyses;
     OSV_TRY_ASSIGN(render::RenderJob job, buildEquirectJob(index, frame.pair(), geometry, draft, purpose,
                                                            *renderer.pool, analyses, outputTransfer));
+    m_lastRenderExact = analyses.exact;  // [WP-STEADY] a stand-in stays out of the host's frame cache
     if (!job.planesOnDevice[0] || !job.planesOnDevice[1]) {
         return Error{ErrorCode::Internal, "the stitch job does not reference the device frames"};
     }

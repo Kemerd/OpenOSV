@@ -72,6 +72,8 @@ void applySeamToolControls(const DialogControls& c, PrefsBlob& blob) noexcept {
     blob.setFarOffsetDeg(c.farOffsetDeg);
 }
 
+// ---- [/WP-SEAMTOOLS] ---------------------------------------------------------
+
 // ---------------------------------------------------------------------------
 //  [WP-VIGNETTE] the lens shading correction <-> its two rows
 // ---------------------------------------------------------------------------
@@ -93,9 +95,45 @@ void applyShadingControls(const DialogControls& c, PrefsBlob& blob) noexcept {
     }
     blob.setShadingStrengthPercent(c.shadingStrengthPercent);
 }
+// ---- [/WP-VIGNETTE] ----------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+//  [WP-STEADY] Parallax Grid and Lens Alignment <-> their two combos
+// ---------------------------------------------------------------------------
+
+/// Blob -> combo indices through the dialog's tables (kDialogParallaxGrid,
+/// kDialogLensAlign); a choice missing from a table - impossible after
+/// sanitise() - shows index 0 (Auto).
+void steadyControlsFromPrefs(const PrefsBlob& prefs, DialogControls& c) noexcept {
+    c.parallaxGrid = 0;
+    for (std::size_t i = 0; i < std::size(kDialogParallaxGrid); ++i) {
+        if (kDialogParallaxGrid[i] == prefs.parallaxGridChoice()) {
+            c.parallaxGrid = static_cast<int>(i);
+            break;
+        }
+    }
+    c.lensAlign = 0;
+    for (std::size_t i = 0; i < std::size(kDialogLensAlign); ++i) {
+        if (kDialogLensAlign[i] == prefs.lensAlignChoice()) {
+            c.lensAlign = static_cast<int>(i);
+            break;
+        }
+    }
+}
+
+/// Combo indices -> blob.  An index outside a table (a combo with no
+/// selection reports -1) lands on Auto, the default.
+void applySteadyControls(const DialogControls& c, PrefsBlob& blob) noexcept {
+    const bool gridOk = c.parallaxGrid >= 0 && static_cast<std::size_t>(c.parallaxGrid) < std::size(kDialogParallaxGrid);
+    blob.parallaxGrid = static_cast<std::uint8_t>(gridOk ? kDialogParallaxGrid[static_cast<std::size_t>(c.parallaxGrid)]
+                                                         : PrefsParallaxGrid::Auto);
+    const bool alignOk = c.lensAlign >= 0 && static_cast<std::size_t>(c.lensAlign) < std::size(kDialogLensAlign);
+    blob.lensAlign = static_cast<std::uint8_t>(alignOk ? kDialogLensAlign[static_cast<std::size_t>(c.lensAlign)]
+                                                       : PrefsLensAlign::Auto);
+}
+// ---- [/WP-STEADY] ------------------------------------------------------------
 
 }  // namespace
-// ---- [/WP-SEAMTOOLS] ---------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 //  PrefsBlob -> controls
@@ -122,6 +160,7 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     seamToolControlsFromPrefs(prefs, c);  // [WP-SEAMTOOLS]
     shadingControlsFromPrefs(prefs, c);  // [WP-VIGNETTE]
     c.hdrPeak = static_cast<int>(prefs.hdrPeakChoice());  // [WP-HDRPEAK]
+    steadyControlsFromPrefs(prefs, c);  // [WP-STEADY]
     return c;
 }
 
@@ -185,6 +224,7 @@ PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& bas
     // [WP-HDRPEAK] An out-of-range index lands on 1000 nits, the default.
     blob.hdrPeak = pick(controls.hdrPeak, static_cast<int>(PrefsHdrPeak::Count),
                         static_cast<std::uint8_t>(PrefsHdrPeak::Nits1000));
+    applySteadyControls(controls, blob);  // [WP-STEADY]
 
     blob.sanitise();
     return blob;

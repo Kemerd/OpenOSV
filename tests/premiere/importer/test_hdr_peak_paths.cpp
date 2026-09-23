@@ -289,11 +289,12 @@ TEST_CASE("the HDR peak byte defaults to 1000 nits and repairs corruption", "[im
     p.hdrPeak = 0xC3;
     CHECK(p.hdrPeakNits() == 1000.0f);
     p.padAfterHdrPeak = 0x5A;
-    p.padBeforeHdrPeak[7] = 0x11;
+    // [WP-STEADY] byte 53, the reserved byte right before it.
+    p.steadyReserved[1] = 0x11;
     REQUIRE_FALSE(p.sanitise());
     CHECK(p.hdrPeakChoice() == PrefsHdrPeak::Nits1000);
     CHECK(p.padAfterHdrPeak == 0);
-    CHECK(p.padBeforeHdrPeak[7] == 0);
+    CHECK(p.steadyReserved[1] == 0);
     // And the byte sits in the range assigned to it, inside the 128 bytes.
     static_assert(offsetof(PrefsBlob, hdrPeak) == 54, "hdrPeak sits at 54");
     static_assert(sizeof(PrefsBlob) == PrefsBlob::kSize, "the blob stays 128 bytes");

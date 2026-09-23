@@ -120,6 +120,13 @@ struct Pipeline {
 
     /// Frame rate.
     [[nodiscard]] double fps() const noexcept;
+
+    /// [WP-STEADY] 0-based sync (intra) frame indices of the first lens's
+    /// video track, ascending; empty when the track has no sync table (every
+    /// frame is then a sync frame) or the container is not open.  The
+    /// per-clip analyses snap their sample frames to these on a long clip
+    /// (render::clipSampleFrames), exactly as the importer does.
+    [[nodiscard]] std::vector<std::uint32_t> syncFrames() const;
 };
 
 /// Parse "WxH" into two integers (false on malformed input).

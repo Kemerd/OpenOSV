@@ -30,6 +30,7 @@ add_executable(osv_importer_tests
   test_hdr_peak_paths.cpp   # [WP-HDRPEAK] the PQ output's HDR peak, importer frames and engine generation
   test_prefs_mapping.cpp
   test_reopen.cpp
+  test_steady_importer.cpp  # [WP-STEADY] steady seam corrections and lens alignment end to end
   test_user_defaults_importer.cpp  # [WP-DEFAULTS] new clips start from the user's saved defaults
   "${CMAKE_SOURCE_DIR}/plugins/importer/PrefsMapping.cpp"
 )

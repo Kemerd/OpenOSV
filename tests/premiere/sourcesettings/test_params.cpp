@@ -260,6 +260,7 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
             {kIndexSeamSmoothing, PF_Param_FLOAT_SLIDER}, {kIndexNearOffset, PF_Param_FLOAT_SLIDER},
             {kIndexFarOffset, PF_Param_FLOAT_SLIDER},
             {kIndexLensShading, PF_Param_POPUP},     {kIndexShadingStrength, PF_Param_FLOAT_SLIDER},  // [WP-VIGNETTE]
+            {kIndexParallaxGrid, PF_Param_POPUP},    {kIndexLensAlign, PF_Param_POPUP},  // [WP-STEADY]
             {kIndexStitchTopicEnd, PF_Param_GROUP_END},
             {kIndexAdvancedTopic, PF_Param_GROUP_START}, {kIndexDlogmFit, PF_Param_POPUP},
             {kIndexExposure, PF_Param_FLOAT_SLIDER}, {kIndexRenderDevice, PF_Param_POPUP},
@@ -292,6 +293,7 @@ TEST_CASE("every value-carrying control refuses to vary over time", "[sourcesett
         kIndexPhotoSeam, kIndexPhotoStrength, kIndexSeamInset,  // [WP-PHOTO]
         kIndexSeamBlend, kIndexParallaxBlend, kIndexSeamSmoothing, kIndexNearOffset, kIndexFarOffset,  // [WP-SEAMTOOLS]
         kIndexLensShading, kIndexShadingStrength,  // [WP-VIGNETTE]
+        kIndexParallaxGrid, kIndexLensAlign,       // [WP-STEADY]
     };
     for (const int index : valueIndices) {
         REQUIRE(index >= 1);  // a short initialiser list would leave zeros behind
@@ -355,8 +357,8 @@ TEST_CASE("the two groups are balanced and every control is inside the intended 
     for (const int index : {kIndexSeamSearch, kIndexGainMatch, kIndexCalibration, kIndexFlareRemoval, kIndexPhotoSeam,
                             kIndexPhotoStrength, kIndexSeamInset, kIndexSeamBlend, kIndexParallaxBlend,
                             kIndexSeamSmoothing, kIndexNearOffset, kIndexFarOffset, kIndexLensShading,
-                            kIndexShadingStrength, kIndexDlogmFit, kIndexExposure, kIndexRenderDevice,
-                            kIndexDirectColour}) {
+                            kIndexShadingStrength, kIndexParallaxGrid, kIndexLensAlign,  // [WP-STEADY]
+                            kIndexDlogmFit, kIndexExposure, kIndexRenderDevice, kIndexDirectColour}) {
         INFO("grouped index " << index);
         CHECK(depthAt[static_cast<std::size_t>(index)] == 1);
     }
@@ -380,6 +382,8 @@ TEST_CASE("the popup item lists are the documented ones", "[sourcesettings][para
         {kIndexDirectColour, OSV_SS_DIRECT_COLOUR_ITEMS},
         {kIndexPhotoSeam, OSV_SS_PHOTO_SEAM_ITEMS},  // [WP-PHOTO]
         {kIndexLensShading, OSV_SS_LENS_SHADING_ITEMS},  // [WP-VIGNETTE]
+        {kIndexParallaxGrid, OSV_SS_PARALLAX_GRID_ITEMS},  // [WP-STEADY]
+        {kIndexLensAlign, OSV_SS_LENS_ALIGN_ITEMS},        // [WP-STEADY]
     };
     for (const auto& [index, items] : expected) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");
@@ -476,6 +480,8 @@ TEST_CASE("the popups list every value of their prefs enum", "[sourcesettings][p
         {kIndexHdrPeak, static_cast<int>(PrefsHdrPeak::Count)},  // [WP-HDRPEAK]
         {kIndexPhotoSeam, static_cast<int>(PrefsPhotoSeam::Count)},  // [WP-PHOTO]
         {kIndexLensShading, static_cast<int>(PrefsLensShading::Count)},  // [WP-VIGNETTE]
+        {kIndexParallaxGrid, static_cast<int>(PrefsParallaxGrid::Count)},  // [WP-STEADY]
+        {kIndexLensAlign, static_cast<int>(PrefsLensAlign::Count)},        // [WP-STEADY]
     };
     for (const auto& [index, count] : expected) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");

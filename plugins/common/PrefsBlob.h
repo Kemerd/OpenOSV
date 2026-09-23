@@ -241,6 +241,38 @@ enum class PrefsLensShading : std::uint8_t {
     Count
 };
 
+/// [WP-STEADY] "Parallax Grid": whether the seam corrections (the parallax
+/// grid, the seam-shift table and the carved seam) are measured per moment
+/// or held still for the whole clip (osv/render/ClipSteady.h).  Persisted,
+/// so append-only.
+///
+/// FollowsScene is 0 so an older blob - whose byte is zero - keeps rendering
+/// exactly as it did (one measurement per bucket of 8 frames, glided); a
+/// fresh blob gets Auto from defaults().
+enum class PrefsParallaxGrid : std::uint8_t {
+    /// Per moment: one measurement per 8-frame bucket, glided between
+    /// buckets.  Follows near objects that move past the seam (handheld).
+    FollowsScene = 0,
+    /// One correction for the whole clip, from fixed sample frames: nothing
+    /// at the seam moves (rigid mounts: a wing, a helmet, a car).
+    Steady = 1,
+    /// Steady unless a sample frame's own correction aligns something the
+    /// clip correction loses (a near object that moved past the seam).
+    Auto = 2,
+    Count
+};
+
+/// [WP-STEADY] "Lens Alignment": whether the importer fits the small
+/// rotation between the two lenses once per clip and folds it into the rig
+/// (osv/render/LensAlign.h), or trusts the recorded calibration alone.
+/// Persisted, so append-only.  Off is 0 so an older blob renders exactly as
+/// it did; a fresh blob gets Auto from defaults().
+enum class PrefsLensAlign : std::uint8_t {
+    Off = 0,   ///< The recorded calibration only.
+    Auto = 1,  ///< Fit the rotation on fixed frames of the clip (cached per clip) and fold it in.
+    Count
+};
+
 #pragma pack(push, 1)
 
 /// The 128-byte preferences record.  Use defaults() to construct one,
@@ -351,11 +383,20 @@ struct PrefsBlob {
     /// shadingStrengthPercent().
     std::uint8_t shadingStrength = 0;
     // ---- [/WP-VIGNETTE] -------------------------------------------------------
+    // ---- [WP-STEADY] steady seam corrections and lens alignment --------------
+    /// Offsets 48-49: the rest of the range before WP-STEADY's
+    /// (docs/PARALLEL_WORK.md).  Zero, and zeroed by sanitise(); the lead
+    /// folds it at merge.
+    std::uint8_t padBeforeSteady[2] = {};
+    /// PrefsParallaxGrid; 0 = FollowsScene, so an older blob renders as it did.
+    std::uint8_t parallaxGrid = 0;
+    /// PrefsLensAlign; 0 = Off, so an older blob renders as it did.
+    std::uint8_t lensAlign = 0;
+    /// Offsets 52-53: the rest of WP-STEADY's range.  Zero, and zeroed by
+    /// sanitise().
+    std::uint8_t steadyReserved[2] = {};
+    // ---- [/WP-STEADY] ---------------------------------------------------------
     // ---- [WP-HDRPEAK] the PQ output's peak brightness -------------------------
-    /// Offsets 48-53: the byte ranges of the packages still working alongside
-    /// this one (docs/PARALLEL_WORK.md).  Zero, and zeroed by sanitise(); the
-    /// lead folds them into those packages' fields at merge.
-    std::uint8_t padBeforeHdrPeak[6] = {};
     /// PrefsHdrPeak: the display peak the PQ output's highlights roll off
     /// into.  0 = 1000 nits (no roll-off), the default and every older blob.
     std::uint8_t hdrPeak = 0;
@@ -445,6 +486,15 @@ struct PrefsBlob {
         // and a lens whose sky shows no structure is left untouched.
         p.lensShading = static_cast<std::uint8_t>(PrefsLensShading::Auto);
         p.shadingStrength = 0;
+        // [WP-STEADY] New clips hold the seam corrections still unless the
+        // clip shows a near object moving past the seam, and fit the lens
+        // rotation.  Measured on the sample: the warp's frame-to-frame motion
+        // at the nacelle falls from 2.0 px to 0 at 6K with the same alignment,
+        // and the rotation takes the ground from NCC 0.37 to 0.88 without a
+        // grid and from 0.922-0.932 to 0.932-0.946 with one (docs/PREMIERE.md,
+        // "Steady seam and lens alignment").
+        p.parallaxGrid = static_cast<std::uint8_t>(PrefsParallaxGrid::Auto);
+        p.lensAlign = static_cast<std::uint8_t>(PrefsLensAlign::Auto);
         return p;
     }
 
@@ -610,18 +660,31 @@ struct PrefsBlob {
             clean = false;
         }
         // [WP-HDRPEAK] zero is the default (1000 nits, no roll-off), so a
-        // corrupt byte lands there; the padding around it stays zero.
+        // corrupt byte lands there; its spare byte stays zero.
         clampEnum(hdrPeak, static_cast<std::uint8_t>(PrefsHdrPeak::Count),
                   static_cast<std::uint8_t>(PrefsHdrPeak::Nits1000));
-        for (std::uint8_t& b : padBeforeHdrPeak) {
+        if (padAfterHdrPeak != 0) {
+            padAfterHdrPeak = 0;
+            clean = false;
+        }
+        // [WP-STEADY] Corrupt choices land on the DEFAULT (Auto), like
+        // parallax and the sky seam fix: a fresh blob's setting.  The padding
+        // and the rest of the range stay zero.
+        clampEnum(parallaxGrid, static_cast<std::uint8_t>(PrefsParallaxGrid::Count),
+                  static_cast<std::uint8_t>(PrefsParallaxGrid::Auto));
+        clampEnum(lensAlign, static_cast<std::uint8_t>(PrefsLensAlign::Count),
+                  static_cast<std::uint8_t>(PrefsLensAlign::Auto));
+        for (std::uint8_t& b : padBeforeSteady) {
             if (b != 0) {
                 b = 0;
                 clean = false;
             }
         }
-        if (padAfterHdrPeak != 0) {
-            padAfterHdrPeak = 0;
-            clean = false;
+        for (std::uint8_t& b : steadyReserved) {
+            if (b != 0) {
+                b = 0;
+                clean = false;
+            }
         }
         if (magic != kMagic || version != kVersion) {
             magic = kMagic;
@@ -746,6 +809,20 @@ struct PrefsBlob {
     }
     /// [WP-PHOTO] The sky seam fix mode.
     [[nodiscard]] PrefsPhotoSeam photoSeamMode() const noexcept { return static_cast<PrefsPhotoSeam>(photoSeam); }
+    /// [WP-STEADY] The Parallax Grid choice; an out-of-range byte (an
+    /// unsanitised blob) reads as FollowsScene, what the importer did before
+    /// the byte existed.
+    [[nodiscard]] PrefsParallaxGrid parallaxGridChoice() const noexcept {
+        return parallaxGrid < static_cast<std::uint8_t>(PrefsParallaxGrid::Count)
+                   ? static_cast<PrefsParallaxGrid>(parallaxGrid)
+                   : PrefsParallaxGrid::FollowsScene;
+    }
+    /// [WP-STEADY] The Lens Alignment choice; an out-of-range byte reads as
+    /// Off, the calibration alone.
+    [[nodiscard]] PrefsLensAlign lensAlignChoice() const noexcept {
+        return lensAlign < static_cast<std::uint8_t>(PrefsLensAlign::Count) ? static_cast<PrefsLensAlign>(lensAlign)
+                                                                             : PrefsLensAlign::Off;
+    }
     /// [WP-PHOTO] Gain-field strength in percent (code 0 = the default 100).
     [[nodiscard]] double photoStrengthPercent() const noexcept {
         if (photoStrength == 0 || photoStrength > kMaxPhotoStrengthCode) {
@@ -937,10 +1014,17 @@ static_assert(offsetof(PrefsBlob, farOffset) == 44, "PrefsBlob layout drifted");
 // Off, so an old project renders as before; a fresh blob gets Auto.
 static_assert(offsetof(PrefsBlob, lensShading) == 46, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, shadingStrength) == 47, "PrefsBlob layout drifted");
-// [WP-HDRPEAK] hdrPeak takes offset 54 of its assigned range (54-55); 48-53
-// are padded for the packages that own them.  An older blob's zero byte reads
-// as PrefsHdrPeak::Nits1000 - no roll-off, the PQ output it always had.
-static_assert(offsetof(PrefsBlob, padBeforeHdrPeak) == 48, "PrefsBlob layout drifted");
+// [WP-STEADY] owns offsets 50-53 (48-49 are padded).  Both choices' zero
+// reads as the behaviour before they existed - per-moment corrections, the
+// calibration alone - so an old project renders exactly as before; a fresh
+// blob gets Auto for both.
+static_assert(offsetof(PrefsBlob, padBeforeSteady) == 48, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, parallaxGrid) == 50, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, lensAlign) == 51, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, steadyReserved) == 52, "PrefsBlob layout drifted");
+// [WP-HDRPEAK] hdrPeak takes offset 54 of its assigned range (54-55).  An
+// older blob's zero byte reads as PrefsHdrPeak::Nits1000 - no roll-off, the
+// PQ output it always had.
 static_assert(offsetof(PrefsBlob, hdrPeak) == 54, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, padAfterHdrPeak) == 55, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, reserved) == 56, "PrefsBlob layout drifted");

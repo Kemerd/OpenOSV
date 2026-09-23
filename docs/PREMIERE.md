@@ -565,7 +565,7 @@ absent, so that fact cannot be forgotten.
 
 As in the reframe effect, `PF_ADD_TOPIC` and `PF_END_TOPIC` each issue their
 own `PF_ADD_PARAM`, so a group occupies two real parameter slots and the
-`GROUP_END` slot sits in the MIDDLE of the list. There are 31 parameters: 23
+`GROUP_END` slot sits in the MIDDLE of the list. There are 33 parameters: 25
 value controls, 2 buttons and 6 group markers. `SourceSettingsParams.h`
 spells the index table out literally. Ids are permanent and only ever
 appended; indices moved when a control joined a group (the ids did not).
@@ -601,28 +601,32 @@ meaning; forcing the bare-lens set is new and therefore last.
 | 18 | 24 | Far Offset | float slider | -3..+3 deg, hundredths | 0 | `farOffset` |
 | 19 | 34 | Lens Shading | popup | Off \| Auto | Auto | `lensShading` |
 | 20 | 35 | Shading Strength | float slider | 0..100 %, whole percent | 100 | `shadingStrength` |
-| 21 | 8 | (closes Stitching) | GROUP_END | | | |
-| 22 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
-| 23 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 \| Osmo 360 | Osmo 360 | `dlogmFit` |
-| 24 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
-| 25 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
-| 26 | 14 | Program Monitor Colour | popup | Sequence space (fast) \| Match Source monitor | Sequence space | `directColour` |
-| 27 | 13 | (closes Advanced) | GROUP_END | | | |
-| 28 | 30 | Defaults | topic (GROUP_START, starts collapsed) | | | |
-| 29 | 31 | Save | button, `PF_ParamFlag_SUPERVISE` | "Save as Default for New Clips" | | writes the user defaults file |
-| 30 | 32 | Restore | button, `PF_ParamFlag_SUPERVISE` | "Restore Built-in Defaults" | | removes it |
-| 31 | 33 | (closes Defaults) | GROUP_END | | | |
+| 21 | 40 | Parallax Grid | popup | Auto (steady unless the scene moves) \| Steady (per clip) \| Follows scene (per moment) | Auto | `parallaxGrid` |
+| 22 | 41 | Lens Alignment | popup | Auto (fit per clip) \| Off (calibration only) | Auto | `lensAlign` |
+| 23 | 8 | (closes Stitching) | GROUP_END | | | |
+| 24 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
+| 25 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 \| Osmo 360 | Osmo 360 | `dlogmFit` |
+| 26 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
+| 27 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
+| 28 | 14 | Program Monitor Colour | popup | Sequence space (fast) \| Match Source monitor | Sequence space | `directColour` |
+| 29 | 13 | (closes Advanced) | GROUP_END | | | |
+| 30 | 30 | Defaults | topic (GROUP_START, starts collapsed) | | | |
+| 31 | 31 | Save | button, `PF_ParamFlag_SUPERVISE` | "Save as Default for New Clips" | | writes the user defaults file |
+| 32 | 32 | Restore | button, `PF_ParamFlag_SUPERVISE` | "Restore Built-in Defaults" | | removes it |
+| 33 | 33 | (closes Defaults) | GROUP_END | | | |
 
 The Defaults group is always last and its indices are defined relative to
 the Advanced terminator, so a control added to an earlier group moves them
 without renumbering; ids 20-29 are left to the Stitching group. The lens
-shading correction's ids (34-35) come after every id already shipped, and
-the HDR peak's (46) after those. See "User defaults for new clips" below.
+shading correction's ids (34-35) come after every id already shipped, the
+steady seam's (40-41) after those, and the HDR peak's (46) after those.
+See "User defaults for new clips" below.
 
-An effect saved before ids 15-19 (or 34-35) existed has no stored value for
-them, so it picks up the control defaults above (DJI look, ghost removal, the
-sky seam fix and the lens shading correction on) - a project opened in this
-build gets the improved stitch.
+An effect saved before ids 15-19 (or 34-35, or 40-41) existed has no stored
+value for them, so it picks up the control defaults above (DJI look, ghost
+removal, the sky seam fix, the lens shading correction, the steady seam and
+lens alignment on) - a project opened in this build gets the improved
+stitch.
 
 #### Lens shading (ids 34-35)
 
@@ -647,6 +651,99 @@ correction travels inside the stitch block, so the importer's equirect, the
 Source monitor and the Program monitor's direct path show the same picture.
 Cost: 7-10 ms of analysis per bucket of eight frames; the render kernels do
 not measurably slow down (+0.00 ms at 2560x1440 on the direct path).
+
+#### Steady seam and lens alignment (ids 40-41)
+
+Two per-clip analyses (`include/osv/render/LensAlign.h`,
+`include/osv/render/ClipSteady.h`, `plugins/importer/SteadyStage.h`;
+docs/research/AI_STITCHING.md section 5, "As built").
+
+| Control | What it does | Measured on the sample |
+|---|---|---|
+| Lens Alignment | Auto fits the small rotation between the two lenses - three numbers per clip - from the flow of three fixed frames at 10 / 50 / 90 % of the clip, and turns each lens by half of it, in opposite senses, before anything else is measured: the stitched world, the horizon and stabilisation stay where they were. Refused (the calibration is kept, and the Properties panel says why) when the frames disagree by more than 0.05 deg, the fit leaves more than 0.1 deg RMS, fewer than 20 % of the cells agree, it exceeds 2 deg, or the cells do not pin down all three axes. Off: the recorded calibration, exactly. | 0.356-0.360 deg, the three frames within 0.004-0.008 deg, 0.058-0.068 deg RMS residual over 5551 of 5834 cells. The ground's lens-to-lens NCC without any flow grid 0.37 -> 0.88; with the grid 0.922 / 0.932 / 0.932 -> 0.932 / 0.942 / 0.946 (frames 0 / 32 / 64); the wing 0.310 / 0.288 / 0.332 -> 0.324 / 0.323 / 0.339; the whole band 0.916 / 0.918 / 0.921 -> 0.923 / 0.924 / 0.925; the sky 0.976 -> 0.974-0.975. |
+| Parallax Grid | Steady measures the three per-moment seam corrections - the parallax flow grid, the seam-shift table and the carved seam - once, on nine fixed frames spread over the whole clip, and renders every frame with their median (per cell, per column). Follows scene re-measures them every eight frames and glides between measurements, as before. Auto is Steady unless a near object both lenses see moves past the seam: a textured 11.25 deg sector whose own correction aligns it (NCC >= 0.7, +0.05 over none) but which keeps less than 40 % of that gain AND loses more than 0.02 NCC under the clip correction makes the clip follow the scene. | Auto chooses Steady: the worst judged sector keeps 71-86 % of its own gain. The per-bucket analyses around the nacelle move each lens's picture by up to 1.96 px per frame at 6K (grid glide, p99 0.86 px, 24 of 64 frames above 1 px), the carved seam line by up to 0.60 px, and the seam-shift table steps by up to 13.5 px at a bucket edge where it is used; Steady: 0 for all three, by construction. The clip correction aligns as well as each frame's own: ground 0.925 / 0.932 / 0.930, wing 0.297 / 0.307 / 0.320 against 0.922 / 0.932 / 0.932 and 0.310 / 0.288 / 0.332. |
+
+**What moved the picture.** `osv_importer_bench --part S` renders ONE
+decoded frame of the sample at 6000 x 3000 with the corrections of every
+frame of the per-moment schedule in turn, so the scene cannot move and every
+pixel of motion on a 35 x 12 deg patch around the nacelle is the corrections'
+own (px per frame at 6K):
+
+| Correction | mean | p99 | worst frame pair's p99 | max |
+|---|---|---|---|---|
+| Parallax grid, re-measured every 8 frames and glided | 0.039 | 0.63 | 1.29 | 3.3 |
+| Carved seam, the same | 0.002 | 0.05 | 0.14 | 0.63 |
+| Seam-shift table, stepped at each bucket edge (only where the grid is refused) | 0.18 | 5.5 | 12.3 | 19.1 |
+| All three, as Follows scene renders them | 0.040 | 0.64 | 1.29 | 3.3 |
+| Steady (and Auto on the sample) | 0 | 0 | 0 | 0 |
+
+The grid's glide is the "slight movement" (the same size with the rotation
+folded: 0.053 mean, 1.19 worst p99). The carve's line and feather edges move
+by up to 0.60 / 0.91 px per frame but hardly change the picture there. Of
+what Seam Search off removes, the seam-shift table is what moves the
+picture: on the sample at 6K every bucket's grid is accepted and the table
+is unused, but wherever a bucket's grid is refused the table steps by up to
+12-19 px at the bucket edge. The direct path serves the same clip grid and
+seam to every frame (a test renders consecutive frames and compares the
+tables). Rendered through the importer on the moving clip, the patch's own
+motion - the nacelle reflects the moving ground - is 0.679 px per frame with
+no seam corrections,
+0.726 with Follows scene and 0.719 with the new defaults; what remains above
+0.679 stays with every correction held still (Seam Search off: 0.677, a
+1.5 deg Parallax Blend: 0.710), so it is how a sharper seam shows the
+nacelle's two different reflections, not movement.
+
+**Schedule.** Both run on a background worker of the clip's importer
+instance from its first non-draft frame (thumbnails never start one), each
+measured once per process and clip (a second instance of the same clip, the
+direct path's included, reuses it) and keyed by the rig, the blend and the
+analysis settings.
+
+* **Exact frames** - export, the direct path, every frame the Program
+  monitor is built from - wait for both, once per clip, up to 60 s (a
+  failure or a timeout is logged once and the frame takes the per-moment
+  corrections, measured on the spot). Nothing waits per bucket afterwards.
+* **Interactive frames** (Source monitor scrubbing) never wait: until the
+  clip correction lands they render with the nearest sample frame's own
+  correction, marked non-exact so the host does not cache them, and from
+  then on with the clip correction - the same pixels an Exact render of the
+  frame gives.
+* The rotation is also remembered on disk, next to the importer log
+  (`lens-alignment.tsv`, keyed by the file's path, size, modification time and
+  the rig), so reopening a clip folds it in before the first frame. The log
+  says when each lands, for example "lens alignment: 'x.OSV': 0.360 deg about
+  (+0.26, +0.04, -0.97) ... measured in 329 ms (decode 276)" and "steady:
+  'x.OSV': clip correction ready 741 ms after the first request (... 9 sample
+  frames ..., 9 grids accepted ...); Auto: steady: 0 of 32 judged sectors
+  lose their alignment ...".
+
+**Cost.** Lens alignment: 160-330 ms once per clip (three decodes and three
+flow solves; the disk cache makes a reopen free). Clip correction: 0.74-0.95 s
+once per clip (nine decodes, bands, flow and carves); after that no
+per-bucket analysis of the three runs at all. The first Exact frame of a clip
+therefore takes 0.9-1.2 s instead of 0.15-0.19 s.
+
+**Rotation and the flow grid together.** With the rotation folded, the
+residual the grid has to carry per cell is small, and the grid's default
+benefit bar (a cell must improve its NCC by 20 %) switched off corrections
+that were right: the ground fell to 0.892-0.904. A rig with a fitted rotation
+therefore uses a 5 % bar (`render::kAlignedRequiredImprovement`, which lists
+the gates measured); every other rig keeps 20 %.
+
+**Old projects.** Auto / Auto for new clips, in the built-in user defaults
+(`"parallaxGrid": "auto" | "steady" | "follows-scene"`,
+`"lensAlignment": "auto" | "off"`), and for a project whose Source Settings
+effect was saved before the controls existed (the controls' defaults, like
+every control added after the effect shipped). A prefs blob written before
+them - the modal dialog's - holds zeros at `PrefsBlob` offsets 50-51, which
+read as Follows scene / Off: that clip renders exactly as before until they
+are set. Auto was chosen as the default because on the sample it loses
+nothing - no judged sector loses its alignment to the clip correction (the
+worst keeps 71 % of its own gain), and the ground and whole band improve -
+and a clip it does not suit falls back to the per-moment corrections by
+itself. Also in the importer dialog ("Parallax
+grid", "Lens alignment") and osvtool (`seam --lens-align`, `seam --steady`,
+`seam --regions` for the ground / sky / wing scores).
 
 #### HDR peak (id 46)
 

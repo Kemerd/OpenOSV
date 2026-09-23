@@ -662,3 +662,119 @@ TEST_CASE("with Seam Smoothing on, the engine carries the frame's low band in th
     CHECK(worst < 1e-3);
     api.release(frame.lease, nullptr);
 }
+
+// =============================================================================
+//  [WP-STEADY] the direct path's corrections hold still in steady mode
+// =============================================================================
+
+TEST_CASE("the direct path's parallax grid and carved seam do not move from frame to frame in steady mode",
+          "[importer][engine][cuda][steady][sample]") {
+    // Field report: "subtle shifting at the lens" on the Program monitor,
+    // which renders through the engine and asks EXACT for every frame.  The
+    // per-moment schedule measures the grid and the seam once per 8 frames and
+    // glides between them, so both change on every frame; the steady clip
+    // correction is one grid and one seam for the whole clip.  This reads the
+    // tables the direct kernel samples back out of the caller's context.
+    if (!sampleClipAvailable()) {
+        SKIP("the sample clip is not present at " << sampleClipPath().string());
+    }
+    TestContext cuda;  // before the harness: outlives imShutdown
+    if (!cuda.context) {
+        SKIP("CUDA unavailable: " << cuda.reason);
+    }
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const EngineApi api = resolveEngine();
+    REQUIRE(api.ok());
+    const std::wstring path = sampleClipPath().wstring();
+    char error[512] = {};
+
+    // The tables of one frame, downloaded from the caller's context.
+    struct Tables {
+        std::vector<float> warp;
+        std::vector<float> seam;
+    };
+    const auto tablesOf = [&](std::uint32_t frameIndex) {
+        OsvEngineFrameRequest request = requestFor(path, frameIndex, cuda.context);
+        OsvEngineFrame frame = emptyFrame();
+        const std::int32_t rc = api.acquire(&request, &frame, error, sizeof(error));
+        INFO("engine error: " << error);
+        REQUIRE(rc == OSV_ENGINE_OK);
+        CHECK(frame.exact == 1);
+        Tables t;
+        REQUIRE(cuCtxPushCurrent(cuda.context) == CUDA_SUCCESS);
+        if (frame.warpDevice && frame.stitch.warpEnabled) {
+            t.warp.resize(static_cast<std::size_t>(frame.stitch.warpW) * frame.stitch.warpH * 2u);
+            REQUIRE(cuMemcpyDtoH(t.warp.data(),
+                                 static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(frame.warpDevice)),
+                                 t.warp.size() * sizeof(float)) == CUDA_SUCCESS);
+        }
+        if (frame.blendSeamDevice && frame.stitch.blendSeamEnabled) {
+            t.seam.resize(static_cast<std::size_t>(frame.stitch.blendSeamColumns) * 2u);
+            REQUIRE(cuMemcpyDtoH(t.seam.data(),
+                                 static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(frame.blendSeamDevice)),
+                                 t.seam.size() * sizeof(float)) == CUDA_SUCCESS);
+        }
+        CUcontext popped = nullptr;
+        (void)cuCtxPopCurrent(&popped);
+        api.release(frame.lease, nullptr);
+        return t;
+    };
+    // Largest per-cell change of the warp between two frames, in 6K pixels
+    // (each lens's picture moves by exactly the change of the half grid).
+    const auto warpMotionPx = [](const Tables& a, const Tables& b) {
+        REQUIRE(a.warp.size() == b.warp.size());
+        double worst = 0.0;
+        for (std::size_t i = 0; i + 1 < a.warp.size(); i += 2) {
+            const double du = static_cast<double>(b.warp[i]) - a.warp[i];
+            const double dv = static_cast<double>(b.warp[i + 1]) - a.warp[i + 1];
+            worst = std::max(worst, std::hypot(du, dv) * 180.0 / 3.14159265358979323846 * 6000.0 / 360.0);
+        }
+        return worst;
+    };
+    // Premiere publishes the clip's Source Settings to the engine through
+    // one of its own instances.
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+    const auto publish = [&](osv::premiere::PrefsParallaxGrid grid, osv::premiere::PrefsLensAlign align) {
+        osv::premiere::PrefsBlob prefs = osv::premiere::PrefsBlob::defaults();
+        prefs.flowBackend = static_cast<std::uint8_t>(osv::premiere::PrefsFlowBackend::Classical);
+        prefs.parallaxGrid = static_cast<std::uint8_t>(grid);
+        prefs.lensAlign = static_cast<std::uint8_t>(align);
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+    };
+
+    SECTION("steady: one grid and one seam for every frame") {
+        publish(osv::premiere::PrefsParallaxGrid::Steady, osv::premiere::PrefsLensAlign::Auto);
+        const Tables first = tablesOf(8);
+        REQUIRE_FALSE(first.warp.empty());
+        REQUIRE_FALSE(first.seam.empty());
+        for (std::uint32_t f = 9; f <= 17; ++f) {
+            const Tables t = tablesOf(f);
+            INFO("frame " << f);
+            CHECK(t.warp == first.warp);
+            CHECK(t.seam == first.seam);
+        }
+    }
+    SECTION("per moment (an older project): both glide on every frame of a bucket") {
+        publish(osv::premiere::PrefsParallaxGrid::FollowsScene, osv::premiere::PrefsLensAlign::Off);
+        // Played from the start, as the Program monitor plays: bucket 0 is
+        // measured first, so every frame of bucket 1 glides from it.
+        Tables previous = tablesOf(0);
+        REQUIRE_FALSE(previous.warp.empty());
+        double worst = 0.0;
+        std::size_t seamChanges = 0;
+        for (std::uint32_t f = 1; f <= 16; ++f) {
+            const Tables t = tablesOf(f);
+            if (f >= 9) {
+                worst = std::max(worst, warpMotionPx(previous, t));
+                seamChanges += (t.seam != previous.seam) ? 1u : 0u;
+            }
+            previous = t;
+        }
+        INFO("largest per-frame warp change in frames 8-16: " << worst << " px at 6K");
+        CHECK(worst > 0.05);
+        CHECK(seamChanges > 0u);
+    }
+}

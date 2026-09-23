@@ -2320,6 +2320,12 @@ struct BandDifference {
     p.parallax = static_cast<std::uint8_t>(parallaxOn ? PrefsParallax::On : PrefsParallax::Off);
     p.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Classical);
     p.flareRemoval = 0;  // [WP-FLARE] on by default now; these tests isolate the parallax
+    // [WP-STEADY] These tests exercise the PER-BUCKET schedule and its
+    // background worker (stand-ins, glides, the Exact / Interactive rules),
+    // so they pin it: the steady clip correction and the lens rotation are
+    // new defaults with tests of their own (test_steady_importer.cpp).
+    p.parallaxGrid = static_cast<std::uint8_t>(PrefsParallaxGrid::FollowsScene);
+    p.lensAlign = static_cast<std::uint8_t>(PrefsLensAlign::Off);
     return p;
 }
 
