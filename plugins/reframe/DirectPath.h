@@ -63,6 +63,11 @@ struct SourceBinding {
     csSDK_int32 ownerNode = 0;  ///< The owning clip node, ACQUIRED; release with releaseSource().
     bool ok = false;
     std::string reason;         ///< Why not, when !ok.
+    /// Frames of this instance whose clip time -> media time -> frame mapping
+    /// renderDirect() has logged (the first few of every instance, so a field
+    /// session can check trimmed / sped-up / reversed clips).  A diagnostic
+    /// counter: read and written only under the mapping logger's own lock.
+    mutable int mappingFramesLogged = 0;
 };
 
 /// Walk effect node -> owner clip node -> input media node and read the
