@@ -244,6 +244,14 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
             CHECK(translate(fixture, buffer).gainMatch == (on ? 1u : 0u));
         }
     }
+    SECTION("Sun Ghost Removal") {  // [WP-FLARE]
+        for (const bool on : {false, true}) {
+            PrefsBuffer buffer;
+            fixture.setCheckbox(kIndexFlareRemoval, on);
+            INFO("checkbox " << on);
+            CHECK(translate(fixture, buffer).flareRemoval == (on ? 1u : 0u));
+        }
+    }
     SECTION("Exposure") {
         for (const double stops : {-6.0, -3.0, -0.5, 0.0, 0.5, 2.25, 6.0}) {
             PrefsBuffer buffer;
@@ -439,6 +447,7 @@ TEST_CASE("SEQUENCE_SETUP asks the importer and seeds the controls from the answ
     fromImporter.exposureStops = 1.5f;
     fromImporter.renderDevice = static_cast<std::uint8_t>(PrefsRenderDevice::Cuda);
     fromImporter.directColour = static_cast<std::uint8_t>(PrefsDirectColour::MatchSource);  // not the default
+    fromImporter.flareRemoval = 0;  // [WP-FLARE] not the default
     REQUIRE(fromImporter.sanitise());
 
     const char* raw = reinterpret_cast<const char*>(&fromImporter);
@@ -472,6 +481,7 @@ TEST_CASE("SEQUENCE_SETUP asks the importer and seeds the controls from the answ
     CHECK(fixture.slider(kIndexExposure) == Catch::Approx(1.5));
     CHECK(fixture.popup(kIndexRenderDevice) == static_cast<int>(fromImporter.renderDevice) + 1);
     CHECK(fixture.popup(kIndexDirectColour) == static_cast<int>(fromImporter.directColour) + 1);
+    CHECK(fixture.checkbox(kIndexFlareRemoval) == false);  // [WP-FLARE]
 
     // A round trip proves the seeding and the translation agree: translating
     // the seeded controls must reproduce the importer's blob exactly.
@@ -619,6 +629,18 @@ TEST_CASE("the pure mapping round-trips every value of every field",
     }
 }
 
+TEST_CASE("the pure mapping round-trips Sun Ghost Removal", "[sourcesettings][mapping]") {
+    // [WP-FLARE]
+    for (const bool on : {false, true}) {
+        ControlValues c;
+        c.flareRemoval = on;
+        const PrefsBlob blob = prefsFromControls(c);
+        REQUIRE(blob.isValid());
+        CHECK(blob.flareRemoval == (on ? 1u : 0u));
+        CHECK(controlsFromPrefs(blob).flareRemoval == on);
+    }
+}
+
 TEST_CASE("the pure mapping round-trips the Program Monitor Colour choice", "[sourcesettings][mapping]") {
     // [WP-SETTINGS]
     for (int item = 1; item <= OSV_SS_DIRECT_COLOUR_COUNT; ++item) {
@@ -672,6 +694,7 @@ TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesetting
     CHECK(c.rec709Look == OSV_SS_LOOK_DEFAULT);  // [WP-LOOK]
     CHECK(c.seamSearch == (OSV_SS_SEAM_SEARCH_DEFAULT != 0));
     CHECK(c.gainMatch == (OSV_SS_GAIN_MATCH_DEFAULT != 0));
+    CHECK(c.flareRemoval == (OSV_SS_FLARE_REMOVAL_DEFAULT != 0));  // [WP-FLARE]
     CHECK(c.exposureStops == Catch::Approx(OSV_SS_EXPOSURE_DEFAULT));
 }
 

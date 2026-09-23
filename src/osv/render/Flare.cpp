@@ -705,8 +705,10 @@ SunBlob detectSun(const Gray& luma, const std::vector<std::uint8_t>& inside, con
             maxY = std::max(maxY, static_cast<double>(luma.v[i]));
         }
     }
+    // The scene's median from every other pixel both ways: a quarter of the
+    // nth_element work (the per-frame sun check runs this on every frame).
     const double med = medianOf(luma, [&](std::uint32_t x, std::uint32_t y) {
-        return inside[static_cast<std::size_t>(y) * luma.w + x] != 0;
+        return ((x | y) & 1u) == 0u && inside[static_cast<std::size_t>(y) * luma.w + x] != 0;
     });
     // The sun is several stops above the scene; a frame whose brightest
     // pixel is not is a frame without the sun in it.
@@ -736,9 +738,40 @@ SunBlob detectSun(const Gray& luma, const std::vector<std::uint8_t>& inside, con
         return sun;
     }
     sun.found = true;
-    sun.x = best->cx();
-    sun.y = best->cy();
     sun.radius = std::sqrt(static_cast<double>(best->area) / kPi);
+    // Sub-pixel centroid: every pixel near the blob weighted by how far it
+    // rises above the threshold, (Y - level) / (max - level) clamped to
+    // [0, 1].  The clipped core weighs 1 either way; what the weights add is
+    // the blob's soft edge, which a yes/no mask quantises to whole pixels -
+    // on the coarse per-frame sun check that quantisation alone moved the
+    // centroid by ~1.5 stream px from frame to frame.  Pixels farther than
+    // 1.5 radii + 2 from the mask centroid are left out, so a glint beside
+    // the sun cannot pull it.
+    const double cx0 = best->cx();
+    const double cy0 = best->cy();
+    const double reach = 1.5 * sun.radius + 2.0;
+    const double span = std::max(maxY - level, 1e-12);
+    const int x0 = std::max(0, static_cast<int>(std::floor(cx0 - reach)));
+    const int y0 = std::max(0, static_cast<int>(std::floor(cy0 - reach)));
+    const int x1 = std::min(static_cast<int>(luma.w) - 1, static_cast<int>(std::ceil(cx0 + reach)));
+    const int y1 = std::min(static_cast<int>(luma.h) - 1, static_cast<int>(std::ceil(cy0 + reach)));
+    double sw = 0.0, swx = 0.0, swy = 0.0;
+    for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
+            const std::size_t i = static_cast<std::size_t>(y) * luma.w + static_cast<std::size_t>(x);
+            const double px = x + 0.5;
+            const double py = y + 0.5;
+            if (!inside[i] || (px - cx0) * (px - cx0) + (py - cy0) * (py - cy0) > reach * reach) {
+                continue;
+            }
+            const double w = std::clamp((static_cast<double>(luma.v[i]) - level) / span, 0.0, 1.0);
+            sw += w;
+            swx += w * px;
+            swy += w * py;
+        }
+    }
+    sun.x = sw > 0.0 ? swx / sw : cx0;
+    sun.y = sw > 0.0 ? swy / sw : cy0;
     return sun;
 }
 
@@ -1090,6 +1123,60 @@ double ghostLumaAt(const LensFlare& lens, double px, double py) noexcept {
     return sum;
 }
 
+/// A working image reduced to what the sun detector and the ghost search
+/// share: luma, the usable image circle, and the sun blob.
+struct SunScan {
+    Gray luma;
+    std::vector<std::uint8_t> inside;  ///< 1 inside 97 % of the image circle.
+    double ocx = 0.0, ocy = 0.0;       ///< Optical centre (analysis px).
+    double rMax = 0.0;                 ///< Image-circle radius (analysis px).
+    SunBlob sun;                       ///< The sun, when there is one.
+};
+
+/// Luma, image circle and sun of one working image.  The caller has
+/// validated the image and the lens.
+SunScan scanForSun(const FlareImage& image, const geom::KannalaBrandt5& lens, const FlareParams& fp) {
+    SunScan s;
+    const double f = static_cast<double>(image.factor);
+    const std::uint32_t W = image.w;
+    const std::uint32_t H = image.h;
+    // ---- luma -----------------------------------------------------------------
+    s.luma = Gray(W, H);
+    for (std::size_t i = 0; i < s.luma.v.size(); ++i) {
+        const float* p = &image.rgb[i * 3u];
+        const double y = kLumaR * p[0] + kLumaG * p[1] + kLumaB * p[2];
+        s.luma.v[i] = std::isfinite(y) ? static_cast<float>(y) : 0.0f;
+    }
+    // ---- the usable image circle ------------------------------------------------
+    s.ocx = lens.cx / f;
+    s.ocy = lens.cy / f;
+    double rMax = lens.rMaxPx;
+    if (!(rMax > 0.0)) {
+        rMax = 0.5 * (lens.fx + lens.fy) * lens.thetaD(lens.thetaMaxRad);
+    }
+    s.rMax = rMax / f;
+    s.inside.assign(s.luma.v.size(), 0);
+    const double r2Max = (0.97 * s.rMax) * (0.97 * s.rMax);
+    for (std::uint32_t y = 0; y < H; ++y) {
+        const double dy = y + 0.5 - s.ocy;
+        for (std::uint32_t x = 0; x < W; ++x) {
+            const double dx = x + 0.5 - s.ocx;
+            s.inside[static_cast<std::size_t>(y) * W + x] = dx * dx + dy * dy < r2Max ? 1 : 0;
+        }
+    }
+    // ---- the sun ------------------------------------------------------------------
+    s.sun = detectSun(s.luma, s.inside, fp);
+    return s;
+}
+
+/// The parameter checks analyseLensFlare and locateSun share.
+[[nodiscard]] bool flareParamsValid(const FlareParams& fp) noexcept {
+    return allFinite(fp.sunLevelFraction, fp.sunMinRatioToMedian, fp.corridorDeg, fp.backgroundSigmaPx,
+                     fp.seedContrast, fp.maxTexture, fp.minContrast, fp.minFitR2) &&
+           fp.sunLevelFraction > 0.0 && fp.sunLevelFraction <= 1.0 && fp.backgroundSigmaPx > 0.5 &&
+           fp.maxGhosts >= 0 && fp.corridorDeg >= 0.0;
+}
+
 /// Scale every light term of a ghost (fade in / out) - its shape stays.
 void scaleLight(FlareGhost& g, double k) noexcept {
     for (std::size_t c = 0; c < 3; ++c) {
@@ -1197,10 +1284,7 @@ Result<LensFlare> analyseLensFlare(const FlareImage& image, const geom::KannalaB
     if (!lens.isValid()) {
         return Error{ErrorCode::InvalidArgument, "analyseLensFlare: invalid lens model"};
     }
-    if (!allFinite(fp.sunLevelFraction, fp.sunMinRatioToMedian, fp.corridorDeg, fp.backgroundSigmaPx,
-                   fp.seedContrast, fp.maxTexture, fp.minContrast, fp.minFitR2) ||
-        fp.sunLevelFraction <= 0.0 || fp.sunLevelFraction > 1.0 || fp.backgroundSigmaPx <= 0.5 ||
-        fp.maxGhosts < 0 || fp.corridorDeg < 0.0) {
+    if (!flareParamsValid(fp)) {
         return Error{ErrorCode::InvalidArgument, "analyseLensFlare: invalid parameters"};
     }
     LensFlare out;
@@ -1209,30 +1293,13 @@ Result<LensFlare> analyseLensFlare(const FlareImage& image, const geom::KannalaB
     const std::uint32_t W = image.w;
     const std::uint32_t H = image.h;
 
-    // ---- luma and the usable image circle -----------------------------------
-    Gray luma(W, H);
-    for (std::size_t i = 0; i < luma.v.size(); ++i) {
-        const float* p = &image.rgb[i * 3u];
-        const double y = kLumaR * p[0] + kLumaG * p[1] + kLumaB * p[2];
-        luma.v[i] = std::isfinite(y) ? static_cast<float>(y) : 0.0f;
-    }
-    const double ocx = lens.cx / f;
-    const double ocy = lens.cy / f;
-    double rMax = lens.rMaxPx;
-    if (!(rMax > 0.0)) {
-        rMax = 0.5 * (lens.fx + lens.fy) * lens.thetaD(lens.thetaMaxRad);
-    }
-    rMax /= f;
-    std::vector<std::uint8_t> inside(luma.v.size(), 0);
-    for (std::uint32_t y = 0; y < H; ++y) {
-        for (std::uint32_t x = 0; x < W; ++x) {
-            const double r = std::hypot(x + 0.5 - ocx, y + 0.5 - ocy);
-            inside[static_cast<std::size_t>(y) * W + x] = r < 0.97 * rMax ? 1 : 0;
-        }
-    }
-
-    // ---- the sun ------------------------------------------------------------
-    const SunBlob sun = detectSun(luma, inside, fp);
+    // ---- luma, the usable image circle and the sun ---------------------------
+    const SunScan scan = scanForSun(image, lens, fp);
+    const Gray& luma = scan.luma;
+    const double ocx = scan.ocx;
+    const double ocy = scan.ocy;
+    const double rMax = scan.rMax;
+    const SunBlob& sun = scan.sun;
     if (!sun.found) {
         return out;  // no sun, nothing to remove - not an error
     }
@@ -1310,6 +1377,9 @@ Result<LensFlare> analyseLensFlare(const FlareImage& image, const geom::KannalaB
             continue;
         }
         if (b.aspect() > fp.maxAspect || b.fill() < 0.35) {
+            continue;
+        }
+        if (static_cast<double>(std::max(b.bw(), b.bh())) * f > fp.maxCandidateExtentStreamPx) {
             continue;
         }
         // Texture around the blob: its box grown by its own size each way.
@@ -1411,31 +1481,114 @@ Result<FlareModel> analyseFlare(const geom::LensRig& rig, const video::FramePair
     FlareModel model;
     for (int i = 0; i < 2; ++i) {
         const std::size_t li = static_cast<std::size_t>(i);
-        // Host frame first: it is what the CPU reference path has.
-        Result<FlareImage> image = Error{ErrorCode::InvalidArgument, "analyseFlare: no frame"};
-        if (frames.lens[li].valid()) {
-            image = flareDownsample(frames.lens[li], color, params.factor, pool);
-        } else if (frames.device[li].valid()) {
-            // Device-only frame: the installed GPU sampler, or a refusal
-            // that says what is missing.
-            const std::shared_ptr<FlareDeviceSampler> gpu = flareDeviceSampler();
-            if (!gpu) {
-                return Error{ErrorCode::InvalidArgument,
-                             "analyseFlare: the frames are on the GPU and no device sampler is installed "
-                             "(osv::render::installCudaFlareSampler)"};
-            }
-            OsvPlane plane{};
-            if (!fillDevicePlane(frames.device[li], plane)) {
-                return Error{ErrorCode::InvalidArgument, "analyseFlare: invalid device frame"};
-            }
-            image = gpu->downsample(plane, color, params.factor);
-        }
-        if (!image.ok()) {
-            return Error{image.error()};
-        }
-        OSV_TRY_ASSIGN(model.lens[li], analyseLensFlare(image.value(), rig.lens[li], params, &pool));
+        OSV_TRY_ASSIGN(FlareImage image, flareDownsampleLens(frames, i, color, params.factor, pool));
+        OSV_TRY_ASSIGN(model.lens[li], analyseLensFlare(image, rig.lens[li], params, &pool));
     }
     return model;
+}
+
+Result<FlareImage> flareDownsampleLens(const video::FramePair& frames, int lens, const OsvColorParams& color,
+                                       std::uint32_t factor, ThreadPool& pool) {
+    if (lens < 0 || lens > 1) {
+        return Error{ErrorCode::InvalidArgument, "flareDownsampleLens: lens must be 0 or 1"};
+    }
+    const std::size_t li = static_cast<std::size_t>(lens);
+    // Host frame first: it is what the CPU reference path has.
+    if (frames.lens[li].valid()) {
+        return flareDownsample(frames.lens[li], color, factor, pool);
+    }
+    if (!frames.device[li].valid()) {
+        return Error{ErrorCode::InvalidArgument, "flareDownsampleLens: the pair holds no frame for this lens"};
+    }
+    // Device-only frame: the installed GPU sampler, or a refusal that says
+    // what is missing.
+    const std::shared_ptr<FlareDeviceSampler> gpu = flareDeviceSampler();
+    if (!gpu) {
+        return Error{ErrorCode::InvalidArgument,
+                     "flare analysis: the frames are on the GPU and no device sampler is installed "
+                     "(osv::render::installCudaFlareSampler)"};
+    }
+    OsvPlane plane{};
+    if (!fillDevicePlane(frames.device[li], plane)) {
+        return Error{ErrorCode::InvalidArgument, "flareDownsampleLens: invalid device frame"};
+    }
+    return gpu->downsample(plane, color, factor);
+}
+
+// ===========================================================================
+//  Public: the per-frame sun check
+// ===========================================================================
+
+std::uint32_t flareSunCheckFactor(std::uint32_t lensW) noexcept {
+    // 375-750 analysis px across: 8 at 6K (3000 px lenses, 375 px), 2 for
+    // the 1024 px proxy (512 px).  Fine enough that the sun disc (39 px
+    // radius at 6K, 13 at the proxy) is dozens of samples and its centroid
+    // lands within a pixel or two, coarse enough to cost a sixteenth of the
+    // full analysis' decodes at 6K.
+    const std::uint32_t f = lensW / 375u;
+    return std::clamp<std::uint32_t>(f, 1u, 16u);
+}
+
+double flareSunTolerancePx(std::uint32_t lensW) noexcept {
+    // 3 px at 6K, scaled with the lens (0.2 degrees at every size).  On the
+    // sample clip the brightest ghost moved 0.45 px per px of sun motion
+    // across the image (sun +16 px, ghost +7 px over 65 frames), so a model
+    // is at most ~1.4 px off within this tolerance - under a quarter of its
+    // 6.6 px edge ramp, invisible.  A sun further away than this needs its
+    // own measurement.
+    const double w = lensW > 0 ? static_cast<double>(lensW) : 3000.0;
+    return std::max(1.0, 3.0 * w / 3000.0);
+}
+
+FlareSunFix locateSun(const FlareImage& image, const geom::KannalaBrandt5& lens, const FlareParams& params) noexcept {
+    FlareSunFix fix;
+    try {
+        if (!image.valid() || !lens.isValid() || !flareParamsValid(params)) {
+            return fix;
+        }
+        const SunScan scan = scanForSun(image, lens, params);
+        if (!scan.sun.found) {
+            return fix;
+        }
+        const double f = static_cast<double>(image.factor);
+        fix.found = true;
+        fix.x = scan.sun.x * f;
+        fix.y = scan.sun.y * f;
+        fix.radiusPx = scan.sun.radius * f;
+    } catch (...) {
+        // Allocation failure: report no sun, which removes nothing.
+        fix = FlareSunFix{};
+    }
+    return fix;
+}
+
+Result<FlareSunFixes> locateSuns(const geom::LensRig& rig, const video::FramePair& frames, const OsvColorParams& color,
+                                 const FlareParams& params, ThreadPool& pool) {
+    FlareSunFixes fixes{};
+    for (int i = 0; i < 2; ++i) {
+        const std::size_t li = static_cast<std::size_t>(i);
+        // The lens's width decides the check's resolution.
+        const std::uint32_t lensW = frames.lens[li].valid() ? frames.lens[li].width : frames.device[li].width;
+        OSV_TRY_ASSIGN(FlareImage image,
+                       flareDownsampleLens(frames, i, color, flareSunCheckFactor(lensW), pool));
+        fixes[li] = locateSun(image, rig.lens[li], params);
+    }
+    return fixes;
+}
+
+bool flareSunsMatch(const FlareSunFixes& a, const FlareSunFixes& b, double tolerancePx) noexcept {
+    if (!std::isfinite(tolerancePx) || tolerancePx < 0.0) {
+        return false;
+    }
+    for (std::size_t i = 0; i < 2; ++i) {
+        if (a[i].found != b[i].found) {
+            return false;  // the sun entered or left this lens
+        }
+        if (a[i].found && !(std::hypot(a[i].x - b[i].x, a[i].y - b[i].y) <= tolerancePx)) {
+            return false;  // it moved too far (or a position is not a number)
+        }
+    }
+    return true;
 }
 
 // ===========================================================================

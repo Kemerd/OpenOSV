@@ -90,9 +90,11 @@ inline constexpr int kFlareMaxGhosts = OSV_FLARE_MAX_GHOSTS;
 // ===========================================================================
 
 /// A small native-linear RGB image of one lens: the image the analysis runs
-/// on.  Pixel (x, y) is the mean of the lens's `factor` x `factor` block
-/// starting at (x * factor, y * factor), so a continuous coordinate u in this
-/// image is u * factor in stream pixels (both with sample centres at +0.5).
+/// on.  Pixel (x, y) stands for the lens's `factor` x `factor` block starting
+/// at (x * factor, y * factor): the linear mean of a 2 x 2 sample grid
+/// centred in it (osvFlareDownsamplePixel).  A continuous coordinate u in
+/// this image is u * factor in stream pixels (both with sample centres at
+/// +0.5).
 struct FlareImage {
     std::uint32_t w = 0;       ///< Width in analysis pixels.
     std::uint32_t h = 0;       ///< Height in analysis pixels.
@@ -222,6 +224,13 @@ struct FlareParams {
     /// factor 4) is already a sky structure rather than a reflection, and
     /// its fit window is what used to dominate the analysis time.
     double maxCandidateAreaPx = 2000.0;
+    /// Largest seed bounding-box side, in STREAM px (so it means the same at
+    /// every analysis factor).  The sample's largest ghost seeds at 92 (23
+    /// analysis px at factor 4); a seed of 204 - a sky structure at the rim
+    /// - was refused anyway and its fit, in the largest window, cost 70 ms
+    /// of an 85 ms analysis.  160 keeps 1.7x headroom over every ghost
+    /// measured.
+    double maxCandidateExtentStreamPx = 160.0;
 
     // ---- fit and acceptance -------------------------------------------------
     double minContrast = 0.04;           ///< Fitted plateau luma / background luma lower limit.
@@ -251,6 +260,64 @@ struct FlareParams {
 [[nodiscard]] Result<FlareModel> analyseFlare(const geom::LensRig& rig, const video::FramePair& frames,
                                               const OsvColorParams& color, const FlareParams& params,
                                               ThreadPool& pool);
+
+/// The working image of lens `lens` (0 slave, 1 master) of a frame pair:
+/// the host frame through the CPU sampler, else the device frame through the
+/// installed FlareDeviceSampler (InvalidArgument when there is none).
+[[nodiscard]] Result<FlareImage> flareDownsampleLens(const video::FramePair& frames, int lens,
+                                                     const OsvColorParams& color, std::uint32_t factor,
+                                                     ThreadPool& pool);
+
+// ===========================================================================
+//  The per-frame sun check
+// ===========================================================================
+//
+// A fitted ghost is only where the model says while the sun is where it was
+// when the model was measured: a ghost is an image of the sun, and it moves
+// when the sun moves across the lens (on the sample clip the brightest one
+// by 0.45 px per px of sun motion; how far for other paths is a property of
+// the lens that one clip cannot calibrate).  So before a cached model is
+// applied to a frame, the frame's own sun is located - a coarse, cheap pass
+// (flareSunCheckFactor) - and the model is used only while the sun sits
+// within flareSunTolerancePx of where the model saw it.  A panning shot
+// therefore needs a measurement per frame; a steady one reuses one per
+// bucket.
+
+/// Where the sun is in one lens of one frame.
+struct FlareSunFix {
+    bool found = false;     ///< A sun (compact saturated blob) is in this lens.
+    double x = 0.0;         ///< Centroid (stream px).
+    double y = 0.0;
+    double radiusPx = 0.0;  ///< Equivalent radius (stream px).
+};
+
+/// Both lenses (index = LensIndex).
+using FlareSunFixes = std::array<FlareSunFix, 2>;
+
+/// Working-image factor of the sun check for a lens `lensW` px wide (375-750
+/// analysis px across: 8 at 6K, 2 for the 1024 px proxy; clamped to 1..16).
+[[nodiscard]] std::uint32_t flareSunCheckFactor(std::uint32_t lensW) noexcept;
+
+/// How far (stream px) the sun may be from where a model saw it for the
+/// model to still describe the frame: 3 px at 6K, scaled with the lens.
+[[nodiscard]] double flareSunTolerancePx(std::uint32_t lensW) noexcept;
+
+/// The sun of one working image, found exactly as analyseLensFlare finds it.
+/// No sun (or garbage in) is `found == false`, never an error.
+[[nodiscard]] FlareSunFix locateSun(const FlareImage& image, const geom::KannalaBrandt5& lens,
+                                    const FlareParams& params) noexcept;
+
+/// The sun check of a frame pair: both lenses at flareSunCheckFactor, host
+/// or device frames (see flareDownsampleLens).
+[[nodiscard]] Result<FlareSunFixes> locateSuns(const geom::LensRig& rig, const video::FramePair& frames,
+                                               const OsvColorParams& color, const FlareParams& params,
+                                               ThreadPool& pool);
+
+/// True when two sun checks describe the same sun: present in the same
+/// lenses, and each within `tolerancePx` of the other.  Both sides must come
+/// from the same kind of check (the importer compares sun checks with sun
+/// checks, never with a model's own full-resolution sun).
+[[nodiscard]] bool flareSunsMatch(const FlareSunFixes& a, const FlareSunFixes& b, double tolerancePx) noexcept;
 
 // ===========================================================================
 //  Veil (OFF by default - read before enabling)

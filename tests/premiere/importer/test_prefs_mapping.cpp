@@ -42,6 +42,7 @@ TEST_CASE("the defaults round trip through the control mapping", "[importer][pre
         REQUIRE(controls.dlogmFit == static_cast<int>(PrefsDlogmFit::Osmo360));
         REQUIRE(controls.exposureStops == 0.0);
         REQUIRE(controls.renderDevice == 0);    // Auto
+        REQUIRE(controls.flareRemoval == true); // [WP-FLARE] on for new clips
     }
 
     SECTION("mapping back reproduces the blob byte for byte") {
@@ -68,6 +69,7 @@ TEST_CASE("every field survives the round trip", "[importer][prefs][mapping]") {
                             for (int seam = 0; seam < 2; ++seam) {
                                 for (int gain = 0; gain < 2; ++gain) {
                                     for (const float exposure : {-6.0f, -1.25f, 0.0f, 0.5f, 3.0f, 6.0f}) {
+                                      for (int flare = 0; flare < 2; ++flare) {  // [WP-FLARE]
                                         PrefsBlob original = PrefsBlob::defaults();
                                         original.colorOutput = static_cast<std::uint8_t>(color);
                                         original.outputSize = static_cast<std::uint8_t>(size);
@@ -78,14 +80,17 @@ TEST_CASE("every field survives the round trip", "[importer][prefs][mapping]") {
                                         original.seamSearch = static_cast<std::uint8_t>(seam);
                                         original.gainMatch = static_cast<std::uint8_t>(gain);
                                         original.exposureStops = exposure;
+                                        original.flareRemoval = static_cast<std::uint8_t>(flare);
 
                                         const DialogControls controls = controlsFromPrefs(original);
                                         const PrefsBlob back = prefsFromControls(controls);
 
                                         INFO("colour " << color << " size " << size << " stab " << stab << " calib "
                                                        << calib << " fit " << fit << " device " << device << " seam "
-                                                       << seam << " gain " << gain << " exposure " << exposure);
+                                                       << seam << " gain " << gain << " exposure " << exposure
+                                                       << " flare " << flare);
                                         REQUIRE(back == original);
+                                      }
                                     }
                                 }
                             }
@@ -95,6 +100,36 @@ TEST_CASE("every field survives the round trip", "[importer][prefs][mapping]") {
             }
         }
     }
+}
+
+TEST_CASE("sun ghost removal is on for new clips and off for a blob saved before it existed",
+          "[importer][prefs][mapping]") {
+    // [WP-FLARE] The byte was carved out of the zero-filled reserved block, so
+    // a project saved before it existed carries 0 there - which must read as
+    // OFF (the project renders exactly as it did), while a new clip gets the
+    // default ON.  The parallax rule, for the same reason.
+    const PrefsBlob fresh = PrefsBlob::defaults();
+    REQUIRE(fresh.flareRemoval == 1u);
+
+    PrefsBlob modern = fresh;
+    std::uint8_t bytes[PrefsBlob::kSize];
+    std::memcpy(bytes, &modern, PrefsBlob::kSize);
+    bytes[offsetof(PrefsBlob, flareRemoval)] = 0;
+    const PrefsBlob old = PrefsBlob::fromBytes(bytes, sizeof(bytes));
+    REQUIRE(old.flareRemoval == 0u);
+    REQUIRE(controlsFromPrefs(old).flareRemoval == false);
+
+    // The dialog's checkbox round-trips both ways and changes nothing else.
+    DialogControls c = controlsFromPrefs(old);
+    c.flareRemoval = true;
+    PrefsBlob back = prefsFromControls(c, old);
+    REQUIRE(back.flareRemoval == 1u);
+    back.flareRemoval = 0;
+    REQUIRE(back == old);
+
+    // A corrupt byte lands on off, never on an undefined value.
+    bytes[offsetof(PrefsBlob, flareRemoval)] = 0xFE;
+    REQUIRE(PrefsBlob::fromBytes(bytes, sizeof(bytes)).flareRemoval == 0u);
 }
 
 TEST_CASE("out-of-range control values cannot produce an invalid blob",

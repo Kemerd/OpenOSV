@@ -2100,6 +2100,7 @@ TEST_CASE("parallax correction changes only the overlap band, and only when aske
     off.stabilization = static_cast<std::uint8_t>(PrefsStabilization::Off);
     off.parallax = static_cast<std::uint8_t>(PrefsParallax::Off);
     off.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Classical);
+    off.flareRemoval = 0;  // [WP-FLARE] on by default now; this test isolates the parallax
     PrefsBlob on = off;
     on.parallax = static_cast<std::uint8_t>(PrefsParallax::On);
 
@@ -2318,6 +2319,7 @@ struct BandDifference {
     p.stabilization = static_cast<std::uint8_t>(PrefsStabilization::Off);
     p.parallax = static_cast<std::uint8_t>(parallaxOn ? PrefsParallax::On : PrefsParallax::Off);
     p.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Classical);
+    p.flareRemoval = 0;  // [WP-FLARE] on by default now; these tests isolate the parallax
     return p;
 }
 

@@ -29,6 +29,8 @@ osv_add_premiere_plugin(OpenOSVImporter
     ProtectorGuard.h
     Engine.cpp
     Engine.h
+    FlareStage.cpp
+    FlareStage.h
     ImporterGpuFrame.cpp
     ImporterGpuFrame.h
     SourceSettingsDialog.cpp

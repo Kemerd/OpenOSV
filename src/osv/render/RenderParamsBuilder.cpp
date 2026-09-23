@@ -3,6 +3,7 @@
 
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/core/Log.h"
+#include "osv/render/Flare.h"
 
 #include <algorithm>
 #include <cmath>
@@ -122,6 +123,28 @@ RenderParamsBuilder& RenderParamsBuilder::clearBlendSeam() {
     m_blendSeam.clear();
     m_blendSeamColumns = 0;
     m_blendSeamEdgeRad = 0.0f;
+    return *this;
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-FLARE] sun ghost / veil removal
+// ---------------------------------------------------------------------------
+RenderParamsBuilder& RenderParamsBuilder::flare(const FlareModel& model) {
+    // applyFlare() is the one place a model becomes kernel fields (it
+    // validates, clamps and caps them); run it on a scratch block and keep
+    // only the flare part.
+    OsvRenderParams scratch;
+    std::memset(&scratch, 0, sizeof(scratch));
+    applyFlare(model, scratch);
+    m_flareEnabled = scratch.flareEnabled;
+    m_flareLens[0] = scratch.flare[0];
+    m_flareLens[1] = scratch.flare[1];
+    return *this;
+}
+
+RenderParamsBuilder& RenderParamsBuilder::clearFlare() {
+    m_flareEnabled = 0;
+    std::memset(m_flareLens.data(), 0, sizeof(OsvFlareLens) * m_flareLens.size());
     return *this;
 }
 
@@ -289,6 +312,10 @@ Result<OsvRenderParams> RenderParamsBuilder::buildParams() const {
     p.blendSeamEnabled = m_blendSeam.empty() ? 0 : 1;
     p.blendSeamColumns = m_blendSeam.empty() ? 0 : static_cast<int>(m_blendSeamColumns);
     p.blendSeamEdgeRad = m_blendSeam.empty() ? 0.0f : m_blendSeamEdgeRad;
+    // [WP-FLARE] zero (the memset above) unless a model was given.
+    p.flareEnabled = m_flareEnabled;
+    p.flare[0] = m_flareLens[0];
+    p.flare[1] = m_flareLens[1];
     return p;
 }
 

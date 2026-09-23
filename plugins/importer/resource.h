@@ -46,6 +46,7 @@
 #define IDC_DLOGM_FIT      1015
 #define IDC_EXPOSURE       1016
 #define IDC_RENDER_DEVICE  1017
+#define IDC_FLARE_REMOVAL  1018  // [WP-FLARE] sun ghost removal
 
 // Static labels (no code touches them; they exist so the .rc is readable).
 #define IDC_STATIC_COLOR   1100

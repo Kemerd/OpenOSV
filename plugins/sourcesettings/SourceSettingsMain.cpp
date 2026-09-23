@@ -127,8 +127,12 @@ using namespace osv::premiere::sourcesettings;
 }  // namespace
 static_assert(kIndexAdvancedTopicEnd == OSV_SOURCE_SETTINGS_PARAM_COUNT,
               "the Advanced group terminator must be the last parameter added");
-static_assert(kIndexStitchTopicEnd == kIndexCalibration + 1,
-              "the Stitching group must close immediately after Calibration");
+static_assert(kIndexFlareRemoval == kIndexCalibration + 1,
+              "Sun Ghost Removal follows Calibration inside the Stitching group");  // [WP-FLARE]
+static_assert(kIndexStitchTopicEnd == kIndexFlareRemoval + 1,
+              "the Stitching group must close immediately after Sun Ghost Removal");
+static_assert(kParamIdByIndex[kIndexFlareRemoval - 1] == OSV_SS_ID_FLARE_REMOVAL,
+              "kParamIdByIndex is not aligned with the ParamIndex enum");
 static_assert(kIndexDirectColour == kIndexRenderDevice + 1,
               "Program Monitor Colour follows Render Device inside the Advanced group");
 static_assert(kIndexAdvancedTopicEnd == kIndexDirectColour + 1,
@@ -260,6 +264,10 @@ private:
     if (const PF_ParamDef* p = def(kIndexCalibration)) {
         c.calibration = static_cast<int>(p->u.pd.value);
     }
+    // [WP-FLARE]
+    if (const PF_ParamDef* p = def(kIndexFlareRemoval)) {
+        c.flareRemoval = p->u.bd.value != 0;
+    }
     if (const PF_ParamDef* p = def(kIndexDlogmFit)) {
         c.dlogmFit = static_cast<int>(p->u.pd.value);
     }
@@ -328,6 +336,7 @@ void writeControls(PF_ParamDef* params[], const ControlValues& wanted) noexcept 
     setCheckbox(kIndexSeamSearch, wanted.seamSearch);
     setCheckbox(kIndexGainMatch, wanted.gainMatch);
     setPopup(kIndexCalibration, wanted.calibration);
+    setCheckbox(kIndexFlareRemoval, wanted.flareRemoval);  // [WP-FLARE]
     setPopup(kIndexDlogmFit, wanted.dlogmFit);
     setSlider(kIndexExposure, wanted.exposureStops);
     setPopup(kIndexRenderDevice, wanted.renderDevice);
@@ -488,7 +497,13 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Calibration", OSV_SS_CALIB_COUNT, OSV_SS_CALIB_DEFAULT, OSV_SS_CALIB_ITEMS, kStaticFlags,
                   OSV_SS_ID_CALIBRATION);
 
-    // ---- 9. Close the Stitching group --------------------------------------
+    // ---- 9. Sun Ghost Removal [WP-FLARE] -------------------------------------
+    // Subtracts the fitted reflections of a sun that is in frame
+    // (docs/research/FLARE.md).  On by default, as PrefsBlob::defaults().
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOXX("Sun Ghost Removal", OSV_SS_FLARE_REMOVAL_DEFAULT, kStaticFlags, OSV_SS_ID_FLARE_REMOVAL);
+
+    // ---- 10. Close the Stitching group -------------------------------------
     // PF_END_TOPIC issues its own PF_ADD_PARAM (Param_Utils.h:309-316), so the
     // terminator occupies a parameter slot of its own and everything after it
     // shifts up by one.  Leaving it out would not merely lose a divider: the
@@ -498,16 +513,16 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_STITCH_TOPIC_END);
 
-    // ---- 10. Advanced topic (collapsed: most users never touch it) ----------
+    // ---- 11. Advanced topic (collapsed: most users never touch it) ----------
     AEFX_CLR_STRUCT(def);
     PF_ADD_TOPICX("Advanced", PF_ParamFlag_START_COLLAPSED, OSV_SS_ID_ADVANCED_TOPIC);
 
-    // ---- 11. D-Log M Curve -------------------------------------------------
+    // ---- 12. D-Log M Curve -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("D-Log M Curve", OSV_SS_FIT_COUNT, OSV_SS_FIT_DEFAULT, OSV_SS_FIT_ITEMS, kStaticFlags,
                   OSV_SS_ID_DLOGM_FIT);
 
-    // ---- 12. Exposure ------------------------------------------------------
+    // ---- 13. Exposure ------------------------------------------------------
     // Valid range is the blob's own +/- 6 stops (static_asserted below the
     // handlers); the slider shows the useful +/- 3 so a drag has resolution.
     AEFX_CLR_STRUCT(def);
@@ -515,12 +530,12 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_EXPOSURE_SLIDER_MIN, OSV_SS_EXPOSURE_SLIDER_MAX, OSV_SS_EXPOSURE_DEFAULT,
                          PF_Precision_TENTHS, PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_EXPOSURE);
 
-    // ---- 13. Render Device -------------------------------------------------
+    // ---- 14. Render Device -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Render Device", OSV_SS_DEVICE_COUNT, OSV_SS_DEVICE_DEFAULT, OSV_SS_DEVICE_ITEMS, kStaticFlags,
                   OSV_SS_ID_RENDER_DEVICE);
 
-    // ---- 14. Program Monitor Colour [WP-SETTINGS] --------------------------
+    // ---- 15. Program Monitor Colour [WP-SETTINGS] --------------------------
     // What Open 360 Reframe shows when this clip's Colour Output is not the
     // sequence's working space: the scene rendered straight into it (fast,
     // the default) or Premiere's own conversion of the output (matches the
@@ -530,7 +545,7 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Program Monitor Colour", OSV_SS_DIRECT_COLOUR_COUNT, OSV_SS_DIRECT_COLOUR_DEFAULT,
                   OSV_SS_DIRECT_COLOUR_ITEMS, kStaticFlags, OSV_SS_ID_DIRECT_COLOUR);
 
-    // ---- 15. Close the Advanced group --------------------------------------
+    // ---- 16. Close the Advanced group --------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_ADVANCED_TOPIC_END);
 
@@ -656,10 +671,10 @@ PF_Err translateParamsToPrefs(PF_InData* in_data, PF_ParamDef* params[],
     std::memcpy(extra->prefsPC, &blob, PrefsBlob::kSize);
 
     PluginLog::debug("source settings: translated - colour {}, look {}, size {}, stab {}, seam {}, gain {}, "
-                     "calib {}, fit {}, exposure {:+.2f}, device {}",
+                     "calib {}, fit {}, exposure {:+.2f}, device {}, sun ghost removal {}",
                      blob.colorOutput, blob.look, blob.outputSize, blob.stabilization, blob.seamSearch,
                      blob.gainMatch, blob.calibration, blob.dlogmFit, static_cast<double>(blob.exposureStops),
-                     blob.renderDevice);
+                     blob.renderDevice, blob.flareRemoval);
     return PF_Err_NONE;
 }
 

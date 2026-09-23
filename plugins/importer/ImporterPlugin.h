@@ -244,6 +244,7 @@ struct DialogControls {
     double exposureStops = 0.0;
     int renderDevice = 0;   ///< Combo index: 0 Auto, 1 CPU, 2 CUDA, 3 OpenCL.
     int look = 0;           ///< [WP-LOOK] Combo index = PrefsLook: 0 DJI (default), 1 OpenOSV standard.
+    bool flareRemoval = true;  ///< [WP-FLARE] Sun ghost removal (PrefsBlob::flareRemoval).
 };
 
 /// PrefsBlob -> control state.  Every field is already in range because the

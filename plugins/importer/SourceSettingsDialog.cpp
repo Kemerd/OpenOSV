@@ -283,6 +283,7 @@ void controlsToWidgets(HWND dialog, const DialogControls& c, const CalibrationUi
 
     ::CheckDlgButton(dialog, IDC_SEAM_SEARCH, c.seamSearch ? BST_CHECKED : BST_UNCHECKED);
     ::CheckDlgButton(dialog, IDC_GAIN_MATCH, c.gainMatch ? BST_CHECKED : BST_UNCHECKED);
+    ::CheckDlgButton(dialog, IDC_FLARE_REMOVAL, c.flareRemoval ? BST_CHECKED : BST_UNCHECKED);  // [WP-FLARE]
     setEditDouble(dialog, IDC_EXPOSURE, c.exposureStops);
 
     // [WP-LOOK] The Rec.709 look, indexed by PrefsLook (DJI first: zero is the
@@ -305,6 +306,7 @@ void widgetsToControls(HWND dialog, DialogControls& c) noexcept {
     c.renderDevice = comboSelection(dialog, IDC_RENDER_DEVICE);
     c.seamSearch = ::IsDlgButtonChecked(dialog, IDC_SEAM_SEARCH) == BST_CHECKED;
     c.gainMatch = ::IsDlgButtonChecked(dialog, IDC_GAIN_MATCH) == BST_CHECKED;
+    c.flareRemoval = ::IsDlgButtonChecked(dialog, IDC_FLARE_REMOVAL) == BST_CHECKED;  // [WP-FLARE]
     c.exposureStops = getEditDouble(dialog, IDC_EXPOSURE, c.exposureStops);
     c.look = comboSelection(dialog, IDC_REC709_LOOK);  // [WP-LOOK]
 }
@@ -495,10 +497,10 @@ namespace {
     }
 
     PluginLog::info("source settings accepted: colour {}, look {}, size {}, stab {}, seam {}, gain {}, calib {} ({}), "
-                    "fit {}, exposure {:+.2f}, device {}",
+                    "fit {}, exposure {:+.2f}, device {}, sun ghost removal {}",
                     blob.colorOutput, blob.look, blob.outputSize, blob.stabilization, blob.seamSearch, blob.gainMatch,
                     blob.calibration, calibrationChoiceToken(blob.calibrationChoice()), blob.dlogmFit,
-                    static_cast<double>(blob.exposureStops), blob.renderDevice);
+                    static_cast<double>(blob.exposureStops), blob.renderDevice, blob.flareRemoval);
     return imNoErr;
 }
 

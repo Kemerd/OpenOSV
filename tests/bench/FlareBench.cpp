@@ -52,6 +52,7 @@
 #include "osv/render/CudaRenderer.h"
 #include "osv/render/Flare.h"
 #include "osv/render/FlareCuda.h"
+#include "osv/render/ParallaxWarp.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
 #include "osv/video/DualStreamReader.h"
@@ -494,6 +495,17 @@ int main(int argc, char** argv) {
             OSV_TRY_ASSIGN(render::FlareImage im, render::flareDownsample(hostPair.value().lens[1], linear, 4, pool));
             return okStatus();
         });
+        // The same on a two-thread pool: what a background worker with no
+        // share of the render pool pays.
+        {
+            ThreadPool small(1);
+            const double smallMs = medianMs(std::max(1, reps / 3), [&]() -> Status {
+                OSV_TRY_ASSIGN(render::FlareImage im,
+                               render::flareDownsample(hostPair.value().lens[1], linear, 4, small));
+                return okStatus();
+            });
+            std::printf("  frame %u: downsample one lens on a 2-thread pool %.1f ms\n", frame, smallMs);
+        }
         // The detection + fit alone on a ready working image, with and without
         // the pool spreading the fits.
         double fitPoolMs = -1.0, fitSerialMs = -1.0;
@@ -507,6 +519,25 @@ int main(int argc, char** argv) {
                 return okStatus();
             });
         }
+        // The per-frame sun check the importer pays on every wanted frame
+        // (both lenses at ~375 px), from host frames and from device frames.
+        const double sunCpuMs = medianMs(reps, [&]() -> Status {
+            OSV_TRY_ASSIGN(render::FlareSunFixes fx, render::locateSuns(rig, hostPair.value(), linear, fp, pool));
+            return okStatus();
+        });
+        double sunGpuMs = -1.0;
+        if (gpuPath) {
+            if (auto devPair = devReader.value().read(frame); devPair.ok() && devPair.value().onDevice()) {
+                video::FramePair onlyDevice = devPair.value();
+                onlyDevice.lens[0] = video::PlanarFrame16{};
+                onlyDevice.lens[1] = video::PlanarFrame16{};
+                sunGpuMs = medianMs(reps, [&]() -> Status {
+                    OSV_TRY_ASSIGN(render::FlareSunFixes fx, render::locateSuns(rig, onlyDevice, linear, fp, pool));
+                    return okStatus();
+                });
+            }
+        }
+        std::printf("  frame %u: sun check (both lenses) CPU %.2f ms, GPU %.2f ms\n", frame, sunCpuMs, sunGpuMs);
         std::printf("frame %u: analyseFlare CPU %.1f ms (downsample one lens %.1f), GPU %.1f ms (downsample one lens "
                     "%.1f); master detection + fits %.1f ms pooled, %.1f ms serial\n",
                     frame, cpuMs, cpuSampleMs, gpuMs, gpuSampleMs, fitPoolMs, fitSerialMs);
@@ -577,10 +608,46 @@ int main(int argc, char** argv) {
         std::uint32_t pairs = 0;
         render::FlareGhost lastRaw, lastSm;
         bool haveLast = false;
+        // The importer's schedule (plugins/importer/FlareStage), replayed in
+        // frame order: a frame reuses a model measured within 4 buckets whose
+        // sun check matches its own; otherwise it pays a measurement.
+        struct Measured {
+            std::uint32_t bucket;
+            render::FlareSunFixes suns;
+        };
+        std::vector<Measured> measured;
+        std::vector<std::uint32_t> measuredFrames;
+        const double tolerance = render::flareSunTolerancePx(static_cast<std::uint32_t>(std::max(rig.streamW, 0)));
+        double sunFirstX = 0.0, sunFirstY = 0.0, sunLastX = 0.0, sunLastY = 0.0;
+        bool haveSun = false;
         for (std::uint32_t f = 0; f < frames; ++f) {
             auto pr = hostReader.value().read(f);
             if (!pr.ok()) {
                 break;
+            }
+            if (auto fx = render::locateSuns(rig, pr.value(), linear, fp, pool); fx.ok()) {
+                const std::uint32_t bucket = render::parallaxBucket(f);
+                bool reused = false;
+                for (const Measured& m : measured) {
+                    const std::uint32_t gap = m.bucket > bucket ? m.bucket - bucket : bucket - m.bucket;
+                    if (gap <= 4 && render::flareSunsMatch(m.suns, fx.value(), tolerance)) {
+                        reused = true;
+                        break;
+                    }
+                }
+                if (!reused && (fx.value()[0].found || fx.value()[1].found)) {
+                    measured.push_back({bucket, fx.value()});
+                    measuredFrames.push_back(f);
+                }
+                if (fx.value()[1].found) {
+                    if (!haveSun) {
+                        sunFirstX = fx.value()[1].x;
+                        sunFirstY = fx.value()[1].y;
+                        haveSun = true;
+                    }
+                    sunLastX = fx.value()[1].x;
+                    sunLastY = fx.value()[1].y;
+                }
             }
             auto m = render::analyseFlare(rig, pr.value(), linear, fp, pool);
             if (!m.ok()) {
@@ -626,6 +693,13 @@ int main(int argc, char** argv) {
                 haveLast = true;
             }
         }
+        std::printf("\nschedule: an in-order pass over %u frames measures %zu times (tolerance %.1f px; sun moved "
+                    "%.1f px):", frames, measuredFrames.size(), tolerance,
+                    std::hypot(sunLastX - sunFirstX, sunLastY - sunFirstY));
+        for (const std::uint32_t f : measuredFrames) {
+            std::printf(" %u", f);
+        }
+        std::printf("\n");
         if (pairs > 0) {
             std::printf("\nsweep over %u frames: the pill ghost found in %u; frame-to-frame RMS change raw / smoothed: "
                         "centre %.2f / %.2f px, size %.2f / %.2f px, plateau luma %.4f / %.4f\n",

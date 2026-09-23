@@ -41,6 +41,7 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.exposureStops = static_cast<double>(prefs.exposureStops);
     c.renderDevice = static_cast<int>(prefs.renderDevice);
     c.look = static_cast<int>(prefs.look);  // [WP-LOOK]
+    c.flareRemoval = prefs.flareRemoval != 0;  // [WP-FLARE]
     return c;
 }
 
@@ -90,6 +91,7 @@ PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& bas
     // [WP-LOOK] An out-of-range index lands on the DJI look, the default.
     blob.look = pick(controls.look, static_cast<int>(PrefsLook::Count),
                      static_cast<std::uint8_t>(PrefsLook::DjiStudio));
+    blob.flareRemoval = controls.flareRemoval ? 1u : 0u;  // [WP-FLARE]
 
     // The exposure edit box is free text: "1e999" parses to infinity and a
     // cleared field can yield NaN.  Non-finite values become 0 here (NaN

@@ -248,8 +248,9 @@ struct PrefsBlob {
     /// sanitise().
     std::uint8_t padAfterLook = 0;
     /// [WP-FLARE] 1 = remove the sun's internal-reflection ghosts from the
-    /// lens that sees the sun (osv/render/Flare.h); 0 = off, the default, so
-    /// every blob written before this byte existed renders exactly as before.
+    /// lens that sees the sun (osv/render/Flare.h).  defaults() sets 1; every
+    /// blob written before this byte existed holds 0 = off, so a saved
+    /// project renders exactly as before (the parallax rule).
     std::uint8_t flareRemoval = 0;
     /// Offset 31: the rest of WP-FLARE's range, kept for the overlap veil
     /// estimate, which must stay off until it is cleared legally
@@ -295,6 +296,11 @@ struct PrefsBlob {
         // know the option exists should still get the better picture.
         p.parallax = static_cast<std::uint8_t>(PrefsParallax::On);
         p.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Auto);
+        // [WP-FLARE] Sun ghost removal ON for new clips, like parallax: it
+        // only ever subtracts fitted reflections of a sun that is in frame
+        // (docs/research/FLARE.md).  A blob saved before the byte existed
+        // holds 0 there and keeps rendering exactly as it did.
+        p.flareRemoval = 1;
         return p;
     }
 
@@ -523,7 +529,7 @@ static_assert(offsetof(PrefsBlob, directColour) == 24, "PrefsBlob layout drifted
 // [WP-FLARE] flareRemoval takes offset 30 of the range the harness assigned
 // (30-31); 25-29 are padded for the packages whose ranges they are.  An older
 // blob's zero byte reads as "off", which is how every project rendered
-// before the removal existed.
+// before the removal existed; new blobs get "on" from defaults().
 static_assert(offsetof(PrefsBlob, padBeforeFlare) == 25, "PrefsBlob layout drifted");
 // [WP-LOOK] look takes offset 28 of its assigned range (28-29).  An older
 // blob's zero byte reads as PrefsLook::DjiStudio, the default.
