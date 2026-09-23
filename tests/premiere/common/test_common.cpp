@@ -183,7 +183,10 @@ TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     static_assert(offsetof(PrefsBlob, calibrationForceNative) == 22, "calibrationForceNative follows flowBackend");
     static_assert(offsetof(PrefsBlob, padAfterCalibration) == 23, "offset 23 is unused padding");
     static_assert(offsetof(PrefsBlob, directColour) == 24, "directColour sits at 24");
-    static_assert(offsetof(PrefsBlob, reserved) == 25, "reserved fills the rest");
+    // [WP-FLARE] flareRemoval at 30 (its range is 30-31), 25-29 padded for
+    // the packages that own them; reserved now starts at 32.
+    static_assert(offsetof(PrefsBlob, flareRemoval) == 30, "flareRemoval sits at 30");
+    static_assert(offsetof(PrefsBlob, reserved) == 32, "reserved fills the rest");
     static_assert(std::is_trivially_copyable_v<PrefsBlob>, "the blob is memcpy'd to and from the host");
 
     REQUIRE(sizeof(PrefsBlob) == PrefsBlob::kSize);
@@ -448,10 +451,16 @@ TEST_CASE("PrefsBlob sanitise clamps every out-of-range field", "[common][prefs]
         PrefsBlob p = PrefsBlob::defaults();
         p.directColour = 0x7F;
         p.padAfterCalibration = 0xFF;
+        p.flareRemoval = 0x42;
+        p.padBeforeFlare[2] = 0x11;
+        p.padAfterFlare = 0x99;
         REQUIRE_FALSE(p.sanitise());
         // A corrupt byte lands on the default, as a fresh blob would.
         CHECK(p.directColourMode() == PrefsDirectColour::SequenceSpace);
         CHECK(p.padAfterCalibration == 0);
+        CHECK(p.flareRemoval == 0);
+        CHECK(p.padBeforeFlare[2] == 0);
+        CHECK(p.padAfterFlare == 0);
         // Both valid values survive.
         p.directColour = static_cast<std::uint8_t>(PrefsDirectColour::MatchSource);
         REQUIRE(p.sanitise());
@@ -459,6 +468,10 @@ TEST_CASE("PrefsBlob sanitise clamps every out-of-range field", "[common][prefs]
         p.directColour = static_cast<std::uint8_t>(PrefsDirectColour::SequenceSpace);
         REQUIRE(p.sanitise());
         CHECK(p.directColourMode() == PrefsDirectColour::SequenceSpace);
+        // [WP-FLARE] the ghost removal switch keeps its "on".
+        p.flareRemoval = 1;
+        REQUIRE(p.sanitise());
+        CHECK(p.flareRemoval == 1);
     }
 }
 
