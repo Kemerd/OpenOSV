@@ -1343,6 +1343,8 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     // [WP-SEAMTOOLS] The parallax grid this frame renders with (glided or
     // borrowed), for the Near / Far Offset to add to after the carve.
     std::shared_ptr<const render::ParallaxWarpGrid> appliedGrid;
+    // [WP-VIGNETTE] lens shading first: the photometric field and the exposure match are measured on corrected lenses
+    prepareLensShading(index, pair, draft, pool);
     // [WP-PHOTO] photometric seam field: measured first, so its usable rim is the carved seam's Rim cost below
     const render::PhotoRimPenaltyScope photoRimScope = preparePhotoSeam(index, pair, draft, pool);
 
@@ -1517,7 +1519,7 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
         auto cached = m_gains.find(bucket);
         if (cached == m_gains.end()) {
             render::BandParams band;
-            auto g = render::estimateGain(m_rig, pair, m_blend, band, pool);
+            auto g = render::estimateGain(m_rig, pair, m_blend, band, pool, m_shadingFrame.get());  // [WP-VIGNETTE]
             if (g.ok()) {
                 std::array<Vec3d, 2> gains{g.value().gain[0], g.value().gain[1]};
                 cached = m_gains.emplace(bucket, gains).first;
@@ -1534,6 +1536,7 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     }
 
     frameExact = applyPhotoSeam(builder) && frameExact;  // [WP-PHOTO] rim + gain field (after the global gain)
+    frameExact = applyLensShading(builder) && frameExact;  // [WP-VIGNETTE] the lens shading correction
     return AnalysisOutcome{parallaxApplied, frameExact};
 }
 
@@ -1600,7 +1603,8 @@ render::PhotoRimPenaltyScope ImporterInstance::preparePhotoSeam(std::uint32_t in
         // statistics per bucket of eight frames.
         const std::uint32_t bucket = render::parallaxBucket(index);
         if (!draft && !m_photo.measured(bucket)) {
-            auto field = render::measurePhotoSeam(m_rig, pair, m_blend, params, pool);
+            // [WP-VIGNETTE] on the lenses as the kernel will blend them
+            auto field = render::measurePhotoSeam(m_rig, pair, m_blend, params, pool, m_shadingFrame.get());
             if (field.ok()) {
                 const render::PhotoSeamField& f = field.value();
                 PluginLog::debug("frame {} (bucket {}): photometric seam field in {:.1f} ms (bands {:.1f}, stats "
@@ -1665,6 +1669,109 @@ bool ImporterInstance::applyPhotoSeam(render::RenderParamsBuilder& builder) {
         builder.gain(Vec3d{1.0, 1.0, 1.0}, Vec3d{1.0, 1.0, 1.0});
     }
     return m_photoFrameExact;
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-VIGNETTE] lens shading correction
+// ---------------------------------------------------------------------------
+render::LensShadingParams ImporterInstance::shadingParamsLocked() const noexcept {
+    render::LensShadingParams params;
+    // The prefs enum and the library enum share their values (PrefsBlob.h).
+    params.mode = m_prefs.lensShadingMode() == PrefsLensShading::Auto ? render::LensShadingMode::Auto
+                                                                       : render::LensShadingMode::Off;
+    params.strength = m_prefs.shadingStrengthPercent() / 100.0;
+    return params;
+}
+
+void ImporterInstance::prepareLensShading(std::uint32_t index, const video::FramePair& pair, bool draft,
+                                          ThreadPool& pool) {
+    // The caller (applyAnalyses) holds m_mutex, which guards all of this.
+    m_shadingFrame.reset();
+    m_shadingFrameExact = true;
+    const render::LensShadingParams params = shadingParamsLocked();
+    try {
+        // The photometric fields in m_photo were measured on lenses corrected
+        // by THIS mode and strength; any change makes them stale.
+        std::vector<double> photoKey{static_cast<double>(params.mode), params.strength};
+        if (photoKey != m_shadingPhotoKey) {
+            if (!m_shadingPhotoKey.empty()) {
+                m_photo.clear();
+                m_photoLast.reset();
+            }
+            m_shadingPhotoKey = std::move(photoKey);
+        }
+        if (params.mode == render::LensShadingMode::Off) {
+            return;
+        }
+        // A different rig (calibration slot, lens-protector correction) moves
+        // every lens angle the models are tabulated in.
+        std::vector<double> rigKey = photoRigKey(m_rig);
+        if (rigKey != m_shadingRigKey) {
+            m_shading.clear();
+            m_shadingLast.reset();
+            m_shadingRigKey = std::move(rigKey);
+        }
+
+        // ---- measure this bucket (never for a draft) ------------------------
+        const std::uint32_t bucket = render::parallaxBucket(index);
+        if (!draft && !m_shading.measured(bucket)) {
+            auto model = render::measureLensShading(m_rig, pair, m_blend, params, pool);
+            if (model.ok()) {
+                const render::LensShadingModel& m = model.value();
+                PluginLog::debug("frame {} (bucket {}): lens shading in {:.1f} ms (bands {:.1f}); slave {} sectors, "
+                                 "peak {:+.4f} ({:+.3f} stop at {:.1f} deg); master {} sectors, peak {:+.4f} "
+                                 "({:+.3f} stop at {:.1f} deg)",
+                                 index, bucket, m.bandMs + m.statsMs, m.bandMs, m.lens[0].measuredSectors,
+                                 m.lens[0].peakAmount, m.lens[0].peakStops, m.lens[0].peakThetaDeg,
+                                 m.lens[1].measuredSectors, m.lens[1].peakAmount, m.lens[1].peakStops,
+                                 m.lens[1].peakThetaDeg);
+                m_shading.store(bucket, std::make_shared<const render::LensShadingModel>(std::move(model).value()),
+                                params);
+            } else {
+                PluginLog::debug("frame {} (bucket {}): lens shading refused ({}); rendering without it", index,
+                                 bucket, model.error().message);
+                m_shading.store(bucket, nullptr, params);  // not measured again
+            }
+            m_shading.trim(kMaxAnalysisCache, bucket);
+        }
+
+        // ---- the model this frame renders with ------------------------------
+        std::shared_ptr<const render::LensShadingModel> model = m_shading.modelFor(index, params);
+        if (model) {
+            if (!draft) {
+                m_shadingLast = model;
+            }
+        } else if (draft && m_shadingLast) {
+            // A draft never measures; the last accepted model stands in, and
+            // the frame is not final.
+            model = m_shadingLast;
+            m_shadingFrameExact = false;
+        }
+        if (model && model->active()) {
+            // The strength is applied once, here, so the analyses and the
+            // kernel see exactly the same correction.
+            m_shadingFrame = params.strength >= 1.0
+                                 ? model
+                                 : std::make_shared<const render::LensShadingModel>(
+                                       render::scaledLensShadingModel(*model, params.strength));
+        }
+    } catch (const std::exception& e) {
+        // Allocation failure is the realistic case: render without it.
+        PluginLog::warn("lens shading: {}; rendering without it", e.what());
+        m_shadingFrame.reset();
+    }
+}
+
+bool ImporterInstance::applyLensShading(render::RenderParamsBuilder& builder) {
+    std::shared_ptr<const render::LensShadingModel> model = std::move(m_shadingFrame);
+    m_shadingFrame.reset();
+    if (!model) {
+        builder.clearShading();
+        return true;
+    }
+    // Already scaled by the strength (prepareLensShading).
+    builder.shading(*model, 1.0);
+    return m_shadingFrameExact;
 }
 
 // ---------------------------------------------------------------------------

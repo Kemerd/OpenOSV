@@ -617,3 +617,49 @@ TEST_CASE("the seam tool controls round trip and refuse garbage", "[importer][pr
     bad.seamSmoothingDeg = 1e9;
     REQUIRE(prefsFromControls(bad).seamSmoothingDeg() == 0.0);
 }
+
+// ---------------------------------------------------------------------------
+//  [WP-VIGNETTE] the lens shading rows
+// ---------------------------------------------------------------------------
+
+TEST_CASE("the lens shading controls round trip and refuse garbage", "[importer][prefs][mapping][lensshading]") {
+    // Defaults: Auto at 100 %.
+    const DialogControls shown = controlsFromPrefs(PrefsBlob::defaults());
+    REQUIRE(shown.lensShading == static_cast<int>(PrefsLensShading::Auto));
+    REQUIRE(shown.shadingStrengthPercent == 100.0);
+
+    // Both modes x a spread of strengths survive the round trip.
+    for (int mode = 0; mode < static_cast<int>(PrefsLensShading::Count); ++mode) {
+        for (const double strength : {0.0, 1.0, 35.0, 99.0, 100.0}) {
+            PrefsBlob original = PrefsBlob::defaults();
+            original.lensShading = static_cast<std::uint8_t>(mode);
+            original.setShadingStrengthPercent(strength);
+            const DialogControls controls = controlsFromPrefs(original);
+            INFO("mode " << mode << " strength " << strength);
+            REQUIRE(controls.lensShading == mode);
+            REQUIRE(controls.shadingStrengthPercent == strength);
+            REQUIRE(prefsFromControls(controls) == original);
+        }
+    }
+
+    // An old project (the byte is zero): Off, and OK keeps it Off.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.lensShading = 0;
+    REQUIRE(controlsFromPrefs(old).lensShading == static_cast<int>(PrefsLensShading::Off));
+    REQUIRE(prefsFromControls(controlsFromPrefs(old), old) == old);
+
+    // Garbage from a broken dialog lands on the defaults, never on a bad blob.
+    DialogControls bad = controlsFromPrefs(PrefsBlob::defaults());
+    bad.lensShading = -1;
+    bad.shadingStrengthPercent = std::numeric_limits<double>::quiet_NaN();
+    PrefsBlob blob = prefsFromControls(bad);
+    REQUIRE(blob.lensShadingMode() == PrefsLensShading::Auto);
+    REQUIRE(blob.shadingStrength == 0);
+    REQUIRE(blob.sanitise());
+    bad.lensShading = 5;
+    bad.shadingStrengthPercent = -20.0;
+    blob = prefsFromControls(bad);
+    REQUIRE(blob.lensShadingMode() == PrefsLensShading::Auto);
+    REQUIRE(blob.shadingStrengthPercent() == 100.0);
+    REQUIRE(blob.sanitise());
+}

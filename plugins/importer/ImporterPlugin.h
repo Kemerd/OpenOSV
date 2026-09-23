@@ -264,6 +264,10 @@ struct DialogControls {
     double nearOffsetDeg = 0.0;      ///< Near Offset along the seam, -3..3 deg.
     double farOffsetDeg = 0.0;       ///< Far Offset along the seam, -3..3 deg.
     // ---- [/WP-SEAMTOOLS] -----------------------------------------------------
+    // ---- [WP-VIGNETTE] the lens shading correction -----------------------------
+    int lensShading = 1;                  ///< Combo index = PrefsLensShading: 0 Off, 1 Auto.
+    double shadingStrengthPercent = 100;  ///< Correction strength, 0..100 %.
+    // ---- [/WP-VIGNETTE] ------------------------------------------------------
 };
 
 /// PrefsBlob -> control state.  Every field is already in range because the
