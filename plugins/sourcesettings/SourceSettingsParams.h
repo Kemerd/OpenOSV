@@ -149,10 +149,16 @@
  * after Calibration (index 9); everything after it moved up by one - indices
  * are not persisted, ids are. */
 #define OSV_SS_ID_FLARE_REMOVAL 16
+/* [WP-PHOTO] The sky seam fix: three NEW ids placed inside the Stitching group
+ * right after Sun Ghost Removal (indices 10-12); everything after them moved
+ * up by three - indices are not persisted, ids are. */
+#define OSV_SS_ID_PHOTO_SEAM 17
+#define OSV_SS_ID_PHOTO_STRENGTH 18
+#define OSV_SS_ID_SEAM_INSET 19
 
-/* Total parameters excluding the input layer: 12 controls + 4 group markers.
+/* Total parameters excluding the input layer: 15 controls + 4 group markers.
  * out_data->num_params is this + 1. */
-#define OSV_SOURCE_SETTINGS_PARAM_COUNT 16
+#define OSV_SOURCE_SETTINGS_PARAM_COUNT 19
 
 /* ==========================================================================
  *  Popup item strings
@@ -244,6 +250,19 @@
 #define OSV_SS_LOOK_COUNT 2
 #define OSV_SS_LOOK_DEFAULT 1
 
+/* [WP-PHOTO] "Sky Seam Fix" - PrefsPhotoSeam: Off, RimOnly, RimAndGain.
+ *
+ * The photometric seam field (docs/research/NEURAL_STITCHING.md, section 8):
+ * "Rim only" ends each lens's blend weight at its measured usable rim per
+ * longitude; "Rim and colour" also evens the two lenses' brightness and
+ * colour across the overlap with a 2-D gain field (replacing Exposure Match's
+ * one global gain).  "Off" leaves the seam edge inset and the global gain.
+ * Default 3 = Rim and colour (PrefsPhotoSeam::RimAndGain is 2), as
+ * PrefsBlob::defaults(); an older project's zero byte reads as Off. */
+#define OSV_SS_PHOTO_SEAM_ITEMS "Off|Rim only|Rim and colour"
+#define OSV_SS_PHOTO_SEAM_COUNT 3
+#define OSV_SS_PHOTO_SEAM_DEFAULT 3
+
 /* ==========================================================================
  *  Checkbox and slider ranges / defaults
  * ========================================================================== */
@@ -260,6 +279,21 @@
 #define OSV_SS_EXPOSURE_SLIDER_MIN -3.0
 #define OSV_SS_EXPOSURE_SLIDER_MAX 3.0
 #define OSV_SS_EXPOSURE_DEFAULT 0.0
+
+/* [WP-PHOTO] "Sky Seam Strength", in percent: how much of the colour field
+ * is applied (Rim and colour only).  The blob stores whole percent 0..100
+ * (PrefsBlob::photoStrengthPercent); static_asserts tie the limits to it. */
+#define OSV_SS_PHOTO_STRENGTH_MIN 0.0
+#define OSV_SS_PHOTO_STRENGTH_MAX 100.0
+#define OSV_SS_PHOTO_STRENGTH_DEFAULT 100.0
+
+/* [WP-PHOTO] "Seam Edge Inset", in degrees: how far inside the calibrated
+ * field of view the render blend ends when the sky seam fix is off or
+ * refused (the fix's own per-longitude rim replaces it otherwise).  The blob
+ * stores tenths 0.0..6.0 (PrefsBlob::seamInsetDeg); default 2.6. */
+#define OSV_SS_SEAM_INSET_MIN 0.0
+#define OSV_SS_SEAM_INSET_MAX 6.0
+#define OSV_SS_SEAM_INSET_DEFAULT 2.6
 
 /* ==========================================================================
  *  Everything below is C++ only.
@@ -288,13 +322,16 @@ namespace osv::premiere::sourcesettings {
 ///   7    Exposure Match
 ///   8    Calibration
 ///   9    Sun Ghost Removal        [WP-FLARE]
-///  10  (GROUP_END, Stitching)
-///  11  Advanced           (GROUP_START, starts collapsed)
-///  12    D-Log M Curve
-///  13    Exposure
-///  14    Render Device
-///  15    Program Monitor Colour   [WP-SETTINGS]
-///  16  (GROUP_END, Advanced)
+///  10    Sky Seam Fix             [WP-PHOTO]
+///  11    Sky Seam Strength        [WP-PHOTO]
+///  12    Seam Edge Inset          [WP-PHOTO]
+///  13  (GROUP_END, Stitching)
+///  14  Advanced           (GROUP_START, starts collapsed)
+///  15    D-Log M Curve
+///  16    Exposure
+///  17    Render Device
+///  18    Program Monitor Colour   [WP-SETTINGS]
+///  19  (GROUP_END, Advanced)
 enum ParamIndex : int {
     kIndexColorOutput = 1,
     kIndexRec709Look = 2,
@@ -304,14 +341,17 @@ enum ParamIndex : int {
     kIndexSeamSearch = 6,
     kIndexGainMatch = 7,
     kIndexCalibration = 8,
-    kIndexFlareRemoval = 9,  // [WP-FLARE]
-    kIndexStitchTopicEnd = 10,
-    kIndexAdvancedTopic = 11,
-    kIndexDlogmFit = 12,
-    kIndexExposure = 13,
-    kIndexRenderDevice = 14,
-    kIndexDirectColour = 15,
-    kIndexAdvancedTopicEnd = 16,
+    kIndexFlareRemoval = 9,     // [WP-FLARE]
+    kIndexPhotoSeam = 10,       // [WP-PHOTO]
+    kIndexPhotoStrength = 11,   // [WP-PHOTO]
+    kIndexSeamInset = 12,       // [WP-PHOTO]
+    kIndexStitchTopicEnd = 13,
+    kIndexAdvancedTopic = 14,
+    kIndexDlogmFit = 15,
+    kIndexExposure = 16,
+    kIndexRenderDevice = 17,
+    kIndexDirectColour = 18,
+    kIndexAdvancedTopicEnd = 19,
 };
 
 /// The permanent id stored at each index, in index order (index 1 first).
@@ -320,7 +360,8 @@ enum ParamIndex : int {
 inline constexpr int kParamIdByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
     OSV_SS_ID_COLOR_OUTPUT,     OSV_SS_ID_REC709_LOOK,   OSV_SS_ID_OUTPUT_SIZE,   OSV_SS_ID_STABILIZATION,
     OSV_SS_ID_STITCH_TOPIC,     OSV_SS_ID_SEAM_SEARCH,   OSV_SS_ID_GAIN_MATCH,
-    OSV_SS_ID_CALIBRATION,      OSV_SS_ID_FLARE_REMOVAL, OSV_SS_ID_STITCH_TOPIC_END, OSV_SS_ID_ADVANCED_TOPIC,
+    OSV_SS_ID_CALIBRATION,      OSV_SS_ID_FLARE_REMOVAL, OSV_SS_ID_PHOTO_SEAM, OSV_SS_ID_PHOTO_STRENGTH,
+    OSV_SS_ID_SEAM_INSET,       OSV_SS_ID_STITCH_TOPIC_END, OSV_SS_ID_ADVANCED_TOPIC,
     OSV_SS_ID_DLOGM_FIT,        OSV_SS_ID_EXPOSURE,      OSV_SS_ID_RENDER_DEVICE,
     OSV_SS_ID_DIRECT_COLOUR,    OSV_SS_ID_ADVANCED_TOPIC_END,
 };
@@ -331,7 +372,7 @@ inline constexpr int kParamCount = OSV_SOURCE_SETTINGS_PARAM_COUNT;
 /// Number of controls that actually carry a value, i.e. everything except the
 /// four GROUP_START / GROUP_END markers.  This is the count that has to round
 /// trip through a PrefsBlob.
-inline constexpr int kValueParamCount = 12;
+inline constexpr int kValueParamCount = 15;
 
 /// The parameter names, in index order, so a test can compare the built
 /// module's list without repeating the strings.
@@ -343,7 +384,8 @@ inline constexpr int kValueParamCount = 12;
 /// described a field the SDK never fills.
 inline constexpr const char* kParamNameByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
     "Colour Output", "Look (Rec. 709 only)", "Output Size", "Stabilisation", "Stitching", "Seam Search",
-    "Exposure Match", "Calibration",  "Sun Ghost Removal",  "",          "Advanced",  "D-Log M Curve",
+    "Exposure Match", "Calibration",  "Sun Ghost Removal",  "Sky Seam Fix", "Sky Seam Strength",
+    "Seam Edge Inset", "",            "Advanced",  "D-Log M Curve",
     "Exposure",       "Render Device", "Program Monitor Colour", "",
 };
 

@@ -10,8 +10,9 @@
 // to OpenOSVImporter.prm as a flat preferences blob.  It exists so the stitch
 // options (colour output, output size, stabilisation, seam search, exposure
 // match, calibration slot, D-Log M curve, exposure, render device, the
-// Rec.709 look and the reframe effect's Program Monitor Colour) are simply
-// VISIBLE, instead of hiding behind the modal dialog in imGetPrefs8.
+// Rec.709 look, sun ghost removal, the sky seam fix and the reframe effect's
+// Program Monitor Colour) are simply VISIBLE, instead of hiding behind the
+// modal dialog in imGetPrefs8.
 //
 // How the two halves find each other: the importer sets
 // imImportInfoRec::hasSourceSettingsEffect and puts this effect's match name
@@ -28,7 +29,7 @@
 //                                    SetIsSourceSettingsEffect(), which is
 //                                    what tells Premiere this is a master
 //                                    clip settings effect and not a filter.
-//   PF_Cmd_PARAMS_SETUP              the eleven controls, each flagged
+//   PF_Cmd_PARAMS_SETUP              the fifteen controls, each flagged
 //                                    PF_ParamFlag_CANNOT_TIME_VARY.
 //   PF_Cmd_SEQUENCE_SETUP            PerformSourceSettingsCommand(), which
 //                                    round-trips a blob through the importer
@@ -129,8 +130,16 @@ static_assert(kIndexAdvancedTopicEnd == OSV_SOURCE_SETTINGS_PARAM_COUNT,
               "the Advanced group terminator must be the last parameter added");
 static_assert(kIndexFlareRemoval == kIndexCalibration + 1,
               "Sun Ghost Removal follows Calibration inside the Stitching group");  // [WP-FLARE]
-static_assert(kIndexStitchTopicEnd == kIndexFlareRemoval + 1,
-              "the Stitching group must close immediately after Sun Ghost Removal");
+// [WP-PHOTO] the sky seam fix's three controls follow Sun Ghost Removal.
+static_assert(kIndexPhotoSeam == kIndexFlareRemoval + 1 && kIndexPhotoStrength == kIndexPhotoSeam + 1 &&
+                  kIndexSeamInset == kIndexPhotoStrength + 1,
+              "Sky Seam Fix, Sky Seam Strength and Seam Edge Inset follow Sun Ghost Removal in that order");
+static_assert(kIndexStitchTopicEnd == kIndexSeamInset + 1,
+              "the Stitching group must close immediately after Seam Edge Inset");
+static_assert(kParamIdByIndex[kIndexPhotoSeam - 1] == OSV_SS_ID_PHOTO_SEAM &&
+                  kParamIdByIndex[kIndexPhotoStrength - 1] == OSV_SS_ID_PHOTO_STRENGTH &&
+                  kParamIdByIndex[kIndexSeamInset - 1] == OSV_SS_ID_SEAM_INSET,
+              "kParamIdByIndex is not aligned with the ParamIndex enum");
 static_assert(kParamIdByIndex[kIndexFlareRemoval - 1] == OSV_SS_ID_FLARE_REMOVAL,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
 static_assert(kIndexDirectColour == kIndexRenderDevice + 1,
@@ -268,6 +277,16 @@ private:
     if (const PF_ParamDef* p = def(kIndexFlareRemoval)) {
         c.flareRemoval = p->u.bd.value != 0;
     }
+    // [WP-PHOTO]
+    if (const PF_ParamDef* p = def(kIndexPhotoSeam)) {
+        c.photoSeam = static_cast<int>(p->u.pd.value);
+    }
+    if (const PF_ParamDef* p = def(kIndexPhotoStrength)) {
+        c.photoStrengthPercent = static_cast<double>(p->u.fs_d.value);
+    }
+    if (const PF_ParamDef* p = def(kIndexSeamInset)) {
+        c.seamInsetDeg = static_cast<double>(p->u.fs_d.value);
+    }
     if (const PF_ParamDef* p = def(kIndexDlogmFit)) {
         c.dlogmFit = static_cast<int>(p->u.pd.value);
     }
@@ -337,6 +356,9 @@ void writeControls(PF_ParamDef* params[], const ControlValues& wanted) noexcept 
     setCheckbox(kIndexGainMatch, wanted.gainMatch);
     setPopup(kIndexCalibration, wanted.calibration);
     setCheckbox(kIndexFlareRemoval, wanted.flareRemoval);  // [WP-FLARE]
+    setPopup(kIndexPhotoSeam, wanted.photoSeam);              // [WP-PHOTO]
+    setSlider(kIndexPhotoStrength, wanted.photoStrengthPercent);
+    setSlider(kIndexSeamInset, wanted.seamInsetDeg);
     setPopup(kIndexDlogmFit, wanted.dlogmFit);
     setSlider(kIndexExposure, wanted.exposureStops);
     setPopup(kIndexRenderDevice, wanted.renderDevice);
@@ -435,7 +457,7 @@ PF_Err globalSetdown(PF_InData*, PF_OutData*) noexcept {
     return PF_Err_NONE;
 }
 
-/// PF_Cmd_PARAMS_SETUP: the eleven controls.
+/// PF_Cmd_PARAMS_SETUP: the fifteen controls.
 ///
 /// Every one of them carries PF_ParamFlag_CANNOT_TIME_VARY.  See the file
 /// header for why that is a correctness requirement rather than a style
@@ -503,7 +525,34 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Sun Ghost Removal", OSV_SS_FLARE_REMOVAL_DEFAULT, kStaticFlags, OSV_SS_ID_FLARE_REMOVAL);
 
-    // ---- 10. Close the Stitching group -------------------------------------
+    // ---- 10. Sky Seam Fix [WP-PHOTO] -----------------------------------------
+    // The photometric seam field (docs/research/NEURAL_STITCHING.md, section
+    // 8): each lens's blend weight ends at its measured usable rim, and in
+    // "Rim and colour" a 2-D gain field evens the two lenses' brightness and
+    // colour across the overlap.  Default Rim and colour, as
+    // PrefsBlob::defaults().
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUPX("Sky Seam Fix", OSV_SS_PHOTO_SEAM_COUNT, OSV_SS_PHOTO_SEAM_DEFAULT, OSV_SS_PHOTO_SEAM_ITEMS,
+                  kStaticFlags, OSV_SS_ID_PHOTO_SEAM);
+
+    // ---- 11. Sky Seam Strength [WP-PHOTO] ------------------------------------
+    // How much of the colour field applies, in whole percent (the blob's
+    // step), shown with the host's percent sign.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Sky Seam Strength", OSV_SS_PHOTO_STRENGTH_MIN, OSV_SS_PHOTO_STRENGTH_MAX,
+                         OSV_SS_PHOTO_STRENGTH_MIN, OSV_SS_PHOTO_STRENGTH_MAX, OSV_SS_PHOTO_STRENGTH_DEFAULT,
+                         PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT, kStaticFlags, OSV_SS_ID_PHOTO_STRENGTH);
+
+    // ---- 12. Seam Edge Inset [WP-PHOTO] --------------------------------------
+    // Degrees inside the calibrated field of view where the render blend
+    // ends when the sky seam fix is off or refused (the fix's per-longitude
+    // rim replaces it otherwise); tenths, the blob's step.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Seam Edge Inset", OSV_SS_SEAM_INSET_MIN, OSV_SS_SEAM_INSET_MAX, OSV_SS_SEAM_INSET_MIN,
+                         OSV_SS_SEAM_INSET_MAX, OSV_SS_SEAM_INSET_DEFAULT, PF_Precision_TENTHS,
+                         PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_SEAM_INSET);
+
+    // ---- 13. Close the Stitching group -------------------------------------
     // PF_END_TOPIC issues its own PF_ADD_PARAM (Param_Utils.h:309-316), so the
     // terminator occupies a parameter slot of its own and everything after it
     // shifts up by one.  Leaving it out would not merely lose a divider: the
@@ -513,16 +562,16 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_STITCH_TOPIC_END);
 
-    // ---- 11. Advanced topic (collapsed: most users never touch it) ----------
+    // ---- 14. Advanced topic (collapsed: most users never touch it) ----------
     AEFX_CLR_STRUCT(def);
     PF_ADD_TOPICX("Advanced", PF_ParamFlag_START_COLLAPSED, OSV_SS_ID_ADVANCED_TOPIC);
 
-    // ---- 12. D-Log M Curve -------------------------------------------------
+    // ---- 15. D-Log M Curve -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("D-Log M Curve", OSV_SS_FIT_COUNT, OSV_SS_FIT_DEFAULT, OSV_SS_FIT_ITEMS, kStaticFlags,
                   OSV_SS_ID_DLOGM_FIT);
 
-    // ---- 13. Exposure ------------------------------------------------------
+    // ---- 16. Exposure ------------------------------------------------------
     // Valid range is the blob's own +/- 6 stops (static_asserted below the
     // handlers); the slider shows the useful +/- 3 so a drag has resolution.
     AEFX_CLR_STRUCT(def);
@@ -530,12 +579,12 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_EXPOSURE_SLIDER_MIN, OSV_SS_EXPOSURE_SLIDER_MAX, OSV_SS_EXPOSURE_DEFAULT,
                          PF_Precision_TENTHS, PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_EXPOSURE);
 
-    // ---- 14. Render Device -------------------------------------------------
+    // ---- 17. Render Device -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Render Device", OSV_SS_DEVICE_COUNT, OSV_SS_DEVICE_DEFAULT, OSV_SS_DEVICE_ITEMS, kStaticFlags,
                   OSV_SS_ID_RENDER_DEVICE);
 
-    // ---- 15. Program Monitor Colour [WP-SETTINGS] --------------------------
+    // ---- 18. Program Monitor Colour [WP-SETTINGS] --------------------------
     // What Open 360 Reframe shows when this clip's Colour Output is not the
     // sequence's working space: the scene rendered straight into it (fast,
     // the default) or Premiere's own conversion of the output (matches the
@@ -545,7 +594,7 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Program Monitor Colour", OSV_SS_DIRECT_COLOUR_COUNT, OSV_SS_DIRECT_COLOUR_DEFAULT,
                   OSV_SS_DIRECT_COLOUR_ITEMS, kStaticFlags, OSV_SS_ID_DIRECT_COLOUR);
 
-    // ---- 16. Close the Advanced group --------------------------------------
+    // ---- 19. Close the Advanced group --------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_ADVANCED_TOPIC_END);
 
@@ -671,10 +720,12 @@ PF_Err translateParamsToPrefs(PF_InData* in_data, PF_ParamDef* params[],
     std::memcpy(extra->prefsPC, &blob, PrefsBlob::kSize);
 
     PluginLog::debug("source settings: translated - colour {}, look {}, size {}, stab {}, seam {}, gain {}, "
-                     "calib {}, fit {}, exposure {:+.2f}, device {}, sun ghost removal {}",
+                     "calib {}, fit {}, exposure {:+.2f}, device {}, sun ghost removal {}, sky seam fix {} at "
+                     "{:.0f} %, seam edge inset {:.1f} deg",
                      blob.colorOutput, blob.look, blob.outputSize, blob.stabilization, blob.seamSearch,
                      blob.gainMatch, blob.calibration, blob.dlogmFit, static_cast<double>(blob.exposureStops),
-                     blob.renderDevice, blob.flareRemoval);
+                     blob.renderDevice, blob.flareRemoval, blob.photoSeam, blob.photoStrengthPercent(),
+                     blob.seamInsetDeg());
     return PF_Err_NONE;
 }
 
@@ -720,6 +771,23 @@ static_assert(OSV_SS_DIRECT_COLOUR_COUNT == static_cast<int>(osv::premiere::Pref
               "the Program Monitor Colour popup does not list every PrefsDirectColour value");
 static_assert(OSV_SS_LOOK_COUNT == static_cast<int>(osv::premiere::PrefsLook::Count),
               "the Rec.709 look popup does not list every PrefsLook value");
+// [WP-PHOTO] The sky seam fix: the popup covers PrefsPhotoSeam and the two
+// sliders offer exactly the range the blob can store - whole percent
+// 0..100 (codes 1..101) and tenths 0.0..6.0 (codes 1..61) - with the blob's
+// own defaults.
+static_assert(OSV_SS_PHOTO_SEAM_COUNT == static_cast<int>(osv::premiere::PrefsPhotoSeam::Count),
+              "the Sky Seam Fix popup does not list every PrefsPhotoSeam value");
+static_assert(OSV_SS_PHOTO_SEAM_DEFAULT == static_cast<int>(osv::premiere::PrefsPhotoSeam::RimAndGain) + 1,
+              "the Sky Seam Fix popup's default is not PrefsBlob::defaults()' RimAndGain");
+static_assert(OSV_SS_PHOTO_STRENGTH_MIN == 0.0 &&
+                  OSV_SS_PHOTO_STRENGTH_MAX == static_cast<double>(osv::premiere::PrefsBlob::kMaxPhotoStrengthCode - 1),
+              "the Sky Seam Strength range does not match PrefsBlob::photoStrength");
+static_assert(OSV_SS_PHOTO_STRENGTH_DEFAULT == 100.0, "Sky Seam Strength defaults to 100 %, stored as code 0");
+static_assert(OSV_SS_SEAM_INSET_MIN == 0.0 &&
+                  OSV_SS_SEAM_INSET_MAX == static_cast<double>(osv::premiere::PrefsBlob::kMaxSeamInsetCode - 1) / 10.0,
+              "the Seam Edge Inset range does not match PrefsBlob::seamInset");
+static_assert(OSV_SS_SEAM_INSET_DEFAULT == static_cast<double>(osv::premiere::PrefsBlob::kDefaultSeamInsetTenths) / 10.0,
+              "the Seam Edge Inset default does not match PrefsBlob::kDefaultSeamInsetTenths");
 
 // ===========================================================================
 //  The exported entry point

@@ -77,6 +77,16 @@ PrefsBlob prefsFromControls(const ControlValues& controls) noexcept {
     blob.exposureStops =
         std::isfinite(controls.exposureStops) ? static_cast<float>(controls.exposureStops) : 0.0f;
 
+    // [WP-PHOTO] The sky seam fix.  The mode is a popup like any other; the
+    // two sliders go through the blob's own setters, which round to the
+    // stored step (whole percent, tenths of a degree), clamp to the range,
+    // turn NaN / infinities into the default and store the default value as
+    // code 0 - so an untouched slider keeps tracking the default and the
+    // blob stays byte-identical to PrefsBlob::defaults().
+    blob.photoSeam = fromPopup(controls.photoSeam, OSV_SS_PHOTO_SEAM_COUNT, blob.photoSeam);
+    blob.setPhotoStrengthPercent(controls.photoStrengthPercent);
+    blob.setSeamInsetDeg(controls.seamInsetDeg);
+
     // Clamp everything into range and zero the reserved bytes.  After this
     // the blob is byte-for-byte what the importer expects, which is the
     // property the round-trip test pins.
@@ -111,6 +121,10 @@ ControlValues controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.gainMatch = clean.gainMatch != 0;
     c.flareRemoval = clean.flareRemoval != 0;  // [WP-FLARE]
     c.exposureStops = static_cast<double>(clean.exposureStops);
+    // [WP-PHOTO] The blob's decoders turn code 0 into the default values.
+    c.photoSeam = toPopup(clean.photoSeam, OSV_SS_PHOTO_SEAM_COUNT);
+    c.photoStrengthPercent = clean.photoStrengthPercent();
+    c.seamInsetDeg = clean.seamInsetDeg();
     return c;
 }
 

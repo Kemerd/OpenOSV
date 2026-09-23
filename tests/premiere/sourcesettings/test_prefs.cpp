@@ -252,6 +252,38 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
             CHECK(translate(fixture, buffer).flareRemoval == (on ? 1u : 0u));
         }
     }
+    SECTION("Sky Seam Fix") {  // [WP-PHOTO]
+        // "Off" -> 0, "Rim only" -> 1, "Rim and colour" -> 2 (RimAndGain).
+        for (int item = 1; item <= OSV_SS_PHOTO_SEAM_COUNT; ++item) {
+            PrefsBuffer buffer;
+            fixture.setPopup(kIndexPhotoSeam, item);
+            INFO("popup value " << item);
+            CHECK(translate(fixture, buffer).photoSeam == static_cast<std::uint8_t>(item - 1));
+        }
+        PrefsBuffer off;
+        fixture.setPopup(kIndexPhotoSeam, 1);
+        CHECK(translate(fixture, off).photoSeamMode() == PrefsPhotoSeam::Off);
+        PrefsBuffer full;
+        fixture.setPopup(kIndexPhotoSeam, OSV_SS_PHOTO_SEAM_COUNT);
+        CHECK(translate(fixture, full).photoSeamMode() == PrefsPhotoSeam::RimAndGain);
+    }
+    SECTION("Sky Seam Strength") {  // [WP-PHOTO]
+        for (const double percent : {0.0, 1.0, 37.0, 99.0, 100.0}) {
+            PrefsBuffer buffer;
+            fixture.setSlider(kIndexPhotoStrength, percent);
+            INFO("percent " << percent);
+            CHECK(translate(fixture, buffer).photoStrengthPercent() == Catch::Approx(percent));
+        }
+    }
+    SECTION("Seam Edge Inset") {  // [WP-PHOTO]
+        for (const double deg : {0.0, 0.3, 1.5, 2.6, 4.4, 6.0}) {
+            PrefsBuffer buffer;
+            fixture.setSlider(kIndexSeamInset, deg);
+            INFO("degrees " << deg);
+            // PF_FpShort -> tenths: 0.3 arrives as 0.30000001 and rounds back.
+            CHECK(translate(fixture, buffer).seamInsetDeg() == Catch::Approx(deg));
+        }
+    }
     SECTION("Exposure") {
         for (const double stops : {-6.0, -3.0, -0.5, 0.0, 0.5, 2.25, 6.0}) {
             PrefsBuffer buffer;
@@ -283,6 +315,11 @@ TEST_CASE("all ten controls together round-trip as one blob", "[sourcesettings][
     fixture.setSlider(kIndexExposure, -2.5);
     fixture.setPopup(kIndexRenderDevice, OSV_SS_DEVICE_COUNT);
     fixture.setPopup(kIndexDirectColour, OSV_SS_DIRECT_COLOUR_COUNT);
+    // [WP-PHOTO] The sky seam fix's default IS its last item, so it moves to
+    // the first (Off), and both sliders away from their defaults.
+    fixture.setPopup(kIndexPhotoSeam, 1);
+    fixture.setSlider(kIndexPhotoStrength, 40.0);
+    fixture.setSlider(kIndexSeamInset, 1.2);
 
     // The LAST item of each list, so these track the enums rather than being
     // re-typed every time one grows - Colour Output has already gained
@@ -317,6 +354,9 @@ TEST_CASE("all ten controls together round-trip as one blob", "[sourcesettings][
     CHECK(blob.seamSearch == 0u);
     CHECK(blob.gainMatch == 0u);
     CHECK(static_cast<double>(blob.exposureStops) == Catch::Approx(-2.5));
+    CHECK(blob.photoSeamMode() == PrefsPhotoSeam::Off);          // [WP-PHOTO]
+    CHECK(blob.photoStrengthPercent() == Catch::Approx(40.0));
+    CHECK(blob.seamInsetDeg() == Catch::Approx(1.2));
 
     // And it is still a clean blob.
     CHECK(blob.isValid());
@@ -391,6 +431,49 @@ TEST_CASE("a hostile popup value still produces a valid blob", "[sourcesettings]
         PrefsBlob copy = blob;
         CHECK(copy.sanitise() == true);
     }
+    // [WP-PHOTO] The same for the Sky Seam Fix popup: the default mode.
+    for (const int hostile : {0, -1, 4, 99}) {
+        PrefsBuffer buffer;
+        fixture.setPopup(kIndexPhotoSeam, hostile);
+        INFO("hostile Sky Seam Fix value " << hostile);
+        const PrefsBlob blob = translate(fixture, buffer);
+        CHECK(blob.photoSeam == PrefsBlob::defaults().photoSeam);
+        PrefsBlob copy = blob;
+        CHECK(copy.sanitise() == true);
+    }
+}
+
+TEST_CASE("out-of-range or non-finite sky seam sliders land on a stored value", "[sourcesettings][prefs][photoseam]") {
+    // [WP-PHOTO] An expression or a corrupt project can put anything in a
+    // float slider.  Beyond the range clamps to it; NaN, the infinities and
+    // negatives fall back to the default (the blob setters' rule).
+    EffectFixture fixture;
+    REQUIRE(LoadedPlugin::instance().ok());
+    const PrefsBlob defaults = PrefsBlob::defaults();
+    const struct {
+        double strength;
+        double inset;
+        double wantStrength;
+        double wantInset;
+    } cases[] = {
+        {250.0, 40.0, 100.0, 6.0},
+        {-5.0, -1.0, defaults.photoStrengthPercent(), defaults.seamInsetDeg()},
+        {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN(),
+         defaults.photoStrengthPercent(), defaults.seamInsetDeg()},
+        {std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+         defaults.photoStrengthPercent(), defaults.seamInsetDeg()},
+    };
+    for (const auto& c : cases) {
+        PrefsBuffer buffer;
+        fixture.setSlider(kIndexPhotoStrength, c.strength);
+        fixture.setSlider(kIndexSeamInset, c.inset);
+        INFO("strength " << c.strength << ", inset " << c.inset);
+        PrefsBlob blob = translate(fixture, buffer);
+        CHECK(blob.isValid());
+        CHECK(blob.photoStrengthPercent() == Catch::Approx(c.wantStrength));
+        CHECK(blob.seamInsetDeg() == Catch::Approx(c.wantInset));
+        CHECK(blob.sanitise() == true);
+    }
 }
 
 TEST_CASE("an out-of-range or non-finite exposure is clamped or reset", "[sourcesettings][prefs]") {
@@ -448,6 +531,9 @@ TEST_CASE("SEQUENCE_SETUP asks the importer and seeds the controls from the answ
     fromImporter.renderDevice = static_cast<std::uint8_t>(PrefsRenderDevice::Cuda);
     fromImporter.directColour = static_cast<std::uint8_t>(PrefsDirectColour::MatchSource);  // not the default
     fromImporter.flareRemoval = 0;  // [WP-FLARE] not the default
+    fromImporter.photoSeam = static_cast<std::uint8_t>(PrefsPhotoSeam::RimOnly);  // [WP-PHOTO] none the default
+    fromImporter.setPhotoStrengthPercent(65.0);
+    fromImporter.setSeamInsetDeg(0.8);
     REQUIRE(fromImporter.sanitise());
 
     const char* raw = reinterpret_cast<const char*>(&fromImporter);
@@ -482,6 +568,9 @@ TEST_CASE("SEQUENCE_SETUP asks the importer and seeds the controls from the answ
     CHECK(fixture.popup(kIndexRenderDevice) == static_cast<int>(fromImporter.renderDevice) + 1);
     CHECK(fixture.popup(kIndexDirectColour) == static_cast<int>(fromImporter.directColour) + 1);
     CHECK(fixture.checkbox(kIndexFlareRemoval) == false);  // [WP-FLARE]
+    CHECK(fixture.popup(kIndexPhotoSeam) == static_cast<int>(PrefsPhotoSeam::RimOnly) + 1);  // [WP-PHOTO]
+    CHECK(fixture.slider(kIndexPhotoStrength) == Catch::Approx(65.0));
+    CHECK(fixture.slider(kIndexSeamInset) == Catch::Approx(0.8));
 
     // A round trip proves the seeding and the translation agree: translating
     // the seeded controls must reproduce the importer's blob exactly.
@@ -641,6 +730,46 @@ TEST_CASE("the pure mapping round-trips Sun Ghost Removal", "[sourcesettings][ma
     }
 }
 
+TEST_CASE("the pure mapping round-trips the sky seam fix", "[sourcesettings][mapping][photoseam]") {
+    // [WP-PHOTO] Every mode x a spread of strengths and insets, both ways.
+    for (int item = 1; item <= OSV_SS_PHOTO_SEAM_COUNT; ++item) {
+        for (const double percent : {0.0, 1.0, 50.0, 99.0, 100.0}) {
+            for (const double deg : {0.0, 0.1, 2.6, 3.7, 6.0}) {
+                ControlValues c;
+                c.photoSeam = item;
+                c.photoStrengthPercent = percent;
+                c.seamInsetDeg = deg;
+                const PrefsBlob blob = prefsFromControls(c);
+                INFO("mode " << item << ", strength " << percent << ", inset " << deg);
+                REQUIRE(blob.isValid());
+                CHECK(blob.photoSeam == static_cast<std::uint8_t>(item - 1));
+                const ControlValues back = controlsFromPrefs(blob);
+                CHECK(back.photoSeam == item);
+                CHECK(back.photoStrengthPercent == Catch::Approx(percent));
+                CHECK(back.seamInsetDeg == Catch::Approx(deg));
+            }
+        }
+    }
+    // Hostile popup values: the default mode, never a blob needing repair.
+    for (const int hostile : {std::numeric_limits<int>::min(), -1, 0, OSV_SS_PHOTO_SEAM_COUNT + 1, 99}) {
+        ControlValues c;
+        c.photoSeam = hostile;
+        PrefsBlob blob = prefsFromControls(c);
+        CHECK(blob.photoSeamMode() == PrefsPhotoSeam::RimAndGain);
+        CHECK(blob.sanitise());
+    }
+    // An older project's blob (zero bytes) shows Off at 100 % and the 2.6 deg
+    // inset - what it renders with.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.photoSeam = 0;
+    old.photoStrength = 0;
+    old.seamInset = 0;
+    const ControlValues shown = controlsFromPrefs(old);
+    CHECK(shown.photoSeam == 1);
+    CHECK(shown.photoStrengthPercent == Catch::Approx(100.0));
+    CHECK(shown.seamInsetDeg == Catch::Approx(2.6));
+}
+
 TEST_CASE("the pure mapping round-trips the Program Monitor Colour choice", "[sourcesettings][mapping]") {
     // [WP-SETTINGS]
     for (int item = 1; item <= OSV_SS_DIRECT_COLOUR_COUNT; ++item) {
@@ -695,6 +824,9 @@ TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesetting
     CHECK(c.seamSearch == (OSV_SS_SEAM_SEARCH_DEFAULT != 0));
     CHECK(c.gainMatch == (OSV_SS_GAIN_MATCH_DEFAULT != 0));
     CHECK(c.flareRemoval == (OSV_SS_FLARE_REMOVAL_DEFAULT != 0));  // [WP-FLARE]
+    CHECK(c.photoSeam == OSV_SS_PHOTO_SEAM_DEFAULT);                   // [WP-PHOTO]
+    CHECK(c.photoStrengthPercent == Catch::Approx(OSV_SS_PHOTO_STRENGTH_DEFAULT));
+    CHECK(c.seamInsetDeg == Catch::Approx(OSV_SS_SEAM_INSET_DEFAULT));
     CHECK(c.exposureStops == Catch::Approx(OSV_SS_EXPOSURE_DEFAULT));
 }
 
@@ -730,6 +862,9 @@ TEST_CASE("the pure mapping never produces a blob that needs repair",
         c.dlogmFit = v;
         c.renderDevice = v;
         c.directColour = v;
+        c.photoSeam = v;                                // [WP-PHOTO]
+        c.photoStrengthPercent = static_cast<double>(v);
+        c.seamInsetDeg = static_cast<double>(v);
         c.exposureStops = static_cast<double>(v);
         PrefsBlob blob = prefsFromControls(c);
         INFO("hostile control value " << v);
