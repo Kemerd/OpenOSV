@@ -325,6 +325,140 @@ sibling), tests under `tests/premiere/reframe/`.
   session loaded `xGPUFilterEntry` and never called `CreateInstance`; the
   out-flags now match the two known-good GPU effects (db6eb14) pending a test.
 
+### WP-SETTINGS  Source Settings on the direct path
+
+Field report (Premiere 26.2.2): Exposure -1 in a clip's Source Settings
+darkened the Source monitor (the importer's equirect) but not the Program
+monitor (the effect's direct render); colour and calibration changes "did not
+apply".
+
+**What the field log proves.** Session pid 63724: after every Source Settings
+change Premiere re-opened the clip (`imOpenFile8` on a NEW importer instance,
+`imGetInfo8` with the new blob), created 2-3 new GPU filter instances within
+~25 ms (23:46:51.947 publish, .970 `CreateInstance` x2) and asked the new
+importer instance for the playhead frame at full size. So Premiere rebuilt
+and re-rendered the clip's nodes; what the direct path rendered WITH is where
+the gaps were. The old instances stay alive meanwhile.
+
+**Why Premiere re-renders (the SDK mechanism relied on).** The direct path
+depends on exactly what the effect's input frame depends on - the media file,
+the clip's importer prefs, the time - so Premiere's own invalidation of the
+input is a sufficient invalidation of the direct output:
+
+* SDK guide 11.8.2 "Frame Caching": "If the user has modified the filter
+  settings, the clip settings, the preview quality, etc, Premiere will call
+  the filter to render with the new settings".
+* PPix Cache Suite v2+: "frames are differentiated within the cache, based on
+  the importer preferences, so when the preferences change, the host will not
+  use the old frame".
+* Importer guide, `imGetPrefs8`: "If the user changes the Clip Source
+  Settings in a way such that the frames should be reimported, then the
+  importer should use the Importer File Manager Suite to call
+  RefreshFileAsync()"; "each clip has its own prefs, and the host application
+  automatically passes the correct prefs to the appropriate importer
+  instance".
+* `PrSDKGPUFilter.h`: "A filter instance represents an effect applied to a
+  track item with a fixed set of parameters. Changed parameters will create a
+  new instance" - and the log shows new instances after Source Settings
+  changes too (the clip's segment was rebuilt).
+
+No SDK hook lets a GPU filter force a re-render or mix its own key into the
+render cache (the AE `GuidMixInPtr` belongs to SmartFX PreRender, which the
+GPU filter path does not run; `PF_OutFlag_NON_PARAM_VARY` declares output
+that changes with NO tracked input and would give up frame caching for every
+clip the effect is on). So the design makes the direct output a pure
+function of what Premiere already tracks, and PROVES the re-render in the
+log:
+
+1. **File identity.** The engine keys clips and settings by volume serial +
+   file index (`GetFileInformationByHandle`), not path spelling; tested with
+   case, `/`, `\\?\`, `.`/`..` and a hard link. Each spelling is logged once
+   with its identity.
+2. **Newest instance wins.** Every publication carries the publishing
+   instance's age (a token taken at its first publication, right after
+   `imOpenFile8`). An older instance can never undo a newer one's settings;
+   an instance the host gave no blob publishes its defaults only into a
+   blank. A host blob equal to the defaults is still published (the
+   "exposure back to 0" case).
+3. **Generation.** Each change bumps a per-file generation, reported with every
+   frame (`OsvEngineFrame::settings`) and by `OsvEngine_QuerySettings` (no
+   decode, no GPU), which the effect asks before decoding.
+4. **Never render unknown settings.** Generation 0 (nothing published for the
+   file in this process) hands the frame to the equirect route: a publication
+   failure can no longer show silently wrong settings. Premiere always opens
+   and describes a clip (publishing it) before it can hand the effect a frame
+   of it, so this costs nothing in practice - and it keeps proxy-only
+   sessions on the proxy.
+
+**Colour semantics.** On the equirect route the importer encodes its frame in
+the clip's colour output and Premiere converts that into the working space;
+the direct path renders straight into the working space, so Premiere's
+conversion never runs.
+
+| Clip colour output \ working space | PQ | HLG | Rec.709 |
+|---|---|---|---|
+| PQ | direct, exact | equirect * | equirect * |
+| HLG | equirect * | direct, exact | equirect * |
+| Rec.709 | equirect * | equirect * | direct, exact |
+| D-Log M passthrough | equirect | equirect | equirect |
+
+"Exact": the engine's colour block is byte-identical to the importer's
+(`makeColorParams` with the same fit, transfer, exposure, input, range and
+bit depth - pinned for PQ, HLG and Rec.709 at exposure -1) and Premiere's
+source -> working conversion is the identity, so the pixels match the
+equirect route up to its second resampling (WP-C: NCC 0.9995-0.9999, framing
+<= 0.0016 px). "*": Premiere's own conversion - HDR -> SDR tone mapping with
+the clip's gamut-map controls (`ClipNode::GamutMapControls` in the field
+log), SDR placed at graphics white in an HDR container, HLG <-> PQ at its
+nominal peak - is not exposed by the SDK (the Colour Management Suite only
+describes spaces) and cannot be verified without the host, so no tolerance
+could honestly be stated; the equirect route keeps those clips unless the
+clip's new Source Setting **Direct Path Colour = Sequence Working Space**
+(`PrefsBlob::directColour`, offset 24; Source Settings effect, Advanced
+group) opts into the direct path's own conversion (the behaviour before this
+rule). D-Log M passthrough is always handed over: grading it would make a
+downstream LUT double-convert. `OSV_DIRECT_COLOR=working|match` overrides the
+per-clip choice process-wide for A/B sessions.
+
+**ABI (not bumped; the lead bumps once at merge).** `OsvEngineClipSettings`
+(structSize, generation, clipTransfer, exposureStops, colorOutput,
+calibration, dlogmFit, stabilization, directColour, fileVolume, fileIndex);
+`OsvEngineFrame::settings` appended; optional export
+`OsvEngine_QuerySettings(path, settings*, error, capacity)`.
+
+**What the next Premiere session logs** (importer log, then effect log):
+
+```
+direct: 'L:\...\clip.OSV' is file ec41ff64:00080000000d7852              (once per spelling)
+direct: Source Settings generation 2 for 'clip.OSV' (file ...) from importer
+        instance #5 (importer id 14434?): colour 0, fit 2, exposure -1.00, ...
+direct: kept Source Settings generation 2 ... instance #3 is older and holds ...   (if it happens)
+direct: engine now renders 'clip.OSV' with Source Settings generation 2: ... (was ...)
+reframe/direct: 'clip.OSV' media node hash {GUID}, mod state ..., clip id 14434
+reframe/direct: 'clip.OSV' media node CHANGED - hash ... (was ...)            (if Premiere's identity moves)
+reframe/direct: 'clip.OSV' Source Settings generation 2 (colour PQ, exposure -1.00 stops, ...)
+        in a Rec.709 sequence -> equirect route: ... (or -> straight from the fisheyes: ...)
+```
+
+The effect's generation line appears on the FIRST render after each change,
+so it is the proof that Premiere re-rendered; a publish line without it would
+mean Premiere served a cached output. The importer id in the publish line and
+the media node's ClipID are logged side by side to find out whether they are
+the same number - if so, settings could be bound per clip rather than per
+file (today two master clips of one file with different settings share the
+newest instance's settings).
+
+**Known limitations and hand-offs.** Two master clips of the same file with
+different Source Settings share one set on the direct path (the newest
+instance's). The modal dialog (`SourceSettingsDialog.cpp`, WP-CALIB) calls
+`RefreshFileAsync` only when it has an instance (`imGetInstancePrefs`), not
+from `imGetPrefs8`, and has no Direct Path Colour combo yet (it preserves the
+field). The connection-space override in `imGetSourceVideo` (host selects
+"BT.709 RGB Full") goes through `applyPrefsLocked` and is therefore
+published like a user change (WP-IMPORTER). Effects placed BEFORE Open 360
+Reframe on the clip are bypassed by the direct path (it never reads its
+input frame).
+
 ## Rules for every package
 
 * Heavy Doxygen, defensive checks, no TODOs or stubs, no fake data.
