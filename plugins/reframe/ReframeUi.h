@@ -203,6 +203,17 @@ inline constexpr double kRollDegPerPixelAltDrag = 0.35;
 /// and re-deciding every mouse move makes the picture jitter between them.
 inline constexpr double kAxisLockThresholdPx = 3.0;
 
+/// How much faster than the hand a pan/tilt drag turns the view.
+///
+/// 1.0 is the exact grab: the point under the pointer stays under it.  The
+/// field report was that this feels sluggish next to DJI Studio - reframing
+/// a 360 shot means sweeping large angles, and a 1:1 grab asks for a lot of
+/// mouse travel to do it.  The pointer's travel from the anchor is scaled by
+/// this factor BEFORE the grab is solved, so the drag still moves the sphere
+/// as one rigid piece in both axes (a quicker grab, not a distorted one);
+/// the fixed-rate fallback is scaled by the same factor so the two agree.
+inline constexpr double kPanTiltSensitivity = 2.0;
+
 /// The FOV a pan/tilt drag is calibrated at.  At this FOV, dragging across
 /// the full width of the viewport turns the view by exactly this many
 /// degrees, so the picture tracks the cursor 1:1.  Away from it the rate

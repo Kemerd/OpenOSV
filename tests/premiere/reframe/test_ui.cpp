@@ -438,7 +438,7 @@ TEST_CASE("dragging right turns the view so the world follows the cursor", "[ref
 
     CHECK(after.panDeg > start.panDeg);
     // A quarter of the width at a 90-degree FOV is a quarter of 90 degrees.
-    CHECK(after.panDeg == Approx(90.0 * 0.25));
+    CHECK(after.panDeg == Approx(kPanTiltSensitivity * 90.0 * 0.25));
     CHECK(after.tiltDeg == Approx(start.tiltDeg));
     CHECK(after.rollDeg == Approx(start.rollDeg));
     CHECK(after.fovDeg == Approx(start.fovDeg));
@@ -453,7 +453,7 @@ TEST_CASE("dragging left turns the view the other way", "[reframe][ui][signs]") 
     const CameraValues after = applyDrag(state, PointF{layout.centre.x - 480.0, layout.centre.y}, kModNone);
 
     CHECK(after.panDeg < start.panDeg);
-    CHECK(after.panDeg == Approx(-90.0 * 0.25));
+    CHECK(after.panDeg == Approx(-kPanTiltSensitivity * 90.0 * 0.25));
 }
 
 TEST_CASE("dragging down tilts the view up so the world follows the cursor", "[reframe][ui][signs]") {
@@ -471,7 +471,7 @@ TEST_CASE("dragging down tilts the view up so the world follows the cursor", "[r
     CHECK(after.tiltDeg > start.tiltDeg);
     // The rate is the same per pixel on both axes (it is derived from the
     // viewport WIDTH), so 270px is 270 * 90/1920 degrees.
-    CHECK(after.tiltDeg == Approx(270.0 * 90.0 / 1920.0));
+    CHECK(after.tiltDeg == Approx(kPanTiltSensitivity * 270.0 * 90.0 / 1920.0));
     CHECK(after.panDeg == Approx(start.panDeg));
 }
 
@@ -509,7 +509,11 @@ TEST_CASE("grabbing the sphere keeps the grabbed point under the pointer", "[ref
         start.tiltDeg = c.tilt;
         start.rollDeg = c.roll;
         const PointF anchor{c.ax * kFrameW, c.ay * kFrameH};
-        const PointF pointer{anchor.x + c.dx, anchor.y + c.dy};
+        // The hand moves travel / k; the sphere turns as if it had moved the
+        // full travel (kPanTiltSensitivity), so the grabbed point must land
+        // under anchor + travel.
+        const PointF pointer{anchor.x + c.dx / kPanTiltSensitivity, anchor.y + c.dy / kPanTiltSensitivity};
+        const PointF effective{anchor.x + c.dx, anchor.y + c.dy};
 
         DragState state = beginDrag(layout, anchor, start, kModNone);
         REQUIRE(state.handle == Handle::PanTilt);
@@ -528,7 +532,7 @@ TEST_CASE("grabbing the sphere keeps the grabbed point under the pointer", "[ref
         double grabbed[3];
         double now[3];
         REQUIRE(rayUnderPointer(layout, c.fov, c.distortion, start, anchor, grabbed));
-        REQUIRE(rayUnderPointer(layout, c.fov, c.distortion, after, pointer, now));
+        REQUIRE(rayUnderPointer(layout, c.fov, c.distortion, after, effective, now));
         INFO("pan " << c.pan << " -> " << after.panDeg << ", tilt " << c.tilt << " -> " << after.tiltDeg
                     << "; grabbed point " << angleBetweenDeg(grabbed, now) << " deg from the pointer");
         // Float rays (the kernel's precision) on either side: a few
@@ -632,7 +636,7 @@ TEST_CASE("without a grab the drag keeps its fixed-rate behaviour", "[reframe][u
     DragState state = beginDrag(layout, layout.centre, start, kModNone);
     REQUIRE_FALSE(state.grab.valid);
     const CameraValues v = applyDrag(state, PointF{layout.centre.x + 480.0, layout.centre.y}, kModNone);
-    CHECK(v.panDeg == Approx(480.0 * 90.0 / kFrameW));
+    CHECK(v.panDeg == Approx(kPanTiltSensitivity * 480.0 * 90.0 / kFrameW));
 }
 
 TEST_CASE("a drag is anchored, not accumulated", "[reframe][ui]") {
@@ -665,7 +669,7 @@ TEST_CASE("Shift constrains a drag to the dominant axis", "[reframe][ui]") {
             applyDrag(state, PointF{layout.centre.x + 300.0, layout.centre.y + 40.0}, kModShift);
 
         CHECK(state.mode == DragMode::PanOnly);
-        CHECK(after.panDeg == Approx(300.0 * 90.0 / 1920.0));
+        CHECK(after.panDeg == Approx(kPanTiltSensitivity * 300.0 * 90.0 / 1920.0));
         CHECK(after.tiltDeg == Approx(0.0));  // The 40px of vertical travel is discarded.
     }
 
@@ -675,7 +679,7 @@ TEST_CASE("Shift constrains a drag to the dominant axis", "[reframe][ui]") {
             applyDrag(state, PointF{layout.centre.x + 40.0, layout.centre.y + 300.0}, kModShift);
 
         CHECK(state.mode == DragMode::TiltOnly);
-        CHECK(after.tiltDeg == Approx(300.0 * 90.0 / 1920.0));
+        CHECK(after.tiltDeg == Approx(kPanTiltSensitivity * 300.0 * 90.0 / 1920.0));
         CHECK(after.panDeg == Approx(0.0));
     }
 
@@ -694,7 +698,7 @@ TEST_CASE("Shift constrains a drag to the dominant axis", "[reframe][ui]") {
             applyDrag(state, PointF{layout.centre.x + 10.0, layout.centre.y + 900.0}, kModShift);
         CHECK(state.mode == DragMode::PanOnly);
         CHECK(after.tiltDeg == Approx(0.0));
-        CHECK(after.panDeg == Approx(10.0 * 90.0 / 1920.0));
+        CHECK(after.panDeg == Approx(kPanTiltSensitivity * 10.0 * 90.0 / 1920.0));
     }
 
     SECTION("a drag too small to call moves nothing") {
@@ -1065,8 +1069,8 @@ TEST_CASE("an offset frame hit-tests and drags exactly like one at the origin", 
     CHECK(got.panDeg == Approx(expected.panDeg));
     CHECK(got.tiltDeg == Approx(expected.tiltDeg));
     // And both are the calibrated rate, not merely equal to each other.
-    CHECK(got.panDeg == Approx(96.0 * 90.0 / kFrameW));
-    CHECK(got.tiltDeg == Approx(40.0 * 90.0 / kFrameW));
+    CHECK(got.panDeg == Approx(kPanTiltSensitivity * 96.0 * 90.0 / kFrameW));
+    CHECK(got.tiltDeg == Approx(kPanTiltSensitivity * 40.0 * 90.0 / kFrameW));
 }
 
 TEST_CASE("without the origin correction an offset frame grabs the wrong handle", "[reframe][ui][coords]") {
@@ -1336,7 +1340,9 @@ TEST_CASE("a click-drag-release sequence commits Pan and Tilt for the host to ke
         double grabbed[3];
         double now[3];
         REQUIRE(rayUnderPointer(layout, 90.0, distortion, before, PointF{960.0, 540.0}, grabbed));
-        REQUIRE(rayUnderPointer(layout, 90.0, distortion, after, PointF{960.0 + 480.0, 540.0 + 270.0}, now));
+        REQUIRE(rayUnderPointer(layout, 90.0, distortion, after,
+                                PointF{960.0 + kPanTiltSensitivity * 480.0, 540.0 + kPanTiltSensitivity * 270.0},
+                                now));
         INFO("grabbed point is " << angleBetweenDeg(grabbed, now) << " deg from the pointer after the drag");
         // The parameters are stored as 16.16 fixed point, so allow that
         // quantisation (1/65536 deg) plus float rounding in the ray.
@@ -1872,7 +1878,7 @@ TEST_CASE("many gestures in a row do not exhaust the drag table", "[reframe][ui]
         REQUIRE(f.event(drag, params) == PF_Err_NONE);
 
         // The same answer every time: the table is not degrading.
-        CHECK(angleOf(params, kIndexPan) == Approx(grabPanDeg(96.0)).margin(0.01));
+        CHECK(angleOf(params, kIndexPan) == Approx(grabPanDeg(kPanTiltSensitivity * 96.0)).margin(0.01));
     }
 }
 
@@ -1977,7 +1983,7 @@ TEST_CASE("with a 0x0 layer a DRAW's update rect makes the overlay grabbable", "
     // And the drag commits Pan at the calibrated rate.
     PF_EventExtra drag = makeDragFrom(f.host, click, 960 + 96, 540, true);
     REQUIRE(f.event(drag, params) == PF_Err_NONE);
-    CHECK(angleOf(params, kIndexPan) == Approx(grabPanDeg(96.0)).margin(0.01));
+    CHECK(angleOf(params, kIndexPan) == Approx(grabPanDeg(kPanTiltSensitivity * 96.0)).margin(0.01));
     CHECK(angleOf(params, kIndexTilt) == Approx(0.0).margin(1e-4));
     CHECK(changed(params, kIndexPan));
     CHECK((drag.evt_out_flags & PF_EO_HANDLED_EVENT) != 0);
@@ -2022,7 +2028,7 @@ TEST_CASE("an update rect that does not start at the window origin does not offs
 
     PF_EventExtra drag = makeDragFrom(f.host, click, kX + 960 + 96, kY + 540, true);
     REQUIRE(f.event(drag, params) == PF_Err_NONE);
-    CHECK(angleOf(params, kIndexPan) == Approx(grabPanDeg(96.0)).margin(0.01));
+    CHECK(angleOf(params, kIndexPan) == Approx(grabPanDeg(kPanTiltSensitivity * 96.0)).margin(0.01));
     CHECK(angleOf(params, kIndexTilt) == Approx(0.0).margin(1e-4));
 }
 
@@ -2182,7 +2188,7 @@ TEST_CASE("while a drag is in flight the readout shows its values even if the ho
     // expected text is formatted from the committed value itself.
     PF_EventExtra move1 = makeDragFrom(f.host, click, 960 + 96, 540, false);
     REQUIRE(f.event(move1, params) == PF_Err_NONE);
-    REQUIRE(angleOf(params, kIndexPan) == Approx(grabPanDeg(96.0)).margin(0.01));
+    REQUIRE(angleOf(params, kIndexPan) == Approx(grabPanDeg(kPanTiltSensitivity * 96.0)).margin(0.01));
     const double panMove1 = angleOf(params, kIndexPan);
     REQUIRE(angleOf(stale, kIndexPan) == Approx(0.0).margin(1e-6));
 
@@ -2194,7 +2200,7 @@ TEST_CASE("while a drag is in flight the readout shows its values even if the ho
     // It tracks every move, not just the first.
     PF_EventExtra move2 = makeDragFrom(f.host, click, 960 + 192, 540, false);
     REQUIRE(f.event(move2, params) == PF_Err_NONE);
-    REQUIRE(angleOf(params, kIndexPan) == Approx(grabPanDeg(192.0)).margin(0.01));
+    REQUIRE(angleOf(params, kIndexPan) == Approx(grabPanDeg(kPanTiltSensitivity * 192.0)).margin(0.01));
     const double panMove2 = angleOf(params, kIndexPan);
     f.host.clearDrawbotRecord();
     PF_EventExtra draw2 = makeExtra(f.host, PF_Event_DRAW);

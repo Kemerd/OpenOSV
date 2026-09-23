@@ -638,8 +638,14 @@ CameraValues applyDrag(DragState& state, const PointF& current, std::uint32_t mo
         // solved through the renderer's own camera (see SphereGrab).  The
         // fixed rate below is the fallback when no grab could be built or
         // the pointer has left the projection's valid area.
+        //
+        // Sensitivity: the pointer's travel from the anchor is scaled before
+        // the solve, so the sphere turns kPanTiltSensitivity times faster
+        // than the hand while still moving as one rigid piece.
+        const PointF quickened{state.anchor.x + kPanTiltSensitivity * dxTotal,
+                               state.anchor.y + kPanTiltSensitivity * dyTotal};
         CameraValues grabbed;
-        if (solveSphereGrab(state.grab, state.layout, state.start, current, mode, grabbed)) {
+        if (solveSphereGrab(state.grab, state.layout, state.start, quickened, mode, grabbed)) {
             result.panDeg = grabbed.panDeg;
             result.tiltDeg = grabbed.tiltDeg;
             break;
@@ -648,7 +654,7 @@ CameraValues applyDrag(DragState& state, const PointF& current, std::uint32_t mo
         // Rate scales with the FOV AT GRAB TIME.  Using the live FOV would
         // change the rate mid-drag if a preset or another keyframe moved it,
         // which would make the picture slide out from under the cursor.
-        const double rate = dragScaleDegPerPixel(state.start.fovDeg, state.layout.viewport.w);
+        const double rate = kPanTiltSensitivity * dragScaleDegPerPixel(state.start.fovDeg, state.layout.viewport.w);
 
         // The signs are derived in the header from the kernel's ray,
         // rotation order and equirect lookup.  In short: increasing Pan

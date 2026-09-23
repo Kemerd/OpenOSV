@@ -258,8 +258,20 @@ std::atomic<long> g_liveLeases{0};
 void enginePublishPrefs(const std::filesystem::path& path, const PrefsBlob& prefs) noexcept {
     try {
         Registry& r = registry();
-        std::lock_guard<std::mutex> lock(r.mutex);
-        r.prefs[keyFor(path)] = prefs;
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(r.mutex);
+            PrefsBlob& slot = r.prefs[keyFor(path)];
+            changed = !(slot == prefs);
+            slot = prefs;
+        }
+        // Only real changes are logged: every Premiere instance of the clip
+        // publishes the same blob when it opens, and those repeats say nothing.
+        if (changed) {
+            PluginLog::info("direct: Source Settings published for '{}' - colour {}, fit {}, exposure {:+.2f}",
+                            path.filename().string(), static_cast<int>(prefs.colorOutput),
+                            static_cast<int>(prefs.dlogmFit), static_cast<double>(prefs.exposureStops));
+        }
     } catch (...) {
         // A failed publish only means the engine renders this clip with the
         // settings it had; never worth failing the importer call over.
@@ -373,7 +385,15 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
             // instance last saw them (a no-op when nothing changed).
             PrefsBlob prefs;
             if (publishedPrefs(path, prefs)) {
+                const PrefsBlob before = clip->prefsLocked();
                 clip->applyPrefsLocked(&prefs, PrefsBlob::kSize);
+                if (!(before == clip->prefsLocked())) {
+                    PluginLog::info("direct: engine now renders '{}' with exposure {:+.2f}, fit {} (was {:+.2f}, "
+                                    "fit {})",
+                                    path.filename().string(), static_cast<double>(prefs.exposureStops),
+                                    static_cast<int>(prefs.dlogmFit), static_cast<double>(before.exposureStops),
+                                    static_cast<int>(before.dlogmFit));
+                }
             }
 
             index = frameIndexForTicks(*clip, request->mediaTicks);

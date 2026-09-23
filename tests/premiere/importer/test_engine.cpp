@@ -27,6 +27,7 @@
 #include "osv/container/OsvFile.h"
 #include "osv/video/DualStreamReader.h"
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <cuda.h>
@@ -329,4 +330,57 @@ TEST_CASE("the engine honours the working-space transfer and survives many acqui
         CHECK(frame.frameIndex == target);
         api.release(frame.lease, nullptr);
     }
+}
+
+TEST_CASE("Source Settings changed in Premiere reach the engine's next frame", "[importer][engine][cuda][sample]") {
+    // Field report: dropping Exposure to -1 in Source Settings darkened the
+    // Source monitor (the importer's equirect) but not the direct path's
+    // view.  The engine renders with its OWN instance of the file, so the
+    // settings Premiere hands its instances must be published to it and
+    // applied on the next acquire.  This drives exactly that: a Premiere
+    // instance receives exposure -1 through imGetInfo8, and the engine's
+    // colour block must carry a 2^-1 exposure gain from the next frame on.
+    if (!sampleClipAvailable()) {
+        SKIP("the sample clip is not present at " << sampleClipPath().string());
+    }
+    TestContext cuda;
+    if (!cuda.context) {
+        SKIP("CUDA unavailable: " << cuda.reason);
+    }
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const EngineApi api = resolveEngine();
+    REQUIRE(api.ok());
+    const std::wstring path = sampleClipPath().wstring();
+    char error[512] = {};
+
+    const auto gainOf = [&](std::uint32_t frameIndex) {
+        OsvEngineFrameRequest request = requestFor(path, frameIndex, cuda.context);
+        OsvEngineFrame frame = emptyFrame();
+        const std::int32_t rc = api.acquire(&request, &frame, error, sizeof(error));
+        INFO("engine error: " << error);
+        REQUIRE(rc == OSV_ENGINE_OK);
+        const float gain = frame.stitch.color.exposureGain;
+        api.release(frame.lease, nullptr);
+        return gain;
+    };
+
+    // Before: default settings, unit gain.
+    CHECK(gainOf(2) == 1.0f);
+
+    // Premiere opens the clip with the user's new settings...
+    osv::premiere::PrefsBlob prefs = osv::premiere::PrefsBlob::defaults();
+    prefs.exposureStops = -1.0f;
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+    imFileInfoRec8 info{};
+    REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+
+    // ...and the engine's very next frame renders with them.
+    CHECK(gainOf(3) == 0.5f);
+
+    // And back again, so a later change is not missed either.
+    prefs.exposureStops = 0.5f;
+    REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+    CHECK(gainOf(4) == Catch::Approx(1.41421356f));
 }
