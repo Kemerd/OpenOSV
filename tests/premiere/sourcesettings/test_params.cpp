@@ -220,7 +220,8 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
 
     const std::vector<PF_ParamDef> params = addedParams(fixture);
 
-    // Twenty-four: twenty controls plus the four group markers.  PF_ADD_TOPIC and
+    // Twenty-eight: twenty value controls, the two Defaults buttons and the
+    // six group markers.  PF_ADD_TOPIC and
     // PF_END_TOPIC each issue their own PF_ADD_PARAM, so a group occupies two
     // real slots - counting only the controls is the mistake that shifts
     // every index after the first group.
@@ -501,4 +502,48 @@ TEST_CASE("the sky seam sliders offer exactly what the blob stores", "[sourceset
     CHECK(static_cast<double>(inset.u.fs_d.slider_min) == Catch::Approx(0.0));
     CHECK(static_cast<double>(inset.u.fs_d.slider_max) == Catch::Approx(6.0));
     CHECK(inset.u.fs_d.precision == PF_Precision_TENTHS);
+}
+
+TEST_CASE("the seam tool sliders offer exactly what the blob stores", "[sourcesettings][params][seamtools]") {
+    // [WP-SEAMTOOLS] Each slider's valid and slider range is its blob field's
+    // stored range, its default the blob's default, shown in hundredths.
+    EffectFixture fixture;
+    REQUIRE(LoadedPlugin::instance().ok());
+    const std::vector<PF_ParamDef> params = addedParams(fixture);
+    REQUIRE(params.size() == static_cast<std::size_t>(OSV_SOURCE_SETTINGS_PARAM_COUNT));
+    const PrefsBlob defaults = PrefsBlob::defaults();
+    struct Expected {
+        int index;
+        double lo;
+        double hi;
+        double dflt;
+    };
+    const double step = static_cast<double>(PrefsBlob::kSeamToolStepsPerDeg);
+    const double offsetMax = static_cast<double>(PrefsBlob::kMaxSeamOffsetHundredths) / 100.0;
+    const Expected expected[] = {
+        {kIndexSeamBlend, (PrefsBlob::kMinSeamBlendCode - 1) / step, (PrefsBlob::kMaxSeamBlendCode - 1) / step,
+         defaults.seamBlendDeg()},
+        {kIndexParallaxBlend, 0.0, (PrefsBlob::kMaxParallaxBlendCode - 1) / step, defaults.parallaxBlendDeg()},
+        {kIndexSeamSmoothing, 0.0, (PrefsBlob::kMaxSeamSmoothingCode - 1) / step, defaults.seamSmoothingDeg()},
+        {kIndexNearOffset, -offsetMax, offsetMax, defaults.nearOffsetDeg()},
+        {kIndexFarOffset, -offsetMax, offsetMax, defaults.farOffsetDeg()},
+    };
+    for (const Expected& e : expected) {
+        const PF_ParamDef& def = params[static_cast<std::size_t>(e.index) - 1u];
+        INFO("index " << e.index << " (" << kParamNameByIndex[e.index - 1] << ")");
+        CHECK(def.param_type == PF_Param_FLOAT_SLIDER);
+        CHECK(static_cast<double>(def.u.fs_d.valid_min) == Catch::Approx(e.lo));
+        CHECK(static_cast<double>(def.u.fs_d.valid_max) == Catch::Approx(e.hi));
+        CHECK(static_cast<double>(def.u.fs_d.slider_min) == Catch::Approx(e.lo));
+        CHECK(static_cast<double>(def.u.fs_d.slider_max) == Catch::Approx(e.hi));
+        CHECK(static_cast<double>(def.u.fs_d.dephault) == Catch::Approx(e.dflt));
+        CHECK(def.u.fs_d.precision == PF_Precision_HUNDREDTHS);
+        CHECK((def.flags & PF_ParamFlag_CANNOT_TIME_VARY) != 0);
+    }
+    // Their permanent ids are this package's range, 20-29.
+    for (const int id : {OSV_SS_ID_SEAM_BLEND, OSV_SS_ID_PARALLAX_BLEND, OSV_SS_ID_SEAM_SMOOTHING,
+                         OSV_SS_ID_NEAR_OFFSET, OSV_SS_ID_FAR_OFFSET}) {
+        CHECK(id >= 20);
+        CHECK(id <= 29);
+    }
 }

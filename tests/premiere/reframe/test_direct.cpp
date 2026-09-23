@@ -68,6 +68,7 @@
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
 #include "osv/render/SeamCarve.h"
+#include "osv/render/SeamTools.h"  // [WP-SEAMTOOLS]
 #include "osv/video/DualStreamReader.h"
 
 #include <catch2/catch_approx.hpp>
@@ -874,8 +875,9 @@ TEST_CASE("buildDirectParams takes the camera from buildView and the stitch from
     CHECK(d.warpGrid == warp.data());
 
     // ---- and it fits the kernel's parameter space ----------------------------
-    // Four pointers since [WP-SEAM]: seam table, warp grid, blend seam, output.
-    CHECK(sizeof(OsvRenderParams) + sizeof(OsvDirectPlanes) + 4 * sizeof(void*) + 2 * sizeof(int) <= 4096);
+    // Six pointers since [WP-SEAMTOOLS]: seam table, warp grid, blend seam,
+    // photo table, seam low band, output.
+    CHECK(sizeof(OsvRenderParams) + sizeof(OsvDirectPlanes) + 6 * sizeof(void*) + 2 * sizeof(int) <= 4096);
 }
 
 TEST_CASE("buildDirectParams forwards seam and warp pointers only with their feature", "[reframe][direct]") {
@@ -2041,5 +2043,149 @@ TEST_CASE("[WP-PHOTO] the direct kernel applies the photometric seam field like 
     WARN("[WP-PHOTO] direct kernel 2560x1440 across the seam: " << offMs << " ms without the photometric field, "
                                                                << onMs << " ms with it (+" << (onMs - offMs)
                                                                << " ms); best of 3 x 50 launches, shared machine");
+    CHECK(onMs > 0.0);
+}
+
+// ===========================================================================
+//  [WP-SEAMTOOLS] the seam smoothing on the direct path
+// ===========================================================================
+
+TEST_CASE("[WP-SEAMTOOLS] the direct kernel applies the seam smoothing like its CPU twin, cheaply",
+          "[reframe][direct][cuda][sample][seamtools]") {
+    const std::string noCuda = cudaUnavailableReason();
+    if (!noCuda.empty()) {
+        SKIP("no CUDA device: " << noCuda);
+    }
+    REQUIRE_SAMPLE_CLIP();
+    const auto clip = openSampleClip();
+    constexpr std::uint32_t kFrame = 32;
+    const SampleFrame soft = decodeSampleFrame(*clip, kFrame);
+    GpuRig g;
+    prepareGpuRig(g, *clip, soft, kFrame);
+
+    // ---- the importer's default stitch: warp grid + carved seam, smoothed ------
+    render::ParallaxWarpParams pw;
+    pw.backend = render::FlowBackendKind::Classical;
+    auto grid = render::buildParallaxWarp(clip->rig, soft.pair, clip->blend, pw, nullptr, pool());
+    REQUIRE(grid.ok());
+    render::WarpGridView view;
+    view.uv = grid.value().uv.data();
+    view.w = grid.value().w;
+    view.h = grid.value().h;
+    view.latMinRad = grid.value().latMinRad;
+    view.latMaxRad = grid.value().latMaxRad;
+    render::SeamCorrection correction;
+    correction.warp = &view;
+    auto carved = render::carveSeam(clip->rig, soft.pair, clip->blend, pw.band, correction,
+                                    render::SeamCarveParams{}, nullptr, pool());
+    REQUIRE(carved.ok());
+    geom::EquirectMap map;
+    map.layout = geom::EquirectLayout::Standard;
+    map.w = 6000;
+    map.h = 3000;
+    const auto blockFor = [&](double smoothing) {
+        render::RenderParamsBuilder b;
+        b.rig(clip->rig).color(clip->color).blend(clip->blend, true).alphaCoverage(true);
+        b.warp(grid.value().uv, grid.value().w, grid.value().h, grid.value().latMinRad, grid.value().latMaxRad);
+        b.gain(soft.gains[0], soft.gains[1]).stabilization(soft.stab);
+        render::applyBlendSeam(b, carved.value());
+        if (smoothing > 0.0) {
+            b.seamSmooth(smoothing);
+        }
+        auto block = b.equirect(map).buildParams();
+        REQUIRE(block.ok());
+        return block.value();
+    };
+    const OsvRenderParams smoothBlock = blockFor(2.0);
+    const OsvRenderParams plainBlock = blockFor(0.0);
+    REQUIRE(smoothBlock.seamSmoothEnabled == 1);
+    REQUIRE(plainBlock.seamSmoothEnabled == 0);
+
+    // The low band of this frame, built on the host from the very samples the
+    // device planes hold (the engine builds the same table on the GPU; the
+    // importer's engine test pins that the two agree).
+    std::vector<float> low;
+    std::vector<float> scratch;
+    REQUIRE(render::buildSeamLowBand(smoothBlock, g.hostPlanes, low, scratch, &pool()).ok());
+    StitchState host;
+    host.equirect = smoothBlock;
+    host.warpGrid = grid.value().uv.data();
+    host.blendSeam = carved.value().table.data();
+    host.seamLow = low.data();
+    StitchState device = host;
+    device.warpGrid = uploadTable(g, grid.value().uv);
+    device.blendSeam = uploadTable(g, carved.value().table);
+    device.seamLow = uploadTable(g, low);
+    StitchState plainDevice = device;
+    plainDevice.equirect = plainBlock;
+    plainDevice.seamLow = nullptr;
+
+    // ---- refused when on without a table, or with malformed fields ---------------
+    const Settings across = makeSettings(Resolution::MatchSequence, 90.0, 0.0, 0.0, 100.0, 0.0);
+    StitchState missing = host;
+    missing.seamLow = nullptr;
+    CHECK(buildDirectParams(across, missing, 64, 36, SizePx{}).reject == DirectReject::SeamLow);
+    StitchState malformed = host;
+    malformed.equirect.seamLowFactor = 3;
+    CHECK(buildDirectParams(across, malformed, 64, 36, SizePx{}).reject == DirectReject::SeamLow);
+    // Off: the pointer is never forwarded, even if one is lying around.
+    StitchState stray = device;
+    stray.equirect = plainBlock;
+    CHECK(buildDirectParams(across, stray, 64, 36, SizePx{}).seamLow == nullptr);
+
+    // ---- parity: GPU vs the CPU twin, across the seam and down at the nacelle ----
+    const Settings nacelle = makeSettings(Resolution::MatchSequence, 95.0, -8.0, 0.0, 60.0, 0.0);
+    for (const Settings& s : {across, nacelle}) {
+        for (const bool isHalf : {false, true}) {
+            const DirectSetup cpuSetup = buildDirectParams(s, host, 1920, 1080, SizePx{});
+            const DirectSetup gpuSetup = buildDirectParams(s, device, 1920, 1080, SizePx{});
+            REQUIRE(cpuSetup.valid);
+            REQUIRE(gpuSetup.valid);
+            REQUIRE(gpuSetup.seamLow == device.seamLow);
+            const HostFrame gpu = renderOnGpu(g, gpuSetup, isHalf);
+            HostFrame cpuFrame(1920, 1080, isHalf ? PixelLayout::Bgra16f : PixelLayout::Bgra32f);
+            REQUIRE(renderDirectCpu(cpuSetup, g.hostPlanes, cpuFrame.view(), &pool()));
+            const render::ImageDiffStats stats = render::compareImages16(gpu.toImage(), cpuFrame.toImage());
+            WARN("[WP-SEAMTOOLS] direct GPU vs CPU twin with seam smoothing (" << (isHalf ? "16f" : "32f")
+                                                                               << "): PSNR " << stats.psnrDb
+                                                                               << " dB, max " << stats.maxAbsCode
+                                                                               << " codes");
+            CHECK(stats.psnrDb >= 60.0);
+        }
+    }
+
+    // ---- the smoothing changes the picture only where the lenses overlap -----------
+    {
+        const DirectSetup on = buildDirectParams(across, device, 960, 540, SizePx{});
+        const DirectSetup off = buildDirectParams(across, plainDevice, 960, 540, SizePx{});
+        REQUIRE(on.valid);
+        REQUIRE(off.valid);
+        const render::ImageRGBAf a = renderOnGpu(g, on, false).toImage();
+        const render::ImageRGBAf b = renderOnGpu(g, off, false).toImage();
+        std::size_t changed = 0;
+        for (std::size_t i = 0; i < a.data.size(); ++i) {
+            changed += a.data[i] != b.data[i] ? 1u : 0u;
+        }
+        CHECK(changed > 0);
+        // The view is 100 deg wide across the seam; the band the smoothing
+        // may touch (2 deg either side of the carved seam) is a small part.
+        CHECK(changed < a.data.size() / 4);
+    }
+
+    // ---- cost at 2560 x 1440, back to back with and without --------------------------
+    const DirectSetup off = buildDirectParams(across, plainDevice, 2560, 1440, SizePx{});
+    const DirectSetup on = buildDirectParams(across, device, 2560, 1440, SizePx{});
+    REQUIRE(off.valid);
+    REQUIRE(on.valid);
+    double offMs = 1e9;
+    double onMs = 1e9;
+    for (int round = 0; round < 3; ++round) {
+        offMs = std::min(offMs, kernelMs(g, off, 50));
+        onMs = std::min(onMs, kernelMs(g, on, 50));
+    }
+    WARN("[WP-SEAMTOOLS] direct kernel 2560x1440 across the seam: " << offMs << " ms without seam smoothing, " << onMs
+                                                                   << " ms with it (+" << (onMs - offMs)
+                                                                   << " ms, the low band's build not included); best "
+                                                                      "of 3 x 50 launches, shared machine");
     CHECK(onMs > 0.0);
 }

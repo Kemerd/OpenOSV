@@ -1328,3 +1328,112 @@ TEST_CASE("PrefsBlob sky seam fix: on for new clips, off for old blobs, strength
     REQUIRE_FALSE(p.sanitise());
     CHECK(p.photoReserved[1] == 0);
 }
+
+// ---------------------------------------------------------------------------
+//  [WP-SEAMTOOLS] the carved seam's tweaks
+// ---------------------------------------------------------------------------
+
+TEST_CASE("PrefsBlob seam tools: zeros are today's seam, setters round, clamp and canonicalise",
+          "[common][prefs][seamtools]") {
+    // ---- a fresh blob and an OLD blob both read as today's seam ------------
+    PrefsBlob p = PrefsBlob::defaults();
+    CHECK(p.seamBlend == 0);
+    CHECK(p.parallaxBlend == 0);
+    CHECK(p.seamSmoothing == 0);
+    CHECK(p.seamToolsPad == 0);
+    CHECK(p.nearOffset == 0);
+    CHECK(p.farOffset == 0);
+    CHECK(p.seamBlendDeg() == 1.5);  // exactly SeamCarveParams' defaults
+    CHECK(p.parallaxBlendDeg() == 0.35);
+    CHECK(p.seamSmoothingDeg() == 0.0);
+    CHECK(p.nearOffsetDeg() == 0.0);
+    CHECK(p.farOffsetDeg() == 0.0);
+    // An older project's bytes 38-45 were reserved, i.e. zero: the same.
+    PrefsBlob old = PrefsBlob::defaults();
+    std::memset(reinterpret_cast<std::uint8_t*>(&old) + 38, 0, 8);
+    CHECK(old.sanitise());
+    CHECK(old == PrefsBlob::defaults());
+
+    // ---- setters: the stored step, the range, the default as code 0 --------
+    p.setSeamBlendDeg(3.26);  // rounds to the twentieth
+    CHECK(p.seamBlendDeg() == 3.25);
+    p.setSeamBlendDeg(0.0);   // below the 0.2 minimum: clamped, not refused
+    CHECK(p.seamBlendDeg() == 0.2);
+    p.setSeamBlendDeg(99.0);
+    CHECK(p.seamBlendDeg() == 8.0);
+    p.setSeamBlendDeg(1.5);
+    CHECK(p.seamBlend == 0);  // the default keeps tracking the default
+    p.setParallaxBlendDeg(0.0);
+    CHECK(p.parallaxBlend == 1);  // a hard cut is a real setting, not the default
+    CHECK(p.parallaxBlendDeg() == 0.0);
+    p.setParallaxBlendDeg(4.4);
+    CHECK(p.parallaxBlendDeg() == 4.0);
+    p.setSeamSmoothingDeg(2.0);
+    CHECK(p.seamSmoothingDeg() == 2.0);
+    p.setSeamSmoothingDeg(-1.0);
+    CHECK(p.seamSmoothing == 0);
+    p.setNearOffsetDeg(1.234);
+    CHECK(p.nearOffset == 123);
+    CHECK(p.nearOffsetDeg() == 1.23);
+    p.setNearOffsetDeg(-1.236);  // rounded to the nearest hundredth, either sign
+    CHECK(p.nearOffset == -124);
+    p.setFarOffsetDeg(-9.0);
+    CHECK(p.farOffsetDeg() == -3.0);
+    for (const double bad : {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()}) {
+        p.setSeamBlendDeg(bad);
+        p.setParallaxBlendDeg(bad);
+        p.setSeamSmoothingDeg(bad);
+        p.setNearOffsetDeg(bad);
+        p.setFarOffsetDeg(bad);
+        CHECK(p.seamBlend == 0);
+        CHECK(p.parallaxBlend == 0);
+        CHECK(p.seamSmoothing == 0);
+        CHECK(p.nearOffset == 0);
+        CHECK(p.farOffset == 0);
+    }
+
+    // ---- every stored value round-trips through its decoder -----------------
+    for (int code = 1; code <= PrefsBlob::kMaxSeamSmoothingCode; ++code) {
+        PrefsBlob q = PrefsBlob::defaults();
+        q.setSeamSmoothingDeg(static_cast<double>(code - 1) / PrefsBlob::kSeamToolStepsPerDeg);
+        PrefsBlob r = PrefsBlob::defaults();
+        r.setSeamSmoothingDeg(q.seamSmoothingDeg());
+        CHECK(r.seamSmoothing == q.seamSmoothing);
+    }
+    for (int h = -PrefsBlob::kMaxSeamOffsetHundredths; h <= PrefsBlob::kMaxSeamOffsetHundredths; h += 7) {
+        PrefsBlob q = PrefsBlob::defaults();
+        q.setFarOffsetDeg(static_cast<double>(h) / 100.0);
+        CHECK(q.farOffset == h);
+    }
+
+    // ---- sanitise: out of range lands on the default, one byte pattern ------
+    PrefsBlob s = PrefsBlob::defaults();
+    s.seamBlend = 200;       // beyond 8 deg
+    s.parallaxBlend = 90;    // beyond 4 deg
+    s.seamSmoothing = 170;   // beyond 8 deg
+    s.seamToolsPad = 7;
+    s.nearOffset = 301;
+    s.farOffset = -400;
+    CHECK_FALSE(s.sanitise());
+    CHECK(s == PrefsBlob::defaults());
+    PrefsBlob low = PrefsBlob::defaults();
+    low.seamBlend = 3;  // 0.1 deg: below the minimum no setter writes
+    CHECK_FALSE(low.sanitise());
+    CHECK(low.seamBlend == 0);
+    // A code that spells the default is rewritten as the default's code 0,
+    // so the same setting always makes the same PPix key.
+    PrefsBlob spelled = PrefsBlob::defaults();
+    spelled.seamBlend = 31;      // 1.5 deg
+    spelled.parallaxBlend = 8;   // 0.35 deg
+    spelled.seamSmoothing = 1;   // 0 deg
+    CHECK_FALSE(spelled.sanitise());
+    CHECK(spelled == PrefsBlob::defaults());
+    // And a real setting is clean.
+    PrefsBlob set = PrefsBlob::defaults();
+    set.setSeamBlendDeg(4.0);
+    set.setParallaxBlendDeg(0.0);
+    set.setSeamSmoothingDeg(2.0);
+    set.setNearOffsetDeg(-1.25);
+    set.setFarOffsetDeg(0.5);
+    CHECK(set.sanitise());
+}

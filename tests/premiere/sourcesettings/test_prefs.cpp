@@ -28,6 +28,8 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -307,6 +309,44 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
             INFO("degrees " << deg);
             // PF_FpShort -> tenths: 0.3 arrives as 0.30000001 and rounds back.
             CHECK(translate(fixture, buffer).seamInsetDeg() == Catch::Approx(deg));
+        }
+    }
+    // [WP-SEAMTOOLS] The five seam tool sliders: each value the slider can
+    // carry lands in the blob at its stored step (a twentieth of a degree
+    // for the widths, a hundredth for the offsets).
+    SECTION("Seam Blend") {
+        for (const double deg : {0.2, 0.35, 1.5, 3.25, 8.0}) {
+            PrefsBuffer buffer;
+            fixture.setSlider(kIndexSeamBlend, deg);
+            INFO("degrees " << deg);
+            CHECK(translate(fixture, buffer).seamBlendDeg() == Catch::Approx(deg));
+        }
+    }
+    SECTION("Parallax Blend") {
+        for (const double deg : {0.0, 0.35, 0.8, 4.0}) {
+            PrefsBuffer buffer;
+            fixture.setSlider(kIndexParallaxBlend, deg);
+            INFO("degrees " << deg);
+            CHECK(translate(fixture, buffer).parallaxBlendDeg() == Catch::Approx(deg));
+        }
+    }
+    SECTION("Seam Smoothing") {
+        for (const double deg : {0.0, 0.25, 2.0, 8.0}) {
+            PrefsBuffer buffer;
+            fixture.setSlider(kIndexSeamSmoothing, deg);
+            INFO("degrees " << deg);
+            CHECK(translate(fixture, buffer).seamSmoothingDeg() == Catch::Approx(deg));
+        }
+    }
+    SECTION("Near / Far Offset") {
+        for (const double deg : {-3.0, -1.37, 0.0, 0.01, 2.5, 3.0}) {
+            PrefsBuffer nearBuffer;
+            fixture.setSlider(kIndexNearOffset, deg);
+            INFO("degrees " << deg);
+            CHECK(translate(fixture, nearBuffer).nearOffsetDeg() == Catch::Approx(deg));
+            PrefsBuffer farBuffer;
+            fixture.setSlider(kIndexFarOffset, -deg);
+            CHECK(translate(fixture, farBuffer).farOffsetDeg() == Catch::Approx(-deg));
         }
     }
     SECTION("Exposure") {
@@ -855,6 +895,64 @@ TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesetting
     CHECK(c.photoStrengthPercent == Catch::Approx(OSV_SS_PHOTO_STRENGTH_DEFAULT));
     CHECK(c.seamInsetDeg == Catch::Approx(OSV_SS_SEAM_INSET_DEFAULT));
     CHECK(c.exposureStops == Catch::Approx(OSV_SS_EXPOSURE_DEFAULT));
+    // [WP-SEAMTOOLS] the seam tools: the carved seam as it has always been.
+    CHECK(c.seamBlendDeg == OSV_SS_SEAM_BLEND_DEFAULT);
+    CHECK(c.parallaxBlendDeg == OSV_SS_PARALLAX_BLEND_DEFAULT);
+    CHECK(c.seamSmoothingDeg == OSV_SS_SEAM_SMOOTHING_DEFAULT);
+    CHECK(c.nearOffsetDeg == OSV_SS_SEAM_OFFSET_DEFAULT);
+    CHECK(c.farOffsetDeg == OSV_SS_SEAM_OFFSET_DEFAULT);
+}
+
+TEST_CASE("the pure mapping round-trips the seam tools", "[sourcesettings][mapping][seamtools]") {
+    // [WP-SEAMTOOLS] A spread of each slider, both ways; an older project's
+    // zero bytes show the defaults it renders with; hostile values land on a
+    // stored value, never on a blob that needs repair.
+    for (const double blend : {0.2, 1.5, 4.05, 8.0}) {
+        for (const double parallax : {0.0, 0.35, 2.4}) {
+            for (const double smoothing : {0.0, 1.25, 8.0}) {
+                for (const double offset : {-3.0, -0.5, 0.0, 2.99}) {
+                    ControlValues c;
+                    c.seamBlendDeg = blend;
+                    c.parallaxBlendDeg = parallax;
+                    c.seamSmoothingDeg = smoothing;
+                    c.nearOffsetDeg = offset;
+                    c.farOffsetDeg = -offset;
+                    const PrefsBlob blob = prefsFromControls(c);
+                    INFO("blend " << blend << ", parallax " << parallax << ", smoothing " << smoothing << ", offset "
+                                  << offset);
+                    REQUIRE(blob.isValid());
+                    PrefsBlob copy = blob;
+                    CHECK(copy.sanitise());
+                    const ControlValues back = controlsFromPrefs(blob);
+                    CHECK(back.seamBlendDeg == Catch::Approx(blend));
+                    CHECK(back.parallaxBlendDeg == Catch::Approx(parallax));
+                    CHECK(back.seamSmoothingDeg == Catch::Approx(smoothing));
+                    CHECK(back.nearOffsetDeg == Catch::Approx(offset));
+                    CHECK(back.farOffsetDeg == Catch::Approx(-offset));
+                }
+            }
+        }
+    }
+    PrefsBlob old = PrefsBlob::defaults();
+    std::memset(reinterpret_cast<std::uint8_t*>(&old) + offsetof(PrefsBlob, seamBlend), 0, 8);
+    const ControlValues shown = controlsFromPrefs(old);
+    CHECK(shown.seamBlendDeg == Catch::Approx(1.5));
+    CHECK(shown.parallaxBlendDeg == Catch::Approx(0.35));
+    CHECK(shown.seamSmoothingDeg == 0.0);
+    for (const double hostile : {-1e9, -8.0, std::numeric_limits<double>::quiet_NaN(), 1e9}) {
+        ControlValues c;
+        c.seamBlendDeg = hostile;
+        c.parallaxBlendDeg = hostile;
+        c.seamSmoothingDeg = hostile;
+        c.nearOffsetDeg = hostile;
+        c.farOffsetDeg = hostile;
+        PrefsBlob blob = prefsFromControls(c);
+        INFO("hostile " << hostile);
+        CHECK(blob.sanitise());
+        CHECK(blob.seamBlendDeg() >= 0.2);
+        CHECK(blob.seamBlendDeg() <= 8.0);
+        CHECK(std::fabs(blob.nearOffsetDeg()) <= 3.0);
+    }
 }
 
 TEST_CASE("the pure mapping rejects an invalid blob", "[sourcesettings][mapping]") {

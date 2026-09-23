@@ -25,6 +25,8 @@
 #include "osv/meta/FormatDetector.h"
 #include "osv/meta/MetadataTrack.h"
 #include "osv/container/OsvFile.h"
+#include "osv/render/RenderJob.h"
+#include "osv/render/SeamTools.h"
 #include "osv/video/DualStreamReader.h"
 
 #include <catch2/catch_approx.hpp>
@@ -32,6 +34,7 @@
 
 #include <cuda.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -230,6 +233,9 @@ TEST_CASE("the engine serves a frame as device planes in the caller's context, p
     for (int i = 0; i < 9; ++i) {
         CHECK(frame.bodyFromWorld[i] == frame.stitch.Rout[i]);
     }
+    // [WP-SEAMTOOLS] Default Source Settings: no seam smoothing, no low band.
+    CHECK(frame.stitch.seamSmoothEnabled == 0);
+    CHECK(frame.seamLowDevice == nullptr);
 
     // ---- the planes live in OUR context -------------------------------------
     for (const OsvPlane& plane : frame.planes) {
@@ -479,4 +485,99 @@ TEST_CASE("a device frame carries the fitted sun ghosts in its stitch block, and
         CHECK(frame.stitch.flare[1].ghostCount == 0);
         api.release(frame.lease, nullptr);
     }
+}
+
+// =============================================================================
+//  [WP-SEAMTOOLS] the seam smoothing's low band reaches the direct path
+// =============================================================================
+
+TEST_CASE("with Seam Smoothing on, the engine carries the frame's low band in the caller's context",
+          "[importer][engine][seamtools][cuda][sample]") {
+    if (!sampleClipAvailable()) {
+        SKIP("the sample clip is not present at " << sampleClipPath().string());
+    }
+    TestContext cuda;  // before the harness: outlives imShutdown
+    if (!cuda.context) {
+        SKIP("CUDA unavailable: " << cuda.reason);
+    }
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const EngineApi api = resolveEngine();
+    REQUIRE(api.ok());
+    const std::wstring path = sampleClipPath().wstring();
+    char error[512] = {};
+
+    // ---- the user turns Seam Smoothing to 2 deg in Source Settings -------------
+    osv::premiere::PrefsBlob prefs = osv::premiere::PrefsBlob::defaults();
+    prefs.setSeamSmoothingDeg(2.0);
+    auto clip = harness.openClip(sampleClipPath(), 91);
+    REQUIRE(clip.open());
+    imFileInfoRec8 info{};
+    REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+
+    constexpr std::uint32_t kFrame = 9;
+    OsvEngineFrameRequest request = requestFor(path, kFrame, cuda.context);
+    OsvEngineFrame frame = emptyFrame();
+    const std::int32_t rc = api.acquire(&request, &frame, error, sizeof(error));
+    INFO("engine error: " << error);
+    REQUIRE(rc == OSV_ENGINE_OK);
+
+    // ---- the block and the table ------------------------------------------------
+    // The default stitch carves a seam, so the smoothing is on, sized from the
+    // 3000 x 3000 lenses, with its 2 deg half width.
+    REQUIRE(frame.stitch.blendSeamEnabled == 1);
+    REQUIRE(frame.stitch.seamSmoothEnabled == 1);
+    CHECK(frame.stitch.seamLowW == 375);
+    CHECK(frame.stitch.seamLowH == 375);
+    CHECK(frame.stitch.seamSmoothHalfRad == Catch::Approx(2.0 * 3.14159265358979 / 180.0));
+    REQUIRE(frame.seamLowDevice != nullptr);
+    const std::size_t floats = 2u * 375u * 375u * 4u;
+    std::vector<float> device(floats);
+    REQUIRE(cuCtxPushCurrent(cuda.context) == CUDA_SUCCESS);
+    CHECK(contextOf(frame.seamLowDevice) == cuda.context);
+    // Synchronous copy on the legacy stream: orders after the engine's build
+    // on the request's (null = default) stream.
+    REQUIRE(cuMemcpyDtoH(device.data(), static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(frame.seamLowDevice)),
+                         floats * sizeof(float)) == CUDA_SUCCESS);
+    CUcontext popped = nullptr;
+    (void)cuCtxPopCurrent(&popped);
+
+    // ---- ...and it is the low band of THIS frame -----------------------------------
+    // Built again on the host from the software decode of the same frame with
+    // the same block: the same numbers up to the GPU's float rounding.
+    auto file = osv::OsvFile::open(sampleClipPath());
+    REQUIRE(file.ok());
+    auto track = osv::meta::MetadataTrack::load(file.value());
+    REQUIRE(track.ok());
+    auto format = osv::meta::FormatDetector::detect(file.value(), &track.value());
+    REQUIRE(format.ok());
+    auto reader = osv::video::DualStreamReader::open(sampleClipPath(), format.value());
+    REQUIRE(reader.ok());
+    auto host = reader.value().read(kFrame);
+    REQUIRE(host.ok());
+    OsvPlane planes[2] = {};
+    REQUIRE(osv::render::fillPlane(host.value().lens[0], planes[0]));
+    REQUIRE(osv::render::fillPlane(host.value().lens[1], planes[1]));
+    std::vector<float> reference;
+    std::vector<float> scratch;
+    REQUIRE(osv::render::buildSeamLowBand(frame.stitch, planes, reference, scratch, nullptr).ok());
+    REQUIRE(reference.size() == floats);
+    double worst = 0.0;
+    std::size_t covered = 0;
+    for (std::size_t i = 0; i < floats; i += 4) {
+        const double a = reference[i + 3];
+        CHECK(std::fabs(device[i + 3] - reference[i + 3]) < 1e-5);  // coverage: the same rule, exactly or nearly
+        if (a > 0.05) {
+            ++covered;
+            for (int c = 0; c < 3; ++c) {
+                const double r = reference[i + static_cast<std::size_t>(c)] / a;
+                const double d = device[i + static_cast<std::size_t>(c)] / device[i + 3];
+                worst = std::max(worst, std::fabs(d - r) / std::max(1e-3, std::fabs(r)));
+            }
+        }
+    }
+    INFO("worst relative difference over " << covered << " covered texels: " << worst);
+    CHECK(covered > floats / 4 / 2);
+    CHECK(worst < 1e-3);
+    api.release(frame.lease, nullptr);
 }
