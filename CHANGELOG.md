@@ -6,6 +6,26 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+* **macOS on Apple Silicon (untested in Premiere Pro).** The library,
+  `osvtool` and the test-suite build with AppleClang and pass on GitHub's
+  macOS runners (`.github/workflows/macos.yml`, presets `macos-*`, vcpkg
+  triplet `arm64-osx-openosv`). A Metal renderer (`--device metal`, first
+  in `auto`) matches the CPU reference to the same 60 dB bar as CUDA and
+  OpenCL; hardware decode is VideoToolbox. The importer, Open 360 Reframe
+  and the Source Settings effect build as Mac bundles with their own FFmpeg
+  inside, and the effect's GPU path is Metal. The plug-ins build on CI only
+  when a private SDK archive is configured, since Adobe's SDKs are never
+  committed; the parts that need no SDK - including the effect's Metal path
+  against its CPU path and the bundle layout - are tested there.
+  `scripts/install_plugins.sh` installs the bundles, LUTs, sequence presets
+  and the panel; `scripts/package_macos.sh` makes
+  `OpenOSV-<version>-macos-arm64.zip`. Not on a Mac yet: the direct GPU
+  path (CUDA), the neural flow backend and the modal Source Settings dialog
+  (the Source Settings effect does that job). Windows builds and output are
+  unchanged. See [docs/BUILDING_MAC.md](docs/BUILDING_MAC.md).
+
 ## [0.1.0] - 2026-09-23
 
 ### Added
