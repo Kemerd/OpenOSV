@@ -127,7 +127,11 @@ private:
 
 int runRender(const RenderOptions& o) {
     // ---- open the pipeline ------------------------------------------------------
-    auto pipe = Pipeline::open(o.pipeline, true);
+    // The per-frame analyses shade bands from host planes, so they decide
+    // whether a CUDA decode may keep its frames on the GPU.
+    PipelineOptions pipelineOptions = o.pipeline;
+    pipelineOptions.hostFramesRequired = o.seamSearch || o.gain || o.parallax;
+    auto pipe = Pipeline::open(pipelineOptions, true);
     if (!pipe.ok()) {
         std::fprintf(stderr, "error: %s\n", log::safe(pipe.value() ? "" : pipe.error().toString()).c_str());
         return pipe.error().code == ErrorCode::Io || pipe.error().code == ErrorCode::Malformed ? kExitInput

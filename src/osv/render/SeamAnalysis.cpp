@@ -67,6 +67,13 @@ Result<std::vector<float>> shadeRows(const RenderJob& job, std::uint32_t row0, s
     if (!job.valid()) {
         return Error{ErrorCode::InvalidArgument, "shadeRows: invalid render job"};
     }
+    // The bands are shaded on the CPU; GPU-resident frames would be read as
+    // host memory and fault (an access violation, seen with
+    // `osvtool --hw cuda --device cuda --seam-search`).
+    if (job.planesOnDevice[0] || job.planesOnDevice[1]) {
+        return Error{ErrorCode::InvalidArgument,
+                     "shadeRows: the frames are on the GPU; the band analyses need host frames"};
+    }
     const OsvRenderParams params = job.params;
     if (row1 <= row0 || row1 > static_cast<std::uint32_t>(params.outH)) {
         return Error{ErrorCode::InvalidArgument, "shadeRows: row range outside the map"};

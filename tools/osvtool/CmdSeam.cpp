@@ -127,7 +127,10 @@ Result<geom::LensRig> variantRig(const Pipeline& P, std::optional<double> scaleO
 }
 
 int runSeam(const SeamOptions& o) {
-    auto pipe = Pipeline::open(o.pipeline, false);
+    // Every seam measurement shades bands from host planes.
+    PipelineOptions pipelineOptions = o.pipeline;
+    pipelineOptions.hostFramesRequired = true;
+    auto pipe = Pipeline::open(pipelineOptions, false);
     if (!pipe.ok()) {
         std::fprintf(stderr, "error: %s\n", log::safe(pipe.error().toString()).c_str());
         return pipe.error().code == ErrorCode::Io ? kExitInput : kExitRuntime;

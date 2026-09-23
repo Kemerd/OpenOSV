@@ -249,20 +249,33 @@ Result<RenderJob> RenderParamsBuilder::build(const video::FramePair& frames) con
     job.params = params;
     for (std::size_t i = 0; i < 2; ++i) {
         const video::PlanarFrame16& f = frames.lens[i];
-        if (!f.valid()) {
-            return Error{ErrorCode::InvalidArgument, "RenderParamsBuilder: lens frame " + std::to_string(i) + " is invalid"};
+        const video::DeviceFrameRef& dev = frames.device[i];
+        // A frame the decoder left on the GPU (keepOnDevice) carries its size
+        // and timing but NO host planes, so f.valid() is false for it by
+        // design.  Rejecting that as "invalid" is what broke
+        // `osvtool --hw cuda --device cuda` ("lens frame 0 is invalid"):
+        // exactly the zero-copy path the CUDA renderer was written for.
+        const bool onHost = f.valid();
+        const bool onDevice = !onHost && dev.valid();
+        if (!onHost && !onDevice) {
+            return Error{ErrorCode::InvalidArgument, "RenderParamsBuilder: lens frame " + std::to_string(i) +
+                                                         " has neither host planes nor a device frame"};
         }
-        if (static_cast<int>(f.width) != params.lens[i].width || static_cast<int>(f.height) != params.lens[i].height) {
+        const std::uint32_t fw = onHost ? f.width : dev.width;
+        const std::uint32_t fh = onHost ? f.height : dev.height;
+        if (static_cast<int>(fw) != params.lens[i].width || static_cast<int>(fh) != params.lens[i].height) {
             return Error{ErrorCode::InvalidArgument,
-                         "RenderParamsBuilder: frame size does not match the rig (" + std::to_string(f.width) + "x" +
-                             std::to_string(f.height) + " vs " + std::to_string(params.lens[i].width) + "x" +
+                         "RenderParamsBuilder: frame size does not match the rig (" + std::to_string(fw) + "x" +
+                             std::to_string(fh) + " vs " + std::to_string(params.lens[i].width) + "x" +
                              std::to_string(params.lens[i].height) + ")"};
         }
-        if (!fillPlane(f, job.planes[i])) {
+        const bool described = onHost ? fillPlane(f, job.planes[i]) : fillDevicePlane(dev, job.planes[i]);
+        if (!described) {
             return Error{ErrorCode::InvalidArgument, "RenderParamsBuilder: cannot describe lens frame"};
         }
+        job.planesOnDevice[i] = onDevice;
         job.frames[i] = f;
-        job.deviceFrames[i] = frames.device[i];
+        job.deviceFrames[i] = dev;
     }
     job.seamShiftDeg = m_seam;
     job.warpGrid = m_warp;

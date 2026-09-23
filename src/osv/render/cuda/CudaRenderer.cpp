@@ -221,6 +221,13 @@ struct CudaRenderer::Impl {
             const video::DeviceFrameRef& ref = job.deviceFrames[static_cast<std::size_t>(i)];
             if (ref.valid() && ref.deviceIndex == device) {
                 describeDeviceFrame(ref, job.planes[static_cast<std::size_t>(i)], devPlanes[i]);
+            } else if (job.planesOnDevice[static_cast<std::size_t>(i)]) {
+                // Device-only frame decoded on ANOTHER GPU: there is no host
+                // copy to upload from, and a peer copy is not worth the
+                // complexity for a configuration nobody runs.
+                return failStatus(ErrorCode::InvalidArgument,
+                                  "CudaRenderer: lens frame " + std::to_string(i) + " lives on CUDA device " +
+                                      std::to_string(ref.deviceIndex) + ", not on device " + std::to_string(device));
             } else {
                 OSV_TRY(uploadPlane(i, job.planes[static_cast<std::size_t>(i)], devPlanes[i]));
             }

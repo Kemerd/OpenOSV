@@ -21,6 +21,14 @@ struct RenderJob {
     std::array<OsvPlane, 2> planes{};            ///< Host plane descriptors (CPU / upload path).
     std::array<video::PlanarFrame16, 2> frames{};///< Keeps the decoded frames alive for the job's lifetime.
     std::array<video::DeviceFrameRef, 2> deviceFrames{}; ///< Optional GPU-resident inputs (CUDA zero-copy).
+
+    /// True for a lens whose `planes` entry holds DEVICE pointers, because the
+    /// decoder left that frame on the GPU and never copied it to the host
+    /// (DecoderOptions::keepOnDevice).  Only a GPU backend on the same device
+    /// can read such a job; the CPU and OpenCL backends refuse it rather than
+    /// dereference device addresses.
+    std::array<bool, 2> planesOnDevice{false, false};
+
     std::vector<float> seamShiftDeg;             ///< Per-column seam table (empty when disabled).
 
     /// 2-D parallax warp grid, interleaved (u, v) radians, warpW * warpH
@@ -73,6 +81,28 @@ inline bool fillPlane(const video::PlanarFrame16& frame, OsvPlane& out) noexcept
     out.strideC = static_cast<int>(frame.strideElems[1]);
     out.bitShift = frame.bitShift;
     out.chromaInterleaved = frame.chromaInterleaved ? 1 : 0;
+    return true;
+}
+
+/// Fill an OsvPlane descriptor from a GPU-resident decoded frame: luma plus
+/// interleaved CbCr (NV12 / P010 surfaces), one pitch for both planes.  The
+/// pointers are DEVICE addresses - see RenderJob::planesOnDevice.  Returns
+/// false when the reference is not valid.
+inline bool fillDevicePlane(const video::DeviceFrameRef& ref, OsvPlane& out) noexcept {
+    if (!ref.valid() || ref.pitchBytes % sizeof(osv_u16) != 0) {
+        return false;
+    }
+    out.y = static_cast<const osv_u16*>(ref.yDevice);
+    out.u = static_cast<const osv_u16*>(ref.uvDevice);
+    out.v = out.u + 1;  // interleaved: Cr follows Cb, the sampler steps by 2
+    out.w = static_cast<int>(ref.width);
+    out.h = static_cast<int>(ref.height);
+    out.cw = static_cast<int>((ref.width + 1) / 2);
+    out.ch = static_cast<int>((ref.height + 1) / 2);
+    out.strideY = static_cast<int>(ref.pitchBytes / sizeof(osv_u16));
+    out.strideC = out.strideY;
+    out.bitShift = ref.bitShift;
+    out.chromaInterleaved = 1;
     return true;
 }
 

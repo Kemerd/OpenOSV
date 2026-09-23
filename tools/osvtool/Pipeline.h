@@ -63,6 +63,13 @@ struct PipelineOptions {
     std::string hw = "none";                      ///< none | d3d11va | cuda | auto
     std::string device = "auto";                  ///< cpu | cuda | opencl | auto
     int threads = 0;
+
+    /// True when a per-frame analysis (seam search, gain match, parallax)
+    /// reads the decoded pixels on the CPU.  Those analyses shade bands from
+    /// HOST planes, so a CUDA decode must then copy its frames back instead
+    /// of leaving them on the GPU for the zero-copy render.  Not a flag -
+    /// the command sets it from the analyses it was asked for.
+    bool hostFramesRequired = false;
 };
 
 /// Register the option flags shared by the commands on `sub`.

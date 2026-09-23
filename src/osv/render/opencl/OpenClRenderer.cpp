@@ -317,6 +317,10 @@ Result<ImageRGBAf> OpenClRenderer::render(const RenderJob& job) {
     if (!job.valid()) {
         return Error{ErrorCode::InvalidArgument, "OpenClRenderer: invalid render job"};
     }
+    // CUDA device addresses mean nothing to an OpenCL context.
+    if (job.planesOnDevice[0] || job.planesOnDevice[1]) {
+        return Error{ErrorCode::InvalidArgument, "OpenClRenderer: the lens frames are CUDA device frames"};
+    }
     Impl& impl = *m_impl;
     std::lock_guard<std::mutex> lock(impl.mutex);
 

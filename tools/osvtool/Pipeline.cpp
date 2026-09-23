@@ -204,7 +204,10 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
         return Error{ErrorCode::InvalidArgument, "unknown --hw '" + options.hw + "'"};
     }
     decOpt.threads = options.threads;
-    decOpt.keepOnDevice = (decOpt.hw == video::HwAccel::Cuda) && lower(options.device) != "cpu";
+    // Zero-copy (frames stay on the GPU) only when nothing needs them on the
+    // host: the CPU renderer and the band analyses both read host planes.
+    decOpt.keepOnDevice =
+        (decOpt.hw == video::HwAccel::Cuda) && lower(options.device) != "cpu" && !options.hostFramesRequired;
     OSV_TRY_ASSIGN(video::DualStreamReader reader, video::DualStreamReader::open(options.input, p->format, decOpt));
     p->reader = std::make_unique<video::DualStreamReader>(std::move(reader));
 

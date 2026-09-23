@@ -18,6 +18,12 @@ Status CpuRenderer::renderInto(const RenderJob& job, ImageRGBAf& image) {
     if (!job.valid()) {
         return failStatus(ErrorCode::InvalidArgument, "CpuRenderer: invalid render job");
     }
+    // A job whose planes are GPU addresses (a keepOnDevice decode) cannot be
+    // read from the host; dereferencing them would fault.
+    if (job.planesOnDevice[0] || job.planesOnDevice[1]) {
+        return failStatus(ErrorCode::InvalidArgument,
+                          "CpuRenderer: the lens frames are on the GPU (decode with keepOnDevice = false for the CPU)");
+    }
     // Reuse the caller's allocation.  No zero-fill is needed: the loop below
     // writes every pixel of every row.
     OSV_TRY(image.reshape(static_cast<std::uint32_t>(job.params.outW), static_cast<std::uint32_t>(job.params.outH)));

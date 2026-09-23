@@ -269,6 +269,64 @@ TEST_CASE("RenderParamsBuilder validates its inputs", "[render]") {
     REQUIRE(sizeof(OsvRenderParams) <= 4096);
 }
 
+TEST_CASE("a frame the decoder left on the GPU builds a device job that host renderers refuse", "[render]") {
+    // A keepOnDevice decode delivers PlanarFrame16s with a size but NO host
+    // planes, plus a DeviceFrameRef.  The builder used to reject exactly that
+    // ("lens frame 0 is invalid"), which broke the zero-copy CUDA path it was
+    // designed for.  The pointers below are never dereferenced: the builder
+    // only describes them, and the CPU renderer must refuse the job instead
+    // of reading them as host memory.
+    auto rig = makeSampleRig(600);
+    REQUIRE(rig.ok());
+    std::vector<std::uint16_t> fakeY(16), fakeUv(16);  // addresses only
+    video::FramePair pair;
+    for (int i = 0; i < 2; ++i) {
+        video::PlanarFrame16& f = pair.lens[static_cast<std::size_t>(i)];
+        f.width = 600;
+        f.height = 600;
+        REQUIRE_FALSE(f.valid());  // no host planes, as the decoder leaves it
+        video::DeviceFrameRef& d = pair.device[static_cast<std::size_t>(i)];
+        d.yDevice = fakeY.data();
+        d.uvDevice = fakeUv.data();
+        d.pitchBytes = 1280;  // P010 rows padded past 600 * 2 bytes
+        d.width = 600;
+        d.height = 600;
+        d.bitDepth = 10;
+        d.bitShift = 6;
+        REQUIRE(d.valid());
+    }
+    geom::VirtualCamera cam;
+    cam.w = 64;
+    cam.h = 36;
+    const OsvColorParams cp = color::makeColorParams(color::DlogMFit::DjiRefit, color::OutputTransfer::PQ, 0.0f);
+    auto job = render::RenderParamsBuilder().rig(rig.value()).camera(cam).color(cp).build(pair);
+    REQUIRE(job.ok());
+    for (int i = 0; i < 2; ++i) {
+        const OsvPlane& pl = job.value().planes[static_cast<std::size_t>(i)];
+        CHECK(job.value().planesOnDevice[static_cast<std::size_t>(i)]);
+        CHECK(pl.y == fakeY.data());
+        CHECK(pl.u == fakeUv.data());
+        CHECK(pl.v == fakeUv.data() + 1);
+        CHECK(pl.chromaInterleaved == 1);
+        CHECK(pl.strideY == 640);
+        CHECK(pl.bitShift == 6);
+    }
+    ThreadPool pool(2);
+    render::CpuRenderer cpu(pool);
+    auto img = cpu.render(job.value());
+    REQUIRE_FALSE(img.ok());
+    CHECK(img.error().code == ErrorCode::InvalidArgument);
+
+    // And a frame with neither host planes nor a device frame is still an
+    // error, with a message that says which.
+    video::FramePair empty;
+    empty.lens[0].width = empty.lens[1].width = 600;
+    empty.lens[0].height = empty.lens[1].height = 600;
+    auto bad = render::RenderParamsBuilder().rig(rig.value()).camera(cam).color(cp).build(empty);
+    REQUIRE_FALSE(bad.ok());
+    CHECK(bad.error().message.find("neither host planes nor a device frame") != std::string::npos);
+}
+
 // -----------------------------------------------------------------------------
 //  Sample clip
 // -----------------------------------------------------------------------------
@@ -483,6 +541,56 @@ TEST_CASE("CUDA renderer matches the CPU reference", "[render][sample][cuda]") {
     auto r = render::CudaRenderer::create(0);
     REQUIRE(r.ok());
     checkParity(*r.value(), "cuda");
+}
+
+TEST_CASE("a zero-copy NVDEC frame renders like the software-decoded one", "[render][sample][cuda][hwaccel]") {
+    // End to end through the path the direct-GPU pipeline is built on: NVDEC
+    // decodes into device memory (keepOnDevice), the builder describes those
+    // surfaces in place, and the CUDA renderer samples them with no host
+    // copy.  HEVC decoding is bit-exact by specification, so the only
+    // differences allowed are the renderer's own GPU-vs-GPU nothing: the
+    // same kernel on the same device, fed P010 instead of yuv420p10.
+    OSV_REQUIRE_SAMPLE();
+    std::string reason;
+    if (!render::CudaRenderer::available(&reason)) {
+        SKIP("CUDA unavailable: " << reason);
+    }
+    auto sp = openSampleFrame(7);  // not a keyframe: the decoder has to run forward
+    REQUIRE(sp.ok());
+
+    video::DecoderOptions opt;
+    opt.hw = video::HwAccel::Cuda;
+    opt.keepOnDevice = true;
+    auto reader = video::DualStreamReader::open(osvtest::sampleOsv(), sp.value().format, opt);
+    if (!reader.ok()) {
+        SKIP("NVDEC unavailable: " << reader.error().message);
+    }
+    auto devicePair = reader.value().read(7);
+    REQUIRE(devicePair.ok());
+    REQUIRE(devicePair.value().onDevice());
+
+    const OsvColorParams cp = color::makeColorParams(color::DlogMFit::DjiRefit, color::OutputTransfer::PQ, 0.0f);
+    geom::VirtualCamera cam;
+    cam.w = 1920;
+    cam.h = 1080;
+    cam.hfovDeg = 100;
+    cam.yawDeg = 80;  // looks across the seam
+    auto hostJob = render::RenderParamsBuilder().rig(sp.value().rig).camera(cam).color(cp).build(sp.value().pair);
+    auto devJob = render::RenderParamsBuilder().rig(sp.value().rig).camera(cam).color(cp).build(devicePair.value());
+    REQUIRE(hostJob.ok());
+    REQUIRE(devJob.ok());
+    REQUIRE(devJob.value().planesOnDevice[0]);
+    REQUIRE(devJob.value().planesOnDevice[1]);
+
+    auto gpu = render::CudaRenderer::create(0);
+    REQUIRE(gpu.ok());
+    auto a = gpu.value()->render(hostJob.value());
+    auto b = gpu.value()->render(devJob.value());
+    REQUIRE(a.ok());
+    REQUIRE(b.ok());
+    const render::ImageDiffStats stats = render::compareImages16(a.value(), b.value());
+    INFO("host-decoded vs NVDEC zero-copy: PSNR " << stats.psnrDb << " dB, max " << stats.maxAbsCode << " codes");
+    CHECK(stats.maxAbsCode <= 1);
 }
 #endif
 

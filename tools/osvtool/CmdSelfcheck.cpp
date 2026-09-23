@@ -124,6 +124,7 @@ void checkMath() {
 void checkClip(const PipelineOptions& po) {
     PipelineOptions opt = po;
     opt.device = "cpu";
+    opt.hostFramesRequired = true;  // the seam NCC check reads host planes
     auto pipe = Pipeline::open(opt, true);
     report("open clip", pipe.ok(), pipe.ok() ? pipe.value()->format.cameraModel : pipe.error().toString());
     if (!pipe.ok()) {
