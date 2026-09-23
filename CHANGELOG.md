@@ -8,6 +8,50 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ### Added
 
+* **Carved stitch seam (WP-SEAM).** Inside the overlap each lens now shows
+  only on its own side of a seam carved where the lenses agree (dynamic
+  programming over a closed longitude ring, stick mask and flare / rim costs
+  steering it), with a 0.35-1.5 deg feather instead of the old 4 deg 50/50
+  mix. The doubled wing fin is gone: ghost energy 76 -> 6 (x1000 luma), seam
+  motion 0.0001 deg/frame. On whenever Seam search is on.
+* **DJI's camera in the reframe effect (WP-CAMERA).** Camera Model "DJI" adds
+  DJI Studio's FOV (vertical pinhole angle), Correction Angle (eye distance
+  behind the sphere centre) and its read-out Zoom, recovered from DJI Studio
+  and DJI's Premiere plug-in; the same numbers give the same framing. DJI
+  preset values, a Drag Sensitivity control (default 2.0), and popups read
+  correctly whether the host numbers them from 0 or 1.
+* **Source Settings reach the Program monitor (WP-SETTINGS).** The engine
+  keys clips by file identity (volume serial + file index), the newest
+  importer instance's settings win, and every frame carries a settings
+  generation. New per-clip "Program Monitor Colour": Sequence space (fast,
+  the default) or Match Source monitor.
+* **Calibration that tells the truth (WP-CALIB).** Auto follows the recorded
+  accessory; the menu says which set each choice really uses; DJI's
+  lens-protector field-angle correction (our own fit) is folded into the rig
+  for protector clips and verified on frame 0. OK in the Source Settings
+  dialog no longer resets hidden settings.
+* **DJI Studio's Rec.709 look (WP-LOOK)** as the default Rec.709 rendering:
+  a 46-constant fitted model (no DJI data shipped), dE2000 vs DJI 2.15 -> 0.50
+  on the sample. "OpenOSV standard" stays selectable.
+* **Sun ghost removal (WP-FLARE).** Internal-reflection ghosts are detected,
+  fitted and subtracted in linear light before the blend; +23.6 % -> +0.2 %
+  on the sample's pill ghost, zero pixels touched elsewhere. On for new
+  clips; playback never waits for the fit.
+* **Photometric seam field (WP-PHOTO).** Render-only seam edge inset, lens
+  gain from trusted pixels only, a per-longitude usable rim and a 2-D log gain
+  field per analysis bucket: the sky seam's light line x0.71 and colour step
+  x0.34 on the default stitch.
+* **HDR at 16/32 bits and the importer's frame on the GPU (WP-IMPORTER).**
+  PQ/HLG clips are never handed to Premiere as 8-bit; the importer decodes on
+  NVDEC, stitches from VRAM and packs on the GPU (park 83-116 -> 46-64 ms).
+* **Warm reopen (WP-REOPEN).** Shared hardware devices, deferred first frame,
+  parallel lens opens, and parked readers / NVDEC decoders: a reopen or
+  unquiet of a seen clip costs ~0-14 ms instead of 100-430 ms.
+* **End-to-end direct-path test (WP-E2E)** through the mock host with the real
+  .aex and .prm; the GPU parameter probe now reads Premiere 26.2's real
+  parameter list (before, Source Roll read Source Pan's value and several
+  controls were ignored on the GPU path).
+* **Engine ABI version 2** for all of the above.
 * **`video::GpuClipDecoder`: both lenses decoded by NVDEC straight into the
   VRAM of the caller's CUDA context, with a GOP-aware frame cache and
   decode-ahead** (work package A of docs/DIRECT_GPU.md).  A park that used to
