@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -450,6 +451,58 @@ TEST_CASE("The committed LUTs match the current pipeline", "[color][cube]") {
         INFO((st.ok() ? std::string("ok") : st.error().toString()));
         REQUIRE(st.ok());
 
+#if !defined(_MSC_VER)
+        // The committed LUTs are generated on Windows.  Another platform's
+        // math library rounds a transcendental differently in the last ulp
+        // now and then (Apple's powf / exp2f do), which moves the sixth
+        // printed decimal of a few entries - so here the files are compared
+        // as numbers: every header line equal, every value within a few units
+        // of that decimal.  A real pipeline change moves thousands of entries
+        // by far more than that.
+        {
+            constexpr double kTolerance = 5e-6;
+            std::ifstream ta(committed);
+            std::ifstream tb(fresh);
+            REQUIRE(ta.good());
+            REQUIRE(tb.good());
+            std::string la;
+            std::string lb;
+            std::size_t lineNo = 0;
+            double worst = 0.0;
+            std::size_t worstLine = 0;
+            for (;;) {
+                const bool gotA = static_cast<bool>(std::getline(ta, la));
+                const bool gotB = static_cast<bool>(std::getline(tb, lb));
+                ++lineNo;
+                INFO("line " << lineNo);
+                REQUIRE(gotA == gotB);
+                if (!gotA) {
+                    break;
+                }
+                // Header lines (TITLE, LUT_3D_SIZE, DOMAIN_*) must be identical.
+                const bool numeric = !la.empty() && (std::isdigit(static_cast<unsigned char>(la[0])) != 0 ||
+                                                     la[0] == '-' || la[0] == '.');
+                if (!numeric) {
+                    REQUIRE(la == lb);
+                    continue;
+                }
+                double va[3] = {0.0, 0.0, 0.0};
+                double vb[3] = {0.0, 0.0, 0.0};
+                REQUIRE(std::sscanf(la.c_str(), "%lf %lf %lf", &va[0], &va[1], &va[2]) == 3);
+                REQUIRE(std::sscanf(lb.c_str(), "%lf %lf %lf", &vb[0], &vb[1], &vb[2]) == 3);
+                for (int c = 0; c < 3; ++c) {
+                    const double d = std::fabs(va[c] - vb[c]);
+                    if (d > worst) {
+                        worst = d;
+                        worstLine = lineNo;
+                    }
+                }
+            }
+            INFO("largest difference " << worst << " on line " << worstLine);
+            INFO("re-run scripts/gen_luts.ps1 and commit the result");
+            REQUIRE(worst <= kTolerance);
+        }
+#else
         // Sizes first, so a length mismatch reports a number rather than a
         // byte offset.
         const auto committedSize = std::filesystem::file_size(committed);
@@ -494,6 +547,7 @@ TEST_CASE("The committed LUTs match the current pipeline", "[color][cube]") {
         }
         INFO("first differing byte offset: " << firstDiff);
         REQUIRE(firstDiff == kNoDiff);
+#endif
     }
 }
 
