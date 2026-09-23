@@ -36,6 +36,7 @@
 
 #include "osv/video/GpuClipDecoder.h"
 
+#include "FileIdentity.h"
 #include "osv/core/Log.h"
 #include "osv/video/Decoder.h"
 #include "osv/video/HwAccel.h"
@@ -47,6 +48,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -561,6 +563,12 @@ struct GpuClipDecoder::Impl {
     std::uint32_t aheadEnd = 0;              ///< Last frame of the decode-ahead window.
     std::thread worker;                      ///< Decode-ahead thread (absent when the window is 0).
 
+    // ---- what open() was given (GpuDecoderPool matches on these) ----------------
+    std::filesystem::path openPath;              ///< Path as passed to open().
+    GpuDecoderOptions openOptions;               ///< Options as passed to open().
+    std::array<std::uint32_t, 2> openTracks{};   ///< Lens tracks (videoTrackIds).
+    std::wstring openIdentity;                   ///< detail::fileIdentity at open (empty = unknown).
+
     ~Impl() { shutdown(); }
 
     // -------------------------------------------------------------------------
@@ -723,14 +731,19 @@ struct GpuClipDecoder::Impl {
                 best = static_cast<std::int32_t>(i);
             }
         }
-        // 2. Grow while the budget allows (slots are allocated in order)
-        //    rather than evict a frame somebody may still want.
+        // 2. Grow while the budget allows rather than evict a frame somebody
+        //    may still want.  Slots are allocated in order, so without a trim
+        //    the first slot without VRAM is slots[allocatedSlots]; after
+        //    trimForIdle() gave some back they may sit anywhere, hence the
+        //    scan for the first one (at most one slot per frame of the clip).
         if (!bestIsEmpty && s.allocatedSlots < s.usableSlots && s.allocatedSlots < s.slots.size()) {
-            detail::GpuSlot& fresh = s.slots[s.allocatedSlots];
-            if (fresh.base == 0 && !fresh.writing) {
-                fresh.writing = true;
-                needsAllocation = true;
-                return static_cast<std::int32_t>(s.allocatedSlots);
+            for (std::size_t i = 0; i < s.slots.size(); ++i) {
+                detail::GpuSlot& fresh = s.slots[i];
+                if (fresh.base == 0 && !fresh.writing) {
+                    fresh.writing = true;
+                    needsAllocation = true;
+                    return static_cast<std::int32_t>(i);
+                }
             }
         }
         if (best < 0) {
@@ -1333,6 +1346,20 @@ Result<std::unique_ptr<GpuClipDecoder>> GpuClipDecoder::open(const std::filesyst
         impl.store = std::make_shared<detail::GpuFrameStore>();
         detail::GpuFrameStore& s = *impl.store;
 
+        // ---- what this decoder is (for GpuDecoderPool) --------------------------
+        // The file version is read BEFORE the decoders map the file: a parked
+        // decoder must be matched to the bytes it was opened on, never to a
+        // later rewrite of the same path.  A failure only keeps it out of pools.
+        impl.openPath = path;
+        impl.openOptions = options;
+        impl.openTracks = {format.videoTrackIds[0], format.videoTrackIds[1]};
+        {
+            auto identity = detail::fileIdentity(path);
+            if (identity.ok()) {
+                impl.openIdentity = std::move(identity).value();
+            }
+        }
+
         // ---- context: the caller's, or the primary one (never a new one) ------
         if (options.cuContext) {
             s.context = static_cast<CUcontext>(options.cuContext);
@@ -1750,6 +1777,218 @@ int GpuClipDecoder::deviceIndex() const noexcept {
     return (m_impl && m_impl->store) ? m_impl->store->deviceOrdinal : 0;
 }
 
+// -----------------------------------------------------------------------------
+//  Open record (GpuDecoderPool)
+// -----------------------------------------------------------------------------
+const std::filesystem::path& GpuClipDecoder::path() const noexcept {
+    static const std::filesystem::path kEmpty;
+    return m_impl ? m_impl->openPath : kEmpty;
+}
+
+GpuDecoderOptions GpuClipDecoder::options() const noexcept {
+    return m_impl ? m_impl->openOptions : GpuDecoderOptions{};
+}
+
+std::array<std::uint32_t, 2> GpuClipDecoder::trackIds() const noexcept {
+    return m_impl ? m_impl->openTracks : std::array<std::uint32_t, 2>{0u, 0u};
+}
+
+const std::wstring& GpuClipDecoder::fileIdentity() const noexcept {
+    static const std::wstring kEmpty;
+    return m_impl ? m_impl->openIdentity : kEmpty;
+}
+
+bool GpuClipDecoder::usesRetainedPrimaryContext() const noexcept {
+    return m_impl && m_impl->store && m_impl->store->context && m_impl->store->retainedPrimary;
+}
+
+// -----------------------------------------------------------------------------
+//  Context and device health
+// -----------------------------------------------------------------------------
+bool GpuClipDecoder::contextAlive() const noexcept {
+    if (!m_impl || !m_impl->store || !m_impl->store->context) {
+        return false;
+    }
+    const detail::GpuFrameStore& s = *m_impl->store;
+    if (s.retainedPrimary) {
+        // Our retain keeps the primary context from being destroyed by a
+        // release, but cuDevicePrimaryCtxReset / cudaDeviceReset anywhere in
+        // the process would still tear it down; "active" is how that shows.
+        unsigned int flags = 0;
+        int active = 0;
+        const CUresult r = cuDevicePrimaryCtxGetState(s.device, &flags, &active);
+        return r == CUDA_SUCCESS && active != 0;
+    }
+    // A caller's context: usable exactly when it can be made current.
+    ScopedContext ctx(s.context);
+    return ctx.ok();
+}
+
+Status GpuClipDecoder::deviceMemory(std::size_t& freeBytes, std::size_t& totalBytes) const noexcept {
+    freeBytes = 0;
+    totalBytes = 0;
+    if (!m_impl || !m_impl->store || !m_impl->store->context) {
+        return failStatus(ErrorCode::InvalidArgument, "decoder not open");
+    }
+    try {
+        ScopedContext ctx(m_impl->store->context);
+        if (!ctx.ok()) {
+            return Status(cuError("cuCtxPushCurrent", ctx.result()));
+        }
+        std::size_t f = 0;
+        std::size_t t = 0;
+        const CUresult r = cuMemGetInfo(&f, &t);
+        if (r != CUDA_SUCCESS) {
+            return Status(cuError("cuMemGetInfo", r));
+        }
+        freeBytes = f;
+        totalBytes = t;
+        return okStatus();
+    } catch (...) {
+        // Only the error text construction can throw.
+        return failStatus(ErrorCode::Internal, "deviceMemory: unknown failure");
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  trimForIdle
+// -----------------------------------------------------------------------------
+std::size_t GpuClipDecoder::trimForIdle(std::uint32_t keepFrames) noexcept {
+    if (!m_impl || !m_impl->store) {
+        return 0;
+    }
+    Impl& impl = *m_impl;
+    detail::GpuFrameStore& s = *impl.store;
+
+    /// What one freed slot owned, carried out of the lock to be released.
+    struct FreedSlot {
+        CUdeviceptr base = 0;
+        std::array<CUevent, 2> ready{};
+        std::vector<CUevent> releases;
+    };
+    std::vector<FreedSlot> freed;
+    try {
+        std::unique_lock<std::mutex> lock(s.mutex);
+        // ---- 1. nothing decodes ahead any more ----------------------------------
+        // The worker finishes at most the frame pair it is on and then sleeps
+        // (workerHasWorkLocked is false without an active run).
+        impl.aheadActive = false;
+        s.cv.notify_all();
+        const bool idle = s.cv.wait_for(lock, std::chrono::seconds(2),
+                                        [&impl] { return !impl.engineBusy || impl.stopping.load(); });
+        if (!idle || impl.stopping) {
+            // Somebody is still decoding (a caller that did not let go):
+            // trimming under it would buy nothing but risk.
+            return 0;
+        }
+
+        // ---- 2. which slots keep their VRAM ---------------------------------------
+        // Every allocated slot nobody pins or fills is a candidate.  The ones
+        // kept are the frame the host asked for LAST - the one on screen when
+        // the clip was put down, which is what the next request is most
+        // likely to want - and its nearest neighbours, forward first (the
+        // direction playback goes).  Recency of use would be the wrong
+        // measure: decode-ahead publishes frames the host never looked at
+        // with a later LRU stamp than the frame it did look at.  Before any
+        // request, the most recently used frames are kept instead.
+        std::vector<std::size_t> cached;
+        std::vector<std::size_t> release;
+        for (std::size_t i = 0; i < s.slots.size(); ++i) {
+            const detail::GpuSlot& slot = s.slots[i];
+            if (slot.base == 0 || slot.pins > 0 || slot.writing) {
+                continue;
+            }
+            if (slot.frame >= 0) {
+                cached.push_back(i);
+            } else {
+                release.push_back(i);  // allocated but empty: nothing to keep
+            }
+        }
+        const std::int64_t anchor = impl.lastRequest;
+        // Rank 0 = the anchor, then +1, -1, +2, -2, ... (ties impossible).
+        const auto rank = [anchor](std::int64_t frame) -> std::uint64_t {
+            const std::int64_t d = frame - anchor;
+            return d >= 0 ? static_cast<std::uint64_t>(d) * 2u : static_cast<std::uint64_t>(-d) * 2u + 1u;
+        };
+        std::sort(cached.begin(), cached.end(), [&s, anchor, &rank](std::size_t a, std::size_t b) {
+            if (anchor < 0) {
+                return s.slots[a].lastUse > s.slots[b].lastUse;
+            }
+            return rank(s.slots[a].frame) < rank(s.slots[b].frame);
+        });
+        for (std::size_t k = std::min<std::size_t>(keepFrames, cached.size()); k < cached.size(); ++k) {
+            release.push_back(cached[k]);
+        }
+
+        // ---- 3. detach them under the lock ---------------------------------------
+        // Once a slot's base is 0 it is simply "not allocated": the grow path
+        // may give it fresh VRAM at once, while the old memory travels out in
+        // `freed` and is released below.
+        freed.reserve(release.size());
+        for (const std::size_t i : release) {
+            detail::GpuSlot& slot = s.slots[i];
+            FreedSlot f;
+            f.base = slot.base;
+            f.ready = slot.ready;
+            f.releases = std::move(slot.releases);
+            slot.releases.clear();
+            if (slot.frame >= 0 && static_cast<std::size_t>(slot.frame) < s.frameToSlot.size()) {
+                s.frameToSlot[static_cast<std::size_t>(slot.frame)] = -1;
+            }
+            slot.base = 0;
+            slot.ready = {};
+            slot.frame = -1;
+            slot.readyConfirmed = false;
+            slot.lastUse = 0;
+            if (s.allocatedSlots > 0) {
+                --s.allocatedSlots;
+            }
+            freed.push_back(std::move(f));
+        }
+    } catch (...) {
+        // Allocation failure while collecting: whatever was detached is
+        // still released below; the rest simply stays cached.
+    }
+    if (freed.empty()) {
+        return 0;
+    }
+
+    // ---- 4. release outside the lock ----------------------------------------------
+    // Consumers that released on a stream left events: their kernels may still
+    // read the frame, so the memory waits for them, exactly as the store's
+    // destructor does.  The ready events cover our own copies into the slot.
+    std::size_t bytes = 0;
+    ScopedContext ctx(s.context);
+    if (!ctx.ok()) {
+        // The context is gone and took the memory with it.
+        return 0;
+    }
+    for (FreedSlot& f : freed) {
+        for (CUevent ev : f.releases) {
+            if (ev) {
+                cuEventSynchronize(ev);
+                cuEventDestroy(ev);
+            }
+        }
+        for (CUevent ev : f.ready) {
+            if (ev) {
+                cuEventSynchronize(ev);
+                cuEventDestroy(ev);
+            }
+        }
+        if (f.base) {
+            cuMemFree(f.base);
+            bytes += s.slotBytes;
+        }
+    }
+    try {
+        log::debug("video/gpu: trimmed for idle: {} slot(s), {} MiB of frame cache released, {} frame(s) kept",
+                   freed.size(), bytes >> 20, keepFrames);
+    } catch (...) {
+    }
+    return bytes;
+}
+
 #else  // !OSV_VIDEO_HAVE_CUDA
 
 // =============================================================================
@@ -1818,6 +2057,24 @@ std::uint32_t GpuClipDecoder::lensWidth() const noexcept { return 0; }
 std::uint32_t GpuClipDecoder::lensHeight() const noexcept { return 0; }
 void* GpuClipDecoder::cuContext() const noexcept { return nullptr; }
 int GpuClipDecoder::deviceIndex() const noexcept { return 0; }
+const std::filesystem::path& GpuClipDecoder::path() const noexcept {
+    static const std::filesystem::path kEmpty;
+    return kEmpty;
+}
+GpuDecoderOptions GpuClipDecoder::options() const noexcept { return {}; }
+std::array<std::uint32_t, 2> GpuClipDecoder::trackIds() const noexcept { return {0u, 0u}; }
+const std::wstring& GpuClipDecoder::fileIdentity() const noexcept {
+    static const std::wstring kEmpty;
+    return kEmpty;
+}
+bool GpuClipDecoder::usesRetainedPrimaryContext() const noexcept { return false; }
+bool GpuClipDecoder::contextAlive() const noexcept { return false; }
+Status GpuClipDecoder::deviceMemory(std::size_t& freeBytes, std::size_t& totalBytes) const noexcept {
+    freeBytes = 0;
+    totalBytes = 0;
+    return failStatus(ErrorCode::Unsupported, "this build of OpenOSV has no CUDA support");
+}
+std::size_t GpuClipDecoder::trimForIdle(std::uint32_t /*keepFrames*/) noexcept { return 0; }
 
 #endif  // OSV_VIDEO_HAVE_CUDA
 

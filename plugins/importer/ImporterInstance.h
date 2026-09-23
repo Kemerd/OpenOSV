@@ -172,10 +172,13 @@ public:
     [[nodiscard]] Status open();
 
     /// Drop the decoders, the renderer lease, the audio decoder and the OS
-    /// handle but keep the parsed metadata (imQuietFile).  The video reader
-    /// is parked in video::ReaderPool rather than destroyed, so the next open
-    /// of the same file - this instance's unquiet or a new instance - takes
-    /// it back warm; the pool releases it after an idle minute.  Idempotent.
+    /// handle but keep the parsed metadata (imQuietFile).  The host path's
+    /// video reader is parked in video::ReaderPool and the GPU frame path's
+    /// NVDEC decoder in video::GpuDecoderPool rather than destroyed, so the
+    /// next open of the same file - this instance's unquiet or a new instance
+    /// - takes them back warm; the pools release them after an idle minute
+    /// or under memory / VRAM pressure.  Decoders in a caller's CUDA context
+    /// (the direct path) are released as before.  Idempotent.
     void releaseHeavy() noexcept;
 
     /// True between a successful open() and releaseHeavy().
@@ -436,6 +439,15 @@ private:
     /// retried once, so a driver hiccup costs one slow frame instead of a
     /// "media offline" in the Program Monitor.
     [[nodiscard]] Result<video::FramePair> readPair(std::uint32_t index);
+
+    /// [WP-REOPEN] The importer frame path's NVDEC decoder for `options`: a
+    /// warm one parked in video::GpuDecoderPool by an earlier quiet / close
+    /// of this exact file version when there is one whose context is
+    /// `expectedContext` (`warm` = true), else a newly opened one.  The
+    /// GpuDecoderOptions must name no caller context (only primary-context
+    /// decoders are ever parked).  Caller holds m_mutex.
+    [[nodiscard]] Result<std::unique_ptr<video::GpuClipDecoder>> takeOrOpenGpuDecoder(
+        const video::GpuDecoderOptions& options, void* expectedContext, bool& warm);
 
     /// The body of audio() / audioLocked(); assumes the lock is held.
     [[nodiscard]] AudioDecoder* audioImpl();

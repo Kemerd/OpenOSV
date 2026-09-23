@@ -1,97 +1,58 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// ReaderPool implementation: a mutex-guarded list of parked readers, oldest
-// first, and a reaper thread that releases them when their idle time runs out
-// or memory runs short (see ReaderPool.h for the rules and why they are what
-// they are).
-//
-// Every reader released by the pool is destroyed OUTSIDE the pool lock:
-// tearing a decoder down joins libavcodec's worker threads and frees GPU
-// surfaces, which can take tens of milliseconds, and nobody else should wait
-// on the pool for that.
+// ReaderPool: the typed front of detail::IdlePool for DualStreamReaders.
+// This file only decides what makes two readers interchangeable (the match
+// key) and what a parked reader is; the parking itself - bounds, idle
+// expiry, memory pressure, the reaper thread - lives in IdlePool.cpp and is
+// shared with GpuDecoderPool.
 
 #include "osv/video/ReaderPool.h"
 
 #include "FileIdentity.h"
-#include "osv/core/Log.h"
+#include "IdlePool.h"
 
-#include <algorithm>
 #include <array>
-#include <condition_variable>
-#include <exception>
-#include <iterator>
-#include <mutex>
+#include <cstdint>
+#include <cstdio>
 #include <string>
-#include <thread>
 #include <utility>
-#include <vector>
-
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 
 namespace osv::video {
 
 namespace {
 
-using Clock = std::chrono::steady_clock;
-
-/// How often the reaper looks at the memory situation while it holds
-/// readers.  The check itself is a single GlobalMemoryStatusEx call.
-constexpr std::chrono::milliseconds kPressurePoll{1000};
-
-/// How long clear() waits for the reaper thread to finish exiting.  It only
-/// has to notice the empty pool and return; the bound is there so a reaper
-/// that a concurrent park() kept busy can never hang the caller.
-constexpr unsigned long kReaperExitWaitMs = 2000;
-
 // -----------------------------------------------------------------------------
 //  Matching
 // -----------------------------------------------------------------------------
 
+/// Pointer as fixed-width hex, for the key (two contexts must never collide).
+std::wstring pointerText(const void* p) {
+    wchar_t buffer[32] = {};
+    std::swprintf(buffer, std::size(buffer), L"%llx",
+                  static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(p)));
+    return buffer;
+}
+
 /// Everything a parked reader must share with a request to be handed out for
-/// it.  deferFirstFrame is deliberately absent: it only changes what open()
-/// does, and an open reader is the same reader either way.
-struct PoolKey {
-    std::wstring file;                          ///< detail::fileIdentity (path|size|mtime).
-    std::array<std::uint32_t, 2> tracks{};      ///< Lens tracks (the proxy track twice).
-    bool sideBySide = false;
-    HwAccel hw = HwAccel::None;
-    int threads = 0;
-    bool keepOnDevice = false;
-    int cudaDeviceIndex = 0;
-    void* cudaContext = nullptr;
-    void* cudaStream = nullptr;
-    bool containerSamples = false;
-    bool shareHwDevice = true;
-    int hwDeviceSlot = 0;
-
-    bool operator==(const PoolKey&) const = default;
-};
-
-/// The key of a request / of a reader.
-PoolKey makeKey(std::wstring file, const std::array<std::uint32_t, 2>& tracks, bool sideBySide,
-                const DecoderOptions& o) {
-    PoolKey k;
-    k.file = std::move(file);
-    k.tracks = tracks;
-    k.sideBySide = sideBySide;
-    k.hw = o.hw;
-    k.threads = o.threads;
-    k.keepOnDevice = o.keepOnDevice;
-    k.cudaDeviceIndex = o.cudaDeviceIndex;
-    k.cudaContext = o.cudaContext;
-    k.cudaStream = o.cudaStream;
-    k.containerSamples = o.useContainerSamples;
-    k.shareHwDevice = o.shareHwDevice;
-    k.hwDeviceSlot = o.hwDeviceSlot;
+/// it, as one string: the file version, the tracks, the layout and every
+/// DecoderOptions field except deferFirstFrame (which only changes what
+/// open() does - an open reader is the same reader either way).  '|' cannot
+/// occur in a Windows path, so the fields can never run into each other.
+std::wstring makeKey(const std::wstring& file, const std::array<std::uint32_t, 2>& tracks, bool sideBySide,
+                     const DecoderOptions& o) {
+    std::wstring k = file;
+    k += L"|tracks=" + std::to_wstring(tracks[0]) + L"," + std::to_wstring(tracks[1]);
+    k += L"|sbs=" + std::to_wstring(sideBySide ? 1 : 0);
+    k += L"|hw=" + std::to_wstring(static_cast<int>(o.hw));
+    k += L"|threads=" + std::to_wstring(o.threads);
+    k += L"|device=" + std::to_wstring(o.keepOnDevice ? 1 : 0);
+    k += L"|cudaDevice=" + std::to_wstring(o.cudaDeviceIndex);
+    k += L"|cudaContext=" + pointerText(o.cudaContext);
+    k += L"|cudaStream=" + pointerText(o.cudaStream);
+    k += L"|samples=" + std::to_wstring(o.useContainerSamples ? 1 : 0);
+    k += L"|shareHw=" + std::to_wstring(o.shareHwDevice ? 1 : 0);
+    k += L"|slot=" + std::to_wstring(o.hwDeviceSlot);
     return k;
 }
 
@@ -106,243 +67,36 @@ std::array<std::uint32_t, 2> tracksFor(const meta::FormatInfo& format) noexcept 
 }
 
 // -----------------------------------------------------------------------------
-//  Memory pressure
+//  The parked item
 // -----------------------------------------------------------------------------
 
-/// True when the system is short of memory: the OS says so, or less than
-/// `minAvailableMiB` of physical memory is available (0 = no floor).
-bool memoryUnderPressure(std::uint64_t minAvailableMiB) noexcept {
-#if defined(_WIN32)
-    // The OS's own verdict first.  The notification object is created once
-    // and deliberately never closed: it lives as long as the process.
-    static const HANDLE lowMemory = ::CreateMemoryResourceNotification(LowMemoryResourceNotification);
-    if (lowMemory != nullptr) {
-        BOOL low = FALSE;
-        if (::QueryMemoryResourceNotification(lowMemory, &low) && low) {
-            return true;
-        }
-    }
-    if (minAvailableMiB > 0) {
-        MEMORYSTATUSEX status{};
-        status.dwLength = sizeof(status);
-        // Compare in MiB so a huge floor cannot overflow the byte count.
-        if (::GlobalMemoryStatusEx(&status) && (status.ullAvailPhys >> 20) < minAvailableMiB) {
-            return true;
-        }
-    }
-    return false;
-#else
-    (void)minAvailableMiB;
-    return false;
-#endif
-}
+/// One parked reader.  A reader that is no longer open (it never should be)
+/// asks to be released rather than handed out.
+class ReaderItem final : public detail::IdleItem {
+public:
+    explicit ReaderItem(std::unique_ptr<DualStreamReader> reader) noexcept : m_reader(std::move(reader)) {}
 
-}  // namespace
-
-// =============================================================================
-//  State (shared with the reaper, which may outlive a private pool)
-// =============================================================================
-struct ReaderPool::State {
-    struct Entry {
-        PoolKey key;
-        std::unique_ptr<DualStreamReader> reader;
-        Clock::time_point parkedAt;
-    };
-
-    mutable std::mutex mutex;
-    std::condition_variable cv;
-    std::vector<Entry> entries;   ///< Oldest first.
-    Limits limits;
-    Stats stats;
-    bool reaperRunning = false;
-    bool stopping = false;        ///< The owning pool is gone: park nothing, reaper exits.
-    /// Windows: handle of the most recent reaper thread (HANDLE), kept so
-    /// clear() can wait for it to be gone.  Closed when the next reaper starts
-    /// (the previous one has exited by then); never closed for the process-
-    /// wide pool's last reaper, which costs one handle for the process.
-    void* reaperThread = nullptr;
-
-    State() = default;
-    State(const State&) = delete;
-    State& operator=(const State&) = delete;
-    ~State() {
-#if defined(_WIN32)
-        if (reaperThread) {
-            ::CloseHandle(static_cast<HANDLE>(reaperThread));
-        }
-#endif
+    [[nodiscard]] bool mustRelease(std::uint64_t /*minFreeDeviceMemoryMiB*/) noexcept override {
+        return !m_reader || !m_reader->isOpen();
     }
 
-    // ---- helpers; every one expects `mutex` to be held ------------------------
+    /// Hand the reader back (the item is empty afterwards).
+    [[nodiscard]] std::unique_ptr<DualStreamReader> release() noexcept { return std::move(m_reader); }
 
-    /// Move readers whose idle time has run out into `dead`.
-    void collectExpired(Clock::time_point now, std::vector<std::unique_ptr<DualStreamReader>>& dead) {
-        for (auto it = entries.begin(); it != entries.end();) {
-            if (now - it->parkedAt >= limits.idleTtl) {
-                dead.push_back(std::move(it->reader));
-                it = entries.erase(it);
-                ++stats.expired;
-            } else {
-                ++it;
-            }
-        }
-    }
-
-    /// Move every reader into `dead`, counting them in `counter`.
-    void collectAll(std::vector<std::unique_ptr<DualStreamReader>>& dead, std::uint64_t& counter) {
-        for (Entry& e : entries) {
-            dead.push_back(std::move(e.reader));
-            ++counter;
-        }
-        entries.clear();
-    }
-
-    /// Move the oldest readers into `dead` until the count fits the limit.
-    void collectOverCapacity(std::vector<std::unique_ptr<DualStreamReader>>& dead) {
-        while (entries.size() > limits.maxIdleReaders && !entries.empty()) {
-            dead.push_back(std::move(entries.front().reader));
-            entries.erase(entries.begin());
-            ++stats.evictedForRoom;
-        }
-    }
-
-    /// When the oldest parked reader expires (time_point::max when none).
-    [[nodiscard]] Clock::time_point nextExpiry() const {
-        Clock::time_point next = Clock::time_point::max();
-        for (const Entry& e : entries) {
-            next = std::min(next, e.parkedAt + limits.idleTtl);
-        }
-        return next;
-    }
+private:
+    std::unique_ptr<DualStreamReader> m_reader;
 };
 
-namespace {
-
-// =============================================================================
-//  The reaper
-// =============================================================================
-
-/// The reaper's loop.  Runs until the pool is empty (or its owner is gone),
-/// releasing readers as they expire and everything under memory pressure.
-void reaperLoop(const std::shared_ptr<ReaderPool::State>& s) noexcept {
-    if (!s) {
-        return;
-    }
-    try {
-        std::unique_lock<std::mutex> lock(s->mutex);
-        for (;;) {
-            if (s->stopping || s->entries.empty()) {
-                s->reaperRunning = false;
-                return;
-            }
-            const Clock::time_point now = Clock::now();
-            std::vector<std::unique_ptr<DualStreamReader>> dead;
-            s->collectExpired(now, dead);
-            if (!s->entries.empty() && memoryUnderPressure(s->limits.minAvailableMemoryMiB)) {
-                s->collectAll(dead, s->stats.releasedForMemory);
-            }
-            if (!dead.empty()) {
-                // Tear down without the lock, then look again.
-                const std::size_t released = dead.size();
-                lock.unlock();
-                dead.clear();
-                log::debug("video: reader pool released {} idle reader(s)", released);
-                lock.lock();
-                continue;
-            }
-            // Sleep until the next expiry, but look at memory at least once a
-            // second while anything is parked.
-            const Clock::time_point wake = std::min(s->nextExpiry(), now + kPressurePoll);
-            s->cv.wait_until(lock, wake);
-        }
-    } catch (...) {
-        // A mutex or allocation failure: stop reaping.  The pool still
-        // trims lazily on every park() / take(), so nothing is lost for good.
-        try {
-            std::lock_guard<std::mutex> guard(s->mutex);
-            s->reaperRunning = false;
-        } catch (...) {
-        }
-    }
-}
-
-#if defined(_WIN32)
-/// What the reaper thread is started with.
-struct ReaperContext {
-    std::shared_ptr<ReaderPool::State> state;
-    HMODULE module = nullptr;   ///< Reference on the module holding this code (released on exit).
-};
-
-/// Thread entry.  The module reference taken when the thread was started
-/// keeps this code mapped while it runs; FreeLibraryAndExitThread drops it
-/// and ends the thread in one call, so the module may unload at that moment
-/// without the thread ever executing another instruction of it.
-DWORD WINAPI reaperEntry(LPVOID param) {
-    HMODULE module = nullptr;
-    {
-        std::unique_ptr<ReaperContext> context(static_cast<ReaperContext*>(param));
-        if (context) {
-            module = context->module;
-            std::shared_ptr<ReaderPool::State> state = std::move(context->state);
-            reaperLoop(state);
-        }
-        // `state` and `context` are released here, while the module is
-        // still pinned.
-    }
-    if (module) {
-        ::FreeLibraryAndExitThread(module, 0);
-    }
-    return 0;
-}
-#endif
-
-/// Start the reaper.  `s->mutex` must be held and `s->reaperRunning` false.
-void startReaperLocked(const std::shared_ptr<ReaderPool::State>& s) noexcept {
-    if (!s) {
-        return;
-    }
-    s->reaperRunning = true;
-#if defined(_WIN32)
-    // Pin the module that holds reaperEntry for as long as the thread lives.
-    HMODULE module = nullptr;
-    if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                              reinterpret_cast<LPCWSTR>(reinterpret_cast<const void*>(&reaperEntry)), &module) ||
-        !module) {
-        s->reaperRunning = false;
-        log::warn("video: reader pool cannot pin its module ({}); idle readers expire only when the pool is used",
-                  static_cast<unsigned long>(::GetLastError()));
-        return;
-    }
-    ReaperContext* context = nullptr;
-    try {
-        context = new ReaperContext{s, module};
-    } catch (...) {
-        ::FreeLibrary(module);
-        s->reaperRunning = false;
-        return;
-    }
-    HANDLE thread = ::CreateThread(nullptr, 0, &reaperEntry, context, 0, nullptr);
-    if (!thread) {
-        delete context;
-        ::FreeLibrary(module);
-        s->reaperRunning = false;
-        log::warn("video: reader pool cannot start its reaper; idle readers expire only when the pool is used");
-        return;
-    }
-    // The thread runs on its own; nobody joins it.  Its handle is kept only
-    // so clear() can wait for it; the previous reaper's handle is done with
-    // (that thread cleared reaperRunning before it exited).
-    if (s->reaperThread) {
-        ::CloseHandle(static_cast<HANDLE>(s->reaperThread));
-    }
-    s->reaperThread = thread;
-#else
-    try {
-        std::thread([state = s]() noexcept { reaperLoop(state); }).detach();
-    } catch (...) {
-        s->reaperRunning = false;
-    }
-#endif
+/// Core limits from the reader pool's (no device floor: readers copy their
+/// frames to host memory, and their hardware surfaces are bounded by count
+/// and time).
+detail::IdlePoolLimits toCore(const ReaderPool::Limits& limits) noexcept {
+    detail::IdlePoolLimits core;
+    core.maxIdle = limits.maxIdleReaders;
+    core.idleTtl = limits.idleTtl;
+    core.minAvailableMemoryMiB = limits.minAvailableMemoryMiB;
+    core.minFreeDeviceMemoryMiB = 0;
+    return core;
 }
 
 }  // namespace
@@ -350,28 +104,12 @@ void startReaperLocked(const std::shared_ptr<ReaderPool::State>& s) noexcept {
 // =============================================================================
 //  ReaderPool
 // =============================================================================
-ReaderPool::ReaderPool() : m_state(std::make_shared<State>()) {}
+ReaderPool::ReaderPool() : ReaderPool(Limits{}) {}
 
-ReaderPool::ReaderPool(const Limits& limits) : m_state(std::make_shared<State>()) { m_state->limits = limits; }
+ReaderPool::ReaderPool(const Limits& limits)
+    : m_core(std::make_unique<detail::IdlePool>("reader pool", toCore(limits))) {}
 
-ReaderPool::~ReaderPool() {
-    if (!m_state) {
-        return;
-    }
-    std::vector<std::unique_ptr<DualStreamReader>> dead;
-    try {
-        std::lock_guard<std::mutex> guard(m_state->mutex);
-        m_state->stopping = true;
-        m_state->collectAll(dead, m_state->stats.cleared);
-    } catch (...) {
-        // Locking failed: nothing can be done safely; the readers are
-        // released with the state when the reaper lets go of it.
-    }
-    m_state->cv.notify_all();
-    dead.clear();
-    // The reaper, if running, holds its own reference to the state and exits
-    // at its next wake-up because `stopping` is set.
-}
+ReaderPool::~ReaderPool() = default;
 
 ReaderPool& ReaderPool::instance() {
     // Never destroyed on purpose: releasing decoders from a static destructor
@@ -382,205 +120,99 @@ ReaderPool& ReaderPool::instance() {
 
 std::unique_ptr<DualStreamReader> ReaderPool::take(const std::filesystem::path& path, const meta::FormatInfo& format,
                                                    const DecoderOptions& options) noexcept {
-    if (!m_state) {
+    if (!m_core) {
         return nullptr;
     }
-    std::vector<std::unique_ptr<DualStreamReader>> dead;
-    std::unique_ptr<DualStreamReader> found;
     try {
-        // The identity is read outside the lock (two file-system calls).
+        // The identity is read before the pool lock (two file-system calls).
+        // A file that cannot be stat'ed still counts as a miss.
         auto identity = detail::fileIdentity(path);
-        std::lock_guard<std::mutex> guard(m_state->mutex);
-        m_state->collectExpired(Clock::now(), dead);
-        if (identity.ok()) {
-            const PoolKey key = makeKey(std::move(identity).value(), tracksFor(format), format.sideBySideProxy, options);
-            // Newest first: the reader parked last is the warmest.
-            for (auto it = m_state->entries.rbegin(); it != m_state->entries.rend(); ++it) {
-                if (it->key == key && it->reader && it->reader->isOpen()) {
-                    found = std::move(it->reader);
-                    m_state->entries.erase(std::next(it).base());
-                    break;
-                }
-            }
+        const std::wstring key =
+            identity.ok() ? makeKey(identity.value(), tracksFor(format), format.sideBySideProxy, options) : L"";
+        std::unique_ptr<detail::IdleItem> item = m_core->take(key);
+        if (!item) {
+            return nullptr;
         }
-        if (found) {
-            ++m_state->stats.hits;
-        } else {
-            ++m_state->stats.misses;
-        }
+        // Only ReaderItems are ever parked in this pool's core.
+        auto* reader = static_cast<ReaderItem*>(item.get());
+        return reader->release();
     } catch (...) {
-        // Out of memory or a mutex failure: behave as a miss; the caller opens.
-        found.reset();
+        return nullptr;
     }
-    dead.clear();
-    return found;
 }
 
 bool ReaderPool::park(std::unique_ptr<DualStreamReader> reader) noexcept {
-    if (!m_state) {
+    if (!m_core) {
         return false;
     }
-    std::vector<std::unique_ptr<DualStreamReader>> dead;
-    bool kept = false;
     try {
-        const bool eligible = reader && reader->isOpen() && !reader->fileIdentity().empty();
-        // Build the key before taking the lock (it copies strings).
-        PoolKey key;
-        if (eligible) {
+        // A reader that is not open, or whose file identity is unknown, can
+        // never be matched; the core refuses the empty key and releases it.
+        std::wstring key;
+        if (reader && reader->isOpen() && !reader->fileIdentity().empty()) {
             key = makeKey(reader->fileIdentity(), reader->trackIds(), reader->isSideBySide(), reader->options());
         }
-        bool wake = false;
-        {
-            std::lock_guard<std::mutex> guard(m_state->mutex);
-            const Clock::time_point now = Clock::now();
-            m_state->collectExpired(now, dead);
-            if (!eligible || m_state->stopping || m_state->limits.maxIdleReaders == 0) {
-                ++m_state->stats.rejected;
-            } else if (memoryUnderPressure(m_state->limits.minAvailableMemoryMiB)) {
-                // Short of memory: this reader goes, and so does everything else.
-                m_state->collectAll(dead, m_state->stats.releasedForMemory);
-                ++m_state->stats.rejected;
-            } else {
-                m_state->entries.push_back(State::Entry{std::move(key), std::move(reader), now});
-                ++m_state->stats.parked;
-                kept = true;
-                m_state->collectOverCapacity(dead);
-                if (!m_state->reaperRunning) {
-                    startReaperLocked(m_state);
-                }
-                wake = true;
-            }
+        std::unique_ptr<detail::IdleItem> item;
+        if (reader) {
+            item = std::make_unique<ReaderItem>(std::move(reader));
         }
-        if (wake) {
-            // The reaper may be sleeping towards a later expiry than this one.
-            m_state->cv.notify_all();
-        }
+        return m_core->park(std::move(key), std::move(item));
     } catch (...) {
-        kept = false;
+        // Allocation failure: the reader (wherever it is now) is released on
+        // the way out, exactly as a refusal would.
+        return false;
     }
-    // A refused reader (still in `reader`) and anything released above are
-    // destroyed here, outside the lock.
-    reader.reset();
-    dead.clear();
-    return kept;
 }
 
 void ReaderPool::trim() noexcept {
-    if (!m_state) {
-        return;
+    if (m_core) {
+        m_core->trim();
     }
-    std::vector<std::unique_ptr<DualStreamReader>> dead;
-    try {
-        std::lock_guard<std::mutex> guard(m_state->mutex);
-        m_state->collectExpired(Clock::now(), dead);
-        if (!m_state->entries.empty() && memoryUnderPressure(m_state->limits.minAvailableMemoryMiB)) {
-            m_state->collectAll(dead, m_state->stats.releasedForMemory);
-        }
-    } catch (...) {
-    }
-    dead.clear();
 }
 
 void ReaderPool::clear() noexcept {
-    if (!m_state) {
-        return;
+    if (m_core) {
+        m_core->clear();
     }
-    std::vector<std::unique_ptr<DualStreamReader>> dead;
-#if defined(_WIN32)
-    HANDLE reaper = nullptr;
-#endif
-    try {
-        std::lock_guard<std::mutex> guard(m_state->mutex);
-        m_state->collectAll(dead, m_state->stats.cleared);
-#if defined(_WIN32)
-        // A private copy of the reaper's handle to wait on: the stored one may
-        // be closed by a reaper started later, while this call still waits.
-        if (m_state->reaperRunning && m_state->reaperThread) {
-            if (!::DuplicateHandle(::GetCurrentProcess(), static_cast<HANDLE>(m_state->reaperThread),
-                                   ::GetCurrentProcess(), &reaper, SYNCHRONIZE, FALSE, 0)) {
-                reaper = nullptr;
-            }
-        }
-#endif
-    } catch (...) {
-    }
-    // Wake the reaper so it sees the empty pool and exits now, releasing its
-    // module reference, instead of at its next scheduled look.
-    m_state->cv.notify_all();
-    dead.clear();
-#if defined(_WIN32)
-    // Wait (bounded) until the reaper thread is really gone, so a host that
-    // unloads the module right after this call unloads it for real instead of
-    // leaving it pinned until the reaper's next wake-up.
-    if (reaper) {
-        ::WaitForSingleObject(reaper, kReaperExitWaitMs);
-        ::CloseHandle(reaper);
-    }
-#endif
 }
 
 void ReaderPool::setLimits(const Limits& limits) noexcept {
-    if (!m_state) {
-        return;
+    if (m_core) {
+        m_core->setLimits(toCore(limits));
     }
-    std::vector<std::unique_ptr<DualStreamReader>> dead;
-    try {
-        std::lock_guard<std::mutex> guard(m_state->mutex);
-        m_state->limits = limits;
-        m_state->collectExpired(Clock::now(), dead);
-        m_state->collectOverCapacity(dead);
-    } catch (...) {
-    }
-    m_state->cv.notify_all();
-    dead.clear();
 }
 
 ReaderPool::Limits ReaderPool::limits() const noexcept {
-    if (!m_state) {
-        return {};
+    Limits out;
+    if (!m_core) {
+        return out;
     }
-    try {
-        std::lock_guard<std::mutex> guard(m_state->mutex);
-        return m_state->limits;
-    } catch (...) {
-        return {};
-    }
+    const detail::IdlePoolLimits core = m_core->limits();
+    out.maxIdleReaders = core.maxIdle;
+    out.idleTtl = core.idleTtl;
+    out.minAvailableMemoryMiB = core.minAvailableMemoryMiB;
+    return out;
 }
 
 ReaderPool::Stats ReaderPool::stats() const noexcept {
-    if (!m_state) {
-        return {};
+    Stats out;
+    if (!m_core) {
+        return out;
     }
-    try {
-        std::lock_guard<std::mutex> guard(m_state->mutex);
-        return m_state->stats;
-    } catch (...) {
-        return {};
-    }
+    const detail::IdlePoolStats core = m_core->stats();
+    out.parked = core.parked;
+    out.rejected = core.rejected;
+    out.hits = core.hits;
+    out.misses = core.misses;
+    out.expired = core.expired;
+    out.evictedForRoom = core.evictedForRoom;
+    out.releasedForMemory = core.releasedForMemory;
+    out.cleared = core.cleared;
+    return out;
 }
 
-std::size_t ReaderPool::idleCount() const noexcept {
-    if (!m_state) {
-        return 0;
-    }
-    try {
-        std::lock_guard<std::mutex> guard(m_state->mutex);
-        return m_state->entries.size();
-    } catch (...) {
-        return 0;
-    }
-}
+std::size_t ReaderPool::idleCount() const noexcept { return m_core ? m_core->idleCount() : 0; }
 
-bool ReaderPool::reaperRunning() const noexcept {
-    if (!m_state) {
-        return false;
-    }
-    try {
-        std::lock_guard<std::mutex> guard(m_state->mutex);
-        return m_state->reaperRunning;
-    } catch (...) {
-        return false;
-    }
-}
+bool ReaderPool::reaperRunning() const noexcept { return m_core && m_core->reaperRunning(); }
 
 }  // namespace osv::video
