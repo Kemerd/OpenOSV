@@ -1520,10 +1520,11 @@ Result<FlareImage> flareDownsampleLens(const video::FramePair& frames, int lens,
 // ===========================================================================
 
 std::uint32_t flareSunCheckFactor(std::uint32_t lensW) noexcept {
-    // ~375 analysis px across: 8 at 6K (3000 px lenses), 3 for the 1024 px
-    // proxy.  Fine enough that the sun disc (39 px radius at 6K, 13 at the
-    // proxy) is dozens of samples and its centroid lands within a pixel or
-    // two, coarse enough to cost a sixteenth of the full analysis' decodes.
+    // 375-750 analysis px across: 8 at 6K (3000 px lenses, 375 px), 2 for
+    // the 1024 px proxy (512 px).  Fine enough that the sun disc (39 px
+    // radius at 6K, 13 at the proxy) is dozens of samples and its centroid
+    // lands within a pixel or two, coarse enough to cost a sixteenth of the
+    // full analysis' decodes at 6K.
     const std::uint32_t f = lensW / 375u;
     return std::clamp<std::uint32_t>(f, 1u, 16u);
 }

@@ -27,6 +27,7 @@ enum Reason : int {
     kReasonNoSun = 1,     ///< No sun in either lens.
     kReasonCheck = 2,     ///< The sun check itself failed.
     kReasonAnalysis = 3,  ///< The analysis failed.
+    kReasonPassthrough = 4,  ///< D-Log M passthrough output: the kernel cannot remove.
 };
 
 /// "master" / "slave" for a lens index.
@@ -226,6 +227,18 @@ FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePai
                 logReasonOnce(kReasonOff, std::format("flare: '{}': sun ghost removal is off in Source Settings",
                                                       clip));
             }
+            return out;
+        }
+        // The D-Log M passthrough output blends in log code, where the kernel
+        // has no linear light to subtract from (osv_kernel.h skips the
+        // removal there), so a measurement would cost an analysis per sun
+        // position and change nothing.
+        if (color.transfer == OSV_TRANSFER_PASSTHROUGH) {
+            m_penalty.clear();
+            logReasonOnce(kReasonPassthrough,
+                          std::format("flare: '{}': the D-Log M passthrough output is not treated (it blends in log "
+                                      "code); rendering without ghost removal",
+                                      clip));
             return out;
         }
         const render::FlareParams params;

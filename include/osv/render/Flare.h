@@ -294,8 +294,8 @@ struct FlareSunFix {
 /// Both lenses (index = LensIndex).
 using FlareSunFixes = std::array<FlareSunFix, 2>;
 
-/// Working-image factor of the sun check for a lens `lensW` px wide (~375
-/// analysis px across: 8 at 6K, 3 for the 1024 px proxy).
+/// Working-image factor of the sun check for a lens `lensW` px wide (375-750
+/// analysis px across: 8 at 6K, 2 for the 1024 px proxy; clamped to 1..16).
 [[nodiscard]] std::uint32_t flareSunCheckFactor(std::uint32_t lensW) noexcept;
 
 /// How far (stream px) the sun may be from where a model saw it for the

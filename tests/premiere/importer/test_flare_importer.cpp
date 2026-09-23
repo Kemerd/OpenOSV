@@ -10,8 +10,9 @@
 //     ghosts' footprints - the model is recomputed here with the library, on
 //     the same decoded frame, and every changed pixel of the equirect must map
 //     into one of its ghosts through the clip's own lens rig;
-//   * with it off - and for a blob saved before the option existed, and for
-//     a draft request - the frame is bit-identical to a render without it;
+//   * with it off - and for a blob saved before the option existed, for a
+//     draft request, and for the D-Log M passthrough output the kernel
+//     cannot treat - the frame is bit-identical to a render without it;
 //   * an interactive request never waits for the analysis: the first one
 //     comes back uncorrected, bit for bit, and later ones receive the
 //     background result.
@@ -43,6 +44,7 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -141,6 +143,24 @@ struct Frame {
     p.parallax = static_cast<std::uint8_t>(PrefsParallax::Off);
     p.flareRemoval = flareOn ? 1u : 0u;
     return p;
+}
+
+/// imAnalysis text of an open clip (the host's two-step protocol: size, then
+/// text).
+[[nodiscard]] std::string analysisOf(ImporterHarness& harness, ImporterHarness::ClipHandle& clip,
+                                     const PrefsBlob& prefs) {
+    PrefsBlob blob = prefs;
+    imAnalysisRec rec{};
+    rec.privatedata = clip.privateData();
+    rec.prefs = &blob;
+    REQUIRE(harness.send(imAnalysis, nullptr, &rec) == imNoErr);
+    REQUIRE(rec.buffersize > 0);
+    // Headroom: a frame rendered between the two steps may add a line.
+    std::vector<char> buffer(static_cast<std::size_t>(rec.buffersize) + 1024u, '\0');
+    rec.buffer = buffer.data();
+    rec.buffersize = static_cast<csSDK_int32>(buffer.size());
+    REQUIRE(harness.send(imAnalysis, nullptr, &rec) == imNoErr);
+    return std::string(buffer.data());
 }
 
 /// Pixels that differ between two renders.
@@ -306,6 +326,24 @@ TEST_CASE("sun ghost removal changes only the fitted ghosts, and off renders exa
         harness.host().clearCache();
         const Frame draft = render(harness, clip, ppix, kFrame, imRenderIntent_Export, on, kPrRenderQuality_Low);
         REQUIRE(changedPixels(draft, frameOff) == 0);
+    }
+
+    SECTION("the D-Log M passthrough output is left alone, and the analysis says so") {
+        // The kernel blends that output in log code, where there is no linear
+        // light to subtract from, so the importer does not measure at all.
+        PrefsBlob logOff = off;
+        logOff.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::DLogM);
+        PrefsBlob logOn = on;
+        logOn.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::DLogM);
+        harness.host().clearCache();
+        const Frame a = render(harness, clip, ppix, kFrame, imRenderIntent_Export, logOff);
+        harness.host().clearCache();
+        const Frame b = render(harness, clip, ppix, kFrame, imRenderIntent_Export, logOn);
+        REQUIRE(changedPixels(a, b) == 0);
+        const std::string text = analysisOf(harness, clip, logOn);
+        INFO(text);
+        REQUIRE(text.find("Sun ghost removal: on, not applied") != std::string::npos);
+        REQUIRE(analysisOf(harness, clip, on).find("Sun ghost removal: on\r\n") != std::string::npos);
     }
 
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);

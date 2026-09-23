@@ -459,6 +459,75 @@ TEST_CASE("analyseLensFlare removes nothing without a sun, on texture, or off th
     }
 }
 
+// =============================================================================
+//  The per-frame sun check (the importer's reuse rule, FlareStage)
+// =============================================================================
+
+TEST_CASE("the sun check finds the sun where the analysis does, and matches only a sun that stayed put", "[flare]") {
+    const render::FlareParams fp;
+
+    SECTION("locateSun is the analysis' own sun") {
+        const render::FlareImage img = makeScene(SceneOptions{});
+        const render::FlareSunFix fix = render::locateSun(img, syntheticLens(), fp);
+        REQUIRE(fix.found);
+        REQUIRE_THAT(fix.x, WithinAbs(240.0, 0.5));
+        REQUIRE_THAT(fix.y, WithinAbs(300.0, 0.5));
+        REQUIRE_THAT(fix.radiusPx, WithinAbs(8.0, 1.0));
+        // Same detector, same numbers: the check and the model agree exactly.
+        auto res = render::analyseLensFlare(img, syntheticLens(), fp);
+        REQUIRE(res.ok());
+        REQUIRE(res.value().sunFound);
+        REQUIRE_THAT(fix.x, WithinAbs(res.value().sunX, 1e-9));
+        REQUIRE_THAT(fix.y, WithinAbs(res.value().sunY, 1e-9));
+    }
+
+    SECTION("no sun, or garbage in, is 'not found' - never an error, never a guess") {
+        SceneOptions o;
+        o.sun = false;
+        REQUIRE_FALSE(render::locateSun(makeScene(o), syntheticLens(), fp).found);
+        REQUIRE_FALSE(render::locateSun(render::FlareImage{}, syntheticLens(), fp).found);
+        REQUIRE_FALSE(render::locateSun(makeScene(SceneOptions{}), geom::KannalaBrandt5{}, fp).found);
+        render::FlareParams bad;
+        bad.sunLevelFraction = std::nan("");
+        REQUIRE_FALSE(render::locateSun(makeScene(SceneOptions{}), syntheticLens(), bad).found);
+    }
+
+    SECTION("two checks match only with the same lenses lit and the sun within the tolerance") {
+        render::FlareSunFixes a{};
+        a[1] = {true, 1346.0, 1495.0, 39.0};
+        render::FlareSunFixes b = a;
+        REQUIRE(render::flareSunsMatch(a, b, 3.0));
+        b[1].x += 2.0;
+        b[1].y += 2.0;  // 2.83 px away
+        REQUIRE(render::flareSunsMatch(a, b, 3.0));
+        b[1].x += 1.0;  // 3.61 px away
+        REQUIRE_FALSE(render::flareSunsMatch(a, b, 3.0));
+        // The sun entering the other lens is a different flare, however close.
+        b = a;
+        b[0] = {true, 10.0, 10.0, 5.0};
+        REQUIRE_FALSE(render::flareSunsMatch(a, b, 3.0));
+        // Two sunless checks match: nothing to remove in either.
+        REQUIRE(render::flareSunsMatch(render::FlareSunFixes{}, render::FlareSunFixes{}, 3.0));
+        // A broken tolerance or position never matches.
+        REQUIRE_FALSE(render::flareSunsMatch(a, a, -1.0));
+        REQUIRE_FALSE(render::flareSunsMatch(a, a, std::nan("")));
+        b = a;
+        b[1].x = std::nan("");
+        REQUIRE_FALSE(render::flareSunsMatch(a, b, 3.0));
+    }
+
+    SECTION("the check's resolution and tolerance scale with the lens") {
+        REQUIRE(render::flareSunCheckFactor(3000) == 8u);   // 6K: 375 px across
+        REQUIRE(render::flareSunCheckFactor(1024) == 2u);   // proxy: 512 px across
+        REQUIRE(render::flareSunCheckFactor(0) == 1u);      // never zero
+        REQUIRE(render::flareSunCheckFactor(100000) == 16u);
+        REQUIRE_THAT(render::flareSunTolerancePx(3000), WithinAbs(3.0, 1e-12));
+        REQUIRE_THAT(render::flareSunTolerancePx(6000), WithinAbs(6.0, 1e-12));
+        REQUIRE_THAT(render::flareSunTolerancePx(0), WithinAbs(3.0, 1e-12));   // unknown: the 6K value
+        REQUIRE_THAT(render::flareSunTolerancePx(100), WithinAbs(1.0, 1e-12)); // never below a pixel
+    }
+}
+
 TEST_CASE("subtracting a fitted ghost flattens it and leaves the rest of the frame alone", "[flare]") {
     const render::FlareImage img = makeScene(SceneOptions{});
     SceneOptions clean;
@@ -889,6 +958,40 @@ TEST_CASE("the sample clip's sun and its brightest ghost are found in the master
         return std::hypot(g.cx - 1182.0, g.cy - 1547.0) < 12.0 && g.contrast > 0.15;
     });
     REQUIRE(foundPill);
+}
+
+TEST_CASE("the sample clip's sun check agrees with the analysis and tells a moved sun apart", "[flare][sample]") {
+    OSV_REQUIRE_SAMPLE();
+    ThreadPool pool;
+    const render::FlareParams fp;
+    auto first = openSampleFrame(0);
+    REQUIRE(first.ok());
+    const double tolerance = render::flareSunTolerancePx(3000);
+    auto check0 = render::locateSuns(first.value().rig, first.value().pair, linearColor(), fp, pool);
+    REQUIRE(check0.ok());
+    // The coarse check (factor 8) lands within the tolerance of the full
+    // analysis' sun, in the master only.
+    auto model = render::analyseFlare(first.value().rig, first.value().pair, linearColor(), fp, pool);
+    REQUIRE(model.ok());
+    const render::FlareSunFix& sun = check0.value()[1];
+    INFO("check (" << sun.x << ", " << sun.y << "), analysis (" << model.value().lens[1].sunX << ", "
+                   << model.value().lens[1].sunY << ")");
+    REQUIRE(sun.found);
+    REQUIRE_FALSE(check0.value()[0].found);
+    REQUIRE(std::hypot(sun.x - model.value().lens[1].sunX, sun.y - model.value().lens[1].sunY) <= tolerance);
+
+    // The sun drifts ~0.23 px a frame on this clip: the next frame reuses
+    // the model, the last frame (15 px on) does not.
+    auto next = openSampleFrame(1);
+    REQUIRE(next.ok());
+    auto check1 = render::locateSuns(next.value().rig, next.value().pair, linearColor(), fp, pool);
+    REQUIRE(check1.ok());
+    REQUIRE(render::flareSunsMatch(check0.value(), check1.value(), tolerance));
+    auto last = openSampleFrame(64);
+    REQUIRE(last.ok());
+    auto check64 = render::locateSuns(last.value().rig, last.value().pair, linearColor(), fp, pool);
+    REQUIRE(check64.ok());
+    REQUIRE_FALSE(render::flareSunsMatch(check0.value(), check64.value(), tolerance));
 }
 
 #if defined(OSV_HAVE_CUDA)

@@ -2232,7 +2232,10 @@ std::string ImporterInstance::analysisText() const {
     line(std::string("Stabilisation: ") + stabName);
     line(std::string("Seam search: ") + (m_prefs.seamSearch ? "on" : "off") + ", exposure match: " +
          (m_prefs.gainMatch ? "on" : "off"));
-    line(std::string("Sun ghost removal: ") + (m_prefs.flareRemoval ? "on" : "off"));  // [WP-FLARE]
+    line(std::string("Sun ghost removal: ") +  // [WP-FLARE] (FlareStage.h: passthrough is not treated)
+         (!m_prefs.flareRemoval                          ? "off"
+          : m_color.transfer == OSV_TRANSFER_PASSTHROUGH ? "on, not applied (D-Log M passthrough blends in log code)"
+                                                         : "on"));
 
     if (m_audioChannels > 0) {
         char buf[64] = {};

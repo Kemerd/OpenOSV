@@ -38,8 +38,9 @@
 //
 // COST ON THE RENDER THREAD
 // -------------------------
-// Every wanted frame pays the sun check (both lenses at ~375 px, a few ms on
-// the CPU, well under one on the GPU).  An Interactive miss additionally
+// Every wanted frame pays the sun check once (both lenses at ~375 px:
+// measured 5.4-5.8 ms on the CPU pool, 2.8-3.4 ms from device frames); a
+// repeat render of an answered frame skips it.  An Interactive miss additionally
 // pays the working images it hands to the worker; the fits (the tens to
 // hundreds of milliseconds) run only on the worker.  An Exact miss pays the
 // whole analysis, as an export should.
@@ -97,8 +98,10 @@ public:
     ///
     /// `enabled` is the Source Settings switch (PrefsBlob::flareRemoval);
     /// `draft` a draft request, which never pays for the analysis;
-    /// `exactWanted` the request's purpose.  `color` only needs the clip's
-    /// input decode (the analysis works in native linear light).  `clip`
+    /// `exactWanted` the request's purpose.  `color` is the clip's block:
+    /// the analysis reads only its input decode (it works in native linear
+    /// light), and a passthrough output (D-Log M) switches the removal off,
+    /// because the kernel blends that output in log code.  `clip`
     /// names the file in the log.  The caller holds the instance lock.
     /// Never fails a frame: every problem is logged and leaves the frame
     /// without removal.
@@ -192,7 +195,7 @@ private:
     std::uint64_t m_generation = 0;
     std::map<std::uint32_t, Bucket> m_models;
     bool m_loggedModel = false;
-    std::array<bool, 4> m_loggedReason{};
+    std::array<bool, 5> m_loggedReason{};
 
     /// Latest model for WP-SEAM's carve (thread-safe on its own).
     render::FlareSeamPenalty m_penalty;

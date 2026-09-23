@@ -103,6 +103,12 @@ constexpr PrTime kTicksPerFrame5994 = 4237833600LL;
     p.seamSearch = 0;
     p.gainMatch = 0;
     p.parallax = static_cast<std::uint8_t>(PrefsParallax::Off);
+    // [WP-FLARE] Sun ghost removal is on in the defaults now, and it is a
+    // measured analysis like the three above: each path fits the ghosts from
+    // the frames it has (device frames through the CUDA sampler, host frames
+    // through the CPU one), so its fits differ by float noise.  Off here so a
+    // "plain" frame is analysis-free; the analysis test below turns it on.
+    p.flareRemoval = 0;
     // Horizon lock stays ON: it only rotates the equirect, identically in
     // both paths, and a stabilised frame is the realistic one.
     return p;
@@ -562,7 +568,8 @@ TEST_CASE("with an analysis on, the two frame paths differ only by that analysis
     // those last bits into a different choice, so with an analysis on the
     // paths are NOT byte-identical.  What must hold is that the difference
     // stays where the analysis acts: a seam or parallax change inside the
-    // overlap band only, a gain change as a tiny global scale.  (The GPU
+    // overlap band only, a gain change as a tiny global scale, a sun ghost
+    // removal change far below a 10-bit code in the ghosts.  (The GPU
     // path's analyses are the ones the effect's direct path computes, so
     // the importer's equirect and the direct view now agree with each other.)
     // Stabilisation off, so the band can be located in the equirect.
@@ -575,11 +582,13 @@ TEST_CASE("with an analysis on, the two frame paths differ only by that analysis
         bool seam;
         bool gain;
         bool parallax;
+        bool flare;  // [WP-FLARE]
     };
     const Case cases[] = {
-        {"seam search", true, false, false},
-        {"parallax", false, false, true},
-        {"gain match", false, true, false},
+        {"seam search", true, false, false, false},
+        {"parallax", false, false, true, false},
+        {"gain match", false, true, false, false},
+        {"sun ghost removal", false, false, false, true},
     };
     csSDK_int32 id = 311;
     for (const Case& c : cases) {
@@ -587,6 +596,7 @@ TEST_CASE("with an analysis on, the two frame paths differ only by that analysis
         prefs.seamSearch = c.seam ? 1 : 0;
         prefs.gainMatch = c.gain ? 1 : 0;
         prefs.parallax = static_cast<std::uint8_t>(c.parallax ? PrefsParallax::On : PrefsParallax::Off);
+        prefs.flareRemoval = c.flare ? 1 : 0;
         constexpr std::uint32_t kFrame = 20;
 
         Delivered gpu;
@@ -609,7 +619,31 @@ TEST_CASE("with an analysis on, the two frame paths differ only by that analysis
         INFO(c.name << ": band pixels differing " << d.pixelsInside << " / " << d.bandPixels << " (worst "
                     << d.worstInside << ", mean " << d.meanInside << "), outside the band " << d.pixelsOutside
                     << " (worst " << d.worstOutside << ")");
-        if (c.gain) {
+        if (c.flare) {
+            // [WP-FLARE] Each path fits the sun's ghosts from its own frames
+            // (CUDA sampler on device frames, CPU sampler on host frames), so
+            // the subtracted ghosts differ by the fit's float noise: measured
+            // 264 pixels, worst 7.4e-6, none in the band (the ghosts sit near
+            // the sun, far from the seam).  A ghost one path fitted and the
+            // other rejected would differ by tenths, so half a 10-bit code
+            // still catches that with room for the noise.
+            CHECK(d.worstOutside <= 0.5f / 1023.0f);
+            CHECK(d.worstInside <= 0.5f / 1023.0f);
+            // And the comparison is not vacuous: the removal really acted on
+            // this frame (the host path with it off is visibly different).
+            PrefsBlob plain = prefs;
+            plain.flareRemoval = 0;
+            Delivered hostOff;
+            {
+                NoGpuDecode off;
+                auto clip = harness.openClip(sampleClipPath(), id++);
+                REQUIRE(clip.open());
+                hostOff = renderOne(harness, clip, ppix.suite, kFrame, PrPixelFormat_BGRA_4444_32f, 3000, 1500, plain);
+            }
+            const float removed = maxDiff(host, hostOff);
+            INFO("largest change the removal made " << removed);
+            CHECK(removed > 0.01f);
+        } else if (c.gain) {
             // Per-lens gains from slightly different bands: a global scale a
             // hair apart (measured 8e-6) - below half a 16-bit code anywhere.
             CHECK(d.worstOutside <= 0.5f / 32768.0f);
