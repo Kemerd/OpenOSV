@@ -18,9 +18,11 @@
 #include "osv/video/HwAccel.h"
 #include "osv/video/PlanarFrame.h"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <string>
 
 namespace osv::video {
 
@@ -37,10 +39,31 @@ public:
 
     /// Open the two lens tracks named by `format.videoTrackIds` (or the one
     /// side-by-side track when `format.sideBySideProxy` is set).  Both
-    /// decoders receive the same `options`.  Fails when the tracks disagree
-    /// in frame count or dimensions.
+    /// decoders receive the same `options`, except that each lens takes its
+    /// own shared hardware device slot (options.hwDeviceSlot * 2 + lens) so
+    /// the two lenses never queue behind one device lock.  The two lenses
+    /// open in parallel.  Fails when the tracks disagree in frame count or
+    /// dimensions.
     static Result<DualStreamReader> open(const std::filesystem::path& path, const meta::FormatInfo& format,
                                          const DecoderOptions& options = {});
+
+    // ---- what the reader was opened on (ReaderPool matches these) ---------
+
+    /// The path open() was given (empty when not open).
+    [[nodiscard]] const std::filesystem::path& path() const noexcept;
+
+    /// The options open() was given, exactly as passed (default options when
+    /// not open).
+    [[nodiscard]] DecoderOptions options() const noexcept;
+
+    /// The track ids open() used: both lens tracks, or the side-by-side
+    /// track twice ({0, 0} when not open).
+    [[nodiscard]] std::array<std::uint32_t, 2> trackIds() const noexcept;
+
+    /// Identity of the file VERSION the reader decodes: absolute path, size
+    /// and modification time as they were at open().  Empty when they could
+    /// not be read, which keeps the reader out of any pool.
+    [[nodiscard]] const std::wstring& fileIdentity() const noexcept;
 
     /// True when open() succeeded and the object has not been moved from.
     [[nodiscard]] bool isOpen() const noexcept;

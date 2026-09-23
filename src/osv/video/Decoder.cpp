@@ -23,6 +23,7 @@
 
 #include "ContainerSource.h"
 #include "FfmpegCommon.h"
+#include "HwDeviceCache.h"
 #include "osv/core/Log.h"
 #include "osv/core/MappedFile.h"
 
@@ -37,6 +38,7 @@ extern "C" {
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -47,6 +49,17 @@ extern "C" {
 #include <vector>
 
 namespace osv::video {
+
+namespace {
+
+/// Milliseconds elapsed since `start` on the steady clock (never negative).
+[[nodiscard]] double msSince(std::chrono::steady_clock::time_point start) noexcept {
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+    return ms > 0.0 ? ms : 0.0;
+}
+
+}  // namespace
 
 // =============================================================================
 //  FFmpeg log routing (process wide, installed once)
@@ -196,6 +209,12 @@ struct HevcStreamDecoder::Impl {
     const AVCodec* codec = nullptr;
     ff::CodecContextPtr codecCtx;
     ff::BufferRefPtr hwDevice;
+    /// The process-wide device `hwDevice` references (see HwDeviceCache.h);
+    /// holding it is what keeps the device alive for the next decoder.
+    std::shared_ptr<detail::SharedHwDevice> sharedDevice;
+    bool shareHwDevice = true;                           ///< DecoderOptions::shareHwDevice.
+    int hwDeviceSlot = 0;                                ///< DecoderOptions::hwDeviceSlot.
+    bool deferFirstFrame = false;                        ///< DecoderOptions::deferFirstFrame.
     ff::PacketPtr packet;                                ///< Reused for every send.
     AVPixelFormat hwPixFmt = AV_PIX_FMT_NONE;            ///< Format get_format() must pick.
     HwAccel requestedHw = HwAccel::None;
@@ -223,6 +242,9 @@ struct HevcStreamDecoder::Impl {
     std::optional<std::int64_t> lastPts;  ///< pts of the last frame handed out.
     std::optional<DeviceFrameRef> lastDevice;
 
+    // ---- diagnostics --------------------------------------------------------
+    DecoderOpenTimings timings;           ///< Filled phase by phase while open() runs.
+
     // ---- lifetime -----------------------------------------------------------
     ~Impl() { close(); }
 
@@ -233,6 +255,9 @@ struct HevcStreamDecoder::Impl {
         packet.reset();
         codecCtx.reset();
         hwDevice.reset();
+        // Last reference to the device record goes after the codec context
+        // and our own ref, so a shared device outlives every user it had.
+        sharedDevice.reset();
         fmt.reset();
         stream = nullptr;
         if (avio) {
@@ -366,20 +391,29 @@ struct HevcStreamDecoder::Impl {
         }
 #endif
         // Device string: CUDA takes the ordinal, D3D11VA the adapter index
-        // (nullptr = default adapter).
+        // (empty = default adapter).
         std::string deviceName;
-        const char* deviceArg = nullptr;
         if (want == HwAccel::Cuda) {
             deviceName = std::to_string(cudaDeviceIndex);
-            deviceArg = deviceName.c_str();
         }
-        AVBufferRef* device = nullptr;
-        const int ret = av_hwdevice_ctx_create(&device, type, deviceArg, nullptr, 0);
-        if (ret < 0 || !device) {
-            return failStatus(ErrorCode::Unsupported, std::string("cannot create ") + hwAccelName(want) +
-                                                          " device: " + ff::errorString(ret));
+        // The device itself comes from the process-wide cache (or is created
+        // privately when the caller opted out of sharing).
+        auto acquired = detail::acquireHwDevice(type, deviceName, hwDeviceSlot, shareHwDevice);
+        if (!acquired.ok()) {
+            return failStatus(acquired.error().code, acquired.error().message);
         }
-        hwDevice.reset(device);
+        if (!acquired.value().device || !acquired.value().device->ref()) {
+            return failStatus(ErrorCode::Internal, "hardware device cache returned no device");
+        }
+        // Our own reference for the codec context to share; the record keeps
+        // the device registered for the next decoder.
+        AVBufferRef* own = av_buffer_ref(acquired.value().device->ref());
+        if (!own) {
+            return failStatus(ErrorCode::Decoder, "cannot reference the hardware device");
+        }
+        hwDevice.reset(own);
+        sharedDevice = std::move(acquired.value().device);
+        timings.hwDeviceReused = acquired.value().reused;
         hwPixFmt = surface;
         return okStatus();
     }
@@ -925,6 +959,10 @@ struct HevcStreamDecoder::Impl {
     /// empty) and the requested threading / hardware configuration.
     Status openCodec(AVCodecID codecId, const AVCodecParameters* params, const std::vector<std::uint8_t>& extradata,
                      int threads) {
+        // The whole function counts as codec open, minus the time spent
+        // creating the hardware device (booked separately below).
+        const auto codecStart = std::chrono::steady_clock::now();
+        double deviceMs = 0.0;
         codec = avcodec_find_decoder(codecId);
         if (!codec) {
             return failStatus(ErrorCode::Unsupported, std::string("no decoder for codec ") +
@@ -965,7 +1003,9 @@ struct HevcStreamDecoder::Impl {
         }
         activeHw = HwAccel::None;
         for (const HwAccel attempt : attempts) {
+            const auto deviceStart = std::chrono::steady_clock::now();
             Status st = setupHardware(attempt);
+            deviceMs += msSince(deviceStart);
             if (st.ok()) {
                 activeHw = attempt;
                 codecCtx->hw_device_ctx = av_buffer_ref(hwDevice.get());
@@ -980,6 +1020,8 @@ struct HevcStreamDecoder::Impl {
             }
             log::debug("video: {} unavailable ({}), trying next", hwAccelName(attempt), st.error().message);
             hwDevice.reset();
+            sharedDevice.reset();
+            timings.hwDeviceReused = false;
             hwPixFmt = AV_PIX_FMT_NONE;
         }
         if (keepOnDevice && activeHw != HwAccel::Cuda) {
@@ -995,6 +1037,9 @@ struct HevcStreamDecoder::Impl {
         if (!packet) {
             return failStatus(ErrorCode::Decoder, "av_packet_alloc failed");
         }
+        // Book the phases: device creation on its own, the rest as codec open.
+        timings.hwDeviceMs = deviceMs;
+        timings.codecOpenMs = std::max(0.0, msSince(codecStart) - deviceMs);
         return okStatus();
     }
 
@@ -1021,12 +1066,21 @@ struct HevcStreamDecoder::Impl {
         // avformat_open_input frees `raw` on failure, so it is only adopted
         // by the unique_ptr once it succeeded.
         const std::string name = path.filename().string();
+        const auto demuxStart = std::chrono::steady_clock::now();
         int ret = avformat_open_input(&raw, name.c_str(), nullptr, nullptr);
+        timings.demuxOpenMs = msSince(demuxStart);
         if (ret < 0) {
             return failStatus(ErrorCode::Malformed, "avformat_open_input: " + ff::errorString(ret));
         }
         fmt.reset(raw);
+        // The probe: libavformat reads packets of every stream (all seven on
+        // an OSV) until it can describe each one.  It is what prints "not
+        // enough frames to estimate rate" for the metadata streams, but it
+        // measured only ~3 ms on the sample clip - the hardware device and
+        // the first-frame decode were the expensive parts of an open.
+        const auto infoStart = std::chrono::steady_clock::now();
         ret = avformat_find_stream_info(fmt.get(), nullptr);
+        timings.streamInfoMs = msSince(infoStart);
         if (ret < 0) {
             return failStatus(ErrorCode::Malformed, "avformat_find_stream_info: " + ff::errorString(ret));
         }
@@ -1143,6 +1197,41 @@ struct HevcStreamDecoder::Impl {
         return openCodec(codecId, nullptr, header, threadsRequested);
     }
 
+    /// DecoderOptions::deferFirstFrame: take the geometry and bit depth from
+    /// the codec context instead of decoding frame 0.  libavcodec's HEVC
+    /// decoder parses the parameter sets in the extradata during
+    /// avcodec_open2 and exports the CROPPED size and the software pixel
+    /// format from the first SPS - exactly what the probe would have read
+    /// off the decoded picture.  Returns false (and changes nothing) when
+    /// any of it is missing, so the caller falls back to the real probe.
+    [[nodiscard]] bool adoptCodecParameters() noexcept {
+        if (!codecCtx) {
+            return false;
+        }
+        const int w = codecCtx->width;
+        const int h = codecCtx->height;
+        // The software format is what the frames carry before any hardware
+        // mapping; with a hardware decoder it is still the stream's own
+        // format at this point (get_format has not run yet).
+        const AVPixelFormat sw = (codecCtx->sw_pix_fmt != AV_PIX_FMT_NONE) ? codecCtx->sw_pix_fmt : codecCtx->pix_fmt;
+        if (w <= 0 || h <= 0 || sw == AV_PIX_FMT_NONE || isHwFormat(sw)) {
+            return false;
+        }
+        const std::uint8_t depth = formatBitDepth(sw);
+        if (depth == 0) {
+            return false;
+        }
+        width = static_cast<std::uint32_t>(w);
+        height = static_cast<std::uint32_t>(h);
+        sourceBitDepth = depth;
+        // Nothing was decoded: the first request seeks to its sync sample
+        // exactly as it would after a probe.
+        nextIndex = 0;
+        positionValid = false;
+        lastDecodedIndex = -1;
+        return true;
+    }
+
     /// Decode frame 0 once so dimensions / bit depth / the real hardware
     /// path are known before open() returns (and a broken stream fails
     /// early instead of on the first render).
@@ -1210,16 +1299,35 @@ Result<HevcStreamDecoder> HevcStreamDecoder::open(const std::filesystem::path& p
     impl.cudaStream = options.cudaStream;
     impl.threadsRequested = options.threads;
     impl.samplesMode = options.useContainerSamples;
+    impl.shareHwDevice = options.shareHwDevice;
+    impl.hwDeviceSlot = std::max(0, options.hwDeviceSlot);
+    impl.deferFirstFrame = options.deferFirstFrame;
+    const auto openStart = std::chrono::steady_clock::now();
 
     // The mapping is what libavformat reads from; a missing file fails here
-    // with Io before FFmpeg is involved at all.
-    OSV_TRY_ASSIGN(impl.mapping, MappedFile::open(path));
+    // with Io before FFmpeg is involved at all.  Container-sample mode reads
+    // every byte through the container parser's own mapping, so a second one
+    // would only cost a handle - but the missing-file check must still give
+    // Io, which the parser alone would not guarantee.
+    const auto mapStart = std::chrono::steady_clock::now();
+    if (impl.samplesMode) {
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec) || ec) {
+            return Error{ErrorCode::Io, "file not found: " + path.string()};
+        }
+    } else {
+        OSV_TRY_ASSIGN(impl.mapping, MappedFile::open(path));
+    }
+    impl.timings.mapMs = msSince(mapStart);
 
     // Our container parser: mandatory in samples mode, best effort otherwise
     // (it provides the sync-sample table and the exact stts frame rate).
+    const auto containerStart = std::chrono::steady_clock::now();
     auto source = detail::ContainerSource::open(path, trackId);
+    impl.timings.containerMs = msSince(containerStart);
     if (source.ok()) {
         impl.container = std::move(source).value();
+        impl.timings.containerReused = impl.container && impl.container->reusedParse();
     } else if (options.useContainerSamples) {
         return Error(source.error());
     } else {
@@ -1232,10 +1340,25 @@ Result<HevcStreamDecoder> HevcStreamDecoder::open(const std::filesystem::path& p
     } else {
         OSV_TRY(impl.openWithAvformat(trackId));
     }
-    OSV_TRY(impl.probeFirstFrame());
+    // Frame 0 is decoded here only when the parameter sets did not already
+    // tell us what it will look like (or the caller wants the early check).
+    const auto probeStart = std::chrono::steady_clock::now();
+    if (impl.deferFirstFrame && impl.adoptCodecParameters()) {
+        impl.timings.firstFrameDeferred = true;
+    } else {
+        OSV_TRY(impl.probeFirstFrame());
+    }
+    impl.timings.firstFrameMs = msSince(probeStart);
+    impl.timings.totalMs = msSince(openStart);
+    const DecoderOpenTimings& t = impl.timings;
     log::debug("video: opened track {} of {}: {}x{} {} fps, {} frames, {}-bit source, codec {}, hw {}", trackId,
                log::safe(path.filename().string()), impl.width, impl.height, impl.fps, impl.frameCount,
                impl.sourceBitDepth, impl.codec ? impl.codec->name : "?", hwAccelName(impl.activeHw));
+    log::debug("video: track {} open took {:.1f} ms (map {:.1f}, container {:.1f}{}, demux {:.1f}, probe {:.1f}, "
+               "device {:.1f}{}, codec {:.1f}, first frame {})",
+               trackId, t.totalMs, t.mapMs, t.containerMs, t.containerReused ? " reused" : "", t.demuxOpenMs,
+               t.streamInfoMs, t.hwDeviceMs, t.hwDeviceReused ? " shared" : "", t.codecOpenMs,
+               t.firstFrameDeferred ? std::string("deferred") : std::to_string(t.firstFrameMs));
     return decoder;
 }
 
@@ -1265,6 +1388,10 @@ std::uint32_t HevcStreamDecoder::trackId() const noexcept { return m_impl ? m_im
 bool HevcStreamDecoder::usesContainerSamples() const noexcept { return m_impl != nullptr && m_impl->samplesMode; }
 
 TimeBase HevcStreamDecoder::timeBase() const noexcept { return m_impl ? m_impl->timeBase : TimeBase{}; }
+
+DecoderOpenTimings HevcStreamDecoder::openTimings() const noexcept {
+    return m_impl ? m_impl->timings : DecoderOpenTimings{};
+}
 
 std::uint32_t HevcStreamDecoder::nextIndex() const noexcept { return m_impl ? m_impl->nextIndex : 0; }
 
