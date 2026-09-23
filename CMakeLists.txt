@@ -15,8 +15,8 @@ cmake_minimum_required(VERSION 3.28)
 
 project(openosv
         VERSION 0.1.0
-        DESCRIPTION "Clean-room DJI Osmo 360 .OSV parser, stitcher, reframer and HDR colour pipeline"
-        HOMEPAGE_URL "https://github.com/openosv/openosv"
+        DESCRIPTION "Independent open-source DJI Osmo 360 .OSV parser, stitcher, reframer and HDR colour pipeline"
+        HOMEPAGE_URL "https://github.com/Kemerd/OpenOSV"
         LANGUAGES C CXX)
 
 # -----------------------------------------------------------------------------

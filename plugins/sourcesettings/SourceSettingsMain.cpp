@@ -448,7 +448,7 @@ PF_Err about(PF_InData* in_data, PF_OutData* out_data) noexcept {
                   "Stitch and decode options for an OpenOSV 360 clip.\r"
                   "Applied to the master clip; the values reach the importer as prefs,\r"
                   "so they cannot be keyframed.  Reframing lives in Open 360 Reframe.\r"
-                  "Part of OpenOSV, the clean-room DJI Osmo 360 toolkit.  Apache-2.0.",
+                  "Part of OpenOSV, the independent open-source DJI Osmo 360 toolkit.  Apache-2.0.",
                   OSV_SOURCE_SETTINGS_DISPLAY_NAME, OSV_SOURCE_SETTINGS_VERSION_MAJOR,
                   OSV_SOURCE_SETTINGS_VERSION_MINOR, OSV_SOURCE_SETTINGS_VERSION_BUG);
     return PF_Err_NONE;
