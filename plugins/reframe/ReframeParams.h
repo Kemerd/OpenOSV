@@ -232,9 +232,30 @@
 #define OSV_REFRAME_ID_LENS 21
 /* ---- end [WP-LENSUI] ------------------------------------------------------ */
 
-/* Total parameters excluding the input layer: the 19 controls plus the two
+/* ---- [WP-EASING] Keyframe Easing, appended ----------------------------------
+ *
+ *   22  Keyframe Easing   popup "None|Linear Smooth|Fast In, Slow Out|Slow In,
+ *                         Fast Out|Fast In, Fast Out|Slow In, Slow Out|Linear",
+ *                         None by default: the motion curve the effect applies
+ *                         between consecutive keyframes of the camera controls
+ *                         (Pan, Tilt, Roll and the selected lens's pair).
+ *
+ * The seven entries are DJI Studio's Keyframe Animation presets, in DJI
+ * Studio's order (ReframeEasing.h has the curves and which of them are
+ * DJI's exact numbers).  "None" leaves Premiere's own interpolation alone -
+ * the effect then reads every control exactly as it did before this popup
+ * existed, so an old project, which loads the popup at its default, renders
+ * bit for bit what it rendered before.
+ *
+ * Appended after the Lens popup for the reason the Lens popup itself was
+ * appended (see OSV_REFRAME_ID_LENS): only an append leaves every saved
+ * index where it was, however the host binds saved values. */
+#define OSV_REFRAME_ID_KEYFRAME_EASING 22
+/* ---- end [WP-EASING] ------------------------------------------------------ */
+
+/* Total parameters excluding the input layer: the 20 controls plus the two
  * group terminators.  out_data->num_params is this + 1. */
-#define OSV_REFRAME_PARAM_COUNT 21
+#define OSV_REFRAME_PARAM_COUNT 22
 
 /* ==========================================================================
  *  Popup item strings
@@ -270,6 +291,15 @@
  *      with the 0 that decodes it. */
 #define OSV_REFRAME_LENS_ITEMS "DJI|Classic"
 #define OSV_REFRAME_LENS_COUNT 2
+
+/* [WP-EASING] The Keyframe Easing popup: DJI Studio's seven Keyframe
+ * Animation presets, in the order DJI Studio's grid lists them.  "None" is
+ * first, so the default is entry 1 in After Effects' numbering and entry 0
+ * in Premiere's GPU numbering - a reading that settles the host's popup base
+ * by itself (decodeHostPopup), exactly like the Lens popup's DJI default. */
+#define OSV_REFRAME_EASING_ITEMS \
+    "None|Linear Smooth|Fast In, Slow Out|Slow In, Fast Out|Fast In, Fast Out|Slow In, Slow Out|Linear"
+#define OSV_REFRAME_EASING_COUNT 7
 
 /* ==========================================================================
  *  Ranges and defaults (the numbers PF_ADD_* is called with)
@@ -328,6 +358,10 @@
 
 /* [WP-LENSUI] Lens: 1-based popup value; 1 = "DJI", the user's default. */
 #define OSV_REFRAME_LENS_DEFAULT 1
+
+/* [WP-EASING] Keyframe Easing: 1-based popup value; 1 = "None" (Premiere's
+ * own interpolation), so nothing changes until the user picks a preset. */
+#define OSV_REFRAME_EASING_DEFAULT 1
 
 /* DJI FOV: the vertical pinhole field of view.  DJI Studio clamps it to
  * [20, 150] (generateNewParams / setFov); DJI's plug-in allows [1, 178]. */
@@ -419,8 +453,9 @@ namespace osv::reframe {
 ///  19  Correction Angle      [WP-CAMERA]
 ///  20  Drag Sensitivity      [WP-CAMERA]
 ///  21  Lens                  [WP-LENSUI]
+///  22  Keyframe Easing       [WP-EASING]
 ///
-/// 16..21 are siblings of Smooth Keyframes, outside both groups, and
+/// 16..22 are siblings of Smooth Keyframes, outside both groups, and
 /// deliberately so: appending is the only change that leaves the index of
 /// every existing control - and so every saved project and every host index
 /// map - exactly where it was.
@@ -448,6 +483,8 @@ enum ParamIndex : int {
     kIndexDragSensitivity = 20,
     // [WP-LENSUI]
     kIndexLens = 21,
+    // [WP-EASING]
+    kIndexKeyframeEasing = 22,
 };
 
 /// The permanent id stored with each index, in index order (index 1 first).
@@ -465,6 +502,8 @@ inline constexpr int kParamIdByIndex[OSV_REFRAME_PARAM_COUNT] = {
     OSV_REFRAME_ID_CORRECTION,    OSV_REFRAME_ID_DRAG_SENSITIVITY,
     // [WP-LENSUI]
     OSV_REFRAME_ID_LENS,
+    // [WP-EASING]
+    OSV_REFRAME_ID_KEYFRAME_EASING,
 };
 
 /// Number of user-visible parameters (excludes the input layer).
@@ -490,7 +529,7 @@ inline constexpr int kParamCount = OSV_REFRAME_PARAM_COUNT;
 /// spelled independently so this header still needs no Adobe include.
 enum class HostParamKind : int {
     Unknown = 0,
-    Int32,    ///< A popup (Output Resolution, Preset, Lens): a small integer (see decodeHostPopup()).
+    Int32,    ///< A popup (Output Resolution, Preset, Lens, Keyframe Easing): a small integer (see decodeHostPopup()).
     Float32,  ///< An AE angle dial (the six Pan / Tilt / Roll controls), in degrees.
     Float64,  ///< An AE float slider (FOV, Distortion, Zoom, DJI FOV, Correction Angle, Drag Sensitivity).
     Bool,     ///< A checkbox (Smooth Keyframes, Camera Model).
@@ -503,7 +542,7 @@ enum class HostParamKind : int {
 /// Number of controls that actually carry a value, i.e. everything except
 /// the four PF_Param_GROUP_START / GROUP_END markers.  This is the list a
 /// probe expects to find on the host, in this order.
-inline constexpr int kValueParamCount = 17;
+inline constexpr int kValueParamCount = 18;
 
 /// [WP-CAMERA] How many of those the effect had before the DJI camera block
 /// was appended.  A host list may stop after these (it then exposes none of
@@ -511,7 +550,7 @@ inline constexpr int kValueParamCount = 17;
 /// list end early inside the appended block.
 inline constexpr int kOriginalValueParamCount = 11;
 
-/// The AE indices of the seventeen value-carrying controls, in ADD ORDER.
+/// The AE indices of the eighteen value-carrying controls, in ADD ORDER.
 /// The group markers are absent by construction: they hold no value, so no
 /// host can report one for them and nothing ever reads them.
 inline constexpr int kValueParamAeIndex[kValueParamCount] = {
@@ -523,23 +562,26 @@ inline constexpr int kValueParamAeIndex[kValueParamCount] = {
     kIndexDragSensitivity,
     // [WP-LENSUI]
     kIndexLens,
+    // [WP-EASING]
+    kIndexKeyframeEasing,
 };
 
 /// The PrParam kind each of those controls arrives in, in the same order.
 ///
 /// Read down the column and this is the SIGNATURE the probe matches:
 ///
-///     i32 i32 f32 f32 f32 f64 f64 f32 f32 f32 bool | bool f64 f64 f64 f64 i32
+///     i32 i32 f32 f32 f32 f64 f64 f32 f32 f32 bool | bool f64 f64 f64 f64 i32 i32
 ///
 /// The part before the bar is the effect's original list and is still
 /// distinctive on its own - the adjacent FOV / Distortion Float64 pair
 /// between the angle dials, and the Bool that closes it (Smooth Keyframes).
 /// The part after it was appended later: the DJI camera block of
-/// [WP-CAMERA] (the Camera Model checkbox and four float sliders) and the
-/// Lens popup of [WP-LENSUI].  matchHostParams() accepts a host list that
-/// stops anywhere inside that tail, so a host that has not (yet) exposed the
-/// appended controls still maps the original ones - and a control it does
-/// not expose reads its default.
+/// [WP-CAMERA] (the Camera Model checkbox and four float sliders), the Lens
+/// popup of [WP-LENSUI] and the Keyframe Easing popup of [WP-EASING].
+/// matchHostParams() accepts a host list that stops anywhere inside that
+/// tail, so a host that has not (yet) exposed the appended controls still
+/// maps the original ones - and a control it does not expose reads its
+/// default.
 inline constexpr HostParamKind kValueParamKind[kValueParamCount] = {
     HostParamKind::Int32,   HostParamKind::Int32,   HostParamKind::Float32, HostParamKind::Float32,
     HostParamKind::Float32, HostParamKind::Float64, HostParamKind::Float64, HostParamKind::Float32,
@@ -548,6 +590,8 @@ inline constexpr HostParamKind kValueParamKind[kValueParamCount] = {
     HostParamKind::Bool,    HostParamKind::Float64, HostParamKind::Float64, HostParamKind::Float64,
     HostParamKind::Float64,
     // [WP-LENSUI]
+    HostParamKind::Int32,
+    // [WP-EASING]
     HostParamKind::Int32,
 };
 
@@ -565,6 +609,8 @@ inline constexpr HostParamKind kParamKindByIndex[OSV_REFRAME_PARAM_COUNT] = {
     HostParamKind::Bool,    HostParamKind::Float64, HostParamKind::Float64, HostParamKind::Float64,
     HostParamKind::Float64,
     // [WP-LENSUI]
+    HostParamKind::Int32,
+    // [WP-EASING]
     HostParamKind::Int32,
 };
 
@@ -967,6 +1013,38 @@ static_assert(cameraModelFromCheckbox(OSV_REFRAME_CAMERA_MODEL_DEFAULT) == kDefa
               "the hidden Camera Model mirror must default to the Lens popup's default");
 
 // ---------------------------------------------------------------------------
+//  [WP-EASING] The Keyframe Easing popup
+// ---------------------------------------------------------------------------
+
+/// Popup values of "Keyframe Easing" (1-based, After Effects numbering), in
+/// DJI Studio's Keyframe Animation order.  ReframeEasing.h defines the curve
+/// each one draws and says which are DJI's exact numbers.
+enum class KeyframeEasing : int {
+    None = 1,           ///< Premiere's own interpolation - the effect does nothing.
+    LinearSmooth = 2,   ///< Through every keyframe without stopping; speed changes smoothly.
+    FastInSlowOut = 3,  ///< Leaves a keyframe fast, arrives at the next one slowly.
+    SlowInFastOut = 4,  ///< Leaves a keyframe slowly, arrives at the next one fast.
+    FastInFastOut = 5,  ///< Fast at both keyframes, slowest halfway.
+    SlowInSlowOut = 6,  ///< Starts and stops gently at both keyframes.
+    Linear = 7,         ///< Constant speed between keyframes, whatever Premiere's own type.
+};
+
+/// The easing a popup value selects.  Anything outside the list - a corrupt
+/// project, garbage - is None: the one entry that cannot change a picture the
+/// user already approved.
+[[nodiscard]] inline constexpr KeyframeEasing sanitiseKeyframeEasing(long popupValue) noexcept {
+    if (popupValue < 1 || popupValue > OSV_REFRAME_EASING_COUNT) {
+        return KeyframeEasing::None;
+    }
+    return static_cast<KeyframeEasing>(popupValue);
+}
+
+static_assert(sanitiseKeyframeEasing(OSV_REFRAME_EASING_DEFAULT) == KeyframeEasing::None,
+              "Keyframe Easing must default to None, so old projects render exactly as before");
+static_assert(static_cast<int>(KeyframeEasing::Linear) == OSV_REFRAME_EASING_COUNT,
+              "the Keyframe Easing enum and its popup must have the same number of entries");
+
+// ---------------------------------------------------------------------------
 //  [WP-LENSUI] What the Effect Controls panel shows per lens
 //
 //  Only the selected lens's controls are visible, so a user never sees two
@@ -1053,6 +1131,11 @@ struct Settings {
     double djiFovDeg = OSV_REFRAME_DJI_FOV_DEFAULT;          ///< DJI vertical pinhole FOV (deg).
     double correction = OSV_REFRAME_CORRECTION_DEFAULT;      ///< DJI eye distance (sphere radii).
     double dragSensitivity = OSV_REFRAME_DRAG_SENSITIVITY_DEFAULT;  ///< Overlay only; never rendered from.
+    // [WP-EASING]
+    /// The Keyframe Easing popup, as read.  The readers have ALREADY applied
+    /// it to the angles and lens values above; it is carried here so a log
+    /// line on a rejected setup can say which curve produced them.
+    KeyframeEasing easing = KeyframeEasing::None;
 };
 
 // ---------------------------------------------------------------------------

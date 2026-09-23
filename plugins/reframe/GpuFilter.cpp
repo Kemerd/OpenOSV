@@ -41,6 +41,9 @@
 
 #include "DirectPath.h"
 #include "ReframeCpu.h"
+// [WP-EASING] The Keyframe Easing curves and keyframe walk, shared with the
+// CPU path so both compute the same eased values.
+#include "ReframeEasing.h"
 #include "ReframeParams.h"
 
 #include "PluginLog.h"
@@ -60,10 +63,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <thread>
 #include <new>
+#include <optional>
 #include <string>
 
 // ===========================================================================
@@ -1009,6 +1014,125 @@ bool readBool(const Instance& inst, int aeIndex, PrTime time, bool fallback) noe
     }
 }
 
+// ---------------------------------------------------------------------------
+//  [WP-EASING] Keyframes through the Video Segment Suite
+// ---------------------------------------------------------------------------
+
+/// Where the backwards keyframe search starts: one day before clip time 0.
+/// Premiere keeps an effect's keyframes inside (or, after a trim, near) its
+/// clip, so nothing a host holds lies further back; the value only has to be
+/// early enough, and small enough that t - earliest never overflows.
+constexpr PrTime kEarliestKeyframeTicks = -254016000000LL * 60LL * 60LL * 24LL;
+
+/// One control's keyframes through PrSDKVideoSegmentSuite - the GPU path's
+/// KeyframeTrack (ReframeEasing.h).
+///
+/// The only keyframe query the suite offers is GetNextKeyframeTime ("the
+/// first keyframe strictly after t"), so "the last keyframe at or before t"
+/// is found with keyAtOrBeforeFromNext(), a doubling backwards probe that
+/// costs O(log) calls however far back the keyframe is.  Times are Premiere
+/// ticks - whole numbers - so "strictly before t" is "at or before t - 1".
+/// The host index comes from the instance's probed map, the same one
+/// GetParam reads through; a control the host does not expose (index -1)
+/// has no keyframes as far as this is concerned.
+class SegmentKeyframeTrack final : public KeyframeTrack {
+public:
+    SegmentKeyframeTrack(const Instance& inst, int aeIndex, PrTime ticksPerFrame) noexcept
+        : m_inst(inst), m_aeIndex(aeIndex), m_hostIndex(inst.paramMap[aeIndex]),
+          m_step(ticksPerFrame > 0 ? ticksPerFrame : kDefaultStep) {}
+
+    std::optional<double> keyAfter(double t) override {
+        const std::optional<PrTime> key = next(toTicks(t));
+        return key ? std::optional<double>(static_cast<double>(*key)) : std::nullopt;
+    }
+
+    std::optional<double> keyAtOrBefore(double t) override {
+        if (!usable() || !std::isfinite(t)) {
+            return std::nullopt;
+        }
+        const std::optional<std::int64_t> key = keyAtOrBeforeFromNext(
+            [this](std::int64_t after) -> std::optional<std::int64_t> { return next(after); }, toTicks(t),
+            kEarliestKeyframeTicks, m_step, kMaxKeyframeQueries);
+        return key ? std::optional<double>(static_cast<double>(*key)) : std::nullopt;
+    }
+
+    std::optional<double> keyBefore(double t) override {
+        if (!std::isfinite(t)) {
+            return std::nullopt;
+        }
+        return keyAtOrBefore(static_cast<double>(toTicks(t) - 1));
+    }
+
+    /// The control's value at a keyframe, read through GetParam like every
+    /// other value on this path: angles arrive as mFloat32, sliders as
+    /// mFloat64.
+    std::optional<double> valueAt(double t) override {
+        if (!std::isfinite(t)) {
+            return std::nullopt;
+        }
+        PrParam p{};
+        if (!readParam(m_inst, m_aeIndex, toTicks(t), &p)) {
+            return std::nullopt;
+        }
+        switch (p.mType) {
+            case kPrParamType_Float32: return static_cast<double>(p.mFloat32);
+            case kPrParamType_Float64: return p.mFloat64;
+            default:                   return std::nullopt;
+        }
+    }
+
+private:
+    /// One second: the first backwards probe when the host gave no frame
+    /// duration.
+    static constexpr PrTime kDefaultStep = 254016000000LL;
+
+    [[nodiscard]] bool usable() const noexcept {
+        return m_hostIndex >= 0 && m_inst.segment && m_inst.segment->GetNextKeyframeTime;
+    }
+
+    /// A double tick count back to ticks.  Every time the core hands back is
+    /// one this adapter produced from whole ticks, so the rounding is exact;
+    /// anything outside the representable range pins to the earliest time.
+    [[nodiscard]] static PrTime toTicks(double t) noexcept {
+        if (!std::isfinite(t) || std::fabs(t) > 9.0e18) {
+            return kEarliestKeyframeTicks;
+        }
+        return static_cast<PrTime>(std::llround(t));
+    }
+
+    /// One GetNextKeyframeTime call: the first keyframe strictly after
+    /// `after`, or nothing (no keyframe after it, or any host error).
+    [[nodiscard]] std::optional<PrTime> next(PrTime after) const noexcept {
+        if (!usable()) {
+            return std::nullopt;
+        }
+        PrTime key = 0;
+        csSDK_int32 mode = 0;
+        const prSuiteError err = m_inst.segment->GetNextKeyframeTime(m_inst.nodeId, m_hostIndex, after, &key, &mode);
+        if (err != suiteError_NoError) {
+            return std::nullopt;
+        }
+        return key;
+    }
+
+    const Instance& m_inst;
+    int m_aeIndex = 0;
+    int m_hostIndex = -1;
+    PrTime m_step = kDefaultStep;
+};
+
+/// The eased value of control `aeIndex` at `clipTime`, or `hostValue` when
+/// the easing is None or has nothing to ease there (ReframeEasing.h).
+[[nodiscard]] double easedOr(const Instance& inst, KeyframeEasing easing, int aeIndex, PrTime clipTime,
+                             PrTime ticksPerFrame, double hostValue) noexcept {
+    if (easing == KeyframeEasing::None) {
+        return hostValue;
+    }
+    SegmentKeyframeTrack track(inst, aeIndex, ticksPerFrame);
+    const std::optional<double> eased = easedValue(easing, track, static_cast<double>(clipTime));
+    return eased ? *eased : hostValue;
+}
+
 /// Read every control at `time`, applying the "Smooth Keyframes" average
 /// over t-1, t and t+1 frames to the six angle dials when it is on.
 ///
@@ -1016,6 +1140,12 @@ bool readBool(const Instance& inst, int aeIndex, PrTime time, bool fallback) noe
 /// it needs no extra input frames, so GetFrameDependencies can keep saying
 /// "only the current frame", and it produces the same numbers as the CPU
 /// path, which does the same three-sample average through PF_CHECKOUT_PARAM.
+///
+/// [WP-EASING] With a Keyframe Easing preset chosen, Pan, Tilt, Roll and the
+/// selected lens's two controls take the preset's value between their
+/// keyframes, computed by the same ReframeEasing.cpp the CPU path calls;
+/// the smoothing then averages eased samples.  The direct path renders from
+/// these Settings too, so it eases identically.
 Settings readSettings(const Instance& inst, PrTime clipTime, PrTime ticksPerFrame) noexcept {
     Settings s;
 
@@ -1036,12 +1166,18 @@ Settings readSettings(const Instance& inst, PrTime clipTime, PrTime ticksPerFram
     // between them.  On Premiere that "1" is Classic, and Classic only ever
     // arrives with Preset "Custom" reading 0 (ReframeParams.h,
     // OSV_REFRAME_LENS_ITEMS), so the base is settled on the same frame.
+    //
+    // [WP-EASING] The Keyframe Easing popup joins them too.  Its default,
+    // None, reads 0 on a 0-based host - the reading that settles the base -
+    // and its entry count, 7, only on a 1-based one.
     int rawResolution = 0;
     int rawPreset = 0;
     int rawLens = 0;
+    int rawEasing = 0;
     const bool haveResolution = readPopupRaw(inst, kIndexOutputResolution, clipTime, &rawResolution);
     const bool havePreset = readPopupRaw(inst, kIndexPreset, clipTime, &rawPreset);
     const bool haveLens = readPopupRaw(inst, kIndexLens, clipTime, &rawLens);
+    const bool haveEasing = readPopupRaw(inst, kIndexKeyframeEasing, clipTime, &rawEasing);
     PopupBase base = static_cast<PopupBase>(inst.popupBase.load(std::memory_order_relaxed));
     if (haveResolution) {
         (void)decodeHostPopup(rawResolution, OSV_REFRAME_RESOLUTION_COUNT, &base);
@@ -1051,6 +1187,9 @@ Settings readSettings(const Instance& inst, PrTime clipTime, PrTime ticksPerFram
     }
     if (haveLens) {
         (void)decodeHostPopup(rawLens, OSV_REFRAME_LENS_COUNT, &base);
+    }
+    if (haveEasing) {
+        (void)decodeHostPopup(rawEasing, OSV_REFRAME_EASING_COUNT, &base);
     }
     const PopupBase learned = base;
     s.resolution = sanitiseResolution(haveResolution
@@ -1063,6 +1202,10 @@ Settings readSettings(const Instance& inst, PrTime clipTime, PrTime ticksPerFram
     // what the CPU path reads for a project that has no value for it.
     s.cameraModel = cameraModelFromLensPopup(haveLens ? decodeHostPopup(rawLens, OSV_REFRAME_LENS_COUNT, &base)
                                                       : OSV_REFRAME_LENS_DEFAULT);
+    // A host that does not expose the popup reads its default, None: the
+    // host's own interpolation, as before the popup existed.
+    s.easing = sanitiseKeyframeEasing(haveEasing ? decodeHostPopup(rawEasing, OSV_REFRAME_EASING_COUNT, &base)
+                                                 : OSV_REFRAME_EASING_DEFAULT);
     if (learned != PopupBase::Unknown) {
         const int previous = inst.popupBase.exchange(static_cast<int>(learned), std::memory_order_relaxed);
         if (previous != static_cast<int>(learned)) {
@@ -1087,16 +1230,33 @@ Settings readSettings(const Instance& inst, PrTime clipTime, PrTime ticksPerFram
     s.correction = readFloat(inst, kIndexCorrection, clipTime, OSV_REFRAME_CORRECTION_DEFAULT);
     s.dragSensitivity = readFloat(inst, kIndexDragSensitivity, clipTime, OSV_REFRAME_DRAG_SENSITIVITY_DEFAULT);
 
+    // ---- [WP-EASING] the selected lens's two controls -------------------------
+    // The other lens's pair is never rendered from, so it is not eased (and
+    // not worth its keyframe queries).  None returns the host's values
+    // untouched, which is what keeps None bit-identical to before.
+    if (s.cameraModel == CameraModel::Dji) {
+        s.djiFovDeg = easedOr(inst, s.easing, kIndexDjiFov, clipTime, ticksPerFrame, s.djiFovDeg);
+        s.correction = easedOr(inst, s.easing, kIndexCorrection, clipTime, ticksPerFrame, s.correction);
+    } else {
+        s.fovDeg = easedOr(inst, s.easing, kIndexFov, clipTime, ticksPerFrame, s.fovDeg);
+        s.distortion = easedOr(inst, s.easing, kIndexDistortion, clipTime, ticksPerFrame, s.distortion);
+    }
+
     // The six angles, either sampled once or averaged over three frames.
     const int angleIndices[6] = {kIndexPan,       kIndexTilt,       kIndexRoll,
                                  kIndexSourcePan, kIndexSourceTilt, kIndexSourceRoll};
+    // [WP-EASING] Only the camera's own three angles are eased; the Source
+    // angles orient the panorama and stay the host's (as on the CPU path).
+    constexpr int kEasedAngles = 3;
     double angles[6] = {0, 0, 0, 0, 0, 0};
 
     // Smoothing needs a frame duration; without one (a host that could not
     // tell us) it degrades to no smoothing rather than to a wrong average.
     const bool smooth = s.smoothKeyframes && ticksPerFrame > 0;
     for (int i = 0; i < 6; ++i) {
-        const double centre = readAngle(inst, angleIndices[i], clipTime, 0.0);
+        const KeyframeEasing easing = (i < kEasedAngles) ? s.easing : KeyframeEasing::None;
+        const double centre =
+            easedOr(inst, easing, angleIndices[i], clipTime, ticksPerFrame, readAngle(inst, angleIndices[i], clipTime, 0.0));
         if (!smooth) {
             angles[i] = centre;
             continue;
@@ -1106,8 +1266,10 @@ Settings readSettings(const Instance& inst, PrTime clipTime, PrTime ticksPerFram
         // negative PrTime is not something every host is happy with.
         const PrTime before = (clipTime > ticksPerFrame) ? (clipTime - ticksPerFrame) : 0;
         const PrTime after = clipTime + ticksPerFrame;
-        const double prev = readAngle(inst, angleIndices[i], before, centre);
-        const double next = readAngle(inst, angleIndices[i], after, centre);
+        const double prev =
+            easedOr(inst, easing, angleIndices[i], before, ticksPerFrame, readAngle(inst, angleIndices[i], before, centre));
+        const double next =
+            easedOr(inst, easing, angleIndices[i], after, ticksPerFrame, readAngle(inst, angleIndices[i], after, centre));
         angles[i] = (prev + centre + next) / 3.0;
     }
 

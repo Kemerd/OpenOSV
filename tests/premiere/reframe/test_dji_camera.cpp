@@ -846,14 +846,18 @@ TEST_CASE("matchHostParams with the appended DJI block", "[reframe][params][dji]
         CHECK(map[kIndexCameraModel] == 11);
         CHECK(map[kIndexDragSensitivity] == 15);
         CHECK(map[kIndexLens] == 16);
+        // [WP-EASING] The Keyframe Easing popup, appended after the Lens.
+        CHECK(map[kIndexKeyframeEasing] == 17);
     }
     SECTION("a list that stops before the Lens popup maps the rest; the Lens reads its default") {
         // A host whose list predates [WP-LENSUI]: every control up to Drag
-        // Sensitivity, then nothing.
-        const std::vector<HostParamKind> noLens(kValueParamKind, kValueParamKind + kValueParamCount - 1);
+        // Sensitivity, then nothing - so neither the Lens popup nor the
+        // Keyframe Easing popup appended after it ([WP-EASING]).
+        const std::vector<HostParamKind> noLens(kValueParamKind, kValueParamKind + kValueParamCount - 2);
         REQUIRE(matchHostParams(noLens.data(), static_cast<int>(noLens.size()), &map));
         CHECK(map[kIndexDragSensitivity] == 15);
         CHECK(map[kIndexLens] == -1);
+        CHECK(map[kIndexKeyframeEasing] == -1);
     }
     SECTION("Premiere's compact layout of the NEW list: the Source group hidden") {
         std::vector<HostParamKind> compact;
@@ -863,7 +867,7 @@ TEST_CASE("matchHostParams with the appended DJI block", "[reframe][params][dji]
                 compact.push_back(kValueParamKind[i]);
             }
         }
-        REQUIRE(compact.size() == 14u);
+        REQUIRE(compact.size() == 15u);
         REQUIRE(matchHostParams(compact.data(), static_cast<int>(compact.size()), &map));
         CHECK(map[kIndexSmooth] == 7);
         CHECK(map[kIndexCameraModel] == 8);
@@ -872,6 +876,7 @@ TEST_CASE("matchHostParams with the appended DJI block", "[reframe][params][dji]
         CHECK(map[kIndexCorrection] == 11);
         CHECK(map[kIndexDragSensitivity] == 12);
         CHECK(map[kIndexLens] == 13);
+        CHECK(map[kIndexKeyframeEasing] == 14);  // [WP-EASING]
         CHECK(map[kIndexSourcePan] == -1);
     }
     SECTION("a list of nothing but appended controls is not our list") {
