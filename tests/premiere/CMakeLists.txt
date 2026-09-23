@@ -39,6 +39,7 @@ add_executable(osv_premiere_common_tests
   common/test_mockhost.cpp
   common/test_common.cpp
   common/test_pixelcopy_bands.cpp
+  common/test_user_defaults.cpp   # [WP-DEFAULTS] the per-user Source Settings defaults file
 )
 
 target_link_libraries(osv_premiere_common_tests PRIVATE
