@@ -46,8 +46,9 @@ function reframeParams(popupBase) {
 /**
  * [WP-EASING] The parameter list of a fresh OpenOSV Source Settings (the
  * popups the panel reads), as the host would list it: Colour Output PQ,
- * Output Size Native, Stabilisation Horizon Lock, Calibration Auto, D-Log M
- * Curve Osmo 360 (its LAST entry), Render Device Auto.
+ * Output Size Native, Stabilisation Smooth + Horizon Lock (its LAST entry),
+ * Calibration Auto, D-Log M Curve Osmo 360 (its LAST entry), Render Device
+ * Auto.
  */
 function sourceSettingsParams(popupBase) {
     const b = popupBase;
@@ -55,7 +56,7 @@ function sourceSettingsParams(popupBase) {
         { displayName: 'Colour Output', value: b + 0, timeVarying: false },
         { displayName: 'Look (Rec. 709 only)', value: b + 0, timeVarying: false },
         { displayName: 'Output Size', value: b + 0, timeVarying: false },
-        { displayName: 'Stabilisation', value: b + 1, timeVarying: false },
+        { displayName: 'Stabilisation', value: b + 4, timeVarying: false },
         { displayName: 'Stitching', value: null, timeVarying: false },
         { displayName: 'Calibration', value: b + 0, timeVarying: false },
         { displayName: 'D-Log M Curve', value: b + 2, timeVarying: false },

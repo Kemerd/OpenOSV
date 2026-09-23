@@ -68,11 +68,14 @@ function createWorld(options) {
         return { matchName: 'AE.OpenOSV.Open360Reframe', displayName: 'Open 360 Reframe', properties: collection(params, 'numItems') };
     }
 
-    /** [WP-EASING] The fresh OpenOSV Source Settings popups the panel reads. */
+    /**
+     * [WP-EASING] The fresh OpenOSV Source Settings popups the panel reads
+     * (Stabilisation at its default, Smooth + Horizon Lock, the last entry).
+     */
     function sourceSettingsComponent() {
         const b = popupBase;
         const params = [
-            ['Colour Output', b + 0], ['Look (Rec. 709 only)', b + 0], ['Output Size', b + 0], ['Stabilisation', b + 1],
+            ['Colour Output', b + 0], ['Look (Rec. 709 only)', b + 0], ['Output Size', b + 0], ['Stabilisation', b + 4],
             ['Stitching', null], ['Calibration', b + 0], ['D-Log M Curve', b + 2], ['Render Device', b + 0]
         ].map(([name, value]) => makeParam(name, value));
         return { matchName: 'AE.OpenOSV.SourceSettings', displayName: 'OpenOSV Source Settings', properties: collection(params, 'numItems') };

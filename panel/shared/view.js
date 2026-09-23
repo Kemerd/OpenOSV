@@ -119,9 +119,14 @@
         easingSelected: 'Apply to selected clips',
         easingAll: 'Apply to all OSV clips in this sequence',
         easingUndoNote: 'This Premiere undoes it one clip at a time.',
-        // The Stabilisation card.
+        // The Stabilisation card: DJI Studio's two switches, then what Apply
+        // writes ({entry} is the Source Settings entry the pair spells).
         stabilizationSection: 'Stabilisation',
-        stabilizationCaption: 'Set on each selected clip\'s master clip, in its OpenOSV Source Settings.',
+        rockSteadyLabel: 'RockSteady',
+        rockSteadyCaption: 'Irons out the shake. The view still turns with you.',
+        horizonLabel: 'Horizon Leveling',
+        horizonCaption: 'Keeps the horizon level, whatever the camera does.',
+        stabilizationCaption: 'Apply sets Stabilisation to {entry} on each selected clip\'s master clip.',
         stabilizationApply: 'Apply to selected clips',
         stabilizationUnsupported: 'This Premiere can\'t reach Source Settings from a panel. Set it in the master clip\'s Source Settings.'
     };
@@ -1012,14 +1017,35 @@
         shell.appendChild(easingCard);
 
         // ---- [WP-EASING] Stabilisation ---------------------------------------
+        // DJI Studio's two independent switches, RockSteady and Horizon
+        // Leveling, each on its own row like the defaults card's switches.
+        // Together they spell one Source Settings entry, which the caption
+        // under them names, so Apply never writes a surprise.
         shell.appendChild(make(doc, 'div', 'osv-section-title', COPY.stabilizationSection));
         var stabCard = make(doc, 'div', 'osv-card osv-card-padded');
-        var stabilization = makeSegmented('stab', core.STABILIZATIONS.map(function (s) {
-            return { value: s.id, label: s.label };
-        }), function (value) { controller.setStabilization(value); });
-        stabilization.node.className += ' osv-segmented-full';
-        stabCard.appendChild(stabilization.node);
-        var stabCaption = make(doc, 'div', 'osv-caption osv-card-caption', COPY.stabilizationCaption);
+
+        /**
+         * One switch row of the card: the label, what it does, the switch.
+         * `top` marks the first row, which starts flush with the card's padding.
+         */
+        function makeStabRow(id, label, caption, top, onToggle) {
+            var row = make(doc, 'div', 'osv-row osv-stab-row' + (top ? ' osv-stab-row-top' : ''));
+            var text = make(doc, 'div', 'osv-row-text');
+            text.appendChild(make(doc, 'div', 'osv-label', label));
+            text.appendChild(make(doc, 'div', 'osv-caption', caption));
+            var sw = makeSwitch(id, 'small', label, onToggle);
+            row.appendChild(text);
+            row.appendChild(sw.node);
+            stabCard.appendChild(row);
+            return sw;
+        }
+        var rockSteadySwitch = makeStabRow('rockSteady', COPY.rockSteadyLabel, COPY.rockSteadyCaption, true,
+                                           function (on) { controller.setRockSteady(on); });
+        stabCard.appendChild(make(doc, 'div', 'osv-divider'));
+        var horizonSwitch = makeStabRow('horizonLeveling', COPY.horizonLabel, COPY.horizonCaption, false,
+                                        function (on) { controller.setHorizonLeveling(on); });
+        // What Apply writes; filled in by render().
+        var stabCaption = make(doc, 'div', 'osv-caption osv-card-caption osv-stab-caption', '');
         stabCard.appendChild(stabCaption);
         var stabActions = make(doc, 'div', 'osv-actions osv-card-actions');
         var stabApply = makeButton('btnStab', 'osv-button-secondary', COPY.stabilizationApply,
@@ -1197,14 +1223,20 @@
             }
             setClass(easingNote, 'is-empty', undoNote === '');
 
-            // [WP-EASING] Stabilisation.
-            if (first || rendered.settings.stabilization !== s.stabilization) {
-                stabilization.set(s.stabilization, animate);
+            // [WP-EASING] Stabilisation: each switch springs on its own, and
+            // the caption names the entry the pair now spells.
+            if (first || rendered.settings.rockSteady !== s.rockSteady) {
+                rockSteadySwitch.set(s.rockSteady, animate);
+            }
+            if (first || rendered.settings.horizonLeveling !== s.horizonLeveling) {
+                horizonSwitch.set(s.horizonLeveling, animate);
             }
             var reachable = caps.stabilization !== false;
             stabApply.setEnabled(usable && reachable);
             stabApply.setLabel(running === 'stabilization' ? busyText : COPY.stabilizationApply);
-            var stabText = reachable ? COPY.stabilizationCaption : COPY.stabilizationUnsupported;
+            var stabChoice = core.stabilizationChoice(s.rockSteady, s.horizonLeveling);
+            var stabText = reachable ? COPY.stabilizationCaption.replace('{entry}', stabChoice.name)
+                                     : COPY.stabilizationUnsupported;
             if (stabCaption.textContent !== stabText) {
                 stabCaption.textContent = stabText;
             }
@@ -1238,7 +1270,6 @@
         function relayout() {
             lens.relayout();
             slider.relayout();
-            stabilization.relayout();
         }
 
         /** 'dark' or 'light'; `background` (a CSS colour) matches the host panel. */
@@ -1257,6 +1288,8 @@
             autoSwitch.redraw();
             dragSwitch.redraw();
             // [WP-EASING] The spring-mixed colours of the new controls.
+            rockSteadySwitch.redraw();
+            horizonSwitch.redraw();
             easingTiles.forEach(function (t) { t.tile.redraw(); });
             hint.redraw();
         }

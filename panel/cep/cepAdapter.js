@@ -468,11 +468,11 @@
             setStabilization: function (seq, items, request) {
                 var req = request || {};
                 var entry = Math.floor(Number(req.entry));
-                var result = { unsupported: false, updated: 0, unchanged: 0, missing: 0, failed: 0, errors: [], notes: [],
-                               learnedBase: null };
+                var result = { unsupported: false, updated: 0, unchanged: 0, missing: 0, failed: 0, replacedFull: 0,
+                               errors: [], notes: [], learnedBase: null };
                 var keys = (Array.isArray(items) ? items : []).map(function (i) { return i ? String(i.key) : ''; })
                     .filter(function (k) { return k.length > 0; });
-                if (!(entry >= 1 && entry <= 4) || keys.length === 0) {
+                if (!(entry >= 1 && entry <= core.SOURCE_POPUP_COUNTS.Stabilisation) || keys.length === 0) {
                     return Promise.resolve(result);
                 }
                 var sequenceId = seq ? seq.id : '';
@@ -502,7 +502,11 @@
                     }
                     result.learnedBase = base;
                     var target = core.popupValue(entry, base);
+                    // Full has no pair of switches; count the clips this
+                    // press takes off it, so the status line can say so.
+                    var full = core.popupValue(core.STABILIZATION_ENTRIES.full, base);
                     var writes = [];
+                    var wasFull = 0;
                     targets.forEach(function (t) {
                         var p = (t.params || []).filter(function (x) {
                             return x && x.name === core.SOURCE_PARAM_NAMES.stabilization;
@@ -513,6 +517,7 @@
                             result.unchanged += 1;
                         } else {
                             writes.push({ key: t.key, index: p.index, name: p.name, value: target });
+                            wasFull += p.value === full ? 1 : 0;
                         }
                     });
                     if (writes.length === 0) {
@@ -522,6 +527,9 @@
                         var failed = Number(w.failed) || 0;
                         result.failed += failed;
                         result.updated += Math.max(0, writes.length - failed);
+                        // The host counts failures without naming them, so a
+                        // failed write may have been a Full one: never claim more.
+                        result.replacedFull = Math.max(0, wasFull - failed);
                         if (failed > 0 && Array.isArray(w.errors) && w.errors.length > 0) {
                             result.errors.push(String(w.errors[0]));
                         }

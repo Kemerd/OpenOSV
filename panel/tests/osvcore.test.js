@@ -72,21 +72,27 @@ test('pickHostMatchName prefers the registered name and returns null when it is 
 // ---------------------------------------------------------------------------
 
 test('settings default to auto-apply on, DJI lens, drag sensitivity untouched at 2.0', () => {
-    // [WP-EASING] The newer settings: no easing picked yet, Horizon Leveling
-    // (the Source Settings default), the controls card open for a new user,
-    // and the popup numbering not learned yet.
+    // [WP-EASING] The newer settings: no easing picked yet, RockSteady and
+    // Horizon Leveling both on (the Source Settings default), the controls
+    // card open for a new user, and the popup numbering not learned yet.
     assert.deepEqual(core.sanitizeSettings(null), {
-        autoApply: true, lens: 'dji', dragEnabled: false, dragSensitivity: 2, easing: 'none', stabilization: 'horizon', hintOpen: true, popupBase: null
+        autoApply: true, lens: 'dji', dragEnabled: false, dragSensitivity: 2, easing: 'none', rockSteady: true,
+        horizonLeveling: true, hintOpen: true, popupBase: null
     });
     assert.deepEqual(core.sanitizeSettings(undefined), core.sanitizeSettings({}));
 });
 
 test('settings are repaired field by field', () => {
     const s = core.sanitizeSettings({ autoApply: 'yes', lens: 'CLASSIC', dragEnabled: 1, dragSensitivity: 'fast',
-                                      easing: 'bounce', stabilization: 'gyro', hintOpen: 'no', popupBase: 2 });
-    assert.deepEqual(s, { autoApply: true, lens: 'dji', dragEnabled: false, dragSensitivity: 2, easing: 'none', stabilization: 'horizon', hintOpen: true, popupBase: null });
+                                      easing: 'bounce', rockSteady: 'on', horizonLeveling: 0, hintOpen: 'no',
+                                      popupBase: 2 });
+    assert.deepEqual(s, { autoApply: true, lens: 'dji', dragEnabled: false, dragSensitivity: 2, easing: 'none',
+                          rockSteady: true, horizonLeveling: true, hintOpen: true, popupBase: null });
     assert.equal(core.sanitizeSettings({ easing: 'slow-in-slow-out' }).easing, 'slow-in-slow-out');
-    assert.equal(core.sanitizeSettings({ stabilization: 'rocksteady' }).stabilization, 'rocksteady');
+    assert.equal(core.sanitizeSettings({ rockSteady: false }).rockSteady, false);
+    assert.equal(core.sanitizeSettings({ rockSteady: false }).horizonLeveling, true, 'the switches are independent');
+    assert.equal(core.sanitizeSettings({ horizonLeveling: false }).horizonLeveling, false);
+    assert.equal(core.sanitizeSettings({ horizonLeveling: false }).rockSteady, true);
     assert.equal(core.sanitizeSettings({ hintOpen: false }).hintOpen, false);
     assert.equal(core.sanitizeSettings({ popupBase: 0 }).popupBase, 0);
     assert.equal(core.sanitizeSettings({ popupBase: 1 }).popupBase, 1);
@@ -103,11 +109,63 @@ test('settings are repaired field by field', () => {
 
 test('stored settings round-trip, and garbage storage gives the defaults', () => {
     const s = { autoApply: false, lens: 'classic', dragEnabled: true, dragSensitivity: 3.5, easing: 'linear-smooth',
-                stabilization: 'off', hintOpen: false, popupBase: 0 };
+                rockSteady: true, horizonLeveling: false, hintOpen: false, popupBase: 0 };
     assert.deepEqual(core.parseSettings(core.serializeSettings(s)), s);
     for (const junk of [null, '', '{', 'null', '42', '"text"', '[]', 'x'.repeat(5000)]) {
         assert.deepEqual(core.parseSettings(junk), core.sanitizeSettings(null), String(junk).slice(0, 20));
     }
+});
+
+test('an older panel\'s single Stabilisation choice becomes the two switches', () => {
+    const pair = (stored) => {
+        const s = core.parseSettings(JSON.stringify(stored));
+        return [s.rockSteady, s.horizonLeveling];
+    };
+    // Off and RockSteady keep exactly what their Apply wrote (Off, Smooth).
+    assert.deepEqual(pair({ stabilization: 'off' }), [false, false]);
+    assert.deepEqual(pair({ stabilization: 'rocksteady' }), [true, false]);
+    // 'horizon' was the default every untouched card stored: it becomes the
+    // new default, both on.
+    assert.deepEqual(pair({ stabilization: 'horizon' }), [true, true]);
+    // Anything else is the default too.
+    assert.deepEqual(pair({ stabilization: 'gyro' }), [true, true]);
+    assert.deepEqual(pair({ stabilization: 42 }), [true, true]);
+    assert.deepEqual(pair({ stabilization: 'constructor' }), [true, true], 'no prototype keys');
+    // Switches this panel stored win over a leftover single choice.
+    assert.deepEqual(pair({ stabilization: 'off', rockSteady: true, horizonLeveling: false }), [true, false]);
+    // The old key is not written back.
+    const saved = JSON.parse(core.serializeSettings(core.parseSettings(JSON.stringify({ stabilization: 'rocksteady' }))));
+    assert.equal(Object.prototype.hasOwnProperty.call(saved, 'stabilization'), false);
+    assert.equal(saved.rockSteady, true);
+    assert.equal(saved.horizonLeveling, false);
+});
+
+test('the two Stabilisation switches spell one Source Settings entry', () => {
+    // RockSteady / Horizon Leveling -> entry, as DJI Studio's two switches.
+    const cases = [
+        [false, false, 1, 'No stabilisation'],
+        [false, true, 2, 'Horizon Leveling'],
+        [true, false, 4, 'RockSteady'],
+        [true, true, 5, 'RockSteady + Horizon Leveling']
+    ];
+    for (const [rockSteady, horizon, entry, label] of cases) {
+        const c = core.stabilizationChoice(rockSteady, horizon);
+        assert.equal(c.entry, entry, rockSteady + ' / ' + horizon);
+        assert.equal(c.label, label);
+        assert.equal(c.rockSteady, rockSteady);
+        assert.equal(c.horizonLeveling, horizon);
+    }
+    // Entry 3, Full, is not reachable from the switches.
+    for (const rs of [false, true]) {
+        for (const hl of [false, true]) {
+            assert.notEqual(core.stabilizationChoice(rs, hl).entry, core.STABILIZATION_ENTRIES.full);
+        }
+    }
+    // Anything but true is off: a garbled switch never turns a mode on.
+    assert.equal(core.stabilizationChoice('yes', 1).entry, 1);
+    assert.equal(core.stabilizationChoice(undefined, null).entry, 1);
+    // Every entry fits the popup the numbering is learned from.
+    assert.equal(core.SOURCE_POPUP_COUNTS.Stabilisation, 5);
 });
 
 // ---------------------------------------------------------------------------

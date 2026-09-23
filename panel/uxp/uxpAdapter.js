@@ -43,7 +43,8 @@
  *   writeFraming(seq, {action: 'preset'|'zoom', preset, direction, popupBase})
  *                            -> {ok, reason, error, label, keyframed, learnedBase}
  *   setStabilization(seq, items, {entry, popupBase})
- *                            -> {unsupported, updated, unchanged, missing, failed, errors[], notes[], learnedBase}
+ *                            -> {unsupported, updated, unchanged, missing, failed, replacedFull, errors[], notes[],
+ *                                learnedBase}
  *
  * UNDO.  Every change this adapter makes is ONE Project.executeTransaction()
  * - "Execute undoable transaction by passing compound action" (Adobe's
@@ -1405,14 +1406,14 @@
             setStabilization: function (seq, items, request) {
                 var req = request || {};
                 var entry = Math.floor(Number(req.entry));
-                var result = { unsupported: false, updated: 0, unchanged: 0, missing: 0, failed: 0, errors: [], notes: [],
-                               learnedBase: null };
+                var result = { unsupported: false, updated: 0, unchanged: 0, missing: 0, failed: 0, replacedFull: 0,
+                               errors: [], notes: [], learnedBase: null };
                 if (!ppro.ClipProjectItem || typeof ppro.ClipProjectItem.cast !== 'function') {
                     result.unsupported = true;
                     return Promise.resolve(result);
                 }
                 var targets = Array.isArray(items) ? items : [];
-                if (!(entry >= 1 && entry <= 4) || targets.length === 0) {
+                if (!(entry >= 1 && entry <= core.SOURCE_POPUP_COUNTS.Stabilisation) || targets.length === 0) {
                     return Promise.resolve(result);
                 }
                 var mediaVideo = (constants().MediaType && constants().MediaType.VIDEO !== undefined)
@@ -1497,17 +1498,23 @@
                     }
                     result.learnedBase = base;
                     var target = core.popupValue(entry, base);
+                    // Full has no pair of switches; count the clips this
+                    // press takes off it, so the status line can say so.
+                    var full = core.popupValue(core.STABILIZATION_ENTRIES.full, base);
                     var writes = [];
+                    var wasFull = 0;
                     plans.forEach(function (plan) {
                         if (plan.value === target) {
                             result.unchanged += 1;
                         } else {
                             writes.push({ param: plan.param, value: target, time: null });
+                            wasFull += plan.value === full ? 1 : 0;
                         }
                     });
                     return commitWrites(ctx, writes, UNDO_STABILIZATION).then(function (done) {
                         if (done.ok) {
                             result.updated += writes.length;
+                            result.replacedFull = wasFull;
                         } else {
                             result.failed += writes.length;
                             result.errors.push(done.error);
