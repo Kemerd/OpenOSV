@@ -89,7 +89,7 @@ struct FlowField {
 /// Tuning for the DIS solver.
 ///
 /// Most of these match the values DJI's own stitcher uses, determined for
-/// interoperability.
+/// interoperability (docs/LEGAL.md lists them).
 /// Each field says where its default came from.  Four of them - pyramid
 /// levels and iteration count among them - keep the paper's operating point
 /// and say so at their own declaration.

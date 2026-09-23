@@ -4,7 +4,8 @@
 // D-Log M curve constants and host-side helpers.
 //
 // Three curves are shipped:
-//   * kDlogMPocket3  - the public DJI Pocket 3 D-Log M -> linear constants.
+//   * kDlogMPocket3  - the published community fit of DJI Pocket 3 D-Log M ->
+//                      linear by Thatcher Freeman (see NOTICE).
 //   * kDlogMDjiRefit - the same seven-parameter form re-fitted by
 //                      scripts/fit_dlogm.py to 64 neutral-axis measurements
 //                      of a DJI D-Log M -> HLG conversion (Pocket-3 era).
@@ -19,9 +20,11 @@
 
 namespace osv::color {
 
-/// Public DJI Pocket 3 D-Log M constants.  The cut is defined as the branch
-/// intersection intercept / (slope2 - slope) = 0.6034245, which is exactly
-/// the published cut value, so the curve is continuous.
+/// DJI Pocket 3 D-Log M constants from Thatcher Freeman's published community
+/// fit ("DJI Pocket 3 D-Log M to DWG.dctl", github.com/thatcherfreeman/
+/// dwg-transforms); DJI publishes no formula.  The cut is defined as the
+/// branch intersection intercept / (slope2 - slope) = 0.6034245, which is
+/// exactly the published cut value, so the curve is continuous.
 /// Anchors: code 0.40 -> 0.1800, code 1.00 -> 2.4735.
 inline constexpr OsvDlogMCurve kDlogMPocket3 = {
     -2.428226947784424f,   // xShift
