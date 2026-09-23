@@ -95,8 +95,18 @@ Result<FormatInfo> FormatDetector::detect(const OsvFile& file, const MetadataTra
         info.colorModeFromMetadata = false;
         info.notes.push_back("colour mode not present in metadata; use the histogram auto-detect (osv_color) or --input");
     }
-    if (stream) {
+    // The lens accessory is StreamMeta.extri_lens_mode (field 7) - the
+    // in-camera "Lens Protection Mode" switch.  It is proto3, and the camera
+    // writes the message even for the default value (an empty field 7 means
+    // "native"), so a MISSING field is a different statement from a native
+    // one and gets its own note.
+    if (stream && stream->present.test(7)) {
         info.lensMode = stream->extriLensMode;
+        info.lensModeFromMetadata = true;
+    } else if (stream) {
+        info.lensMode = ExtriLensMode::Native;
+        info.lensModeFromMetadata = false;
+        info.notes.push_back("lens accessory not recorded (StreamMeta has no extri_lens_mode); assuming bare lenses");
     } else {
         info.notes.push_back("lens accessory mode unknown (no StreamMeta); assuming native lenses");
     }

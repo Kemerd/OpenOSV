@@ -55,6 +55,44 @@ schema. The fields that matter:
 Repeated scalars may be packed or unpacked; unknown fields are skipped by
 wire type; every field is optional.
 
+### Calibration sets and lens accessories
+
+The camera writes **every** `PanoDewarpParams` slot; the sets it has no
+numbers for are zero-filled placeholders.  On the sample clip only
+`native_refine` (1/2), `native` (11/12) and the six far presets (13-24) carry
+data; 3-10 (native_refine_far, lens guards, above / under water) are 159-byte
+all-zero records.  `osvtool probe` prints the table, the differences against
+native_refine and what every calibration choice would stitch with.
+
+`extri_lens_mode` (StreamMeta.7) is the camera's **Lens Protection Mode**
+switch (control centre, "Transparent Lens Protectors"); the proto3 default
+(an empty field 7) means bare lenses.  There is no ND-filter field anywhere
+in the format: ND filters that mount like the protectors are declared through
+the same switch (Freewell's instructions say so).  `FrameMeta.2.8`
+`underwater_confidence` is written but unused by DJI's tools.
+
+What DJI's own tools do (DJI's Premiere importer and DJI Studio, studied for
+interoperability; understanding only, nothing copied):
+
+* **Slot choice** ignores `extri_lens_mode`.  For library version 02.01.07 and
+  later (the sample is 02.01.15) they start at **`far_11` (17/18)**, fall back
+  per lens to native_refine_far (3/4) and then native_refine (1/2), and never
+  read `native` (11/12) or the lens-guard / water slots.  OpenOSV stays on
+  `native_refine`: far_11 differs by 2.6 px focal / 0.14 px centre / 0.006 deg
+  in calibration space and measured +0.0004 overlap NCC on the sample - noise.
+  `--stitch-distance 1.1` selects it explicitly.
+* **Lens protectors** are a field-angle correction, not a calibration slot:
+  DJI's importer bends every ray's angle from the lens axis through a
+  measured curve (+0.52 deg at 30, +1.28 deg at 90, +1.66 deg at 98 deg)
+  *before* projecting with the native calibration.  OpenOSV folds its own
+  smooth fit of that curve into the lens model (`geom/LensProtector.h`) when
+  the choice resolves to lens guards and the clip has no dedicated set, and
+  checks the direction once per clip on frame 0
+  (`render/LensProtectorCheck.h`).  DJI Studio defaults its Lens Protector
+  option from `extri_lens_mode == 1`, which is what OpenOSV's Auto does.
+* **Underwater / above water** use similar curves (much larger: 90 deg maps to
+  86.5 / 78.6 deg) that OpenOSV does not model yet.
+
 ## Index table
 
 The second `free` box holds three 16-byte entries. For `camd` the offset is

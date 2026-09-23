@@ -176,7 +176,9 @@ TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     // readable.  Its zero bytes read as parallax Off / backend Auto.
     static_assert(offsetof(PrefsBlob, parallax) == 20, "parallax sits at 20");
     static_assert(offsetof(PrefsBlob, flowBackend) == 21, "flowBackend follows parallax");
-    static_assert(offsetof(PrefsBlob, reserved) == 22, "reserved fills the rest");
+    // calibrationForceNative came out of the reserved block the same way.
+    static_assert(offsetof(PrefsBlob, calibrationForceNative) == 22, "calibrationForceNative follows flowBackend");
+    static_assert(offsetof(PrefsBlob, reserved) == 23, "reserved fills the rest");
     static_assert(std::is_trivially_copyable_v<PrefsBlob>, "the blob is memcpy'd to and from the host");
 
     REQUIRE(sizeof(PrefsBlob) == PrefsBlob::kSize);
@@ -208,6 +210,97 @@ TEST_CASE("a blob from an older build still deserialises", "[common][prefs]") {
     // A FRESH blob, by contrast, has it on.
     const PrefsBlob fresh = PrefsBlob::defaults();
     CHECK(fresh.parallaxEnabled());
+}
+
+TEST_CASE("the calibration choice decodes from two bytes and old blobs keep their meaning", "[common][prefs]") {
+    // Before the choice existed, calibration 0 ("Native") passed NO override
+    // to the selector, i.e. it followed the accessory the camera recorded -
+    // which is what Auto means.  An old blob (calibrationForceNative byte = 0
+    // because it was reserved) must therefore read as Auto, and 1 / 2 as the
+    // forced sets they always were.
+    SECTION("old blobs") {
+        PrefsBlob old = PrefsBlob::defaults();
+        old.calibrationForceNative = 0;  // what an older build's reserved byte holds
+        const struct {
+            PrefsCalibration stored;
+            PrefsCalibrationChoice expected;
+        } cases[] = {
+            {PrefsCalibration::Native, PrefsCalibrationChoice::Auto},
+            {PrefsCalibration::LensGuards, PrefsCalibrationChoice::LensGuards},
+            {PrefsCalibration::Underwater, PrefsCalibrationChoice::Underwater},
+        };
+        for (const auto& c : cases) {
+            old.calibration = static_cast<std::uint8_t>(c.stored);
+            INFO("stored calibration " << static_cast<int>(c.stored));
+            REQUIRE(old.sanitise());  // nothing to change: an old blob is clean
+            CHECK(old.calibrationChoice() == c.expected);
+        }
+    }
+
+    SECTION("a fresh blob is Auto, with the same bytes an old default blob had") {
+        const PrefsBlob fresh = PrefsBlob::defaults();
+        CHECK(fresh.calibrationChoice() == PrefsCalibrationChoice::Auto);
+        CHECK(fresh.calibration == 0);
+        CHECK(fresh.calibrationForceNative == 0);
+    }
+
+    SECTION("every choice round-trips through its canonical bytes") {
+        for (int c = 0; c < static_cast<int>(PrefsCalibrationChoice::Count); ++c) {
+            PrefsBlob p = PrefsBlob::defaults();
+            p.setCalibrationChoice(static_cast<PrefsCalibrationChoice>(c));
+            INFO("choice " << c);
+            REQUIRE(p.sanitise());  // the setter writes a clean pattern
+            CHECK(static_cast<int>(p.calibrationChoice()) == c);
+            // Only a forced Native sets the extra byte.
+            CHECK((p.calibrationForceNative != 0) == (c == static_cast<int>(PrefsCalibrationChoice::Native)));
+        }
+        // Auto and a forced Native share calibration 0 but are different
+        // blobs, so they are different PPix cache keys.
+        PrefsBlob a = PrefsBlob::defaults();
+        PrefsBlob n = PrefsBlob::defaults();
+        a.setCalibrationChoice(PrefsCalibrationChoice::Auto);
+        n.setCalibrationChoice(PrefsCalibrationChoice::Native);
+        CHECK(a.calibration == n.calibration);
+        CHECK(a != n);
+    }
+
+    SECTION("sanitise canonicalises and clamps the new byte") {
+        // The force byte only qualifies Native: with a forced set it is noise
+        // and is cleared, so one meaning has one byte pattern.
+        PrefsBlob p = PrefsBlob::defaults();
+        p.calibration = static_cast<std::uint8_t>(PrefsCalibration::LensGuards);
+        p.calibrationForceNative = 1;
+        REQUIRE_FALSE(p.sanitise());
+        CHECK(p.calibrationForceNative == 0);
+        CHECK(p.calibrationChoice() == PrefsCalibrationChoice::LensGuards);
+        REQUIRE(p.sanitise());
+
+        // Garbage in the byte falls back to 0 (Auto), the default.
+        PrefsBlob g = PrefsBlob::defaults();
+        g.calibrationForceNative = 77;
+        REQUIRE_FALSE(g.sanitise());
+        CHECK(g.calibrationForceNative == 0);
+        CHECK(g.calibrationChoice() == PrefsCalibrationChoice::Auto);
+
+        // An out-of-range calibration byte lands on Auto too - the default
+        // choice - even when the force byte claimed Native.
+        PrefsBlob bad = PrefsBlob::defaults();
+        bad.calibration = 250;
+        bad.calibrationForceNative = 1;
+        CHECK(bad.calibrationChoice() == PrefsCalibrationChoice::Auto);  // even unsanitised
+        REQUIRE_FALSE(bad.sanitise());
+        CHECK(bad.calibrationChoice() == PrefsCalibrationChoice::Auto);
+        CHECK(bad.calibration == 0);
+        CHECK(bad.calibrationForceNative == 0);
+    }
+
+    SECTION("a blob with a forced Native survives fromBytes") {
+        PrefsBlob p = PrefsBlob::defaults();
+        p.setCalibrationChoice(PrefsCalibrationChoice::Native);
+        const PrefsBlob back = PrefsBlob::fromBytes(&p, sizeof(p));
+        CHECK(back == p);
+        CHECK(back.calibrationChoice() == PrefsCalibrationChoice::Native);
+    }
 }
 
 TEST_CASE("PrefsBlob defaults match the documented table", "[common][prefs]") {
@@ -329,7 +422,9 @@ TEST_CASE("PrefsBlob sanitise clamps every out-of-range field", "[common][prefs]
     SECTION("dirty reserved bytes are zeroed so the cache key stays stable") {
         PrefsBlob p = PrefsBlob::defaults();
         p.reserved[0] = 0xFF;
-        p.reserved[107] = 0x01;
+        // The LAST reserved byte, by size: a literal index here outlived two
+        // shrinks of the block and ended up writing past the struct.
+        p.reserved[sizeof(p.reserved) - 1] = 0x01;
         REQUIRE_FALSE(p.sanitise());
         for (const std::uint8_t b : p.reserved) {
             REQUIRE(b == 0);

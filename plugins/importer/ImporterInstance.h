@@ -447,9 +447,10 @@ private:
     std::int64_t m_audioDuration = 0;
     std::uint32_t m_audioTrackId = 0;
 
-    /// The calibration slot the current rig was built for, so rebuildRig()
-    /// can skip the work when the prefs did not touch it.
-    PrefsCalibration m_rigCalibration = PrefsCalibration::Native;
+    /// The calibration choice the current rig was built for, so rebuildRig()
+    /// can skip the work when the prefs did not touch it.  The choice rather
+    /// than the stored byte: Auto and a forced Native share calibration 0.
+    PrefsCalibrationChoice m_rigCalibration = PrefsCalibrationChoice::Auto;
     bool m_rigBuilt = false;
 
     /// Set once a hardware decoder has failed on this clip: every reader
