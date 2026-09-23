@@ -10,9 +10,9 @@
 // to OpenOSVImporter.prm as a flat preferences blob.  It exists so the stitch
 // options (colour output, output size, stabilisation, seam search, exposure
 // match, calibration slot, D-Log M curve, exposure, render device, the
-// Rec.709 look, sun ghost removal, the sky seam fix and the reframe effect's
-// Program Monitor Colour) are simply VISIBLE, instead of hiding behind the
-// modal dialog in imGetPrefs8.
+// Rec.709 look, sun ghost removal, the sky seam fix, the carved seam's tweaks
+// and the reframe effect's Program Monitor Colour) are simply VISIBLE, instead
+// of hiding behind the modal dialog in imGetPrefs8.
 //
 // How the two halves find each other: the importer sets
 // imImportInfoRec::hasSourceSettingsEffect and puts this effect's match name
@@ -29,7 +29,7 @@
 //                                    SetIsSourceSettingsEffect(), which is
 //                                    what tells Premiere this is a master
 //                                    clip settings effect and not a filter.
-//   PF_Cmd_PARAMS_SETUP              the fifteen controls, each flagged
+//   PF_Cmd_PARAMS_SETUP              the twenty controls, each flagged
 //                                    PF_ParamFlag_CANNOT_TIME_VARY.
 //   PF_Cmd_SEQUENCE_SETUP            PerformSourceSettingsCommand(), which
 //                                    round-trips a blob through the importer
@@ -134,8 +134,20 @@ static_assert(kIndexFlareRemoval == kIndexCalibration + 1,
 static_assert(kIndexPhotoSeam == kIndexFlareRemoval + 1 && kIndexPhotoStrength == kIndexPhotoSeam + 1 &&
                   kIndexSeamInset == kIndexPhotoStrength + 1,
               "Sky Seam Fix, Sky Seam Strength and Seam Edge Inset follow Sun Ghost Removal in that order");
-static_assert(kIndexStitchTopicEnd == kIndexSeamInset + 1,
-              "the Stitching group must close immediately after Seam Edge Inset");
+// [WP-SEAMTOOLS] the seam tools' five controls follow Seam Edge Inset, and
+// the Stitching group closes right after them.
+static_assert(kIndexSeamBlend == kIndexSeamInset + 1 && kIndexParallaxBlend == kIndexSeamBlend + 1 &&
+                  kIndexSeamSmoothing == kIndexParallaxBlend + 1 && kIndexNearOffset == kIndexSeamSmoothing + 1 &&
+                  kIndexFarOffset == kIndexNearOffset + 1,
+              "Seam Blend, Parallax Blend, Seam Smoothing, Near Offset and Far Offset follow Seam Edge Inset");
+static_assert(kParamIdByIndex[kIndexSeamBlend - 1] == OSV_SS_ID_SEAM_BLEND &&
+                  kParamIdByIndex[kIndexParallaxBlend - 1] == OSV_SS_ID_PARALLAX_BLEND &&
+                  kParamIdByIndex[kIndexSeamSmoothing - 1] == OSV_SS_ID_SEAM_SMOOTHING &&
+                  kParamIdByIndex[kIndexNearOffset - 1] == OSV_SS_ID_NEAR_OFFSET &&
+                  kParamIdByIndex[kIndexFarOffset - 1] == OSV_SS_ID_FAR_OFFSET,
+              "kParamIdByIndex is not aligned with the ParamIndex enum");
+static_assert(kIndexStitchTopicEnd == kIndexFarOffset + 1,
+              "the Stitching group must close immediately after Far Offset");
 static_assert(kParamIdByIndex[kIndexPhotoSeam - 1] == OSV_SS_ID_PHOTO_SEAM &&
                   kParamIdByIndex[kIndexPhotoStrength - 1] == OSV_SS_ID_PHOTO_STRENGTH &&
                   kParamIdByIndex[kIndexSeamInset - 1] == OSV_SS_ID_SEAM_INSET,
@@ -287,6 +299,22 @@ private:
     if (const PF_ParamDef* p = def(kIndexSeamInset)) {
         c.seamInsetDeg = static_cast<double>(p->u.fs_d.value);
     }
+    // [WP-SEAMTOOLS]
+    if (const PF_ParamDef* p = def(kIndexSeamBlend)) {
+        c.seamBlendDeg = static_cast<double>(p->u.fs_d.value);
+    }
+    if (const PF_ParamDef* p = def(kIndexParallaxBlend)) {
+        c.parallaxBlendDeg = static_cast<double>(p->u.fs_d.value);
+    }
+    if (const PF_ParamDef* p = def(kIndexSeamSmoothing)) {
+        c.seamSmoothingDeg = static_cast<double>(p->u.fs_d.value);
+    }
+    if (const PF_ParamDef* p = def(kIndexNearOffset)) {
+        c.nearOffsetDeg = static_cast<double>(p->u.fs_d.value);
+    }
+    if (const PF_ParamDef* p = def(kIndexFarOffset)) {
+        c.farOffsetDeg = static_cast<double>(p->u.fs_d.value);
+    }
     if (const PF_ParamDef* p = def(kIndexDlogmFit)) {
         c.dlogmFit = static_cast<int>(p->u.pd.value);
     }
@@ -359,6 +387,11 @@ void writeControls(PF_ParamDef* params[], const ControlValues& wanted) noexcept 
     setPopup(kIndexPhotoSeam, wanted.photoSeam);              // [WP-PHOTO]
     setSlider(kIndexPhotoStrength, wanted.photoStrengthPercent);
     setSlider(kIndexSeamInset, wanted.seamInsetDeg);
+    setSlider(kIndexSeamBlend, wanted.seamBlendDeg);          // [WP-SEAMTOOLS]
+    setSlider(kIndexParallaxBlend, wanted.parallaxBlendDeg);
+    setSlider(kIndexSeamSmoothing, wanted.seamSmoothingDeg);
+    setSlider(kIndexNearOffset, wanted.nearOffsetDeg);
+    setSlider(kIndexFarOffset, wanted.farOffsetDeg);
     setPopup(kIndexDlogmFit, wanted.dlogmFit);
     setSlider(kIndexExposure, wanted.exposureStops);
     setPopup(kIndexRenderDevice, wanted.renderDevice);
@@ -457,7 +490,7 @@ PF_Err globalSetdown(PF_InData*, PF_OutData*) noexcept {
     return PF_Err_NONE;
 }
 
-/// PF_Cmd_PARAMS_SETUP: the fifteen controls.
+/// PF_Cmd_PARAMS_SETUP: the twenty controls.
 ///
 /// Every one of them carries PF_ParamFlag_CANNOT_TIME_VARY.  See the file
 /// header for why that is a correctness requirement rather than a style
@@ -552,7 +585,38 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_SEAM_INSET_MAX, OSV_SS_SEAM_INSET_DEFAULT, PF_Precision_TENTHS,
                          PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_SEAM_INSET);
 
-    // ---- 13. Close the Stitching group -------------------------------------
+    // ---- 13-17. The carved seam's tweaks [WP-SEAMTOOLS] --------------------
+    // Degrees, hundredths shown (the blob keeps twentieths for the widths,
+    // hundredths for the offsets).  Every default is the seam as it renders
+    // without them, and each changes only the overlap band.
+    //   13 Seam Blend      feather where the lenses agree;
+    //   14 Parallax Blend  feather where they disagree (0 = a hard cut);
+    //   15 Seam Smoothing  colour and shading blend this wide, detail still
+    //                      switches at the seam (0 = off);
+    //   16 Near Offset     nudge near content along the seam;
+    //   17 Far Offset      nudge far content along the seam.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Seam Blend", OSV_SS_SEAM_BLEND_MIN, OSV_SS_SEAM_BLEND_MAX, OSV_SS_SEAM_BLEND_MIN,
+                         OSV_SS_SEAM_BLEND_MAX, OSV_SS_SEAM_BLEND_DEFAULT, PF_Precision_HUNDREDTHS,
+                         PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_SEAM_BLEND);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Parallax Blend", OSV_SS_PARALLAX_BLEND_MIN, OSV_SS_PARALLAX_BLEND_MAX,
+                         OSV_SS_PARALLAX_BLEND_MIN, OSV_SS_PARALLAX_BLEND_MAX, OSV_SS_PARALLAX_BLEND_DEFAULT,
+                         PF_Precision_HUNDREDTHS, PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_PARALLAX_BLEND);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Seam Smoothing", OSV_SS_SEAM_SMOOTHING_MIN, OSV_SS_SEAM_SMOOTHING_MAX,
+                         OSV_SS_SEAM_SMOOTHING_MIN, OSV_SS_SEAM_SMOOTHING_MAX, OSV_SS_SEAM_SMOOTHING_DEFAULT,
+                         PF_Precision_HUNDREDTHS, PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_SEAM_SMOOTHING);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Near Offset", OSV_SS_SEAM_OFFSET_MIN, OSV_SS_SEAM_OFFSET_MAX, OSV_SS_SEAM_OFFSET_MIN,
+                         OSV_SS_SEAM_OFFSET_MAX, OSV_SS_SEAM_OFFSET_DEFAULT, PF_Precision_HUNDREDTHS,
+                         PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_NEAR_OFFSET);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Far Offset", OSV_SS_SEAM_OFFSET_MIN, OSV_SS_SEAM_OFFSET_MAX, OSV_SS_SEAM_OFFSET_MIN,
+                         OSV_SS_SEAM_OFFSET_MAX, OSV_SS_SEAM_OFFSET_DEFAULT, PF_Precision_HUNDREDTHS,
+                         PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_FAR_OFFSET);
+
+    // ---- 18. Close the Stitching group -------------------------------------
     // PF_END_TOPIC issues its own PF_ADD_PARAM (Param_Utils.h:309-316), so the
     // terminator occupies a parameter slot of its own and everything after it
     // shifts up by one.  Leaving it out would not merely lose a divider: the
@@ -562,16 +626,16 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_STITCH_TOPIC_END);
 
-    // ---- 14. Advanced topic (collapsed: most users never touch it) ----------
+    // ---- 19. Advanced topic (collapsed: most users never touch it) ----------
     AEFX_CLR_STRUCT(def);
     PF_ADD_TOPICX("Advanced", PF_ParamFlag_START_COLLAPSED, OSV_SS_ID_ADVANCED_TOPIC);
 
-    // ---- 15. D-Log M Curve -------------------------------------------------
+    // ---- 20. D-Log M Curve -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("D-Log M Curve", OSV_SS_FIT_COUNT, OSV_SS_FIT_DEFAULT, OSV_SS_FIT_ITEMS, kStaticFlags,
                   OSV_SS_ID_DLOGM_FIT);
 
-    // ---- 16. Exposure ------------------------------------------------------
+    // ---- 21. Exposure ------------------------------------------------------
     // Valid range is the blob's own +/- 6 stops (static_asserted below the
     // handlers); the slider shows the useful +/- 3 so a drag has resolution.
     AEFX_CLR_STRUCT(def);
@@ -579,12 +643,12 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_EXPOSURE_SLIDER_MIN, OSV_SS_EXPOSURE_SLIDER_MAX, OSV_SS_EXPOSURE_DEFAULT,
                          PF_Precision_TENTHS, PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_EXPOSURE);
 
-    // ---- 17. Render Device -------------------------------------------------
+    // ---- 22. Render Device -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Render Device", OSV_SS_DEVICE_COUNT, OSV_SS_DEVICE_DEFAULT, OSV_SS_DEVICE_ITEMS, kStaticFlags,
                   OSV_SS_ID_RENDER_DEVICE);
 
-    // ---- 18. Program Monitor Colour [WP-SETTINGS] --------------------------
+    // ---- 23. Program Monitor Colour [WP-SETTINGS] --------------------------
     // What Open 360 Reframe shows when this clip's Colour Output is not the
     // sequence's working space: the scene rendered straight into it (fast,
     // the default) or Premiere's own conversion of the output (matches the
@@ -594,7 +658,7 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Program Monitor Colour", OSV_SS_DIRECT_COLOUR_COUNT, OSV_SS_DIRECT_COLOUR_DEFAULT,
                   OSV_SS_DIRECT_COLOUR_ITEMS, kStaticFlags, OSV_SS_ID_DIRECT_COLOUR);
 
-    // ---- 19. Close the Advanced group --------------------------------------
+    // ---- 24. Close the Advanced group --------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_ADVANCED_TOPIC_END);
 
@@ -721,11 +785,13 @@ PF_Err translateParamsToPrefs(PF_InData* in_data, PF_ParamDef* params[],
 
     PluginLog::debug("source settings: translated - colour {}, look {}, size {}, stab {}, seam {}, gain {}, "
                      "calib {}, fit {}, exposure {:+.2f}, device {}, sun ghost removal {}, sky seam fix {} at "
-                     "{:.0f} %, seam edge inset {:.1f} deg",
+                     "{:.0f} %, seam edge inset {:.1f} deg, seam blend {:.2f} / parallax blend {:.2f} / smoothing "
+                     "{:.2f} deg, near / far offset {:+.2f} / {:+.2f} deg",
                      blob.colorOutput, blob.look, blob.outputSize, blob.stabilization, blob.seamSearch,
                      blob.gainMatch, blob.calibration, blob.dlogmFit, static_cast<double>(blob.exposureStops),
                      blob.renderDevice, blob.flareRemoval, blob.photoSeam, blob.photoStrengthPercent(),
-                     blob.seamInsetDeg());
+                     blob.seamInsetDeg(), blob.seamBlendDeg(), blob.parallaxBlendDeg(), blob.seamSmoothingDeg(),
+                     blob.nearOffsetDeg(), blob.farOffsetDeg());
     return PF_Err_NONE;
 }
 
@@ -788,6 +854,30 @@ static_assert(OSV_SS_SEAM_INSET_MIN == 0.0 &&
               "the Seam Edge Inset range does not match PrefsBlob::seamInset");
 static_assert(OSV_SS_SEAM_INSET_DEFAULT == static_cast<double>(osv::premiere::PrefsBlob::kDefaultSeamInsetTenths) / 10.0,
               "the Seam Edge Inset default does not match PrefsBlob::kDefaultSeamInsetTenths");
+// [WP-SEAMTOOLS] Each slider offers exactly the range its blob field stores,
+// with the blob's own default.
+static_assert(OSV_SS_SEAM_BLEND_MIN == static_cast<double>(osv::premiere::PrefsBlob::kMinSeamBlendCode - 1) /
+                                           osv::premiere::PrefsBlob::kSeamToolStepsPerDeg &&
+                  OSV_SS_SEAM_BLEND_MAX == static_cast<double>(osv::premiere::PrefsBlob::kMaxSeamBlendCode - 1) /
+                                               osv::premiere::PrefsBlob::kSeamToolStepsPerDeg,
+              "the Seam Blend range does not match PrefsBlob::seamBlend");
+static_assert(OSV_SS_SEAM_BLEND_DEFAULT == osv::premiere::PrefsBlob::kDefaultSeamBlendDeg,
+              "the Seam Blend default does not match PrefsBlob::kDefaultSeamBlendDeg");
+static_assert(OSV_SS_PARALLAX_BLEND_MIN == 0.0 &&
+                  OSV_SS_PARALLAX_BLEND_MAX ==
+                      static_cast<double>(osv::premiere::PrefsBlob::kMaxParallaxBlendCode - 1) /
+                          osv::premiere::PrefsBlob::kSeamToolStepsPerDeg,
+              "the Parallax Blend range does not match PrefsBlob::parallaxBlend");
+static_assert(OSV_SS_PARALLAX_BLEND_DEFAULT == osv::premiere::PrefsBlob::kDefaultParallaxBlendDeg,
+              "the Parallax Blend default does not match PrefsBlob::kDefaultParallaxBlendDeg");
+static_assert(OSV_SS_SEAM_SMOOTHING_MIN == 0.0 && OSV_SS_SEAM_SMOOTHING_DEFAULT == 0.0 &&
+                  OSV_SS_SEAM_SMOOTHING_MAX ==
+                      static_cast<double>(osv::premiere::PrefsBlob::kMaxSeamSmoothingCode - 1) /
+                          osv::premiere::PrefsBlob::kSeamToolStepsPerDeg,
+              "the Seam Smoothing range does not match PrefsBlob::seamSmoothing");
+static_assert(OSV_SS_SEAM_OFFSET_MAX == static_cast<double>(osv::premiere::PrefsBlob::kMaxSeamOffsetHundredths) / 100.0 &&
+                  OSV_SS_SEAM_OFFSET_MIN == -OSV_SS_SEAM_OFFSET_MAX && OSV_SS_SEAM_OFFSET_DEFAULT == 0.0,
+              "the Near / Far Offset range does not match PrefsBlob::nearOffset / farOffset");
 
 // ===========================================================================
 //  The exported entry point

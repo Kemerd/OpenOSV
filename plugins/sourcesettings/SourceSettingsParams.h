@@ -155,10 +155,19 @@
 #define OSV_SS_ID_PHOTO_SEAM 17
 #define OSV_SS_ID_PHOTO_STRENGTH 18
 #define OSV_SS_ID_SEAM_INSET 19
+/* [WP-SEAMTOOLS] The carved seam's tweaks: five NEW ids (20-29 are this
+ * package's range) placed inside the Stitching group right after Seam Edge
+ * Inset (indices 13-17); everything after them moved up by five - indices
+ * are not persisted, ids are. */
+#define OSV_SS_ID_SEAM_BLEND 20
+#define OSV_SS_ID_PARALLAX_BLEND 21
+#define OSV_SS_ID_SEAM_SMOOTHING 22
+#define OSV_SS_ID_NEAR_OFFSET 23
+#define OSV_SS_ID_FAR_OFFSET 24
 
-/* Total parameters excluding the input layer: 15 controls + 4 group markers.
+/* Total parameters excluding the input layer: 20 controls + 4 group markers.
  * out_data->num_params is this + 1. */
-#define OSV_SOURCE_SETTINGS_PARAM_COUNT 19
+#define OSV_SOURCE_SETTINGS_PARAM_COUNT 24
 
 /* ==========================================================================
  *  Popup item strings
@@ -303,6 +312,32 @@
 #define OSV_SS_SEAM_INSET_MAX 6.0
 #define OSV_SS_SEAM_INSET_DEFAULT 2.6
 
+/* [WP-SEAMTOOLS] The carved seam's tweaks, in degrees (osv/render/SeamTools.h).
+ * The blob stores twentieths of a degree for the three widths and hundredths
+ * for the two offsets (PrefsBlob::seamBlendDeg ...); static_asserts in
+ * SourceSettingsMain.cpp tie every limit and default below to it.
+ *
+ *   Seam Blend       the feather where the lenses agree (default 1.5 = the
+ *                    carved seam as it has always been);
+ *   Parallax Blend   the feather where they disagree (0.35; 0 = a hard cut;
+ *                    never wider than Seam Blend);
+ *   Seam Smoothing   blends colour and shading across this half width while
+ *                    detail still switches at the seam (0 = off);
+ *   Near Offset      nudges near content along the seam (up / down where the
+ *   Far Offset       seam runs vertically past the camera), far content. */
+#define OSV_SS_SEAM_BLEND_MIN 0.2
+#define OSV_SS_SEAM_BLEND_MAX 8.0
+#define OSV_SS_SEAM_BLEND_DEFAULT 1.5
+#define OSV_SS_PARALLAX_BLEND_MIN 0.0
+#define OSV_SS_PARALLAX_BLEND_MAX 4.0
+#define OSV_SS_PARALLAX_BLEND_DEFAULT 0.35
+#define OSV_SS_SEAM_SMOOTHING_MIN 0.0
+#define OSV_SS_SEAM_SMOOTHING_MAX 8.0
+#define OSV_SS_SEAM_SMOOTHING_DEFAULT 0.0
+#define OSV_SS_SEAM_OFFSET_MIN -3.0
+#define OSV_SS_SEAM_OFFSET_MAX 3.0
+#define OSV_SS_SEAM_OFFSET_DEFAULT 0.0
+
 /* ==========================================================================
  *  Everything below is C++ only.
  * ========================================================================== */
@@ -333,13 +368,18 @@ namespace osv::premiere::sourcesettings {
 ///  10    Sky Seam Fix             [WP-PHOTO]
 ///  11    Sky Seam Strength        [WP-PHOTO]
 ///  12    Seam Edge Inset          [WP-PHOTO]
-///  13  (GROUP_END, Stitching)
-///  14  Advanced           (GROUP_START, starts collapsed)
-///  15    D-Log M Curve
-///  16    Exposure
-///  17    Render Device
-///  18    Program Monitor Colour   [WP-SETTINGS]
-///  19  (GROUP_END, Advanced)
+///  13    Seam Blend               [WP-SEAMTOOLS]
+///  14    Parallax Blend           [WP-SEAMTOOLS]
+///  15    Seam Smoothing           [WP-SEAMTOOLS]
+///  16    Near Offset              [WP-SEAMTOOLS]
+///  17    Far Offset               [WP-SEAMTOOLS]
+///  18  (GROUP_END, Stitching)
+///  19  Advanced           (GROUP_START, starts collapsed)
+///  20    D-Log M Curve
+///  21    Exposure
+///  22    Render Device
+///  23    Program Monitor Colour   [WP-SETTINGS]
+///  24  (GROUP_END, Advanced)
 enum ParamIndex : int {
     kIndexColorOutput = 1,
     kIndexRec709Look = 2,
@@ -353,13 +393,18 @@ enum ParamIndex : int {
     kIndexPhotoSeam = 10,       // [WP-PHOTO]
     kIndexPhotoStrength = 11,   // [WP-PHOTO]
     kIndexSeamInset = 12,       // [WP-PHOTO]
-    kIndexStitchTopicEnd = 13,
-    kIndexAdvancedTopic = 14,
-    kIndexDlogmFit = 15,
-    kIndexExposure = 16,
-    kIndexRenderDevice = 17,
-    kIndexDirectColour = 18,
-    kIndexAdvancedTopicEnd = 19,
+    kIndexSeamBlend = 13,       // [WP-SEAMTOOLS]
+    kIndexParallaxBlend = 14,   // [WP-SEAMTOOLS]
+    kIndexSeamSmoothing = 15,   // [WP-SEAMTOOLS]
+    kIndexNearOffset = 16,      // [WP-SEAMTOOLS]
+    kIndexFarOffset = 17,       // [WP-SEAMTOOLS]
+    kIndexStitchTopicEnd = 18,
+    kIndexAdvancedTopic = 19,
+    kIndexDlogmFit = 20,
+    kIndexExposure = 21,
+    kIndexRenderDevice = 22,
+    kIndexDirectColour = 23,
+    kIndexAdvancedTopicEnd = 24,
 };
 
 /// The permanent id stored at each index, in index order (index 1 first).
@@ -369,7 +414,8 @@ inline constexpr int kParamIdByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
     OSV_SS_ID_COLOR_OUTPUT,     OSV_SS_ID_REC709_LOOK,   OSV_SS_ID_OUTPUT_SIZE,   OSV_SS_ID_STABILIZATION,
     OSV_SS_ID_STITCH_TOPIC,     OSV_SS_ID_SEAM_SEARCH,   OSV_SS_ID_GAIN_MATCH,
     OSV_SS_ID_CALIBRATION,      OSV_SS_ID_FLARE_REMOVAL, OSV_SS_ID_PHOTO_SEAM, OSV_SS_ID_PHOTO_STRENGTH,
-    OSV_SS_ID_SEAM_INSET,       OSV_SS_ID_STITCH_TOPIC_END, OSV_SS_ID_ADVANCED_TOPIC,
+    OSV_SS_ID_SEAM_INSET,       OSV_SS_ID_SEAM_BLEND,    OSV_SS_ID_PARALLAX_BLEND, OSV_SS_ID_SEAM_SMOOTHING,
+    OSV_SS_ID_NEAR_OFFSET,      OSV_SS_ID_FAR_OFFSET,    OSV_SS_ID_STITCH_TOPIC_END, OSV_SS_ID_ADVANCED_TOPIC,
     OSV_SS_ID_DLOGM_FIT,        OSV_SS_ID_EXPOSURE,      OSV_SS_ID_RENDER_DEVICE,
     OSV_SS_ID_DIRECT_COLOUR,    OSV_SS_ID_ADVANCED_TOPIC_END,
 };
@@ -380,7 +426,7 @@ inline constexpr int kParamCount = OSV_SOURCE_SETTINGS_PARAM_COUNT;
 /// Number of controls that actually carry a value, i.e. everything except the
 /// four GROUP_START / GROUP_END markers.  This is the count that has to round
 /// trip through a PrefsBlob.
-inline constexpr int kValueParamCount = 15;
+inline constexpr int kValueParamCount = 20;
 
 /// The parameter names, in index order, so a test can compare the built
 /// module's list without repeating the strings.
@@ -393,7 +439,8 @@ inline constexpr int kValueParamCount = 15;
 inline constexpr const char* kParamNameByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
     "Colour Output", "Look (Rec. 709 only)", "Output Size", "Stabilisation", "Stitching", "Seam Search",
     "Exposure Match", "Calibration",  "Sun Ghost Removal",  "Sky Seam Fix", "Sky Seam Strength",
-    "Seam Edge Inset", "",            "Advanced",  "D-Log M Curve",
+    "Seam Edge Inset", "Seam Blend",  "Parallax Blend", "Seam Smoothing", "Near Offset", "Far Offset",
+    "",               "Advanced",     "D-Log M Curve",
     "Exposure",       "Render Device", "Program Monitor Colour", "",
 };
 

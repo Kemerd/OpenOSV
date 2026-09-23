@@ -250,6 +250,13 @@ struct DialogControls {
     double photoStrengthPercent = 100;  ///< Gain-field strength, 0..100 %.
     double seamInsetDeg = 2.6;          ///< Render-blend seam edge inset, 0..6 deg.
     // ---- [/WP-PHOTO] ---------------------------------------------------------
+    // ---- [WP-SEAMTOOLS] the carved seam's tweaks (PrefsBlob decoders) --------
+    double seamBlendDeg = 1.5;       ///< Seam Blend: feather where the lenses agree, 0.2..8 deg.
+    double parallaxBlendDeg = 0.35;  ///< Parallax Blend: feather where they disagree, 0..4 deg.
+    double seamSmoothingDeg = 0.0;   ///< Seam Smoothing: two-band half width, 0 (off)..8 deg.
+    double nearOffsetDeg = 0.0;      ///< Near Offset along the seam, -3..3 deg.
+    double farOffsetDeg = 0.0;       ///< Far Offset along the seam, -3..3 deg.
+    // ---- [/WP-SEAMTOOLS] -----------------------------------------------------
 };
 
 /// PrefsBlob -> control state.  Every field is already in range because the

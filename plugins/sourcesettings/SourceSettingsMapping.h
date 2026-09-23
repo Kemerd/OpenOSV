@@ -68,6 +68,12 @@ struct ControlValues {
     int photoSeam = OSV_SS_PHOTO_SEAM_DEFAULT;                     ///< 1-based popup value.
     double photoStrengthPercent = OSV_SS_PHOTO_STRENGTH_DEFAULT;   ///< Sky Seam Strength, percent.
     double seamInsetDeg = OSV_SS_SEAM_INSET_DEFAULT;               ///< Seam Edge Inset, degrees.
+    // ---- [WP-SEAMTOOLS] the carved seam's tweaks, degrees ---------------------
+    double seamBlendDeg = OSV_SS_SEAM_BLEND_DEFAULT;          ///< Seam Blend.
+    double parallaxBlendDeg = OSV_SS_PARALLAX_BLEND_DEFAULT;  ///< Parallax Blend.
+    double seamSmoothingDeg = OSV_SS_SEAM_SMOOTHING_DEFAULT;  ///< Seam Smoothing (0 = off).
+    double nearOffsetDeg = OSV_SS_SEAM_OFFSET_DEFAULT;        ///< Near Offset.
+    double farOffsetDeg = OSV_SS_SEAM_OFFSET_DEFAULT;         ///< Far Offset.
 };
 
 /// Control values -> PrefsBlob.

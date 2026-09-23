@@ -192,7 +192,15 @@ TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     static_assert(offsetof(PrefsBlob, seamInset) == 32, "seamInset sits at 32");
     static_assert(offsetof(PrefsBlob, photoSeam) == 33, "photoSeam sits at 33");
     static_assert(offsetof(PrefsBlob, photoStrength) == 34, "photoStrength sits at 34");
-    static_assert(offsetof(PrefsBlob, reserved) == 38, "reserved fills the rest");
+    // [WP-SEAMTOOLS] the seam tools at 38-45 (three width codes, a pad byte,
+    // two int16 offsets), from the front of the reserved block, which now
+    // starts at 46.
+    static_assert(offsetof(PrefsBlob, seamBlend) == 38, "seamBlend sits at 38");
+    static_assert(offsetof(PrefsBlob, parallaxBlend) == 39, "parallaxBlend sits at 39");
+    static_assert(offsetof(PrefsBlob, seamSmoothing) == 40, "seamSmoothing sits at 40");
+    static_assert(offsetof(PrefsBlob, nearOffset) == 42, "nearOffset sits at 42");
+    static_assert(offsetof(PrefsBlob, farOffset) == 44, "farOffset sits at 44");
+    static_assert(offsetof(PrefsBlob, reserved) == 46, "reserved fills the rest");
     static_assert(std::is_trivially_copyable_v<PrefsBlob>, "the blob is memcpy'd to and from the host");
 
     REQUIRE(sizeof(PrefsBlob) == PrefsBlob::kSize);
