@@ -169,6 +169,20 @@ enum class PrefsDirectColour : std::uint8_t {
     Count
 };
 
+/// [WP-LOOK] The display look of the Rec.709 colour output
+/// (osv::color::Look, include/osv/color/Look.h).  Only Rec.709 has a look;
+/// PQ, HLG and the passthrough ignore this byte.  Persisted, so append-only.
+enum class PrefsLook : std::uint8_t {
+    /// DJI Studio's own D-Log M -> Rec.709 rendering, fitted to DJI's Osmo
+    /// 360 LUT: the default, and what the zero byte of an older project reads
+    /// as (it is also what makeColorParams builds when no look is named).
+    DjiStudio = 0,
+    /// The HLG signal in Rec.709 primaries: OpenOSV's Rec.709 rendering
+    /// before the look existed, kept selectable for projects graded on it.
+    Standard = 1,
+    Count
+};
+
 /// Renderer selection; the numeric values are the ones stored in the blob
 /// and match HostContext's RenderDevicePreference.
 enum class PrefsRenderDevice : std::uint8_t {
@@ -223,10 +237,16 @@ struct PrefsBlob {
     /// PrefsDirectColour: how the effect's direct path treats this clip's
     /// colour output (0 = SequenceSpace, the default; see DIRECT_GPU.md).
     std::uint8_t directColour = 0;
-    /// Offsets 25-29: the byte ranges of WP-SETTINGS, WP-SEAM and WP-LOOK
-    /// (docs/PARALLEL_WORK.md), unused on the WP-FLARE branch.  Zero, and
-    /// zeroed by sanitise(); the lead folds them into those fields at merge.
-    std::uint8_t padBeforeFlare[5] = {};
+    /// Offsets 25-27: the byte ranges of WP-SETTINGS and WP-SEAM
+    /// (docs/PARALLEL_WORK.md), unused.  Zero, and zeroed by sanitise(); the
+    /// lead folds them into those fields at merge.
+    std::uint8_t padBeforeFlare[3] = {};
+    /// [WP-LOOK] PrefsLook: the Rec.709 output's display look (0 = the DJI
+    /// Studio look, the default; 1 = the standard rendering).
+    std::uint8_t look = 0;
+    /// Offset 29: the rest of WP-LOOK's range, unused.  Zero, and zeroed by
+    /// sanitise().
+    std::uint8_t padAfterLook = 0;
     /// [WP-FLARE] 1 = remove the sun's internal-reflection ghosts from the
     /// lens that sees the sun (osv/render/Flare.h); 0 = off, the default, so
     /// every blob written before this byte existed renders exactly as before.
@@ -361,6 +381,13 @@ struct PrefsBlob {
             padAfterFlare = 0;
             clean = false;
         }
+        // [WP-LOOK] zero is the default look, so a corrupt byte lands there;
+        // the rest of the range stays zero.
+        clampEnum(look, static_cast<std::uint8_t>(PrefsLook::Count), static_cast<std::uint8_t>(PrefsLook::DjiStudio));
+        if (padAfterLook != 0) {
+            padAfterLook = 0;
+            clean = false;
+        }
 
         // NaN compares false with everything, so test the valid range and
         // reset anything else (NaN, infinities, out of range).
@@ -411,6 +438,8 @@ struct PrefsBlob {
     [[nodiscard]] PrefsDirectColour directColourMode() const noexcept {
         return static_cast<PrefsDirectColour>(directColour);
     }
+    /// [WP-LOOK]
+    [[nodiscard]] PrefsLook lookChoice() const noexcept { return static_cast<PrefsLook>(look); }
     /// True when the flow-based parallax correction should run.
     [[nodiscard]] bool parallaxEnabled() const noexcept { return parallaxMode() == PrefsParallax::On; }
 
@@ -496,6 +525,10 @@ static_assert(offsetof(PrefsBlob, directColour) == 24, "PrefsBlob layout drifted
 // blob's zero byte reads as "off", which is how every project rendered
 // before the removal existed.
 static_assert(offsetof(PrefsBlob, padBeforeFlare) == 25, "PrefsBlob layout drifted");
+// [WP-LOOK] look takes offset 28 of its assigned range (28-29).  An older
+// blob's zero byte reads as PrefsLook::DjiStudio, the default.
+static_assert(offsetof(PrefsBlob, look) == 28, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, padAfterLook) == 29, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, flareRemoval) == 30, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, padAfterFlare) == 31, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, reserved) == 32, "PrefsBlob layout drifted");
