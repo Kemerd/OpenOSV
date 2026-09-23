@@ -17,9 +17,10 @@
 //                           want frames in.  That registration is RETRIED
 //                           from the first PF_Cmd_RENDER if the suite was not
 //                           available here; see registerPixelFormats().
-//   PF_Cmd_PARAMS_SETUP     the 19 controls, with their permanent ids (the
-//                           DJI camera block, ids 16..20, and the Lens
-//                           popup, id 21, appended last).
+//   PF_Cmd_PARAMS_SETUP     the 20 controls, with their permanent ids (the
+//                           DJI camera block, ids 16..20, the Lens popup,
+//                           id 21, and the Keyframe Easing popup, id 22,
+//                           appended last).
 //   PF_Cmd_USER_CHANGED_PARAM  Preset writes the Classic and the DJI lens
 //                           and Tilt and selects DJI's lens; the Lens popup
 //                           carries the look across to the lens picked;
@@ -42,6 +43,9 @@
 // handle) rather than allocating something nobody reads.
 
 #include "ReframeCpu.h"
+// [WP-EASING] The Keyframe Easing curves and keyframe walk, shared with the
+// GPU filter so both paths compute the same eased values.
+#include "ReframeEasing.h"
 #include "ReframeParams.h"
 // The Program Monitor overlay.  It includes the Adobe UI headers itself and
 // keeps every DrawBot and event detail behind three functions, so this file
@@ -145,12 +149,20 @@ static_assert(osv::reframe::kParamIdByIndex[osv::reframe::kIndexDragSensitivity 
                   OSV_REFRAME_ID_DRAG_SENSITIVITY,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
 
-// [WP-LENSUI] The Lens popup is appended after the DJI block and ends the
-// list, for the same reason: no saved index may move.
+// [WP-LENSUI] The Lens popup is appended after the DJI block, for the same
+// reason: no saved index may move.
 static_assert(osv::reframe::kIndexLens == osv::reframe::kIndexDragSensitivity + 1,
               "the Lens popup must follow Drag Sensitivity");
-static_assert(osv::reframe::kIndexLens == OSV_REFRAME_PARAM_COUNT, "the Lens popup must be the last parameter added");
 static_assert(osv::reframe::kParamIdByIndex[osv::reframe::kIndexLens - 1] == OSV_REFRAME_ID_LENS,
+              "kParamIdByIndex is not aligned with the ParamIndex enum");
+
+// [WP-EASING] The Keyframe Easing popup follows the Lens popup and ends the
+// list: appended, like every control added since the first release.
+static_assert(osv::reframe::kIndexKeyframeEasing == osv::reframe::kIndexLens + 1,
+              "the Keyframe Easing popup must follow the Lens popup");
+static_assert(osv::reframe::kIndexKeyframeEasing == OSV_REFRAME_PARAM_COUNT,
+              "the Keyframe Easing popup must be the last parameter added");
+static_assert(osv::reframe::kParamIdByIndex[osv::reframe::kIndexKeyframeEasing - 1] == OSV_REFRAME_ID_KEYFRAME_EASING,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
 static_assert(OSV_REFRAME_LENS_COUNT == 2 &&
                   static_cast<int>(osv::reframe::LensPopup::Classic) == OSV_REFRAME_LENS_COUNT,
@@ -679,8 +691,196 @@ double checkoutAngle(PF_InData* in_data, int index, A_long timeOffsetFrames, dou
     return value;
 }
 
+// ---------------------------------------------------------------------------
+//  [WP-EASING] Keyframes through the PF Param Utils Suite
+// ---------------------------------------------------------------------------
+
+/// A time as the AE API spells it: a value in a time scale.  Keyframe times
+/// come back from PF_FindKeyframeTime with THEIR scale, which need not be the
+/// render's, so each one is kept in its own words and handed back to the
+/// host exactly as the host gave it.
+struct AeTime {
+    A_long value = 0;
+    A_u_long scale = 0;
+};
+
+/// One control's keyframes through PF_ParamUtilsSuite3 - the CPU path's
+/// KeyframeTrack (ReframeEasing.h).
+///
+/// The easing core speaks doubles in ONE unit; this adapter uses the render's
+/// own time scale (in_data->time_scale) for that unit and remembers the
+/// host's exact (value, scale) for every keyframe it reports, so a keyframe
+/// time is never rounded on its way back to the host.  Every query that the
+/// host refuses - no suite, an error, "not found" - is std::nullopt, which
+/// makes the core keep the host's own value.
+class AeKeyframeTrack final : public KeyframeTrack {
+public:
+    AeKeyframeTrack(PF_InData* in_data, const PF_ParamUtilsSuite3* suite, int aeIndex) noexcept
+        : m_in(in_data), m_suite(suite), m_index(aeIndex) {}
+
+    std::optional<double> keyAtOrBefore(double t) override { return find(t, PF_TimeDir_LESS_THAN_OR_EQUAL); }
+    std::optional<double> keyBefore(double t) override { return find(t, PF_TimeDir_LESS_THAN); }
+    std::optional<double> keyAfter(double t) override { return find(t, PF_TimeDir_GREATER_THAN); }
+
+    /// The control's value at a keyframe the adapter reported, checked out at
+    /// the host's own time for it.  Angles arrive as fixed 16.16 degrees,
+    /// float sliders as doubles; the def's own type decides which member is
+    /// read, never an assumption about the index.
+    std::optional<double> valueAt(double t) override {
+        if (!m_in || !m_in->inter.checkout_param || !std::isfinite(t)) {
+            return std::nullopt;
+        }
+        const AeTime when = native(t);
+        if (when.scale == 0) {
+            return std::nullopt;
+        }
+        // The frame duration only matters to the host for temporal effects;
+        // it is passed in the time's own scale when that is the render's.
+        const A_long step = (when.scale == m_in->time_scale) ? m_in->time_step : 1;
+        PF_ParamDef def{};
+        if (m_in->inter.checkout_param(m_in->effect_ref, m_index, when.value, step, when.scale, &def) != PF_Err_NONE) {
+            return std::nullopt;
+        }
+        std::optional<double> value;
+        if (def.param_type == PF_Param_ANGLE) {
+            value = static_cast<double>(def.u.ad.value) / 65536.0;
+        } else if (def.param_type == PF_Param_FLOAT_SLIDER) {
+            value = static_cast<double>(def.u.fs_d.value);
+        }
+        if (m_in->inter.checkin_param) {
+            m_in->inter.checkin_param(m_in->effect_ref, &def);
+        }
+        return value;
+    }
+
+private:
+    /// One PF_FindKeyframeTime call.
+    std::optional<double> find(double t, PF_TimeDir dir) {
+        if (!m_in || !m_suite || !m_suite->PF_FindKeyframeTime || !std::isfinite(t)) {
+            return std::nullopt;
+        }
+        const AeTime at = native(t);
+        if (at.scale == 0) {
+            return std::nullopt;
+        }
+        PF_Boolean found = FALSE;
+        A_long keyTime = 0;
+        A_u_long keyScale = 0;
+        const PF_Err err = m_suite->PF_FindKeyframeTime(m_in->effect_ref, m_index, at.value, at.scale, dir, &found,
+                                                        nullptr, &keyTime, &keyScale);
+        if (err != PF_Err_NONE || !found || keyScale == 0) {
+            return std::nullopt;
+        }
+        // In the render's scale for the core; the exact host words are kept.
+        const double inRenderScale =
+            static_cast<double>(keyTime) * static_cast<double>(m_in->time_scale) / static_cast<double>(keyScale);
+        remember(inRenderScale, AeTime{keyTime, keyScale});
+        return inRenderScale;
+    }
+
+    /// The host's own words for a time the core hands back: a keyframe this
+    /// adapter reported, or the render's scale rounded for anything else
+    /// (the render time itself is always a whole number there).
+    [[nodiscard]] AeTime native(double t) const noexcept {
+        for (int i = 0; i < m_known; ++i) {
+            if (m_times[i] == t) {
+                return m_native[i];
+            }
+        }
+        if (!m_in || m_in->time_scale == 0 || !(std::fabs(t) < 2147483647.0)) {
+            return AeTime{};
+        }
+        return AeTime{static_cast<A_long>(std::llround(t)), m_in->time_scale};
+    }
+
+    /// Remember a reported keyframe (a small ring: the core asks about at
+    /// most four per control).
+    void remember(double t, AeTime when) noexcept {
+        for (int i = 0; i < m_known; ++i) {
+            if (m_times[i] == t) {
+                m_native[i] = when;
+                return;
+            }
+        }
+        const int slot = (m_known < kSlots) ? m_known++ : (m_next++ % kSlots);
+        m_times[slot] = t;
+        m_native[slot] = when;
+    }
+
+    static constexpr int kSlots = 8;
+    PF_InData* m_in = nullptr;
+    const PF_ParamUtilsSuite3* m_suite = nullptr;
+    int m_index = 0;
+    double m_times[kSlots] = {};
+    AeTime m_native[kSlots] = {};
+    int m_known = 0;
+    int m_next = 0;
+};
+
+/// The PF Param Utils Suite for one readSettings() call, acquired only when
+/// an easing is chosen (None never touches it, which is what keeps None
+/// bit-identical to the effect before the popup existed) and released on
+/// every exit.
+class EasingScope {
+public:
+    EasingScope(PF_InData* in_data, KeyframeEasing easing) noexcept : m_in(in_data), m_easing(easing) {
+        if (m_easing == KeyframeEasing::None || !m_in || !m_in->pica_basicP) {
+            return;
+        }
+        const void* raw = nullptr;
+        const SPErr err = m_in->pica_basicP->AcquireSuite(kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, &raw);
+        if (err != kSPNoError || !raw) {
+            PluginLog::oncef("reframe/easing/nosuite", PluginLog::Level::Warn,
+                             "reframe: Keyframe Easing is on but the PF Param Utils Suite v3 is unavailable "
+                             "(AcquireSuite err {}); the CPU path keeps Premiere's interpolation",
+                             static_cast<long>(err));
+            return;
+        }
+        m_suite = static_cast<const PF_ParamUtilsSuite3*>(raw);
+        if (!m_suite->PF_FindKeyframeTime) {
+            PluginLog::oncef("reframe/easing/nofind", PluginLog::Level::Warn,
+                             "reframe: the PF Param Utils Suite v3 has no PF_FindKeyframeTime; the CPU path keeps "
+                             "Premiere's interpolation");
+        }
+    }
+    ~EasingScope() {
+        if (m_suite && m_in && m_in->pica_basicP) {
+            m_in->pica_basicP->ReleaseSuite(kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3);
+        }
+    }
+    EasingScope(const EasingScope&) = delete;
+    EasingScope& operator=(const EasingScope&) = delete;
+
+    /// The eased value of control `aeIndex` at `time` (render time scale), or
+    /// `hostValue` when there is nothing to ease or the host cannot say.
+    [[nodiscard]] double valueOr(int aeIndex, A_long time, double hostValue) noexcept {
+        if (m_easing == KeyframeEasing::None || !m_suite) {
+            return hostValue;
+        }
+        AeKeyframeTrack track(m_in, m_suite, aeIndex);
+        const std::optional<double> eased = easedValue(m_easing, track, static_cast<double>(time));
+        return eased ? *eased : hostValue;
+    }
+
+    /// True when an easing is chosen at all (the smoothing neighbours then
+    /// need an eased sample of their own).
+    [[nodiscard]] bool active() const noexcept { return m_easing != KeyframeEasing::None && m_suite != nullptr; }
+
+private:
+    PF_InData* m_in = nullptr;
+    KeyframeEasing m_easing = KeyframeEasing::None;
+    const PF_ParamUtilsSuite3* m_suite = nullptr;
+};
+
 /// Build the resolved Settings from the params array the host handed
 /// PF_Cmd_RENDER, applying the three-sample smoothing when it is on.
+///
+/// [WP-EASING] With a Keyframe Easing preset chosen, Pan, Tilt, Roll and the
+/// selected lens's two controls take the preset's value between their
+/// keyframes (ReframeEasing.h) instead of the host's; the Smooth Keyframes
+/// average then averages eased samples.  The Source angles are left to the
+/// host: they are the panorama's orientation, not the camera move DJI
+/// Studio's keyframe animation eases.
 Settings readSettings(PF_InData* in_data, PF_ParamDef* params[]) noexcept {
     Settings s;
     if (!params) {
@@ -720,11 +920,35 @@ Settings readSettings(PF_InData* in_data, PF_ParamDef* params[]) noexcept {
         s.dragSensitivity = static_cast<double>(params[kIndexDragSensitivity]->u.fs_d.value);
     }
 
+    // ---- [WP-EASING] the Keyframe Easing preset ------------------------------
+    // A missing entry (a host that handed a short array) is None: the host's
+    // own interpolation, exactly what the effect did before the popup.
+    s.easing = params[kIndexKeyframeEasing] ? sanitiseKeyframeEasing(params[kIndexKeyframeEasing]->u.pd.value)
+                                            : KeyframeEasing::None;
+    EasingScope easing(in_data, s.easing);
+    const A_long now = in_data ? in_data->current_time : 0;
+    // The selected lens's two controls follow the preset; the other lens's
+    // are never rendered from, so they are not worth a keyframe query.
+    if (easing.active()) {
+        if (s.cameraModel == CameraModel::Dji) {
+            s.djiFovDeg = easing.valueOr(kIndexDjiFov, now, s.djiFovDeg);
+            s.correction = easing.valueOr(kIndexCorrection, now, s.correction);
+        } else {
+            s.fovDeg = easing.valueOr(kIndexFov, now, s.fovDeg);
+            s.distortion = easing.valueOr(kIndexDistortion, now, s.distortion);
+        }
+    }
+
     const int angleIndices[6] = {kIndexPan,       kIndexTilt,       kIndexRoll,
                                  kIndexSourcePan, kIndexSourceTilt, kIndexSourceRoll};
+    // Only the camera's own three angles are eased (see the function comment).
+    constexpr int kEasedAngles = 3;
     double angles[6] = {0, 0, 0, 0, 0, 0};
     for (int i = 0; i < 6; ++i) {
         angles[i] = angleValue(*params[angleIndices[i]]);
+        if (i < kEasedAngles && easing.active()) {
+            angles[i] = easing.valueOr(angleIndices[i], now, angles[i]);
+        }
     }
 
     // Smoothing averages the parameter at t-1, t and t+1 frames.  It is done
@@ -733,8 +957,17 @@ Settings readSettings(PF_InData* in_data, PF_ParamDef* params[]) noexcept {
     if (s.smoothKeyframes && in_data && in_data->time_step != 0) {
         for (int i = 0; i < 6; ++i) {
             const double centre = angles[i];
-            const double prev = checkoutAngle(in_data, angleIndices[i], -1, centre);
-            const double next = checkoutAngle(in_data, angleIndices[i], +1, centre);
+            double prev = checkoutAngle(in_data, angleIndices[i], -1, centre);
+            double next = checkoutAngle(in_data, angleIndices[i], +1, centre);
+            // [WP-EASING] An eased angle is averaged over eased samples; a
+            // neighbour before the clip start keeps the centre fallback, as
+            // checkoutAngle() does.
+            if (i < kEasedAngles && easing.active()) {
+                const A_long before = now - in_data->time_step;
+                const A_long after = now + in_data->time_step;
+                prev = (before >= 0) ? easing.valueOr(angleIndices[i], before, prev) : prev;
+                next = easing.valueOr(angleIndices[i], after, next);
+            }
             angles[i] = (prev + centre + next) / 3.0;
         }
     }
@@ -968,6 +1201,18 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Lens", OSV_REFRAME_LENS_COUNT, OSV_REFRAME_LENS_DEFAULT, OSV_REFRAME_LENS_ITEMS,
                   PF_ParamFlag_SUPERVISE | PF_ParamFlag_CANNOT_TIME_VARY, OSV_REFRAME_ID_LENS);
+
+    // ---- [WP-EASING] 22. Keyframe Easing -----------------------------------
+    // DJI Studio's Keyframe Animation presets: the curve the camera follows
+    // between its keyframes (ReframeEasing.h).  None - the default - leaves
+    // Premiere's interpolation alone, so an old project renders exactly as
+    // before.  Appended last, like every control since the first release.
+    // Not animatable: it describes how the keyframes are joined, and a
+    // keyframed choice of curve would be a curve for the curves.  Not
+    // supervised: picking a preset changes no other control.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUPX("Keyframe Easing", OSV_REFRAME_EASING_COUNT, OSV_REFRAME_EASING_DEFAULT, OSV_REFRAME_EASING_ITEMS,
+                  PF_ParamFlag_CANNOT_TIME_VARY, OSV_REFRAME_ID_KEYFRAME_EASING);
 
     out_data->num_params = OSV_REFRAME_PARAM_COUNT + 1;  // + the input layer
 
@@ -1653,13 +1898,14 @@ PF_Err render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
         PluginLog::oncef("reframe/render/setup-values", PluginLog::Level::Error,
                          "reframe: setup rejected with resolution={} preset={} lens={} fov={:.3f} distortion={:.3f} "
                          "djiFov={:.3f} correction={:.3f} pan={:.3f} tilt={:.3f} roll={:.3f} srcPan={:.3f} "
-                         "srcTilt={:.3f} srcRoll={:.3f} smooth={} seq={}x{}",
+                         "srcTilt={:.3f} srcRoll={:.3f} smooth={} easing={} seq={}x{}",
                          static_cast<int>(settings.resolution), static_cast<int>(settings.preset),
                          settings.cameraModel == CameraModel::Dji ? "DJI" : "Classic", settings.fovDeg,
                          settings.distortion, settings.djiFovDeg, settings.correction, settings.panDeg,
                          settings.tiltDeg, settings.rollDeg,
                          settings.sourcePanDeg, settings.sourceTiltDeg, settings.sourceRollDeg,
-                         settings.smoothKeyframes ? 1 : 0, sequenceSize(in_data).w, sequenceSize(in_data).h);
+                         settings.smoothKeyframes ? 1 : 0, static_cast<int>(settings.easing),
+                         sequenceSize(in_data).w, sequenceSize(in_data).h);
         PluginLog::oncef("reframe/render/setup", PluginLog::Level::Error,
                          "reframe: could not build the kernel parameters ({}x{} -> {}x{}): {} "
                          "[src layout={} rowBytes={} topDown={}]",

@@ -1187,8 +1187,8 @@ the presets would land in a profile nobody ever opens.
 
 `PF_ADD_TOPIC` and `PF_END_TOPIC` each issue their own `PF_ADD_PARAM`
 (`Param_Utils.h:298-320`), so a group terminator is a real parameter holding
-a real index, and it sits in the MIDDLE of the list. There are therefore 21
-parameters, not 19, and a control that follows a closed group has an index
+a real index, and it sits in the MIDDLE of the list. There are therefore 22
+parameters, not 20, and a control that follows a closed group has an index
 one higher than its id per group already closed. `ReframeParams.h` spells the
 index table out literally (`ParamIndex`, with `kParamIdByIndex` beside it)
 rather than deriving it, and `EffectMain.cpp` static_asserts the
@@ -1221,9 +1221,10 @@ choice of the Lens popup (see "One lens at a time" below).
 | 19 | 19 | Correction Angle | float slider | valid 0..1.8, sphere radii the eye sits behind the centre (0 rectilinear, 1 stereographic, >1 crystal ball) | 0.6 | DJI |
 | 20 | 20 | Drag Sensitivity | float slider | valid 0.1..10, slider 0.25..5; Program Monitor grab speed, never rendered from | 2.0 | always |
 | 21 | 21 | Lens | popup, not animatable | DJI \| Classic: which lens renders and which lens's controls are shown | DJI | always |
+| 22 | 22 | Keyframe Easing | popup, not animatable | None \| Linear Smooth \| Fast In, Slow Out \| Slow In, Fast Out \| Fast In, Fast Out \| Slow In, Slow Out \| Linear: how the camera moves between keyframes (see "Keyframe Easing" below) | None | always |
 
 "Output Resolution" and "Smooth Keyframes" are top-level siblings of the two
-groups, which is only true because both groups close. Ids 16-21 were appended
+groups, which is only true because both groups close. Ids 16-22 were appended
 after Smooth Keyframes, outside both groups, so every existing index - and
 every saved project - stayed where it was; the DJI model's maths and evidence
 are in `docs/research/DJI_CAMERA.md`. A test walks the real parameter list
@@ -1327,6 +1328,91 @@ Known Premiere behaviours the implementation works around:
 Every failure is non-fatal: without the suite, or when the host refuses an
 update, the panel shows every control - the layout before this - and the
 effect renders exactly the same.
+
+#### Keyframe Easing (id 22)
+
+DJI Studio's Keyframe Animation section offers seven presets for how the view
+travels between keyframes, applied per clip, with an "Apply to all" button.
+Premiere's scripting APIs can set a keyframe's interpolation TYPE (linear,
+hold, Bezier) but never an arbitrary curve, so the effect draws the curve
+itself: the Keyframe Easing popup picks one, and the OpenOSV panel's Keyframe
+Animation card sets it on selected clips or on every OSV clip of a sequence
+(`docs/PANEL.md`).
+
+**What it eases.** Pan, Tilt, Roll and the selected lens's two controls (DJI
+FOV and Correction Angle, or Classic FOV and Distortion). Between two
+keyframes `k0 <= t < k1` of such a control the readers compute
+
+    v(t) = v0 + (v1 - v0) * s((t - k0) / (k1 - k0))
+
+from the control's values AT the two keyframes, instead of taking the host's
+in-between value. The Source angles are left to Premiere (they orient the
+panorama; DJI Studio's keyframe animation eases the camera), Zoom is not
+animatable, and a control with fewer than two keyframes, or a time before the
+first or after the last one, keeps the host's value. Smooth Keyframes then
+averages eased samples.
+
+**The presets.** Each is defined by its speed profile across one interval,
+relative to a straight line's speed (1). DJI Studio's own preset icons draw
+exactly these profiles - a flat line, a bell, a valley, an S-shaped fall and
+rise, and a tilde for Linear Smooth - and the panel draws its tiles from the
+same functions (`osvcore.js`, `easeSpeed`):
+
+| Popup entry | Speed profile | s(u) | Established how |
+|---|---|---|---|
+| None | - | Premiere's own interpolation | the popup's default; nothing is computed |
+| Linear Smooth | steady through each keyframe | cubic Hermite, tangent at each keyframe = mean of the straight-line slopes on either side (exactly linear on two keyframes) | DJI's name and icon; the curve is the standard one |
+| Fast In, Slow Out | 2 -> 0, flat at both ends | 2u - 2u^3 + u^4 | DJI's name and profile shape; standard polynomial |
+| Slow In, Fast Out | 0 -> 2, flat at both ends | 2u^3 - u^4 | as above |
+| Fast In, Fast Out | 2 at both keys, 0.5 halfway | 2u - 3u^2 + 2u^3 | as above |
+| Slow In, Slow Out | 0 at both keys, 1.5 halfway | 3u^2 - 2u^3 (smoothstep) | as above |
+| Linear | 1 | u | DJI's name; exact by definition |
+
+The seven entries, their names and their order are DJI Studio's. Linear is
+exact by definition; for the other five the shape of each profile matches
+DJI Studio's icon, but the exact numbers DJI Studio uses could not be
+established from DJI's public material, so each is the standard polynomial
+with that shape. All are monotone, start at 0, end at 1 and cover the same
+distance as a straight line; Slow In / Slow Out and Fast In / Fast Out are
+point-symmetric, and Slow In / Fast Out is Fast In / Slow Out reversed.
+
+**Why the value is computed, not sampled at a remapped time.** For
+Premiere's default Linear keyframes `v0 + (v1 - v0) s(u)` is exactly the value
+Premiere gives at the remapped time `k0 + s(u) (k1 - k0)`. Computing it
+instead of sampling there has two advantages: the CPU path's time grid can be
+one unit per frame, where a remapped time between frames is not
+representable, and both paths then do the same arithmetic in
+`ReframeEasing.cpp` - CPU / GPU parity by construction. The consequence:
+while a preset is chosen it alone decides how an eased control moves between
+its keyframes, as the keyframe connection does in DJI Studio; Premiere's
+Bezier handles or Hold on those keyframes are not consulted.
+
+**How each path finds the keyframes.**
+
+* CPU (`PF_Cmd_RENDER`): `PF_ParamUtilsSuite3::PF_FindKeyframeTime` (less
+  than or equal / less than / greater than) for the neighbouring keyframes,
+  and `checkout_param` at each keyframe's own time and time scale for its
+  value. The AE SDK's list of features Premiere does not support does not
+  name the Param Utils suite (`PF_UpdateParamUI` from the same suite already
+  works in Premiere, see "One lens at a time"); a host without the suite
+  logs one line and keeps its own interpolation.
+* GPU and the direct path: the Video Segment Suite's `GetNextKeyframeTime`
+  ("the next keyframe time after the specified time") through the probed
+  host index, and `GetParam` at the keyframe for its value. The suite can
+  only walk forwards, so the last keyframe at or before `t` is found by a
+  doubling backwards probe - O(log) calls however far back it is; the test
+  measured at most 14 calls per search over 300 random keyframes, against
+  a 300-call scan. The direct path renders from the same `Settings`, so it
+  eases identically.
+
+**None is bit-identical.** With None the CPU path never acquires the Param
+Utils suite and neither path makes a single keyframe query; the tests count
+zero `PF_FindKeyframeTime` and zero `GetNextKeyframeTime` calls and compare
+the render byte for byte. An old project loads the popup at None.
+
+**The overlay** reads and writes the host's values (keyframes are recorded
+the usual way); between keyframes of an eased control its read-out shows the
+host's value, not the eased one the picture uses.
 
 ### Geometry
 
@@ -1828,6 +1914,30 @@ and a test runs five repaints and asserts the live-object count is zero.
      CPU render: PSNR >= 60 dB for 32f and >= 45 dB for 16f. Keyframed
      parameters are read at the render time and two concurrent instances
      render independently.
+   * Keyframe Easing (`test_easing.cpp`, `[easing]`): every curve starts at
+     0 and ends at 1, is monotone with its speed never negative, has the
+     documented speed profile (checked against a central difference too),
+     is point-symmetric or mirrored as documented, and survives NaN / inf
+     input; None, Linear and Linear Smooth are the identity in time. On a
+     synthetic keyframe set each preset lands on its value halfway, keeps the
+     host's value outside the keyframes and with one keyframe, and Linear
+     Smooth is exactly linear on straight runs and flat through a peak. The
+     backwards keyframe search agrees with a brute-force scan on 2,000 times
+     over 300 random keyframes (at most 14 host calls a search) and refuses a
+     host that answers out of order, past its call budget or by throwing. The
+     popup is registered last, id 22, None by default, not animatable, and
+     the parameter probe maps it on the compact list (a list without it reads
+     None). Through the loaded module, `PF_Cmd_RENDER` of every preset is
+     byte-identical to a render of the expected constant pan (keyframes 0 ->
+     16 deg, halfway: Fast In / Slow Out 13, Slow In / Fast Out 3, the other
+     four 8), Classic FOV and Tilt ease the same way, and None renders the
+     host's value with zero `PF_FindKeyframeTime`
+     calls; `Render` on the GPU matches the CPU picture of the eased pan at
+     >= 60 dB on hosts that number popups from 1 and from 0 (and does not
+     match the linear one), walks Linear Smooth's neighbouring keyframes, and
+     makes zero `GetNextKeyframeTime` calls for None. DJI Studio's four
+     Manual Framing read-outs (Zoom 45.5 / 101.4 / 221.5 / 256.6) lie on
+     the zoom path the effect walks (`test_dji_camera.cpp`).
 3. `osv_source_settings_tests` (`tests/premiere/sourcesettings/`) loads the
    built `OpenOSVSourceSettings.aex` with `LoadLibraryW` - never links its
    objects - and drives it through the mock host:
@@ -2018,7 +2128,16 @@ is the one thing a human has to do.
   the overlay degrades to nothing and logs one line.
 * There is no scroll-wheel zoom, because the SDK has no mouse-wheel event.
   See "Program Monitor overlay" for the evidence; `Ctrl` + drag is the
-  substitute.
+  substitute. (A Windows mouse hook was considered and deliberately not
+  built: `Ctrl` + drag does the job and a global hook in a host process is
+  the kind of fragility this plug-in avoids.)
+* Keyframe Easing reads keyframes through `PF_FindKeyframeTime` on the CPU
+  path and `GetNextKeyframeTime` on the GPU path; both are exercised against
+  the mock host, not yet against a live Premiere. Two facts to confirm on the
+  first live run: that Premiere answers `PF_FindKeyframeTime` for an effect's
+  own parameters, and that `GetNextKeyframeTime` uses the same index space as
+  `GetParam` (the probed map). Either failing leaves Premiere's own
+  interpolation, logged once.
 * No LRF-as-proxy attach automation; `.lrf` imports as its own clip.
 * A `.LRF` proxy now opens AND renders. The fix is `meta::FormatInfo::lensW()`
   / `lensH()`: the proxy is one 2048 x 1024 side-by-side track holding two

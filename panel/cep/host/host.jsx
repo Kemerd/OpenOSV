@@ -44,7 +44,19 @@ var OpenOSVHost = (function () {
     var EVENT_TYPE = 'com.openosv.panel.hostchange';
 
     /** Parameters whose values the panel may need, by display name. */
-    var WANTED_PARAMS = { 'Lens': true, 'Preset': true, 'Camera Model': true, 'Drag Sensitivity': true };
+    var WANTED_PARAMS = {
+        'Lens': true, 'Preset': true, 'Camera Model': true, 'Drag Sensitivity': true,
+        // [WP-EASING] The Keyframe Easing popup and the Manual Framing controls.
+        'Keyframe Easing': true, 'Output Resolution': true, 'Pan': true, 'Tilt': true, 'Roll': true, 'FOV': true,
+        'DJI FOV': true, 'Distortion': true, 'Zoom': true, 'Correction Angle': true
+    };
+
+    /** [WP-EASING] The Source Settings effect on a master clip, and what the panel reads there. */
+    var SOURCE_MATCH_NAME = 'OpenOSV.SourceSettings';
+    var SOURCE_WANTED = {
+        'Stabilisation': true, 'Colour Output': true, 'Output Size': true, 'Calibration': true, 'D-Log M Curve': true,
+        'Render Device': true
+    };
 
     /** Project item nodeId -> media facts; reset when the project changes. */
     var pathCache = {};
@@ -432,8 +444,14 @@ var OpenOSVHost = (function () {
         };
     }
 
-    /** The parameters of a component that the panel may write. */
-    function readParams(component) {
+    /**
+     * The parameters of a component that the panel may read or write:
+     * the ones named in `wanted` (WANTED_PARAMS by default), each with its
+     * value - at `atTime` (a Time object) when given, which is the only read
+     * that works on a keyframed parameter - and whether it is keyframed.
+     */
+    function readParams(component, wanted, atTime) {
+        var names = wanted || WANTED_PARAMS;
         var params = [];
         var props = null;
         try {
@@ -459,15 +477,22 @@ var OpenOSVHost = (function () {
             } catch (e) {
                 p = null;
             }
-            if (!p || !WANTED_PARAMS.hasOwnProperty(name)) {
+            if (!p || !names.hasOwnProperty(name)) {
                 continue;
             }
             var value = null;
             var timeVarying = false;
             try {
-                value = p.getValue();
+                value = atTime ? p.getValueAtTime(atTime) : p.getValue();
             } catch (e) {
                 value = null;
+            }
+            if (atTime && value === null) {
+                try {
+                    value = p.getValue();
+                } catch (e) {
+                    value = null;
+                }
             }
             try {
                 timeVarying = p.isTimeVarying() === true;
@@ -483,6 +508,194 @@ var OpenOSVHost = (function () {
             });
         }
         return params;
+    }
+
+    // ======================================================================
+    //  [WP-EASING] Every Open 360 Reframe of a clip, times, the selection
+    // ======================================================================
+
+    /** Every Open 360 Reframe component of a clip, in list order. */
+    function ourComponents(clip) {
+        var out = [];
+        var names = componentMatchNames(clip);
+        for (var i = 0; i < names.length; i += 1) {
+            if (isOurMatchName(names[i])) {
+                try {
+                    if (clip.components[i]) {
+                        out.push(clip.components[i]);
+                    }
+                } catch (e) {
+                    // An unreadable component is skipped.
+                }
+            }
+        }
+        return out;
+    }
+
+    /** A Time object for a tick count, or null when ExtendScript has none. */
+    function timeFromTicks(ticks) {
+        try {
+            var t = new Time();
+            t.ticks = String(ticks);
+            return t;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /** A tick string as a number ('' reads as NaN). */
+    function ticksNumber(ticks) {
+        return ticks === '' ? NaN : Number(ticks);
+    }
+
+    /**
+     * The one selected OSV clip of the active sequence:
+     * {clip, trackIndex, info} or {reason}.
+     */
+    function selectedOsvClip(seq) {
+        var picks = [];
+        var other = 0;
+        var tracks = videoTrackCount(seq);
+        for (var t = 0; t < tracks; t += 1) {
+            var track = videoTrack(seq, t);
+            if (!track) {
+                continue;
+            }
+            var n = clipCount(track);
+            for (var c = 0; c < n; c += 1) {
+                var clip = clipAt(track, c);
+                var selected = false;
+                try {
+                    selected = clip ? clip.isSelected() === true : false;
+                } catch (e) {
+                    selected = false;
+                }
+                if (!selected) {
+                    continue;
+                }
+                var info = mediaInfo(clip);
+                if (!info || !info.osv) {
+                    other += 1;
+                    continue;
+                }
+                picks.push({ clip: clip, trackIndex: t, info: info });
+            }
+        }
+        if (picks.length === 1) {
+            return picks[0];
+        }
+        if (picks.length > 1) {
+            return { reason: 'many-selected' };
+        }
+        return { reason: other > 0 ? 'not-osv' : 'no-selection' };
+    }
+
+    /** The OpenOSV Source Settings component of a clip's master clip, or null. */
+    function sourceSettingsComponent(clip) {
+        var item = null;
+        try {
+            item = clip.projectItem;
+        } catch (e) {
+            item = null;
+        }
+        if (!item || typeof item.videoComponents !== 'function') {
+            return null;
+        }
+        var comps = null;
+        try {
+            comps = item.videoComponents();
+        } catch (e) {
+            comps = null;
+        }
+        if (!comps) {
+            return null;
+        }
+        var n = 0;
+        try {
+            n = Number(comps.numItems) || 0;
+        } catch (e) {
+            n = 0;
+        }
+        for (var i = 0; i < n; i += 1) {
+            var name = '';
+            try {
+                name = trimString(String(comps[i].matchName));
+            } catch (e) {
+                name = '';
+            }
+            if (name.indexOf('AE.') === 0) {
+                name = name.substring(3);
+            }
+            if (name === SOURCE_MATCH_NAME) {
+                return comps[i];
+            }
+        }
+        return null;
+    }
+
+    /** True when this ExtendScript DOM can reach a master clip's components at all. */
+    function canReachMasterClips(seq) {
+        var tracks = videoTrackCount(seq);
+        for (var t = 0; t < tracks; t += 1) {
+            var track = videoTrack(seq, t);
+            var n = track ? clipCount(track) : 0;
+            for (var c = 0; c < n; c += 1) {
+                var clip = clipAt(track, c);
+                try {
+                    if (clip && clip.projectItem) {
+                        return typeof clip.projectItem.videoComponents === 'function';
+                    }
+                } catch (e) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Write one parameter: a keyframe at `atTicks` when the parameter is
+     * keyframed and a time is given (ComponentParam.addKey + setValueAtKey),
+     * otherwise its value (setValue).  A keyframed parameter without a time
+     * is refused - writing it would flatten the animation.  Returns '' or
+     * the reason it failed.
+     */
+    function writeParam(param, value, atTicks) {
+        var keyframed = false;
+        try {
+            keyframed = param.isTimeVarying() === true;
+        } catch (e) {
+            keyframed = false;
+        }
+        try {
+            if (keyframed) {
+                if (atTicks === undefined || atTicks === null || atTicks === '') {
+                    return 'is keyframed';
+                }
+                var t = timeFromTicks(atTicks);
+                if (!t) {
+                    return 'no Time object in this ExtendScript';
+                }
+                // A keyframe already at that time is updated, not doubled
+                // (findNearestKey with no tolerance: the documented query).
+                var exists = false;
+                try {
+                    var near = param.findNearestKey(t, 0);
+                    exists = !!near && String(near.ticks) === String(t.ticks);
+                } catch (e) {
+                    exists = false;
+                }
+                if (!exists) {
+                    param.addKey(t);
+                }
+                param.setValueAtKey(t, value, 1);
+                return '';
+            }
+            param.setValue(value, 1);
+            return '';
+        } catch (e) {
+            return messageOf(e);
+        }
     }
 
     // ======================================================================
@@ -846,9 +1059,16 @@ var OpenOSVHost = (function () {
     };
 
     /**
-     * Write parameter values into the newest Open 360 Reframe of each clip.
-     * Every write names the parameter it expects at that index, and is
-     * refused if the name differs - an index is only trusted with its name.
+     * Write parameter values into Open 360 Reframe components.  Every write
+     * names the parameter it expects at that index, and is refused if the
+     * name differs - an index is only trusted with its name.
+     *
+     * A write goes to the clip's NEWEST Open 360 Reframe unless it names
+     * `component`, the ordinal among the clip's Open 360 Reframe components
+     * ([WP-EASING]: Keyframe Easing is set on every instance).  With
+     * `atTicks` a keyframed parameter gets a keyframe at that component time
+     * (the Manual Framing card); without it a keyframed parameter is refused,
+     * as before.
      */
     api.setParams = function (request) {
         try {
@@ -860,11 +1080,19 @@ var OpenOSVHost = (function () {
             var writes = isArray(req.writes) ? req.writes : [];
             var written = 0;
             var failed = 0;
+            var keyed = 0;
             var errors = [];
             for (var i = 0; i < writes.length; i += 1) {
                 var w = writes[i] || {};
                 var found = findClip(seq, String(w.key));
-                var component = found ? lastOurComponent(found.clip) : null;
+                var component = null;
+                if (found) {
+                    if (typeof w.component === 'number' && w.component >= 0) {
+                        component = ourComponents(found.clip)[w.component] || null;
+                    } else {
+                        component = lastOurComponent(found.clip);
+                    }
+                }
                 var param = null;
                 try {
                     param = component ? component.properties[Number(w.index)] : null;
@@ -882,24 +1110,224 @@ var OpenOSVHost = (function () {
                     errors.push('couldn\'t find ' + String(w.name));
                     continue;
                 }
-                var keyframed = false;
+                var wasKeyframed = false;
                 try {
-                    keyframed = param.isTimeVarying() === true;
+                    wasKeyframed = param.isTimeVarying() === true;
                 } catch (e) {
-                    keyframed = false;
+                    wasKeyframed = false;
                 }
-                if (keyframed) {
+                var problem = writeParam(param, w.value, w.atTicks);
+                if (problem !== '') {
                     failed += 1;
-                    errors.push(name + ' is keyframed');
+                    errors.push(problem === 'is keyframed' ? name + ' is keyframed' : problem);
                     continue;
                 }
-                try {
-                    param.setValue(w.value, 1);
-                    written += 1;
-                } catch (e) {
-                    failed += 1;
-                    errors.push(messageOf(e));
+                written += 1;
+                if (wasKeyframed) {
+                    keyed += 1;
                 }
+            }
+            return okJson({ written: written, failed: failed, keyed: keyed, errors: errors });
+        } catch (e) {
+            return errorJson(messageOf(e));
+        }
+    };
+
+    /**
+     * [WP-EASING] Every Open 360 Reframe of the clips named by
+     * `request.keys`, with the parameters the panel reads (for the Keyframe
+     * Easing popup and the popups that settle the numbering).  Clips
+     * without the effect are counted in `missing`.
+     */
+    api.easingTargets = function (request) {
+        try {
+            var req = request || {};
+            var seq = activeSequence();
+            if (!seq || sequenceIdOf(seq) !== String(req.sequenceId)) {
+                return errorJson('the active sequence changed. Try again');
+            }
+            var keys = isArray(req.keys) ? req.keys : [];
+            var targets = [];
+            var missing = 0;
+            var failed = 0;
+            for (var i = 0; i < keys.length; i += 1) {
+                var found = findClip(seq, String(keys[i]));
+                if (!found) {
+                    failed += 1;
+                    continue;
+                }
+                var mine = ourComponents(found.clip);
+                if (mine.length === 0) {
+                    missing += 1;
+                    continue;
+                }
+                var components = [];
+                for (var c = 0; c < mine.length; c += 1) {
+                    components.push({ ordinal: c, params: readParams(mine[c]) });
+                }
+                targets.push({ key: String(keys[i]), components: components });
+            }
+            return okJson({ targets: targets, missing: missing, failed: failed });
+        } catch (e) {
+            return errorJson(messageOf(e));
+        }
+    };
+
+    /**
+     * [WP-EASING] The selected OSV clip's Open 360 Reframe at the playhead,
+     * for the Manual Framing card: where the clip sits, the component time
+     * the playhead maps to, the sequence's frame size and the controls'
+     * values at that time.  `reason` instead when there is nothing to frame.
+     */
+    api.framingInfo = function (request) {
+        try {
+            var req = request || {};
+            var seq = activeSequence();
+            if (!seq || (req.sequenceId && sequenceIdOf(seq) !== String(req.sequenceId))) {
+                return errorJson('the active sequence changed. Try again');
+            }
+            var pick = selectedOsvClip(seq);
+            if (pick.reason) {
+                return okJson({ reason: pick.reason });
+            }
+            var playhead = '';
+            try {
+                playhead = ticksOf(seq.getPlayerPosition());
+            } catch (e) {
+                playhead = '';
+            }
+            var start = ticksOf(pick.clip.start);
+            var end = ticksOf(pick.clip.end);
+            var inPoint = ticksOf(pick.clip.inPoint);
+            var p = ticksNumber(playhead);
+            if (!(p >= ticksNumber(start) && p < ticksNumber(end))) {
+                return okJson({ reason: 'outside' });
+            }
+            var component = lastOurComponent(pick.clip);
+            if (!component) {
+                return okJson({ reason: 'no-effect' });
+            }
+            // Effect keyframes live on the clip's media time.  ES3 has no
+            // integer beyond 2^53 ticks (about 9.8 hours), which no clip's
+            // media time reaches.
+            var componentTicks = String(p - ticksNumber(start) + ticksNumber(inPoint));
+            var width = 0;
+            var height = 0;
+            try {
+                width = Number(seq.frameSizeHorizontal) || 0;
+                height = Number(seq.frameSizeVertical) || 0;
+            } catch (e) {
+                width = 0;
+                height = 0;
+            }
+            var name = '';
+            try {
+                name = String(pick.clip.name);
+            } catch (e) {
+                name = '';
+            }
+            return okJson({
+                key: String(pick.clip.nodeId),
+                name: name,
+                componentTicks: componentTicks,
+                seqWidth: width,
+                seqHeight: height,
+                params: readParams(component, WANTED_PARAMS, timeFromTicks(componentTicks))
+            });
+        } catch (e) {
+            return errorJson(messageOf(e));
+        }
+    };
+
+    /**
+     * [WP-EASING] The OpenOSV Source Settings of the master clips behind the
+     * clips named by `request.keys` (ProjectItem.videoComponents(), "Video
+     * components for the 'Master Clip' of this project item"), one entry per
+     * master clip.  `unsupported` when this DOM has no such call.
+     */
+    api.sourceTargets = function (request) {
+        try {
+            var req = request || {};
+            var seq = activeSequence();
+            if (!seq || sequenceIdOf(seq) !== String(req.sequenceId)) {
+                return errorJson('the active sequence changed. Try again');
+            }
+            if (!canReachMasterClips(seq)) {
+                return okJson({ unsupported: true, targets: [], missing: 0, failed: 0 });
+            }
+            var keys = isArray(req.keys) ? req.keys : [];
+            var seen = {};
+            var targets = [];
+            var missing = 0;
+            var failed = 0;
+            for (var i = 0; i < keys.length; i += 1) {
+                var found = findClip(seq, String(keys[i]));
+                if (!found) {
+                    failed += 1;
+                    continue;
+                }
+                var info = mediaInfo(found.clip);
+                var id = info ? String(info.projectItemId) : '';
+                if (id !== '' && seen.hasOwnProperty(id)) {
+                    continue;   // one master clip, several timeline clips
+                }
+                seen[id] = true;
+                var component = sourceSettingsComponent(found.clip);
+                if (!component) {
+                    missing += 1;
+                    continue;
+                }
+                targets.push({ key: String(keys[i]), params: readParams(component, SOURCE_WANTED) });
+            }
+            return okJson({ unsupported: false, targets: targets, missing: missing, failed: failed });
+        } catch (e) {
+            return errorJson(messageOf(e));
+        }
+    };
+
+    /**
+     * [WP-EASING] Write parameters of the Source Settings component on the
+     * master clip of each named clip, name-checked like setParams.
+     */
+    api.setSourceParams = function (request) {
+        try {
+            var req = request || {};
+            var seq = activeSequence();
+            if (!seq || sequenceIdOf(seq) !== String(req.sequenceId)) {
+                return errorJson('the active sequence changed. Try again');
+            }
+            var writes = isArray(req.writes) ? req.writes : [];
+            var written = 0;
+            var failed = 0;
+            var errors = [];
+            for (var i = 0; i < writes.length; i += 1) {
+                var w = writes[i] || {};
+                var found = findClip(seq, String(w.key));
+                var component = found ? sourceSettingsComponent(found.clip) : null;
+                var param = null;
+                try {
+                    param = component ? component.properties[Number(w.index)] : null;
+                } catch (e) {
+                    param = null;
+                }
+                var name = '';
+                try {
+                    name = param ? trimString(param.displayName) : '';
+                } catch (e) {
+                    name = '';
+                }
+                if (!param || name !== String(w.name)) {
+                    failed += 1;
+                    errors.push('couldn\'t find ' + String(w.name));
+                    continue;
+                }
+                var problem = writeParam(param, w.value, null);
+                if (problem !== '') {
+                    failed += 1;
+                    errors.push(problem);
+                    continue;
+                }
+                written += 1;
             }
             return okJson({ written: written, failed: failed, errors: errors });
         } catch (e) {
@@ -930,7 +1358,10 @@ var OpenOSVHost = (function () {
                 return okJson({ bound: true, already: true });
             }
             var bound = 0;
-            var names = ['onActiveSequenceTrackItemAdded', 'onActiveSequenceChanged', 'onActiveSequenceStructureChanged'];
+            // [WP-EASING] ...SelectionChanged moves the Manual Framing read-outs
+            // to the newly selected clip (Adobe's PProPanel binds it the same way).
+            var names = ['onActiveSequenceTrackItemAdded', 'onActiveSequenceChanged', 'onActiveSequenceStructureChanged',
+                         'onActiveSequenceSelectionChanged'];
             for (var i = 0; i < names.length; i += 1) {
                 try {
                     var reason = names[i];

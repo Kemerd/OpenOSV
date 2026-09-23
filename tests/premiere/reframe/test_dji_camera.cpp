@@ -519,6 +519,43 @@ TEST_CASE("djiZoomTo walks DJI Studio's zoom path to the requested Zoom", "[refr
     CHECK(same.correction == 0.6);
 }
 
+TEST_CASE("DJI Studio's Manual Framing read-outs lie on the zoom path the effect walks", "[reframe][dji]") {
+    // Four read-outs of DJI Studio's Manual Framing panel on a 16:9 canvas,
+    // all on the path out of the zoomed-in corner (FOV 20 / Correction 0,
+    // where both of DJI Studio's limits meet).  Each is Zoom, FOV and
+    // Correction Angle as DJI Studio displays them: Zoom and FOV to a tenth
+    // of a degree, Correction to a hundredth.
+    struct ReadOut {
+        double zoom;
+        double fov;
+        double correction;
+    };
+    const ReadOut readOuts[] = {
+        {45.5, 25.4, 0.04},
+        {101.4, 52.5, 0.25},
+        {221.5, 112.1, 0.71},
+        {256.6, 128.3, 0.83},
+    };
+    const DjiLens zoomedIn{OSV_REFRAME_DJI_STUDIO_FOV_MIN, OSV_REFRAME_CORRECTION_VALID_MIN};
+    for (const ReadOut& r : readOuts) {
+        INFO("DJI Studio shows Zoom " << r.zoom << ", FOV " << r.fov << ", Correction " << r.correction);
+        // The path from the zoomed-in corner is FOV = 20 + 130 x Correction:
+        // every read-out sits on it, to the precision DJI displays.
+        CHECK(r.fov == Approx(OSV_REFRAME_DJI_STUDIO_FOV_MIN + OSV_REFRAME_DJI_ZOOM_FOV_PER_CORRECTION * r.correction)
+                           .margin(0.5));
+        // DJI's own Zoom formula gives the Zoom DJI shows for the FOV and
+        // Correction it shows (the displayed values are rounded, so the
+        // margin covers half a unit of the last digit of both).
+        CHECK(djiZoomDeg(DjiLens{r.fov, r.correction}, kAspect169) == Approx(r.zoom).margin(1.2));
+        // And walking the effect's zoom path (the Zoom control, the overlay's
+        // Ctrl + drag) to that Zoom from the same corner lands on DJI's numbers.
+        const DjiLens walked = djiZoomTo(r.zoom, zoomedIn, kAspect169);
+        CHECK(djiZoomDeg(walked, kAspect169) == Approx(r.zoom).margin(1e-6));
+        CHECK(walked.fovDeg == Approx(r.fov).margin(0.5));
+        CHECK(walked.correction == Approx(r.correction).margin(0.006));
+    }
+}
+
 TEST_CASE("switching lenses carries the picture across", "[reframe][dji]") {
     SECTION("Classic -> DJI frames exactly what Classic framed") {
         // Including the automatic ramp (210 deg) and the Classic presets.
@@ -846,14 +883,18 @@ TEST_CASE("matchHostParams with the appended DJI block", "[reframe][params][dji]
         CHECK(map[kIndexCameraModel] == 11);
         CHECK(map[kIndexDragSensitivity] == 15);
         CHECK(map[kIndexLens] == 16);
+        // [WP-EASING] The Keyframe Easing popup, appended after the Lens.
+        CHECK(map[kIndexKeyframeEasing] == 17);
     }
     SECTION("a list that stops before the Lens popup maps the rest; the Lens reads its default") {
         // A host whose list predates [WP-LENSUI]: every control up to Drag
-        // Sensitivity, then nothing.
-        const std::vector<HostParamKind> noLens(kValueParamKind, kValueParamKind + kValueParamCount - 1);
+        // Sensitivity, then nothing - so neither the Lens popup nor the
+        // Keyframe Easing popup appended after it ([WP-EASING]).
+        const std::vector<HostParamKind> noLens(kValueParamKind, kValueParamKind + kValueParamCount - 2);
         REQUIRE(matchHostParams(noLens.data(), static_cast<int>(noLens.size()), &map));
         CHECK(map[kIndexDragSensitivity] == 15);
         CHECK(map[kIndexLens] == -1);
+        CHECK(map[kIndexKeyframeEasing] == -1);
     }
     SECTION("Premiere's compact layout of the NEW list: the Source group hidden") {
         std::vector<HostParamKind> compact;
@@ -863,7 +904,7 @@ TEST_CASE("matchHostParams with the appended DJI block", "[reframe][params][dji]
                 compact.push_back(kValueParamKind[i]);
             }
         }
-        REQUIRE(compact.size() == 14u);
+        REQUIRE(compact.size() == 15u);
         REQUIRE(matchHostParams(compact.data(), static_cast<int>(compact.size()), &map));
         CHECK(map[kIndexSmooth] == 7);
         CHECK(map[kIndexCameraModel] == 8);
@@ -872,6 +913,7 @@ TEST_CASE("matchHostParams with the appended DJI block", "[reframe][params][dji]
         CHECK(map[kIndexCorrection] == 11);
         CHECK(map[kIndexDragSensitivity] == 12);
         CHECK(map[kIndexLens] == 13);
+        CHECK(map[kIndexKeyframeEasing] == 14);  // [WP-EASING]
         CHECK(map[kIndexSourcePan] == -1);
     }
     SECTION("a list of nothing but appended controls is not our list") {

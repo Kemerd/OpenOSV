@@ -224,7 +224,7 @@ TEST_CASE("GLOBAL_SETUP and GLOBAL_SETDOWN leave no suite acquired", "[reframe][
 // ===========================================================================
 //  PARAMS_SETUP
 // ===========================================================================
-TEST_CASE("PARAMS_SETUP registers the 19 documented parameters", "[reframe][params]") {
+TEST_CASE("PARAMS_SETUP registers the 22 documented parameters", "[reframe][params]") {
     EffectFixture f;
     const std::vector<PF_ParamDef> params = setupParams(f);
 
@@ -239,7 +239,9 @@ TEST_CASE("PARAMS_SETUP registers the 19 documented parameters", "[reframe][para
     // [WP-CAMERA] The DJI camera block (ids 16..20) is APPENDED after Smooth
     // Keyframes: every entry above it keeps the index and id it had, which
     // is the whole backward-compatibility argument for old projects.
-    // [WP-LENSUI] The Lens popup (id 21) is appended after it, last.
+    // [WP-LENSUI] The Lens popup (id 21) is appended after it.
+    // [WP-EASING] The Keyframe Easing popup (id 22) is appended after that,
+    // last.
     const int expectedIds[kParamCount] = {
         OSV_REFRAME_ID_OUTPUT_RESOLUTION, OSV_REFRAME_ID_CAMERA_TOPIC, OSV_REFRAME_ID_PRESET,
         OSV_REFRAME_ID_PAN,              OSV_REFRAME_ID_TILT,         OSV_REFRAME_ID_ROLL,
@@ -248,6 +250,7 @@ TEST_CASE("PARAMS_SETUP registers the 19 documented parameters", "[reframe][para
         OSV_REFRAME_ID_SOURCE_ROLL,      OSV_REFRAME_ID_SOURCE_TOPIC_END, OSV_REFRAME_ID_SMOOTH,
         OSV_REFRAME_ID_CAMERA_MODEL,     OSV_REFRAME_ID_ZOOM,         OSV_REFRAME_ID_DJI_FOV,
         OSV_REFRAME_ID_CORRECTION,       OSV_REFRAME_ID_DRAG_SENSITIVITY, OSV_REFRAME_ID_LENS,
+        OSV_REFRAME_ID_KEYFRAME_EASING,
     };
     const PF_ParamType expectedTypes[kParamCount] = {
         PF_Param_POPUP,       PF_Param_GROUP_START, PF_Param_POPUP,        PF_Param_ANGLE,
@@ -255,7 +258,7 @@ TEST_CASE("PARAMS_SETUP registers the 19 documented parameters", "[reframe][para
         PF_Param_GROUP_END,   PF_Param_GROUP_START, PF_Param_ANGLE,        PF_Param_ANGLE,
         PF_Param_ANGLE,       PF_Param_GROUP_END,   PF_Param_CHECKBOX,
         PF_Param_CHECKBOX,    PF_Param_FLOAT_SLIDER, PF_Param_FLOAT_SLIDER, PF_Param_FLOAT_SLIDER,
-        PF_Param_FLOAT_SLIDER, PF_Param_POPUP,
+        PF_Param_FLOAT_SLIDER, PF_Param_POPUP,      PF_Param_POPUP,
     };
     // PF_END_TOPIC sets no name, and AEFX_CLR_STRUCT zeroes the def before
     // it, so a terminator's name is the empty string.
@@ -264,7 +267,7 @@ TEST_CASE("PARAMS_SETUP registers the 19 documented parameters", "[reframe][para
         "Roll",          "FOV",         "Distortion",       "",     "Source",
         "Source Pan",    "Source Tilt", "Source Roll",      "",     "Smooth Keyframes",
         "Camera Model",  "Zoom",        "DJI FOV",          "Correction Angle", "Drag Sensitivity",
-        "Lens",
+        "Lens",          "Keyframe Easing",
     };
 
     for (int i = 0; i < kParamCount; ++i) {
@@ -291,6 +294,7 @@ TEST_CASE("PARAMS_SETUP registers the 19 documented parameters", "[reframe][para
     CHECK(params[kIndexSourcePan - 1].uu.id == OSV_REFRAME_ID_SOURCE_PAN);
     CHECK(params[kIndexSmooth - 1].uu.id == OSV_REFRAME_ID_SMOOTH);
     CHECK(params[kIndexLens - 1].uu.id == OSV_REFRAME_ID_LENS);
+    CHECK(params[kIndexKeyframeEasing - 1].uu.id == OSV_REFRAME_ID_KEYFRAME_EASING);
 }
 
 TEST_CASE("PARAMS_SETUP reports the parameter count the host will allocate", "[reframe][params]") {
@@ -384,6 +388,29 @@ TEST_CASE("the popup items are exactly the documented lists", "[reframe][params]
         CHECK((def.flags & PF_ParamFlag_CANNOT_TIME_VARY) != 0);
         CHECK((def.ui_flags & PF_PUI_INVISIBLE) == 0);
     }
+
+    SECTION("Keyframe Easing") {
+        // [WP-EASING] DJI Studio's seven Keyframe Animation presets, None
+        // first and the default, so an old project renders as it did.
+        const PF_ParamDef& def = params[kIndexKeyframeEasing - 1];
+        REQUIRE(def.param_type == PF_Param_POPUP);
+        CHECK(std::string(def.PF_DEF_NAME) == "Keyframe Easing");
+        CHECK(def.u.pd.num_choices == OSV_REFRAME_EASING_COUNT);
+        CHECK(def.u.pd.dephault == OSV_REFRAME_EASING_DEFAULT);
+        CHECK(sanitiseKeyframeEasing(def.u.pd.dephault) == KeyframeEasing::None);
+
+        const std::vector<std::string> items = splitItems(def.u.pd.u.namesptr);
+        REQUIRE(items.size() == 7u);
+        CHECK(items[0] == "None");
+        CHECK(items[1] == "Linear Smooth");
+        CHECK(items[2] == "Fast In, Slow Out");
+        CHECK(items[3] == "Slow In, Fast Out");
+        CHECK(items[4] == "Fast In, Fast Out");
+        CHECK(items[5] == "Slow In, Slow Out");
+        CHECK(items[6] == "Linear");
+        CHECK((def.flags & PF_ParamFlag_CANNOT_TIME_VARY) != 0);
+        CHECK((def.ui_flags & PF_PUI_INVISIBLE) == 0);
+    }
 }
 
 TEST_CASE("the sliders carry the documented ranges and defaults", "[reframe][params]") {
@@ -465,6 +492,7 @@ TEST_CASE("exactly the supervised parameters carry PF_ParamFlag_SUPERVISE", "[re
         true,   // Correction Angle
         false,  // Drag Sensitivity
         true,   // Lens: switching carries the look across
+        false,  // Keyframe Easing: picking a curve changes no other control
     };
     for (int i = 0; i < kParamCount; ++i) {
         INFO("parameter " << (i + 1) << " (" << params[static_cast<std::size_t>(i)].PF_DEF_NAME << ")");
@@ -522,6 +550,8 @@ TEST_CASE("every parameter group is opened and closed exactly once", "[reframe][
     // [WP-LENSUI] The Lens popup is appended after both groups closed, so
     // it is top level too.
     CHECK(depthOfIndex[kIndexLens] == 0);
+    // [WP-EASING] So is the Keyframe Easing popup after it.
+    CHECK(depthOfIndex[kIndexKeyframeEasing] == 0);
 
     // ... and a representative member of each group, which must NOT be.
     CHECK(depthOfIndex[kIndexFov] == 1);

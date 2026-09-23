@@ -25,6 +25,32 @@ All notable changes to OpenOSV are documented here. The format follows
   osvtool (`render --hdr-peak`, `lut --hdr-peak`), the user defaults file and
   the direct path (a change re-renders the Program monitor). CPU / CUDA /
   OpenCL agree at 115.8 / 112.2 dB. Engine ABI 5.
+* **Keyframe Easing (WP-EASING).** DJI Studio's seven Keyframe Animation
+  presets - None, Linear Smooth, Fast In / Slow Out, Slow In / Fast Out,
+  Fast In / Fast Out, Slow In / Slow Out, Linear - as a new "Keyframe
+  Easing" popup on Open 360 Reframe (id 22, appended). Between keyframes of
+  Pan, Tilt, Roll and the selected lens's pair the effect draws the curve
+  itself, identically on the CPU path, the GPU filter and the direct path
+  (one shared `ReframeEasing.cpp`); Premiere's scripting APIs can only set a
+  keyframe's interpolation type, never a curve. The names, order and speed
+  profiles are DJI Studio's; the exact numbers could not be established, so
+  each curve is the standard polynomial with DJI's shape (docs/PREMIERE.md).
+  None is the default and renders byte for byte as before (no keyframe query
+  is made at all).
+
+* **Panel: Keyframe Animation, Manual Framing, Stabilisation and the
+  Program Monitor controls.** A preset grid with curve icons drawn from the
+  effect's own curves, applied to the selected clips or to every OSV clip of
+  the sequence (clips without the effect are skipped and counted); DJI
+  Studio's Manual Framing (Crystal Ball / Asteroid / Ultra Wide / Wide /
+  Dewarp, a Zoom stepper along DJI Studio's zoom path, and live FOV /
+  Correction / Pan / Tilt / Roll read-outs of the selected clip at the
+  playhead, keyframed controls keyed there); RockSteady / Horizon Leveling /
+  Off set on the master clips' OpenOSV Source Settings; and a card listing
+  every Program Monitor gesture, open for a new user. On UXP every button
+  press is one undo step; on CEP each value is its own History step, and the
+  panel says so (docs/PANEL.md).
+
 * **Lens Shading in Source Settings (WP-VIGNETTE).** The soft darker band
   that stayed on every sky seam crossing after the sky seam fix is a ring in
   the front lens's own image - 83-89 deg from its axis, up to 0.34 stop deep

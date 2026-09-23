@@ -201,6 +201,12 @@ struct EffectRef {
     /// every plausible implementation satisfies.
     std::map<std::pair<A_long, A_long>, PF_ParamDef> keyframes;
 
+    /// PF_FindKeyframeTime calls made on this reference.  The [WP-EASING]
+    /// Keyframe Easing reads keyframes through it; a test counts the calls to
+    /// prove that easing "None" never asks at all, which is part of what
+    /// keeps None bit-identical to the effect before the popup existed.
+    std::size_t findKeyframeCalls = 0;
+
     /// The custom UI the effect registered through
     /// PF_InteractCallbacks::register_ui, and whether it registered one at
     /// all.  A test reads these to prove the reframe overlay asked for
@@ -412,6 +418,9 @@ struct MockHost::Impl {
     std::vector<ParamReadRecord> paramReads;
     std::size_t paramReadsDropped = 0;
     static constexpr std::size_t kMaxParamReads = 1u << 16;
+    /// GetNextKeyframeTime calls, all nodes together: the [WP-EASING] tests
+    /// prove with it that easing "None" never walks keyframes on the GPU path.
+    std::size_t nextKeyframeCalls = 0;
     /// ReleaseVideoNodeID calls on a node that had nothing outstanding (or
     /// that does not exist) - always a plug-in bug.
     std::size_t invalidNodeReleases = 0;

@@ -475,6 +475,10 @@ public:
 
     /// Every GetParam call since the last clearParamReads(), oldest first.
     [[nodiscard]] std::vector<ParamReadRecord> paramReads() const;
+    /// GetNextKeyframeTime calls since the last clearParamReads() (served
+    /// from the same keyframe table as GetParam: the first key strictly after
+    /// the time asked).
+    [[nodiscard]] std::size_t nextKeyframeCalls() const;
     void clearParamReads();
 
     // ---- segment graph -----------------------------------------------------
@@ -590,6 +594,9 @@ public:
     void setParamValueAtTime(PF_ProgPtr ref, A_long index, A_long time, const PF_ParamDef& def);
     /// Drop every keyframe installed on `ref`.
     void clearParamKeyframes(PF_ProgPtr ref);
+    /// PF_FindKeyframeTime calls made on `ref` (the Param Utils Suite serves
+    /// it from the keyframes setParamValueAtTime installed).
+    [[nodiscard]] std::size_t findKeyframeCalls(PF_ProgPtr ref) const;
     /// The world checkout_param(0) and params[0] wrap.
     void setInputWorld(PF_ProgPtr ref, EffectWorld* world);
     /// A ready-to-use params array for PF_Cmd_RENDER: [0] the input layer,

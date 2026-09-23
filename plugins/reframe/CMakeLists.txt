@@ -126,6 +126,10 @@ osv_add_premiere_plugin(Open360Reframe
     ReframeCpu.cpp
     ReframeCpu.h
     ReframeParams.h
+    # [WP-EASING] The Keyframe Easing curves and keyframe walk: pure, shared
+    # by the CPU and GPU readers, and compiled into the tests as well.
+    ReframeEasing.cpp
+    ReframeEasing.h
     # The direct fisheye -> view path (docs/DIRECT_GPU.md, WP-C): the
     # parameter builder and CPU twin, and the driver-API launcher of the
     # fused kernel that ReframeKernel.cu adds to the same fatbin.

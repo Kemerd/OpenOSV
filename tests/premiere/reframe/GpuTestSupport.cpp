@@ -386,6 +386,10 @@ void writeVerbatimControls(MockHost& host, csSDK_int32 node, const Controls& c, 
     putBool(host, node, kIndexSmooth, c.smooth, time);
     // [WP-LENSUI] The Lens popup, in the same raw numbering as the others.
     putI32(host, node, kIndexLens, c.lens, time);
+    // [WP-EASING] The Keyframe Easing popup, only when the test chose one.
+    if (c.easing >= 0) {
+        putI32(host, node, kIndexKeyframeEasing, c.easing, time);
+    }
     // The count a host with this layout reports, whatever this build added
     // after the controls written here.
     host.setParamCount(node, kParamCount);
@@ -393,16 +397,24 @@ void writeVerbatimControls(MockHost& host, csSDK_int32 node, const Controls& c, 
 
 Settings settingsOf(const Controls& c) {
     Settings s;
-    // Learn the numbering from all three popups first, then decode each -
-    // the order GpuFilter.cpp's readSettings() uses, so a 0-based test and a
+    // Learn the numbering from every popup first, then decode each - the
+    // order GpuFilter.cpp's readSettings() uses, so a 0-based test and a
     // 1-based one both get the Settings the filter should have read.
     PopupBase base = PopupBase::Unknown;
     (void)decodeHostPopup(c.resolution, OSV_REFRAME_RESOLUTION_COUNT, &base);
     (void)decodeHostPopup(c.preset, OSV_REFRAME_PRESET_COUNT, &base);
     (void)decodeHostPopup(c.lens, OSV_REFRAME_LENS_COUNT, &base);
+    if (c.easing >= 0) {
+        (void)decodeHostPopup(c.easing, OSV_REFRAME_EASING_COUNT, &base);
+    }
     s.resolution = sanitiseResolution(decodeHostPopup(c.resolution, OSV_REFRAME_RESOLUTION_COUNT, &base));
     s.preset = sanitisePreset(decodeHostPopup(c.preset, OSV_REFRAME_PRESET_COUNT, &base));
     s.cameraModel = cameraModelFromLensPopup(decodeHostPopup(c.lens, OSV_REFRAME_LENS_COUNT, &base));
+    // The easing is recorded but NOT applied: the angles below are the
+    // constants the controls hold, and a test that keyframes them computes
+    // the eased values it expects itself.
+    s.easing = sanitiseKeyframeEasing(c.easing >= 0 ? decodeHostPopup(c.easing, OSV_REFRAME_EASING_COUNT, &base)
+                                                    : OSV_REFRAME_EASING_DEFAULT);
     s.panDeg = c.pan;
     s.tiltDeg = c.tilt;
     s.rollDeg = c.roll;
