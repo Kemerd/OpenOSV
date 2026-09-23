@@ -12,6 +12,12 @@
 // ReframeUiEvent.cpp.  Splitting them is what keeps this file testable.
 #include "ReframeUi.h"
 
+// The renderer's camera function (osvViewRay).  The one dependency this
+// otherwise self-contained unit takes, on purpose: the grab must cast the
+// pointer through exactly the camera the picture is rendered with.  The
+// header is plain C, inline, and links nothing.
+#include "osv/render/osv_kernel.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -229,6 +235,216 @@ Handle hitTest(const Layout& layout, const PointF& point) noexcept {
 // ---------------------------------------------------------------------------
 //  Drag maths
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+//  Grab the sphere
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Unit view-frame ray under a point of the viewport, through the renderer's
+/// own camera function (osvViewRay, osv_kernel.h) so the overlay and the
+/// picture can never disagree about what is under the pointer.
+///
+/// View frame: X right, Y forward, Z up.  The pointer position is continuous
+/// (no pixel-centre offset): it is a point, not a pixel.
+[[nodiscard]] bool grabRay(const SphereGrab& g, const Layout& layout, const PointF& p, double out[3]) noexcept {
+    if (!layout.valid || !isFinitePoint(p)) {
+        return false;
+    }
+    const double w = layout.viewport.w;
+    const double h = layout.viewport.h;
+    if (!(w > 0.0) || !(h > 0.0)) {
+        return false;
+    }
+    // Centred offsets, +ny = up, exactly as osvReframeEquirectPixel forms them.
+    const float nx = static_cast<float>((p.x - layout.viewport.x) - 0.5 * w);
+    const float ny = static_cast<float>(0.5 * h - (p.y - layout.viewport.y));
+    float d[3] = {0.0f, 0.0f, 0.0f};
+    if (!osvViewRay(g.projection, static_cast<float>(g.focalPx), static_cast<float>(g.eyeOffset),
+                    static_cast<float>(g.tanHalfH), static_cast<float>(g.tanHalfV), static_cast<float>(w),
+                    static_cast<float>(h), nx, ny, d)) {
+        return false;  // outside the projection's valid radius
+    }
+    const double n = std::sqrt(static_cast<double>(d[0]) * d[0] + static_cast<double>(d[1]) * d[1] +
+                               static_cast<double>(d[2]) * d[2]);
+    if (!(n > 0.0) || !std::isfinite(n)) {
+        return false;
+    }
+    out[0] = d[0] / n;
+    out[1] = d[1] / n;
+    out[2] = d[2] / n;
+    return true;
+}
+
+// The camera's rotation is R = Rz(pan) Rx(tilt) Ry(roll) (VirtualCamera::
+// rotation, the same order buildView uses), with the right-handed matrices
+// of osv/core/Math.h.  These apply one factor to a vector in place.
+
+void applyRotZ(double rad, double v[3]) noexcept {
+    const double c = std::cos(rad), s = std::sin(rad);
+    const double x = c * v[0] - s * v[1];
+    const double y = s * v[0] + c * v[1];
+    v[0] = x;
+    v[1] = y;
+}
+
+void applyRotX(double rad, double v[3]) noexcept {
+    const double c = std::cos(rad), s = std::sin(rad);
+    const double y = c * v[1] - s * v[2];
+    const double z = s * v[1] + c * v[2];
+    v[1] = y;
+    v[2] = z;
+}
+
+void applyRotY(double rad, double v[3]) noexcept {
+    const double c = std::cos(rad), s = std::sin(rad);
+    const double x = c * v[0] + s * v[2];
+    const double z = -s * v[0] + c * v[2];
+    v[0] = x;
+    v[2] = z;
+}
+
+/// Wrap an angle in radians into (-pi, pi].
+[[nodiscard]] double wrapRad(double a) noexcept {
+    constexpr double kTwoPi = 2.0 * 3.14159265358979323846;
+    a = std::fmod(a, kTwoPi);
+    if (a <= -0.5 * kTwoPi) {
+        a += kTwoPi;
+    } else if (a > 0.5 * kTwoPi) {
+        a -= kTwoPi;
+    }
+    return a;
+}
+
+/// Horizontal length below which an azimuth is undefined (looking straight
+/// up or down): the pan is then kept rather than read from noise.
+constexpr double kAzimuthEpsilon = 1e-9;
+
+}  // namespace
+
+SphereGrab beginSphereGrab(int projection, double focalPx, double eyeOffset, double tanHalfH, double tanHalfV,
+                           const Layout& layout, const CameraValues& start, const PointF& anchor) noexcept {
+    SphereGrab g;
+    if (!layout.valid || !std::isfinite(focalPx) || !(focalPx > 0.0) || !std::isfinite(eyeOffset) ||
+        !std::isfinite(tanHalfH) || !std::isfinite(tanHalfV)) {
+        return g;
+    }
+    g.projection = projection;
+    g.focalPx = focalPx;
+    g.eyeOffset = eyeOffset;
+    g.tanHalfH = tanHalfH;
+    g.tanHalfV = tanHalfV;
+
+    // The grabbed direction in the camera's parent frame: R_camera(start)
+    // applied to the anchor's view ray, factor by factor (roll first).
+    double v[3];
+    if (!grabRay(g, layout, anchor, v)) {
+        return SphereGrab{};
+    }
+    const CameraValues s = sanitise(start);
+    applyRotY(s.rollDeg * kDegToRad, v);
+
+    // The tilt branch, decided once for the whole gesture: which side of its
+    // elevation peak the starting tilt sits on for the anchor's own ray (the
+    // start tilt solves the grab equation exactly there).  See
+    // solveSphereGrab for why it must never be re-derived mid-drag.
+    const double peak0 = wrapRad(0.5 * 3.14159265358979323846 - std::atan2(v[2], v[1]));
+    g.tiltBranch = (wrapRad(s.tiltDeg * kDegToRad - peak0) >= 0.0) ? 1.0 : -1.0;
+
+    applyRotX(s.tiltDeg * kDegToRad, v);
+    applyRotZ(s.panDeg * kDegToRad, v);
+    if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2])) {
+        return SphereGrab{};
+    }
+    g.target[0] = v[0];
+    g.target[1] = v[1];
+    g.target[2] = v[2];
+    g.valid = true;
+    return g;
+}
+
+bool solveSphereGrab(const SphereGrab& grab, const Layout& layout, const CameraValues& start, const PointF& current,
+                     DragMode mode, CameraValues& out) noexcept {
+    if (!grab.valid) {
+        return false;
+    }
+    if (mode != DragMode::PanTilt && mode != DragMode::PanOnly && mode != DragMode::TiltOnly) {
+        return false;
+    }
+    const CameraValues s = sanitise(start);
+
+    // The pointer's view ray with the (unchanged) roll applied: u = Ry(roll) v.
+    // What remains to solve is  Rz(pan) Rx(tilt) u = target.
+    double u[3];
+    if (!grabRay(grab, layout, current, u)) {
+        return false;
+    }
+    applyRotY(s.rollDeg * kDegToRad, u);
+    const double* t = grab.target;
+
+    // ---- tilt -----------------------------------------------------------
+    // Rz(pan) leaves z alone, so the z component alone fixes the tilt:
+    //     (Rx(p) u).z = u.y sin p + u.z cos p = t.z
+    // With R = |(u.y, u.z)| and phi = atan2(u.z, u.y) the left side is
+    // R sin(p + phi), largest (= R) at p* = pi/2 - phi, where the pointer's
+    // ray is lifted as high as any tilt can lift it.  The two solutions are
+    // symmetric about that peak:
+    //     p = p* + acos(t.z / R)   or   p = p* - acos(t.z / R).
+    //
+    // The drag must stay on ONE of them for its whole life.  Picking
+    // "whichever root is nearer the start" instead jumps to the other root
+    // the moment the near one leaves the dial's range, which flips the view
+    // (the classic grab-the-sphere failure: tilt 89 -> 66 in one mouse move,
+    // pinned by a test).  The branch was fixed at the click (see
+    // beginSphereGrab) - re-deriving it here from the moving peak would
+    // switch it as soon as the peak passed the start tilt, which is the same
+    // flip by another route.  A solution past the tilt limit is clamped to the limit
+    // on that same branch, and a target the pointer cannot reach at all
+    // (|t.z| > R: the point was dragged past a pole) takes the peak itself,
+    // the tilt that brings it closest.  Both keep the tilt monotonic.
+    const double tilt0 = s.tiltDeg * kDegToRad;
+    const double limit = OSV_REFRAME_TILT_LIMIT_DEG * kDegToRad;
+    double tilt = tilt0;
+    if (mode != DragMode::PanOnly) {
+        const double r = std::hypot(u[1], u[2]);
+        if (!(r > 1e-9)) {
+            return false;  // pointer ray along the tilt axis: tilt undetermined
+        }
+        const double cosArg = std::clamp(t[2] / r, -1.0, 1.0);
+        const double phi = std::atan2(u[2], u[1]);
+        const double peak = wrapRad(0.5 * 3.14159265358979323846 - phi);
+        const double root = wrapRad(peak + grab.tiltBranch * std::acos(cosArg));
+        tilt = std::clamp(root, -limit, limit);
+    }
+
+    // ---- pan --------------------------------------------------------------
+    // With the tilt fixed, the pan is the azimuth that turns Rx(tilt) u onto
+    // the target about the vertical axis.
+    double pan = s.panDeg * kDegToRad;
+    if (mode != DragMode::TiltOnly) {
+        double w[3] = {u[0], u[1], u[2]};
+        applyRotX(tilt, w);
+        const double wh = std::hypot(w[0], w[1]);
+        const double th = std::hypot(t[0], t[1]);
+        if (wh > kAzimuthEpsilon && th > kAzimuthEpsilon) {
+            const double delta = std::atan2(t[1], t[0]) - std::atan2(w[1], w[0]);
+            // Unwrap relative to the starting pan so the dial moves by the
+            // small angle, never by a full turn.
+            pan = pan + wrapRad(delta - pan);
+        }
+    }
+
+    const double panDeg = pan * kRadToDeg;
+    const double tiltDeg = tilt * kRadToDeg;
+    if (!std::isfinite(panDeg) || !std::isfinite(tiltDeg)) {
+        return false;
+    }
+    out = s;
+    out.panDeg = panDeg;
+    out.tiltDeg = tiltDeg;
+    return true;
+}
+
 double dragScaleDegPerPixel(double fovDeg, double viewportWidth) noexcept {
     if (!std::isfinite(fovDeg) || !(fovDeg > 0.0)) {
         return 0.0;
@@ -418,6 +634,17 @@ CameraValues applyDrag(DragState& state, const PointF& current, std::uint32_t mo
     case DragMode::PanTilt:
     case DragMode::PanOnly:
     case DragMode::TiltOnly: {
+        // Grab the sphere: keep the grabbed direction under the pointer,
+        // solved through the renderer's own camera (see SphereGrab).  The
+        // fixed rate below is the fallback when no grab could be built or
+        // the pointer has left the projection's valid area.
+        CameraValues grabbed;
+        if (solveSphereGrab(state.grab, state.layout, state.start, current, mode, grabbed)) {
+            result.panDeg = grabbed.panDeg;
+            result.tiltDeg = grabbed.tiltDeg;
+            break;
+        }
+
         // Rate scales with the FOV AT GRAB TIME.  Using the live FOV would
         // change the rate mid-drag if a preset or another keyframe moved it,
         // which would make the picture slide out from under the cursor.

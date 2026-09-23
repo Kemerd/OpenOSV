@@ -329,6 +329,67 @@ struct CameraValues {
     double fovDeg = OSV_REFRAME_FOV_DEFAULT;
 };
 
+/// The renderer's pixel -> ray model plus the grabbed point, captured when a
+/// pan / tilt drag starts - "grab the sphere".
+///
+/// WHY.  A fixed degrees-per-pixel rate only keeps the picture under the
+/// pointer near the centre of a narrow, unrolled view.  With a wide field of
+/// view (the eye-offset projection bends toward stereographic as FOV grows),
+/// with roll, or near the poles, the grabbed content slides away from the
+/// hand, and a vertical drag reads as "the tilt dial moving" rather than as
+/// dragging the scene - which is exactly how it felt next to DJI Studio.  A
+/// grab instead remembers WHICH direction of the sphere was under the
+/// pointer and, on every move, solves for the pan and tilt that put that
+/// direction back under the pointer, through the very camera model the
+/// renderer uses.  Roll is never changed by a grab.
+///
+/// POD on purpose: it lives inside DragState in the drag table.
+struct SphereGrab {
+    bool valid = false;   ///< False: fall back to the fixed-rate drag.
+    int projection = 0;   ///< OSV_PROJ_* of the camera (buildView's choice).
+    double focalPx = 0.0; ///< Focal length for the viewport, in viewport pixels.
+    double eyeOffset = 0.0;
+    double tanHalfH = 0.0;
+    double tanHalfV = 0.0;
+    /// The grabbed direction in the camera's PARENT frame, i.e.
+    /// R_camera(start) * ray(anchor).  The source rotation (Rout =
+    /// R_source * R_camera) multiplies both sides of the grab equation, so it
+    /// cancels and is not needed.
+    double target[3] = {0.0, 0.0, 0.0};
+    /// Which of the two tilt solutions the gesture follows (+1 / -1): the
+    /// side of the pointer ray's elevation peak the starting tilt was on.
+    /// Fixed at the click so a long drag can never hop to the other solution
+    /// (a sudden flip of the view).
+    double tiltBranch = 1.0;
+};
+
+/// Start a grab: cast the anchor through the camera and remember where on
+/// the sphere it landed.
+///
+/// `projection`..`tanHalfV` are the view fields of the camera the renderer
+/// builds for a frame the size of `layout.viewport` (buildView()), and
+/// `start` the camera values at the click.  Returns an invalid grab - so the
+/// drag falls back to the fixed rate - when the layout is invalid, a value is
+/// not finite, or the anchor lies where the projection has no ray (outside
+/// the valid radius of a very wide eye-offset view).
+[[nodiscard]] SphereGrab beginSphereGrab(int projection, double focalPx, double eyeOffset, double tanHalfH,
+                                         double tanHalfV, const Layout& layout, const CameraValues& start,
+                                         const PointF& anchor) noexcept;
+
+/// Solve the pan and tilt that put the grabbed direction under `current`.
+///
+/// `mode` decides what may move: PanTilt both, PanOnly pan only (tilt kept),
+/// TiltOnly tilt only (pan kept).  Roll and FOV always come from `start`.
+/// The pan is unwrapped to the solution nearest `start` so the dial never
+/// jumps by 360 degrees; the tilt is the root nearest `start` inside
+/// +-OSV_REFRAME_TILT_LIMIT_DEG (clamped when neither root is).
+///
+/// Returns false - and leaves `out` alone - when the grab is invalid, the
+/// pointer has no ray, or the geometry is degenerate (a pointer ray along
+/// the tilt axis); the caller then uses the fixed-rate drag.
+[[nodiscard]] bool solveSphereGrab(const SphereGrab& grab, const Layout& layout, const CameraValues& start,
+                                   const PointF& current, DragMode mode, CameraValues& out) noexcept;
+
 /// Everything a drag in progress needs to remember between events.
 ///
 /// It is deliberately a plain aggregate with no pointers: the shim stores it
@@ -355,6 +416,10 @@ struct DragState {
     FrameGeometry geometry;
     double startRollAngleDeg = 0.0; ///< Angle of the anchor about the centre.
     bool axisLocked = false;     ///< Shift: whether the axis is already chosen.
+    /// The grabbed point of the sphere for pan / tilt drags; invalid when the
+    /// shim could not build the camera, in which case the fixed-rate drag
+    /// is used exactly as before.
+    SphereGrab grab;
 };
 
 /// Degrees of view rotation per pixel of drag, at a given FOV and viewport

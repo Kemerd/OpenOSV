@@ -489,6 +489,61 @@ void packRefcon(A_intptr_t refcon[4], int index, std::uint64_t generation) noexc
     return sanitise(v);
 }
 
+/// Start a "grab the sphere" for a pan / tilt gesture.
+///
+/// Builds the camera the renderer would build for a frame the size of the
+/// overlay's viewport - the same buildView() the CPU and GPU paths call, fed
+/// the live Output Resolution, FOV, Distortion and angles - and casts the
+/// anchor through it (beginSphereGrab).  Any unreadable parameter or a
+/// camera that cannot be built yields an invalid grab, and the drag then
+/// falls back to the fixed-rate mapping exactly as it behaved before.
+///
+/// The source rotation is read for completeness but cancels out of the grab
+/// equation (see SphereGrab::target), so it cannot skew the result.
+[[nodiscard]] SphereGrab grabForClick(PF_ParamDef* params[], const Layout& layout, const CameraValues& start,
+                                      const PointF& anchor) noexcept {
+    if (!params || !layout.valid) {
+        return SphereGrab{};
+    }
+    // Every entry the camera depends on must be present; a host that handed
+    // a partial array gets the old behaviour rather than a guessed camera.
+    const int needed[] = {kIndexOutputResolution, kIndexPreset,     kIndexFov,        kIndexDistortion,
+                          kIndexPan,              kIndexTilt,       kIndexRoll,       kIndexSourcePan,
+                          kIndexSourceTilt,       kIndexSourceRoll};
+    for (const int index : needed) {
+        if (!params[index]) {
+            return SphereGrab{};
+        }
+    }
+    Settings s;
+    s.resolution = sanitiseResolution(params[kIndexOutputResolution]->u.pd.value);
+    s.preset = sanitisePreset(params[kIndexPreset]->u.pd.value);
+    s.fovDeg = start.fovDeg;
+    s.distortion = static_cast<double>(params[kIndexDistortion]->u.fs_d.value);
+    s.panDeg = start.panDeg;
+    s.tiltDeg = start.tiltDeg;
+    s.rollDeg = start.rollDeg;
+    s.sourcePanDeg = fixedToDeg(params[kIndexSourcePan]->u.ad.value);
+    s.sourceTiltDeg = fixedToDeg(params[kIndexSourceTilt]->u.ad.value);
+    s.sourceRollDeg = fixedToDeg(params[kIndexSourceRoll]->u.ad.value);
+
+    // The viewport IS the picture (cover-fit always fills the frame), so the
+    // camera is built for a frame of the viewport's own size.
+    const long long w = std::llround(layout.viewport.w);
+    const long long h = std::llround(layout.viewport.h);
+    if (w <= 0 || h <= 0 || w > kMaxOverlayEdge || h > kMaxOverlayEdge) {
+        return SphereGrab{};
+    }
+    const int wi = static_cast<int>(w);
+    const int hi = static_cast<int>(h);
+    const ViewSetup view = buildView(s, wi, hi, SizePx{wi, hi});
+    if (!view.valid) {
+        return SphereGrab{};
+    }
+    return beginSphereGrab(view.params.projection, view.params.focalPx, view.params.eyeOffset, view.params.tanHalfH,
+                           view.params.tanHalfV, layout, start, anchor);
+}
+
 /// Commit the parameters a drag changed, using the documented CHANGED_VALUE
 /// route described in this file's header comment.
 ///
@@ -1437,6 +1492,13 @@ PF_Err onDoClick(PF_InData* in_data, PF_ParamDef* params[], PF_EventExtra* extra
     state.start = readCamera(params);
     state.mode = resolveDragMode(handle, static_cast<std::uint32_t>(click.modifiers));
     state.axisLocked = false;
+    // Pan / tilt drags grab the sphere: remember which direction is under
+    // the pointer so the drag keeps it there (see SphereGrab).  Built for
+    // every open-picture click, since a modifier can turn the gesture into a
+    // pan / tilt at any point; the handles never use it.
+    if (handle == Handle::PanTilt) {
+        state.grab = grabForClick(params, layout, state.start, where);
+    }
     // Remember where on the ring the grab happened, so a roll drag can
     // measure the angle actually swept rather than a pixel distance.
     state.startRollAngleDeg = 0.0;

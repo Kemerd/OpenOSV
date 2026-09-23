@@ -31,8 +31,11 @@
 
 #include "ReframeTestSupport.h"
 
+#include "ReframeCpu.h"
 #include "ReframeParams.h"
 #include "ReframeUi.h"
+
+#include "osv/render/osv_kernel.h"
 
 #include "MockHost.h"
 
@@ -42,6 +45,7 @@
 #include "AE_EffectSuites.h"
 #include "AE_EffectUI.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -195,6 +199,86 @@ struct UiFixture {
 /// Whether a parameter was marked as changed by the event just run.
 [[nodiscard]] bool changed(const std::vector<PF_ParamDef*>& array, int index) {
     return (array[static_cast<std::size_t>(index)]->uu.change_flags & PF_ChangeFlag_CHANGED_VALUE) != 0;
+}
+
+/// The direction of the sphere under `pointer` for a camera, cast with the
+/// RENDERER's own camera (buildView) and rotation (its Rout).  Deliberately
+/// independent of the overlay's grab code - it is what the grab is checked
+/// against - and it is the same pixel -> ray -> Rout chain the effect's
+/// kernel runs for every output pixel.
+[[nodiscard]] bool rayUnderPointer(const Layout& layout, double fovDeg, double distortion, const CameraValues& cam,
+                                   const PointF& pointer, double out[3]) {
+    Settings s;
+    s.fovDeg = fovDeg;
+    s.distortion = distortion;
+    s.panDeg = cam.panDeg;
+    s.tiltDeg = cam.tiltDeg;
+    s.rollDeg = cam.rollDeg;
+    const int w = static_cast<int>(std::lround(layout.viewport.w));
+    const int h = static_cast<int>(std::lround(layout.viewport.h));
+    const ViewSetup view = buildView(s, w, h, SizePx{w, h});
+    if (!view.valid) {
+        return false;
+    }
+    const OsvReframeParams& p = view.params;
+    const float nx = static_cast<float>((pointer.x - layout.viewport.x) - 0.5 * layout.viewport.w);
+    const float ny = static_cast<float>(0.5 * layout.viewport.h - (pointer.y - layout.viewport.y));
+    float d[3] = {0.0f, 0.0f, 0.0f};
+    if (!osvViewRay(p.projection, p.focalPx, p.eyeOffset, p.tanHalfH, p.tanHalfV, static_cast<float>(w),
+                    static_cast<float>(h), nx, ny, d)) {
+        return false;
+    }
+    for (int r = 0; r < 3; ++r) {
+        out[r] = static_cast<double>(p.Rout[r * 3 + 0]) * d[0] + static_cast<double>(p.Rout[r * 3 + 1]) * d[1] +
+                 static_cast<double>(p.Rout[r * 3 + 2]) * d[2];
+    }
+    const double n = std::sqrt(out[0] * out[0] + out[1] * out[1] + out[2] * out[2]);
+    if (!(n > 0.0)) {
+        return false;
+    }
+    for (int r = 0; r < 3; ++r) {
+        out[r] /= n;
+    }
+    return true;
+}
+
+/// Angle between two unit vectors, in degrees.
+[[nodiscard]] double angleBetweenDeg(const double a[3], const double b[3]) {
+    const double dot = std::clamp(a[0] * b[0] + a[1] * b[1] + a[2] * b[2], -1.0, 1.0);
+    return std::acos(dot) * (180.0 / 3.14159265358979323846);
+}
+
+/// The Pan a module-level drag of `dxPx` pixels straight right from the
+/// frame centre commits, with the fixture's level camera: the grab puts the
+/// centre direction (0, 1, 0) back under the pointer, so Pan is the azimuth
+/// of the pointer's own ray, atan2(x, y).  Computed through the renderer's
+/// camera, never from a fixed degrees-per-pixel rate.
+[[nodiscard]] double grabPanDeg(double dxPx, double fovDeg = 90.0,
+                                double distortion = OSV_REFRAME_DISTORTION_DEFAULT) {
+    const Layout layout = computeLayout(fullFrame());
+    CameraValues level;
+    level.fovDeg = fovDeg;
+    double v[3];
+    REQUIRE(rayUnderPointer(layout, fovDeg, distortion, level, PointF{layout.centre.x + dxPx, layout.centre.y}, v));
+    return std::atan2(v[0], v[1]) * (180.0 / 3.14159265358979323846);
+}
+
+/// A grab started the way the shim starts one: the renderer's camera for the
+/// layout's viewport, cast through the anchor.
+[[nodiscard]] SphereGrab grabFor(const Layout& layout, double fovDeg, double distortion, const CameraValues& start,
+                                 const PointF& anchor) {
+    Settings s;
+    s.fovDeg = fovDeg;
+    s.distortion = distortion;
+    s.panDeg = start.panDeg;
+    s.tiltDeg = start.tiltDeg;
+    s.rollDeg = start.rollDeg;
+    const int w = static_cast<int>(std::lround(layout.viewport.w));
+    const int h = static_cast<int>(std::lround(layout.viewport.h));
+    const ViewSetup view = buildView(s, w, h, SizePx{w, h});
+    REQUIRE(view.valid);
+    return beginSphereGrab(view.params.projection, view.params.focalPx, view.params.eyeOffset, view.params.tanHalfH,
+                           view.params.tanHalfV, layout, start, anchor);
 }
 
 }  // namespace
@@ -389,6 +473,166 @@ TEST_CASE("dragging down tilts the view up so the world follows the cursor", "[r
     // viewport WIDTH), so 270px is 270 * 90/1920 degrees.
     CHECK(after.tiltDeg == Approx(270.0 * 90.0 / 1920.0));
     CHECK(after.panDeg == Approx(start.panDeg));
+}
+
+TEST_CASE("grabbing the sphere keeps the grabbed point under the pointer", "[reframe][ui][grab]") {
+    // The drag the overlay now does: whatever direction of the sphere was
+    // under the pointer at the click is under the pointer after every move,
+    // through the renderer's own camera.  A fixed degrees-per-pixel rate only
+    // manages that near the centre of a narrow, level view; these cases are
+    // the ones where it visibly failed - a wide eye-offset view bending
+    // toward stereographic, the 263-degree view from the field report, a
+    // tiny planet, roll, a steep tilt - plus the plain one.
+    struct Case {
+        const char* name;
+        double fov, distortion, pan, tilt, roll;
+        double ax, ay;  // anchor, fraction of the frame
+        double dx, dy;  // drag, pixels
+    };
+    const Case cases[] = {
+        {"90 deg, level, horizontal", 90.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 300.0, 0.0},
+        {"90 deg, level, vertical", 90.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 200.0},
+        {"90 deg, off-centre diagonal", 90.0, 50.0, 30.0, 20.0, 0.0, 0.25, 0.7, -250.0, 150.0},
+        {"150 deg wide, rolled", 150.0, 30.0, 0.0, 30.0, 25.0, 0.6, 0.4, 120.0, -160.0},
+        {"263 deg (field report), vertical", 263.0, 40.0, 143.4, -0.2, 0.0, 0.55, 0.45, 0.0, 150.0},
+        {"263 deg (field report), horizontal", 263.0, 40.0, 143.4, -0.2, 0.0, 0.55, 0.45, 180.0, 0.0},
+        {"tiny planet 300 deg", 300.0, 100.0, 0.0, -60.0, 0.0, 0.5, 0.35, 90.0, 60.0},
+        {"narrow 60 deg, steep tilt, rolled", 60.0, 0.0, -40.0, 60.0, 10.0, 0.45, 0.55, 50.0, -40.0},
+    };
+    const Layout layout = computeLayout(fullFrame());
+    REQUIRE(layout.valid);
+    for (const Case& c : cases) {
+        INFO(c.name);
+        CameraValues start;
+        start.fovDeg = c.fov;
+        start.panDeg = c.pan;
+        start.tiltDeg = c.tilt;
+        start.rollDeg = c.roll;
+        const PointF anchor{c.ax * kFrameW, c.ay * kFrameH};
+        const PointF pointer{anchor.x + c.dx, anchor.y + c.dy};
+
+        DragState state = beginDrag(layout, anchor, start, kModNone);
+        REQUIRE(state.handle == Handle::PanTilt);
+        state.grab = grabFor(layout, c.fov, c.distortion, start, anchor);
+        REQUIRE(state.grab.valid);
+        const CameraValues after = applyDrag(state, pointer, kModNone);
+
+        // Nothing but pan and tilt may move.
+        CHECK(after.rollDeg == Approx(c.roll));
+        CHECK(after.fovDeg == Approx(c.fov));
+        // No case here asks for a pole crossing, so the tilt is a free
+        // solution, not a clamped one - which is what makes the invariant
+        // below exact rather than approximate.
+        REQUIRE(std::fabs(after.tiltDeg) < OSV_REFRAME_TILT_LIMIT_DEG - 1e-6);
+
+        double grabbed[3];
+        double now[3];
+        REQUIRE(rayUnderPointer(layout, c.fov, c.distortion, start, anchor, grabbed));
+        REQUIRE(rayUnderPointer(layout, c.fov, c.distortion, after, pointer, now));
+        INFO("pan " << c.pan << " -> " << after.panDeg << ", tilt " << c.tilt << " -> " << after.tiltDeg
+                    << "; grabbed point " << angleBetweenDeg(grabbed, now) << " deg from the pointer");
+        // Float rays (the kernel's precision) on either side: a few
+        // thousandths of a degree is the noise floor.
+        CHECK(angleBetweenDeg(grabbed, now) < 0.01);
+    }
+}
+
+TEST_CASE("a grab moves the world with the hand in both axes", "[reframe][ui][grab][signs]") {
+    // Same signs as the fixed-rate drag always had - right -> +Pan, down ->
+    // +Tilt - so muscle memory and old keyframes agree with the new drag.
+    const Layout layout = computeLayout(fullFrame());
+    CameraValues start;
+    start.fovDeg = 90.0;
+    for (const double distortion : {0.0, 60.0}) {
+        DragState right = beginDrag(layout, layout.centre, start, kModNone);
+        right.grab = grabFor(layout, 90.0, distortion, start, layout.centre);
+        const CameraValues r = applyDrag(right, PointF{layout.centre.x + 200.0, layout.centre.y}, kModNone);
+        CHECK(r.panDeg > 0.0);
+        CHECK(r.tiltDeg == Approx(0.0).margin(1e-9));
+
+        DragState down = beginDrag(layout, layout.centre, start, kModNone);
+        down.grab = grabFor(layout, 90.0, distortion, start, layout.centre);
+        const CameraValues d = applyDrag(down, PointF{layout.centre.x, layout.centre.y + 200.0}, kModNone);
+        CHECK(d.tiltDeg > 0.0);
+        CHECK(d.panDeg == Approx(0.0).margin(1e-9));
+    }
+}
+
+TEST_CASE("returning the pointer to the grab point restores the start exactly", "[reframe][ui][grab]") {
+    const Layout layout = computeLayout(fullFrame());
+    CameraValues start;
+    start.fovDeg = 200.0;
+    start.panDeg = 77.0;
+    start.tiltDeg = -35.0;
+    start.rollDeg = 12.0;
+    const PointF anchor{700.0, 300.0};
+    DragState state = beginDrag(layout, anchor, start, kModNone);
+    state.grab = grabFor(layout, 200.0, 20.0, start, anchor);
+    REQUIRE(state.grab.valid);
+    (void)applyDrag(state, PointF{1100.0, 800.0}, kModNone);
+    const CameraValues back = applyDrag(state, anchor, kModNone);
+    CHECK(back.panDeg == Approx(start.panDeg).margin(1e-6));
+    CHECK(back.tiltDeg == Approx(start.tiltDeg).margin(1e-6));
+    CHECK(back.rollDeg == Approx(start.rollDeg));
+}
+
+TEST_CASE("a Shift-constrained grab moves only the chosen axis", "[reframe][ui][grab]") {
+    const Layout layout = computeLayout(fullFrame());
+    CameraValues start;
+    start.fovDeg = 120.0;
+    start.panDeg = 10.0;
+    start.tiltDeg = 15.0;
+    {
+        DragState state = beginDrag(layout, layout.centre, start, kModShift);
+        state.grab = grabFor(layout, 120.0, 30.0, start, layout.centre);
+        const CameraValues v = applyDrag(state, PointF{layout.centre.x + 300.0, layout.centre.y + 40.0}, kModShift);
+        CHECK(v.panDeg != Approx(start.panDeg));
+        CHECK(v.tiltDeg == Approx(start.tiltDeg));
+    }
+    {
+        DragState state = beginDrag(layout, layout.centre, start, kModShift);
+        state.grab = grabFor(layout, 120.0, 30.0, start, layout.centre);
+        const CameraValues v = applyDrag(state, PointF{layout.centre.x + 30.0, layout.centre.y + 250.0}, kModShift);
+        CHECK(v.panDeg == Approx(start.panDeg));
+        CHECK(v.tiltDeg != Approx(start.tiltDeg));
+    }
+}
+
+TEST_CASE("dragging a point past the pole clamps the tilt instead of flipping the view", "[reframe][ui][grab]") {
+    // Grab something near the top of a steeply tilted view and drag it far
+    // down: the exact solution would need a tilt beyond +90.  The dial must
+    // stop at the limit, stay finite, and never jump to the other root (a
+    // sudden 180-degree flip is the classic grab-the-sphere failure).
+    const Layout layout = computeLayout(fullFrame());
+    CameraValues start;
+    start.fovDeg = 100.0;
+    start.tiltDeg = 80.0;
+    const PointF anchor{960.0, 200.0};
+    DragState state = beginDrag(layout, anchor, start, kModNone);
+    state.grab = grabFor(layout, 100.0, 0.0, start, anchor);
+    REQUIRE(state.grab.valid);
+    double previousTilt = start.tiltDeg;
+    for (double y = 220.0; y <= 1060.0; y += 40.0) {
+        const CameraValues v = applyDrag(state, PointF{960.0, y}, kModNone);
+        REQUIRE(std::isfinite(v.panDeg));
+        REQUIRE(std::isfinite(v.tiltDeg));
+        CHECK(v.tiltDeg <= OSV_REFRAME_TILT_LIMIT_DEG + 1e-9);
+        CHECK(v.tiltDeg >= previousTilt - 1e-6);  // monotonic: no flip back
+        previousTilt = v.tiltDeg;
+    }
+    CHECK(previousTilt == Approx(OSV_REFRAME_TILT_LIMIT_DEG));
+}
+
+TEST_CASE("without a grab the drag keeps its fixed-rate behaviour", "[reframe][ui][grab]") {
+    // A host that gave the shim nothing to build a camera from leaves the
+    // grab invalid; the drag must then be exactly the old one.
+    const Layout layout = computeLayout(fullFrame());
+    CameraValues start;
+    start.fovDeg = 90.0;
+    DragState state = beginDrag(layout, layout.centre, start, kModNone);
+    REQUIRE_FALSE(state.grab.valid);
+    const CameraValues v = applyDrag(state, PointF{layout.centre.x + 480.0, layout.centre.y}, kModNone);
+    CHECK(v.panDeg == Approx(480.0 * 90.0 / kFrameW));
 }
 
 TEST_CASE("a drag is anchored, not accumulated", "[reframe][ui]") {
@@ -1074,9 +1318,30 @@ TEST_CASE("a click-drag-release sequence commits Pan and Tilt for the host to ke
     CHECK(changed(params, kIndexTilt));
     CHECK((drag.evt_out_flags & PF_EO_HANDLED_EVENT) != 0);
 
-    // The signs and the magnitudes, pinned.  Right -> Pan up, down -> Tilt up.
-    CHECK(angleOf(params, kIndexPan) == Approx(480.0 * 90.0 / 1920.0).margin(0.01));
-    CHECK(angleOf(params, kIndexTilt) == Approx(270.0 * 90.0 / 1920.0).margin(0.01));
+    // The signs: right -> Pan up, down -> Tilt up (the world follows the
+    // hand).  And the magnitude is no longer a fixed rate but the grab
+    // contract: the direction that was under the pointer at the click (the
+    // centre of the picture) is under the pointer again after the drag, as
+    // cast by the renderer's own camera.
+    CHECK(angleOf(params, kIndexPan) > 0.0);
+    CHECK(angleOf(params, kIndexTilt) > 0.0);
+    {
+        const Layout layout = computeLayout(fullFrame());
+        const double distortion = static_cast<double>(params[kIndexDistortion]->u.fs_d.value);
+        CameraValues before;
+        before.fovDeg = 90.0;
+        CameraValues after = before;
+        after.panDeg = angleOf(params, kIndexPan);
+        after.tiltDeg = angleOf(params, kIndexTilt);
+        double grabbed[3];
+        double now[3];
+        REQUIRE(rayUnderPointer(layout, 90.0, distortion, before, PointF{960.0, 540.0}, grabbed));
+        REQUIRE(rayUnderPointer(layout, 90.0, distortion, after, PointF{960.0 + 480.0, 540.0 + 270.0}, now));
+        INFO("grabbed point is " << angleBetweenDeg(grabbed, now) << " deg from the pointer after the drag");
+        // The parameters are stored as 16.16 fixed point, so allow that
+        // quantisation (1/65536 deg) plus float rounding in the ray.
+        CHECK(angleBetweenDeg(grabbed, now) < 0.01);
+    }
 
     // Roll and FOV were not part of this drag and must carry no change flag:
     // a spurious Roll keyframe from a pan is exactly the bug this guards.
@@ -1084,6 +1349,7 @@ TEST_CASE("a click-drag-release sequence commits Pan and Tilt for the host to ke
     CHECK_FALSE(changed(params, kIndexFov));
 
     // ---- release ----------------------------------------------------------
+    const double panAtDrag = angleOf(params, kIndexPan);
     PF_EventExtra release = makeExtra(f.host, PF_Event_DRAG);
     std::memcpy(release.u.do_click.continue_refcon, click.u.do_click.continue_refcon,
                 sizeof(release.u.do_click.continue_refcon));
@@ -1094,7 +1360,7 @@ TEST_CASE("a click-drag-release sequence commits Pan and Tilt for the host to ke
     REQUIRE(f.event(release, params) == PF_Err_NONE);
 
     // The value is unchanged by the release itself, and the gesture is over.
-    CHECK(angleOf(params, kIndexPan) == Approx(480.0 * 90.0 / 1920.0).margin(0.01));
+    CHECK(angleOf(params, kIndexPan) == Approx(panAtDrag).margin(1e-4));
 
     // A further drag with the SAME refcon must now do nothing: the slot was
     // freed, so a duplicated event cannot resume a finished gesture.
@@ -1606,7 +1872,7 @@ TEST_CASE("many gestures in a row do not exhaust the drag table", "[reframe][ui]
         REQUIRE(f.event(drag, params) == PF_Err_NONE);
 
         // The same answer every time: the table is not degrading.
-        CHECK(angleOf(params, kIndexPan) == Approx(96.0 * 90.0 / 1920.0).margin(0.01));
+        CHECK(angleOf(params, kIndexPan) == Approx(grabPanDeg(96.0)).margin(0.01));
     }
 }
 
@@ -1711,7 +1977,7 @@ TEST_CASE("with a 0x0 layer a DRAW's update rect makes the overlay grabbable", "
     // And the drag commits Pan at the calibrated rate.
     PF_EventExtra drag = makeDragFrom(f.host, click, 960 + 96, 540, true);
     REQUIRE(f.event(drag, params) == PF_Err_NONE);
-    CHECK(angleOf(params, kIndexPan) == Approx(96.0 * 90.0 / 1920.0).margin(0.01));
+    CHECK(angleOf(params, kIndexPan) == Approx(grabPanDeg(96.0)).margin(0.01));
     CHECK(angleOf(params, kIndexTilt) == Approx(0.0).margin(1e-4));
     CHECK(changed(params, kIndexPan));
     CHECK((drag.evt_out_flags & PF_EO_HANDLED_EVENT) != 0);
@@ -1756,7 +2022,7 @@ TEST_CASE("an update rect that does not start at the window origin does not offs
 
     PF_EventExtra drag = makeDragFrom(f.host, click, kX + 960 + 96, kY + 540, true);
     REQUIRE(f.event(drag, params) == PF_Err_NONE);
-    CHECK(angleOf(params, kIndexPan) == Approx(96.0 * 90.0 / 1920.0).margin(0.01));
+    CHECK(angleOf(params, kIndexPan) == Approx(grabPanDeg(96.0)).margin(0.01));
     CHECK(angleOf(params, kIndexTilt) == Approx(0.0).margin(1e-4));
 }
 
@@ -1911,24 +2177,29 @@ TEST_CASE("while a drag is in flight the readout shows its values even if the ho
     REQUIRE(f.event(click, params) == PF_Err_NONE);
     REQUIRE(click.u.do_click.send_drag == TRUE);
 
-    // First move: the host's own array now holds 4.5, the stale one still 0.
+    // First move: the host's own array now holds the grab's Pan for 96 px,
+    // the stale one still 0.  The readout shows what the array holds, so the
+    // expected text is formatted from the committed value itself.
     PF_EventExtra move1 = makeDragFrom(f.host, click, 960 + 96, 540, false);
     REQUIRE(f.event(move1, params) == PF_Err_NONE);
-    REQUIRE(angleOf(params, kIndexPan) == Approx(4.5).margin(0.01));
+    REQUIRE(angleOf(params, kIndexPan) == Approx(grabPanDeg(96.0)).margin(0.01));
+    const double panMove1 = angleOf(params, kIndexPan);
     REQUIRE(angleOf(stale, kIndexPan) == Approx(0.0).margin(1e-6));
 
     f.host.clearDrawbotRecord();
     PF_EventExtra draw1 = makeExtra(f.host, PF_Event_DRAW);
     REQUIRE(f.event(draw1, stale) == PF_Err_NONE);
-    CHECK(drewText(f.host.drawbotRecord(), panReadout(4.5)));
+    CHECK(drewText(f.host.drawbotRecord(), panReadout(panMove1)));
 
     // It tracks every move, not just the first.
     PF_EventExtra move2 = makeDragFrom(f.host, click, 960 + 192, 540, false);
     REQUIRE(f.event(move2, params) == PF_Err_NONE);
+    REQUIRE(angleOf(params, kIndexPan) == Approx(grabPanDeg(192.0)).margin(0.01));
+    const double panMove2 = angleOf(params, kIndexPan);
     f.host.clearDrawbotRecord();
     PF_EventExtra draw2 = makeExtra(f.host, PF_Event_DRAW);
     REQUIRE(f.event(draw2, stale) == PF_Err_NONE);
-    CHECK(drewText(f.host.drawbotRecord(), panReadout(9.0)));
+    CHECK(drewText(f.host.drawbotRecord(), panReadout(panMove2)));
 
     // Another reframe instance never shows this gesture's numbers.
     {
@@ -1946,7 +2217,7 @@ TEST_CASE("while a drag is in flight the readout shows its values even if the ho
         REQUIRE(LoadedPlugin::instance().effectMain()(PF_Cmd_EVENT, &otherIn, &otherOut, otherParams.data(),
                                                       nullptr, &otherDraw) == PF_Err_NONE);
         CHECK(drewText(f.host.drawbotRecord(), panReadout(OSV_REFRAME_PAN_DEFAULT)));
-        CHECK_FALSE(drewText(f.host.drawbotRecord(), panReadout(9.0)));
+        CHECK_FALSE(drewText(f.host.drawbotRecord(), panReadout(panMove2)));
         f.host.destroyEffectRef(other);
     }
 
@@ -1963,5 +2234,5 @@ TEST_CASE("while a drag is in flight the readout shows its values even if the ho
     f.host.clearDrawbotRecord();
     PF_EventExtra afterReal = makeExtra(f.host, PF_Event_DRAW);
     REQUIRE(f.event(afterReal, params) == PF_Err_NONE);
-    CHECK(drewText(f.host.drawbotRecord(), panReadout(9.0)));
+    CHECK(drewText(f.host.drawbotRecord(), panReadout(panMove2)));
 }
