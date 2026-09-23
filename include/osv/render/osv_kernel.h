@@ -336,6 +336,21 @@ OSV_HD float osvEyeOffsetTheta(float r, float focalPx, float d) {
     return theta;
 }
 
+/* ---- [WP-CAMERA] DJI sphere camera: id and forward declaration ------------
+ * The projection DJI's reframe tools render with (DJI Studio and DJI's own
+ * Premiere plug-in): a pinhole camera with a VERTICAL field of view, placed
+ * `eyeZ` sphere radii behind the centre of the unit panorama sphere and
+ * looking through it.  The sphere point it sees is the FAR intersection of
+ * the pinhole ray with the sphere.  In OsvReframeParams / OsvRenderParams the
+ * existing fields carry it: focalPx = the PINHOLE focal length in pixels
+ * ((H / 2) / tan(vfov / 2)), eyeOffset = eyeZ (any value >= 0; above 1 the
+ * eye is outside the sphere and rays that miss it are uncovered).  The
+ * function itself lives in the [WP-CAMERA] region at the end of this file.
+ * See docs/research/DJI_CAMERA.md for the recovery of the model. */
+#define OSV_PROJ_DJI_SPHERE 4
+OSV_HD int osvDjiSphereRay(float focalPx, float eyeZ, float nx, float ny, float* d);
+/* ---- end [WP-CAMERA] ------------------------------------------------------ */
+
 /* Unit view ray for a centred pixel offset (nx right, ny up, in pixels) of a
  * W x H viewport under one of the OSV_PROJ_* camera models.  Shared by the
  * fisheye stitching shader and the equirect reframe entry point so both
@@ -343,6 +358,11 @@ OSV_HD float osvEyeOffsetTheta(float r, float focalPx, float d) {
  * pixel maps to no direction (outside the image circle / valid radius). */
 OSV_HD int osvViewRay(int projection, float focalPx, float eyeOffset, float tanHalfH, float tanHalfV, float W,
                       float H, float nx, float ny, float* d) {
+    /* [WP-CAMERA] DJI's pinhole-behind-the-sphere camera has its own ray
+     * construction (a ray / sphere intersection, not a radial angle map). */
+    if (projection == OSV_PROJ_DJI_SPHERE) {
+        return osvDjiSphereRay(focalPx, eyeOffset, nx, ny, d);
+    }
     if (projection == OSV_PROJ_RECTILINEAR) {
         const float u = (nx / (0.5f * W)) * tanHalfH;
         const float v = (ny / (0.5f * H)) * tanHalfV;
@@ -1059,5 +1079,72 @@ OSV_FN void osvReframeEquirectPixel(const OsvReframeParams* p, const OsvRgbaSour
         out[3] = 1.0f;
     }
 }
+
+/* ========================================================================= */
+/*  [WP-CAMERA] DJI sphere camera                                            */
+/* ========================================================================= */
+
+/* View ray of DJI's reframe camera for a centred pixel offset (nx right,
+ * ny up, pixels).
+ *
+ * THE MODEL (matching DJI Studio and DJI's Premiere plug-in, see
+ * docs/research/DJI_CAMERA.md): the panorama is a unit sphere at the origin;
+ * the camera is an ordinary pinhole with focal length `focalPx` (pixels),
+ * looking along +Y (view frame: X right, Y forward, Z up), with its eye at
+ * E = (0, -eyeZ, 0), i.e. eyeZ radii BEHIND the centre.  A pixel sees the
+ * point where its pinhole ray leaves the sphere - the far root of
+ * |E + t u| = 1 - which is also the only face DJI's renderer keeps (it culls
+ * the faces seen from outside).  The returned direction is that sphere
+ * point, which on a unit sphere is already the direction from the centre.
+ *
+ *   eyeZ = 0      plain rectilinear (pinhole at the centre);
+ *   eyeZ = 1      stereographic (DJI's "Asteroid");
+ *   eyeZ > 1      the eye is OUTSIDE the sphere ("Crystal Ball"): rays that
+ *                 miss it are uncovered and the function returns 0.
+ *
+ * For eyeZ <= 1 this is the same map as OSV_PROJ_EYE_OFFSET with
+ * f_eye = focalPx / (1 + eyeZ); it is written as an intersection instead of
+ * an angle inversion because that form needs no trigonometry, stays exact
+ * past eyeZ = 1 and is parameterised the way DJI's controls are (a pinhole
+ * field of view, not a visible angle).
+ *
+ * Numerics: sin^2 of the ray's angle is formed as (nx^2 + ny^2) / |ray|^2
+ * rather than 1 - cos^2, so the discriminant keeps full precision near the
+ * view axis; the result is renormalised to absorb the last ulp of drift. */
+OSV_HD int osvDjiSphereRay(float focalPx, float eyeZ, float nx, float ny, float* d) {
+    /* Every comparison is written so a NaN fails it. */
+    if (!(focalPx > 0.0f) || !(eyeZ >= 0.0f)) {
+        return 0;
+    }
+    const float r2 = nx * nx + ny * ny;
+    const float len2 = r2 + focalPx * focalPx;
+    if (!(len2 > 0.0f)) {
+        return 0;
+    }
+    const float invLen = 1.0f / sqrtf(len2);
+    /* Unit pinhole ray. */
+    const float ux = nx * invLen;
+    const float uy = focalPx * invLen;
+    const float uz = ny * invLen;
+    /* |E + t u|^2 = 1 with E = (0, -e, 0):
+     *   t^2 - 2 e uy t + (e^2 - 1) = 0
+     *   t = e uy + sqrt(1 - e^2 sin^2(alpha)),  sin^2(alpha) = r2 / len2. */
+    const float sin2 = r2 / len2;
+    const float disc = 1.0f - eyeZ * eyeZ * sin2;
+    if (!(disc >= 0.0f)) {
+        return 0; /* eye outside the sphere and the ray passes it by */
+    }
+    const float t = eyeZ * uy + sqrtf(disc);
+    if (!(t > 0.0f)) {
+        return 0;
+    }
+    d[0] = t * ux;
+    d[1] = t * uy - eyeZ;
+    d[2] = t * uz;
+    osvNormalize3(d);
+    return 1;
+}
+
+/* ---- end [WP-CAMERA] ------------------------------------------------------ */
 
 #endif /* OSV_KERNEL_H */
