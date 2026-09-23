@@ -8,6 +8,23 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ### Added
 
+* **HDR Peak Brightness for the PQ output (WP-HDRPEAK).** PQ is rendered for
+  a 1000-nit display, so sunlit white is genuinely bright: the sample's white
+  aircraft sits at 525 nits median, 98 % of it above diffuse white, and looks
+  blown out wherever the display or the conversion cannot show that. "HDR
+  Peak (PQ only)" in Source Settings rolls the highlights off into 1000
+  (default, unchanged), 600, 400 or 203 nits ("SDR-safe") with the BT.2408
+  Annex 5 EETF per component: everything below the knee - 464 / 251 nits for
+  600 / 400, so diffuse white, faces and mid-tones - is left bit for bit; 203
+  keeps the whole picture under reference white (its knee is 88 nits, so
+  diffuse white lands at 159). The aircraft at 600 / 400 / 203: median
+  514 / 381 / 200 nits, max 600 / 400 / 203, shading across it 1.10 / 0.54 /
+  0.19 stops (1.44 at 1000; DJI Studio's Rec.709 view 0.61). HLG is left
+  alone on purpose - it is display-relative, and its peak adaptation is the
+  HLG display's own. Also in the importer dialog, the Properties panel,
+  osvtool (`render --hdr-peak`, `lut --hdr-peak`), the user defaults file and
+  the direct path (a change re-renders the Program monitor). CPU / CUDA /
+  OpenCL agree at 115.8 / 112.2 dB. Engine ABI 5.
 * **Lens Shading in Source Settings (WP-VIGNETTE).** The soft darker band
   that stayed on every sky seam crossing after the sky seam fix is a ring in
   the front lens's own image - 83-89 deg from its axis, up to 0.34 stop deep

@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// makeColorParams and the enum name / parse helpers.
+// makeColorParams, the enum name / parse helpers and [WP-HDRPEAK] the PQ
+// output's HDR peak roll-off set-up (setHdrPeak and its queries).
 
 #include "osv/color/ColorParams.h"
 
 #include "osv/color/Look.h"
 #include "osv/color/Matrices.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -219,7 +221,7 @@ OsvColorParams makeDisabledColorParams() noexcept {
 
 OsvColorParams makeColorParams(DlogMFit fit, OutputTransfer transfer, float exposureStops, InputEncoding input,
                                bool narrowInput, std::uint32_t bitDepth, const OsvDlogMCurve* curveOverride,
-                               float sceneScale, Look look) noexcept {
+                               float sceneScale, Look look, float hdrPeakNits) noexcept {
     OsvColorParams p = makeDisabledColorParams();
     p.enabled = 1;
 
@@ -302,7 +304,129 @@ OsvColorParams makeColorParams(DlogMFit fit, OutputTransfer transfer, float expo
     // zeroed "no look" block for every other combination and for an
     // out-of-range Look value.
     p.look = makeLookParams(look, static_cast<OutputTransfer>(p.transfer));
+
+    // --- [WP-HDRPEAK] PQ highlight roll-off ----------------------------------
+    // Also keyed off the sanitised transfer: only PQ gets a target, and the
+    // default 1000-nit target leaves the group zeroed, so the block is byte
+    // for byte what it was before the setting existed.
+    setHdrPeak(p, hdrPeakNits);
     return p;
+}
+
+// -----------------------------------------------------------------------------
+//  [WP-HDRPEAK] HDR peak brightness
+// -----------------------------------------------------------------------------
+void setHdrPeak(OsvColorParams& params, float targetNits) noexcept {
+    // Start from "off": every early return below leaves the zeroed group,
+    // which the kernel reads as no roll-off.
+    params.hdrPeakNits = 0.0f;
+    params.hdrPeakSrcCode = 0.0f;
+    params.hdrPeakMaxLum = 0.0f;
+    params.hdrPeakKnee = 0.0f;
+
+    // Only the PQ output is an absolute display light level; HLG is relative
+    // to whatever display shows it (that display applies its own peak), and
+    // Rec.709, linear and the passthrough have no HDR highlights to limit.
+    if (params.transfer != OSV_TRANSFER_PQ) {
+        return;
+    }
+    // A garbage request (NaN, infinities, zero or negative light) is the
+    // default: no roll-off.
+    if (!std::isfinite(targetNits) || targetNits <= 0.0f) {
+        return;
+    }
+    // The source (mastering) peak is the OOTF display the PQ signal was
+    // rendered for.  A block without a usable one cannot be normalised.
+    const double source = static_cast<double>(params.peakNits);
+    if (!std::isfinite(source) || source <= 0.0) {
+        return;
+    }
+    // Nothing to roll off when the target shows the whole source range.
+    if (static_cast<double>(targetNits) >= source) {
+        return;
+    }
+    // Raise absurdly low targets to the SDR reference peak (see
+    // kMinHdrPeakNits); a target at or above the source was handled above,
+    // so the clamp cannot lift one past it unless the source itself is lower.
+    const double target = std::max(static_cast<double>(targetNits), static_cast<double>(kMinHdrPeakNits));
+    if (target >= source) {
+        return;
+    }
+
+    // BT.2408-7 Annex 5, steps 1 and 2, in double precision: the source range
+    // in PQ, the target peak normalised to it, and the knee start.
+    const double srcCode = ref::pqInverseEotf(source);
+    if (!(srcCode > 1e-6)) {
+        return;
+    }
+    const double maxLum = ref::pqInverseEotf(target) / srcCode;
+    const double knee = 1.5 * maxLum - 0.5;
+    // Defensive: the kernel refuses anything outside 0 < KS < maxLum < 1, so
+    // a block that would be refused there is not built here either.
+    if (!(maxLum > 0.0 && maxLum < 1.0) || !(knee < maxLum)) {
+        return;
+    }
+    params.hdrPeakNits = static_cast<float>(target);
+    params.hdrPeakSrcCode = static_cast<float>(srcCode);
+    params.hdrPeakMaxLum = static_cast<float>(maxLum);
+    params.hdrPeakKnee = static_cast<float>(knee);
+}
+
+float hdrPeakNitsOf(const OsvColorParams& params) noexcept {
+    // Relative outputs have no absolute peak to report.
+    if (params.transfer != OSV_TRANSFER_PQ) {
+        return 0.0f;
+    }
+    // An active roll-off caps the output at its target; otherwise the OOTF's
+    // own display peak is the brightest the output gets for in-range light.
+    return params.hdrPeakNits > 0.0f ? params.hdrPeakNits : params.peakNits;
+}
+
+float hdrPeakKneeNits(float targetNits, float sourcePeakNits) noexcept {
+    // Garbage in: nothing meaningful to report.
+    if (!std::isfinite(targetNits) || !std::isfinite(sourcePeakNits) || targetNits <= 0.0f ||
+        sourcePeakNits <= 0.0f) {
+        return 0.0f;
+    }
+    // No roll-off: the whole source range is untouched.
+    if (targetNits >= sourcePeakNits) {
+        return sourcePeakNits;
+    }
+    // The same clamp and the same knee as setHdrPeak, back through the EOTF.
+    const double target = std::max(static_cast<double>(targetNits), static_cast<double>(kMinHdrPeakNits));
+    if (target >= static_cast<double>(sourcePeakNits)) {
+        return sourcePeakNits;
+    }
+    const double srcCode = ref::pqInverseEotf(static_cast<double>(sourcePeakNits));
+    const double maxLum = ref::pqInverseEotf(target) / srcCode;
+    const double knee = std::max(1.5 * maxLum - 0.5, 0.0);
+    return static_cast<float>(ref::pqEotf(knee * srcCode));
+}
+
+bool parseHdrPeak(std::string_view text, float& nits) noexcept {
+    std::string t = lowerAscii(text);
+    // Accept the unit spelled out ("600nits", "600 nits") as well as bare.
+    for (const char* suffix : {" nits", "nits", " nit", "nit"}) {
+        const std::size_t n = std::strlen(suffix);
+        if (t.size() > n && t.compare(t.size() - n, n, suffix) == 0) {
+            t.resize(t.size() - n);
+            break;
+        }
+    }
+    // Exactly the Source Settings choices, so the CLI renders only what
+    // Premiere can: the same four targets, the same knees.
+    for (const float choice : kHdrPeakChoicesNits) {
+        if (t == std::to_string(static_cast<int>(choice))) {
+            nits = choice;
+            return true;
+        }
+    }
+    // The 203-nit choice under the name the UI gives it.
+    if (t == "sdr" || t == "sdr-safe" || t == "sdrsafe") {
+        nits = 203.0f;
+        return true;
+    }
+    return false;
 }
 
 bool colorParamsValid(const OsvColorParams& params) noexcept {
@@ -337,6 +461,22 @@ bool colorParamsValid(const OsvColorParams& params) noexcept {
     // The look block: either "no look" or a complete, finite one.
     if (!lookParamsValid(params.look)) {
         return false;
+    }
+    // [WP-HDRPEAK] The roll-off group: zeroed (off), or a PQ block with a
+    // finite target below its own peak and constants the kernel accepts.
+    const float peakGroup[] = {params.hdrPeakNits, params.hdrPeakSrcCode, params.hdrPeakMaxLum, params.hdrPeakKnee};
+    for (const float v : peakGroup) {
+        if (!std::isfinite(v)) {
+            return false;
+        }
+    }
+    if (params.hdrPeakNits != 0.0f) {
+        if (params.transfer != OSV_TRANSFER_PQ || !(params.hdrPeakNits > 0.0f) ||
+            !(params.hdrPeakNits < params.peakNits) || !(params.hdrPeakSrcCode > 0.0f) ||
+            !(params.hdrPeakMaxLum > 0.0f && params.hdrPeakMaxLum < 1.0f) ||
+            !(params.hdrPeakKnee < params.hdrPeakMaxLum)) {
+            return false;
+        }
     }
     return params.sceneScale > 0.0f && params.exposureGain > 0.0f && params.peakNits > 0.0f;
 }

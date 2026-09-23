@@ -268,6 +268,9 @@ struct DialogControls {
     int lensShading = 1;                  ///< Combo index = PrefsLensShading: 0 Off, 1 Auto.
     double shadingStrengthPercent = 100;  ///< Correction strength, 0..100 %.
     // ---- [/WP-VIGNETTE] ------------------------------------------------------
+    /// [WP-HDRPEAK] Combo index = PrefsHdrPeak: 0 1000 nits (default), 1 600,
+    /// 2 400, 3 203 (SDR-safe).  Only the PQ output uses it.
+    int hdrPeak = 0;
 };
 
 /// PrefsBlob -> control state.  Every field is already in range because the

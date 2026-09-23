@@ -185,6 +185,16 @@ typedef struct OsvColorParams {
     /* Appended last so every field above keeps its offset; a zeroed block
      * (id == OSV_LOOK_STANDARD) renders exactly as before looks existed. */
     OsvLookParams look;           /**< Display look for the Rec.709 output (see osvLookApply). */
+    /* [WP-HDRPEAK] "HDR Peak Brightness" (see osvHdrPeakRolloff).  Appended
+     * after the look so every field above keeps its offset.  A zeroed group
+     * (hdrPeakNits == 0) is "no roll-off": the PQ output of every build
+     * before the setting existed, bit for bit.  makeColorParams fills it for
+     * the PQ output only and derives the three normalisation constants on the
+     * host, so the kernel does no set-up work per pixel. */
+    float hdrPeakNits;            /**< PQ target display peak in nits; 0 = off (the 1000-nit master untouched). */
+    float hdrPeakSrcCode;         /**< PQ code of the source (mastering) peak, PQ(peakNits). */
+    float hdrPeakMaxLum;          /**< PQ(hdrPeakNits) / hdrPeakSrcCode: the target peak in the normalised range. */
+    float hdrPeakKnee;            /**< BT.2408 knee start KS = 1.5 * hdrPeakMaxLum - 0.5, normalised. */
 } OsvColorParams;
 
 /* ---------------------------------------------------------------------------
@@ -588,6 +598,84 @@ OSV_HD void osvLookApply(const OsvLookParams* look, const float in[3], float out
 }
 
 /* ---------------------------------------------------------------------------
+ *  [WP-HDRPEAK] HDR peak brightness: the PQ output's highlight roll-off
+ *
+ *  Defined ahead of the pipeline stages for the same reason as the looks:
+ *  osvLinearToOutput calls it, and C and OpenCL C both need the definition
+ *  before the call.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * @brief Roll one PQ code's highlights off into the block's target peak.
+ *
+ * The reference EETF of ITU-R BT.2408-7 Annex 5 (first published in
+ * BT.2390), with the source range [0, PQ(peakNits)] (black 0 nit) and the
+ * target peak hdrPeakNits:
+ *
+ *   E1 = E / PQ(Lw)                          normalise to the source range
+ *   KS = 1.5 * maxLum - 0.5                  knee start
+ *   E2 = E1                                  for E1 <= KS (1:1, untouched)
+ *   T  = (E1 - KS) / (1 - KS)                above the knee:
+ *   E2 = (2T^3 - 3T^2 + 1) KS + (T^3 - 2T^2 + T)(1 - KS) + (-2T^3 + 3T^2) maxLum
+ *   E  = E2 * PQ(Lw)                         back to absolute PQ
+ *
+ * The spline leaves the knee with slope 1 and arrives at maxLum (the target
+ * peak) with slope 0 at the source peak.  With this KS its start tangent,
+ * 1 - KS = 1.5 (1 - maxLum), is exactly three times its chord,
+ * maxLum - KS = 0.5 (1 - maxLum) - the largest a cubic Hermite can carry and
+ * stay monotonic - and the spline collapses to
+ *
+ *   E2 = KS + (maxLum - KS) * (1 - (1 - T)^3)
+ *
+ * which is what is evaluated here.  It is the same curve (the tests hold it
+ * to the Hermite form and to the double-precision reference within 2e-6),
+ * but in float the Hermite form's opposing terms can step DOWN by an ulp on
+ * the flat shoulder, while this form is a chain of monotonic operations and
+ * cannot.  Source and target black are both 0 nit, so the annex's
+ * black-lift term b * (1 - E2)^4 is zero.
+ *
+ * The caller applies it per R'G'B' component in BT.2020 primaries (the
+ * annex's option 4): that cannot leave the target gamut, and bright colours
+ * desaturate towards white as they roll off, the way a camera's knee does.
+ *
+ * Exactly the input comes back at and below the knee, for a null block, and
+ * for a block with hdrPeakNits <= 0 (every zeroed block, and every block
+ * whose target is not below the source peak).  A block whose derived
+ * constants are inconsistent (a corrupt block) also returns the input rather
+ * than dividing by zero or bending the curve backwards.  Input at or above
+ * the source peak lands exactly on the target peak.
+ */
+OSV_HD float osvHdrPeakRolloff(const OsvColorParams* params, float pqCode) {
+    /* Off: no block, or no target (the zeroed default). */
+    if (params == 0 || !(params->hdrPeakNits > 0.0f)) {
+        return pqCode;
+    }
+    const float src = params->hdrPeakSrcCode;
+    const float maxLum = params->hdrPeakMaxLum;
+    const float ks = params->hdrPeakKnee;
+    /* Defensive: every constant the spline divides by or aims at must be in
+     * range, and the knee must sit below the target (KS < maxLum < 1). */
+    if (!(src > 1e-6f) || !(maxLum > 0.0f && maxLum < 1.0f) || !(ks < maxLum)) {
+        return pqCode;
+    }
+    /* Normalise; at and below the knee the curve is the identity, and the
+     * input itself is returned so nothing there moves by even one bit. */
+    const float e1 = pqCode / src;
+    if (!(e1 > ks)) {
+        return pqCode;
+    }
+    /* Position along the shoulder; above the source peak the curve has
+     * already reached the target peak (t = 1). */
+    const float t = (fminf(e1, 1.0f) - ks) / (1.0f - ks);
+    /* BT.2408 Annex 5, step 4 - the Hermite spline from (KS, slope 1) to
+     * (maxLum, slope 0) - in its closed form for this knee (see above). */
+    const float u = 1.0f - t;
+    const float e2 = ks + (maxLum - ks) * (1.0f - u * u * u);
+    /* Back to absolute PQ, never above the target peak. */
+    return fminf(e2, maxLum) * src;
+}
+
+/* ---------------------------------------------------------------------------
  *  Pipeline stages
  * ------------------------------------------------------------------------- */
 
@@ -667,7 +755,8 @@ OSV_HD void osvCodeToLinear(const OsvColorParams* params, const float code[3], f
  * Steps: nativeToWorking matrix, exposure gain, then per transfer:
  *  - HLG:     * sceneScale, workingToOutput, HLG OETF per channel.
  *  - PQ:      * sceneScale, workingToOutput, HLG OOTF (peakNits, ootfGamma on
- *             BT.2020 luminance), PQ inverse EOTF per channel.
+ *             BT.2020 luminance), PQ inverse EOTF per channel, then
+ *             [WP-HDRPEAK] osvHdrPeakRolloff per channel when hdrPeakNits > 0.
  *  - Rec709:  with look.id == OSV_LOOK_DJI, osvLookApply on the working
  *             value (the DJI Studio look, Look.h).  Otherwise the standard
  *             rendering: * sceneScale, workingToOutput (2020 -> 709) in
@@ -738,6 +827,15 @@ OSV_HD void osvLinearToOutput(const OsvColorParams* params, const float lin[3], 
             osvMat3Apply(&params->workingToOutput, nits[0], nits[1], nits[2], tmp);
             for (i = 0; i < 3; ++i) {
                 out[i] = osvSaturatef(osvPqInverseEotf(fmaxf(tmp[i], 0.0f)));
+            }
+            /* [WP-HDRPEAK] Roll the highlights off into the chosen display
+             * peak (BT.2408 Annex 5 EETF, per component).  Skipped entirely
+             * for a zeroed group - the 1000-nit default - so that output is
+             * bit for bit what it was before the setting existed. */
+            if (params->hdrPeakNits > 0.0f) {
+                for (i = 0; i < 3; ++i) {
+                    out[i] = osvHdrPeakRolloff(params, out[i]);
+                }
             }
             return;
         }

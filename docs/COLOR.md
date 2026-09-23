@@ -10,6 +10,7 @@ blend / gain           ->  (in linear light)
 native -> Rec.2020     ->  3x3 matrix
 x sceneScale x 2^stops ->  BT.2408 anchor: 0.2674 puts 18 % grey at HLG 0.38
 transfer               ->  HLG OETF | HLG-OOTF(1000 nit, gamma 1.2) + PQ inverse EOTF
+                             [+ the HDR peak roll-off, per component, when it is below 1000]
                            | Rec.709: the DJI Studio look (default, see below) or the
                              standard 2020->709 in linear light + HLG OETF | linear | passthrough
 ```
@@ -174,6 +175,9 @@ output, which is already converted.
   203 -> 0.5807, 1000 -> 0.7518.
 * BT.2408: 18 % grey = 38 % HLG/PQ = 26 nit; HDR reference white = 75 % HLG /
   58 % PQ = 203 nit.
+* BT.2408 Annex 5 (the BT.2390 EETF): the PQ output's HDR peak roll-off,
+  knee KS = 1.5 maxLum - 0.5, per R'G'B' component - see "HDR peak
+  brightness" below. Knees: 600 nits -> 464, 400 -> 251, 203 -> 88.
 * Rec.709 output: by default the DJI Studio look ("The DJI Studio look"
   below). The standard rendering, `Look::Standard`, is the HLG signal as the
   SDR rendering (BT.2390, "HLG on an SDR display"), computed in Rec.709
@@ -284,6 +288,146 @@ stands out from the sky around it by 5.97 dE2000 in the standard rendering,
 sky is 1.71 / 1.76 / 1.68. The remaining difference to DJI Studio's picture
 is photometric (lens gain, veiling glare, the seam field), which is
 WP-PHOTO's and WP-FLARE's work, not the tone transform's.
+
+## HDR peak brightness (the PQ output)
+
+The PQ output is standards-correct: 18 % grey at 26 nits, diffuse white at
+203 nits (BT.2408), and highlights up to the 1000-nit display of the HLG OOTF
+it is rendered through. That is also why a sunlit white surface can look
+blown out: on the sample clip's frame 30 the white aircraft beside the camera
+sits at 525 nits median (p10 277, p90 753, max 1008) - 98.3 % of its paint is
+brighter than diffuse white - so a display or a conversion that cannot show
+more than a few hundred nits flattens it, while DJI Studio's Rec.709 view
+keeps 0.61 stops of shading across it.
+
+"HDR Peak Brightness" makes the PQ output less hot without touching anything
+below its knee:
+
+| Choice | Knee: untouched below | 18 % grey (26 nits) | Diffuse white (203 nits) | 1000 nits and above |
+|---|---|---|---|---|
+| **1000 nits** (default) | - (no roll-off; bit for bit the output before the setting) | 26 | 203 | 1000 |
+| 600 nits | 464 nits | 26 | 203 | 600 |
+| 400 nits | 251 nits | 26 | 203 | 400 |
+| 203 nits, "SDR-safe" | 88 nits | 26 | **159** | 203 |
+
+### The curve
+
+The reference EETF of ITU-R BT.2408-7, Annex 5 (first published in BT.2390),
+with the source range [0, PQ(1000)] and the target peak Lw:
+
+```
+E1     = E / PQ(1000)                            normalise the PQ code
+maxLum = PQ(Lw) / PQ(1000)
+KS     = 1.5 maxLum - 0.5                        knee start
+E2     = E1                                      E1 <= KS: untouched
+T      = (E1 - KS) / (1 - KS)                    above the knee:
+E2     = (2T^3 - 3T^2 + 1) KS + (T^3 - 2T^2 + T)(1 - KS) + (-2T^3 + 3T^2) maxLum
+E      = min(E2, maxLum) PQ(1000)
+```
+
+The spline leaves the knee with slope 1 and reaches the target peak with
+slope 0 at 1000 nits; anything brighter (exposure, saturated channels) lands
+on the target exactly. Source and target black are both 0 nit, so the
+annex's black-lift term is zero. With this knee the spline's start tangent
+(1 - KS = 1.5 (1 - maxLum)) is exactly three times its chord
+(maxLum - KS = 0.5 (1 - maxLum)), the most a monotonic cubic can carry, and it
+collapses to
+
+```
+E2 = KS + (maxLum - KS) (1 - (1 - T)^3)          slope (1 - T)^2
+```
+
+which is what `osvHdrPeakRolloff` (ColorMath.h) evaluates: the same curve
+(within 2e-6 of the Hermite form and of the double-precision reference), but
+in float the Hermite form's opposing terms stepped *down* by an ulp on the
+flat shoulder, and this form is a chain of monotonic operations that cannot.
+The host derives PQ(1000), maxLum and KS once per block (`setHdrPeak`), so
+the kernel pays a compare below the knee and a divide and a cube above it.
+
+**Per component.** The annex lists five places to apply the EETF (ICtCp,
+Y'CbCr, Y, R'G'B', max(R, G, B)). It is applied to each R'G'B' component in
+BT.2020 primaries: with max(R, G, B) one of the two that cannot produce
+colours outside the target gamut (so no gamut mapping is needed after it),
+and the one the annex says "generally tends to produce natural looking
+colours", adding that primaries close to BT.2020 work well. The price, which
+the annex also names: saturated highlights desaturate towards white as they
+roll off, like a camera knee, and some may shift hue. On the sample the
+aircraft's bright teal stripes lose visible chroma at 203 nits and a little
+at 400, while the white paint stays neutral. max(R, G, B) would keep that
+chroma but, per the annex, can make bright skin and sunsets look unnatural;
+it is not offered.
+
+**203 nits, "SDR-safe", is well defined but different in kind.** It is the
+same EETF with Lw = 203 nits - BT.2408's HDR reference white, the level an
+SDR signal's 100 % is placed at in HDR - so the whole picture, highlights
+included, ends at or below reference white. Its knee (88 nits) is below
+diffuse white, so unlike 600 and 400 it also moves diffuse white (to 159
+nits) and everything between 88 and 1000 nits; grey and the shadows stay.
+Any conversion that puts reference white at SDR white clips nothing of it.
+
+### HLG is unchanged, on purpose
+
+An HLG signal is relative, not absolute: 1.0 is the peak of whatever display
+shows it, and BT.2100's peak adaptation - system gamma
+1.2 + 0.42 log10(Lw / 1000) for a display of peak Lw (BT.2390 finds it holds
+from 400 to 2000 nits) - is part of that *display's* OOTF. A 400-nit HLG
+display already renders our signal at 400 nits with gamma 1.03; baking the
+adaptation into the signal would apply it twice. So the HLG output ignores
+the setting and stays byte-identical to the default. Rec.709 (with or
+without the look), linear and the D-Log M passthrough have no HDR
+highlights and ignore it too: their colour blocks are byte-identical
+whatever it says.
+
+### Measured on the sample
+
+Frame 30, the white aircraft beside the camera (19285 px of equirect, the
+largest near-neutral bright blob; BT.2020 luminance in nits, through the PQ
+EOTF):
+
+| Peak | p10 | p50 | p90 | max | p10-p90 spread | at its top (>= 99 %) |
+|---|---|---|---|---|---|---|
+| 1000 | 277 | 525 | 753 | 1008 | 1.44 stops | 4.4 % |
+| 600 | 277 | 514 | 591 | 600 | 1.10 stops | 10.6 % |
+| 400 | 274 | 381 | 398 | 400 | 0.54 stops | 15.2 % |
+| 203 | 178 | 200 | 203 | 203 | 0.19 stops | 38.1 % |
+| *DJI look, Rec.709 (display light, BT.1886)* | *0.59* | *0.78* | *0.90 of SDR white* | | *0.61 stops* | *8.2 % at the clip* |
+
+What changes, to the eye: 600 only tames the hottest glints (the fuselage's
+sunlit flank above 464 nits; the median moves 0.03 stops). 400 brings the
+whole sunlit side down about half a stop and keeps roughly the tonal spread
+DJI Studio's Rec.709 view gives the aircraft. 203 puts the entire aircraft
+into the top quarter-stop under reference white: nothing clips on an SDR
+conversion, but the paint reads flat grey-white and the teal stripes pale.
+Across the whole frame 1.2 / 6.2 / 37.6 % of pixels sit above the 600 / 400
+/ 203 knees; the frame's median luminance (33.7 nits) and every pixel below
+each knee (518050 of 524288 at 600, in a 1024 x 512 test render) are
+bit-identical to the default.
+
+Tests (`tests/unit/test_hdr_peak.cpp`,
+`tests/premiere/importer/test_hdr_peak_paths.cpp`): 1000 is bitwise the
+pre-setting PQ formula; only PQ changes; identity below the knee, continuity,
+monotonicity and the cap in nits over 200000 codes; the documented knees;
+hostile targets (NaN, infinities, zero and negative mean "no roll-off",
+positive targets below 100 nits are raised to 100) and corrupt blocks; the
+sample's brightest component (1011 nits) at 600.0 / 400.0 / 203.0; CPU / CUDA
+/ OpenCL at 115.8 / 112.2 dB on a colour sweep through the shoulder.
+
+### Where to select it
+
+| Where | Control |
+|---|---|
+| Source Settings effect | **HDR Peak (PQ only)**: 1000 nits (default) / 600 / 400 / 203 (SDR-safe), under Look |
+| Importer Source Settings dialog | **HDR peak (PQ)** (greyed unless Colour output is PQ) |
+| Preference blob | `PrefsBlob::hdrPeak`, offset 54: 0 = 1000 nits (the default, and every older project), 1 = 600, 2 = 400, 3 = 203 |
+| User defaults file | `"hdrPeakNits": 1000` (only 1000, 600, 400 or 203 read back) |
+| `osvtool render` / `osvtool lut` | `--hdr-peak 1000` (default) / `600` / `400` / `203`; a PQ still's sidecar records its peak, a rolled-off PQ LUT's title names it |
+| Library | `makeColorParams(..., hdrPeakNits)`, `setHdrPeak`, `hdrPeakNitsOf`, `hdrPeakKneeNits`, `parseHdrPeak` |
+
+It follows the clip onto the direct path like the look does: a clip rendered
+into a PQ working space - whatever its own Colour Output - rolls off into its
+own peak, and a change moves the engine's Source Settings generation, so the
+Program monitor re-renders. The shipped LUTs are the 1000-nit tables and are
+unchanged.
 
 ## Native primaries
 

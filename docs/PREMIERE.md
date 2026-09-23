@@ -565,7 +565,7 @@ absent, so that fact cannot be forgotten.
 
 As in the reframe effect, `PF_ADD_TOPIC` and `PF_END_TOPIC` each issue their
 own `PF_ADD_PARAM`, so a group occupies two real parameter slots and the
-`GROUP_END` slot sits in the MIDDLE of the list. There are 30 parameters: 22
+`GROUP_END` slot sits in the MIDDLE of the list. There are 31 parameters: 23
 value controls, 2 buttons and 6 group markers. `SourceSettingsParams.h`
 spells the index table out literally. Ids are permanent and only ever
 appended; indices moved when a control joined a group (the ids did not).
@@ -583,40 +583,41 @@ meaning; forcing the bare-lens set is new and therefore last.
 |---|---|---|---|---|---|---|
 | 1 | 1 | Colour Output | popup | BT.2100 PQ \| BT.2100 HLG \| Rec. 709 \| D-Log M (no transform) | PQ | `colorOutput` |
 | 2 | 15 | Look (Rec. 709 only) | popup | DJI (default) \| OpenOSV standard | DJI | `look` |
-| 3 | 2 | Output Size | popup | Native (2 x decoded height) \| 4K (3840 x 1920) \| 2560 x 1280 \| 2K (1920 x 960) | Native | `outputSize` |
-| 4 | 3 | Stabilisation | popup | Off \| Horizon Lock \| Full \| Smooth | Horizon Lock | `stabilization` |
-| 5 | 4 | Stitching | topic (GROUP_START) | | | |
-| 6 | 5 | Seam Search | checkbox (also carves the seam) | | on | `seamSearch` |
-| 7 | 6 | Exposure Match | checkbox | | on | `gainMatch` |
-| 8 | 7 | Calibration | popup | Auto (as recorded) \| Lens Protectors / ND Filters \| Underwater \| Native (bare lenses) | Auto | `calibration` + `calibrationForceNative` |
-| 9 | 16 | Sun Ghost Removal | checkbox | | on | `flareRemoval` |
-| 10 | 17 | Sky Seam Fix | popup | Off \| Rim only \| Rim and colour | Rim and colour | `photoSeam` |
-| 11 | 18 | Sky Seam Strength | float slider | 0..100 %, whole percent | 100 | `photoStrength` |
-| 12 | 19 | Seam Edge Inset | float slider | 0..6 deg, tenths | 2.6 | `seamInset` |
-| 13 | 20 | Seam Blend | float slider | 0.2..8 deg, hundredths shown, twentieths stored | 1.5 | `seamBlend` |
-| 14 | 21 | Parallax Blend | float slider | 0..4 deg (0 = hard cut), as above | 0.35 | `parallaxBlend` |
-| 15 | 22 | Seam Smoothing | float slider | 0..8 deg (0 = off), as above | 0 | `seamSmoothing` |
-| 16 | 23 | Near Offset | float slider | -3..+3 deg, hundredths | 0 | `nearOffset` |
-| 17 | 24 | Far Offset | float slider | -3..+3 deg, hundredths | 0 | `farOffset` |
-| 18 | 34 | Lens Shading | popup | Off \| Auto | Auto | `lensShading` |
-| 19 | 35 | Shading Strength | float slider | 0..100 %, whole percent | 100 | `shadingStrength` |
-| 20 | 8 | (closes Stitching) | GROUP_END | | | |
-| 21 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
-| 22 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 \| Osmo 360 | Osmo 360 | `dlogmFit` |
-| 23 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
-| 24 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
-| 25 | 14 | Program Monitor Colour | popup | Sequence space (fast) \| Match Source monitor | Sequence space | `directColour` |
-| 26 | 13 | (closes Advanced) | GROUP_END | | | |
-| 27 | 30 | Defaults | topic (GROUP_START, starts collapsed) | | | |
-| 28 | 31 | Save | button, `PF_ParamFlag_SUPERVISE` | "Save as Default for New Clips" | | writes the user defaults file |
-| 29 | 32 | Restore | button, `PF_ParamFlag_SUPERVISE` | "Restore Built-in Defaults" | | removes it |
-| 30 | 33 | (closes Defaults) | GROUP_END | | | |
+| 3 | 46 | HDR Peak (PQ only) | popup | 1000 nits (default) \| 600 nits \| 400 nits \| 203 nits (SDR-safe) | 1000 nits | `hdrPeak` |
+| 4 | 2 | Output Size | popup | Native (2 x decoded height) \| 4K (3840 x 1920) \| 2560 x 1280 \| 2K (1920 x 960) | Native | `outputSize` |
+| 5 | 3 | Stabilisation | popup | Off \| Horizon Lock \| Full \| Smooth | Horizon Lock | `stabilization` |
+| 6 | 4 | Stitching | topic (GROUP_START) | | | |
+| 7 | 5 | Seam Search | checkbox (also carves the seam) | | on | `seamSearch` |
+| 8 | 6 | Exposure Match | checkbox | | on | `gainMatch` |
+| 9 | 7 | Calibration | popup | Auto (as recorded) \| Lens Protectors / ND Filters \| Underwater \| Native (bare lenses) | Auto | `calibration` + `calibrationForceNative` |
+| 10 | 16 | Sun Ghost Removal | checkbox | | on | `flareRemoval` |
+| 11 | 17 | Sky Seam Fix | popup | Off \| Rim only \| Rim and colour | Rim and colour | `photoSeam` |
+| 12 | 18 | Sky Seam Strength | float slider | 0..100 %, whole percent | 100 | `photoStrength` |
+| 13 | 19 | Seam Edge Inset | float slider | 0..6 deg, tenths | 2.6 | `seamInset` |
+| 14 | 20 | Seam Blend | float slider | 0.2..8 deg, hundredths shown, twentieths stored | 1.5 | `seamBlend` |
+| 15 | 21 | Parallax Blend | float slider | 0..4 deg (0 = hard cut), as above | 0.35 | `parallaxBlend` |
+| 16 | 22 | Seam Smoothing | float slider | 0..8 deg (0 = off), as above | 0 | `seamSmoothing` |
+| 17 | 23 | Near Offset | float slider | -3..+3 deg, hundredths | 0 | `nearOffset` |
+| 18 | 24 | Far Offset | float slider | -3..+3 deg, hundredths | 0 | `farOffset` |
+| 19 | 34 | Lens Shading | popup | Off \| Auto | Auto | `lensShading` |
+| 20 | 35 | Shading Strength | float slider | 0..100 %, whole percent | 100 | `shadingStrength` |
+| 21 | 8 | (closes Stitching) | GROUP_END | | | |
+| 22 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
+| 23 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 \| Osmo 360 | Osmo 360 | `dlogmFit` |
+| 24 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
+| 25 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
+| 26 | 14 | Program Monitor Colour | popup | Sequence space (fast) \| Match Source monitor | Sequence space | `directColour` |
+| 27 | 13 | (closes Advanced) | GROUP_END | | | |
+| 28 | 30 | Defaults | topic (GROUP_START, starts collapsed) | | | |
+| 29 | 31 | Save | button, `PF_ParamFlag_SUPERVISE` | "Save as Default for New Clips" | | writes the user defaults file |
+| 30 | 32 | Restore | button, `PF_ParamFlag_SUPERVISE` | "Restore Built-in Defaults" | | removes it |
+| 31 | 33 | (closes Defaults) | GROUP_END | | | |
 
 The Defaults group is always last and its indices are defined relative to
 the Advanced terminator, so a control added to an earlier group moves them
 without renumbering; ids 20-29 are left to the Stitching group. The lens
-shading correction's ids (34-35) come after every id already shipped. See
-"User defaults for new clips" below.
+shading correction's ids (34-35) come after every id already shipped, and
+the HDR peak's (46) after those. See "User defaults for new clips" below.
 
 An effect saved before ids 15-19 (or 34-35) existed has no stored value for
 them, so it picks up the control defaults above (DJI look, ghost removal, the
@@ -646,6 +647,36 @@ correction travels inside the stitch block, so the importer's equirect, the
 Source monitor and the Program monitor's direct path show the same picture.
 Cost: 7-10 ms of analysis per bucket of eight frames; the render kernels do
 not measurably slow down (+0.00 ms at 2560x1440 on the direct path).
+
+#### HDR peak (id 46)
+
+The display peak the BT.2100 PQ output's highlights roll off into, with the
+BT.2408 Annex 5 EETF (docs/COLOR.md, "HDR peak brightness"). Everything below
+the knee is left bit for bit; only the highlights above it compress.
+
+| Choice | Knee (untouched below) | Diffuse white (203 nits) | The sample's sunlit aircraft, frame 30 (p50 / p90 / max nits) |
+|---|---|---|---|
+| 1000 nits (default) | - (no roll-off) | 203 | 525 / 753 / 1008 |
+| 600 nits | 464 nits | 203 | 514 / 591 / 600 |
+| 400 nits | 251 nits | 203 | 381 / 398 / 400 |
+| 203 nits (SDR-safe) | 88 nits | 159 | 200 / 203 / 203 |
+
+"PQ only" is in the name because a source settings effect cannot dependably
+grey a control out: HLG is display-relative (the HLG display applies its own
+peak), and Rec. 709, linear and the passthrough have no HDR highlights, so
+all of them ignore it. It follows the clip onto the direct path: a clip
+rendered into a PQ working space - whatever its own Colour Output - rolls off
+into its own peak, and a change moves the Source Settings generation like
+any colour setting, so the Program monitor re-renders. A Rec. 709 working
+space is untouched by it. The Properties panel says "HDR peak: 600 nits
+(highlights above 464 nits roll off, BT.2408 EETF)" when it is not 1000.
+
+1000 for new clips, for every blob written before the setting existed (its
+zero at `PrefsBlob` offset 54) and for an effect saved before id 46 existed
+(the control's default) - so every existing project renders exactly as
+before. Also in the importer dialog (greyed unless Colour output is PQ), the
+user defaults file (`"hdrPeakNits": 1000 | 600 | 400 | 203`) and osvtool
+(`render --hdr-peak`, `lut --hdr-peak`).
 
 #### Seam tools (ids 20-24)
 

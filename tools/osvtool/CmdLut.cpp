@@ -6,6 +6,7 @@
 //
 //   osvtool lut [--fit osmo360|dji|pocket3] [--out-transfer pq|hlg|709] [--size 65]
 //               [--exposure 0] [--title "..."] [--input dlogm|hlg|709]
+//               [--look dji|standard] [--hdr-peak 1000|600|400|203]
 //               [--narrow-input] out.cube
 
 #include "Commands.h"
@@ -29,6 +30,7 @@ struct LutOptions {
     std::string outTransfer = "pq";
     std::string input = "dlogm";
     std::string look = "dji";  ///< Rec.709 display look: dji (default) | standard.
+    std::string hdrPeak = "1000";  ///< [WP-HDRPEAK] PQ output's peak: 1000 (default) | 600 | 400 | 203.
     std::string title;
     std::string outPath;
     unsigned size = 65;
@@ -65,6 +67,13 @@ int runLut(const LutOptions& opt) {
                      osv::log::safe(opt.look).c_str());
         return kExitUsage;
     }
+    // [WP-HDRPEAK] The PQ output's peak: the Source Settings choices only.
+    float hdrPeakNits = kDefaultHdrPeakNits;
+    if (!parseHdrPeak(opt.hdrPeak, hdrPeakNits)) {
+        std::fprintf(stderr, "error: unknown --hdr-peak '%s' (expected 1000, 600, 400 or 203)\n",
+                     osv::log::safe(opt.hdrPeak).c_str());
+        return kExitUsage;
+    }
     // --- numeric sanity ------------------------------------------------------
     if (opt.size < 2 || opt.size > 256) {
         std::fprintf(stderr, "error: --size must be in [2, 256]\n");
@@ -84,7 +93,10 @@ int runLut(const LutOptions& opt) {
     // of the block is unused; narrow-input handling is done by the cube
     // writer on the LUT axis instead.
     const OsvColorParams params = makeColorParams(fit, transfer, static_cast<float>(opt.exposure), input, true, 10,
-                                                  nullptr, kBt2408SceneScale, look);
+                                                  nullptr, kBt2408SceneScale, look, hdrPeakNits);
+    // [WP-HDRPEAK] True when the table actually carries a roll-off (a PQ LUT
+    // with a peak below 1000); every other combination is the default table.
+    const bool rolledOff = params.hdrPeakNits > 0.0f;
     if (!colorParamsValid(params)) {
         std::fprintf(stderr, "error: internal colour parameter block is invalid\n");
         return kExitRuntime;
@@ -97,8 +109,13 @@ int runLut(const LutOptions& opt) {
         cube.title = opt.title;
     } else {
         // Auto title documents what the LUT does.
+        // [WP-HDRPEAK] A rolled-off PQ table names its peak inside the
+        // brackets; the default title (and so the committed LUTs) is
+        // unchanged.
+        const std::string peak =
+            rolledOff ? ", " + std::to_string(static_cast<int>(params.hdrPeakNits)) + "-nit peak" : std::string();
         cube.title = std::string("OpenOSV ") + inputEncodingName(input) + " to " + outputTransferName(transfer) +
-                     " (" + dlogMFitName(fit) + " fit)";
+                     " (" + dlogMFitName(fit) + " fit" + peak + ")";
     }
 
     // --- write ---------------------------------------------------------------
@@ -116,6 +133,21 @@ int runLut(const LutOptions& opt) {
     std::printf("  output    : %s\n", outputTransferName(transfer));
     if (transfer == OutputTransfer::Rec709) {
         std::printf("  look      : %s\n", lookName(look));
+    }
+    // [WP-HDRPEAK] What the peak did to this table.  HLG is display-relative:
+    // the display showing it applies its own peak, so the signal is the same
+    // whatever was asked for, and the report says so rather than staying
+    // silent about an option it ignored.
+    if (transfer == OutputTransfer::PQ) {
+        if (rolledOff) {
+            std::printf("  hdr peak  : %.0f nits (roll-off above %.0f nits, BT.2408 EETF)\n",
+                        static_cast<double>(params.hdrPeakNits),
+                        static_cast<double>(hdrPeakKneeNits(params.hdrPeakNits, params.peakNits)));
+        } else {
+            std::printf("  hdr peak  : %.0f nits (no roll-off)\n", static_cast<double>(params.peakNits));
+        }
+    } else if (hdrPeakNits < kDefaultHdrPeakNits) {
+        std::printf("  hdr peak  : ignored (only the PQ output has an absolute peak)\n");
     }
     std::printf("  exposure  : %+.2f stops\n", opt.exposure);
     std::printf("  size      : %u^3 = %llu entries\n", opt.size, entries);
@@ -140,6 +172,9 @@ void registerLutCommand(CLI::App& app, CommandContext& ctx) {
         ->capture_default_str();
     sub->add_option("--input", opt->input, "Source encoding: dlogm (default), hlg, 709")->capture_default_str();
     sub->add_option("--look", opt->look, "Rec.709 look: dji (DJI Studio, default) or standard")
+        ->capture_default_str();
+    sub->add_option("--hdr-peak", opt->hdrPeak,
+                    "PQ output's peak in nits: 1000 (default, no roll-off), 600, 400 or 203 (SDR-safe)")
         ->capture_default_str();
     sub->add_option("--size", opt->size, "Grid points per axis (2..256)")->capture_default_str();
     sub->add_option("--exposure", opt->exposure, "Exposure offset in stops")->capture_default_str();

@@ -558,11 +558,13 @@ Status ImporterInstance::parseOnce() {
     // output is the "auto PQ for log footage" case the default already gives.
     {
         const color::InputEncoding in = inputEncodingFor(m_format.colorMode);
-        PluginLog::info("colour: '{}': source {} ({}) -> input encoding {}, output {} ({}), Rec.709 look {}",
+        PluginLog::info("colour: '{}': source {} ({}) -> input encoding {}, output {} ({}), Rec.709 look {}, "
+                        "HDR peak {:.0f} nits",
                         m_path.filename().string(), meta::colorModeName(m_format.colorMode),
                         m_format.colorModeFromMetadata ? "from metadata" : "inferred from luma statistics",
                         color::inputEncodingName(in), color::outputTransferName(toOutputTransfer(m_prefs.color())),
-                        colorSpaceTokenFor(m_prefs), color::lookName(toLook(m_prefs.lookChoice())));
+                        colorSpaceTokenFor(m_prefs), color::lookName(toLook(m_prefs.lookChoice())),
+                        static_cast<double>(m_prefs.hdrPeakNits()));
     }
     return okStatus();
 }
@@ -1103,10 +1105,11 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
     // engine's instance does not publish back (it would only echo).
     publishSettingsLocked(true);
 
-    // Colour depends on colorOutput, dlogmFit, exposureStops and [WP-LOOK] the
-    // Rec.709 look.
+    // Colour depends on colorOutput, dlogmFit, exposureStops, [WP-LOOK] the
+    // Rec.709 look and [WP-HDRPEAK] the PQ output's peak.
     if (!m_colorBuilt || previous.colorOutput != incoming.colorOutput || previous.dlogmFit != incoming.dlogmFit ||
-        previous.exposureStops != incoming.exposureStops || previous.look != incoming.look) {
+        previous.exposureStops != incoming.exposureStops || previous.look != incoming.look ||
+        previous.hdrPeak != incoming.hdrPeak) {
         rebuildColor();
     }
 
@@ -1205,10 +1208,11 @@ void ImporterInstance::rebuildColor() {
     // stream (10 for the Osmo 360, 8 for the LRF proxy).
     // The look is passed for every output; makeColorParams applies it only to
     // Rec.709 (the one output with a fitted look) and ignores it otherwise.
+    // [WP-HDRPEAK] Likewise the HDR peak, which only the PQ output uses.
     m_color = color::makeColorParams(toDlogMFit(m_prefs.fit()), toOutputTransfer(m_prefs.color()),
                                      m_prefs.exposureStops, input, true,
                                      m_format.bitDepth ? m_format.bitDepth : 10u, nullptr, color::kBt2408SceneScale,
-                                     toLook(m_prefs.lookChoice()));
+                                     toLook(m_prefs.lookChoice()), m_prefs.hdrPeakNits());
     m_colorBuilt = true;
 }
 
@@ -2016,10 +2020,13 @@ Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_
     if (outputTransfer >= 0 && outputTransfer != m_color.transfer) {
         // [WP-LOOK] the clip's look travels with it: a PQ clip rendered into
         // a Rec.709 working space gets the look the user chose for Rec.709.
+        // [WP-HDRPEAK] So does its HDR peak: any clip rendered into a PQ
+        // working space rolls off into the peak chosen for it.
         color = color::makeColorParams(toDlogMFit(m_prefs.fit()), static_cast<color::OutputTransfer>(outputTransfer),
                                        m_prefs.exposureStops, inputEncodingFor(m_format.colorMode), true,
                                        m_format.bitDepth ? m_format.bitDepth : 10u, nullptr,
-                                       color::kBt2408SceneScale, toLook(m_prefs.lookChoice()));
+                                       color::kBt2408SceneScale, toLook(m_prefs.lookChoice()),
+                                       m_prefs.hdrPeakNits());
     }
 
     // ---- the stitch block ------------------------------------------------------
@@ -2190,11 +2197,12 @@ OsvColorParams ImporterInstance::colorForTransfer(int outputTransfer) const {
         return m_color;
     }
     // [WP-LOOK] the same look as the clip's own block, so a Rec.709
-    // connection-space override renders the look the user chose.
+    // connection-space override renders the look the user chose, and
+    // [WP-HDRPEAK] a PQ one the HDR peak the user chose.
     return color::makeColorParams(toDlogMFit(m_prefs.fit()), static_cast<color::OutputTransfer>(outputTransfer),
                                   m_prefs.exposureStops, inputEncodingFor(m_format.colorMode), true,
                                   m_format.bitDepth ? m_format.bitDepth : 10u, nullptr, color::kBt2408SceneScale,
-                                  toLook(m_prefs.lookChoice()));
+                                  toLook(m_prefs.lookChoice()), m_prefs.hdrPeakNits());
 }
 
 Result<render::RenderJob> ImporterInstance::buildEquirectJob(std::uint32_t index, const video::FramePair& pair,
@@ -2679,6 +2687,21 @@ std::string ImporterInstance::analysisText() const {
     default:                       break;
     }
     line(std::string("Output colour: ") + outName + ", full-range RGB " + depth);
+    // [WP-HDRPEAK] Said only when the PQ output does not carry the master's
+    // full 1000 nits, with where the roll-off starts - and, for any other
+    // output, that the setting is there but not used by it.
+    if (m_prefs.hdrPeakChoice() != PrefsHdrPeak::Nits1000) {
+        char buf[160] = {};
+        const double peak = static_cast<double>(m_prefs.hdrPeakNits());
+        if (m_prefs.color() == PrefsColorOutput::PQ) {
+            std::snprintf(buf, sizeof(buf), "HDR peak: %.0f nits (highlights above %.0f nits roll off, BT.2408 EETF)",
+                          peak, static_cast<double>(color::hdrPeakKneeNits(m_prefs.hdrPeakNits())));
+        } else {
+            std::snprintf(buf, sizeof(buf), "HDR peak: %.0f nits (PQ output only; this output does not use it)",
+                          peak);
+        }
+        line(buf);
+    }
     if (m_prefs.color() == PrefsColorOutput::DLogM) {
         // Said out loud in the Properties panel, because it is the one output
         // whose numbers are NOT ready to look at: the frame is log, so it

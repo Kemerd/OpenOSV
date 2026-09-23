@@ -220,8 +220,8 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
 
     const std::vector<PF_ParamDef> params = addedParams(fixture);
 
-    // Twenty-eight: twenty value controls, the two Defaults buttons and the
-    // six group markers.  PF_ADD_TOPIC and
+    // Thirty-one: twenty-three value controls, the two Defaults buttons and
+    // the six group markers.  PF_ADD_TOPIC and
     // PF_END_TOPIC each issue their own PF_ADD_PARAM, so a group occupies two
     // real slots - counting only the controls is the mistake that shifts
     // every index after the first group.
@@ -249,6 +249,7 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
     SECTION("the types are the documented ones") {
         const std::pair<int, PF_ParamType> expected[] = {
             {kIndexColorOutput, PF_Param_POPUP},     {kIndexRec709Look, PF_Param_POPUP},
+            {kIndexHdrPeak, PF_Param_POPUP},  // [WP-HDRPEAK]
             {kIndexOutputSize, PF_Param_POPUP},
             {kIndexStabilization, PF_Param_POPUP},   {kIndexStitchTopic, PF_Param_GROUP_START},
             {kIndexSeamSearch, PF_Param_CHECKBOX},   {kIndexGainMatch, PF_Param_CHECKBOX},
@@ -287,6 +288,7 @@ TEST_CASE("every value-carrying control refuses to vary over time", "[sourcesett
         kIndexCalibration, kIndexDlogmFit,   kIndexExposure,      kIndexRenderDevice, kIndexDirectColour,
         kIndexFlareRemoval,
         kIndexRec709Look,
+        kIndexHdrPeak,  // [WP-HDRPEAK]
         kIndexPhotoSeam, kIndexPhotoStrength, kIndexSeamInset,  // [WP-PHOTO]
         kIndexSeamBlend, kIndexParallaxBlend, kIndexSeamSmoothing, kIndexNearOffset, kIndexFarOffset,  // [WP-SEAMTOOLS]
         kIndexLensShading, kIndexShadingStrength,  // [WP-VIGNETTE]
@@ -345,7 +347,8 @@ TEST_CASE("the two groups are balanced and every control is inside the intended 
 
     // The four top-level controls really are top level, and the seven grouped
     // ones really are one level in.
-    for (const int index : {kIndexColorOutput, kIndexRec709Look, kIndexOutputSize, kIndexStabilization}) {
+    for (const int index : {kIndexColorOutput, kIndexRec709Look, kIndexHdrPeak, kIndexOutputSize,
+                            kIndexStabilization}) {
         INFO("top-level index " << index);
         CHECK(depthAt[static_cast<std::size_t>(index)] == 0);
     }
@@ -370,6 +373,7 @@ TEST_CASE("the popup item lists are the documented ones", "[sourcesettings][para
     // the whole string catches an insertion anywhere.
     const std::pair<int, const char*> expected[] = {
         {kIndexColorOutput, OSV_SS_COLOR_ITEMS},   {kIndexRec709Look, OSV_SS_LOOK_ITEMS},
+        {kIndexHdrPeak, OSV_SS_HDR_PEAK_ITEMS},  // [WP-HDRPEAK]
         {kIndexOutputSize, OSV_SS_SIZE_ITEMS},
         {kIndexStabilization, OSV_SS_STAB_ITEMS},  {kIndexCalibration, OSV_SS_CALIB_ITEMS},
         {kIndexDlogmFit, OSV_SS_FIT_ITEMS},        {kIndexRenderDevice, OSV_SS_DEVICE_ITEMS},
@@ -428,6 +432,7 @@ TEST_CASE("every control's default is PrefsBlob::defaults()", "[sourcesettings][
     CHECK(params[kIndexRenderDevice - 1].u.pd.dephault == static_cast<A_long>(defaults.renderDevice) + 1);
     CHECK(params[kIndexDirectColour - 1].u.pd.dephault == static_cast<A_long>(defaults.directColour) + 1);
     CHECK(params[kIndexRec709Look - 1].u.pd.dephault == static_cast<A_long>(defaults.look) + 1);  // [WP-LOOK]
+    CHECK(params[kIndexHdrPeak - 1].u.pd.dephault == static_cast<A_long>(defaults.hdrPeak) + 1);  // [WP-HDRPEAK]
 
     CHECK(params[kIndexSeamSearch - 1].u.bd.dephault == static_cast<A_long>(defaults.seamSearch));
     CHECK(params[kIndexGainMatch - 1].u.bd.dephault == static_cast<A_long>(defaults.gainMatch));
@@ -468,6 +473,7 @@ TEST_CASE("the popups list every value of their prefs enum", "[sourcesettings][p
         {kIndexRenderDevice, static_cast<int>(PrefsRenderDevice::Count)},
         {kIndexDirectColour, static_cast<int>(PrefsDirectColour::Count)},
         {kIndexRec709Look, static_cast<int>(PrefsLook::Count)},
+        {kIndexHdrPeak, static_cast<int>(PrefsHdrPeak::Count)},  // [WP-HDRPEAK]
         {kIndexPhotoSeam, static_cast<int>(PrefsPhotoSeam::Count)},  // [WP-PHOTO]
         {kIndexLensShading, static_cast<int>(PrefsLensShading::Count)},  // [WP-VIGNETTE]
     };
