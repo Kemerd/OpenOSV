@@ -45,6 +45,12 @@ endif()
 
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/test-output")
 
+# The GPU decoder tests drive the CUDA driver API directly (contexts,
+# pointer attributes, device-to-host downloads of the cached frames).
+if(OSV_ENABLE_CUDA AND TARGET CUDA::cuda_driver)
+  target_link_libraries(osv_tests PRIVATE CUDA::cuda_driver)
+endif()
+
 catch_discover_tests(osv_tests
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   PROPERTIES SKIP_RETURN_CODE 4
