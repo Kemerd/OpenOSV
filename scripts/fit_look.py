@@ -56,11 +56,13 @@ compression bends out-of-range values back in rather than cutting them.
 
 Stages were chosen by measurement, not by taste (see the report the script
 prints and docs in Look.h): a per-channel tone curve after a primaries matrix
-explains the reference's shadow saturation (a D-Log M colour 3 stops under
-grey renders with chroma ratios ten times wider than a ratio-preserving tone
-map would give), the display matrix explains its extra saturation in the
-mid-tones and the sky, the hue-preservation blend its orange-stays-orange
-highlights, and the gamut compression its non-zero minor channel on colours
+explains the reference's shadow saturation (an orange three stops under grey
+renders with display-light channel ratios of 1 : 0.265 : 0.001, against
+1 : 0.357 : 0.062 for a ratio-preserving rendering of the same colour, and the
+ratios drift with exposure, which only a per-channel curve does), the display
+matrix explains its extra saturation in the mid-tones and the sky, the
+hue-preservation blend its orange-stays-orange highlights, and the gamut
+compression its non-zero minor channel on colours
 far outside Rec.709 ((1.0, 0.4, 0.4) renders with 0.19 of green where a
 matrix and clamp give 0).  Additive-model tests in three domains show the
 reference is not separable in any single domain, which is why no two-stage
@@ -539,7 +541,8 @@ def main():
     ap.add_argument("--fit-pixels", type=int, default=20000, help="sample pixels used inside the fit")
     ap.add_argument("--knots", type=int, default=MAX_KNOTS, help="tone knots (2..%d)" % MAX_KNOTS)
     ap.add_argument("--max-nfev", type=int, default=600, help="solver evaluation budget per pass")
-    ap.add_argument("--restarts", type=int, default=8, help="extra solver passes from the last solution")
+    ap.add_argument("--restarts", type=int, default=0,
+                    help="extra solver passes from the last solution (0 reproduces the shipped constants)")
     ap.add_argument("--json", help="write the fitted constants and the report here")
     args = ap.parse_args()
 
