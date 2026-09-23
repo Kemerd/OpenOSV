@@ -70,8 +70,13 @@ extern "C" {
  *       seamLowDevice) and OsvRenderParams its seam smoothing block; the
  *       direct kernel takes the low band as a new argument after the photo
  *       table.  A version-2 effect meeting a version-3 importer (or the
- *       reverse) refuses the engine, as above. */
-#define OSV_ENGINE_ABI_VERSION 3u
+ *       reverse) refuses the engine, as above.
+ *    4  OsvRenderParams grew by the lens shading block (WP-VIGNETTE:
+ *       shadeEnabled, the knot geometry, the strength and two OsvShadeLens,
+ *       1064 bytes); no new table or entry point - the correction travels
+ *       inside OsvEngineFrame::stitch.  A version-3 effect meeting a
+ *       version-4 importer (or the reverse) refuses the engine, as above. */
+#define OSV_ENGINE_ABI_VERSION 4u
 
 /** Module file name of the importer that exports the engine. */
 #define OSV_ENGINE_MODULE_NAME L"OpenOSVImporter.prm"
