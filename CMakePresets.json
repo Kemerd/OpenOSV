@@ -91,6 +91,53 @@
         "OSV_WARNINGS_AS_ERRORS": "ON",
         "VCPKG_INSTALL_OPTIONS": "--clean-after-build"
       }
+    },
+    {
+      "name": "macos-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "arm64-osx-openosv",
+        "VCPKG_HOST_TRIPLET": "arm64-osx",
+        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/triplets",
+        "VCPKG_INSTALLED_DIR": "${sourceDir}/vcpkg_installed",
+        "VCPKG_MANIFEST_MODE": "ON",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "13.3",
+        "OSV_ENABLE_CUDA": "OFF",
+        "OSV_ENABLE_OPENCL": "OFF"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
+    },
+    {
+      "name": "macos-release",
+      "displayName": "macOS arm64 Release (AppleClang, Ninja)",
+      "inherits": "macos-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "macos-debug",
+      "displayName": "macOS arm64 Debug (AppleClang, Ninja)",
+      "inherits": "macos-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "macos-premiere-release",
+      "displayName": "macOS arm64 Release + Premiere Pro plug-ins (AppleClang, Ninja)",
+      "inherits": "macos-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "OSV_BUILD_PREMIERE": "ON",
+        "OSV_PREMIERE_SDK_DIR": "${sourceDir}/Premiere Pro 26.0 C++ SDK",
+        "OSV_AE_SDK_DIR": "${sourceDir}/third_party/ae-sdk"
+      }
+    },
+    {
+      "name": "ci-macos",
+      "displayName": "CI (GitHub Actions macos-14, arm64)",
+      "inherits": "macos-release"
     }
   ],
   "buildPresets": [
@@ -100,7 +147,11 @@
     { "name": "windows-msvc-premiere-release", "configurePreset": "windows-msvc-premiere-release" },
     { "name": "windows-msvc-premiere-debug",   "configurePreset": "windows-msvc-premiere-debug" },
     { "name": "windows-vs2022-cuda",       "configurePreset": "windows-vs2022-cuda", "configuration": "Release" },
-    { "name": "ci-windows",                "configurePreset": "ci-windows" }
+    { "name": "ci-windows",                "configurePreset": "ci-windows" },
+    { "name": "macos-release",             "configurePreset": "macos-release" },
+    { "name": "macos-debug",               "configurePreset": "macos-debug" },
+    { "name": "macos-premiere-release",    "configurePreset": "macos-premiere-release" },
+    { "name": "ci-macos",                  "configurePreset": "ci-macos" }
   ],
   "testPresets": [
     {
@@ -130,6 +181,24 @@
       "configurePreset": "ci-windows",
       "output": { "outputOnFailure": true },
       "filter": { "exclude": { "name": "cuda|opencl|hwaccel|ffmpeg-exe" } }
+    },
+    {
+      "name": "macos",
+      "configurePreset": "macos-release",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "macos-premiere",
+      "configurePreset": "macos-premiere-release",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    {
+      "name": "ci-macos",
+      "configurePreset": "ci-macos",
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
     }
   ]
 }

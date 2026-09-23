@@ -112,10 +112,14 @@ add_executable(osv_seam_carve_bench bench/SeamCarveBench.cpp)
 target_link_libraries(osv_seam_carve_bench PRIVATE ${_osv_test_libs})
 target_compile_definitions(osv_seam_carve_bench PRIVATE OSV_SAMPLE_FILE="${OSV_SAMPLE_FILE}")
 set_target_properties(osv_seam_carve_bench PROPERTIES FOLDER "tests")
-add_custom_command(TARGET osv_seam_carve_bench POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:osv_seam_carve_bench>
-          $<TARGET_FILE_DIR:osv_seam_carve_bench>
-  COMMAND_EXPAND_LISTS)
+# Runtime DLLs beside the executable: a Windows-only step (the list is empty
+# on RPATH platforms, where copy_if_different would have nothing to copy).
+if(WIN32)
+  add_custom_command(TARGET osv_seam_carve_bench POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:osv_seam_carve_bench>
+            $<TARGET_FILE_DIR:osv_seam_carve_bench>
+    COMMAND_EXPAND_LISTS)
+endif()
 
 # -----------------------------------------------------------------------------
 #  osv_flare_bench - what the sun ghost / veil removal finds, removes, damages
