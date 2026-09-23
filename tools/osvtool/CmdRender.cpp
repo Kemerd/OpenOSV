@@ -367,8 +367,9 @@ int runRender(const RenderOptions& o) {
     bool haveWarp = false;
     render::BlendSeam blendSeam;  // the carved seam in force (--seam-carve)
     // [WP-PHOTO] --photo: the parameters, the per-clip field history (EMA,
-    // cross-fade, accumulated rim - exactly the importer's) and the global
-    // gain in force, which a full field replaces and a refusal restores.
+    // cross-fade, the rim median over the run of buckets - exactly the
+    // importer's) and the global gain in force, which a full field replaces
+    // and a refusal restores.
     render::PhotoSeamParams photoParams;
     if (o.photo == "rim") {
         photoParams.mode = render::PhotoSeamMode::RimOnly;
@@ -444,6 +445,40 @@ int runRender(const RenderOptions& o) {
                 log::warn("frame {}: seam search failed: {}", f, profile.error().message);
             }
         }
+        // [WP-PHOTO] The photometric seam field for this frame, chosen BEFORE
+        // the carve like the importer does: its usable rim is the carved
+        // seam's Rim cost (SeamPenaltySlot::Rim), in force on this thread
+        // for the rest of the frame's analyses.  One measurement per bucket
+        // (the analysis blend, never the inset render blend), then the
+        // bucket's field cross-faded from the previous one.
+        std::shared_ptr<const render::PhotoSeamField> photoFrame;
+        if (photoParams.mode != render::PhotoSeamMode::Off) {
+            const std::uint32_t bucket = render::parallaxBucket(f);
+            if (!photoHistory.measured(bucket)) {
+                auto field = render::measurePhotoSeam(P.rig, pair.value(), P.blendParams, photoParams, *P.pool);
+                if (field.ok()) {
+                    const render::PhotoSeamField& pf = field.value();
+                    log::info("frame {}: photometric seam field in {:.1f} ms (bands {:.1f}), trusted {:.1f}%, usable "
+                              "rim {:.2f} / {:.2f} deg, median gain {:+.3f} / {:+.3f} / {:+.3f} stops",
+                              f, pf.bandMs + pf.statsMs, pf.bandMs,
+                              100.0 * static_cast<double>(pf.trustedPixels) / static_cast<double>(pf.bandPixels),
+                              pf.rimMedianDeg[0], pf.rimMedianDeg[1], pf.medianLog2Gain[0], pf.medianLog2Gain[1],
+                              pf.medianLog2Gain[2]);
+                    photoHistory.store(bucket, std::make_shared<const render::PhotoSeamField>(std::move(field).value()),
+                                       photoParams);
+                } else {
+                    log::warn("frame {}: photometric seam field refused ({}); keeping the inset and the global gain",
+                              f, log::safe(field.error().message));
+                    photoHistory.store(bucket, nullptr, photoParams);
+                }
+            }
+            photoFrame = photoHistory.fieldFor(f, photoParams);
+        }
+        if (photoFrame) {
+            render::installPhotoRimPenaltyHook();
+        }
+        const render::PhotoRimPenaltyScope photoRimScope(photoFrame ? &P.rig : nullptr, photoFrame);
+
         // The carved seam, through whichever correction is in force this
         // frame, steered by the previous one (frames render in order here).
         if (analyse && o.seamCarve) {
@@ -483,38 +518,15 @@ int runRender(const RenderOptions& o) {
             }
         }
         builder.gain(globalGain[0], globalGain[1]);
-        // [WP-PHOTO] The photometric seam field: one measurement per bucket
-        // (the analysis blend, never the inset render blend), then the
-        // bucket's field cross-faded from the previous one.  Applied, its rim
-        // replaces the inset and - in full mode - its gain the global one.
+        // [WP-PHOTO] Applied, the field's rim replaces the inset and - in full
+        // mode - its gain the global one.
         builder.clearPhoto();
         builder.blend(renderBlend, o.pipeline.blend);
-        if (photoParams.mode != render::PhotoSeamMode::Off) {
-            const std::uint32_t bucket = render::parallaxBucket(f);
-            if (!photoHistory.measured(bucket)) {
-                auto field = render::measurePhotoSeam(P.rig, pair.value(), P.blendParams, photoParams, *P.pool);
-                if (field.ok()) {
-                    const render::PhotoSeamField& pf = field.value();
-                    log::info("frame {}: photometric seam field in {:.1f} ms (bands {:.1f}), trusted {:.1f}%, usable "
-                              "rim {:.2f} / {:.2f} deg, median gain {:+.3f} / {:+.3f} / {:+.3f} stops",
-                              f, pf.bandMs + pf.statsMs, pf.bandMs,
-                              100.0 * static_cast<double>(pf.trustedPixels) / static_cast<double>(pf.bandPixels),
-                              pf.rimMedianDeg[0], pf.rimMedianDeg[1], pf.medianLog2Gain[0], pf.medianLog2Gain[1],
-                              pf.medianLog2Gain[2]);
-                    photoHistory.store(bucket, std::make_shared<const render::PhotoSeamField>(std::move(field).value()),
-                                       photoParams);
-                } else {
-                    log::warn("frame {}: photometric seam field refused ({}); keeping the inset and the global gain",
-                              f, log::safe(field.error().message));
-                    photoHistory.store(bucket, nullptr, photoParams);
-                }
-            }
-            if (const auto field = photoHistory.fieldFor(f, photoParams)) {
-                builder.photo(*field, photoParams);
-                builder.blend(P.blendParams, o.pipeline.blend);
-                if (photoParams.mode == render::PhotoSeamMode::RimAndGain) {
-                    builder.gain(Vec3d{1, 1, 1}, Vec3d{1, 1, 1});
-                }
+        if (photoFrame) {
+            builder.photo(*photoFrame, photoParams);
+            builder.blend(P.blendParams, o.pipeline.blend);
+            if (photoParams.mode == render::PhotoSeamMode::RimAndGain) {
+                builder.gain(Vec3d{1, 1, 1}, Vec3d{1, 1, 1});
             }
         }
         // The builder persists across frames, so both corrections are set

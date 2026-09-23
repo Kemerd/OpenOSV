@@ -1323,6 +1323,98 @@ TEST_CASE("stage 2: the photometric seam field thins the sky seam through the re
     CHECK(sumOn[3] <= 0.35 * sumOff[3]);
 }
 
+TEST_CASE("stage 2 on the importer's default stitch: parallax grid, carved seam, global gain", "[photoseam][sample]") {
+    // The research baseline above is the plain calibrated blend.  The
+    // importer's default stitch is the parallax grid plus WP-SEAM's carved
+    // seam (a narrow blend along a DP seam) plus the global gain; this is
+    // what the field changes for a user.  The carve sees the field's rim as
+    // its Rim cost, exactly as ImporterInstance::applyAnalyses arranges it.
+    OSV_REQUIRE_SAMPLE();
+    auto clip = openSampleClip();
+    REQUIRE(clip.ok());
+    auto reader = video::DualStreamReader::open(osvtest::sampleOsv(), clip.value().format);
+    REQUIRE(reader.ok());
+    ThreadPool pool;
+    const geom::BlendParams analysis;
+    const render::PhotoSeamParams P;
+    const render::MetricBandRequest req;
+    std::array<double, 4> sumOff{}, sumOn{};
+    for (const std::uint32_t frame : {0u, 32u, 64u}) {
+        auto pair = reader.value().read(frame);
+        REQUIRE(pair.ok());
+        // ---- the default analyses ------------------------------------------------
+        render::ParallaxWarpParams pw;
+        pw.backend = render::FlowBackendKind::Classical;
+        auto grid = render::buildParallaxWarp(clip.value().rig, pair.value(), analysis, pw, nullptr, pool);
+        REQUIRE(grid.ok());
+        render::WarpGridView view;
+        view.uv = grid.value().uv.data();
+        view.w = grid.value().w;
+        view.h = grid.value().h;
+        view.latMinRad = grid.value().latMinRad;
+        view.latMaxRad = grid.value().latMaxRad;
+        render::SeamCorrection correction;
+        correction.warp = &view;
+        auto gain = render::estimateGain(clip.value().rig, pair.value(), analysis, render::BandParams{}, pool);
+        REQUIRE(gain.ok());
+        auto field = render::measurePhotoSeam(clip.value().rig, pair.value(), analysis, P, pool);
+        REQUIRE(field.ok());
+        const auto shared = std::make_shared<const render::PhotoSeamField>(field.value());
+        // Production: carved without a rim; stage 2: carved with the field's
+        // rim as the Rim cost (the importer's order: field first, then carve).
+        auto carvedOff = render::carveSeam(clip.value().rig, pair.value(), analysis, pw.band, correction,
+                                           render::SeamCarveParams{}, nullptr, pool);
+        REQUIRE(carvedOff.ok());
+        render::installPhotoRimPenaltyHook();
+        Result<render::BlendSeam> carvedOn = [&] {
+            const render::PhotoRimPenaltyScope scope(&clip.value().rig, shared);
+            return render::carveSeam(clip.value().rig, pair.value(), analysis, pw.band, correction,
+                                     render::SeamCarveParams{}, nullptr, pool);
+        }();
+        REQUIRE(carvedOn.ok());
+
+        // ---- the two stitches -----------------------------------------------------
+        render::RenderParamsBuilder off;
+        off.rig(clip.value().rig).blend(analysis, true).gain(gain.value().gain[0], gain.value().gain[1]);
+        off.warp(grid.value().uv, grid.value().w, grid.value().h, grid.value().latMinRad, grid.value().latMaxRad);
+        render::RenderParamsBuilder on = off;
+        render::applyBlendSeam(off, carvedOff.value());
+        render::applyBlendSeam(on, carvedOn.value());
+        on.photo(*shared, P).gain(Vec3d{1, 1, 1}, Vec3d{1, 1, 1});
+        auto offBands = render::renderMetricBands(off, pair.value(), req, pool);
+        auto onBands = render::renderMetricBands(on, pair.value(), req, pool);
+        REQUIRE(offBands.ok());
+        REQUIRE(onBands.ok());
+        const std::vector<std::uint8_t> trust = render::rimTrustMask(offBands.value(), clip.value().rig, *shared);
+        auto mOff = render::skySeamMetrics(offBands.value(), trust, 0.20, 0.44);
+        auto mOn = render::skySeamMetrics(onBands.value(), trust, 0.20, 0.44);
+        REQUIRE(mOff.ok());
+        REQUIRE(mOn.ok());
+        const auto a = metricArray(mOff.value());
+        const auto b = metricArray(mOn.value());
+        WARN("frame " << frame << " default stitch (millistops) without -> with the field: line " << a[0] << " -> "
+                      << b[0] << ", band " << a[1] << " -> " << b[1] << ", broad " << a[2] << " -> " << b[2]
+                      << ", dE " << a[3] << " -> " << b[3]);
+        for (std::size_t k = 0; k < 4; ++k) {
+            sumOff[k] += a[k];
+            sumOn[k] += b[k];
+        }
+    }
+    WARN("default stitch over frames 0/32/64, with the field: line x" << ratio(sumOn[0], sumOff[0]) << ", band x"
+                                                                      << ratio(sumOn[1], sumOff[1]) << ", broad x"
+                                                                      << ratio(sumOn[2], sumOff[2]) << ", dE x"
+                                                                      << ratio(sumOn[3], sumOff[3]));
+    // Measured: line x0.71, band x0.98, broad x0.97, dE x0.34.  The carved
+    // seam's narrow blend already removes most of the band-scale bump the
+    // plain blend shows (band 51 vs 106 millistops), so what the field adds
+    // on this stitch is the thin line and the colour step; it must not make
+    // the band-scale terms worse.
+    CHECK(sumOn[0] <= 0.85 * sumOff[0]);
+    CHECK(sumOn[1] <= sumOff[1]);
+    CHECK(sumOn[2] <= sumOff[2]);
+    CHECK(sumOn[3] <= 0.50 * sumOff[3]);
+}
+
 TEST_CASE("stage 2 does no harm on texture: ground NCC with parallax, whole-band nccAfter", "[photoseam][sample]") {
     OSV_REQUIRE_SAMPLE();
     auto clip = openSampleClip();
