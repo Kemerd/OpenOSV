@@ -433,6 +433,57 @@ void logNode(const PrSDKVideoSegmentSuite& s, csSDK_int32 node, const char* role
                     static_cast<unsigned>(flags), props);
 }
 
+/// Log, once, whether the CUcontext Premiere hands GPU filters is its device's
+/// PRIMARY context.  If it is, the importer's CUDA work (which runs on the
+/// primary context through the runtime API) already shares an address space
+/// with the effect, and one decoder + VRAM frame cache can serve both paths;
+/// if not, device memory cannot cross between them and each needs its own.
+///
+/// cuDevicePrimaryCtxGetState is used first so the probe never CREATES a
+/// primary context that was not already alive (that would cost VRAM); only
+/// when one is active is it retained - briefly, to read its handle - and
+/// released again.
+void probeHostContext(CUcontext hostContext) noexcept {
+    try {
+        static std::atomic<bool> done{false};
+        if (!hostContext || done.exchange(true)) {
+            return;
+        }
+        ContextScope scope(hostContext);
+        if (!scope.ok()) {
+            return;
+        }
+        CUdevice device = 0;
+        if (cuCtxGetDevice(&device) != CUDA_SUCCESS) {
+            return;
+        }
+        unsigned int flags = 0;
+        int active = 0;
+        if (cuDevicePrimaryCtxGetState(device, &flags, &active) != CUDA_SUCCESS) {
+            return;
+        }
+        unsigned int apiVersion = 0;
+        (void)cuCtxGetApiVersion(hostContext, &apiVersion);
+        if (!active) {
+            PluginLog::info("reframe/gpu/source: host CUDA context {} on device {} (api {}); the device's primary "
+                            "context is NOT active, so the host context is a private one",
+                            static_cast<const void*>(hostContext), static_cast<int>(device), apiVersion);
+            return;
+        }
+        CUcontext primary = nullptr;
+        if (cuDevicePrimaryCtxRetain(&primary, device) != CUDA_SUCCESS) {
+            return;
+        }
+        PluginLog::info("reframe/gpu/source: host CUDA context {} on device {} (api {}) {} the primary context {} "
+                        "(flags 0x{:x})",
+                        static_cast<const void*>(hostContext), static_cast<int>(device), apiVersion,
+                        primary == hostContext ? "IS" : "is NOT", static_cast<const void*>(primary), flags);
+        (void)cuDevicePrimaryCtxRelease(device);
+    } catch (...) {
+        // Diagnostics must never take the effect down.
+    }
+}
+
 /// Log the sequence's working colour space - the space the frames an effect
 /// receives, and must return, are expressed in.  A direct render from the
 /// fisheyes bypasses Premiere's source -> working conversion, so it has to
@@ -918,6 +969,7 @@ prSuiteError createInstance(PrGPUFilterInstance* io) noexcept {
             delete inst;
             return suiteError_Fail;
         }
+        probeHostContext(inst->context);
 
         // ---- the kernel -------------------------------------------------
         inst->kernel = acquireKernel(io->inDeviceIndex, inst->context);
