@@ -103,6 +103,9 @@ constexpr PrTime kTicksPerFrame5994 = 4237833600LL;
     p.seamSearch = 0;
     p.gainMatch = 0;
     p.parallax = static_cast<std::uint8_t>(PrefsParallax::Off);
+    // [WP-PHOTO] the photometric seam field is an analysis too (measured
+    // from each path's own frames); the float-noise case below turns it on.
+    p.photoSeam = static_cast<std::uint8_t>(PrefsPhotoSeam::Off);
     // Horizon lock stays ON: it only rotates the equirect, identically in
     // both paths, and a stabilised frame is the realistic one.
     return p;
@@ -511,7 +514,9 @@ struct PathDifference {
     double meanInside = 0.0;           ///< Mean absolute channel difference over the band.
 };
 
-[[nodiscard]] PathDifference pathDifference(const Delivered& a, const Delivered& b) {
+/// `bandDeg` widens the band for an analysis that reaches further ([WP-PHOTO]
+/// the photometric gain field decays 20 degrees beyond its 9 degree rows).
+[[nodiscard]] PathDifference pathDifference(const Delivered& a, const Delivered& b, double bandDeg = 9.5) {
     REQUIRE(a.width == b.width);
     REQUIRE(a.height == b.height);
     PathDifference d;
@@ -520,7 +525,7 @@ struct PathDifference {
         const float* p = a.rgba.row(y);
         const float* q = b.rgba.row(y);
         for (std::uint32_t x = 0; x < a.width; ++x) {
-            const bool inside = std::fabs(seamLatitudeDeg(x, y, a.width, a.height)) <= 9.5;
+            const bool inside = std::fabs(seamLatitudeDeg(x, y, a.width, a.height)) <= bandDeg;
             float worst = 0.0f;
             for (int c = 0; c < 4; ++c) {
                 const float e = std::fabs(p[x * 4 + c] - q[x * 4 + c]);
@@ -575,11 +580,13 @@ TEST_CASE("with an analysis on, the two frame paths differ only by that analysis
         bool seam;
         bool gain;
         bool parallax;
+        bool photo;  ///< [WP-PHOTO] the sky seam fix (rim and gain field)
     };
     const Case cases[] = {
-        {"seam search", true, false, false},
-        {"parallax", false, false, true},
-        {"gain match", false, true, false},
+        {"seam search", true, false, false, false},
+        {"parallax", false, false, true, false},
+        {"gain match", false, true, false, false},
+        {"sky seam fix", false, false, false, true},  // [WP-PHOTO]
     };
     csSDK_int32 id = 311;
     for (const Case& c : cases) {
@@ -587,6 +594,7 @@ TEST_CASE("with an analysis on, the two frame paths differ only by that analysis
         prefs.seamSearch = c.seam ? 1 : 0;
         prefs.gainMatch = c.gain ? 1 : 0;
         prefs.parallax = static_cast<std::uint8_t>(c.parallax ? PrefsParallax::On : PrefsParallax::Off);
+        prefs.photoSeam = static_cast<std::uint8_t>(c.photo ? PrefsPhotoSeam::RimAndGain : PrefsPhotoSeam::Off);
         constexpr std::uint32_t kFrame = 20;
 
         Delivered gpu;
@@ -605,7 +613,9 @@ TEST_CASE("with an analysis on, the two frame paths differ only by that analysis
             REQUIRE(analysisOf(harness, clip, prefs).find(kHostPathLine) != std::string::npos);
         }
 
-        const PathDifference d = pathDifference(gpu, host);
+        // [WP-PHOTO] the field's rows span +-9 deg and its gain decays over
+        // 20 deg beyond them: nothing past 29 deg may differ.
+        const PathDifference d = pathDifference(gpu, host, c.photo ? 30.0 : 9.5);
         INFO(c.name << ": band pixels differing " << d.pixelsInside << " / " << d.bandPixels << " (worst "
                     << d.worstInside << ", mean " << d.meanInside << "), outside the band " << d.pixelsOutside
                     << " (worst " << d.worstOutside << ")");
@@ -613,6 +623,14 @@ TEST_CASE("with an analysis on, the two frame paths differ only by that analysis
             // Per-lens gains from slightly different bands: a global scale a
             // hair apart (measured 8e-6) - below half a 16-bit code anywhere.
             CHECK(d.worstOutside <= 0.5f / 32768.0f);
+            CHECK(d.worstInside <= 0.5f / 32768.0f);
+        } else if (c.photo) {
+            // [WP-PHOTO] The field from device bands on one path and host bands
+            // on the other: exactly nothing beyond its reach, and across it
+            // the two fields' float noise - a gain a hair apart, like the
+            // gain match (measured worst 1.0e-5, mean 3e-7): below half a
+            // 16-bit code anywhere.
+            CHECK(d.pixelsOutside == 0);
             CHECK(d.worstInside <= 0.5f / 32768.0f);
         } else if (c.seam) {
             // The seam table shifts every pixel of a column along its

@@ -994,8 +994,79 @@ TEST_CASE("PhotoSeamHistory glides between buckets and accumulates the rim", "[p
     history.trim(1, 1);
     CHECK(history.size() == 1u);
     CHECK(history.measured(1));
+    // The survivor keeps gliding from bucket 0's field though bucket 0 left.
+    auto afterTrim = history.fieldFor(render::kParallaxBucketFrames, P);
+    REQUIRE(afterTrim);
+    CHECK(afterTrim->gain == atFirst->gain);
     history.clear();
     CHECK(history.size() == 0u);
+}
+
+TEST_CASE("PhotoSeamHistory: a frame renders the same whatever was measured before or after it", "[photoseam]") {
+    // The direct path's Exact contract (plugins/reframe/DirectPath.cpp) and
+    // two live instances of one clip (tests/premiere/importer/test_reopen.cpp)
+    // need a frame's field to be a function of the frame, not of which other
+    // buckets happened to be measured first.
+    const render::PhotoSeamParams P;
+    const auto make = [](float scale, double rimDeg) {
+        auto f = std::make_shared<render::PhotoSeamField>(syntheticField(32, 6, scale));
+        f->rimMeasured.assign(f->rim.size(), static_cast<float>(deg2rad(rimDeg)));
+        return std::shared_ptr<const render::PhotoSeamField>(std::move(f));
+    };
+    const auto b0 = make(0.2f, 92.0);
+    const auto b1 = make(0.6f, 93.0);
+    const auto b2 = make(1.0f, 94.0);
+    const auto b4 = make(0.4f, 91.8);
+    const auto b5 = make(0.8f, 95.0);
+    constexpr std::uint32_t N = render::kParallaxBucketFrames;
+    const auto same = [](const std::shared_ptr<const render::PhotoSeamField>& x,
+                         const std::shared_ptr<const render::PhotoSeamField>& y) {
+        return x && y && x->gain == y->gain && x->rim == y->rim;
+    };
+
+    // Instance A renders frames 20 then 45, instance B frames 20, 5 then 45
+    // (the reopen test's order): frames 20 and 45 agree bit for bit.
+    render::PhotoSeamHistory a;
+    a.store(2, b2, P);
+    a.store(5, b5, P);
+    render::PhotoSeamHistory b;
+    b.store(2, b2, P);
+    b.store(0, b0, P);
+    b.store(5, b5, P);
+    CHECK(same(a.fieldFor(2 * N + 4, P), b.fieldFor(2 * N + 4, P)));
+    CHECK(same(a.fieldFor(5 * N + 5, P), b.fieldFor(5 * N + 5, P)));
+
+    // A bucket stored AFTER another never changes the other's frames: its
+    // glide partner, EMA and rim were fixed when it was stored.
+    const auto frame20 = a.fieldFor(2 * N + 4, P);
+    const auto frame45 = a.fieldFor(5 * N + 5, P);
+    a.store(1, b1, P);
+    a.store(4, b4, P);
+    CHECK(same(a.fieldFor(2 * N + 4, P), frame20));
+    CHECK(same(a.fieldFor(5 * N + 5, P), frame45));
+
+    // Stored in order (playback), a bucket glides from its predecessor and
+    // carries the median rim of the run: bucket 2 after 0 and 1 has
+    // median(92, 93, 94) = 93 deg for both lenses.
+    render::PhotoSeamHistory played;
+    played.store(0, b0, P);
+    played.store(1, b1, P);
+    played.store(2, b2, P);
+    const auto last2 = played.fieldFor(3 * N - 1, P);
+    const auto first2 = played.fieldFor(2 * N, P);
+    REQUIRE(last2);
+    REQUIRE(first2);
+    CHECK_FALSE(same(first2, last2));
+    for (std::uint32_t g = 0; g < last2->w; ++g) {
+        for (int lens = 0; lens < 2; ++lens) {
+            CHECK_THAT(render::photoRimDegAt(*last2, lens, cellLonRad(*last2, g)),
+                       Catch::Matchers::WithinAbs(93.0, 1e-3));
+        }
+    }
+    // Out of order, the same bucket has no run before it: its own rim.
+    const auto alone = a.fieldFor(3 * N - 1, P);
+    REQUIRE(alone);
+    CHECK_THAT(render::photoRimDegAt(*alone, 0, 0.0), Catch::Matchers::WithinAbs(94.0, 1e-3));
 }
 
 // ===========================================================================

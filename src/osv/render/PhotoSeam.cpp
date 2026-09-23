@@ -1433,55 +1433,89 @@ void PhotoRimAccumulator::clear() noexcept {
 void PhotoSeamHistory::store(std::uint32_t bucket, const std::shared_ptr<const PhotoSeamField>& measured,
                              const PhotoSeamParams& params) {
     if (!measured || !measured->valid()) {
-        m_fields[bucket] = nullptr;  // a refusal: not measured again
+        m_fields[bucket] = Entry{};  // a refusal: not measured again
         return;
     }
-    m_rim.add(*measured);
-    PhotoSeamField stored = *measured;
-    // EMA against the previous bucket's STORED field, so noise from one
-    // measurement is carried at temporalAlpha weight rather than in full.
-    const double alpha = std::isfinite(params.temporalAlpha) ? std::clamp(params.temporalAlpha, 0.0, 1.0) : 1.0;
-    if (bucket > 0 && alpha < 1.0) {
-        if (const auto it = m_fields.find(bucket - 1); it != m_fields.end() && it->second) {
-            auto ema = blendPhotoSeamFields(*it->second, *measured, alpha);
-            if (ema.ok()) {
-                stored = std::move(ema).value();
-            }
+    // ---- the previous bucket AS STORED NOW ----------------------------------
+    // Everything below reads only what is stored at this moment and is then
+    // frozen into this bucket's entry, so a bucket measured later can never
+    // change how this one's frames render (see the class comment).
+    std::shared_ptr<const PhotoSeamField> previous;
+    if (bucket > 0) {
+        if (const auto it = m_fields.find(bucket - 1); it != m_fields.end()) {
+            previous = it->second.field;  // null when that bucket was refused
         }
     }
-    // The bucket carries the clip's accumulated rim AS IT STANDS NOW, so
-    // fieldFor() cross-fades the rim between buckets exactly like the gain.
-    // Applying the accumulator at render time instead made every newly
-    // measured bucket move every frame's rim at once (0.85 deg in one step
-    // on the sample, while the median settled).
-    m_rim.apply(stored, params);
-    m_fields[bucket] = std::make_shared<const PhotoSeamField>(std::move(stored));
+
+    // ---- EMA against the previous bucket's STORED field ---------------------
+    // Noise from one measurement is carried at temporalAlpha weight rather
+    // than in full.  The EMA keeps `measured`'s raw rim (rimMeasured).
+    PhotoSeamField stored = *measured;
+    const double alpha = std::isfinite(params.temporalAlpha) ? std::clamp(params.temporalAlpha, 0.0, 1.0) : 1.0;
+    if (previous && alpha < 1.0) {
+        auto ema = blendPhotoSeamFields(*previous, *measured, alpha);
+        if (ema.ok()) {
+            stored = std::move(ema).value();
+        }
+    }
+
+    // ---- the rim: running median over the contiguous run before this bucket -
+    // Walk back while buckets are stored (a refusal continues the run but has
+    // no rim to add; the first bucket never stored ends it), then feed the
+    // accumulator oldest first so its per-column depth keeps the newest.
+    // The bucket carries this rim as a snapshot, so fieldFor() cross-fades
+    // the rim between buckets exactly like the gain; applying an accumulator
+    // at render time instead moved every frame's rim whenever any bucket was
+    // added (0.85 deg in one step on the sample, while the median settled).
+    std::vector<const PhotoSeamField*> run;
+    run.reserve(kRimChainBuckets);
+    for (std::uint32_t d = 1; d <= kRimChainBuckets && d <= bucket; ++d) {
+        const auto it = m_fields.find(bucket - d);
+        if (it == m_fields.end()) {
+            break;
+        }
+        if (it->second.field) {
+            run.push_back(it->second.field.get());
+        }
+    }
+    PhotoRimAccumulator rim;
+    for (auto older = run.rbegin(); older != run.rend(); ++older) {
+        rim.add(**older);
+    }
+    rim.add(*measured);
+    rim.apply(stored, params);
+
+    // ---- freeze the entry ------------------------------------------------------
+    Entry entry;
+    entry.field = std::make_shared<const PhotoSeamField>(std::move(stored));
+    entry.from = std::move(previous);
+    m_fields[bucket] = std::move(entry);
 }
 
 bool PhotoSeamHistory::measured(std::uint32_t bucket) const { return m_fields.find(bucket) != m_fields.end(); }
 
 std::shared_ptr<const PhotoSeamField> PhotoSeamHistory::fieldFor(std::uint32_t frame,
                                                                  const PhotoSeamParams& params) const {
-    const std::uint32_t bucket = parallaxBucket(frame);
-    const auto own = m_fields.find(bucket);
-    if (own == m_fields.end() || !own->second) {
+    (void)params;  // everything was fixed when the bucket was stored
+    const auto own = m_fields.find(parallaxBucket(frame));
+    if (own == m_fields.end() || !own->second.field) {
         return nullptr;
     }
-    (void)params;  // the rim was fixed when the bucket was stored
-    // The last frame of a bucket is its own field, exactly: no copy.
-    if (bucket == 0 || parallaxCrossfadeWeight(frame) >= 1.0) {
-        return own->second;
+    const Entry& e = own->second;
+    // No glide partner (the first bucket, or none stored before this one),
+    // or the last frame of a bucket: its own field exactly, no copy.
+    const double w = parallaxCrossfadeWeight(frame);
+    if (!e.from || w >= 1.0) {
+        return e.field;
     }
-    // Glide from the previous bucket's field inside this bucket - the
-    // parallax grid's schedule, so every per-bucket correction moves
-    // together - gain AND rim (each bucket carries its rim snapshot).
-    if (const auto prev = m_fields.find(bucket - 1); prev != m_fields.end() && prev->second) {
-        auto blended = blendPhotoSeamFields(*prev->second, *own->second, parallaxCrossfadeWeight(frame));
-        if (blended.ok()) {
-            return std::make_shared<const PhotoSeamField>(std::move(blended).value());
-        }
+    // Glide from the previous bucket's field (as it was when this bucket was
+    // stored) inside this bucket - the parallax grid's schedule, so every
+    // per-bucket correction moves together - gain AND rim.
+    auto blended = blendPhotoSeamFields(*e.from, *e.field, w);
+    if (blended.ok()) {
+        return std::make_shared<const PhotoSeamField>(std::move(blended).value());
     }
-    return own->second;
+    return e.field;
 }
 
 std::shared_ptr<const PhotoSeamField> PhotoSeamHistory::nearest(std::uint32_t bucket, std::uint32_t maxBuckets,
@@ -1495,9 +1529,9 @@ std::shared_ptr<const PhotoSeamField> PhotoSeamHistory::nearest(std::uint32_t bu
                 continue;
             }
             const std::uint32_t b = sign < 0 ? bucket - d : bucket + d;
-            if (const auto it = m_fields.find(b); it != m_fields.end() && it->second) {
+            if (const auto it = m_fields.find(b); it != m_fields.end() && it->second.field) {
                 (void)params;  // the stored field already carries its rim
-                return it->second;
+                return it->second.field;
             }
         }
     }
@@ -1517,10 +1551,7 @@ void PhotoSeamHistory::trim(std::size_t limit, std::uint32_t keep) {
     }
 }
 
-void PhotoSeamHistory::clear() {
-    m_fields.clear();
-    m_rim.clear();
-}
+void PhotoSeamHistory::clear() { m_fields.clear(); }
 
 // ===========================================================================
 //  Stage 2: metrics trust mask

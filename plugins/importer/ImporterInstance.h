@@ -678,7 +678,9 @@ private:
     // thread (a band shade plus a few ms of statistics per bucket), so no
     // worker ever touches it.
 
-    /// Per-bucket fields (EMA'd) and the clip's accumulated usable rim.
+    /// Per-bucket fields, each frozen when stored (EMA, accumulated usable
+    /// rim and glide partner), so a frame renders the same whatever else was
+    /// rendered first.
     render::PhotoSeamHistory m_photo;
     /// The rig the fields were measured with (intrinsics and extrinsics,
     /// flattened); a different rig - another calibration set, a protector

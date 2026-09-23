@@ -366,10 +366,11 @@ struct RgbLensBands {
 /// field, lens index or column count.
 [[nodiscard]] std::vector<float> photoRimColumnsDeg(const PhotoSeamField& field, int lens, std::uint32_t columns);
 
-/// Per-clip usable-rim estimate: per column and lens, the running median of
-/// the last kHistory accepted measurements (the rim is a static property of
-/// the lens and its mount, section 1.2).  Columns never measured inherit the
-/// clip-wide median of the measured ones.
+/// Usable-rim estimate over a run of buckets: per column and lens, the
+/// running median of the last kHistory accepted measurements (the rim is a
+/// static property of the lens and its mount, section 1.2).  Columns never
+/// measured inherit the median of the measured ones.  PhotoSeamHistory feeds
+/// it the contiguous run of buckets stored before the one being stored.
 class PhotoRimAccumulator {
 public:
     static constexpr std::size_t kHistory = 15;
@@ -398,15 +399,31 @@ private:
 /// so an osvtool A/B shows the picture a user gets).
 ///
 ///   * store(bucket, measured): an EMA against the previous bucket's STORED
-///     field (temporalAlpha); the rim is fed to the accumulator and the
-///     stored field carries the accumulated rim as it stands then;
+///     field (temporalAlpha), and the rim replaced by the running median
+///     (PhotoRimAccumulator) over the contiguous run of buckets stored
+///     before this one plus this one;
 ///   * fieldFor(frame): the bucket's field cross-faded from the previous
 ///     bucket's (parallaxCrossfadeWeight, exactly like the parallax grid),
 ///     gain and rim alike, so neither steps at a bucket edge.
 ///
+/// Determinism: everything a bucket's frames render with - its EMA, its rim
+/// and the field it glides from - is fixed when the bucket is STORED, from
+/// what was stored before it at that moment.  A bucket measured later never
+/// changes it.  So a frame renders identically every time it is asked for,
+/// whatever is rendered in between (the direct path's Exact contract, and
+/// two instances of one clip rendering the same frame agree).  A clip-wide
+/// accumulator applied at render time broke exactly that: its median
+/// depended on every bucket any earlier request happened to measure.  In
+/// sequential playback - buckets stored in order - the two are the same.
+///
 /// Not thread-safe; the importer holds its instance lock around it.
 class PhotoSeamHistory {
 public:
+    /// How far back store() walks the contiguous run for the rim median, in
+    /// buckets: four times the median's depth, so a column measured only
+    /// every few buckets (texture gating) still gathers a full history.
+    static constexpr std::uint32_t kRimChainBuckets = 4u * static_cast<std::uint32_t>(PhotoRimAccumulator::kHistory);
+
     /// Record bucket `bucket`'s measurement; nullptr records a refusal (the
     /// bucket is not measured again, and renders without a field).
     void store(std::uint32_t bucket, const std::shared_ptr<const PhotoSeamField>& measured,
@@ -420,21 +437,26 @@ public:
     [[nodiscard]] std::shared_ptr<const PhotoSeamField> fieldFor(std::uint32_t frame,
                                                                  const PhotoSeamParams& params) const;
 
-    /// The nearest ACCEPTED bucket's field (with the accumulated rim) within
-    /// `maxBuckets` of `bucket`, earlier first - the stand-in for a draft.
+    /// The nearest ACCEPTED bucket's stored field (with its accumulated rim)
+    /// within `maxBuckets` of `bucket`, earlier first.
     [[nodiscard]] std::shared_ptr<const PhotoSeamField> nearest(std::uint32_t bucket, std::uint32_t maxBuckets,
                                                                 const PhotoSeamParams& params) const;
 
     /// Bound the cache: beyond `limit` entries the lowest buckets go (never
-    /// `keep`; then the highest).  The rim accumulator is kept.
+    /// `keep`; then the highest).  A kept bucket keeps the field it glides
+    /// from even when that bucket's own entry goes.
     void trim(std::size_t limit, std::uint32_t keep);
 
     void clear();
     [[nodiscard]] std::size_t size() const noexcept { return m_fields.size(); }
 
 private:
-    std::map<std::uint32_t, std::shared_ptr<const PhotoSeamField>> m_fields;
-    PhotoRimAccumulator m_rim;
+    /// One bucket as stored.  Both pointers are fixed at store() time.
+    struct Entry {
+        std::shared_ptr<const PhotoSeamField> field;  ///< Its own field; null records a refusal.
+        std::shared_ptr<const PhotoSeamField> from;   ///< The previous bucket's field then, or null: no glide.
+    };
+    std::map<std::uint32_t, Entry> m_fields;
 };
 
 /// The research's trust mask for skySeamMetrics's colour term: both lenses'
