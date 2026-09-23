@@ -2,7 +2,8 @@
 
 Every band file is RGBA float32, h x w, scene-linear light; theta.f32 holds
 (theta0, theta1) in degrees per pixel.  Latitude of band row y is
-90 - (row0 + y + 0.5) * 180 / mapH (polar-axis layout: +lat towards lens 0).
+90 - (row0 + y + 0.5) * 180 / mapH (polar-axis layout: +lat is towards lens 1,
+the master, on the sample clip - measure_mismatch.py checks it from theta).
 """
 import json
 import os
@@ -37,7 +38,7 @@ def theta():
 
 
 def lat_deg():
-    """Latitude of every band row, degrees (+ = towards lens 0)."""
+    """Latitude of every band row, degrees (+ = towards lens 1 on the sample clip)."""
     m = meta()
     rows = np.arange(m["h"], dtype=np.float64) + m["row0"] + 0.5
     return 90.0 - rows * 180.0 / m["mapH"]

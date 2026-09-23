@@ -142,6 +142,23 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 const OsvRenderParams& p = params.value();
+                // Lens intrinsics as the kernel receives them (stream pixels),
+                // for relating band angles back to fisheye radii.
+                {
+                    std::ofstream lj(outDir + "/lenses.json");
+                    lj << "[";
+                    for (int L = 0; L < 2; ++L) {
+                        const OsvLens& q = p.lens[L];
+                        lj << (L ? "," : "") << "{\"fx\":" << q.fx << ",\"fy\":" << q.fy << ",\"cx\":" << q.cx
+                           << ",\"cy\":" << q.cy << ",\"k\":[" << q.k[0] << "," << q.k[1] << "," << q.k[2] << ","
+                           << q.k[3] << "," << q.k[4] << "],\"thetaMax\":" << q.thetaMax << ",\"R\":[";
+                        for (int i = 0; i < 9; ++i) {
+                            lj << (i ? "," : "") << q.R[i];
+                        }
+                        lj << "],\"w\":" << q.width << ",\"h\":" << q.height << "}";
+                    }
+                    lj << "]\n";
+                }
                 std::vector<float> th(static_cast<std::size_t>(bandH) * map.w * 2u);
                 for (int y = 0; y < bandH; ++y) {
                     for (int x = 0; x < map.w; ++x) {

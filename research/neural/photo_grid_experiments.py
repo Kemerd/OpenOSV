@@ -111,7 +111,8 @@ def main():
     ov = tmax - 90.0
     cols = np.zeros(w, bool)
     cols[int(0.20 * w):int(0.44 * w)] = True
-    names = ["prod", "rim", "col-d8", "col-d20", "grid-d20", "offset-d20", "col-anchor0-d20"]
+    names = ["prod", "rim", "col-d8", "col-d20", "grid-d20", "offset-d20", "col-anchor0-d20",
+             "fallback-inset95+gain"]
     acc = {n: [] for n in names}
     outdir = os.path.join(bandio.BANDS, "exp")
     os.makedirs(outdir, exist_ok=True)
@@ -158,6 +159,21 @@ def main():
         a, b = L0, L1 * np.exp(-d * k(1, 20))
         res["col-anchor0-d20"] = blend(a, b, wr0, wr1)
         pr["col-anchor0-d20"] = (a, b)
+        # Zero-plumbing fallback: what existing BlendParams + GainEstimate can
+        # already express - both lenses' FOV weight ends at 95 deg with a
+        # 3 deg feather (lensFovDeg 190, featherDeg 3), and ONE symmetric RGB
+        # gain per lens estimated from trusted pixels only.
+        fi0 = np.where(th[..., 0] > 95.0, 0.0, smoothstep((95.0 - th[..., 0]) / 3.0)) * occ0
+        fi1 = np.where(th[..., 1] > 95.0, 0.0, smoothstep((95.0 - th[..., 1]) / 3.0)) * occ1
+        dead = (fi0 + fi1) <= 1e-4
+        fi0, fi1 = np.where(dead, w0, fi0), np.where(dead, w1, fi1)
+        tr95 = cov & (th[..., 0] < 94.5) & (th[..., 1] < 94.5)
+        m0 = np.array([L0[..., c][tr95].mean() for c in range(3)])
+        m1 = np.array([L1[..., c][tr95].mean() for c in range(3)])
+        g0 = np.clip(np.sqrt(m1 / m0), 0.5, 2.0)
+        a, b = L0 * g0, L1 / g0
+        res["fallback-inset95+gain"] = blend(a, b, fi0, fi1)
+        pr["fallback-inset95+gain"] = (a, b)
         for n in names:
             acc[n].append(metrics(res[n], lat, cols, pr[n][0], pr[n][1], trust))
         rows_det, rows_img = [], []
