@@ -64,7 +64,9 @@
 
 .PARAMETER StageDir
     The folder produced by the build (OSV_PLUGIN_STAGE_DIR, by default
-    <build>\plugins\OpenOSV).  When omitted the script looks for the newest
+    <build>\plugins\OpenOSV).  When omitted the script uses
+    <package>\plugins\OpenOSV when it runs from a release package
+    (scripts\package_release.ps1), and otherwise looks for the newest
     plugins\OpenOSV under <repo>\build\*.
 
 .PARAMETER Destination
@@ -251,6 +253,20 @@ function Invoke-Elevated {
 # ---------------------------------------------------------------------------
 function Find-StageDir {
     $repoRoot = Split-Path -Parent $PSScriptRoot
+
+    # A release package (scripts\package_release.ps1) ships the modules in
+    # <package>\plugins\OpenOSV, next to this script's scripts\ folder.  In a
+    # source checkout that folder does not exist - <repo>\plugins holds the
+    # plug-in SOURCES - and the module check keeps it that way even if a
+    # stray folder of that name ever appeared there.
+    $packaged = Join-Path $repoRoot 'plugins\OpenOSV'
+    if (Test-Path -LiteralPath $packaged -PathType Container) {
+        $present = @($script:PluginFiles | Where-Object { Test-Path -LiteralPath (Join-Path $packaged $_) })
+        if ($present.Count -gt 0) {
+            return $packaged
+        }
+    }
+
     $buildRoot = Join-Path $repoRoot 'build'
     if (-not (Test-Path -LiteralPath $buildRoot)) {
         throw "No -StageDir given and '$buildRoot' does not exist. Build the plug-ins first (see docs/BUILDING.md) or pass -StageDir."

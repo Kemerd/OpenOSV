@@ -8,6 +8,8 @@ ref/
 
 # ---- build outputs ----
 build/
+# release packages (scripts/package_release.ps1)
+dist/
 # disposable research probes' binaries (research/*/build_*.cmd)
 research/*/bin/
 out/
