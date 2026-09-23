@@ -148,6 +148,46 @@ sibling), tests under `tests/premiere/reframe/`.
   direct render has the same framing (geometric alignment within 0.5 px,
   measured) and is at least as sharp (higher high-frequency energy); a
   CPU-reference twin of the kernel agrees with the GPU to PSNR >= 60 dB.
+* **Settled interface** (done; `plugins/reframe/DirectRender.h`,
+  `DirectLaunch.h`, `DirectKernelAbi.h`):
+
+  ```cpp
+  struct StitchState {                  // one source frame
+      OsvRenderParams equirect;         // the importer's equirect block for the frame: exactly
+                                        // RenderParamsBuilder.rig.color.blend.alphaCoverage.gain
+                                        // .seam|.warp.stabilization(stabilizationFor(i))
+                                        // .equirect(Standard).buildParams()
+      const float* seamTable;           // device ptr (GPU) / host ptr (CPU twin), or null
+      const float* warpGrid;            // same rule
+  };
+  DirectSetup buildDirectParams(const Settings&, const StitchState&, int outW, int outH,
+                                SizePx sequenceSize) noexcept;          // valid / DirectReject
+  DirectLaunchResult launchDirect(CUfunction kernel /* kDirectKernelName */, CUstream stream,
+                                  const DirectSetup&, const OsvPlane devicePlanes[2],
+                                  const DirectOutput& out /* data, rowBytes, w, h, isHalf */) noexcept;
+  bool renderDirectCpu(const DirectSetup&, const OsvPlane hostPlanes[2], const FrameView& dst,
+                       ThreadPool*) noexcept;                           // CPU twin / fallback
+  ```
+
+  The kernel `osvReframeDirectKernel` lives in the effect's existing fatbin
+  (`cuModuleGetFunction(module, kDirectKernelName)` on the module GpuFilter
+  already loads); planes come from `render::fillDevicePlane()` of the P010
+  frames. The camera is `buildView()` - the function `buildParams()` uses -
+  and `Rout = R_stab * Rout_view`, where `R_stab` is the equirect block's own
+  Rout (an equirect block has no camera). No `osv_kernel.h` change was
+  needed: the viewport is always the whole frame and the cover-fit is folded
+  into `focalPx`; `buildDirectParams` refuses a sub-rectangle viewport so that
+  assumption cannot fail silently. `launchDirect` checks every plane, table
+  and output address with `cuPointerGetAttribute` (device memory, this
+  device, inside its allocation) before launching; WP-D should log a
+  `DirectLaunchReject` and fall back to the equirect path.
+* **Measured** (RTX 5090, sample clip, `tests/premiere/reframe/test_direct.cpp`):
+  framing error <= 0.0016 output px over 8 views x 2 stabilisations
+  (negative control 453 px); sample-clip NCC 0.9995-0.9999 with the peak at
+  zero offset (sub-pixel <= 0.044 px); mean gradient 1.04-1.12x the two-step
+  render (1.12x at 40 deg); GPU vs CPU twin 95-112 dB (32f and 16f, seam table
+  and warp grid, NVDEC zero-copy frames); kernel 0.26-0.29 ms at 2560x1440,
+  0.65-0.76 ms at 3840x2160.
 
 ### WP-D  Engine ABI, registry and effect integration (lead)
 
