@@ -24,6 +24,7 @@ add_executable(osv_importer_tests
   test_importer.cpp
   test_engine.cpp
   test_prefs_mapping.cpp
+  test_reopen.cpp
   "${CMAKE_SOURCE_DIR}/plugins/importer/PrefsMapping.cpp"
 )
 

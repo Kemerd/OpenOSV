@@ -27,6 +27,7 @@
 #include "osv/meta/FormatDetector.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
+#include "osv/video/ReaderPool.h"
 #if defined(OSV_HAVE_CUDA)
 #include "osv/render/CudaAnalysis.h"
 #endif
@@ -188,6 +189,76 @@ void ensureGpuAnalyses() noexcept {
         // a noexcept function honest on a path reached from a C boundary.
     }
 #endif
+}
+
+// ---------------------------------------------------------------------------
+//  Reader helpers (ensureReader / releaseHeavy)
+// ---------------------------------------------------------------------------
+
+/// True when every track the reader will decode carries the configuration
+/// record (hvcC for the native lenses, avcC for the LRF proxy) that the
+/// container-sample feed primes libavcodec with.  Every camera-written clip
+/// does; a remuxed file might not, and then libavformat demuxes it instead.
+[[nodiscard]] bool containerSamplesUsable(const OsvFile* file, const meta::FormatInfo& format) noexcept {
+    if (!file) {
+        return false;
+    }
+    // The same track selection DualStreamReader::open makes.
+    std::array<std::uint32_t, 2> tracks{format.videoTrackIds[0], format.videoTrackIds[1]};
+    if (format.sideBySideProxy) {
+        const std::uint32_t t = format.videoTrackIds[0] != 0 ? format.videoTrackIds[0] : 1u;
+        tracks = {t, t};
+    }
+    for (const std::uint32_t id : tracks) {
+        const TrackInfo* track = id != 0 ? file->track(id) : nullptr;
+        if (!track || !track->isVideo() || (!track->hevc() && !track->avc())) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The options the importer opens its reader with on one back-end.
+///
+/// Measured on the sample clip (osv_decoder_open_bench, D3D11VA, both lenses;
+/// the machine was shared with parallel builds, so ratios matter more than
+/// absolute numbers):
+///
+///   * useContainerSamples - frame index == sample index == djmd index by
+///     construction, and no libavformat probe of all seven streams (only
+///     ~3 ms here, but it grows with the metadata tracks).
+///   * shareHwDevice - creating a D3D11 device cost ~120 ms per lens, more
+///     than everything else in open() together.  Shared, a re-open with any
+///     reader of any clip alive costs ~2 ms instead of ~160-280 ms.
+///   * deferFirstFrame - open() used to decode frame 0 (~100 ms) only to
+///     learn a size the hvcC parameter sets already state; the first real
+///     request paid for its own decode on top.
+///   * 4 threads on hardware - libavcodec's automatic count (16 on this
+///     32-core machine) gives every hardware decoder one surface per thread
+///     (36 per lens, ~1 GB of VRAM each at 3072x3072 P010) and a 16-deep
+///     pipeline to fill before the first picture.  Twelve scattered landings,
+///     both lenses, in the calmer runs:
+///
+///         threads   surfaces/lens   first landing   landings   sequential
+///         auto (16)      36            ~162 ms        ~52-57      ~8.0 ms/pair
+///         4              24            ~130-137 ms    ~45         ~8.2-8.6
+///         1              20            ~112-117 ms    ~45         ~10.8-10.9
+///
+///     Four keeps sequential decode where it was, makes random access and
+///     the first landing faster, and a parked reader holds a third less VRAM.
+///     Software keeps libavcodec's own count: there, frame threads are the
+///     whole speed.
+[[nodiscard]] video::DecoderOptions importerReaderOptions(video::HwAccel hw, bool containerSamples) noexcept {
+    // Hardware decoder threads (see the table above).
+    constexpr int kHardwareDecoderThreads = 4;
+    video::DecoderOptions opt;
+    opt.hw = hw;
+    opt.threads = (hw == video::HwAccel::None) ? 0 : kHardwareDecoderThreads;
+    opt.keepOnDevice = false;
+    opt.useContainerSamples = containerSamples;
+    opt.shareHwDevice = true;
+    opt.deferFirstFrame = true;
+    return opt;
 }
 
 }  // namespace
@@ -557,16 +628,44 @@ Status ImporterInstance::ensureReader() {
     }
     order.push_back(video::HwAccel::None);
 
+    // ---- how it is opened -------------------------------------------------
+    // The container-sample feed when the tracks allow it (every camera file
+    // does), libavformat otherwise; the rest of the choices and the numbers
+    // behind them are in importerReaderOptions().
+    const bool samples = containerSamplesUsable(m_file.get(), m_format);
+
+    // ---- where it comes from ------------------------------------------------
+    // Premiere quiets a clip it is not reading and wakes it seconds later, and
+    // opens a second instance of the clip on every Source Settings change.
+    // releaseHeavy() parks the reader in the process-wide pool instead of
+    // destroying it, so each back-end first asks the pool for a warm reader of
+    // this exact file version and options: no device, no surfaces, no codec
+    // set-up, and the decode position it had is kept.  Only a miss opens one.
+    // The pool is asked per back-end IN preference order, interleaved with
+    // the opens, so a parked software reader never displaces the hardware
+    // reader a fresh open would have produced.
+    video::ReaderPool& pool = video::ReaderPool::instance();
     Status lastError = okStatus();
     for (const video::HwAccel hw : order) {
-        video::DecoderOptions opt;
-        opt.hw = hw;
-        opt.threads = 0;  // software only: let libavcodec size its thread pool
-        opt.keepOnDevice = false;
+        const video::DecoderOptions opt = importerReaderOptions(hw, samples);
 
+        // ---- 1. a warm reader ------------------------------------------------
         const auto t0 = std::chrono::steady_clock::now();
+        std::unique_ptr<video::DualStreamReader> warm = pool.take(m_path, m_format, opt);
+        if (warm && warm->isOpen()) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            m_reader = std::move(warm);
+            const video::HevcStreamDecoder* d = m_reader->decoder(0);
+            const video::HwAccel active = d ? d->activeHw() : video::HwAccel::None;
+            PluginLog::info("video: '{}' decoding with {} (warm reader from the pool in {:.1f} ms)",
+                            m_path.filename().string(), video::hwAccelName(active), ms);
+            return okStatus();
+        }
+
+        // ---- 2. a new reader -------------------------------------------------
+        const auto t1 = std::chrono::steady_clock::now();
         auto reader = video::DualStreamReader::open(m_path, m_format, opt);
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
         if (!reader.ok()) {
             // Expected on a machine without that back-end; the next one is
             // tried, so this is informational rather than a warning.
@@ -577,13 +676,18 @@ Status ImporterInstance::ensureReader() {
         }
         m_reader = std::make_unique<video::DualStreamReader>(std::move(reader).value());
 
-        // The decoder may still have dropped to software inside open() (its
-        // get_format callback does when the GPU cannot decode this profile),
-        // so report what is really running, not what was asked for.
+        // The decoder may still drop to software on its first decode (its
+        // get_format callback does when the GPU cannot decode this profile);
+        // activeHw() reports that from then on.  Here it names what opened.
         const video::HevcStreamDecoder* d = m_reader->decoder(0);
         const video::HwAccel active = d ? d->activeHw() : video::HwAccel::None;
-        PluginLog::info("video: '{}' decoding with {} (opened in {:.0f} ms)", m_path.filename().string(),
-                        video::hwAccelName(active), ms);
+        const video::DecoderOpenTimings t = d ? d->openTimings() : video::DecoderOpenTimings{};
+        PluginLog::info("video: '{}' decoding with {} (opened in {:.0f} ms: device {:.0f} ms{}, codec {:.0f} ms, "
+                        "{}, first frame {})",
+                        m_path.filename().string(), video::hwAccelName(active), ms, t.hwDeviceMs,
+                        t.hwDeviceReused ? " shared" : "", t.codecOpenMs,
+                        opt.useContainerSamples ? "container samples" : "libavformat",
+                        t.firstFrameDeferred ? "deferred" : "probed");
         return okStatus();
     }
     // Software is always in the list, so reaching here means even it failed
@@ -617,6 +721,8 @@ Result<video::FramePair> ImporterInstance::readPair(std::uint32_t index) {
     PluginLog::warn("video: {} decoding failed on frame {} of '{}' ({}); switching this clip to software decoding",
                     video::hwAccelName(active), index, m_path.filename().string(), pair.error().message);
     m_hwDecodeFailed = true;
+    // Destroyed, NOT parked: a reader whose hardware just failed must never
+    // be handed to the next instance of this clip as a warm one.
     m_reader.reset();
     const Status reopened = ensureReader();
     if (!reopened.ok()) {
@@ -639,6 +745,19 @@ void ImporterInstance::releaseHeavy() noexcept {
     // they may reference.
     m_audio.reset();
     m_audioProbed = false;
+    // The reader is parked rather than destroyed: the next unquiet of this
+    // clip, or the next instance Premiere opens for it (every Source Settings
+    // change does), takes it back warm from the process-wide pool instead of
+    // paying for a new one.  The pool owns it from here - it decodes from its
+    // own shared mapping of the file, not from this instance's - and releases
+    // it after an idle minute, under memory pressure, or when a newer reader
+    // needs the room (video/ReaderPool.h).  A reader that is not open is
+    // simply destroyed by park().
+    if (m_reader) {
+        const bool parked = video::ReaderPool::instance().park(std::move(m_reader));
+        PluginLog::debug("video: '{}' reader {} on release", m_path.filename().string(),
+                         parked ? "parked in the pool" : "released");
+    }
     m_reader.reset();
     // The direct path's NVDEC decoders and their VRAM frame caches (up to
     // ~1.5 GB each): a quiet is exactly when that memory should go back.
