@@ -196,15 +196,21 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
             CHECK(translate(fixture, buffer).renderDevice == static_cast<std::uint8_t>(item - 1));
         }
     }
-    SECTION("Direct Path Colour") {
-        // [WP-SETTINGS] Match Colour Output -> 0 (MatchClip), Sequence
-        // Working Space -> 1 (WorkingSpace).
+    SECTION("Program Monitor Colour") {
+        // [WP-SETTINGS] "Sequence space (fast)" -> 0 (SequenceSpace, the
+        // default), "Match Source monitor" -> 1 (MatchSource).
         for (int item = 1; item <= OSV_SS_DIRECT_COLOUR_COUNT; ++item) {
             PrefsBuffer buffer;
             fixture.setPopup(kIndexDirectColour, item);
             INFO("popup value " << item);
             CHECK(translate(fixture, buffer).directColour == static_cast<std::uint8_t>(item - 1));
         }
+        PrefsBuffer first;
+        fixture.setPopup(kIndexDirectColour, 1);
+        CHECK(translate(fixture, first).directColourMode() == PrefsDirectColour::SequenceSpace);
+        PrefsBuffer second;
+        fixture.setPopup(kIndexDirectColour, 2);
+        CHECK(translate(fixture, second).directColourMode() == PrefsDirectColour::MatchSource);
     }
     SECTION("Seam Search") {
         for (const bool on : {false, true}) {
@@ -416,7 +422,7 @@ TEST_CASE("SEQUENCE_SETUP asks the importer and seeds the controls from the answ
     fromImporter.dlogmFit = static_cast<std::uint8_t>(PrefsDlogmFit::Pocket3);
     fromImporter.exposureStops = 1.5f;
     fromImporter.renderDevice = static_cast<std::uint8_t>(PrefsRenderDevice::Cuda);
-    fromImporter.directColour = static_cast<std::uint8_t>(PrefsDirectColour::WorkingSpace);
+    fromImporter.directColour = static_cast<std::uint8_t>(PrefsDirectColour::MatchSource);  // not the default
     REQUIRE(fromImporter.sanitise());
 
     const char* raw = reinterpret_cast<const char*>(&fromImporter);
@@ -597,7 +603,7 @@ TEST_CASE("the pure mapping round-trips every value of every field",
     }
 }
 
-TEST_CASE("the pure mapping round-trips the direct-path colour choice", "[sourcesettings][mapping]") {
+TEST_CASE("the pure mapping round-trips the Program Monitor Colour choice", "[sourcesettings][mapping]") {
     // [WP-SETTINGS]
     for (int item = 1; item <= OSV_SS_DIRECT_COLOUR_COUNT; ++item) {
         ControlValues c;

@@ -209,17 +209,18 @@
 #define OSV_SS_DEVICE_COUNT 4
 #define OSV_SS_DEVICE_DEFAULT 1
 
-/* [WP-SETTINGS] PrefsDirectColour: MatchClip, WorkingSpace.
+/* [WP-SETTINGS] "Program Monitor Colour" - PrefsDirectColour: SequenceSpace,
+ * MatchSource.
  *
- * What the Open 360 Reframe effect's direct path (rendering straight from the
- * fisheyes) does when this clip's Colour Output is not the sequence's working
- * colour space.  "Match Colour Output" hands such a clip to the equirect
- * route so the Program monitor shows exactly what Premiere's own conversion
- * of the chosen output looks like; "Sequence Working Space" renders it
- * straight into the working space with OpenOSV's conversion - sharper and
- * faster, but then Colour Output no longer changes the reframed picture.
- * Default 1 = Match (PrefsDirectColour::MatchClip is 0). */
-#define OSV_SS_DIRECT_COLOUR_ITEMS "Match Colour Output|Sequence Working Space"
+ * What Open 360 Reframe shows when this clip's Colour Output is not the
+ * sequence's working colour space.  "Sequence space (fast)" renders straight
+ * from the fisheyes into the working space with OpenOSV's own tone mapping -
+ * the fast, sharp route, and in a Rec.709 sequence the DJI-matched look.
+ * "Match Source monitor" hands such a clip to the importer's equirect so the
+ * Program monitor shows exactly Premiere's conversion of the chosen output,
+ * as the Source monitor does - slower and one resampling softer.
+ * Default 1 = Sequence space (PrefsDirectColour::SequenceSpace is 0). */
+#define OSV_SS_DIRECT_COLOUR_ITEMS "Sequence space (fast)|Match Source monitor"
 #define OSV_SS_DIRECT_COLOUR_COUNT 2
 #define OSV_SS_DIRECT_COLOUR_DEFAULT 1
 
@@ -268,7 +269,7 @@ namespace osv::premiere::sourcesettings {
 ///  10    D-Log M Curve
 ///  11    Exposure
 ///  12    Render Device
-///  13    Direct Path Colour   [WP-SETTINGS]
+///  13    Program Monitor Colour   [WP-SETTINGS]
 ///  14  (GROUP_END, Advanced)
 enum ParamIndex : int {
     kIndexColorOutput = 1,
@@ -317,7 +318,7 @@ inline constexpr int kValueParamCount = 10;
 inline constexpr const char* kParamNameByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
     "Colour Output", "Output Size",   "Stabilisation",      "Stitching", "Seam Search",
     "Exposure Match", "Calibration",  "",                   "Advanced",  "D-Log M Curve",
-    "Exposure",       "Render Device", "Direct Path Colour", "",
+    "Exposure",       "Render Device", "Program Monitor Colour", "",
 };
 
 }  // namespace osv::premiere::sourcesettings

@@ -10,7 +10,7 @@
 // to OpenOSVImporter.prm as a flat preferences blob.  It exists so the stitch
 // options (colour output, output size, stabilisation, seam search, exposure
 // match, calibration slot, D-Log M curve, exposure, render device, and the
-// reframe effect's direct-path colour rule) are simply VISIBLE, instead of
+// reframe effect's Program Monitor Colour) are simply VISIBLE, instead of
 // hiding behind the modal dialog in imGetPrefs8.
 //
 // How the two halves find each other: the importer sets
@@ -130,9 +130,9 @@ static_assert(kIndexAdvancedTopicEnd == OSV_SOURCE_SETTINGS_PARAM_COUNT,
 static_assert(kIndexStitchTopicEnd == kIndexCalibration + 1,
               "the Stitching group must close immediately after Calibration");
 static_assert(kIndexDirectColour == kIndexRenderDevice + 1,
-              "Direct Path Colour follows Render Device inside the Advanced group");
+              "Program Monitor Colour follows Render Device inside the Advanced group");
 static_assert(kIndexAdvancedTopicEnd == kIndexDirectColour + 1,
-              "the Advanced group must close immediately after Direct Path Colour");
+              "the Advanced group must close immediately after Program Monitor Colour");
 static_assert(kParamIdByIndex[kIndexColorOutput - 1] == OSV_SS_ID_COLOR_OUTPUT,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
 static_assert(kParamIdByIndex[kIndexRenderDevice - 1] == OSV_SS_ID_RENDER_DEVICE,
@@ -502,13 +502,14 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Render Device", OSV_SS_DEVICE_COUNT, OSV_SS_DEVICE_DEFAULT, OSV_SS_DEVICE_ITEMS, kStaticFlags,
                   OSV_SS_ID_RENDER_DEVICE);
 
-    // ---- 13. Direct Path Colour [WP-SETTINGS] ------------------------------
-    // Whether Open 360 Reframe may render this clip straight from the
-    // fisheyes when its Colour Output is not the sequence's working space
-    // (see OSV_SS_DIRECT_COLOUR_ITEMS).  Static like every control here: it
-    // reaches the effect through the same flat blob.
+    // ---- 13. Program Monitor Colour [WP-SETTINGS] --------------------------
+    // What Open 360 Reframe shows when this clip's Colour Output is not the
+    // sequence's working space: the scene rendered straight into it (fast,
+    // the default) or Premiere's own conversion of the output (matches the
+    // Source monitor) - see OSV_SS_DIRECT_COLOUR_ITEMS.  Static like every
+    // control here: it reaches the effect through the same flat blob.
     AEFX_CLR_STRUCT(def);
-    PF_ADD_POPUPX("Direct Path Colour", OSV_SS_DIRECT_COLOUR_COUNT, OSV_SS_DIRECT_COLOUR_DEFAULT,
+    PF_ADD_POPUPX("Program Monitor Colour", OSV_SS_DIRECT_COLOUR_COUNT, OSV_SS_DIRECT_COLOUR_DEFAULT,
                   OSV_SS_DIRECT_COLOUR_ITEMS, kStaticFlags, OSV_SS_ID_DIRECT_COLOUR);
 
     // ---- 14. Close the Advanced group --------------------------------------
@@ -682,7 +683,7 @@ static_assert(OSV_SS_FIT_COUNT == static_cast<int>(osv::premiere::PrefsDlogmFit:
 static_assert(OSV_SS_DEVICE_COUNT == static_cast<int>(osv::premiere::PrefsRenderDevice::Count),
               "the Render Device popup does not list every PrefsRenderDevice value");
 static_assert(OSV_SS_DIRECT_COLOUR_COUNT == static_cast<int>(osv::premiere::PrefsDirectColour::Count),
-              "the Direct Path Colour popup does not list every PrefsDirectColour value");
+              "the Program Monitor Colour popup does not list every PrefsDirectColour value");
 
 // ===========================================================================
 //  The exported entry point

@@ -214,11 +214,13 @@ TEST_CASE("a blob from an older build still deserialises", "[common][prefs]") {
     const PrefsBlob fresh = PrefsBlob::defaults();
     CHECK(fresh.parallaxEnabled());
 
-    // [WP-SETTINGS] The direct-path colour choice came out of the reserved
-    // block too; an older project's zero byte reads as MatchClip, which is
-    // also the default of a fresh blob.
-    CHECK(old.directColourMode() == PrefsDirectColour::MatchClip);
-    CHECK(fresh.directColourMode() == PrefsDirectColour::MatchClip);
+    // [WP-SETTINGS] Program Monitor Colour came out of the reserved block
+    // too; an older project's zero byte reads as Sequence space, which is
+    // also the default of a fresh blob - so existing projects get the direct
+    // path's speed without being touched.
+    CHECK(old.directColourMode() == PrefsDirectColour::SequenceSpace);
+    CHECK(fresh.directColourMode() == PrefsDirectColour::SequenceSpace);
+    CHECK(fresh.directColour == 0u);
 }
 
 TEST_CASE("PrefsBlob defaults match the documented table", "[common][prefs]") {
@@ -349,19 +351,23 @@ TEST_CASE("PrefsBlob sanitise clamps every out-of-range field", "[common][prefs]
         }
     }
 
-    SECTION("[WP-SETTINGS] a corrupt direct-path colour choice and dirty padding are repaired") {
+    SECTION("[WP-SETTINGS] a corrupt Program Monitor Colour and dirty padding are repaired") {
         PrefsBlob p = PrefsBlob::defaults();
         p.directColour = 0x7F;
         p.padBeforeSettings[0] = 0x01;
         p.padBeforeSettings[1] = 0xFF;
         REQUIRE_FALSE(p.sanitise());
-        CHECK(p.directColourMode() == PrefsDirectColour::MatchClip);
+        // A corrupt byte lands on the default, as a fresh blob would.
+        CHECK(p.directColourMode() == PrefsDirectColour::SequenceSpace);
         CHECK(p.padBeforeSettings[0] == 0);
         CHECK(p.padBeforeSettings[1] == 0);
         // Both valid values survive.
-        p.directColour = static_cast<std::uint8_t>(PrefsDirectColour::WorkingSpace);
+        p.directColour = static_cast<std::uint8_t>(PrefsDirectColour::MatchSource);
         REQUIRE(p.sanitise());
-        CHECK(p.directColourMode() == PrefsDirectColour::WorkingSpace);
+        CHECK(p.directColourMode() == PrefsDirectColour::MatchSource);
+        p.directColour = static_cast<std::uint8_t>(PrefsDirectColour::SequenceSpace);
+        REQUIRE(p.sanitise());
+        CHECK(p.directColourMode() == PrefsDirectColour::SequenceSpace);
     }
 }
 

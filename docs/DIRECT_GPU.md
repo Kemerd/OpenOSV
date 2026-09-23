@@ -391,34 +391,62 @@ log:
    sessions on the proxy.
 
 **Colour semantics.** On the equirect route the importer encodes its frame in
-the clip's colour output and Premiere converts that into the working space;
-the direct path renders straight into the working space, so Premiere's
-conversion never runs.
+the clip's colour output and Premiere converts that into the working space -
+what the Source monitor shows. The direct path renders straight from the
+fisheyes into the working space, so Premiere's conversion never runs. The
+clip's Source Setting **Program Monitor Colour** (`PrefsBlob::directColour`,
+offset 24; Source Settings effect, Advanced group) decides what happens when
+the colour output is not the working space:
 
 | Clip colour output \ working space | PQ | HLG | Rec.709 |
 |---|---|---|---|
-| PQ | direct, exact | equirect * | equirect * |
-| HLG | equirect * | direct, exact | equirect * |
-| Rec.709 | equirect * | equirect * | direct, exact |
+| PQ | direct, identical | direct, differs (S) / equirect (M) | direct, differs (S) / equirect (M) |
+| HLG | direct, differs (S) / equirect (M) | direct, identical | direct, differs (S) / equirect (M) |
+| Rec.709 | direct, differs (S) / equirect (M) | direct, differs (S) / equirect (M) | direct, identical |
 | D-Log M passthrough | equirect | equirect | equirect |
 
-"Exact": the engine's colour block is byte-identical to the importer's
-(`makeColorParams` with the same fit, transfer, exposure, input, range and
-bit depth - pinned for PQ, HLG and Rec.709 at exposure -1) and Premiere's
-source -> working conversion is the identity, so the pixels match the
-equirect route up to its second resampling (WP-C: NCC 0.9995-0.9999, framing
-<= 0.0016 px). "*": Premiere's own conversion - HDR -> SDR tone mapping with
-the clip's gamut-map controls (`ClipNode::GamutMapControls` in the field
-log), SDR placed at graphics white in an HDR container, HLG <-> PQ at its
-nominal peak - is not exposed by the SDK (the Colour Management Suite only
-describes spaces) and cannot be verified without the host, so no tolerance
-could honestly be stated; the equirect route keeps those clips unless the
-clip's new Source Setting **Direct Path Colour = Sequence Working Space**
-(`PrefsBlob::directColour`, offset 24; Source Settings effect, Advanced
-group) opts into the direct path's own conversion (the behaviour before this
-rule). D-Log M passthrough is always handed over: grading it would make a
-downstream LUT double-convert. `OSV_DIRECT_COLOR=working|match` overrides the
-per-clip choice process-wide for A/B sessions.
+(S) = **Sequence space (fast)**, the default - value 0, so new clips AND
+every older project's zero byte get it. (M) = **Match Source monitor**, the
+per-clip opt-in. `OSV_DIRECT_COLOR=working|match` overrides the per-clip
+choice process-wide for A/B sessions. Every route line in the log names the
+rule that chose it (`settings unknown`, `working space`, `same space`,
+`D-Log M passthrough`, `Sequence space (fast)`, `Match Source monitor`).
+
+* **Identical** (the diagonal, rule "same space"): the engine's colour block is
+  byte-identical to the importer's (`makeColorParams` with the same fit,
+  transfer, exposure, input, range and bit depth - pinned for PQ, HLG,
+  Rec.709 and the passthrough at exposure -1) and Premiere's source -> working
+  conversion is the identity, so the Program monitor matches the Source
+  monitor route up to that route's second resampling (WP-C: NCC
+  0.9995-0.9999, framing <= 0.0016 px); the direct render is the sharper one.
+* **Differs, by design** (off the diagonal, default): PQ, HLG and Rec.709 are
+  three encodings of one scene, and the direct path renders that scene
+  straight into the working space with OpenOSV's own tone mapping - the
+  colour-managed answer, just not Premiere's generic conversion. The Source
+  monitor shows Premiere's conversion of the importer's frame: HDR -> SDR
+  tone mapping with the clip's gamut-map controls (`ClipNode::GamutMapControls`
+  in the field log), SDR placed at graphics white (203 nits) in an HDR
+  container, HLG <-> PQ at its nominal peak. The SDK exposes none of that (the
+  Colour Management Suite only describes spaces), so the two monitors differ
+  by however far Premiere's tone mapper is from ours. In the user's everyday
+  setup - PQ clips (the default output) in Rec.709 sequences (every installed
+  preset's working space is "BT.709 RGB Full") - the Program monitor
+  therefore shows OpenOSV's Rec.709 rendering, the DJI Studio look WP-LOOK is
+  matching, while the Source monitor shows Premiere's PQ -> 709 tone map.
+  Choosing Rec.709 as the colour output makes both monitors agree; "Match
+  Source monitor" makes the Program monitor follow Premiere instead, at the
+  cost of the direct path's speed and sharpness.
+* **D-Log M passthrough**: the importer declares the log signal as "BT.2020
+  RGB Full (Scene)" (SEI build: primaries 9, transfer 2 "unspecified";
+  `PrefsMapping.cpp`), deliberately never 709 (that would present flat log
+  as a finished picture). None of the working spaces the direct path
+  produces (PQ 9/16, HLG 9/18, Rec.709 1/1-6-14-15; `transferForSeiCodes`) is
+  that space, so "same space" can never apply and the clip always takes the
+  equirect route: its look is Premiere's interpretation, and grading it would
+  make a downstream LUT double-convert. Were a working space ever equal to
+  the passthrough's own encoding, the generic "same space" rule would render
+  it exactly - the engine test pins that the passthrough colour block is then
+  byte-identical to the importer's.
 
 **ABI (not bumped; the lead bumps once at merge).** `OsvEngineClipSettings`
 (structSize, generation, clipTransfer, exposureStops, colorOutput,
@@ -436,9 +464,17 @@ direct: kept Source Settings generation 2 ... instance #3 is older and holds ...
 direct: engine now renders 'clip.OSV' with Source Settings generation 2: ... (was ...)
 reframe/direct: 'clip.OSV' media node hash {GUID}, mod state ..., clip id 14434
 reframe/direct: 'clip.OSV' media node CHANGED - hash ... (was ...)            (if Premiere's identity moves)
-reframe/direct: 'clip.OSV' Source Settings generation 2 (colour PQ, exposure -1.00 stops, ...)
-        in a Rec.709 sequence -> equirect route: ... (or -> straight from the fisheyes: ...)
+reframe/direct: 'clip.OSV' Source Settings generation 2 (colour PQ, exposure -1.00 stops, ...,
+        Program Monitor Colour Sequence space (fast); file ...) in a Rec.709 sequence
+        -> straight from the fisheyes (rule: Sequence space (fast)): rendering the scene straight
+        into the Rec.709 working space with OpenOSV's tone mapping; the Source monitor shows
+        Premiere's own PQ -> Rec.709 conversion, so the two differ
 ```
+
+(The last line is verbatim from the settings-change end-to-end test, apart
+from the working space; the other rules read `(rule: same space)`,
+`(rule: Match Source monitor)`, `(rule: D-Log M passthrough)`,
+`(rule: settings unknown)` and `(rule: working space)`.)
 
 The effect's generation line appears on the FIRST render after each change,
 so it is the proof that Premiere re-rendered; a publish line without it would
@@ -450,17 +486,18 @@ newest instance's settings).
 
 **Known limitations and hand-offs.** Two master clips of the same file with
 different Source Settings share one set on the direct path (the newest
-instance's). The modal dialog (`SourceSettingsDialog.cpp` / `PrefsMapping.cpp`,
-WP-CALIB) calls `RefreshFileAsync` only when it has an instance
-(`imGetInstancePrefs`), not from `imGetPrefs8`; it has no Direct Path Colour
-combo yet, and because `prefsFromControls` rebuilds the blob from
+instance's). Handed to WP-CALIB: the modal dialog (`SourceSettingsDialog.cpp`
+/ `PrefsMapping.cpp`) calls `RefreshFileAsync` only when it has an instance
+(`imGetInstancePrefs`), not from `imGetPrefs8`; it has no Program Monitor
+Colour combo yet, and because `prefsFromControls` rebuilds the blob from
 `PrefsBlob::defaults()`, clicking OK resets every field it shows no control
-for (Direct Path Colour, and already parallax / flow backend) - it should
-start from the incoming blob. The connection-space override in
-`imGetSourceVideo` (host selects "BT.709 RGB Full") goes through
-`applyPrefsLocked` and is therefore published like a user change
-(WP-IMPORTER). Effects placed BEFORE Open 360 Reframe on the clip are
-bypassed by the direct path (it never reads its input frame).
+for (Program Monitor Colour - now onto its default, so harmless unless the
+user chose Match Source monitor - and already parallax / flow backend).
+Handed to WP-IMPORTER: the connection-space override in `imGetSourceVideo`
+(host selects "BT.709 RGB Full") goes through `applyPrefsLocked` and is
+therefore published like a user change. Effects placed BEFORE Open 360
+Reframe on the clip are bypassed by the direct path (it never reads its
+input frame).
 
 ## Rules for every package
 

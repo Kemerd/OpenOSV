@@ -122,24 +122,28 @@ enum class PrefsParallax : std::uint8_t {
     Count
 };
 
-/// [WP-SETTINGS] How the reframe effect's direct path (docs/DIRECT_GPU.md)
-/// treats a clip whose colour output is not the sequence's working space.
+/// [WP-SETTINGS] "Program Monitor Colour": how the reframe effect's direct
+/// path (docs/DIRECT_GPU.md) treats a clip whose colour output is not the
+/// sequence's working space.
 ///
 /// The direct path renders straight from the fisheyes into the working
 /// space, so Premiere's conversion of the importer's frame never runs.  When
-/// the colour output IS the working space the two routes agree exactly; when
-/// it is not, only Premiere knows its own conversion (tone mapping, SDR in an
-/// HDR container, log interpretation), and this choice decides who renders.
+/// the colour output IS the working space the two routes agree exactly.
+/// When it is not, PQ, HLG and Rec.709 are still three encodings of the same
+/// scene, and rendering that scene straight into the working space with
+/// OpenOSV's own tone mapping is the colour-managed answer - it just is not
+/// Premiere's generic conversion, which is what the Source monitor shows.
 /// Persisted, so append-only.
 enum class PrefsDirectColour : std::uint8_t {
-    /// Hand such a clip to the equirect route, so the Program monitor shows
-    /// exactly what the Source monitor route produces.  The default (and
-    /// what the zero bytes of an older project read as).
-    MatchClip = 0,
-    /// Render it straight into the working space with OpenOSV's own
-    /// conversion: sharper and faster, but the colour output choice no longer
-    /// changes the reframed picture.
-    WorkingSpace = 1,
+    /// Render straight into the sequence's working space with OpenOSV's own
+    /// conversion: the direct path's speed and sharpness for every graded
+    /// colour output.  The default - and what the zero byte of an older
+    /// project reads as.
+    SequenceSpace = 0,
+    /// Hand a clip whose colour output is not the working space to the
+    /// equirect route, so the Program monitor shows exactly what Premiere's
+    /// own conversion makes of it (the Source monitor route).
+    MatchSource = 1,
     Count
 };
 
@@ -190,7 +194,7 @@ struct PrefsBlob {
     /// docs/PARALLEL_WORK.md); the lead folds it into the fields that own
     /// offsets 22-23 at merge.  Zero, and zeroed by sanitise().
     std::uint8_t padBeforeSettings[2] = {};
-    std::uint8_t directColour = 0;     ///< [WP-SETTINGS] PrefsDirectColour (0 = MatchClip).
+    std::uint8_t directColour = 0;     ///< [WP-SETTINGS] PrefsDirectColour (0 = SequenceSpace).
     std::uint8_t reserved[103] = {};   ///< Zero; future fields.
 
     /// A blob with every field at its documented default.
@@ -283,7 +287,7 @@ struct PrefsBlob {
                   static_cast<std::uint8_t>(PrefsFlowBackend::Auto));
         // [WP-SETTINGS] Zero is the default, so a corrupt byte lands there too.
         clampEnum(directColour, static_cast<std::uint8_t>(PrefsDirectColour::Count),
-                  static_cast<std::uint8_t>(PrefsDirectColour::MatchClip));
+                  static_cast<std::uint8_t>(PrefsDirectColour::SequenceSpace));
         for (std::uint8_t& b : padBeforeSettings) {
             if (b != 0) {
                 b = 0;
@@ -360,7 +364,7 @@ static_assert(offsetof(PrefsBlob, parallax) == 20, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, flowBackend) == 21, "PrefsBlob layout drifted");
 // [WP-SETTINGS] owns offsets 24-25 (docs/PARALLEL_WORK.md); 22-23 are padding
 // here until the lead folds in the package that owns them.  An older blob's
-// zero byte reads as PrefsDirectColour::MatchClip, the default.
+// zero byte reads as PrefsDirectColour::SequenceSpace, the default.
 static_assert(offsetof(PrefsBlob, directColour) == 24, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, reserved) == 25, "PrefsBlob layout drifted");
 

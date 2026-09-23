@@ -24,6 +24,7 @@
 //     exactness the effect's colour rule relies on.
 
 #include "ImporterHarness.h"
+#include "ImporterPlugin.h"
 
 #include "OsvEngineAbi.h"
 
@@ -211,14 +212,15 @@ TEST_CASE("Source Settings reach the engine whatever the path spelling, keyed by
     REQUIRE(clip.open());
     imFileInfoRec8 info{};
     PrefsBlob prefs = withExposure(-1.0f);
-    prefs.directColour = static_cast<std::uint8_t>(osv::premiere::PrefsDirectColour::WorkingSpace);
+    // The non-default Program Monitor Colour, so the field is seen to travel.
+    prefs.directColour = static_cast<std::uint8_t>(osv::premiere::PrefsDirectColour::MatchSource);
     REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
 
     const OsvEngineClipSettings canonical = query(api, clipPath.wstring());
     CHECK(canonical.generation > before.generation);
     CHECK(canonical.exposureStops == -1.0f);
-    // The per-clip direct-path colour choice travels with the settings.
-    CHECK(canonical.directColour == static_cast<std::uint8_t>(osv::premiere::PrefsDirectColour::WorkingSpace));
+    // The per-clip Program Monitor Colour choice travels with the settings.
+    CHECK(canonical.directColour == static_cast<std::uint8_t>(osv::premiere::PrefsDirectColour::MatchSource));
     // The identity was readable, and it is what the block reports.
     CHECK((canonical.fileVolume != 0u || canonical.fileIndex != 0u));
 
@@ -458,16 +460,48 @@ TEST_CASE("each frame reports the Source Settings it was rendered with, and matc
             CHECK(own.stitch.color.exposureGain == Catch::Approx(0.5f));
         }
 
-        // The working space equal to the clip's output - the only case the
-        // effect's rule lets the direct path render - gives a byte-identical
-        // block: no conversion anywhere, same pixels as the equirect route.
-        if (c.transfer != OSV_TRANSFER_PASSTHROUGH) {
+        // A working space equal to the clip's own output - the effect's
+        // "same space" rule - gives a byte-identical block: no conversion
+        // anywhere, same pixels as the equirect route.  The passthrough is
+        // included: were a sequence ever to work in the passthrough's own
+        // encoding, the direct path would reproduce the importer's log codes
+        // exactly (no working space the effect produces is that encoding - see
+        // the declaration test below - so in practice it takes the equirect
+        // route).
+        {
             OsvEngineFrame working{};
             acquire(frameIndex++, c.transfer, working);
             CHECK(std::memcmp(&working.stitch.color, &own.stitch.color, sizeof(OsvColorParams)) == 0);
+            CHECK(std::memcmp(&working.stitch.color, &expected, sizeof(OsvColorParams)) == 0);
             CHECK(working.settings.generation == own.settings.generation);
             api.release(working.lease, nullptr);
         }
         api.release(own.lease, nullptr);
     }
+}
+
+TEST_CASE("the D-Log M passthrough is declared as no working space the direct path produces",
+          "[importer][engine][settings]") {
+    // The effect's rules route passthrough clips to the equirect route
+    // because their declared colour space never equals a working space the
+    // direct path renders (PQ = SEI 9/16, HLG = 9/18, Rec.709 = 1/1-6-14-15;
+    // DirectPathSettings' transferForSeiCodes, pinned in the reframe tests).
+    // This pins the importer's half of that argument: the SEI build declares
+    // BT.2020 primaries with the "unspecified" transfer, and the token build
+    // "BT.2020 RGB Full (Scene)" (test_prefs_mapping.cpp pins the token and
+    // that it is never the 709 / PQ / HLG one).
+    PrefsBlob passthrough = PrefsBlob::defaults();
+    passthrough.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::DLogM);
+    const osv::premiere::SeiCodes codes = osv::premiere::seiCodesFor(passthrough);
+    CHECK(codes.primaries == 9);
+    CHECK(codes.transfer == 2);
+    CHECK(std::string(osv::premiere::colorSpaceTokenFor(passthrough)) == "BT.2020 RGB Full (Scene)");
+    // The graded outputs, by contrast, ARE the working spaces they name.
+    PrefsBlob pq = PrefsBlob::defaults();
+    CHECK(osv::premiere::seiCodesFor(pq).primaries == 9);
+    CHECK(osv::premiere::seiCodesFor(pq).transfer == 16);
+    PrefsBlob rec709 = PrefsBlob::defaults();
+    rec709.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::Rec709);
+    CHECK(osv::premiere::seiCodesFor(rec709).primaries == 1);
+    CHECK(osv::premiere::seiCodesFor(rec709).transfer == 1);
 }

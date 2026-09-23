@@ -113,9 +113,10 @@ typedef struct OsvEngineClipSettings {
     uint8_t calibration;   /**< The raw PrefsCalibration value. */
     uint8_t dlogmFit;      /**< The raw PrefsDlogmFit value. */
     uint8_t stabilization; /**< The raw PrefsStabilization value. */
-    /** The raw PrefsDirectColour value: 0 = hand a clip whose colour output
-     *  is not the working space to the equirect route, 1 = render it in the
-     *  working space anyway. */
+    /** The raw PrefsDirectColour value ("Program Monitor Colour"): 0 =
+     *  render every graded colour output straight into the working space
+     *  (the default), 1 = hand a clip whose colour output is not the working
+     *  space to the equirect route (match the Source monitor). */
     uint8_t directColour;
     uint8_t reservedSettings[3]; /**< Zero; keeps the 64-bit fields below naturally aligned. */
     /** Identity of the file the settings belong to (volume serial and file

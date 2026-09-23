@@ -80,15 +80,13 @@ namespace {
     // frame decide, one decode later.
     found.querySettings =
         reinterpret_cast<OsvEngineQuerySettingsFn>(GetProcAddress(module, OSV_ENGINE_SYM_QUERY_SETTINGS));
-    ColourMode forced = ColourMode::MatchClip;
+    ColourMode forced = ColourMode::SequenceSpace;
     const bool overridden = colourModeOverride(forced);
     PluginLog::info("reframe/direct: the importer's engine is available (ABI {}, Source Settings query {}, "
-                    "direct-path colour {})",
+                    "Program Monitor Colour {}{})",
                     version, found.querySettings ? "yes" : "no",
-                    !overridden ? "per clip (Source Settings)"
-                    : forced == ColourMode::FollowWorkingSpace
-                        ? "forced to the working space by OSV_DIRECT_COLOR"
-                        : "forced to match the clip by OSV_DIRECT_COLOR");
+                    overridden ? colourModeLabel(forced) : "per clip (Source Settings)",
+                    overridden ? " for every clip (OSV_DIRECT_COLOR)" : "");
     return found;
 }
 
@@ -464,18 +462,15 @@ int workingTransfer(const PrSDKSequenceInfoSuite* sequence, int sequenceVersion,
         }
         // The spaces the colour pipeline can produce exactly, by the H.273
         // codes: PQ and HLG on BT.2020 primaries, BT.709 on BT.709.  (First
-        // real session: primaries 9, transfer 16 - Rec.2100 PQ.)
+        // real session: primaries 9, transfer 16 - Rec.2100 PQ.)  The table
+        // is [WP-SETTINGS] transferForSeiCodes(), shared with the Source
+        // Settings rules so both agree on which spaces exist.
         const int primaries = sei.colorPrimariesCode;
         const int transfer = sei.transferCharacteristicCode;
         reason = "working space: primaries " + std::to_string(primaries) + ", transfer " + std::to_string(transfer);
-        if (primaries == 9 && transfer == 16) {
-            return OSV_TRANSFER_PQ;
-        }
-        if (primaries == 9 && transfer == 18) {
-            return OSV_TRANSFER_HLG;
-        }
-        if (primaries == 1 && (transfer == 1 || transfer == 6 || transfer == 14 || transfer == 15)) {
-            return OSV_TRANSFER_REC709;
+        const int produced = transferForSeiCodes(primaries, transfer);
+        if (produced >= 0) {
+            return produced;
         }
         reason += " - not one the direct path produces";
         return -1;

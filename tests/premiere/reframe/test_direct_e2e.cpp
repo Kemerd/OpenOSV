@@ -981,14 +981,12 @@ TEST_CASE("the direct path serves exactly the working spaces it can produce", "[
     };
 
     // ---- produced: PQ and HLG on BT.2020, BT.709 ------------------------------------
-    // [WP-SETTINGS] The clip's Source Settings ask the direct path to render
-    // in the working space whatever the clip's own colour output (the
-    // per-clip "Direct Path Colour" opt-in), so every space it can produce is
-    // served straight from the fisheyes.
-    PrefsBlob followWorking = PrefsBlob::defaults();
-    followWorking.directColour = static_cast<std::uint8_t>(osv::premiere::PrefsDirectColour::WorkingSpace);
-    auto publishedFollow = publishSourceSettings(harness, e2eSampleClipPath(), followWorking, 40);
-    REQUIRE(publishedFollow.open());
+    // [WP-SETTINGS] The clip's default Source Settings - PQ output, Program
+    // Monitor Colour "Sequence space (fast)" - so every space the path can
+    // produce is served straight from the fisheyes, the user's everyday
+    // PQ-clip-in-a-Rec.709-sequence included.
+    auto publishedDefaults = publishSourceSettings(harness, e2eSampleClipPath(), PrefsBlob::defaults(), 40);
+    REQUIRE(publishedDefaults.open());
     const std::vector<float> pq = renderUnder(kPrRec2100PQ);
     const std::vector<float> hlg = renderUnder(kPrRec2100HLG);
     const std::vector<float> rec709 = renderUnder(kPrRec709);
@@ -999,19 +997,38 @@ TEST_CASE("the direct path serves exactly the working spaces it can produce", "[
     CHECK(maxAbsDifference(pq, hlg) > 0.01);
     CHECK(maxAbsDifference(pq, rec709) > 0.01);
 
-    // ---- [WP-SETTINGS] the default: only the clip's own colour output ----------------
-    // With the default "match the colour output", a PQ clip is served
-    // directly only in a PQ sequence; in HLG and Rec.709 sequences Premiere's
-    // own conversion of the importer's PQ frame is the faithful picture, so
-    // the equirect route keeps it.  (A newer importer instance publishes, as
-    // Premiere's does after a Source Settings change.)
-    auto publishedMatch = publishSourceSettings(harness, e2eSampleClipPath(), PrefsBlob::defaults(), 41);
+    // ---- [WP-SETTINGS] the opt-in: Match Source monitor --------------------------------
+    // A PQ clip is then served directly only in a PQ sequence; in HLG and
+    // Rec.709 sequences Premiere's own conversion of the importer's PQ frame
+    // is what the user asked for, so the equirect route keeps it.  (A newer
+    // importer instance publishes, as Premiere's does after a Source
+    // Settings change.)
+    PrefsBlob matchSource = PrefsBlob::defaults();
+    matchSource.directColour = static_cast<std::uint8_t>(osv::premiere::PrefsDirectColour::MatchSource);
+    auto publishedMatch = publishSourceSettings(harness, e2eSampleClipPath(), matchSource, 41);
     REQUIRE(publishedMatch.open());
     const std::vector<float> pqMatch = renderUnder(kPrRec2100PQ);
     CHECK(drawnBy(pqMatch) == DrawnBy::Direct);
     CHECK(maxAbsDifference(pqMatch, pq) == 0.0);  // the same picture either way when the spaces agree
     CHECK(drawnBy(renderUnder(kPrRec2100HLG)) == DrawnBy::Equirect);
     CHECK(drawnBy(renderUnder(kPrRec709)) == DrawnBy::Equirect);
+
+    // ---- [WP-SETTINGS] the D-Log M passthrough: never the direct path -----------------
+    // Declared as BT.2020 RGB Full (Scene), which none of these spaces is.
+    PrefsBlob passthrough = PrefsBlob::defaults();
+    passthrough.colorOutput = static_cast<std::uint8_t>(osv::premiere::PrefsColorOutput::DLogM);
+    auto publishedLog = publishSourceSettings(harness, e2eSampleClipPath(), passthrough, 42);
+    REQUIRE(publishedLog.open());
+    for (const char* space : {kPrRec2100PQ, kPrRec2100HLG, kPrRec709}) {
+        INFO("passthrough in " << space);
+        CHECK(drawnBy(renderUnder(space)) == DrawnBy::Equirect);
+    }
+
+    // Back to the defaults (a yet newer instance), so every refusal below is
+    // down to the working space alone.
+    auto publishedAgain = publishSourceSettings(harness, e2eSampleClipPath(), PrefsBlob::defaults(), 43);
+    REQUIRE(publishedAgain.open());
+    CHECK(drawnBy(renderUnder(kPrRec709)) == DrawnBy::Direct);
 
     // ---- not produced: the equirect path, where Premiere's own conversion of
     // the importer's frame stays in charge -------------------------------------
@@ -1176,29 +1193,30 @@ TEST_CASE("a Source Settings change reaches the very next direct frame of the sa
     const std::vector<float> stillDarker = renderAndRead(instance, marker, out, t, kTicksPerFrame5994);
     CHECK(maxAbsDifference(stillDarker, after) == 0.0);
 
-    // ---- Colour Output Rec.709 in this PQ sequence: Premiere's conversion rules --------
+    // ---- Colour Output Rec.709 in this PQ sequence: still direct (the default) --------
+    // "Sequence space (fast)": the scene is rendered straight into the PQ
+    // working space, exactly as it was with the PQ output - the colour output
+    // only decides what the IMPORTER's own frame is encoded in.
     PrefsBlob rec709 = darker;
     rec709.colorOutput = static_cast<std::uint8_t>(osv::premiere::PrefsColorOutput::Rec709);
     auto colourChanged = publishSourceSettings(harness, sample, rec709, 53);
     REQUIRE(colourChanged.open());
-    CHECK(drawnBy(renderAndRead(instance, marker, out, t, kTicksPerFrame5994)) == DrawnBy::Equirect);
+    const std::vector<float> sequenceSpace = renderAndRead(instance, marker, out, t, kTicksPerFrame5994);
+    CHECK(drawnBy(sequenceSpace) == DrawnBy::Direct);
+    CHECK(maxAbsDifference(sequenceSpace, after) == 0.0);
 
-    // ---- ...unless the clip opts into the working space --------------------------------
-    // Then the direct path renders PQ exactly as it did with the PQ output:
-    // the colour output only decides what the IMPORTER's frame is encoded in.
-    PrefsBlob optedIn = rec709;
-    optedIn.directColour = static_cast<std::uint8_t>(osv::premiere::PrefsDirectColour::WorkingSpace);
-    auto optedInInstance = publishSourceSettings(harness, sample, optedIn, 54);
-    REQUIRE(optedInInstance.open());
-    const std::vector<float> working = renderAndRead(instance, marker, out, t, kTicksPerFrame5994);
-    CHECK(drawnBy(working) == DrawnBy::Direct);
-    CHECK(maxAbsDifference(working, after) == 0.0);
+    // ---- ...and "Match Source monitor" hands it to Premiere's conversion ---------------
+    PrefsBlob matchSource = rec709;
+    matchSource.directColour = static_cast<std::uint8_t>(osv::premiere::PrefsDirectColour::MatchSource);
+    auto matchInstance = publishSourceSettings(harness, sample, matchSource, 54);
+    REQUIRE(matchInstance.open());
+    CHECK(drawnBy(renderAndRead(instance, marker, out, t, kTicksPerFrame5994)) == DrawnBy::Equirect);
 
     // ---- the log tells the story, one line per change -----------------------------------
     // The effect logs one decision line per (file, generation, working space,
-    // verdict); the fresh instance above shares the file's line.  Four states
-    // were rendered: the defaults, exposure -1, Rec.709 handed over, and the
-    // opt-in.
+    // rule, verdict); the fresh instance above shares the file's line.  Four
+    // states were rendered: the defaults, exposure -1, Rec.709 through the
+    // sequence space, and Rec.709 handed over.
     std::vector<std::string> decisions;
     for (const std::string& line : reframeLogLinesSince(logStart)) {
         if (line.find("reframe/direct: 'EXAMPLE_FOOTAGE_DLOGM.OSV' Source Settings generation") != std::string::npos) {
@@ -1210,13 +1228,13 @@ TEST_CASE("a Source Settings change reaches the very next direct frame of the sa
     }
     REQUIRE(decisions.size() == 4u);
     CHECK(decisions[0].find("exposure +0.00") != std::string::npos);
-    CHECK(decisions[0].find("-> straight from the fisheyes") != std::string::npos);
+    CHECK(decisions[0].find("-> straight from the fisheyes (rule: same space)") != std::string::npos);
     CHECK(decisions[1].find("exposure -1.00") != std::string::npos);
-    CHECK(decisions[1].find("-> straight from the fisheyes") != std::string::npos);
+    CHECK(decisions[1].find("-> straight from the fisheyes (rule: same space)") != std::string::npos);
     CHECK(decisions[2].find("colour Rec.709") != std::string::npos);
-    CHECK(decisions[2].find("-> equirect route") != std::string::npos);
-    CHECK(decisions[3].find("direct-path colour working space") != std::string::npos);
-    CHECK(decisions[3].find("-> straight from the fisheyes") != std::string::npos);
+    CHECK(decisions[2].find("-> straight from the fisheyes (rule: Sequence space (fast))") != std::string::npos);
+    CHECK(decisions[3].find("Program Monitor Colour Match Source monitor") != std::string::npos);
+    CHECK(decisions[3].find("-> equirect route (rule: Match Source monitor)") != std::string::npos);
 
     CHECK(instance.dispose() == suiteError_NoError);
     CHECK(host.totalNodeRefs() == 0);

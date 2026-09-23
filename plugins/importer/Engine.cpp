@@ -601,7 +601,7 @@ void enginePublishPrefs(const std::filesystem::path& path, const PrefsBlob& pref
         if (outcome == Outcome::Adopted) {
             PluginLog::info("direct: Source Settings generation {} for '{}' (file {:08x}:{:016x}) from importer "
                             "instance #{}{} (importer id {}): colour {}, fit {}, exposure {:+.2f}, calibration {}, "
-                            "stabilisation {}, seam {}, gain {}, parallax {}, direct-path colour {}",
+                            "stabilisation {}, seam {}, gain {}, parallax {}, Program Monitor Colour {}",
                             now.generation, nameOf(path), identity.volume, identity.index, publisher.token,
                             publisher.fromHost ? "" : " (its defaults: the host gave it no settings)",
                             publisher.importerId, static_cast<int>(prefs.colorOutput),
@@ -609,8 +609,8 @@ void enginePublishPrefs(const std::filesystem::path& path, const PrefsBlob& pref
                             static_cast<int>(prefs.calibration), static_cast<int>(prefs.stabilization),
                             static_cast<int>(prefs.seamSearch), static_cast<int>(prefs.gainMatch),
                             static_cast<int>(prefs.parallax),
-                            prefs.directColourMode() == PrefsDirectColour::WorkingSpace ? "working space"
-                                                                                        : "match clip");
+                            prefs.directColourMode() == PrefsDirectColour::MatchSource ? "match Source monitor"
+                                                                                       : "sequence space");
         } else if (outcome == Outcome::Refused) {
             // Two reasons to refuse, worded apart so a field log says which.
             PluginLog::info("direct: kept Source Settings generation {} for '{}' (colour {}, exposure {:+.2f}) from "
