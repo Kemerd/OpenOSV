@@ -248,11 +248,12 @@ struct UiFixture {
     return std::acos(dot) * (180.0 / 3.14159265358979323846);
 }
 
-/// The Pan a module-level drag of `dxPx` pixels straight right from the
-/// frame centre commits, with the fixture's level camera: the grab puts the
-/// centre direction (0, 1, 0) back under the pointer, so Pan is the azimuth
-/// of the pointer's own ray, atan2(x, y).  Computed through the renderer's
-/// camera, never from a fixed degrees-per-pixel rate.
+/// The Pan a module-level drag of `dxPx` pixels to the right, starting on
+/// the frame centre, commits with the fixture's level camera: the axis drag
+/// turns Pan by the azimuth the picture spans along the horizontal centre
+/// line, which from the centre is the azimuth of the ray under the pointer,
+/// atan2(x, y).  Computed through the renderer's camera, never from a fixed
+/// degrees-per-pixel rate.
 [[nodiscard]] double grabPanDeg(double dxPx, double fovDeg = 90.0,
                                 double distortion = OSV_REFRAME_DISTORTION_DEFAULT) {
     const Layout layout = computeLayout(fullFrame());
@@ -261,6 +262,19 @@ struct UiFixture {
     double v[3];
     REQUIRE(rayUnderPointer(layout, fovDeg, distortion, level, PointF{layout.centre.x + dxPx, layout.centre.y}, v));
     return std::atan2(v[0], v[1]) * (180.0 / 3.14159265358979323846);
+}
+
+/// The Tilt the same drag commits for `dyPx` pixels DOWN from the centre:
+/// minus the elevation of the ray under the pointer on the vertical centre
+/// line (down -> +Tilt, the picture travels with the hand).
+[[nodiscard]] double grabTiltDeg(double dyPx, double fovDeg = 90.0,
+                                 double distortion = OSV_REFRAME_DISTORTION_DEFAULT) {
+    const Layout layout = computeLayout(fullFrame());
+    CameraValues level;
+    level.fovDeg = fovDeg;
+    double v[3];
+    REQUIRE(rayUnderPointer(layout, fovDeg, distortion, level, PointF{layout.centre.x, layout.centre.y + dyPx}, v));
+    return -std::atan2(v[2], v[1]) * (180.0 / 3.14159265358979323846);
 }
 
 /// A grab started the way the shim starts one: the renderer's camera for the
@@ -475,14 +489,14 @@ TEST_CASE("dragging down tilts the view up so the world follows the cursor", "[r
     CHECK(after.panDeg == Approx(start.panDeg));
 }
 
-TEST_CASE("grabbing the sphere keeps the grabbed point under the pointer", "[reframe][ui][grab]") {
-    // The drag the overlay now does: whatever direction of the sphere was
-    // under the pointer at the click is under the pointer after every move,
-    // through the renderer's own camera.  A fixed degrees-per-pixel rate only
-    // manages that near the centre of a narrow, level view; these cases are
-    // the ones where it visibly failed - a wide eye-offset view bending
-    // toward stereographic, the 263-degree view from the field report, a
-    // tiny planet, roll, a steep tilt - plus the plain one.
+TEST_CASE("left / right turns only Pan and up / down only Tilt, at every zoom", "[reframe][ui][grab]") {
+    // The field report: zoomed far out, a left / right drag tipped the view,
+    // because the full sphere grab keeps one ARBITRARY grabbed point under the
+    // pointer and a far off-centre point moves along a circle of latitude.
+    // The drag is now per axis: horizontal travel moves Pan, vertical travel
+    // moves Tilt, and neither ever moves the other - checked on exactly the
+    // views where the coupling was worst (wide eye-offset, the 263-degree
+    // view, a tiny planet, roll, a steep tilt) and on the plain ones.
     struct Case {
         const char* name;
         double fov, distortion, pan, tilt, roll;
@@ -490,12 +504,10 @@ TEST_CASE("grabbing the sphere keeps the grabbed point under the pointer", "[ref
         double dx, dy;  // drag, pixels
     };
     const Case cases[] = {
-        {"90 deg, level, horizontal", 90.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 300.0, 0.0},
-        {"90 deg, level, vertical", 90.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 200.0},
-        {"90 deg, off-centre diagonal", 90.0, 50.0, 30.0, 20.0, 0.0, 0.25, 0.7, -250.0, 150.0},
+        {"90 deg, level", 90.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 300.0, 200.0},
+        {"90 deg, off-centre", 90.0, 50.0, 30.0, 20.0, 0.0, 0.25, 0.7, -250.0, 150.0},
         {"150 deg wide, rolled", 150.0, 30.0, 0.0, 30.0, 25.0, 0.6, 0.4, 120.0, -160.0},
-        {"263 deg (field report), vertical", 263.0, 40.0, 143.4, -0.2, 0.0, 0.55, 0.45, 0.0, 150.0},
-        {"263 deg (field report), horizontal", 263.0, 40.0, 143.4, -0.2, 0.0, 0.55, 0.45, 180.0, 0.0},
+        {"263 deg (field report)", 263.0, 40.0, 143.4, -0.2, 0.0, 0.55, 0.45, 180.0, 150.0},
         {"tiny planet 300 deg", 300.0, 100.0, 0.0, -60.0, 0.0, 0.5, 0.35, 90.0, 60.0},
         {"narrow 60 deg, steep tilt, rolled", 60.0, 0.0, -40.0, 60.0, 10.0, 0.45, 0.55, 50.0, -40.0},
     };
@@ -509,36 +521,98 @@ TEST_CASE("grabbing the sphere keeps the grabbed point under the pointer", "[ref
         start.tiltDeg = c.tilt;
         start.rollDeg = c.roll;
         const PointF anchor{c.ax * kFrameW, c.ay * kFrameH};
-        // The hand moves travel / k; the sphere turns as if it had moved the
-        // full travel (kPanTiltSensitivity), so the grabbed point must land
-        // under anchor + travel.
-        const PointF pointer{anchor.x + c.dx / kPanTiltSensitivity, anchor.y + c.dy / kPanTiltSensitivity};
-        const PointF effective{anchor.x + c.dx, anchor.y + c.dy};
+        auto dragTo = [&](double dx, double dy) {
+            DragState state = beginDrag(layout, anchor, start, kModNone);
+            REQUIRE(state.handle == Handle::PanTilt);
+            state.grab = grabFor(layout, c.fov, c.distortion, start, anchor);
+            REQUIRE(state.grab.cameraValid);
+            return applyDrag(state, PointF{anchor.x + dx, anchor.y + dy}, kModNone);
+        };
 
-        DragState state = beginDrag(layout, anchor, start, kModNone);
-        REQUIRE(state.handle == Handle::PanTilt);
-        state.grab = grabFor(layout, c.fov, c.distortion, start, anchor);
-        REQUIRE(state.grab.valid);
-        const CameraValues after = applyDrag(state, pointer, kModNone);
-
-        // Nothing but pan and tilt may move.
-        CHECK(after.rollDeg == Approx(c.roll));
-        CHECK(after.fovDeg == Approx(c.fov));
-        // No case here asks for a pole crossing, so the tilt is a free
-        // solution, not a clamped one - which is what makes the invariant
-        // below exact rather than approximate.
-        REQUIRE(std::fabs(after.tiltDeg) < OSV_REFRAME_TILT_LIMIT_DEG - 1e-6);
-
-        double grabbed[3];
-        double now[3];
-        REQUIRE(rayUnderPointer(layout, c.fov, c.distortion, start, anchor, grabbed));
-        REQUIRE(rayUnderPointer(layout, c.fov, c.distortion, after, effective, now));
-        INFO("pan " << c.pan << " -> " << after.panDeg << ", tilt " << c.tilt << " -> " << after.tiltDeg
-                    << "; grabbed point " << angleBetweenDeg(grabbed, now) << " deg from the pointer");
-        // Float rays (the kernel's precision) on either side: a few
-        // thousandths of a degree is the noise floor.
-        CHECK(angleBetweenDeg(grabbed, now) < 0.01);
+        // A purely horizontal drag: Pan moves, Tilt does not move at all.
+        const CameraValues h = dragTo(c.dx, 0.0);
+        CHECK(h.panDeg != Approx(c.pan));
+        CHECK(h.tiltDeg == c.tilt);
+        // A purely vertical drag: Tilt moves, Pan does not move at all.
+        const CameraValues v = dragTo(0.0, c.dy);
+        CHECK(v.panDeg == c.pan);
+        CHECK(v.tiltDeg != Approx(c.tilt));
+        // A diagonal drag is exactly the two combined.
+        const CameraValues d = dragTo(c.dx, c.dy);
+        CHECK(d.panDeg == Approx(h.panDeg).margin(1e-9));
+        CHECK(d.tiltDeg == Approx(v.tiltDeg).margin(1e-9));
+        // Nothing else moves.
+        CHECK(d.rollDeg == Approx(c.roll));
+        CHECK(d.fovDeg == Approx(c.fov));
     }
+}
+
+TEST_CASE("on a level view what sits on the centre lines stays under the pointer", "[reframe][ui][grab]") {
+    // The per-axis drag still drags the SCENE, not a dial: the angles it
+    // turns by are the ones the picture spans along the centre lines,
+    // through the renderer's own camera, so on those lines the grabbed
+    // content is exactly under the pointer after the move - at 90 degrees
+    // and zoomed far out alike.
+    const Layout layout = computeLayout(fullFrame());
+    for (const double fov : {90.0, 200.0, 300.0}) {
+        for (const double distortion : {0.0, 60.0}) {
+            INFO("fov " << fov << ", distortion " << distortion);
+            CameraValues start;
+            start.fovDeg = fov;
+            start.panDeg = 40.0;
+            // Horizontal: a point on the horizontal centre line (level view).
+            {
+                const PointF anchor{layout.centre.x - 200.0, layout.centre.y};
+                const PointF to{anchor.x + 350.0 / kPanTiltSensitivity, anchor.y};
+                DragState state = beginDrag(layout, anchor, start, kModNone);
+                state.grab = grabFor(layout, fov, distortion, start, anchor);
+                const CameraValues after = applyDrag(state, to, kModNone);
+                double grabbed[3];
+                double now[3];
+                REQUIRE(rayUnderPointer(layout, fov, distortion, start, anchor, grabbed));
+                REQUIRE(rayUnderPointer(layout, fov, distortion, after, PointF{anchor.x + 350.0, anchor.y}, now));
+                CHECK(angleBetweenDeg(grabbed, now) < 0.01);
+            }
+            // Vertical: a point on the vertical centre line, at any pan and
+            // tilt (only roll would take the line out of the tilt plane).
+            {
+                CameraValues tilted = start;
+                tilted.tiltDeg = -25.0;
+                const PointF anchor{layout.centre.x, layout.centre.y - 120.0};
+                const PointF to{anchor.x, anchor.y + 200.0 / kPanTiltSensitivity};
+                DragState state = beginDrag(layout, anchor, tilted, kModNone);
+                state.grab = grabFor(layout, fov, distortion, tilted, anchor);
+                const CameraValues after = applyDrag(state, to, kModNone);
+                double grabbed[3];
+                double now[3];
+                REQUIRE(rayUnderPointer(layout, fov, distortion, tilted, anchor, grabbed));
+                REQUIRE(rayUnderPointer(layout, fov, distortion, after, PointF{anchor.x, anchor.y + 200.0}, now));
+                CHECK(angleBetweenDeg(grabbed, now) < 0.01);
+            }
+        }
+    }
+}
+
+TEST_CASE("the full sphere grab still keeps an arbitrary grabbed point under the pointer", "[reframe][ui][grab]") {
+    // solveSphereGrab is no longer what the overlay drags with, but it stays
+    // a public, exact solve: whatever direction was under the anchor is under
+    // the pointer after it.
+    const Layout layout = computeLayout(fullFrame());
+    CameraValues start;
+    start.fovDeg = 150.0;
+    start.tiltDeg = 30.0;
+    start.rollDeg = 25.0;
+    const PointF anchor{0.6 * kFrameW, 0.4 * kFrameH};
+    const SphereGrab grab = grabFor(layout, 150.0, 30.0, start, anchor);
+    REQUIRE(grab.valid);
+    const PointF to{anchor.x + 120.0, anchor.y - 160.0};
+    CameraValues after;
+    REQUIRE(solveSphereGrab(grab, layout, start, to, DragMode::PanTilt, after));
+    double grabbed[3];
+    double now[3];
+    REQUIRE(rayUnderPointer(layout, 150.0, 30.0, start, anchor, grabbed));
+    REQUIRE(rayUnderPointer(layout, 150.0, 30.0, after, to, now));
+    CHECK(angleBetweenDeg(grabbed, now) < 0.01);
 }
 
 TEST_CASE("a grab moves the world with the hand in both axes", "[reframe][ui][grab][signs]") {
@@ -1323,30 +1397,20 @@ TEST_CASE("a click-drag-release sequence commits Pan and Tilt for the host to ke
     CHECK((drag.evt_out_flags & PF_EO_HANDLED_EVENT) != 0);
 
     // The signs: right -> Pan up, down -> Tilt up (the world follows the
-    // hand).  And the magnitude is no longer a fixed rate but the grab
-    // contract: the direction that was under the pointer at the click (the
-    // centre of the picture) is under the pointer again after the drag, as
-    // cast by the renderer's own camera.
+    // hand).  And the magnitudes are the axis-drag contract, through the
+    // renderer's own camera: Pan is the azimuth the picture spans along the
+    // horizontal centre line for the (sensitivity-scaled) horizontal travel,
+    // Tilt the elevation along the vertical one for the vertical travel.
     CHECK(angleOf(params, kIndexPan) > 0.0);
     CHECK(angleOf(params, kIndexTilt) > 0.0);
     {
-        const Layout layout = computeLayout(fullFrame());
         const double distortion = static_cast<double>(params[kIndexDistortion]->u.fs_d.value);
-        CameraValues before;
-        before.fovDeg = 90.0;
-        CameraValues after = before;
-        after.panDeg = angleOf(params, kIndexPan);
-        after.tiltDeg = angleOf(params, kIndexTilt);
-        double grabbed[3];
-        double now[3];
-        REQUIRE(rayUnderPointer(layout, 90.0, distortion, before, PointF{960.0, 540.0}, grabbed));
-        REQUIRE(rayUnderPointer(layout, 90.0, distortion, after,
-                                PointF{960.0 + kPanTiltSensitivity * 480.0, 540.0 + kPanTiltSensitivity * 270.0},
-                                now));
-        INFO("grabbed point is " << angleBetweenDeg(grabbed, now) << " deg from the pointer after the drag");
         // The parameters are stored as 16.16 fixed point, so allow that
         // quantisation (1/65536 deg) plus float rounding in the ray.
-        CHECK(angleBetweenDeg(grabbed, now) < 0.01);
+        CHECK(angleOf(params, kIndexPan) ==
+              Approx(grabPanDeg(kPanTiltSensitivity * 480.0, 90.0, distortion)).margin(0.01));
+        CHECK(angleOf(params, kIndexTilt) ==
+              Approx(grabTiltDeg(kPanTiltSensitivity * 270.0, 90.0, distortion)).margin(0.01));
     }
 
     // Roll and FOV were not part of this drag and must carry no change flag:
@@ -2336,11 +2400,12 @@ TEST_CASE("Drag Sensitivity sets how much faster than the hand a drag turns the 
     CHECK(effectiveSensitivity(1.25) == 1.25);
 }
 
-TEST_CASE("a grab through DJI's lens keeps the grabbed point under the pointer", "[reframe][ui][grab][dji]") {
-    // The grab is cast through whatever lens renders; on DJI's lens (the
-    // pinhole-behind-the-sphere camera) the invariant is exactly the Classic
-    // one: after the drag, the direction grabbed at the click is under the
-    // (sensitivity-scaled) pointer again.
+TEST_CASE("a drag through DJI's lens turns Pan and Tilt per axis", "[reframe][ui][grab][dji]") {
+    // The drag is cast through whatever lens renders; on DJI's lens (the
+    // pinhole-behind-the-sphere camera) the contract is exactly the Classic
+    // one: horizontal travel turns Pan by the azimuth the picture spans along
+    // the horizontal centre line, vertical travel turns Tilt by the elevation
+    // along the vertical one, each for the sensitivity-scaled travel.
     const Layout layout = computeLayout(fullFrame());
     CameraValues start;
     start.dji = true;
@@ -2360,23 +2425,36 @@ TEST_CASE("a grab through DJI's lens keeps the grabbed point under the pointer",
     REQUIRE(view.valid);
     REQUIRE(view.params.projection == OSV_PROJ_DJI_SPHERE);
 
+    // The expected angles, from the renderer's DJI camera with a level view
+    // (identity rotation): azimuth on the horizontal centre line, minus the
+    // elevation on the vertical one.
+    CameraValues level = start;
+    level.panDeg = 0.0;
+    level.tiltDeg = 0.0;
+    auto azimuthDeg = [&](double x) {
+        double r[3];
+        REQUIRE(djiRayUnderPointer(layout, start.djiFovDeg, start.correction, level, PointF{x, layout.centre.y}, r));
+        return std::atan2(r[0], r[1]) * (180.0 / 3.14159265358979323846);
+    };
+    auto dropDeg = [&](double y) {
+        double r[3];
+        REQUIRE(djiRayUnderPointer(layout, start.djiFovDeg, start.correction, level, PointF{layout.centre.x, y}, r));
+        return -std::atan2(r[2], r[1]) * (180.0 / 3.14159265358979323846);
+    };
+
     for (const double sensitivity : {1.0, 2.0}) {
         INFO("sensitivity " << sensitivity);
         DragState state = beginDrag(layout, anchor, start, kModNone);
         state.sensitivity = sensitivity;
         state.grab = beginSphereGrab(view.params.projection, view.params.focalPx, view.params.eyeOffset,
                                      view.params.tanHalfH, view.params.tanHalfV, layout, start, anchor);
-        REQUIRE(state.grab.valid);
-        const PointF to{anchor.x + 120.0, anchor.y + 60.0};
-        const CameraValues after = applyDrag(state, to, kModNone);
-        double grabbed[3];
-        double now[3];
-        REQUIRE(djiRayUnderPointer(layout, start.djiFovDeg, start.correction, start, anchor, grabbed));
-        const PointF quickened{anchor.x + sensitivity * 120.0, anchor.y + sensitivity * 60.0};
-        REQUIRE(djiRayUnderPointer(layout, start.djiFovDeg, start.correction, after, quickened, now));
-        INFO("grabbed point is " << angleBetweenDeg(grabbed, now) << " deg from the pointer");
-        CHECK(angleBetweenDeg(grabbed, now) < 0.01);
-        // A grab changes neither the lens nor the roll.
+        REQUIRE(state.grab.cameraValid);
+        const CameraValues after = applyDrag(state, PointF{anchor.x + 120.0, anchor.y + 60.0}, kModNone);
+        const double quickX = anchor.x + sensitivity * 120.0;
+        const double quickY = anchor.y + sensitivity * 60.0;
+        CHECK(after.panDeg == Approx(start.panDeg + azimuthDeg(quickX) - azimuthDeg(anchor.x)).margin(1e-3));
+        CHECK(after.tiltDeg == Approx(start.tiltDeg + dropDeg(quickY) - dropDeg(anchor.y)).margin(1e-3));
+        // A drag changes neither the lens nor the roll.
         CHECK(after.djiFovDeg == start.djiFovDeg);
         CHECK(after.correction == start.correction);
         CHECK(after.rollDeg == start.rollDeg);
@@ -2533,8 +2611,8 @@ TEST_CASE("a Ctrl-drag zoom on DJI's lens commits DJI FOV, Correction and Zoom t
 }
 
 TEST_CASE("the Drag Sensitivity control reaches the module's drag", "[reframe][ui][module][dji]") {
-    // With the control at 1.0 the drag is the exact grab: the direction under
-    // the pointer at the click is under the pointer - not twice as far - after.
+    // With the control at 1.0 the drag turns exactly the angles the picture
+    // spans under the hand's own travel - not twice as far.
     UiFixture f;
     f.setAngle(kIndexPan, 0.0);
     f.setAngle(kIndexTilt, 0.0);
@@ -2548,17 +2626,7 @@ TEST_CASE("the Drag Sensitivity control reaches the module's drag", "[reframe][u
     REQUIRE(f.event(drag, params) == PF_Err_NONE);
     REQUIRE(changed(params, kIndexPan));
 
-    const Layout layout = computeLayout(fullFrame());
     const double distortion = static_cast<double>(params[kIndexDistortion]->u.fs_d.value);
-    CameraValues before;
-    before.fovDeg = 90.0;
-    CameraValues after = before;
-    after.panDeg = angleOf(params, kIndexPan);
-    after.tiltDeg = angleOf(params, kIndexTilt);
-    double grabbed[3];
-    double now[3];
-    REQUIRE(rayUnderPointer(layout, 90.0, distortion, before, PointF{960.0, 540.0}, grabbed));
-    REQUIRE(rayUnderPointer(layout, 90.0, distortion, after, PointF{960.0 + 300.0, 540.0 + 100.0}, now));
-    INFO("grabbed point is " << angleBetweenDeg(grabbed, now) << " deg from the pointer");
-    CHECK(angleBetweenDeg(grabbed, now) < 0.01);
+    CHECK(angleOf(params, kIndexPan) == Approx(grabPanDeg(300.0, 90.0, distortion)).margin(0.01));
+    CHECK(angleOf(params, kIndexTilt) == Approx(grabTiltDeg(100.0, 90.0, distortion)).margin(0.01));
 }

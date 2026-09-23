@@ -334,12 +334,15 @@ SphereGrab beginSphereGrab(int projection, double focalPx, double eyeOffset, dou
     g.eyeOffset = eyeOffset;
     g.tanHalfH = tanHalfH;
     g.tanHalfV = tanHalfV;
+    // The camera is known from here on, which is all solveAxisDrag needs;
+    // only the full grab below also needs the anchor to have a ray.
+    g.cameraValid = true;
 
     // The grabbed direction in the camera's parent frame: R_camera(start)
     // applied to the anchor's view ray, factor by factor (roll first).
     double v[3];
     if (!grabRay(g, layout, anchor, v)) {
-        return SphereGrab{};
+        return g;  // valid stays false: no grabbed point, camera still usable
     }
     const CameraValues s = sanitise(start);
     applyRotY(s.rollDeg * kDegToRad, v);
@@ -354,7 +357,7 @@ SphereGrab beginSphereGrab(int projection, double focalPx, double eyeOffset, dou
     applyRotX(s.tiltDeg * kDegToRad, v);
     applyRotZ(s.panDeg * kDegToRad, v);
     if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2])) {
-        return SphereGrab{};
+        return g;  // valid stays false, as above
     }
     g.target[0] = v[0];
     g.target[1] = v[1];
@@ -436,6 +439,140 @@ bool solveSphereGrab(const SphereGrab& grab, const Layout& layout, const CameraV
 
     const double panDeg = pan * kRadToDeg;
     const double tiltDeg = tilt * kRadToDeg;
+    if (!std::isfinite(panDeg) || !std::isfinite(tiltDeg)) {
+        return false;
+    }
+    out = s;
+    out.panDeg = panDeg;
+    out.tiltDeg = tiltDeg;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+//  The axis drag: pan from horizontal travel, tilt from vertical travel
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Which centre line of the viewport an axis drag reads.
+enum class DragAxis { Horizontal, Vertical };
+
+/// Bisection steps used to find where a centre line leaves the projection's
+/// valid area: 40 halvings of a few thousand pixels is far below a pixel.
+constexpr int kEdgeBisectionSteps = 40;
+
+/// The angle the view ray at screen coordinate `s` on one centre line makes
+/// with the view's forward axis, in radians, oriented so that it GROWS with
+/// `s`:
+///   * horizontal line (y = centre): the azimuth atan2(x, y), + to the right;
+///   * vertical line (x = centre): minus the elevation, -atan2(z, y), since
+///     screen y grows downward while elevation grows upward.
+/// Along either line the ray only reaches the back of the sphere at the far
+/// ends, and its lateral component keeps the sign of the screen offset, so
+/// atan2 never wraps between two points of the same line.
+[[nodiscard]] bool axisAngleRad(const SphereGrab& g, const Layout& layout, DragAxis axis, double s,
+                                double& angle) noexcept {
+    if (!std::isfinite(s)) {
+        return false;
+    }
+    const double cx = layout.viewport.x + 0.5 * layout.viewport.w;
+    const double cy = layout.viewport.y + 0.5 * layout.viewport.h;
+    const PointF p = (axis == DragAxis::Horizontal) ? PointF{s, cy} : PointF{cx, s};
+    double v[3];
+    if (!grabRay(g, layout, p, v)) {
+        return false;  // this point lies outside the projection's valid area
+    }
+    angle = (axis == DragAxis::Horizontal) ? std::atan2(v[0], v[1]) : -std::atan2(v[2], v[1]);
+    return std::isfinite(angle);
+}
+
+/// The angle the picture spans along one centre line from `s0` to `s1`
+/// (radians), through the renderer's camera.
+///
+/// When `s1` has no ray (a very wide or crystal-ball view whose picture ends
+/// before the pointer does) the travel runs exactly up to the last point that
+/// has one - found by bisection, since the valid part of a centre line is one
+/// interval around the centre - and continues at `fallbackRadPerPx` beyond
+/// it, so the dial keeps moving smoothly instead of jumping where the
+/// picture stops.  False when `s0` itself has no ray: the caller then uses
+/// the fixed rate for the whole axis.
+[[nodiscard]] bool axisTravelRad(const SphereGrab& g, const Layout& layout, DragAxis axis, double s0, double s1,
+                                 double fallbackRadPerPx, double& travel) noexcept {
+    double a0 = 0.0;
+    if (!axisAngleRad(g, layout, axis, s0, a0)) {
+        return false;
+    }
+    double a1 = 0.0;
+    if (axisAngleRad(g, layout, axis, s1, a1)) {
+        travel = a1 - a0;
+        return std::isfinite(travel);
+    }
+
+    // s0 has a ray and s1 does not: the edge of the picture lies between.
+    double lo = s0;
+    double hi = s1;
+    double aLo = a0;
+    for (int i = 0; i < kEdgeBisectionSteps; ++i) {
+        const double mid = 0.5 * (lo + hi);
+        double aMid = 0.0;
+        if (axisAngleRad(g, layout, axis, mid, aMid)) {
+            lo = mid;
+            aLo = aMid;
+        } else {
+            hi = mid;
+        }
+    }
+    travel = (aLo - a0) + fallbackRadPerPx * (s1 - lo);
+    return std::isfinite(travel);
+}
+
+}  // namespace
+
+bool solveAxisDrag(const SphereGrab& grab, const Layout& layout, const CameraValues& start, const PointF& anchor,
+                   const PointF& current, DragMode mode, double fallbackDegPerPx, CameraValues& out) noexcept {
+    // Only a known camera, real points and a pan / tilt mode get here.
+    if (!grab.cameraValid || !layout.valid || !isFinitePoint(anchor) || !isFinitePoint(current)) {
+        return false;
+    }
+    if (mode != DragMode::PanTilt && mode != DragMode::PanOnly && mode != DragMode::TiltOnly) {
+        return false;
+    }
+    const CameraValues s = sanitise(start);
+
+    // The fixed rate, used past the edge of the picture and for an axis whose
+    // anchor has no ray; zero (no movement) for a nonsensical rate.
+    const double rateDeg = (std::isfinite(fallbackDegPerPx) && fallbackDegPerPx > 0.0) ? fallbackDegPerPx : 0.0;
+    const double rateRad = rateDeg * kDegToRad;
+
+    // ---- pan: horizontal travel only ---------------------------------------
+    // The world follows the hand: content that was at azimuth a0 on the
+    // centre line is now under the pointer at a1, so the view turns by
+    // a1 - a0 (right -> +Pan, the fixed-rate drag's sign).
+    double panDeg = s.panDeg;
+    if (mode != DragMode::TiltOnly) {
+        double travel = 0.0;
+        if (axisTravelRad(grab, layout, DragAxis::Horizontal, anchor.x, current.x, rateRad, travel)) {
+            panDeg = s.panDeg + travel * kRadToDeg;
+        } else {
+            panDeg = s.panDeg + rateDeg * (current.x - anchor.x);
+        }
+    }
+
+    // ---- tilt: vertical travel only ----------------------------------------
+    // The same on the vertical centre line: down -> +Tilt (look up, so the
+    // picture travels down with the hand).  Clamped at the pole, where the
+    // geometry stops anyway.
+    double tiltDeg = s.tiltDeg;
+    if (mode != DragMode::PanOnly) {
+        double travel = 0.0;
+        if (axisTravelRad(grab, layout, DragAxis::Vertical, anchor.y, current.y, rateRad, travel)) {
+            tiltDeg = s.tiltDeg + travel * kRadToDeg;
+        } else {
+            tiltDeg = s.tiltDeg + rateDeg * (current.y - anchor.y);
+        }
+        tiltDeg = std::clamp(tiltDeg, -OSV_REFRAME_TILT_LIMIT_DEG, OSV_REFRAME_TILT_LIMIT_DEG);
+    }
+
     if (!std::isfinite(panDeg) || !std::isfinite(tiltDeg)) {
         return false;
     }
@@ -675,22 +812,24 @@ CameraValues applyDrag(DragState& state, const PointF& current, std::uint32_t mo
     case DragMode::PanTilt:
     case DragMode::PanOnly:
     case DragMode::TiltOnly: {
-        // Grab the sphere: keep the grabbed direction under the pointer,
-        // solved through the renderer's own camera (see SphereGrab).  The
-        // fixed rate below is the fallback when no grab could be built or
-        // the pointer has left the projection's valid area.
+        // Left / right turns Pan, up / down turns Tilt, each by the angle the
+        // picture really spans along the viewport's centre lines, through the
+        // renderer's own camera (solveAxisDrag; SphereGrab explains why the
+        // two axes are no longer solved together).  The fixed rate below is
+        // the fallback when the shim could not build the camera.
         //
         // Sensitivity: the pointer's travel from the anchor is scaled before
-        // the solve, so the sphere turns `sensitivity` times faster than the
-        // hand while still moving as one rigid piece.  [WP-CAMERA] The factor
-        // is the Drag Sensitivity control captured at the click
-        // (kPanTiltSensitivity, the old constant, is its default).
+        // the solve, so the view turns `sensitivity` times faster than the
+        // hand.  [WP-CAMERA] The factor is the Drag Sensitivity control
+        // captured at the click (kPanTiltSensitivity, the old constant, is
+        // its default).
         const double sensitivity = effectiveSensitivity(state.sensitivity);
         const PointF quickened{state.anchor.x + sensitivity * dxTotal, state.anchor.y + sensitivity * dyTotal};
-        CameraValues grabbed;
-        if (solveSphereGrab(state.grab, state.layout, state.start, quickened, mode, grabbed)) {
-            result.panDeg = grabbed.panDeg;
-            result.tiltDeg = grabbed.tiltDeg;
+        CameraValues axes;
+        if (solveAxisDrag(state.grab, state.layout, state.start, state.anchor, quickened, mode,
+                          dragScaleDegPerPixel(state.start.fovDeg, state.layout.viewport.w), axes)) {
+            result.panDeg = axes.panDeg;
+            result.tiltDeg = axes.tiltDeg;
             break;
         }
 

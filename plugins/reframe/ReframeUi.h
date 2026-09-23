@@ -364,9 +364,24 @@ struct CameraValues {
 /// direction back under the pointer, through the very camera model the
 /// renderer uses.  Roll is never changed by a grab.
 ///
+/// WHY THE OVERLAY NO LONGER SOLVES THE FULL GRAB.  Keeping one arbitrary
+/// grabbed point under the pointer lets a purely sideways drag change the
+/// tilt too (the point moves along a circle of latitude, so the solve bends
+/// the view to follow it).  Near the centre of a narrow view that is
+/// invisible; zoomed far out, with the grabbed point far off-centre, a
+/// left/right drag visibly tips the view.  The overlay therefore uses the
+/// same camera model one axis at a time (solveAxisDrag): horizontal travel
+/// turns Pan, vertical travel turns Tilt, each by the angle the picture
+/// really spans along the viewport's centre lines.  solveSphereGrab stays as
+/// the full-sphere solve for callers that want it.
+///
 /// POD on purpose: it lives inside DragState in the drag table.
 struct SphereGrab {
-    bool valid = false;   ///< False: fall back to the fixed-rate drag.
+    bool valid = false;   ///< False: no grabbed point (solveSphereGrab refuses).
+    /// True when the camera fields below describe the renderer's camera,
+    /// whether or not the anchor itself had a ray (it may lie outside a
+    /// crystal ball's disc).  solveAxisDrag needs only this.
+    bool cameraValid = false;
     int projection = 0;   ///< OSV_PROJ_* of the camera (buildView's choice).
     double focalPx = 0.0; ///< Focal length for the viewport, in viewport pixels.
     double eyeOffset = 0.0;
@@ -410,6 +425,30 @@ struct SphereGrab {
 /// the tilt axis); the caller then uses the fixed-rate drag.
 [[nodiscard]] bool solveSphereGrab(const SphereGrab& grab, const Layout& layout, const CameraValues& start,
                                    const PointF& current, DragMode mode, CameraValues& out) noexcept;
+
+/// The overlay's pan / tilt drag: each axis on its own, through the
+/// renderer's camera.
+///
+///   * Pan changes by the azimuth the picture spans along the viewport's
+///     horizontal centre line between `anchor.x` and `current.x`, and by
+///     nothing else - a vertical move never touches it.
+///   * Tilt changes by the elevation the picture spans along the vertical
+///     centre line between `anchor.y` and `current.y`, clamped to
+///     +-OSV_REFRAME_TILT_LIMIT_DEG - a horizontal move never touches it.
+///
+/// So in a level view whatever sits on the centre lines stays exactly under
+/// the pointer, at every zoom, while the two dials stay independent (see
+/// SphereGrab for why the full grab was dropped).  Where a centre-line point
+/// has no ray (past a crystal ball's disc) the travel continues at
+/// `fallbackDegPerPx` from the last point that has one, so the dial never
+/// jumps at the edge of the picture; an anchor with no ray on a line uses
+/// that rate for the whole axis.  `mode` PanOnly / TiltOnly keep the other
+/// axis at `start`.  Returns false - `out` untouched - when the camera is
+/// unknown (grab.cameraValid false), a point is not finite or the mode is
+/// not a pan / tilt mode.
+[[nodiscard]] bool solveAxisDrag(const SphereGrab& grab, const Layout& layout, const CameraValues& start,
+                                 const PointF& anchor, const PointF& current, DragMode mode,
+                                 double fallbackDegPerPx, CameraValues& out) noexcept;
 
 /// Everything a drag in progress needs to remember between events.
 ///
