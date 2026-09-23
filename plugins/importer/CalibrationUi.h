@@ -5,12 +5,14 @@
 // calibration.
 //
 // The dialog used to offer Native / Lens guards / Underwater as if every
-// clip carried all three.  Most do not: the Osmo 360 writes a lens-guard
-// set only when the in-camera "Lens Protection Mode" was on, and an
-// underwater set only for the housing - otherwise those slots are zero-filled
-// placeholders, and picking them silently renders native.  The labels built
-// here say that up front ("not in clip: Native"), and name what Auto will
-// follow ("camera: no lens protectors").
+// clip carried all three.  The sample clip carries neither: its lens-guard
+// and underwater slots are zero-filled placeholders, and picking them
+// silently rendered native.  (DJI's own importer never reads those slots at
+// all - its "Lens Protector" option is a field-angle correction applied on
+// top of the native calibration - so a clip that does fill them has not
+// been seen yet.)  The labels built here say up front when a set is missing
+// ("not in clip: Native"), and name what Auto will follow ("camera: no lens
+// protectors").
 //
 // Deliberately free of osv_meta and Win32: the facts are reduced to a small
 // POD by the dialog (SourceSettingsDialog.cpp, from the clip's
