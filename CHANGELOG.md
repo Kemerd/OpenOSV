@@ -6,8 +6,16 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-23
+
 ### Added
 
+* **A Windows download.** `OpenOSV-0.1.0-windows-x64.zip` on the GitHub
+  Releases page: the three plug-ins, the OpenOSV window, the LUTs, the
+  sequence presets and `osvtool`, with a double-click `Install.cmd` /
+  `Uninstall.cmd` and every third-party licence. `scripts/package_release.ps1`
+  builds it and checks every shipped file before it is zipped
+  (`docs/RELEASING.md`).
 * **RockSteady and Horizon Leveling together, on by default
   (WP-STABPAIR).** DJI Studio runs its two stabilisation switches
   independently, and both can be on. The Stabilisation popup in Source

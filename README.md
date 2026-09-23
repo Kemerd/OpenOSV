@@ -379,10 +379,29 @@ Measured on an RTX 5090 with the 6K test clip.
 
 ## Install
 
-The plug-ins build from source today. You need Windows 10/11, Visual Studio
-2022, CMake 3.28+, vcpkg and, for the GPU paths, CUDA 12.9. Premiere's SDKs
-are not redistributable, so they are never committed.
-[`docs/BUILDING.md`](docs/BUILDING.md) says where to put them.
+### Download
+
+1. Grab `OpenOSV-x.y.z-windows-x64.zip` from the
+   [latest release](https://github.com/Kemerd/OpenOSV/releases/latest) and
+   unzip it.
+2. Close Premiere and double-click **`Install.cmd`**. It asks for admin rights
+   once. The files aren't code-signed, so SmartScreen may step in:
+   **More info → Run anyway**.
+3. Launch Premiere **holding `Shift`**, so it rescans its plug-ins.
+4. Open **Window > Extensions > OpenOSV** (or **Window > UXP Plugins >
+   OpenOSV**; the installer says which).
+
+**Needs** Windows 10/11 x64 and Premiere Pro 2022 or later (tested on 2026).
+**GPU:** CUDA on NVIDIA GTX 16 / RTX 20 and newer (Turing, Ampere, Ada,
+Blackwell); OpenCL on AMD and Intel; the CPU when there's nothing else. On an
+older NVIDIA card, set **Render Device** to OpenCL in Source Settings.
+`Uninstall.cmd` takes it all back out.
+
+### Build from source
+
+You need Windows 10/11, Visual Studio 2022, CMake 3.28+, vcpkg and, for the
+GPU paths, CUDA 12.9. Premiere's SDKs are not redistributable, so they are
+never committed. [`docs/BUILDING.md`](docs/BUILDING.md) says where to put them.
 
 ```powershell
 $env:VCPKG_ROOT = "C:\vcpkg"
@@ -396,7 +415,8 @@ scripts\install_plugins.ps1        # plug-ins, LUTs, sequence presets and the Op
 `C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\OpenOSV\`, so Premiere,
 Media Encoder and After Effects all see them. It asks for admin rights once.
 `-PanelOnly` installs just the panel, `-NoPanel` and `-NoPresets` skip parts,
-and `-Uninstall` removes everything it added.
+and `-Uninstall` removes everything it added. Cutting a release zip:
+[`docs/RELEASING.md`](docs/RELEASING.md).
 
 ### Sequence presets
 
