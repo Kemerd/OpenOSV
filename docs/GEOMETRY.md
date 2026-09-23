@@ -48,7 +48,7 @@ unverified in `FormatInfo::notes`.
 
 ## Field of view and blending
 
-Usable lens FOV is 195.18 degrees (DJI's own shader constant); the kernel
+Usable lens FOV is 195.18 degrees (the value DJI's own stitcher uses); the kernel
 feathers the last 4 degrees before `thetaMax` with a smoothstep and multiplies
 by an occlusion factor derived from the 14-point polygon in the calibration
 (the selfie-stick side of the image). Blending happens in scene-linear light.

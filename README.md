@@ -161,9 +161,10 @@ Technology Co., Ltd.; Adobe, Premiere Pro and After Effects are trademarks of
 Adobe Inc. The names are used only to say what OpenOSV works with.
 
 It contains no DJI code, binaries, neural-network models, LUT files or
-artwork. DJI's publicly distributed software was analysed so OpenOSV can read
-the camera's files and render them the way DJI's own tools do; the numbers
-and formulas taken from that analysis are re-implemented in OpenOSV's own code
-and listed, with how each was obtained, in `docs/LEGAL.md`. Third-party
+artwork. DJI's publicly distributed software was studied for
+interoperability, so OpenOSV can read the camera's files and render them the
+way DJI's own tools do; the numbers and formulas taken from that study are
+re-implemented in OpenOSV's own code and listed, with where each came from,
+in `docs/LEGAL.md`. Third-party
 licences are in `NOTICE`; the papers and standards the project builds on are in
 `docs/CITATIONS.md`.
