@@ -69,6 +69,7 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.dlogmFit = static_cast<int>(prefs.dlogmFit);
     c.exposureStops = static_cast<double>(prefs.exposureStops);
     c.renderDevice = static_cast<int>(prefs.renderDevice);
+    c.look = static_cast<int>(prefs.look);  // [WP-LOOK]
     photoControlsFromPrefs(prefs, c);  // [WP-PHOTO]
     return c;
 }
@@ -116,6 +117,9 @@ PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& bas
              static_cast<std::uint8_t>(PrefsCalibrationChoice::Auto))));
     blob.dlogmFit = pick(controls.dlogmFit, static_cast<int>(PrefsDlogmFit::Count), 0);
     blob.renderDevice = pick(controls.renderDevice, static_cast<int>(PrefsRenderDevice::Count), 0);
+    // [WP-LOOK] An out-of-range index lands on the DJI look, the default.
+    blob.look = pick(controls.look, static_cast<int>(PrefsLook::Count),
+                     static_cast<std::uint8_t>(PrefsLook::DjiStudio));
 
     // The exposure edit box is free text: "1e999" parses to infinity and a
     // cleared field can yield NaN.  Non-finite values become 0 here (NaN

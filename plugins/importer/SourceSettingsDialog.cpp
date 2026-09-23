@@ -103,6 +103,20 @@ void fillCombo(HWND dialog, int control, const wchar_t* const* items, int count,
     return sel == CB_ERR ? 0 : static_cast<int>(sel);
 }
 
+/// [WP-LOOK] Grey the Rec.709 look (and its label) unless Colour output is
+/// Rec.709: PQ, HLG and the passthrough have no look, so the control would
+/// otherwise look like it does something it cannot.  The selection itself is
+/// kept either way, so switching back to Rec.709 restores the user's choice.
+void enableLookForOutput(HWND dialog) noexcept {
+    const bool rec709 = comboSelection(dialog, IDC_COLOR_OUTPUT) == static_cast<int>(PrefsColorOutput::Rec709);
+    if (HWND combo = ::GetDlgItem(dialog, IDC_REC709_LOOK)) {
+        ::EnableWindow(combo, rec709 ? TRUE : FALSE);
+    }
+    if (HWND label = ::GetDlgItem(dialog, IDC_STATIC_LOOK)) {
+        ::EnableWindow(label, rec709 ? TRUE : FALSE);
+    }
+}
+
 /// Write a double into an edit control with two decimals.
 void setEditDouble(HWND dialog, int control, double value) noexcept {
     wchar_t text[32] = {};
@@ -210,7 +224,7 @@ void fillComboStrings(HWND dialog, int control, const std::wstring* items, int c
 // other control's position - exactly as it is.
 
 /// Control ids of the rows.  Clear of every id in resource.h (1000-1017,
-/// 1100-1107) and of each other.
+/// 1030, 1100-1107, 1130) and of each other.
 constexpr int kIdcPhotoSeam = 1040;
 constexpr int kIdcPhotoStrength = 1041;
 constexpr int kIdcSeamInset = 1042;
@@ -382,6 +396,15 @@ void controlsToWidgets(HWND dialog, const DialogControls& c, const CalibrationUi
     ::CheckDlgButton(dialog, IDC_SEAM_SEARCH, c.seamSearch ? BST_CHECKED : BST_UNCHECKED);
     ::CheckDlgButton(dialog, IDC_GAIN_MATCH, c.gainMatch ? BST_CHECKED : BST_UNCHECKED);
     setEditDouble(dialog, IDC_EXPOSURE, c.exposureStops);
+
+    // [WP-LOOK] The Rec.709 look, indexed by PrefsLook (DJI first: zero is the
+    // default and what every older blob holds).  Greyed unless Colour output
+    // is Rec.709, the only output with a look.
+    static const wchar_t* const kLooks[] = {L"DJI (default)", L"OpenOSV standard"};
+    static_assert(std::size(kLooks) == static_cast<std::size_t>(PrefsLook::Count),
+                  "the look combo does not list every PrefsLook value");
+    fillCombo(dialog, IDC_REC709_LOOK, kLooks, static_cast<int>(std::size(kLooks)), c.look);
+    enableLookForOutput(dialog);
 }
 
 /// Read the widgets back into the controls.
@@ -395,6 +418,7 @@ void widgetsToControls(HWND dialog, DialogControls& c) noexcept {
     c.seamSearch = ::IsDlgButtonChecked(dialog, IDC_SEAM_SEARCH) == BST_CHECKED;
     c.gainMatch = ::IsDlgButtonChecked(dialog, IDC_GAIN_MATCH) == BST_CHECKED;
     c.exposureStops = getEditDouble(dialog, IDC_EXPOSURE, c.exposureStops);
+    c.look = comboSelection(dialog, IDC_REC709_LOOK);  // [WP-LOOK]
     photoWidgetsToControls(dialog, c);  // [WP-PHOTO]
 }
 
@@ -425,6 +449,11 @@ INT_PTR CALLBACK sourceSettingsProc(HWND dialog, UINT message, WPARAM wParam, LP
         }
         if (id == IDCANCEL) {
             ::EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        // [WP-LOOK] A new Colour output re-evaluates whether the look applies.
+        if (id == IDC_COLOR_OUTPUT && HIWORD(wParam) == CBN_SELCHANGE) {
+            enableLookForOutput(dialog);
             return TRUE;
         }
         return FALSE;
@@ -579,9 +608,9 @@ namespace {
         PluginLog::warn("source settings: could not request a refresh of the clip");
     }
 
-    PluginLog::info("source settings accepted: colour {}, size {}, stab {}, seam {}, gain {}, calib {} ({}), fit {}, "
-                    "exposure {:+.2f}, device {}",
-                    blob.colorOutput, blob.outputSize, blob.stabilization, blob.seamSearch, blob.gainMatch,
+    PluginLog::info("source settings accepted: colour {}, look {}, size {}, stab {}, seam {}, gain {}, calib {} ({}), "
+                    "fit {}, exposure {:+.2f}, device {}",
+                    blob.colorOutput, blob.look, blob.outputSize, blob.stabilization, blob.seamSearch, blob.gainMatch,
                     blob.calibration, calibrationChoiceToken(blob.calibrationChoice()), blob.dlogmFit,
                     static_cast<double>(blob.exposureStops), blob.renderDevice);
     return imNoErr;

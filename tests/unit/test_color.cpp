@@ -10,6 +10,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include "DjiReference.h"
 #include "TestSample.h"
 
 #include "osv/color/AutoDetect.h"
@@ -45,21 +46,23 @@ constexpr std::array<double, 64> kDjiHlgTable = {
     0.8418, 0.8601, 0.8719, 0.8850, 0.8967, 0.9124, 0.9242, 0.9373, 0.9490, 0.9647, 0.9791, 0.9922};
 
 /// The 33 neutral-axis measurements of DJI's own Osmo 360 D-Log M -> Rec.709
-/// LUT (code i/32 -> output signal), the reference kDlogMOsmo360 was fitted to.
+/// LUT (code i/32 -> output signal), the reference kDlogMOsmo360 was fitted
+/// to.  Shared with test_look.cpp, which fits the DJI look to the same file.
+using osvtest::kOsmo360Rec709Table;
+
+/// The standard (pre-look) rendering for `transfer`.
 ///
-/// These are measurements of a transfer function, not redistributed LUT data:
-/// the diagonal is 33 of that file's 35937 entries, read with
-/// scripts/fit_dlogm.py --from-cube and recorded here so the residual test can
-/// run without the file on disk (see NOTICE).
-///
-/// They are usable directly as HLG-signal targets because OpenOSV's Rec.709
-/// output IS the HLG signal in Rec.709 primaries, and on the neutral axis the
-/// primaries matrices are the identity, so the Rec.709 and HLG branches of
-/// osvLinearToOutput are the same function of the code (see DlogM.h).
-constexpr std::array<double, 33> kOsmo360Rec709Table = {
-    0.000000, 0.002871, 0.011479, 0.027510, 0.053454, 0.084936, 0.119168, 0.155227, 0.192473, 0.230323, 0.269137,
-    0.308931, 0.348810, 0.388234, 0.423856, 0.456224, 0.487409, 0.519277, 0.553789, 0.590770, 0.629860, 0.668478,
-    0.705628, 0.740403, 0.774289, 0.807223, 0.840133, 0.872661, 0.903927, 0.933200, 0.960404, 0.983169, 1.000000};
+/// Several tests below pin the identity "Rec.709 output == the HLG signal in
+/// Rec.709 primaries" and the golden values scripts/colour_reference.py
+/// computes for it.  The default Rec.709 output is now the DJI Studio look,
+/// which deliberately is NOT that function (test_look.cpp covers it), so those
+/// tests select the standard rendering explicitly rather than weakening what
+/// they assert.  For every other transfer the look is ignored and this is
+/// exactly makeColorParams(fit, transfer, stops).
+OsvColorParams standardParams(DlogMFit fit, OutputTransfer transfer, float stops = 0.0f) {
+    return makeColorParams(fit, transfer, stops, InputEncoding::DLogM, true, 10, nullptr, kBt2408SceneScale,
+                           Look::Standard);
+}
 
 /// Run a grey code through the full pipeline of a parameter block.
 float greyThrough(const OsvColorParams& p, float code) {
@@ -292,7 +295,7 @@ TEST_CASE("Osmo 360 D-Log M curve matches DJI's Osmo 360 reference", "[color]") 
     // the algebraic claim the whole fit rests on, so this asserts it rather
     // than assuming it.
     const OsvColorParams hlgP = makeColorParams(DlogMFit::Osmo360, OutputTransfer::HLG, 0.0f);
-    const OsvColorParams sdrP = makeColorParams(DlogMFit::Osmo360, OutputTransfer::Rec709, 0.0f);
+    const OsvColorParams sdrP = standardParams(DlogMFit::Osmo360, OutputTransfer::Rec709);
     REQUIRE(colorParamsValid(hlgP));
     REQUIRE(colorParamsValid(sdrP));
 
@@ -628,7 +631,7 @@ TEST_CASE("Swapping the primaries matrix cannot move the neutral axis", "[color]
         // Same curve both times: only the matrix differs, which is exactly the
         // swap this change made.  Building the blocks by hand rather than via
         // two different fits keeps the curve out of the comparison.
-        OsvColorParams withPocket3 = makeColorParams(DlogMFit::Osmo360, transfer, 0.0f);
+        OsvColorParams withPocket3 = standardParams(DlogMFit::Osmo360, transfer);
         OsvColorParams withOsmo360 = withPocket3;
         for (int i = 0; i < 9; ++i) {
             withPocket3.nativeToWorking.m[i] = kNativeToRec2020_Pocket3.m[i];
@@ -667,7 +670,7 @@ TEST_CASE("Swapping the primaries matrix cannot move the neutral axis", "[color]
     // Rec.709 output is the same function of the code on the neutral axis
     // (it is the HLG signal in Rec.709 primaries), which is the identity the
     // curve fit relies on.
-    const OsvColorParams sdr = makeColorParams(DlogMFit::Osmo360, OutputTransfer::Rec709, 0.0f);
+    const OsvColorParams sdr = standardParams(DlogMFit::Osmo360, OutputTransfer::Rec709);
     REQUIRE_THAT(static_cast<double>(greyThrough(sdr, 0.40f)), WithinAbs(0.380, 1e-4));
     for (int i = 0; i <= 32; ++i) {
         const float code = static_cast<float>(i) / 32.0f;
@@ -781,7 +784,10 @@ TEST_CASE("Osmo 360 primaries beat the Pocket 3 fit on saturated colour", "[colo
 
     // Both blocks decode with the Osmo 360 curve; only the primaries matrix
     // differs, so the comparison isolates the matrix.
-    OsvColorParams withOsmo360 = makeColorParams(DlogMFit::Osmo360, OutputTransfer::Rec709, 0.0f);
+    // The matrix was fitted through the standard rendering, so it is judged
+    // through the standard rendering (the DJI look has its own measured
+    // comparison in test_look.cpp).
+    OsvColorParams withOsmo360 = standardParams(DlogMFit::Osmo360, OutputTransfer::Rec709);
     OsvColorParams withPocket3 = withOsmo360;
     for (int i = 0; i < 9; ++i) {
         withPocket3.nativeToWorking.m[i] = kNativeToRec2020_Pocket3.m[i];
@@ -1031,8 +1037,11 @@ TEST_CASE("Kernel math matches the float64 golden reference", "[color]") {
     checkCurve("osmo360", kDlogMOsmo360);
 
     // Grey pipelines and RGB spot checks through makeColorParams.
+    // The golden holds the standard rendering (colour_reference.py has no
+    // look); the DJI look is pinned against its own fitted model values in
+    // test_look.cpp.
     const auto checkGrey = [&](const char* key, DlogMFit fit, const char* transferKey, OutputTransfer transfer) {
-        const OsvColorParams p = makeColorParams(fit, transfer, 0.0f);
+        const OsvColorParams p = standardParams(fit, transfer);
         for (const auto& entry : j.at("pipeline_grey").at(key).at(transferKey)) {
             const float code = entry[0].get<float>();
             const float in[3] = {code, code, code};
@@ -1090,7 +1099,7 @@ TEST_CASE("Kernel math matches the float64 golden reference", "[color]") {
             for (const auto& [name, transfer] :
                  {std::pair{"hlg", OutputTransfer::HLG}, std::pair{"pq", OutputTransfer::PQ},
                   std::pair{"rec709", OutputTransfer::Rec709}, std::pair{"linear", OutputTransfer::Linear}}) {
-                const OsvColorParams p = makeColorParams(fit, transfer, 0.0f);
+                const OsvColorParams p = standardParams(fit, transfer);
                 float out[3];
                 osvCodeToOutput(&p, in, out);
                 for (int ch = 0; ch < 3; ++ch) {

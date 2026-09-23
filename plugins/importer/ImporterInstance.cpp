@@ -33,6 +33,7 @@
 #include "osv/render/PhotoSeam.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
+#include "osv/video/GpuDecoderPool.h"
 #include "osv/video/ReaderPool.h"
 #if defined(OSV_HAVE_CUDA)
 #include "osv/render/CudaAnalysis.h"
@@ -132,6 +133,20 @@ void trimAnalysisCache(MapT& cache, std::size_t limit, const typename MapT::key_
     // A blob byte outside the enum lands on the project default rather than on
     // an arbitrary curve.
     return color::kDefaultDlogMFit;
+}
+
+/// [WP-LOOK] Map the prefs look onto the library's display look.  Zero - every
+/// blob written before the byte existed, and every fresh one - is the DJI
+/// Studio look, the library default; a byte outside the enum lands there too.
+/// Only the Rec.709 output has a look; makeColorParams ignores it otherwise.
+[[nodiscard]] color::Look toLook(PrefsLook look) noexcept {
+    switch (look) {
+    case PrefsLook::Standard: return color::Look::Standard;
+    case PrefsLook::DjiStudio:
+    case PrefsLook::Count:
+    default:                  break;
+    }
+    return color::kDefaultLook;
 }
 
 /// Map the prefs choice onto the calibration selector's choice.  Auto - the
@@ -535,11 +550,11 @@ Status ImporterInstance::parseOnce() {
     // output is the "auto PQ for log footage" case the default already gives.
     {
         const color::InputEncoding in = inputEncodingFor(m_format.colorMode);
-        PluginLog::info("colour: '{}': source {} ({}) -> input encoding {}, output {} ({})",
+        PluginLog::info("colour: '{}': source {} ({}) -> input encoding {}, output {} ({}), Rec.709 look {}",
                         m_path.filename().string(), meta::colorModeName(m_format.colorMode),
                         m_format.colorModeFromMetadata ? "from metadata" : "inferred from luma statistics",
                         color::inputEncodingName(in), color::outputTransferName(toOutputTransfer(m_prefs.color())),
-                        colorSpaceTokenFor(m_prefs));
+                        colorSpaceTokenFor(m_prefs), color::lookName(toLook(m_prefs.lookChoice())));
     }
     return okStatus();
 }
@@ -854,8 +869,27 @@ void ImporterInstance::releaseHeavy() noexcept {
                          parked ? "parked in the pool" : "released");
     }
     m_reader.reset();
-    // The direct path's NVDEC decoders and their VRAM frame caches (up to
-    // ~1.5 GB each): a quiet is exactly when that memory should go back.
+    // The NVDEC decoders.  The one behind the importer's own GPU frame runs
+    // in the renderer device's PRIMARY context and holds its own retain on
+    // it, so it can outlive this instance safely: it is parked in the
+    // process-wide GpuDecoderPool (its frame cache trimmed to the last few
+    // frames first), and the next unquiet or the next instance of this clip
+    // takes it back with its NVDEC decoders and decode position intact.
+    // The direct path's decoders run in a CALLER's context (Premiere's), which
+    // nothing here can keep alive: the pool refuses them, and they are
+    // released now, giving their VRAM back exactly as a quiet always did.
+    video::GpuDecoderPool& gpuPool = video::GpuDecoderPool::instance();
+    for (auto& entry : m_gpuDecoders) {
+        if (!entry.second) {
+            continue;
+        }
+        const bool poolable = video::GpuDecoderPool::poolable(*entry.second);
+        const bool parked = gpuPool.park(std::move(entry.second));
+        if (poolable) {
+            PluginLog::debug("video: '{}' NVDEC decoder {} on release", m_path.filename().string(),
+                             parked ? "parked in the pool" : "released (the pool refused it)");
+        }
+    }
     m_gpuDecoders.clear();
 
     // Drop the frame and analysis caches: they are pure caches, and holding
@@ -870,6 +904,35 @@ void ImporterInstance::releaseHeavy() noexcept {
         ::CloseHandle(m_fileHandle);
         m_fileHandle = INVALID_HANDLE_VALUE;
     }
+}
+
+Result<std::unique_ptr<video::GpuClipDecoder>> ImporterInstance::takeOrOpenGpuDecoder(
+    const video::GpuDecoderOptions& options, void* expectedContext, bool& warm) {
+    // The caller holds m_mutex.
+    warm = false;
+
+    // ---- 1. a parked decoder of this exact file version and options ----------
+    // releaseHeavy() parks the importer frame's decoder on every quiet and
+    // close, so an unquiet - or the new instance Premiere opens for a Source
+    // Settings change - finds its NVDEC decoders, decode position and last
+    // frames here.  Only decoders in the primary context are ever parked.
+    std::unique_ptr<video::GpuClipDecoder> parked = video::GpuDecoderPool::instance().take(m_path, m_format, options);
+    if (parked) {
+        // It must decode into the very context the caller stitches in (the
+        // renderer's primary context).  The parked decoder's own retain keeps
+        // that context from being destroyed, so a mismatch means a different
+        // device was asked for under the same ordinal - never trust it.
+        if (expectedContext && parked->cuContext() == expectedContext && parked->contextAlive()) {
+            warm = true;
+            return parked;
+        }
+        PluginLog::info("video: '{}' parked NVDEC decoder lives in another context; opening a new one",
+                        m_path.filename().string());
+        parked.reset();
+    }
+
+    // ---- 2. a new one --------------------------------------------------------
+    return video::GpuClipDecoder::open(m_path, m_format, options);
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,9 +1081,10 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
     // engine's instance does not publish back (it would only echo).
     publishSettingsLocked(true);
 
-    // Colour depends on colorOutput, dlogmFit and exposureStops.
+    // Colour depends on colorOutput, dlogmFit, exposureStops and [WP-LOOK] the
+    // Rec.709 look.
     if (!m_colorBuilt || previous.colorOutput != incoming.colorOutput || previous.dlogmFit != incoming.dlogmFit ||
-        previous.exposureStops != incoming.exposureStops) {
+        previous.exposureStops != incoming.exposureStops || previous.look != incoming.look) {
         rebuildColor();
     }
 
@@ -1083,9 +1147,12 @@ void ImporterInstance::rebuildColor() {
     const color::InputEncoding input = inputEncodingFor(m_format.colorMode);
     // The camera always writes narrow-range YCbCr; bit depth comes from the
     // stream (10 for the Osmo 360, 8 for the LRF proxy).
+    // The look is passed for every output; makeColorParams applies it only to
+    // Rec.709 (the one output with a fitted look) and ignores it otherwise.
     m_color = color::makeColorParams(toDlogMFit(m_prefs.fit()), toOutputTransfer(m_prefs.color()),
                                      m_prefs.exposureStops, input, true,
-                                     m_format.bitDepth ? m_format.bitDepth : 10u);
+                                     m_format.bitDepth ? m_format.bitDepth : 10u, nullptr, color::kBt2408SceneScale,
+                                     toLook(m_prefs.lookChoice()));
     m_colorBuilt = true;
 }
 
@@ -1708,9 +1775,12 @@ Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_
     // like rebuildColor() so the two can only ever differ by the transfer.
     OsvColorParams color = m_color;
     if (outputTransfer >= 0 && outputTransfer != m_color.transfer) {
+        // [WP-LOOK] the clip's look travels with it: a PQ clip rendered into
+        // a Rec.709 working space gets the look the user chose for Rec.709.
         color = color::makeColorParams(toDlogMFit(m_prefs.fit()), static_cast<color::OutputTransfer>(outputTransfer),
                                        m_prefs.exposureStops, inputEncodingFor(m_format.colorMode), true,
-                                       m_format.bitDepth ? m_format.bitDepth : 10u);
+                                       m_format.bitDepth ? m_format.bitDepth : 10u, nullptr,
+                                       color::kBt2408SceneScale, toLook(m_prefs.lookChoice()));
     }
 
     // ---- the stitch block ------------------------------------------------------
@@ -1878,9 +1948,12 @@ OsvColorParams ImporterInstance::colorForTransfer(int outputTransfer) const {
     if (outputTransfer < 0 || outputTransfer > OSV_TRANSFER_PASSTHROUGH || outputTransfer == m_color.transfer) {
         return m_color;
     }
+    // [WP-LOOK] the same look as the clip's own block, so a Rec.709
+    // connection-space override renders the look the user chose.
     return color::makeColorParams(toDlogMFit(m_prefs.fit()), static_cast<color::OutputTransfer>(outputTransfer),
                                   m_prefs.exposureStops, inputEncodingFor(m_format.colorMode), true,
-                                  m_format.bitDepth ? m_format.bitDepth : 10u);
+                                  m_format.bitDepth ? m_format.bitDepth : 10u, nullptr, color::kBt2408SceneScale,
+                                  toLook(m_prefs.lookChoice()));
 }
 
 Result<render::RenderJob> ImporterInstance::buildEquirectJob(std::uint32_t index, const video::FramePair& pair,
@@ -2101,7 +2174,10 @@ Result<bool> ImporterInstance::renderFrameOnGpu(std::uint32_t index, const Outpu
         options.cuContext = nullptr;
         options.cudaDevice = cuda->deviceIndex();
         const auto t0 = std::chrono::steady_clock::now();
-        auto opened = video::GpuClipDecoder::open(m_path, m_format, options);
+        // A warm decoder parked by this clip's quiet (or by another instance
+        // of the same file) when there is one; a new one otherwise.
+        bool warm = false;
+        auto opened = takeOrOpenGpuDecoder(options, m_gpuReadback->context(), warm);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         if (!opened.ok()) {
             // Unsupported / InvalidArgument: a stream NVDEC does not take (the
@@ -2114,10 +2190,16 @@ Result<bool> ImporterInstance::renderFrameOnGpu(std::uint32_t index, const Outpu
             return disable("the NVDEC decoder did not open in the renderer's context");
         }
         const video::GpuDecoderStats stats = opened.value()->stats();
-        PluginLog::info("video: '{}' importer frames now decode on NVDEC into VRAM and stitch in place (decoder "
-                        "opened in {:.0f} ms, frame cache {} x {:.1f} MiB)",
-                        m_path.filename().string(), ms, stats.capacitySlots,
-                        static_cast<double>(stats.slotBytes) / (1024.0 * 1024.0));
+        if (warm) {
+            PluginLog::info("video: '{}' importer frames decode on NVDEC again (warm decoder from the pool in {:.1f} ms, "
+                            "{} frame(s) still cached)",
+                            m_path.filename().string(), ms, stats.cachedFrames);
+        } else {
+            PluginLog::info("video: '{}' importer frames now decode on NVDEC into VRAM and stitch in place (decoder "
+                            "opened in {:.0f} ms, frame cache {} x {:.1f} MiB)",
+                            m_path.filename().string(), ms, stats.capacitySlots,
+                            static_cast<double>(stats.slotBytes) / (1024.0 * 1024.0));
+        }
         m_gpuFrameContext = m_gpuReadback->context();
         decoder = m_gpuDecoders.insert_or_assign(m_gpuFrameContext, std::move(opened).value()).first;
     }
@@ -2238,7 +2320,11 @@ std::string ImporterInstance::analysisText() const {
     const char* outName = "BT.2100 PQ";
     switch (m_prefs.color()) {
     case PrefsColorOutput::HLG:    outName = "BT.2100 HLG"; break;
-    case PrefsColorOutput::Rec709: outName = "BT.709"; break;
+    // [WP-LOOK] Rec.709 names its display look: the two render visibly apart.
+    case PrefsColorOutput::Rec709:
+        outName = (m_prefs.lookChoice() == PrefsLook::Standard) ? "BT.709 (OpenOSV standard look)"
+                                                                : "BT.709 (DJI Studio look)";
+        break;
     case PrefsColorOutput::DLogM:  outName = "D-Log M passthrough (camera gamut, no transform)"; break;
     default:                       break;
     }

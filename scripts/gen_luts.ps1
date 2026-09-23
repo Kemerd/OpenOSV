@@ -81,7 +81,10 @@ if (-not $OutDir) { $OutDir = Join-Path $repoRoot 'luts' }
 #
 #  Rec.709 is shipped alongside the two HDR tables for two reasons: it is the
 #  SDR delivery path, and it is the one directly comparable to DJI's own
-#  D-Log M -> Rec.709 LUT, which is how the curve was validated.
+#  D-Log M -> Rec.709 LUT, which is how the curve was validated.  It carries
+#  the DJI Studio look (include/osv/color/Look.h, the Rec.709 default), which
+#  its title says; `--look dji` is passed explicitly so the file cannot change
+#  if the library's default ever moves.  The HDR tables ignore the look.
 # ---------------------------------------------------------------------------
 $script:Luts = @(
     @{ Name = 'OpenOSV_Osmo360_DLogM_to_Rec2100_PQ.cube';  Transfer = 'pq';
@@ -89,7 +92,7 @@ $script:Luts = @(
     @{ Name = 'OpenOSV_Osmo360_DLogM_to_Rec2100_HLG.cube'; Transfer = 'hlg';
        Title = 'OpenOSV Osmo 360 D-Log M to Rec.2100 HLG (osmo360 curve)' }
     @{ Name = 'OpenOSV_Osmo360_DLogM_to_Rec709.cube';      Transfer = '709';
-       Title = 'OpenOSV Osmo 360 D-Log M to Rec.709 (osmo360 curve)' }
+       Title = 'OpenOSV Osmo 360 D-Log M to Rec.709 (osmo360 curve, DJI Studio look)' }
 )
 
 function Write-Step { param([string] $Message) Write-Host "==> $Message" }
@@ -126,7 +129,7 @@ function New-Lut {
     $path = Join-Path $Directory $Spec.Name
     # 2>&1 so a failure message from the tool reaches the transcript rather
     # than the void; the output is only printed when the exit code is bad.
-    $output = & $Tool lut --fit $Fit --out-transfer $Spec.Transfer --size $Size --title $Spec.Title $path 2>&1
+    $output = & $Tool lut --fit $Fit --look dji --out-transfer $Spec.Transfer --size $Size --title $Spec.Title $path 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host ($output -join [Environment]::NewLine)
         throw "osvtool lut failed for '$($Spec.Name)' with exit code $LASTEXITCODE."

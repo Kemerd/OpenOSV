@@ -6,6 +6,7 @@
 #include "osv/color/AutoDetect.h"
 #include "osv/core/Log.h"
 #include "osv/geom/ConventionProbe.h"
+#include "osv/geom/LensProtector.h"
 #include "osv/geom/StreamScaling.h"
 #include "osv/meta/CalibrationSelector.h"
 #include "osv/meta/FormatDetector.h"
@@ -92,7 +93,13 @@ void addPipelineOptions(CLI::App* sub, PipelineOptions& opt) {
     }
     sub->add_option("file", opt.input, "Input .OSV (or .LRF) clip")->required();
     auto* geomGroup = sub->add_option_group("Geometry conventions");
-    geomGroup->add_option("--calib", opt.calib, "Calibration set: native|lens-guards|underwater")->default_str("native");
+    geomGroup->add_option("--calib", opt.calib, "Calibration set: auto|native|lens-guards|underwater")
+        ->default_str("auto");
+    geomGroup
+        ->add_option("--protector", opt.protector,
+                     "Lens-protector field-angle correction: auto|none|forward|inverse (auto = when --calib resolves "
+                     "to lens protectors)")
+        ->default_str("auto");
     geomGroup->add_option("--stitch-distance", opt.stitchDistanceM, "Use the far_XX preset nearest this distance (m)");
     geomGroup->add_option("--crop-scale", opt.cropScale, "Override the sensor->stream scale (6K verified: 0.794492)");
     geomGroup->add_option("--focal-source", opt.focalSource, "dfl (digital_focal_length) | scaled")->default_str("dfl");
@@ -114,6 +121,8 @@ void addPipelineOptions(CLI::App* sub, PipelineOptions& opt) {
     colorGroup->add_option("--fit", opt.fit, "D-Log M curve: osmo360|dji|pocket3")->default_str("osmo360");
     colorGroup->add_option("--input-encoding", opt.inputEncoding, "auto|dlogm|hlg|normal")->default_str("auto");
     colorGroup->add_option("--exposure", opt.exposureStops, "Exposure offset in stops")->default_val(0.0);
+    colorGroup->add_option("--look", opt.look, "Rec.709 look: dji (DJI Studio, default) | standard")
+        ->default_str("dji");
 
     auto* backendGroup = sub->add_option_group("Backends");
     backendGroup->add_option("--hw", opt.hw, "Decoder acceleration: none|d3d11va|cuda|auto")->default_str("none");
@@ -138,18 +147,39 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     }
 
     // ---- calibration set --------------------------------------------------------
-    meta::CalibrationSelector::Options selOpt;
+    // The same selector call the importer's rebuildRig makes, so osvtool and
+    // Premiere stitch a clip with the same set for the same choice.
+    meta::CalibrationChoice choice = meta::CalibrationChoice::Auto;
     const std::string calib = lower(options.calib);
-    if (calib == "lens-guards") {
-        selOpt.lensModeOverride = meta::ExtriLensMode::LensGuards;
+    if (calib == "native") {
+        choice = meta::CalibrationChoice::Native;
+    } else if (calib == "lens-guards") {
+        choice = meta::CalibrationChoice::LensGuards;
     } else if (calib == "underwater") {
-        selOpt.lensModeOverride = meta::ExtriLensMode::Underwater;
-    } else if (calib != "native" && calib != "auto") {
+        choice = meta::CalibrationChoice::Underwater;
+    } else if (calib != "auto") {
         return Error{ErrorCode::InvalidArgument, "unknown --calib value '" + options.calib + "'"};
     }
+    // The protector direction is parsed up front so a typo fails before any
+    // decoding starts.
+    const std::string protector = lower(options.protector);
+    std::optional<geom::ProtectorDirection> forcedProtector;
+    if (protector == "none") {
+        forcedProtector = geom::ProtectorDirection::None;
+    } else if (protector == "forward") {
+        forcedProtector = geom::ProtectorDirection::Forward;
+    } else if (protector == "inverse") {
+        forcedProtector = geom::ProtectorDirection::Inverse;
+    } else if (protector != "auto") {
+        return Error{ErrorCode::InvalidArgument, "unknown --protector value '" + options.protector + "'"};
+    }
+    meta::CalibrationSelector::Options selOpt;
     selOpt.stitchDistanceM = options.stitchDistanceM;
     std::vector<std::string> selWarnings;
-    OSV_TRY_ASSIGN(p->calibration, meta::CalibrationSelector::select(p->track.stream(), selOpt, &selWarnings));
+    OSV_TRY_ASSIGN(meta::CalibrationSelection selection,
+                   meta::CalibrationSelector::choose(p->track.stream(), choice, selOpt, &selWarnings));
+    p->calibration = selection.set;
+    p->notes.push_back("calibration: " + selection.reason);
     for (const std::string& w : selWarnings) {
         p->notes.push_back("calibration: " + w);
     }
@@ -192,7 +222,26 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     for (const std::string& n : p->rig.notes) {
         p->notes.push_back("rig: " + n);
     }
-    p->blendParams.lensFovDeg = options.lensFovDeg;
+
+    // ---- lens protectors: the field-angle correction ------------------------
+    // Folded into both lens models exactly as rebuildRig does.  The usable
+    // FOV shrinks with it, and the kernel takes its angle limit from the
+    // blend parameters, so the blend must follow the fold.
+    double lensFovDeg = options.lensFovDeg;
+    const geom::ProtectorDirection protectorDirection =
+        forcedProtector.value_or(selection.protectorCorrection ? geom::ProtectorDirection::Forward
+                                                               : geom::ProtectorDirection::None);
+    if (protectorDirection != geom::ProtectorDirection::None) {
+        OSV_TRY_ASSIGN(geom::ProtectorRigFold fold,
+                       geom::applyLensProtector(p->rig, protectorDirection, options.lensFovDeg));
+        lensFovDeg = fold.lensFovDeg;
+        char buf[160] = {};
+        std::snprintf(buf, sizeof(buf), "lens-protector correction %s: usable FOV %.2f deg, refit residual %.3f px%s",
+                      geom::protectorDirectionName(protectorDirection), fold.lensFovDeg, fold.maxResidualPx,
+                      forcedProtector ? " (forced by --protector)" : " (unverified: the importer checks frame 0)");
+        p->notes.push_back(std::string("calibration: ") + buf);
+    }
+    p->blendParams.lensFovDeg = lensFovDeg;
     p->blendParams.featherDeg = options.featherDeg;
     p->blendParams.useOcclusionMask = options.occlusionMask;
 
@@ -250,8 +299,15 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     if (!color::parseDlogMFit(lower(options.fit), fit)) {
         return Error{ErrorCode::InvalidArgument, "unknown --fit '" + options.fit + "'"};
     }
+    // The Rec.709 display look (ignored by every other output): DJI Studio's
+    // rendering unless the standard one is asked for.
+    color::Look look = color::kDefaultLook;
+    if (!color::parseLook(lower(options.look), look)) {
+        return Error{ErrorCode::InvalidArgument, "unknown --look '" + options.look + "' (expected dji or standard)"};
+    }
     p->color = color::makeColorParams(fit, p->outputTransfer, static_cast<float>(options.exposureStops),
-                                      p->inputEncoding, true, p->format.bitDepth ? p->format.bitDepth : 10);
+                                      p->inputEncoding, true, p->format.bitDepth ? p->format.bitDepth : 10, nullptr,
+                                      color::kBt2408SceneScale, look);
 
     // ---- stabilisation ----------------------------------------------------------------
     const std::string stab = lower(options.stab);

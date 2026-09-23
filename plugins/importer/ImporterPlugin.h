@@ -243,6 +243,7 @@ struct DialogControls {
     int dlogmFit = 0;       ///< Combo index: 0 DJI refit, 1 Pocket 3.
     double exposureStops = 0.0;
     int renderDevice = 0;   ///< Combo index: 0 Auto, 1 CPU, 2 CUDA, 3 OpenCL.
+    int look = 0;           ///< [WP-LOOK] Combo index = PrefsLook: 0 DJI (default), 1 OpenOSV standard.
     // ---- [WP-PHOTO] the sky seam fix ----------------------------------------
     int photoSeam = 2;                  ///< Combo index = PrefsPhotoSeam: 0 Off, 1 Rim only, 2 Rim and colour.
     double photoStrengthPercent = 100;  ///< Gain-field strength, 0..100 %.

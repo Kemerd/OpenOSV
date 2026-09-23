@@ -56,3 +56,9 @@
 #define IDC_STATIC_EXP     1105
 #define IDC_STATIC_DEVICE  1106
 #define IDC_STATIC_STOPS   1107
+
+// [WP-LOOK] The Rec.709 output's display look (DJI Studio / OpenOSV standard).
+// Numbered well clear of the sequential block above so a control another
+// change appends there cannot collide with it.
+#define IDC_REC709_LOOK    1030
+#define IDC_STATIC_LOOK    1130

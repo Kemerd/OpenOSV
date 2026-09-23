@@ -7,7 +7,7 @@
 // registered with ctest, because its numbers depend on the machine and would
 // only make the suite slow and flaky.  Run it by hand:
 //
-//     build\<dir>\bin\osv_importer_bench.exe [clip.OSV] [--frames N] [--part A|B|C|D|P|F|all]
+//     build\<dir>\bin\osv_importer_bench.exe [clip.OSV] [--frames N] [--part A|B|C|D|P|F|Q|all]
 //
 // WHY IT EXISTS
 // -------------
@@ -47,6 +47,10 @@
 //      OPENOSV_IMPORTER_NO_GPU_DECODE), parking and playing, in ONE process
 //      back to back so the ratios survive a noisy machine.  The mock host's
 //      own PPix allocation is measured per format and reported beside them.
+//
+//   Q  quiet / unquiet and a new instance of the clip (what Premiere does on
+//      every Source Settings change): the first frame after each, per frame
+//      path, against the same frame on a clip that stayed open.
 //
 // Output is plain ASCII so it survives any Windows console code page.
 
@@ -1201,6 +1205,123 @@ void partF(const Options& o) {
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }
 
+// ===========================================================================
+//  Part Q - quiet / unquiet and the Source Settings reopen
+// ===========================================================================
+
+/// Premiere quiets a clip it is not reading (imQuietFile) and wakes it
+/// seconds later, and opens a NEW importer instance of the clip on every
+/// Source Settings change.  Both used to rebuild the decoders from nothing.
+/// This part times the first frame after each, per frame path, against the
+/// same frame on an already-open clip (the floor: decode + stitch + readback
+/// with everything warm).
+void partQ(const Options& o) {
+    std::printf("\n=== Q. Quiet / unquiet and a new instance of the clip: the first frame after each ===\n");
+    std::printf("    frame 17, Stopped, BGRA_4444_8u, 6000x3000, analyses off, host cache cleared before every request\n");
+    std::printf("    steady   = the same request on a clip that stayed open (the floor)\n");
+    std::printf("    unquiet  = imQuietFile, then the request (the importer reopens its decoders)\n");
+    std::printf("    new inst = imCloseFile, imOpenFile8 + imGetInfo8 on a new instance, then the request\n\n");
+
+    ImporterHarness harness;
+    if (!harness.loaded()) {
+        std::printf("    cannot load the importer: %s\n", harness.loadError().c_str());
+        return;
+    }
+    const void* rawSuite = nullptr;
+    if (harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &rawSuite) != kSPNoError ||
+        !rawSuite) {
+        std::printf("    cannot acquire the PPix suite from the mock host\n");
+        return;
+    }
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(rawSuite);
+
+    PrefsBlob prefs = PrefsBlob::defaults();
+    prefs.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::Native);
+    prefs.seamSearch = 0;
+    prefs.gainMatch = 0;
+    prefs.parallax = static_cast<std::uint8_t>(osv::premiere::PrefsParallax::Off);
+    constexpr std::uint32_t kFrame = 17;
+    constexpr int kRounds = 6;
+
+    csSDK_int32 importerId = 1200;
+    for (const bool gpu : {true, false}) {
+        ::_putenv_s("OPENOSV_IMPORTER_NO_GPU_DECODE", gpu ? "" : "1");
+        // One request of frame kFrame on `clip`; -1 on failure.
+        auto request = [&](ImporterHarness::ClipHandle& clip, PrTime ticksPerFrame) {
+            ImporterHarness::SourceVideoRequest r;
+            r.frameTime = ticksPerFrame * static_cast<PrTime>(kFrame);
+            r.format = PrPixelFormat_BGRA_4444_8u;
+            r.width = 6000;
+            r.height = 3000;
+            r.intent = imRenderIntent_Stopped;
+            r.playbackRatio = 1.0;
+            harness.host().clearCache();
+            PPixHand hand = nullptr;
+            const Clock::time_point t0 = Clock::now();
+            const csSDK_int32 err = harness.getSourceVideo(clip, r, prefs, hand);
+            const double ms = msSince(t0);
+            if (err != imNoErr || !hand) {
+                return -1.0;
+            }
+            ppix->Dispose(hand);
+            return ms;
+        };
+        // Open + imGetInfo8; returns the frame period, 0 on failure.
+        auto openInstance = [&](ImporterHarness::ClipHandle& clip) -> PrTime {
+            clip = harness.openClip(o.clip, importerId++);
+            if (!clip.open()) {
+                return 0;
+            }
+            imFileInfoRec8 info{};
+            if (harness.getInfo8(clip, info, &prefs) != imNoErr || info.vidScale <= 0 || info.vidSampleSize <= 0) {
+                return 0;
+            }
+            return kTicksPerSecond * info.vidSampleSize / info.vidScale;
+        };
+
+        ImporterHarness::ClipHandle clip;
+        const PrTime period = openInstance(clip);
+        if (period <= 0) {
+            std::printf("    open failed\n");
+            continue;
+        }
+        const double first = request(clip, period);
+        std::vector<double> steady, unquiet, fresh;
+        for (int r = 0; r < kRounds; ++r) {
+            steady.push_back(request(clip, period));
+            if (clip.quiet() != imNoErr) {
+                std::printf("    imQuietFile failed\n");
+                break;
+            }
+            unquiet.push_back(request(clip, period));
+        }
+        for (int r = 0; r < kRounds; ++r) {
+            clip.close();
+            const PrTime p = openInstance(clip);
+            if (p <= 0) {
+                std::printf("    reopen failed\n");
+                break;
+            }
+            fresh.push_back(request(clip, p));
+        }
+        clip.close();
+        const auto anyFailed = [](const std::vector<double>& v) {
+            return std::any_of(v.begin(), v.end(), [](double x) { return x < 0.0; });
+        };
+        if (first < 0.0 || anyFailed(steady) || anyFailed(unquiet) || anyFailed(fresh)) {
+            std::printf("    %-4s a request failed\n", gpu ? "GPU" : "host");
+            continue;
+        }
+        std::printf("    %-4s first open %7.1f | steady %6.1f | unquiet median %6.1f worst %6.1f | new inst median %6.1f "
+                    "worst %6.1f  (ms)\n",
+                    gpu ? "GPU" : "host", first, median(steady), median(unquiet),
+                    *std::max_element(unquiet.begin(), unquiet.end()), median(fresh),
+                    *std::max_element(fresh.begin(), fresh.end()));
+    }
+    ::_putenv_s("OPENOSV_IMPORTER_NO_GPU_DECODE", "");
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1213,7 +1334,7 @@ int main(int argc, char** argv) {
 
     const Options o = parseArgs(argc, argv);
     if (o.clip.empty() || !std::filesystem::exists(o.clip)) {
-        std::printf("usage: osv_importer_bench [clip.OSV] [--frames N] [--part A|B|C|D|P|F|all]\n");
+        std::printf("usage: osv_importer_bench [clip.OSV] [--frames N] [--part A|B|C|D|P|F|Q|all]\n");
         std::printf("clip not found: '%s'\n", o.clip.string().c_str());
         return 2;
     }
@@ -1239,6 +1360,9 @@ int main(int argc, char** argv) {
     }
     if (wantPart(o, 'F')) {
         partF(o);
+    }
+    if (wantPart(o, 'Q')) {
+        partQ(o);
     }
     return 0;
 }

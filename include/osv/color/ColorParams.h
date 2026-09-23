@@ -48,12 +48,27 @@ enum class InputEncoding : int {
     Rec709Normal = OSV_INPUT_REC709_NORMAL  ///< color_mode 0 "Normal" Rec.709 clips.
 };
 
+/// Which display look the Rec.709 output uses (details in osv/color/Look.h).
+///
+/// Persisted (as PrefsLook in the importer's preference blob, where zero means
+/// "the default"), so values are never renumbered.  Only the Rec.709 output
+/// has a look; HLG, PQ, linear and passthrough ignore it.
+enum class Look : int {
+    Standard = OSV_LOOK_STANDARD,  ///< The HLG signal in Rec.709 primaries (the pre-look rendering).
+    DjiStudio = OSV_LOOK_DJI       ///< DJI Studio's D-Log M -> Rec.709 rendering (the default).
+};
+
+/// The look new code and the CLI select, and what a zeroed preference means.
+inline constexpr Look kDefaultLook = Look::DjiStudio;
+
 /// Stable lower-case names ("dji", "pocket3", "osmo360").
 [[nodiscard]] const char* dlogMFitName(DlogMFit fit) noexcept;
 /// Stable lower-case names ("hlg", "pq", "709", "linear", "dlogm").
 [[nodiscard]] const char* outputTransferName(OutputTransfer transfer) noexcept;
 /// Stable lower-case names ("dlogm", "hlg", "709").
 [[nodiscard]] const char* inputEncodingName(InputEncoding encoding) noexcept;
+/// Stable lower-case names ("dji", "standard").
+[[nodiscard]] const char* lookName(Look look) noexcept;
 
 /// Parse a name (case-insensitive; accepts the aliases documented in the CLI
 /// help: "dji"/"refit", "pocket3"/"pocket", "osmo360"/"osmo").  Returns false
@@ -63,6 +78,8 @@ enum class InputEncoding : int {
 [[nodiscard]] bool parseOutputTransfer(std::string_view text, OutputTransfer& out) noexcept;
 /// Parse "dlogm"/"dlog-m"/"log", "hlg", "709"/"rec709"/"normal".
 [[nodiscard]] bool parseInputEncoding(std::string_view text, InputEncoding& out) noexcept;
+/// Parse "dji"/"dji-studio"/"djistudio"/"studio" or "standard"/"std"/"hlg709".
+[[nodiscard]] bool parseLook(std::string_view text, Look& out) noexcept;
 
 /// The curve constants for a fit.
 [[nodiscard]] const OsvDlogMCurve& dlogmCurve(DlogMFit fit) noexcept;
@@ -103,16 +120,21 @@ enum class InputEncoding : int {
  * @param bitDepth       YCbCr sample bit depth (8..16; 10 for the Osmo 360).
  * @param curveOverride  Optional custom curve replacing the fit's constants.
  * @param sceneScale     Scene-linear -> HLG/PQ scale (kBt2408SceneScale).
+ * @param look           Display look for the Rec.709 output (DJI Studio by
+ *                       default; Look::Standard keeps the pre-look rendering).
+ *                       Ignored by every other transfer.
  *
  * Inputs outside their valid range are clamped (bit depth to 8..16, non-finite
- * stops to 0, non-positive scene scale to the BT.2408 default) rather than
- * rejected, so the function can never produce a block that crashes a kernel.
+ * stops to 0, non-positive scene scale to the BT.2408 default, an unknown look
+ * to the standard rendering) rather than rejected, so the function can never
+ * produce a block that crashes a kernel.
  */
 [[nodiscard]] OsvColorParams makeColorParams(DlogMFit fit, OutputTransfer transfer, float exposureStops,
                                              InputEncoding input = InputEncoding::DLogM, bool narrowInput = true,
                                              std::uint32_t bitDepth = 10,
                                              const OsvDlogMCurve* curveOverride = nullptr,
-                                             float sceneScale = kBt2408SceneScale) noexcept;
+                                             float sceneScale = kBt2408SceneScale,
+                                             Look look = kDefaultLook) noexcept;
 
 /// A disabled block (every stage copies input to output).
 [[nodiscard]] OsvColorParams makeDisabledColorParams() noexcept;

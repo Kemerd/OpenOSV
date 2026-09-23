@@ -10,7 +10,8 @@ blend / gain           ->  (in linear light)
 native -> Rec.2020     ->  3x3 matrix
 x sceneScale x 2^stops ->  BT.2408 anchor: 0.2674 puts 18 % grey at HLG 0.38
 transfer               ->  HLG OETF | HLG-OOTF(1000 nit, gamma 1.2) + PQ inverse EOTF
-                           | 2020->709 in linear light + HLG OETF (SDR) | linear | passthrough
+                           | Rec.709: the DJI Studio look (default, see below) or the
+                             standard 2020->709 in linear light + HLG OETF | linear | passthrough
 ```
 
 ## D-Log M curves
@@ -62,9 +63,12 @@ functional form, which would cost the closed-form inverse.
 
 DJI publishes a D-Log M -> Rec.709 LUT but not an Osmo 360 HLG one, so the fit
 had to be done against a Rec.709 reference. That is sound here without any
-inversion, because **our Rec.709 output is the HLG signal in Rec.709
-primaries** (see "Rec.709 output" below). Reading the `OSV_TRANSFER_REC709`
-branch of `osvLinearToOutput` for a neutral input (R == G == B):
+inversion, because **the standard Rec.709 rendering (`Look::Standard`) is the
+HLG signal in Rec.709 primaries** (see "Rec.709 output" below). Since the DJI
+Studio look became the Rec.709 default, this section describes the standard
+rendering only - the curve is fitted and tested through it. Reading the
+standard `OSV_TRANSFER_REC709` branch of `osvLinearToOutput` for a neutral
+input (R == G == B):
 
 ```
 working = nativeToWorking * (lin, lin, lin)     -> (k*lin, k*lin, k*lin)
@@ -81,22 +85,27 @@ to
 out(code) = HLG_OETF(sceneScale * lin(code))
 ```
 
-which is exactly the HLG branch. For neutrals our 709 and HLG outputs are the
-same function, so a 709 reference LUT's diagonal is usable directly as
+which is exactly the HLG branch. For neutrals the standard 709 and HLG outputs
+are the same function, so a 709 reference LUT's diagonal is usable directly as
 HLG-signal targets. `tests/unit/test_color.cpp` asserts this identity to 2e-6
-rather than assuming it.
+rather than assuming it (with `Look::Standard` named explicitly).
 
 This was also checked the other way round: inverting DJI's diagonal through
 `HLG_OETF^-1 / 0.2674` recovers a smooth, strictly monotonic scene-linear curve
-reaching 3.74 at code 1.0 with 18 % grey at code 0.406. DJI's 709 rendering
-therefore really is an HLG-in-709 rendering and not a separate tone map -- had
-it been one, the recovered curve would show the characteristic roll-off kink
-near diffuse white. **So the curve was what differed from DJI, not our output
-rendering, and only the curve was refitted.**
+reaching 3.74 at code 1.0 with 18 % grey at code 0.406, so the curve refit was
+the right first step. It was not the whole story, and the conclusion drawn
+here at the time - that DJI's rendering "really is" HLG-in-709 and not a tone
+map - was withdrawn once the rest of the file was measured: on the neutral
+axis alone a different log curve and a tone map are indistinguishable, and
+the other 35904 entries show a look (a crushed toe, S-shaped mid-tones, a
+highlight shoulder with slope 0.54 at code 1.0 against the HLG rendering's
+0.83, per-channel shadow saturation, gamut compression). See "The DJI Studio
+look" below.
 
 The apparent mismatch that prompted this (their 0.5 -> 0.487 against our
-0.5 -> 0.526) was entirely the old curve: the new default gives 0.5 -> 0.506
-and is within 0.030 everywhere above the crushed toe.
+0.5 -> 0.526) was mostly the old curve: the new curve gives 0.5 -> 0.506 through
+the standard rendering and is within 0.030 everywhere above the crushed toe.
+The default Rec.709 output, the DJI Studio look, gives 0.5 -> 0.487.
 
 ### Anchors
 
@@ -122,11 +131,14 @@ DJI's own LUT likewise reaches exactly 1.0 at code 1.0.
 |---|---|---|---|
 | `OpenOSV_Osmo360_DLogM_to_Rec2100_PQ.cube` | BT.2100 PQ | 0.3849 | 0.5794 |
 | `OpenOSV_Osmo360_DLogM_to_Rec2100_HLG.cube` | BT.2100 HLG | 0.3873 | 0.7479 |
-| `OpenOSV_Osmo360_DLogM_to_Rec709.cube` | BT.709 | 0.3873 | 0.7479 |
+| `OpenOSV_Osmo360_DLogM_to_Rec709.cube` | BT.709, DJI Studio look | 0.3847 | 0.7457 |
 
 (Grid points 26 and 46 of 65, the nearest to the 18 % grey and diffuse-white
-codes. HLG and Rec.709 are identical on the neutral axis by the algebra above;
-PQ's 0.5794 against BT.2408's 0.5807 for 203-nit reference white.)
+codes. The Rec.709 LUT carries the default DJI Studio look, whose grey scale is
+DJI's own: DJI's file reads 0.3882 and 0.7404 at these two grid points, and the
+standard rendering would give the HLG row's 0.3873 / 0.7479. PQ's 0.5794 is
+against BT.2408's 0.5807 for 203-nit reference white.  `osvtool lut --look
+standard` bakes the standard Rec.709 rendering instead.)
 
 These are **build output, not source**. Regenerate them with
 
@@ -139,8 +151,8 @@ Never edit one by hand. `tests/unit/test_cube.cpp` regenerates each in-process
 and compares byte for byte against the committed copy, so a curve change that
 is not followed by a re-run fails the build instead of shipping a stale table.
 
-Every byte is generated by our own `osvtool lut` from our own fitted curve; no
-DJI LUT data is redistributed (see NOTICE).
+Every byte is generated by our own `osvtool lut` from our own fitted curve (and,
+for Rec.709, our own fitted look); no DJI LUT data is redistributed (see NOTICE).
 
 `scripts\install_plugins.ps1` copies them into
 
@@ -162,18 +174,122 @@ output, which is already converted.
   203 -> 0.5807, 1000 -> 0.7518.
 * BT.2408: 18 % grey = 38 % HLG/PQ = 26 nit; HDR reference white = 75 % HLG /
   58 % PQ = 203 nit.
-* Rec.709 output: the HLG signal is the SDR rendering (BT.2390, "HLG on an SDR
-  display"), computed in Rec.709 primaries: grey lands at 38 %, diffuse white
-  at 75 %, the camera clip near 99 %. This matches DJI's own D-Log M to Rec.709
+* Rec.709 output: by default the DJI Studio look ("The DJI Studio look"
+  below). The standard rendering, `Look::Standard`, is the HLG signal as the
+  SDR rendering (BT.2390, "HLG on an SDR display"), computed in Rec.709
+  primaries: grey lands at 38 %, diffuse white at 75 %, the camera clip near
+  99 %. The standard rendering matches DJI's own D-Log M to Rec.709
   rendering far better than a peak-to-peak tone map, which came out washed out.
-  Verified against DJI's Osmo 360 file, which reads 0.3882 at code 0.40625 and
+  Checked against DJI's Osmo 360 file, which reads 0.3882 at code 0.40625 and
   0.7404 at code 0.71875 -- see "Comparing DJI's Rec.709 rendering with ours"
-  above for the algebra and the check that confirmed it is not a tone map.
+  above for the algebra, and "The DJI Studio look" below for why the default
+  moved on from it.
+
+## The DJI Studio look (the Rec.709 default)
+
+DJI Studio renders an Osmo 360 D-Log M clip through its bundled
+`DJI Osmo 360 D-Log M to Rec.709 V1.cube`: the clip's automatic "D-LOG M"
+filter (slug `LOG_Osmo360_DLogM`, service `mika.lut2`, strength 1.0, recorded
+in DJI Studio's project files). The file is byte-identical to DJI's Pocket 3
+D-Log M LUT; its header dates it to the Mavic 3 Pro. It is a **look**, not a
+colour-space conversion, and the standard rendering was measurably not it:
+
+| Against DJI's LUT, dE2000 (BT.1886 display) | mean | p95 | max |
+|---|---|---|---|
+| Standard rendering, whole 33^3 input cube | 2.81 | 6.57 | 15.8 |
+| Standard rendering, the sample clip's pixels | 2.15 | 4.86 | 6.1 |
+| **DJI Studio look**, whole cube | **1.23** | **2.80** | **6.1** |
+| **DJI Studio look**, the sample clip's pixels | **0.50** | **1.18** | **3.1** |
+| DJI Studio look, neutral axis | 0.13 | - | 0.42 |
+
+What the look does, in plain terms: blacks crushed like DJI's (code 0.0625
+renders 0.001; DJI 0.0115, standard 0.058); darker upper mid-tones (code
+0.5625: 0.554, standard 0.584); a real highlight shoulder (top slope 0.63,
+DJI 0.54, standard 0.83); a more saturated blue sky (sky chroma 33 against
+28; DJI 33); dark colours far more saturated than their mid-tone versions,
+bright oranges that stay orange, and colours outside Rec.709 compressed rather
+than clipped.
+
+### The model
+
+`osvLookApply` (ColorMath.h, shared with the kernels), stage by stage:
+
+```
+x   = toLook * working          3x3, rows sum to 1 (Rec.2020 light in)
+u_c = shaper(x_c)               kDlogMOsmo360 inverted: light -> D-Log M code,
+                                continued linearly below code 0
+y_c = T(u_c)                    monotone cubic Hermite, 17 uniform knots
+y  += a * (yh - y)              highlight hue preservation (smoothstep on the
+                                tone of max(x); yh = that tone * ratio^e)
+y   = display * y               signal-space 3x3, rows sum to 1
+y   = compress(y)               per-channel soft gamut compression below
+                                max(y) (the ACES reference gamut compression
+                                curve)
+out = clamp(y, 0, 1)
+```
+
+Both matrices have unit row sums and the two colour stages leave neutrals
+alone, so the neutral axis is exactly T - DJI's own grey scale, knot for knot.
+Each stage is there because it bought a measured improvement; additive-model
+tests showed DJI's table is not separable in any single domain (code, linear
+light, display signal), which is why every curve-plus-matrix model plateaued
+near 2 dE2000.
+
+### Provenance
+
+`include/osv/color/Look.h` ships 46 constants (38 free parameters) fitted by
+`python scripts/fit_look.py --samples <equirect D-Log M frames>`: least
+squares in CIELAB over all 35937 entries of DJI's file plus 20000 of the
+sample clip's pixels, with the neutral axis weighted in. No LUT data is
+shipped (see NOTICE); 105 measured entries are kept in
+`tests/unit/DjiReference.h` as the tests' reference. The C++ reproduces the
+script's model to 1.3e-6.
+
+Checked properties (`tests/unit/test_look.cpp`): the neutral axis is strictly
+increasing; no hue ever renders darker as its exposure rises (worst drop
+8.8e-6 of display light over 400 random ramps from -9 to +5 stops); every join
+is continuous; hostile input (NaN, infinities, 1e6, negatives) stays finite in
+[0, 1]; CPU / CUDA / OpenCL agree at 123.7 / 120.3 dB.
+
+### Where it applies, and selecting it
+
+Only the Rec.709 output has a look. **HDR has none**: DJI Studio ships no
+colour-managed HDR rendering for the Osmo 360 to match - its only D-Log M HDR
+asset is an optional creative style (`FT_StyleGeneralDlogm2HLG`: an 8-bit 64^3
+PNG LUT, 80 % default strength, blacks lifted to 3/255), the same source the
+`kDlogMDjiRefit` measurements came from. PQ and HLG keep the standard
+rendering, bit for bit.
+
+| Where | Control |
+|---|---|
+| Source Settings effect | **Look (Rec. 709 only)**: DJI (default) / OpenOSV standard, under Colour Output |
+| Importer Source Settings dialog | **Rec.709 look** (greyed unless Colour output is Rec.709) |
+| Preference blob | `PrefsBlob::look`, offset 28: 0 = DJI (the default, and every older project), 1 = standard |
+| `osvtool render` / `osvtool lut` | `--look dji` (default) / `--look standard` |
+| Library | `makeColorParams(..., Look)`, `setLook`, `lookOf`, `parseLook` |
+
+A look change behaves like any colour setting: it is part of the PPix cache
+key (the whole blob), rebuilds the importer's colour block and bumps the
+engine's Source Settings generation, so the direct path follows it. In the
+everyday setup - a Rec.709 sequence holding PQ clips - the direct path renders
+the clip straight into the working space, so the Program monitor shows this
+look.
+
+### The sun ghost
+
+The look does not remove the faint rounded rectangle around the sun; DJI's
+own LUT does not either. Measured on frame 20 of the sample clip, the ghost
+stands out from the sky around it by 5.97 dE2000 in the standard rendering,
+5.41 through DJI's LUT and 5.59 with the look, and a +10 % light step in the
+sky is 1.71 / 1.76 / 1.68. The remaining difference to DJI Studio's picture
+is photometric (lens gain, veiling glare, the seam field), which is
+WP-PHOTO's and WP-FLARE's work, not the tone transform's.
 
 ## Native primaries
 
 The Osmo 360's native -> Rec.2020 matrix (`kNativeToRec2020_Osmo360`) is
-fitted from DJI's own Osmo 360 D-Log M -> Rec.709 reference LUT, measured over
+fitted, through the standard rendering, from DJI's own Osmo 360 D-Log M ->
+Rec.709 reference LUT, measured over
 all 35937 entries by `scripts/fit_primaries.py`. A colour chart is not needed:
 a per-channel tone curve cannot move energy between channels, yet the
 reference plainly does -- a red-only input of 0.500 renders with 0.053 of

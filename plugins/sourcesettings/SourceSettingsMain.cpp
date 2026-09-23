@@ -9,9 +9,9 @@
 // Controls panel whenever the clip is selected, and their values are handed
 // to OpenOSVImporter.prm as a flat preferences blob.  It exists so the stitch
 // options (colour output, output size, stabilisation, seam search, exposure
-// match, calibration slot, D-Log M curve, exposure, render device, and the
-// reframe effect's Program Monitor Colour) are simply VISIBLE, instead of
-// hiding behind the modal dialog in imGetPrefs8.
+// match, calibration slot, D-Log M curve, exposure, render device, the
+// Rec.709 look and the reframe effect's Program Monitor Colour) are simply
+// VISIBLE, instead of hiding behind the modal dialog in imGetPrefs8.
 //
 // How the two halves find each other: the importer sets
 // imImportInfoRec::hasSourceSettingsEffect and puts this effect's match name
@@ -28,7 +28,7 @@
 //                                    SetIsSourceSettingsEffect(), which is
 //                                    what tells Premiere this is a master
 //                                    clip settings effect and not a filter.
-//   PF_Cmd_PARAMS_SETUP              the ten controls, each flagged
+//   PF_Cmd_PARAMS_SETUP              the eleven controls, each flagged
 //                                    PF_ParamFlag_CANNOT_TIME_VARY.
 //   PF_Cmd_SEQUENCE_SETUP            PerformSourceSettingsCommand(), which
 //                                    round-trips a blob through the importer
@@ -133,7 +133,11 @@ static_assert(kIndexDirectColour == kIndexRenderDevice + 1,
               "Program Monitor Colour follows Render Device inside the Advanced group");
 static_assert(kIndexAdvancedTopicEnd == kIndexDirectColour + 1,
               "the Advanced group must close immediately after Program Monitor Colour");
+static_assert(kIndexRec709Look == kIndexColorOutput + 1,
+              "the Rec.709 look sits directly under Colour Output");
 static_assert(kParamIdByIndex[kIndexColorOutput - 1] == OSV_SS_ID_COLOR_OUTPUT,
+              "kParamIdByIndex is not aligned with the ParamIndex enum");
+static_assert(kParamIdByIndex[kIndexRec709Look - 1] == OSV_SS_ID_REC709_LOOK,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
 static_assert(kParamIdByIndex[kIndexRenderDevice - 1] == OSV_SS_ID_RENDER_DEVICE,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
@@ -237,6 +241,10 @@ private:
     if (const PF_ParamDef* p = def(kIndexColorOutput)) {
         c.colorOutput = static_cast<int>(p->u.pd.value);
     }
+    // [WP-LOOK]
+    if (const PF_ParamDef* p = def(kIndexRec709Look)) {
+        c.rec709Look = static_cast<int>(p->u.pd.value);
+    }
     if (const PF_ParamDef* p = def(kIndexOutputSize)) {
         c.outputSize = static_cast<int>(p->u.pd.value);
     }
@@ -314,6 +322,7 @@ void writeControls(PF_ParamDef* params[], const ControlValues& wanted) noexcept 
     };
 
     setPopup(kIndexColorOutput, wanted.colorOutput);
+    setPopup(kIndexRec709Look, wanted.rec709Look);  // [WP-LOOK]
     setPopup(kIndexOutputSize, wanted.outputSize);
     setPopup(kIndexStabilization, wanted.stabilization);
     setCheckbox(kIndexSeamSearch, wanted.seamSearch);
@@ -417,7 +426,7 @@ PF_Err globalSetdown(PF_InData*, PF_OutData*) noexcept {
     return PF_Err_NONE;
 }
 
-/// PF_Cmd_PARAMS_SETUP: the ten controls.
+/// PF_Cmd_PARAMS_SETUP: the eleven controls.
 ///
 /// Every one of them carries PF_ParamFlag_CANNOT_TIME_VARY.  See the file
 /// header for why that is a correctness requirement rather than a style
@@ -438,7 +447,16 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Colour Output", OSV_SS_COLOR_COUNT, OSV_SS_COLOR_DEFAULT, OSV_SS_COLOR_ITEMS, kStaticFlags,
                   OSV_SS_ID_COLOR_OUTPUT);
 
-    // ---- 2. Output Size ----------------------------------------------------
+    // ---- 2. Look (Rec. 709 only) [WP-LOOK] ---------------------------------
+    // The Rec. 709 output's display look, right under the output it belongs
+    // to: DJI Studio's rendering (the default) or OpenOSV's standard one.
+    // The name carries "(Rec. 709 only)" because PQ, HLG and the passthrough
+    // ignore it and a source settings effect cannot dependably grey it out.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUPX("Look (Rec. 709 only)", OSV_SS_LOOK_COUNT, OSV_SS_LOOK_DEFAULT, OSV_SS_LOOK_ITEMS, kStaticFlags,
+                  OSV_SS_ID_REC709_LOOK);
+
+    // ---- 3. Output Size ----------------------------------------------------
     // The size a new sequence built from the clip inherits, which is why the
     // labels spell the pixels out.  Every entry is 2:1 because a full
     // 360 x 180 sphere is; the 16:9 delivery crop is the reframe effect's job.
@@ -446,31 +464,31 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Output Size", OSV_SS_SIZE_COUNT, OSV_SS_SIZE_DEFAULT, OSV_SS_SIZE_ITEMS, kStaticFlags,
                   OSV_SS_ID_OUTPUT_SIZE);
 
-    // ---- 3. Stabilisation --------------------------------------------------
+    // ---- 4. Stabilisation --------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Stabilisation", OSV_SS_STAB_COUNT, OSV_SS_STAB_DEFAULT, OSV_SS_STAB_ITEMS, kStaticFlags,
                   OSV_SS_ID_STABILIZATION);
 
-    // ---- 4. Stitching topic ------------------------------------------------
+    // ---- 5. Stitching topic ------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_TOPICX("Stitching", PF_ParamFlag_NONE, OSV_SS_ID_STITCH_TOPIC);
 
-    // ---- 5. Seam Search ----------------------------------------------------
+    // ---- 6. Seam Search ----------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Seam Search", OSV_SS_SEAM_SEARCH_DEFAULT, kStaticFlags, OSV_SS_ID_SEAM_SEARCH);
 
-    // ---- 6. Exposure Match -------------------------------------------------
+    // ---- 7. Exposure Match -------------------------------------------------
     // The blob field is called gainMatch; the label says what it does to a
     // user, which is match the two lenses' exposure across the seam.
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Exposure Match", OSV_SS_GAIN_MATCH_DEFAULT, kStaticFlags, OSV_SS_ID_GAIN_MATCH);
 
-    // ---- 7. Calibration ----------------------------------------------------
+    // ---- 8. Calibration ----------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Calibration", OSV_SS_CALIB_COUNT, OSV_SS_CALIB_DEFAULT, OSV_SS_CALIB_ITEMS, kStaticFlags,
                   OSV_SS_ID_CALIBRATION);
 
-    // ---- 8. Close the Stitching group --------------------------------------
+    // ---- 9. Close the Stitching group --------------------------------------
     // PF_END_TOPIC issues its own PF_ADD_PARAM (Param_Utils.h:309-316), so the
     // terminator occupies a parameter slot of its own and everything after it
     // shifts up by one.  Leaving it out would not merely lose a divider: the
@@ -480,16 +498,16 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_STITCH_TOPIC_END);
 
-    // ---- 9. Advanced topic (collapsed: most users never touch it) ----------
+    // ---- 10. Advanced topic (collapsed: most users never touch it) ----------
     AEFX_CLR_STRUCT(def);
     PF_ADD_TOPICX("Advanced", PF_ParamFlag_START_COLLAPSED, OSV_SS_ID_ADVANCED_TOPIC);
 
-    // ---- 10. D-Log M Curve -------------------------------------------------
+    // ---- 11. D-Log M Curve -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("D-Log M Curve", OSV_SS_FIT_COUNT, OSV_SS_FIT_DEFAULT, OSV_SS_FIT_ITEMS, kStaticFlags,
                   OSV_SS_ID_DLOGM_FIT);
 
-    // ---- 11. Exposure ------------------------------------------------------
+    // ---- 12. Exposure ------------------------------------------------------
     // Valid range is the blob's own +/- 6 stops (static_asserted below the
     // handlers); the slider shows the useful +/- 3 so a drag has resolution.
     AEFX_CLR_STRUCT(def);
@@ -497,12 +515,12 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_EXPOSURE_SLIDER_MIN, OSV_SS_EXPOSURE_SLIDER_MAX, OSV_SS_EXPOSURE_DEFAULT,
                          PF_Precision_TENTHS, PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_EXPOSURE);
 
-    // ---- 12. Render Device -------------------------------------------------
+    // ---- 13. Render Device -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Render Device", OSV_SS_DEVICE_COUNT, OSV_SS_DEVICE_DEFAULT, OSV_SS_DEVICE_ITEMS, kStaticFlags,
                   OSV_SS_ID_RENDER_DEVICE);
 
-    // ---- 13. Program Monitor Colour [WP-SETTINGS] --------------------------
+    // ---- 14. Program Monitor Colour [WP-SETTINGS] --------------------------
     // What Open 360 Reframe shows when this clip's Colour Output is not the
     // sequence's working space: the scene rendered straight into it (fast,
     // the default) or Premiere's own conversion of the output (matches the
@@ -512,7 +530,7 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Program Monitor Colour", OSV_SS_DIRECT_COLOUR_COUNT, OSV_SS_DIRECT_COLOUR_DEFAULT,
                   OSV_SS_DIRECT_COLOUR_ITEMS, kStaticFlags, OSV_SS_ID_DIRECT_COLOUR);
 
-    // ---- 14. Close the Advanced group --------------------------------------
+    // ---- 15. Close the Advanced group --------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_ADVANCED_TOPIC_END);
 
@@ -637,10 +655,11 @@ PF_Err translateParamsToPrefs(PF_InData* in_data, PF_ParamDef* params[],
     // memcpy of exactly our struct size is the whole write.
     std::memcpy(extra->prefsPC, &blob, PrefsBlob::kSize);
 
-    PluginLog::debug("source settings: translated - colour {}, size {}, stab {}, seam {}, gain {}, calib {}, "
-                     "fit {}, exposure {:+.2f}, device {}",
-                     blob.colorOutput, blob.outputSize, blob.stabilization, blob.seamSearch, blob.gainMatch,
-                     blob.calibration, blob.dlogmFit, static_cast<double>(blob.exposureStops), blob.renderDevice);
+    PluginLog::debug("source settings: translated - colour {}, look {}, size {}, stab {}, seam {}, gain {}, "
+                     "calib {}, fit {}, exposure {:+.2f}, device {}",
+                     blob.colorOutput, blob.look, blob.outputSize, blob.stabilization, blob.seamSearch,
+                     blob.gainMatch, blob.calibration, blob.dlogmFit, static_cast<double>(blob.exposureStops),
+                     blob.renderDevice);
     return PF_Err_NONE;
 }
 
@@ -684,6 +703,8 @@ static_assert(OSV_SS_DEVICE_COUNT == static_cast<int>(osv::premiere::PrefsRender
               "the Render Device popup does not list every PrefsRenderDevice value");
 static_assert(OSV_SS_DIRECT_COLOUR_COUNT == static_cast<int>(osv::premiere::PrefsDirectColour::Count),
               "the Program Monitor Colour popup does not list every PrefsDirectColour value");
+static_assert(OSV_SS_LOOK_COUNT == static_cast<int>(osv::premiere::PrefsLook::Count),
+              "the Rec.709 look popup does not list every PrefsLook value");
 
 // ===========================================================================
 //  The exported entry point
