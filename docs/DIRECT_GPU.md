@@ -49,7 +49,12 @@ equirect does not.
   through the existing equirect route until the same kernel is wired to CPU
   decode; output must match the GPU path.
 * The importer keeps producing the equirect (for users who want the 360 clip
-  itself) and becomes cheap when the effect is present.
+  itself).  It is NOT degraded when the effect is present - the request
+  carries no consumer and the host's cache key none either, so a cheaper
+  frame would reach the Source Monitor, other sequences and the effect's own
+  fallback; instead the importer's own frame runs on the GPU too (NVDEC into
+  VRAM, stitch in place, pinned banded readback: ~6x cheaper while playing).
+  See docs/PREMIERE.md, "The importer's own frame".
 
 ## Work packages
 

@@ -38,6 +38,7 @@ add_executable(osv_premiere_common_tests
   common/TestMain.cpp
   common/test_mockhost.cpp
   common/test_common.cpp
+  common/test_pixelcopy_bands.cpp
 )
 
 target_link_libraries(osv_premiere_common_tests PRIVATE

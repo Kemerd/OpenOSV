@@ -7,7 +7,7 @@
 // registered with ctest, because its numbers depend on the machine and would
 // only make the suite slow and flaky.  Run it by hand:
 //
-//     build\<dir>\bin\osv_importer_bench.exe [clip.OSV] [--frames N] [--part A|B|C|D|P|all]
+//     build\<dir>\bin\osv_importer_bench.exe [clip.OSV] [--frames N] [--part A|B|C|D|P|F|all]
 //
 // WHY IT EXISTS
 // -------------
@@ -40,6 +40,13 @@
 //      sends when the user clicks somewhere new on the timeline, at scattered
 //      frames so no decode-ahead can hide the cost - plus the decoder's
 //      random-access cost alone, for comparison.
+//
+//   F  the importer's own frame by pixel format (32f / 16u / 8u) and by path
+//      (the GPU frame path: NVDEC into VRAM, stitch in place, pack, pinned
+//      banded readback - versus the host path it replaced, forced with
+//      OPENOSV_IMPORTER_NO_GPU_DECODE), parking and playing, in ONE process
+//      back to back so the ratios survive a noisy machine.  The mock host's
+//      own PPix allocation is measured per format and reported beside them.
 //
 // Output is plain ASCII so it survives any Windows console code page.
 
@@ -77,6 +84,8 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <map>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -973,6 +982,225 @@ void partP(const Options& o) {
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }
 
+
+// ===========================================================================
+//  Part F - the importer's own frame by format and by path
+// ===========================================================================
+
+/// Median of `v` without its first sample (the first request of a clip pays
+/// the decoder open and the pinned-memory setup).
+double warmMedian(const std::vector<double>& v) { return median(tail(v, 1)); }
+
+/// One "frame-cost" line of the importer's debug log (ImporterInstance.cpp,
+/// renderFrameToHost / renderFrameOnGpu): key=value fields.
+struct FrameCost {
+    std::string path;                  ///< "gpu" or "host".
+    std::map<std::string, double> ms;  ///< total, decode, job, render, readback, copy, ...
+};
+
+/// The importer's log in this process's isolated LOCALAPPDATA.
+std::filesystem::path importerLogPath() {
+    wchar_t buffer[32768] = {};
+    const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, static_cast<DWORD>(std::size(buffer)));
+    if (n == 0 || n >= std::size(buffer)) {
+        return {};
+    }
+    return std::filesystem::path(buffer) / L"OpenOSV" / L"OpenOSVImporter.log";
+}
+
+/// Every "frame-cost" line appended to the log since byte `from`; `from`
+/// advances to the end.
+std::vector<FrameCost> readFrameCosts(const std::filesystem::path& log, std::uintmax_t& from) {
+    std::vector<FrameCost> out;
+    std::ifstream in(log, std::ios::binary);
+    if (!in) {
+        return out;
+    }
+    in.seekg(0, std::ios::end);
+    const std::uintmax_t size = static_cast<std::uintmax_t>(in.tellg());
+    if (size < from) {
+        from = 0;  // rotated
+    }
+    in.seekg(static_cast<std::streamoff>(from));
+    std::string line;
+    while (std::getline(in, line)) {
+        const std::size_t at = line.find("frame-cost ");
+        if (at == std::string::npos) {
+            continue;
+        }
+        FrameCost cost;
+        std::size_t pos = at + 11;
+        while (pos < line.size()) {
+            const std::size_t end = line.find(' ', pos);
+            const std::string field = line.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            const std::size_t eq = field.find('=');
+            if (eq != std::string::npos) {
+                const std::string key = field.substr(0, eq);
+                const std::string value = field.substr(eq + 1);
+                if (key == "path") {
+                    cost.path = value;
+                } else {
+                    char* stop = nullptr;
+                    const double v = std::strtod(value.c_str(), &stop);
+                    if (stop && stop != value.c_str()) {
+                        cost.ms[key] = v;
+                    }
+                }
+            }
+            if (end == std::string::npos) {
+                break;
+            }
+            pos = end + 1;
+        }
+        out.push_back(std::move(cost));
+    }
+    from = size;
+    return out;
+}
+
+/// Median of one stage over a set of frame costs (first one skipped: cold).
+double stageMedian(const std::vector<FrameCost>& costs, const char* stage) {
+    std::vector<double> v;
+    for (const FrameCost& c : costs) {
+        const auto it = c.ms.find(stage);
+        if (it != c.ms.end()) {
+            v.push_back(it->second);
+        }
+    }
+    return warmMedian(v);
+}
+
+void partF(const Options& o) {
+    std::printf("\n=== F. The importer's own frame: pixel format x frame path (native 6000x3000, analyses off) ===\n");
+    std::printf("    GPU  = NVDEC into VRAM, stitch in place, 16u/8u packed on the GPU, pinned banded readback\n");
+    std::printf("    host = D3D11VA decode to host, upload, stitch, readback, float image, CPU convert\n");
+    std::printf("    park = %zu scattered Stopped requests (host cache cleared), play = sequential Playing\n",
+                std::size(kParkFrames));
+    std::printf("    importer ms = the importer's own time per frame from its frame-cost log lines, i.e. WITHOUT the\n");
+    std::printf("    mock host's PPix allocation (it zero-fills every fresh 288 MB frame; Premiere recycles them)\n\n");
+
+    // The importer reads its log level when it initialises, i.e. when the
+    // harness below loads it: debug is what writes the frame-cost lines.
+    ::_putenv_s("OSV_PLUGIN_LOG_LEVEL", "debug");
+    const std::filesystem::path log = importerLogPath();
+
+    ImporterHarness harness;
+    if (!harness.loaded()) {
+        std::printf("    cannot load the importer: %s\n", harness.loadError().c_str());
+        return;
+    }
+    const void* rawSuite = nullptr;
+    if (harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &rawSuite) != kSPNoError ||
+        !rawSuite) {
+        std::printf("    cannot acquire the PPix suite from the mock host\n");
+        return;
+    }
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(rawSuite);
+
+    // Analyses off: they are per-bucket caches shared by both paths, and
+    // what is compared here is the frame path itself.
+    PrefsBlob prefs = PrefsBlob::defaults();
+    prefs.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::Native);
+    prefs.seamSearch = 0;
+    prefs.gainMatch = 0;
+    prefs.parallax = static_cast<std::uint8_t>(osv::premiere::PrefsParallax::Off);
+
+    struct Format {
+        const char* name;
+        PrPixelFormat format;
+    };
+    const Format formats[] = {{"32f", PrPixelFormat_BGRA_4444_32f},
+                              {"16u", PrPixelFormat_BGRA_4444_16u},
+                              {"8u", PrPixelFormat_BGRA_4444_8u}};
+    const int playFrames = std::min(o.frames, 60);
+
+    std::printf("    %-4s %-3s | %9s %9s | %9s %9s | %s\n", "path", "fmt", "park wall", "importer", "play wall",
+                "importer", "importer stages while playing (median ms)");
+    std::uintmax_t logOffset = 0;
+    (void)readFrameCosts(log, logOffset);  // skip whatever is there already
+    csSDK_int32 importerId = 900;
+    for (const bool gpu : {true, false}) {
+        // Chosen by each clip at its first frame, so it is set before the
+        // clip below renders anything.
+        ::_putenv_s("OPENOSV_IMPORTER_NO_GPU_DECODE", gpu ? "" : "1");
+        for (const Format& f : formats) {
+            auto clip = harness.openClip(o.clip, importerId++);
+            if (!clip.open()) {
+                std::printf("    open failed (%d)\n", static_cast<int>(clip.openResult()));
+                continue;
+            }
+            imFileInfoRec8 info{};
+            if (harness.getInfo8(clip, info, &prefs) != imNoErr || info.vidScale <= 0 || info.vidSampleSize <= 0) {
+                std::printf("    imGetInfo8 failed\n");
+                continue;
+            }
+            const PrTime ticksPerFrame = kTicksPerSecond * info.vidSampleSize / info.vidScale;
+            auto request = [&](std::uint32_t frame, imRenderIntent intent) {
+                ImporterHarness::SourceVideoRequest r;
+                r.frameTime = ticksPerFrame * static_cast<PrTime>(frame);
+                r.format = f.format;
+                r.width = 6000;
+                r.height = 3000;
+                r.intent = intent;
+                r.playbackRatio = 1.0;
+                PPixHand hand = nullptr;
+                const Clock::time_point t0 = Clock::now();
+                const csSDK_int32 err = harness.getSourceVideo(clip, r, prefs, hand);
+                const double ms = msSince(t0);
+                if (err != imNoErr || !hand) {
+                    return -1.0;
+                }
+                ppix->Dispose(hand);
+                return ms;
+            };
+
+            // Parking: scattered, cache cleared, the first landing opens everything.
+            std::vector<double> park;
+            for (const std::uint32_t frame : kParkFrames) {
+                harness.host().clearCache();
+                park.push_back(request(frame, imRenderIntent_Stopped));
+            }
+            const std::vector<FrameCost> parkCosts = readFrameCosts(log, logOffset);
+            // Playing: sequential from frame 0 (decode-ahead engages).
+            std::vector<double> play;
+            for (int i = 0; i < playFrames; ++i) {
+                harness.host().clearCache();
+                play.push_back(request(static_cast<std::uint32_t>(i), imRenderIntent_Playing));
+            }
+            const std::vector<FrameCost> playCosts = readFrameCosts(log, logOffset);
+            clip.close();
+
+            const bool failed = std::any_of(park.begin(), park.end(), [](double v) { return v < 0.0; }) ||
+                                std::any_of(play.begin(), play.end(), [](double v) { return v < 0.0; });
+            if (failed) {
+                std::printf("    %-4s %-3s | a request failed\n", gpu ? "GPU" : "host", f.name);
+                continue;
+            }
+            // The stage split while playing, in the path's own terms.
+            char stages[256] = {};
+            if (playCosts.empty()) {
+                std::snprintf(stages, sizeof(stages), "(no frame-cost lines: run --part F on its own)");
+            } else if (gpu) {
+                std::snprintf(stages, sizeof(stages), "decode %.1f  job %.1f  render %.1f  readback %.1f",
+                              stageMedian(playCosts, "decode"), stageMedian(playCosts, "job"),
+                              stageMedian(playCosts, "render"), stageMedian(playCosts, "readback"));
+            } else {
+                std::snprintf(stages, sizeof(stages), "decode+upload+stitch+readback %.1f  convert %.1f",
+                              stageMedian(playCosts, "render"), stageMedian(playCosts, "copy"));
+            }
+            // Warm play samples only (the second half), like the other parts.
+            std::vector<FrameCost> warmPlay(
+                playCosts.begin() + static_cast<std::ptrdiff_t>(std::min(playCosts.size(), playCosts.size() / 2)),
+                playCosts.end());
+            std::printf("    %-4s %-3s | %9.1f %9.1f | %9.1f %9.1f | %s\n", gpu ? "GPU" : "host", f.name,
+                        warmMedian(park), stageMedian(parkCosts, "total"), median(warm(play)),
+                        stageMedian(warmPlay, "total"), stages);
+        }
+    }
+    ::_putenv_s("OPENOSV_IMPORTER_NO_GPU_DECODE", "");
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -985,7 +1213,7 @@ int main(int argc, char** argv) {
 
     const Options o = parseArgs(argc, argv);
     if (o.clip.empty() || !std::filesystem::exists(o.clip)) {
-        std::printf("usage: osv_importer_bench [clip.OSV] [--frames N] [--part A|B|C|D|P|all]\n");
+        std::printf("usage: osv_importer_bench [clip.OSV] [--frames N] [--part A|B|C|D|P|F|all]\n");
         std::printf("clip not found: '%s'\n", o.clip.string().c_str());
         return 2;
     }
@@ -1008,6 +1236,9 @@ int main(int argc, char** argv) {
     }
     if (wantPart(o, 'P')) {
         partP(o);
+    }
+    if (wantPart(o, 'F')) {
+        partF(o);
     }
     return 0;
 }
