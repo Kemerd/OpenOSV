@@ -210,6 +210,92 @@ bool writeCover(const std::filesystem::path& dir, const std::string& stem, const
     return true;
 }
 
+/// Print and record everything about the clip's calibration sets: which of
+/// the twelve exist (and which are zero-filled placeholders), how each usable
+/// one differs from the native reference, what lens accessory the camera
+/// recorded, and what every Source Settings choice would actually stitch
+/// with.  This is the answer to "I switched Calibration and nothing changed".
+///
+/// Console lines are 7-bit ASCII like the rest of the probe; `calibration`
+/// gains "sets", "accessory" and "choices".
+void describeCalibrationSets(const osv::meta::StreamMeta& s, json& calibration) {
+    using namespace osv::meta;
+    const CalibrationInventory inv = CalibrationSelector::inventory(s);
+    const char* refName = inv.nativeReference ? calibrationSetName(*inv.nativeReference) : "none";
+
+    // ---- the twelve sets -----------------------------------------------------
+    std::printf("calibration sets (differences vs %s, calibration px):\n", refName);
+    json sets = json::array();
+    for (const CalibrationSetInfo& info : inv.sets) {
+        json j;
+        j["name"] = calibrationSetName(info.id);
+        j["slots"] = json::array({calibrationSetSlaveSlot(info.id), calibrationSetMasterSlot(info.id)});
+        j["state"] = calibrationSetStateName(info.state);
+        j["vsNative"] = nullptr;
+        std::string detail;
+        if (info.vsNative) {
+            const CalibrationDelta& d = *info.vsNative;
+            j["vsNative"] = json{{"focalPx", d.focalPx},         {"centrePx", d.centrePx},
+                                 {"distortion", d.distortion},   {"rotationDeg", d.rotationDeg},
+                                 {"identical", d.identical}};
+            if (inv.nativeReference && info.id == *inv.nativeReference) {
+                detail = "reference";
+            } else if (d.identical) {
+                detail = "IDENTICAL to the reference (choosing it changes nothing)";
+            } else {
+                char buf[160] = {};
+                std::snprintf(buf, sizeof(buf), "focal %.3f  centre %.3f  k %.7f  rotation %.4f deg", d.focalPx,
+                              d.centrePx, d.distortion, d.rotationDeg);
+                detail = buf;
+            }
+        } else if (info.state == CalibrationSetState::Empty) {
+            detail = "zero-filled placeholder (the camera had no such calibration)";
+        } else if (info.state == CalibrationSetState::Partial) {
+            detail = "incomplete (a lens lacks fx/fy/cx/cy/size/extrinsic)";
+        }
+        std::printf("  %2u/%-2u %-18s %-8s %s\n", calibrationSetSlaveSlot(info.id), calibrationSetMasterSlot(info.id),
+                    calibrationSetName(info.id), calibrationSetStateName(info.state), detail.c_str());
+        sets.push_back(std::move(j));
+    }
+    calibration["sets"] = sets;
+
+    // ---- the recorded accessory ------------------------------------------------
+    // extri_lens_mode is the only accessory field the format has: it mirrors
+    // the camera's "Lens Protection Mode" switch.  There is no ND filter
+    // field anywhere in ClipMeta / StreamMeta / FrameMeta, so an ND filter is
+    // on record only if the user declared it as a lens protector.
+    calibration["accessory"] = json{{"recordedMode", static_cast<int>(inv.recordedMode)},
+                                    {"recordedModeName", extriLensModeName(inv.recordedMode)},
+                                    {"recordedModePresent", inv.recordedModePresent},
+                                    {"ndFilterField", false}};
+    std::printf("lens accessory: %s (StreamMeta.extri_lens_mode%s); ND filters have no field of their own\n",
+                extriLensModeName(inv.recordedMode), inv.recordedModePresent ? "" : " not recorded, assumed");
+
+    // ---- what each Source Settings choice stitches with ----------------------
+    std::printf("calibration choices:\n");
+    json choices = json::object();
+    for (std::uint8_t c = 0; c < static_cast<std::uint8_t>(CalibrationChoice::Count); ++c) {
+        const auto choice = static_cast<CalibrationChoice>(c);
+        osv::Result<CalibrationSelection> picked = CalibrationSelector::choose(s, choice);
+        if (!picked.ok()) {
+            choices[calibrationChoiceName(choice)] = json{{"error", safe(picked.error().toString())}};
+            std::printf("  %-12s -> none (%s)\n", calibrationChoiceName(choice), safe(picked.error().toString()).c_str());
+            continue;
+        }
+        const CalibrationSelection& sel = picked.value();
+        const bool sameAsNative = sel.fellBack || sel.identicalToNative;
+        choices[calibrationChoiceName(choice)] = json{{"slave", sel.set.sourceSlave},
+                                                      {"master", sel.set.sourceMaster},
+                                                      {"set", calibrationSetName(sel.used)},
+                                                      {"fellBack", sel.fellBack},
+                                                      {"identicalToNative", sel.identicalToNative},
+                                                      {"reason", safe(sel.reason)}};
+        std::printf("  %-12s -> %-14s%s  %s\n", calibrationChoiceName(choice), calibrationSetName(sel.used),
+                    sameAsNative ? " (= native)" : "", safe(sel.reason).c_str());
+    }
+    calibration["choices"] = choices;
+}
+
 /// Run the command; returns one of the kExit* codes.
 int runProbe(const ProbeOptions& opt) {
     using namespace osv;
@@ -436,6 +522,7 @@ int runProbe(const ProbeOptions& opt) {
             for (const std::string& w : calWarnings) {
                 std::printf("  note: %s\n", safe(w).c_str());
             }
+            describeCalibrationSets(s, calibration);
             doc["calibration"] = calibration;
         }
 

@@ -2436,3 +2436,88 @@ TEST_CASE("quieting or closing a clip while a background measurement is queued n
 
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }
+
+// =============================================================================
+//  Calibration choice
+// =============================================================================
+
+namespace {
+
+/// The imAnalysis text for `clip` under `prefs` (the Properties panel).
+[[nodiscard]] std::string analysisText(ImporterHarness& harness, ImporterHarness::ClipHandle& clip, PrefsBlob prefs) {
+    imAnalysisRec rec{};
+    rec.privatedata = clip.privateData();
+    rec.prefs = &prefs;
+    REQUIRE(harness.send(imAnalysis, nullptr, &rec) == imNoErr);  // size first
+    REQUIRE(rec.buffersize > 0);
+    std::vector<char> buffer(static_cast<std::size_t>(rec.buffersize), '\0');
+    rec.buffer = buffer.data();
+    REQUIRE(harness.send(imAnalysis, nullptr, &rec) == imNoErr);
+    return std::string(buffer.data());
+}
+
+}  // namespace
+
+TEST_CASE("every calibration choice reaches the instance; on the sample they all stitch native",
+          "[importer][video][calibration][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+
+    // Nothing but the calibration differs between the renders.  Everything
+    // that depends on image content is off, so the comparison is exact.
+    PrefsBlob base = PrefsBlob::defaults();
+    base.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::Native);
+    base.seamSearch = 0;
+    base.gainMatch = 0;
+    base.stabilization = static_cast<std::uint8_t>(PrefsStabilization::Off);
+    base.parallax = static_cast<std::uint8_t>(PrefsParallax::Off);
+
+    ImporterHarness::SourceVideoRequest request;
+    request.frameTime = 0;
+    request.width = 3000;
+    request.height = 1500;
+
+    PrefsBlob autoBlob = base;
+    autoBlob.setCalibrationChoice(PrefsCalibrationChoice::Auto);
+    const DecodedFrame frameAuto = renderFrame(harness, clip, ppix, request, autoBlob);
+
+    // The sample was shot with the camera's Lens Protection Mode off and
+    // carries no lens-guard or underwater calibration (slots 5..10 are
+    // zero-filled placeholders), so every choice must stitch native_refine
+    // and produce the very same pixels.  A different picture here would mean
+    // a choice silently used something other than what it reports.
+    for (const PrefsCalibrationChoice choice : {PrefsCalibrationChoice::Native, PrefsCalibrationChoice::LensGuards,
+                                                PrefsCalibrationChoice::Underwater}) {
+        PrefsBlob p = base;
+        p.setCalibrationChoice(choice);
+        INFO("choice " << static_cast<int>(choice));
+        harness.host().clearCache();
+        const DecodedFrame frame = renderFrame(harness, clip, ppix, request, p);
+        REQUIRE(maxChannelDiff(frame, frameAuto) == 0.0f);
+
+        // The Properties panel names the slots actually in use.
+        const std::string text = analysisText(harness, clip, p);
+        INFO(text);
+        REQUIRE(text.find("Calibration slots: native_refine_slave / native_refine_master") != std::string::npos);
+        REQUIRE(text.find("Lens accessory: Native") != std::string::npos);
+    }
+
+    SECTION("a blob saved before the choice existed renders exactly as Auto") {
+        std::uint8_t bytes[PrefsBlob::kSize];
+        std::memcpy(bytes, &autoBlob, PrefsBlob::kSize);
+        bytes[offsetof(PrefsBlob, calibrationForceNative)] = 0;  // an older build's reserved byte
+        const PrefsBlob old = PrefsBlob::fromBytes(bytes, sizeof(bytes));
+        REQUIRE(old.calibrationChoice() == PrefsCalibrationChoice::Auto);
+        harness.host().clearCache();
+        REQUIRE(maxChannelDiff(renderFrame(harness, clip, ppix, request, old), frameAuto) == 0.0f);
+    }
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}

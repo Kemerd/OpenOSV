@@ -239,7 +239,7 @@ struct DialogControls {
     int stabilization = 1;  ///< Combo index: 0 Off, 1 Horizon lock, 2 Full, 3 Smooth.
     bool seamSearch = true;
     bool gainMatch = true;
-    int calibration = 0;    ///< Combo index: 0 Native, 1 Lens guards, 2 Underwater.
+    int calibration = 0;    ///< Combo index = PrefsCalibrationChoice: 0 Auto, 1 Native, 2 Lens protectors, 3 Underwater.
     int dlogmFit = 0;       ///< Combo index: 0 DJI refit, 1 Pocket 3.
     double exposureStops = 0.0;
     int renderDevice = 0;   ///< Combo index: 0 Auto, 1 CPU, 2 CUDA, 3 OpenCL.

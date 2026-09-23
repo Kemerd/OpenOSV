@@ -14,6 +14,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "CalibrationUi.h"
 #include "ImporterPlugin.h"
 #include "PrefsBlob.h"
 
@@ -36,7 +37,7 @@ TEST_CASE("the defaults round trip through the control mapping", "[importer][pre
         REQUIRE(controls.stabilization == 1);   // Horizon lock
         REQUIRE(controls.seamSearch == true);
         REQUIRE(controls.gainMatch == true);
-        REQUIRE(controls.calibration == 0);     // Native
+        REQUIRE(controls.calibration == 0);     // Auto (follow the recorded accessory)
         REQUIRE(controls.dlogmFit == static_cast<int>(PrefsDlogmFit::Osmo360));
         REQUIRE(controls.exposureStops == 0.0);
         REQUIRE(controls.renderDevice == 0);    // Auto
@@ -229,5 +230,118 @@ TEST_CASE("the colour-space token follows the colour output", "[importer][prefs]
         codes = seiCodesFor(blob);
         REQUIRE(codes.primaries == 1);   // BT.709
         REQUIRE(codes.transfer == 1);
+    }
+}
+
+// =============================================================================
+//  Calibration: the combo lists the CHOICE, and the labels tell the truth
+// =============================================================================
+
+TEST_CASE("the calibration combo maps to the choice and old blobs read as Auto", "[importer][prefs][mapping]") {
+    // Combo index == PrefsCalibrationChoice: Auto, Native, Lens protectors,
+    // Underwater.  Each index must produce its canonical blob and come back.
+    for (int index = 0; index < static_cast<int>(PrefsCalibrationChoice::Count); ++index) {
+        DialogControls controls = controlsFromPrefs(PrefsBlob::defaults());
+        controls.calibration = index;
+        const PrefsBlob blob = prefsFromControls(controls);
+        INFO("combo index " << index);
+        REQUIRE(static_cast<int>(blob.calibrationChoice()) == index);
+        REQUIRE(controlsFromPrefs(blob).calibration == index);
+        PrefsBlob copy = blob;
+        REQUIRE(copy.sanitise());  // canonical: nothing to fix
+    }
+
+    // A blob saved before the choice existed: calibration 0 with a zero
+    // (formerly reserved) force byte.  It rendered by the recorded accessory,
+    // and it shows - and stays - Auto.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.calibration = 0;
+    old.calibrationForceNative = 0;
+    REQUIRE(controlsFromPrefs(old).calibration == static_cast<int>(PrefsCalibrationChoice::Auto));
+    REQUIRE(prefsFromControls(controlsFromPrefs(old)) == old);
+
+    // A forced Native and Auto are different blobs (different cache keys).
+    DialogControls native = controlsFromPrefs(PrefsBlob::defaults());
+    native.calibration = static_cast<int>(PrefsCalibrationChoice::Native);
+    REQUIRE(prefsFromControls(native) != PrefsBlob::defaults());
+    REQUIRE(prefsFromControls(native).calibration == 0);
+    REQUIRE(prefsFromControls(native).calibrationForceNative == 1);
+}
+
+TEST_CASE("the calibration labels say which sets the clip holds", "[importer][prefs][mapping]") {
+    constexpr auto kAuto = static_cast<std::size_t>(PrefsCalibrationChoice::Auto);
+    constexpr auto kNative = static_cast<std::size_t>(PrefsCalibrationChoice::Native);
+    constexpr auto kGuards = static_cast<std::size_t>(PrefsCalibrationChoice::LensGuards);
+    constexpr auto kWater = static_cast<std::size_t>(PrefsCalibrationChoice::Underwater);
+
+    SECTION("no clip facts: plain names") {
+        const auto labels = calibrationChoiceLabels(CalibrationUiFacts{});
+        REQUIRE(labels[kAuto] == L"Auto (follow the camera)");
+        REQUIRE(labels[kNative] == L"Native (bare lenses)");
+        REQUIRE(labels[kGuards] == L"Lens protectors / ND filters");
+        REQUIRE(labels[kWater] == L"Underwater");
+    }
+
+    SECTION("the sample clip: recorded bare lenses, no accessory sets") {
+        CalibrationUiFacts facts;
+        facts.known = true;
+        facts.recordedAccessory = 0;
+        facts.lensGuards = CalibrationAvailability::Missing;
+        facts.underwater = CalibrationAvailability::Missing;
+        const auto labels = calibrationChoiceLabels(facts);
+        REQUIRE(labels[kAuto] == L"Auto (camera: no lens protectors)");
+        REQUIRE(labels[kGuards] == L"Lens protectors (not in clip: Native)");
+        REQUIRE(labels[kWater] == L"Underwater (not in clip: Native)");
+    }
+
+    SECTION("a clip shot with lens protectors") {
+        CalibrationUiFacts facts;
+        facts.known = true;
+        facts.recordedAccessory = 1;
+        facts.lensGuards = CalibrationAvailability::Usable;
+        facts.underwater = CalibrationAvailability::Missing;
+        const auto labels = calibrationChoiceLabels(facts);
+        REQUIRE(labels[kAuto] == L"Auto (camera: lens protectors)");
+        REQUIRE(labels[kGuards] == L"Lens protectors / ND filters");
+
+        // Recorded, but the file has no numbers for it: Auto says so.
+        facts.lensGuards = CalibrationAvailability::Missing;
+        REQUIRE(calibrationChoiceLabels(facts)[kAuto] == L"Auto (protectors recorded, no data)");
+        // A copy of native is marked as such.
+        facts.lensGuards = CalibrationAvailability::SameAsNative;
+        REQUIRE(calibrationChoiceLabels(facts)[kGuards] == L"Lens protectors (same as Native here)");
+    }
+
+    SECTION("nothing recorded, underwater recorded, unknown accessory") {
+        CalibrationUiFacts facts;
+        facts.known = true;
+        facts.recordedAccessory = -1;
+        REQUIRE(calibrationChoiceLabels(facts)[kAuto] == L"Auto (nothing recorded: Native)");
+        facts.recordedAccessory = 2;
+        facts.underwater = CalibrationAvailability::Usable;
+        REQUIRE(calibrationChoiceLabels(facts)[kAuto] == L"Auto (camera: underwater)");
+        facts.recordedAccessory = 9;
+        REQUIRE(calibrationChoiceLabels(facts)[kAuto] == L"Auto (unknown accessory: Native)");
+    }
+
+    SECTION("every label fits the closed combo box") {
+        // The combo is 179 dialog units wide: about 42 characters of the
+        // dialog font.  A longer label is cut off exactly where it says
+        // "Native", which is the part that matters.
+        for (const int recorded : {-1, 0, 1, 2, 7}) {
+            for (const CalibrationAvailability a :
+                 {CalibrationAvailability::Unknown, CalibrationAvailability::Usable,
+                  CalibrationAvailability::SameAsNative, CalibrationAvailability::Missing}) {
+                CalibrationUiFacts facts;
+                facts.known = true;
+                facts.recordedAccessory = recorded;
+                facts.lensGuards = a;
+                facts.underwater = a;
+                for (const std::wstring& label : calibrationChoiceLabels(facts)) {
+                    REQUIRE(!label.empty());
+                    REQUIRE(label.size() <= 40u);
+                }
+            }
+        }
     }
 }

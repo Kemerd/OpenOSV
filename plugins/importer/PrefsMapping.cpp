@@ -14,6 +14,7 @@
 
 #include "ImporterPlugin.h"
 
+#include "CalibrationUi.h"
 #include "PrefsBlob.h"
 
 #include <cmath>
@@ -33,7 +34,9 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.stabilization = static_cast<int>(prefs.stabilization);
     c.seamSearch = prefs.seamSearch != 0;
     c.gainMatch = prefs.gainMatch != 0;
-    c.calibration = static_cast<int>(prefs.calibration);
+    // The combo lists the CHOICE (Auto, Native, Lens protectors, Underwater),
+    // which two stored bytes encode - see PrefsBlob::calibrationChoice().
+    c.calibration = static_cast<int>(prefs.calibrationChoice());
     c.dlogmFit = static_cast<int>(prefs.dlogmFit);
     c.exposureStops = static_cast<double>(prefs.exposureStops);
     c.renderDevice = static_cast<int>(prefs.renderDevice);
@@ -63,7 +66,11 @@ PrefsBlob prefsFromControls(const DialogControls& controls) noexcept {
     blob.stabilization = pick(controls.stabilization, static_cast<int>(PrefsStabilization::Count), 1);
     blob.seamSearch = controls.seamSearch ? 1u : 0u;
     blob.gainMatch = controls.gainMatch ? 1u : 0u;
-    blob.calibration = pick(controls.calibration, static_cast<int>(PrefsCalibration::Count), 0);
+    // An out-of-range calibration index lands on Auto, the default; the
+    // setter writes the canonical byte pattern for the choice.
+    blob.setCalibrationChoice(static_cast<PrefsCalibrationChoice>(
+        pick(controls.calibration, static_cast<int>(PrefsCalibrationChoice::Count),
+             static_cast<std::uint8_t>(PrefsCalibrationChoice::Auto))));
     blob.dlogmFit = pick(controls.dlogmFit, static_cast<int>(PrefsDlogmFit::Count), 0);
     blob.renderDevice = pick(controls.renderDevice, static_cast<int>(PrefsRenderDevice::Count), 0);
 
@@ -76,6 +83,69 @@ PrefsBlob prefsFromControls(const DialogControls& controls) noexcept {
 
     blob.sanitise();
     return blob;
+}
+
+// ---------------------------------------------------------------------------
+//  Calibration combo labels
+// ---------------------------------------------------------------------------
+
+std::array<std::wstring, static_cast<std::size_t>(PrefsCalibrationChoice::Count)>
+calibrationChoiceLabels(const CalibrationUiFacts& facts) {
+    // Index = PrefsCalibrationChoice.  DJI's own words where they exist: the
+    // camera's control centre calls the setting "Lens Protection Mode" and
+    // the accessory "Transparent Lens Protectors", and ND filters that sit on
+    // the lenses the same way are declared through that same mode (Freewell's
+    // instructions say exactly that), so the entry names both.
+    std::array<std::wstring, static_cast<std::size_t>(PrefsCalibrationChoice::Count)> labels = {
+        L"Auto (follow the camera)",
+        L"Native (bare lenses)",
+        L"Lens protectors / ND filters",
+        L"Underwater",
+    };
+    if (!facts.known) {
+        return labels;  // Nothing to say about a clip we could not read.
+    }
+
+    // ---- Auto: name what it follows, and whether that set is really there --
+    auto& autoLabel = labels[static_cast<std::size_t>(PrefsCalibrationChoice::Auto)];
+    switch (facts.recordedAccessory) {
+    case -1:
+        autoLabel = L"Auto (nothing recorded: Native)";
+        break;
+    case 0:
+        autoLabel = L"Auto (camera: no lens protectors)";
+        break;
+    case 1:
+        autoLabel = facts.lensGuards == CalibrationAvailability::Missing ? L"Auto (protectors recorded, no data)"
+                                                                          : L"Auto (camera: lens protectors)";
+        break;
+    case 2:
+        autoLabel = facts.underwater == CalibrationAvailability::Missing ? L"Auto (underwater recorded, no data)"
+                                                                          : L"Auto (camera: underwater)";
+        break;
+    default:
+        autoLabel = L"Auto (unknown accessory: Native)";
+        break;
+    }
+
+    // ---- the forced accessory sets: say when they cannot change anything --
+    auto mark = [](std::wstring& label, CalibrationAvailability a, const wchar_t* name) {
+        switch (a) {
+        case CalibrationAvailability::Missing:
+            label = std::wstring(name) + L" (not in clip: Native)";
+            break;
+        case CalibrationAvailability::SameAsNative:
+            label = std::wstring(name) + L" (same as Native here)";
+            break;
+        case CalibrationAvailability::Unknown:
+        case CalibrationAvailability::Usable:
+        default:
+            break;  // The plain name is the truth.
+        }
+    };
+    mark(labels[static_cast<std::size_t>(PrefsCalibrationChoice::LensGuards)], facts.lensGuards, L"Lens protectors");
+    mark(labels[static_cast<std::size_t>(PrefsCalibrationChoice::Underwater)], facts.underwater, L"Underwater");
+    return labels;
 }
 
 // ---------------------------------------------------------------------------

@@ -125,15 +125,18 @@ void trimAnalysisCache(MapT& cache, std::size_t limit, const typename MapT::key_
     return color::kDefaultDlogMFit;
 }
 
-/// Map the prefs enum onto the calibration selector's lens-mode override.
-/// Native means "use whatever the clip says", so it stays nullopt.
-[[nodiscard]] std::optional<meta::ExtriLensMode> toLensModeOverride(PrefsCalibration calib) noexcept {
-    switch (calib) {
-    case PrefsCalibration::LensGuards: return meta::ExtriLensMode::LensGuards;
-    case PrefsCalibration::Underwater: return meta::ExtriLensMode::Underwater;
-    case PrefsCalibration::Native:
-    case PrefsCalibration::Count:
-    default:                           return std::nullopt;
+/// Map the prefs choice onto the calibration selector's choice.  Auto - the
+/// default, and what every blob with calibration 0 written before the
+/// choice existed means - follows the accessory the camera recorded; the
+/// other three force their set.
+[[nodiscard]] meta::CalibrationChoice toCalibrationChoice(PrefsCalibrationChoice choice) noexcept {
+    switch (choice) {
+    case PrefsCalibrationChoice::Native:     return meta::CalibrationChoice::Native;
+    case PrefsCalibrationChoice::LensGuards: return meta::CalibrationChoice::LensGuards;
+    case PrefsCalibrationChoice::Underwater: return meta::CalibrationChoice::Underwater;
+    case PrefsCalibrationChoice::Auto:
+    case PrefsCalibrationChoice::Count:
+    default:                                 return meta::CalibrationChoice::Auto;
     }
 }
 
@@ -465,18 +468,18 @@ Status ImporterInstance::rebuildRig() {
     // The lens-guard / underwater slots change the intrinsics AND the
     // extrinsics, so the whole rig is rebuilt; the selector is cheap (it only
     // walks the protobuf records already parsed into StreamMeta).
-    meta::CalibrationSelector::Options selOpt;
-    selOpt.lensModeOverride = toLensModeOverride(m_prefs.calib());
-
+    //
+    // Everything is built into locals and committed together at the end, so
+    // a failure half way leaves the previous calibration, rig and notes
+    // intact and consistent with each other.
+    const PrefsCalibrationChoice choice = m_prefs.calibrationChoice();
     std::vector<std::string> selWarnings;
-    auto selected = meta::CalibrationSelector::select(m_track.stream(), selOpt, &selWarnings);
+    auto selected = meta::CalibrationSelector::choose(m_track.stream(), toCalibrationChoice(choice), {}, &selWarnings);
     if (!selected.ok()) {
         return selected.error();
     }
-    m_calibration = std::move(selected).value();
-    for (const std::string& w : selWarnings) {
-        m_notes.push_back("calibration: " + w);
-    }
+    const meta::CalibrationSelection selection = std::move(selected).value();
+    const meta::CalibrationSet& calibration = selection.set;
 
     // Sensor -> stream scaling: the calibration is expressed in 3840x3840
     // sensor pixels, the decoded frames are 3000x3000 (6K mode).  This is the
@@ -487,36 +490,72 @@ Status ImporterInstance::rebuildRig() {
     // reader splits apart before we ever see a frame.  The rig describes one
     // lens, so it must be derived from the half, not from the track.
     std::vector<std::string> scaleNotes;
-    const double calFxMean = 0.5 * (m_calibration.slave.fx + m_calibration.master.fx);
+    const double calFxMean = 0.5 * (calibration.slave.fx + calibration.master.fx);
     auto scaling = geom::StreamScaling::derive(
         static_cast<int>(m_format.lensW()), static_cast<int>(m_format.lensH()), static_cast<int>(m_format.sensorW),
         static_cast<int>(m_format.sensorH), m_format.digitalFocalLength, calFxMean, std::nullopt, &scaleNotes);
     if (!scaling.ok()) {
         return scaling.error();
     }
-    for (const std::string& n : scaleNotes) {
-        m_notes.push_back("scaling: " + n);
-    }
 
     // The verified conventions (docs, memory: wxyz order, body->lens sense,
     // focal from digital_focal_length, 195.18 deg usable FOV).
+    //
+    // Note what the focal source means for a calibration switch: with
+    // DigitalFocalLength both lenses take the clip's one digital focal length,
+    // so a set contributes its principal point, radial terms, extrinsic
+    // rotation and occlusion arc - but not its own fx/fy (unless those
+    // disagree with the digital focal length by more than 1.2x, see
+    // LensRig.cpp).  On the sample that is the verified-best choice: the
+    // per-lens calibration focal measured a lower overlap NCC (0.807 vs 0.824).
     const geom::ExtrinsicConvention conv;  // defaults are the verified values
-    auto rig = geom::LensRig::build(m_calibration, scaling.value(), geom::FocalSource::DigitalFocalLength,
+    auto rig = geom::LensRig::build(calibration, scaling.value(), geom::FocalSource::DigitalFocalLength,
                                     m_format.digitalFocalLength, conv, 195.18);
     if (!rig.ok()) {
         return rig.error();
     }
+
+    // ---- commit ----------------------------------------------------------------
+    m_calibration = calibration;
     m_rig = std::move(rig).value();
+
+    // The notes feed the Properties panel.  A rebuild REPLACES the previous
+    // calibration / scaling / rig notes instead of piling another copy on
+    // top of them each time the user flips the setting.
+    std::erase_if(m_notes, [](const std::string& n) {
+        return n.starts_with("calibration: ") || n.starts_with("scaling: ") || n.starts_with("rig: ");
+    });
+    m_notes.push_back("calibration: " + selection.reason);
+    for (const std::string& w : selWarnings) {
+        m_notes.push_back("calibration: " + w);
+    }
+    for (const std::string& n : scaleNotes) {
+        m_notes.push_back("scaling: " + n);
+    }
     for (const std::string& n : m_rig.notes) {
         m_notes.push_back("rig: " + n);
     }
+
+    // ---- one line per (re)build: which set stitches this clip, and why ------
+    //
+    // The line to look for when "switching Calibration changes nothing": it
+    // names the choice, what the camera recorded, the set actually used and,
+    // when that set is native after all (the clip holds no lens-guard /
+    // underwater calibration, or holds a copy of native), says so in words.
+    // Info level, because it runs once on open and once per calibration
+    // change - never per frame.
+    PluginLog::info("calibration: '{}': {}/{} - {}", m_path.filename().string(), m_calibration.sourceSlave,
+                    m_calibration.sourceMaster, selection.reason);
 
     // Blend defaults match osvtool's (4 degree feather, occlusion polygon on).
     m_blend.lensFovDeg = 195.18;
     m_blend.featherDeg = 4.0;
     m_blend.useOcclusionMask = true;
 
-    m_rigCalibration = m_prefs.calib();
+    // The CHOICE, not the calibration byte: Auto and a forced Native share
+    // calibration 0 but can stitch with different sets (on a clip recorded
+    // with lens protectors), so the rebuild trigger has to tell them apart.
+    m_rigCalibration = choice;
     m_rigBuilt = true;
     return okStatus();
 }
@@ -799,8 +838,8 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
         rebuildColor();
     }
 
-    // The rig only depends on the calibration slot.
-    if (m_parsed && (!m_rigBuilt || m_rigCalibration != incoming.calib())) {
+    // The rig only depends on the calibration choice.
+    if (m_parsed && (!m_rigBuilt || m_rigCalibration != incoming.calibrationChoice())) {
         const Status st = rebuildRig();
         if (!st.ok()) {
             PluginLog::warn("prefs: calibration slot {} could not be applied: {}",
