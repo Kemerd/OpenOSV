@@ -761,8 +761,8 @@ static_assert(OSV_SS_SIZE_COUNT == static_cast<int>(osv::premiere::PrefsOutputSi
               "the Output Size popup does not list every PrefsOutputSize value");
 static_assert(OSV_SS_STAB_COUNT == static_cast<int>(osv::premiere::PrefsStabilization::Count),
               "the Stabilisation popup does not list every PrefsStabilization value");
-static_assert(OSV_SS_CALIB_COUNT == static_cast<int>(osv::premiere::PrefsCalibration::Count),
-              "the Calibration popup does not list every PrefsCalibration value");
+static_assert(OSV_SS_CALIB_COUNT == static_cast<int>(osv::premiere::PrefsCalibrationChoice::Count),
+              "the Calibration popup does not list every PrefsCalibrationChoice value");
 static_assert(OSV_SS_FIT_COUNT == static_cast<int>(osv::premiere::PrefsDlogmFit::Count),
               "the D-Log M Curve popup does not list every PrefsDlogmFit value");
 static_assert(OSV_SS_DEVICE_COUNT == static_cast<int>(osv::premiere::PrefsRenderDevice::Count),

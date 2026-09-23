@@ -56,7 +56,13 @@ PrefsBlob prefsFromControls(const ControlValues& controls) noexcept {
     blob.colorOutput = fromPopup(controls.colorOutput, OSV_SS_COLOR_COUNT, blob.colorOutput);
     blob.outputSize = fromPopup(controls.outputSize, OSV_SS_SIZE_COUNT, blob.outputSize);
     blob.stabilization = fromPopup(controls.stabilization, OSV_SS_STAB_COUNT, blob.stabilization);
-    blob.calibration = fromPopup(controls.calibration, OSV_SS_CALIB_COUNT, blob.calibration);
+    // Calibration goes through its own table (kCalibrationChoiceByPopup):
+    // the popup is not in enum order, and Native is two bytes (calibration
+    // plus calibrationForceNative), which setCalibrationChoice() writes as a
+    // pair.  An out-of-range value keeps the default choice from defaults().
+    if (controls.calibration >= 1 && controls.calibration <= OSV_SS_CALIB_COUNT) {
+        blob.setCalibrationChoice(kCalibrationChoiceByPopup[controls.calibration - 1]);
+    }
     blob.dlogmFit = fromPopup(controls.dlogmFit, OSV_SS_FIT_COUNT, blob.dlogmFit);
     blob.renderDevice = fromPopup(controls.renderDevice, OSV_SS_DEVICE_COUNT, blob.renderDevice);
     // [WP-SETTINGS] The direct path's colour rule for this clip.
@@ -112,7 +118,16 @@ ControlValues controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.colorOutput = toPopup(clean.colorOutput, OSV_SS_COLOR_COUNT);
     c.outputSize = toPopup(clean.outputSize, OSV_SS_SIZE_COUNT);
     c.stabilization = toPopup(clean.stabilization, OSV_SS_STAB_COUNT);
-    c.calibration = toPopup(clean.calibration, OSV_SS_CALIB_COUNT);
+    // The popup item whose choice is the blob's (see kCalibrationChoiceByPopup);
+    // a choice missing from the table cannot happen after sanitise(), and would
+    // show item 1 (Auto) rather than an out-of-range selection.
+    c.calibration = 1;
+    for (int item = 1; item <= OSV_SS_CALIB_COUNT; ++item) {
+        if (kCalibrationChoiceByPopup[item - 1] == clean.calibrationChoice()) {
+            c.calibration = item;
+            break;
+        }
+    }
     c.dlogmFit = toPopup(clean.dlogmFit, OSV_SS_FIT_COUNT);
     c.renderDevice = toPopup(clean.renderDevice, OSV_SS_DEVICE_COUNT);
     c.directColour = toPopup(clean.directColour, OSV_SS_DIRECT_COLOUR_COUNT);  // [WP-SETTINGS]

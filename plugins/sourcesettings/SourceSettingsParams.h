@@ -206,9 +206,17 @@
 #define OSV_SS_STAB_COUNT 4
 #define OSV_SS_STAB_DEFAULT 2 /* HorizonLock */
 
-/* PrefsCalibration: Native, LensGuards, Underwater. */
-#define OSV_SS_CALIB_ITEMS "Native|Lens Guards|Underwater"
-#define OSV_SS_CALIB_COUNT 3
+/* PrefsCalibrationChoice, in POPUP order (kCalibrationChoiceByPopup in
+ * SourceSettingsMapping.h): Auto, Lens Protectors / ND Filters, Underwater,
+ * Native.
+ *
+ * The first three keep the positions of the original "Native|Lens
+ * Guards|Underwater" list.  Its first entry never forced anything - calibration
+ * 0 always followed the accessory the camera recorded - so it is now labelled
+ * for what it does, Auto, and a saved project keeps its exact meaning.  Forcing
+ * the bare-lens set is new and therefore appended as the fourth item. */
+#define OSV_SS_CALIB_ITEMS "Auto (as recorded)|Lens Protectors / ND Filters|Underwater|Native (bare lenses)"
+#define OSV_SS_CALIB_COUNT 4
 #define OSV_SS_CALIB_DEFAULT 1
 
 /* PrefsDlogmFit: DjiRefit, Pocket3, Osmo360.  The enum is append-only (the

@@ -450,7 +450,9 @@ TEST_CASE("the popups list every value of their prefs enum", "[sourcesettings][p
         {kIndexColorOutput, static_cast<int>(PrefsColorOutput::Count)},
         {kIndexOutputSize, static_cast<int>(PrefsOutputSize::Count)},
         {kIndexStabilization, static_cast<int>(PrefsStabilization::Count)},
-        {kIndexCalibration, static_cast<int>(PrefsCalibration::Count)},
+        // Calibration lists every CHOICE (Auto, Lens Protectors, Underwater,
+        // forced Native), which is one more than the stored set enum.
+        {kIndexCalibration, static_cast<int>(PrefsCalibrationChoice::Count)},
         {kIndexDlogmFit, static_cast<int>(PrefsDlogmFit::Count)},
         {kIndexRenderDevice, static_cast<int>(PrefsRenderDevice::Count)},
         {kIndexDirectColour, static_cast<int>(PrefsDirectColour::Count)},

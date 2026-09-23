@@ -26,6 +26,21 @@
 
 namespace osv::premiere::sourcesettings {
 
+/// The calibration choice each Calibration popup item selects, item 1 first.
+///
+/// Unlike the other popups this list is NOT in enum order: its first three
+/// items sit where the original "Native|Lens Guards|Underwater" items did,
+/// and the original first item (calibration 0) always behaved as Auto, so a
+/// saved project keeps its meaning while the labels now say what each item
+/// does.  Forcing the bare-lens set is new and therefore last.  Both mapping
+/// directions go through this table; nothing else may assume "value - 1".
+inline constexpr PrefsCalibrationChoice kCalibrationChoiceByPopup[OSV_SS_CALIB_COUNT] = {
+    PrefsCalibrationChoice::Auto,
+    PrefsCalibrationChoice::LensGuards,
+    PrefsCalibrationChoice::Underwater,
+    PrefsCalibrationChoice::Native,
+};
+
 /// The value of every control of the Source Settings effect, read out of the
 /// host's PF_ParamDef array and not yet validated.
 ///

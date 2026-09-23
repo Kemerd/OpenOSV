@@ -29,6 +29,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <vector>
 
@@ -189,11 +190,35 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
         }
     }
     SECTION("Calibration") {
+        // Not enum order: the items are Auto, Lens Protectors / ND Filters,
+        // Underwater, Native, so saved projects keep the meaning of their
+        // first three positions (see kCalibrationChoiceByPopup).
+        const PrefsCalibrationChoice expected[] = {PrefsCalibrationChoice::Auto, PrefsCalibrationChoice::LensGuards,
+                                                   PrefsCalibrationChoice::Underwater, PrefsCalibrationChoice::Native};
+        static_assert(std::size(expected) == OSV_SS_CALIB_COUNT, "one expectation per Calibration item");
         for (int item = 1; item <= OSV_SS_CALIB_COUNT; ++item) {
             PrefsBuffer buffer;
             fixture.setPopup(kIndexCalibration, item);
             INFO("popup value " << item);
-            CHECK(translate(fixture, buffer).calibration == static_cast<std::uint8_t>(item - 1));
+            const PrefsBlob blob = translate(fixture, buffer);
+            CHECK(blob.calibrationChoice() == expected[item - 1]);
+        }
+        // The positions a project saved with "Native|Lens Guards|Underwater"
+        // stored: item 1 was calibration 0 without a force, i.e. Auto.
+        {
+            PrefsBuffer buffer;
+            fixture.setPopup(kIndexCalibration, 1);
+            const PrefsBlob blob = translate(fixture, buffer);
+            CHECK(blob.calibration == static_cast<std::uint8_t>(PrefsCalibration::Native));
+            CHECK(blob.calibrationForceNative == 0);
+        }
+        // Only the new last item forces the bare-lens set.
+        {
+            PrefsBuffer buffer;
+            fixture.setPopup(kIndexCalibration, OSV_SS_CALIB_COUNT);
+            const PrefsBlob blob = translate(fixture, buffer);
+            CHECK(blob.calibration == static_cast<std::uint8_t>(PrefsCalibration::Native));
+            CHECK(blob.calibrationForceNative == 1);
         }
     }
     SECTION("D-Log M Curve") {
@@ -340,8 +365,10 @@ TEST_CASE("all ten controls together round-trip as one blob", "[sourcesettings][
     CHECK(static_cast<int>(blob.outputSize) == OSV_SS_SIZE_COUNT - 1);
     CHECK(static_cast<int>(blob.stabilization) == static_cast<int>(PrefsStabilization::Count) - 1);
     CHECK(static_cast<int>(blob.stabilization) == OSV_SS_STAB_COUNT - 1);
-    CHECK(static_cast<int>(blob.calibration) == static_cast<int>(PrefsCalibration::Count) - 1);
-    CHECK(static_cast<int>(blob.calibration) == OSV_SS_CALIB_COUNT - 1);
+    // Calibration's last item is the forced bare-lens set (its list is not
+    // in enum order; see kCalibrationChoiceByPopup).
+    CHECK(blob.calibrationChoice() == sourcesettings::kCalibrationChoiceByPopup[OSV_SS_CALIB_COUNT - 1]);
+    CHECK(blob.calibrationChoice() == PrefsCalibrationChoice::Native);
     CHECK(static_cast<int>(blob.dlogmFit) == static_cast<int>(PrefsDlogmFit::Count) - 1);
     CHECK(static_cast<int>(blob.dlogmFit) == OSV_SS_FIT_COUNT - 1);
     CHECK(static_cast<int>(blob.renderDevice) == static_cast<int>(PrefsRenderDevice::Count) - 1);
