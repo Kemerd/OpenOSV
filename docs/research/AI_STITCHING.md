@@ -779,7 +779,7 @@ The same crossing at 2048 columns, +-10 deg, frame 32. From the top:
 | Depth Anything V2 Metric-Outdoor Small | card says Apache; trained on Virtual KITTI 2 (non-commercial data terms): research | 2.3 ms | ~56 ms |
 | MoGe-2 ViT-S (metric, points, FOV) | MIT code and weights | 55 ms (unbatched) | ~1.3 s |
 
-Other licence-clean depth options checked for later (licence agent, not run):
+Other licence-clean depth options (licences checked 2026-09-23, not run):
 
 * Depth Anything 3 Small / Base / Metric-Large / Mono-Large: Apache-2.0.
 * Video Depth Anything Small: Apache-2.0.
@@ -908,7 +908,7 @@ minutes to hours per clip (SfM on a moving aircraft with a rigid foreground
 is also degenerate: the wing features have zero motion and dominate the
 matches unless masked).
 
-### 4.2 Implementations and licences (verified by the licence agent, 2026-09-23)
+### 4.2 Implementations and licences (verified 2026-09-23)
 
 | Tool | Licence | 360 / fisheye | Ship? |
 |---|---|---|---|
