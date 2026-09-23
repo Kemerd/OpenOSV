@@ -43,10 +43,11 @@ you edit:
   * a **corner grip** to zoom.
 
   Keyframe it like any other effect.
-* **Blazing fast, because it's CUDA all the way down.** Each view renders
-  straight from the two fisheyes into Premiere's frame in **about a quarter of
-  a millisecond** at 1440p. The picture keeps up with your mouse at full
-  quality: no preview mode, no proxy, no waiting for an export.
+* **Blazing fast, way faster than DJI Studio, because it's CUDA all the way
+  down.** Each view renders straight from the two fisheyes into Premiere's
+  frame in **about a quarter of a millisecond** at 1440p. The picture keeps up
+  with your mouse at full quality: no preview mode, no proxy, no waiting for
+  an export.
 * **The OpenOSV window.** Keep it open and **every `.OSV` you drop on the
   timeline gets the effect automatically**. DJI Studio's framing presets,
   easing presets and stabilisation are one click away.
@@ -63,7 +64,7 @@ clip, works out where the lenses disagree, and fixes it.
 | **Output** | SDR (Rec.709) | **Rec.2100 PQ HDR** (default), HLG, Rec.709, or untouched D-Log M, at 16-bit or 32-bit float |
 | **D-Log M conversion** | Built-in SDR look | **Automatic D-Log M → Rec.2100 PQ.** DJI's Rec.709 look is matched too, if you want SDR. `.cube` LUTs included. |
 | **Seam** | Automatic, no controls | **Parallax-aware carved seam**, held steady for the whole clip, **16 stitching controls** to tune it |
-| **Framing** | DJI Studio's viewer | **Drag in Premiere's Program Monitor.** CUDA renders each view in about a quarter of a millisecond. |
+| **Framing** | DJI Studio's viewer | **Drag in Premiere's Program Monitor, way faster.** CUDA renders each view in about a quarter of a millisecond. |
 | **Applying it** | — | **Automatic.** Every `.OSV` dropped on the timeline gets the effect while the OpenOSV window is open. |
 | **Lens alignment** | Factory calibration, plus a Lens Protector option | Factory calibration, a Lens Protector / ND correction, **plus the alignment measured from each clip's own footage** |
 | **Banding in the sky** | — | **Lens shading measured per lens and removed** |
