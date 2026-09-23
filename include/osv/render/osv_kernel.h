@@ -292,6 +292,35 @@ typedef struct OsvRenderParams {
     int flareEnabled;        /* 1 = subtract flare[i] from lens i              */
     OsvFlareLens flare[2];   /* per lens, indexed like lens[]                  */
     /* ---- [/WP-FLARE] ---------------------------------------------------- */
+
+    /* ---- [WP-PHOTO] photometric seam field (PhotoSeam.h) -------------------
+     * The sky band along the seam is photometric: a lens's usable rim ends
+     * before its calibrated thetaMax (and where depends on longitude), and
+     * the two lenses disagree by a gain that changes with direction.  The
+     * photo table fixes both, sampled at the ray's polar-axis (lon, lat):
+     *
+     *   gain  photoW x photoH x 3 floats, log2(L_master / L_slave) per
+     *         channel over the overlap rows [photoLatMinRad, photoLatMaxRad];
+     *         the slave is scaled by +half of it, the master by -half, in
+     *         linear light, decayed to zero beyond the rows;
+     *   rim   photoW x 2 floats after the gain, the usable rim angle per
+     *         longitude and lens (radians, never above thetaMax): the FOV
+     *         feather ends there instead of at thetaMax.
+     *
+     * All zero (the builder's default) = the table is ignored and every
+     * render is exactly what it was without it. */
+    int photoEnabled;           /* 1 = apply the photo table                   */
+    int photoW, photoH;         /* grid (columns = longitude, rows = lat)      */
+    float photoLatMinRad;       /* latitude of gain row 0                      */
+    float photoLatMaxRad;       /* latitude of gain row photoH - 1             */
+    float photoDecayRad;        /* luma gain: raised cosine to 0 beyond rows   */
+    float photoChromaDecayRad;  /* chroma ratios decay over this instead       */
+    float photoRimFeatherRad;   /* feather below the per-column rim; 0 = no rim*/
+    float photoStrength;        /* gain strength 0..1; 0 = no gain             */
+    float photoSinLatLo;        /* early-out: sin(lat) span the table touches  */
+    float photoSinLatHi;        /*   (lo >= hi disables the early-out)         */
+    float photoCodePerStop;     /* passthrough: log code units per stop        */
+    /* ---- [/WP-PHOTO] ------------------------------------------------------ */
 } OsvRenderParams;
 
 /* ------------------------------------------------------------------------- */
@@ -1129,6 +1158,206 @@ OSV_HD void osvFlareDownsamplePixel(const OsvPlane* P, const OsvColorParams* col
 /* ======================= [/WP-FLARE] functions ========================== */
 
 /* ------------------------------------------------------------------------- */
+/*  [WP-PHOTO] Photometric seam field                                         */
+/* ------------------------------------------------------------------------- */
+/* The four hooks the shader calls, in front of it for the same reason as the
+ * [WP-SEAM] helpers (every dialect needs a definition before its first use).
+ * The table layout and the reasoning are in include/osv/render/PhotoSeam.h
+ * and docs/research/NEURAL_STITCHING.md, section 8.  In short:
+ *
+ *   * the WEIGHT of lens i ends at its measured usable rim for the ray's
+ *     longitude instead of at thetaMax: fov_i = smoothstep((rim_i - theta_i)
+ *     / photoRimFeatherRad), times the same occlusion factor as before;
+ *   * the GAIN log2(master / slave) at (lon, lat) is split half and half:
+ *     the slave is scaled by 2^(+half), the master by 2^(-half), in linear
+ *     light (in log code units for passthrough output), and decays to zero
+ *     beyond the overlap rows - chroma twice as fast as luma.
+ *
+ * With a carved blend seam ([WP-SEAM]) the rim-limited weights are what
+ * osvSeamVisibility sees, so the seam never shows a lens past its usable rim.
+ * Nothing here runs unless OsvRenderParams::photoEnabled is set. */
+
+/* What the hooks share for one output pixel. */
+typedef struct OsvPhotoPixel {
+    int rimActive;   /* 1 = rim-limited weights may replace the production ones */
+    int gainActive;  /* 1 = the gain applies at this pixel                      */
+    float rim[2];    /* usable rim angle per lens (radians)                     */
+    float halfLog2[3]; /* per channel: 0.5 x strength x decayed log2(master/slave) */
+    float w[2];      /* rim-limited weight per lens                             */
+} OsvPhotoPixel;
+
+/* Raised-cosine decay by distance `dist` beyond the table rows over `range`:
+ * 1 inside (dist <= 0), 0 at and beyond `range`. */
+OSV_HD float osvPhotoDecay(float dist, float range) {
+    if (!(dist > 0.0f)) {
+        return 1.0f;
+    }
+    if (!(range > 0.0f)) {
+        return 0.0f;
+    }
+    return osvSmoothstep(1.0f - dist / range);
+}
+
+/* Fill `ph` for the body ray `dBody`.  Everything position dependent is done
+ * once per pixel here; the per-lens hooks below only read it. */
+OSV_HD void osvPhotoBegin(const OsvRenderParams* p, OSV_GLOBAL const float* photo, const float* dBody,
+                          OsvPhotoPixel* ph) {
+    ph->rimActive = 0;
+    ph->gainActive = 0;
+    ph->rim[0] = 0.0f;
+    ph->rim[1] = 0.0f;
+    ph->halfLog2[0] = 0.0f;
+    ph->halfLog2[1] = 0.0f;
+    ph->halfLog2[2] = 0.0f;
+    ph->w[0] = 0.0f;
+    ph->w[1] = 0.0f;
+    if (!p->photoEnabled || photo == 0 || p->photoW <= 0 || p->photoH <= 1) {
+        return;
+    }
+    /* Most of a frame lies outside every latitude the table can touch; one
+     * comparison on sin(lat) rejects it before any transcendental. */
+    if (p->photoSinLatLo < p->photoSinLatHi && (dBody[1] < p->photoSinLatLo || dBody[1] > p->photoSinLatHi)) {
+        return;
+    }
+    const int W = p->photoW;
+    const int H = p->photoH;
+    const float lon = atan2f(dBody[0], dBody[2]);
+    const float lat = asinf(osvClampf(dBody[1], -1.0f, 1.0f));
+
+    /* Longitude -> continuous column.  Column j sits at lon = -pi + j 2pi/W
+     * and the ring WRAPS (the warp grid's convention). */
+    const float fx = ((lon + OSV_KERNEL_PI) / OSV_KERNEL_TWO_PI) * (float)W;
+    const float flx = floorf(fx);
+    const float tx = fx - flx;
+    int x0 = (int)flx;
+    int x1 = x0 + 1;
+    x0 = ((x0 % W) + W) % W;
+    x1 = ((x1 % W) + W) % W;
+
+    /* ---- usable rim per lens, linear in longitude ---------------------- */
+    if (p->photoRimFeatherRad > 0.0f) {
+        OSV_GLOBAL const float* rimT = photo + W * H * 3;
+        for (int i = 0; i < 2; ++i) {
+            const float a = rimT[x0 * 2 + i];
+            const float b = rimT[x1 * 2 + i];
+            ph->rim[i] = a + (b - a) * tx;
+        }
+        ph->rimActive = 1;
+    }
+
+    /* ---- gain: bilinear inside the rows, clamped and decayed outside ---- */
+    const float span = p->photoLatMaxRad - p->photoLatMinRad;
+    if (p->photoStrength > 0.0f && span > 1e-6f) {
+        float latC = lat;
+        float dist = 0.0f;
+        if (lat < p->photoLatMinRad) {
+            dist = p->photoLatMinRad - lat;
+            latC = p->photoLatMinRad;
+        } else if (lat > p->photoLatMaxRad) {
+            dist = lat - p->photoLatMaxRad;
+            latC = p->photoLatMaxRad;
+        }
+        const float kL = osvPhotoDecay(dist, p->photoDecayRad);
+        const float kC = osvPhotoDecay(dist, p->photoChromaDecayRad);
+        if (kL > 0.0f || kC > 0.0f) {
+            const float fy = ((latC - p->photoLatMinRad) / span) * (float)(H - 1);
+            const float fly = floorf(fy);
+            const float ty = fy - fly;
+            int y0 = (int)fly;
+            if (y0 < 0) {
+                y0 = 0;
+            }
+            if (y0 > H - 1) {
+                y0 = H - 1;
+            }
+            const int y1 = (y0 + 1 > H - 1) ? H - 1 : y0 + 1;
+            float g[3];
+            for (int c = 0; c < 3; ++c) {
+                const float a = photo[(y0 * W + x0) * 3 + c];
+                const float b = photo[(y0 * W + x1) * 3 + c];
+                const float d0 = photo[(y1 * W + x0) * 3 + c];
+                const float d1 = photo[(y1 * W + x1) * 3 + c];
+                const float top = a + (b - a) * tx;
+                const float bot = d0 + (d1 - d0) * tx;
+                g[c] = top + (bot - top) * ty;
+            }
+            /* G (the luma anchor) decays over photoDecayRad; the R-G and B-G
+             * ratios over photoChromaDecayRad (DJI decays chroma 2x faster). */
+            const float s = 0.5f * p->photoStrength;
+            ph->halfLog2[1] = s * (kL * g[1]);
+            ph->halfLog2[0] = s * (kL * g[1] + kC * (g[0] - g[1]));
+            ph->halfLog2[2] = s * (kL * g[1] + kC * (g[2] - g[1]));
+            ph->gainActive = 1;
+        }
+    }
+}
+
+/* Rim-limited weight of lens i: the production weight `wProd` (FOV feather
+ * x occlusion, osvLensWeight) with the FOV part moved from thetaMax to the
+ * lens's usable rim.  The occlusion factor is recovered as wProd / fovProd
+ * rather than recomputed - the polygon walk is the costliest part of a
+ * weight.  fovProd == 0 implies fovPhoto == 0 (rim <= thetaMax, host clamp),
+ * so the division is never needed there. */
+OSV_HD void osvPhotoLensWeight(const OsvRenderParams* p, OsvPhotoPixel* ph, int i, float theta, float wProd) {
+    if (!ph->rimActive) {
+        return;
+    }
+    const OsvLens* L = &p->lens[i];
+    const float rim = ph->rim[i];
+    float fovPhoto = 0.0f;
+    if (!(theta > rim)) {
+        fovPhoto = osvSmoothstep((rim - theta) / p->photoRimFeatherRad);
+    }
+    /* The production FOV factor, the exact expression osvLensWeight uses. */
+    float fovProd = 1.0f;
+    if (L->featherRad > 0.0f) {
+        fovProd = osvSmoothstep((L->thetaMax - theta) / L->featherRad);
+    }
+    if (fovPhoto == fovProd) {
+        ph->w[i] = wProd; /* rim == thetaMax and the same feather: production, bit for bit */
+    } else if (fovProd > 1e-6f) {
+        ph->w[i] = fovPhoto * (wProd / fovProd);
+    } else {
+        ph->w[i] = 0.0f;
+    }
+}
+
+/* Replace the production weights with the rim-limited ones - unless both of
+ * those vanish (a direction only a lens past its usable rim sees, e.g. next
+ * to the other lens's occlusion): then the production weights stay, and the
+ * shader's occlusion rescue still applies after this. */
+OSV_HD void osvPhotoPickWeights(const OsvPhotoPixel* ph, float* w) {
+    if (!ph->rimActive) {
+        return;
+    }
+    if (ph->w[0] + ph->w[1] > 1e-4f) {
+        w[0] = ph->w[0];
+        w[1] = ph->w[1];
+    }
+}
+
+/* Scale lens i's decoded sample by half the measured lens ratio: the slave
+ * (i == 0) up by 2^(+half), the master (i == 1) down by 2^(-half).  In
+ * passthrough the blend runs on log code values, where a gain of `half`
+ * stops is an offset of half x photoCodePerStop code units. */
+OSV_HD void osvPhotoApplyGain(const OsvRenderParams* p, const OsvPhotoPixel* ph, int i, int passthrough, float* val) {
+    if (!ph->gainActive) {
+        return;
+    }
+    const float sgn = (i == 1) ? -1.0f : 1.0f;
+    if (passthrough) {
+        for (int c = 0; c < 3; ++c) {
+            val[c] += sgn * ph->halfLog2[c] * p->photoCodePerStop;
+        }
+        return;
+    }
+    for (int c = 0; c < 3; ++c) {
+        val[c] *= exp2f(sgn * ph->halfLog2[c]);
+    }
+}
+/* ---- [/WP-PHOTO] --------------------------------------------------------- */
+
+/* ------------------------------------------------------------------------- */
 /*  The shader                                                                */
 /* ------------------------------------------------------------------------- */
 
@@ -1136,12 +1365,17 @@ OSV_HD void osvFlareDownsamplePixel(const OsvPlane* P, const OsvColorParams* col
  * the optional per-column seam shift table in degrees (may be 0 when
  * seamShiftEnabled == 0), `warp` the optional 2-D parallax grid (may be 0
  * when warpEnabled == 0), `blendSeam` the optional carved blend-seam table
- * (may be 0 when blendSeamEnabled == 0).  `out` receives R, G, B in the
- * output encoding and A = coverage (or 1).  Pixels seen by neither lens are
- * (0,0,0,0). */
-OSV_HD void osvShadePixelWS(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
-                            OSV_GLOBAL const float* warp, OSV_GLOBAL const float* blendSeam, int x, int y,
-                            float* out) {
+ * (may be 0 when blendSeamEnabled == 0), `photo` the optional photometric
+ * seam table (may be 0 when photoEnabled == 0).  `out` receives R, G, B in
+ * the output encoding and A = coverage (or 1).  Pixels seen by neither lens
+ * are (0,0,0,0).
+ *
+ * The ONE full entry point: every table the kernel knows.  The older names
+ * below (osvShadePixelWS, osvShadePixelW, osvShadePixel) are thin wrappers
+ * passing null for the tables they predate. */
+OSV_HD void osvShadePixelWSP(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
+                             OSV_GLOBAL const float* warp, OSV_GLOBAL const float* blendSeam,
+                             OSV_GLOBAL const float* photo, int x, int y, float* out) {
     float dView[3];
     if (!osvRayForPixel(p, (float)x, (float)y, dView)) {
         out[0] = out[1] = out[2] = out[3] = 0.0f;
@@ -1175,6 +1409,10 @@ OSV_HD void osvShadePixelWS(const OsvRenderParams* p, const OsvPlane* planes, OS
         warpLon = osvWarpSample(p, warp, lon, lat, 0);
         warpLat = osvWarpSample(p, warp, lon, lat, 1);
     }
+
+    /* [WP-PHOTO] per-pixel rim and gain lookup (a no-op when photoEnabled == 0) */
+    OsvPhotoPixel photoPx;
+    osvPhotoBegin(p, photo, dBody, &photoPx);
 
     /* Project into both lenses and compute their weights. */
     float w[2] = {0.0f, 0.0f};
@@ -1228,8 +1466,10 @@ OSV_HD void osvShadePixelWS(const OsvRenderParams* p, const OsvPlane* planes, OS
             w[i] = osvLensWeight(L, theta, px[i], py[i]);
             projected[i] = 1;
             thetaL[i] = theta;
+            osvPhotoLensWeight(p, &photoPx, i, theta, w[i]); /* [WP-PHOTO] rim-limited twin of w[i] */
         }
     }
+    osvPhotoPickWeights(&photoPx, w); /* [WP-PHOTO] rim-limited weights unless both vanish */
 
     if (!p->blendEnabled) {
         /* Nearest-lens selection: keep only the heavier weight. */
@@ -1322,6 +1562,7 @@ OSV_HD void osvShadePixelWS(const OsvRenderParams* p, const OsvPlane* planes, OS
             val[1] *= p->lens[i].gain[1];
             val[2] *= p->lens[i].gain[2];
         }
+        osvPhotoApplyGain(p, &photoPx, i, passthrough, val); /* [WP-PHOTO] half the lens ratio each way */
         acc[0] += val[0] * w[i];
         acc[1] += val[1] * w[i];
         acc[2] += val[2] * w[i];
@@ -1338,6 +1579,14 @@ OSV_HD void osvShadePixelWS(const OsvRenderParams* p, const OsvPlane* planes, OS
         osvLinearToOutput(&p->color, acc, out);
     }
     out[3] = p->outputAlphaCoverage ? fminf(coverage, 1.0f) : 1.0f; /* [WP-SEAM] coverage */
+}
+
+/* [WP-PHOTO] The entry point from before the photometric seam table: shade
+ * with every other table and no photo table. */
+OSV_HD void osvShadePixelWS(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
+                            OSV_GLOBAL const float* warp, OSV_GLOBAL const float* blendSeam, int x, int y,
+                            float* out) {
+    osvShadePixelWSP(p, planes, seam, warp, blendSeam, (OSV_GLOBAL const float*)0, x, y, out);
 }
 
 /* [WP-SEAM] The entry point every caller used before the carved seam

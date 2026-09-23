@@ -40,6 +40,8 @@ Status CpuRenderer::renderInto(const RenderJob& job, ImageRGBAf& image) {
     const float* warp = (params.warpEnabled && !job.warpGrid.empty()) ? job.warpGrid.data() : nullptr;
     // [WP-SEAM] The carved blend-seam table, size-checked by job.valid().
     const float* blendSeam = (params.blendSeamEnabled && !job.blendSeam.empty()) ? job.blendSeam.data() : nullptr;
+    // [WP-PHOTO] The photometric seam table, size-checked by job.valid().
+    const float* photo = (params.photoEnabled && !job.photoField.empty()) ? job.photoField.data() : nullptr;
     const int width = params.outW;
     float* pixels = image.data.data();
 
@@ -49,8 +51,8 @@ Status CpuRenderer::renderInto(const RenderJob& job, ImageRGBAf& image) {
                                        for (std::size_t y = rowBegin; y < rowEnd; ++y) {
                                            float* row = pixels + y * static_cast<std::size_t>(width) * 4u;
                                            for (int x = 0; x < width; ++x) {
-                                               osvShadePixelWS(&params, planes, seam, warp, blendSeam, x,
-                                                               static_cast<int>(y), row + x * 4);
+                                               osvShadePixelWSP(&params, planes, seam, warp, blendSeam, photo,
+                                                                x, static_cast<int>(y), row + x * 4);
                                            }
                                        }
                                    });

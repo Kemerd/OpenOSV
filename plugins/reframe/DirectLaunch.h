@@ -93,7 +93,7 @@ struct DirectLaunchResult {
 /// `stream`        the stream to order the launch on - Premiere's own, so the
 ///                 work is sequenced against the host's use of the frames;
 ///                 nullptr is the context's default stream;
-/// `setup`         from buildDirectParams(); its seam/warp/blend-seam
+/// `setup`         from buildDirectParams(); its seam/warp/blend-seam/photo
 ///                 pointers must be DEVICE addresses (or null when the
 ///                 feature is off);
 /// `devicePlanes`  two descriptors ([0] slave, [1] master) whose pointers are

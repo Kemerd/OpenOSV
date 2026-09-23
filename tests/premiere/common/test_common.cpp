@@ -186,7 +186,13 @@ TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     // [WP-FLARE] flareRemoval at 30 (its range is 30-31), 25-29 padded for
     // the packages that own them; reserved now starts at 32.
     static_assert(offsetof(PrefsBlob, flareRemoval) == 30, "flareRemoval sits at 30");
-    static_assert(offsetof(PrefsBlob, reserved) == 32, "reserved fills the rest");
+    // [WP-PHOTO] seamInset, photoSeam and photoStrength at 32-34 (its range is
+    // 32-37), taken from the front of the reserved block, which now starts
+    // at 38.
+    static_assert(offsetof(PrefsBlob, seamInset) == 32, "seamInset sits at 32");
+    static_assert(offsetof(PrefsBlob, photoSeam) == 33, "photoSeam sits at 33");
+    static_assert(offsetof(PrefsBlob, photoStrength) == 34, "photoStrength sits at 34");
+    static_assert(offsetof(PrefsBlob, reserved) == 38, "reserved fills the rest");
     static_assert(std::is_trivially_copyable_v<PrefsBlob>, "the blob is memcpy'd to and from the host");
 
     REQUIRE(sizeof(PrefsBlob) == PrefsBlob::kSize);
@@ -1205,4 +1211,112 @@ TEST_CASE("HostContext hands out renderers and shuts down cleanly", "[common][ho
     // Shutting down twice is a no-op.
     HostContext::shutdown();
     REQUIRE_FALSE(HostContext::exists());
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-PHOTO] photometric seam fix prefs
+// ---------------------------------------------------------------------------
+
+TEST_CASE("PrefsBlob seam edge inset: zero is the default, code 1 is no inset", "[common][prefs][photoseam]") {
+    // An old project's zero byte reads as the DEFAULT inset (2.6 deg), so it
+    // gets the thinner sky seam without a Source Settings visit; the value
+    // that reproduces the render blend from before the field existed is an
+    // explicit 0 deg, stored as code 1.
+    PrefsBlob p = PrefsBlob::defaults();
+    CHECK(p.seamInset == 0);
+    CHECK(p.seamInsetDeg() == 2.6);
+
+    p.setSeamInsetDeg(0.0);
+    CHECK(p.seamInset == 1);
+    CHECK(p.seamInsetDeg() == 0.0);
+
+    p.setSeamInsetDeg(6.0);
+    CHECK(p.seamInset == PrefsBlob::kMaxSeamInsetCode);
+    CHECK(p.seamInsetDeg() == 6.0);
+
+    // The default itself is stored as code 0 so it keeps tracking the default.
+    p.setSeamInsetDeg(2.6);
+    CHECK(p.seamInset == 0);
+
+    // Rounded to a tenth, clamped to the documented range, garbage -> default.
+    p.setSeamInsetDeg(1.04);
+    CHECK(p.seamInsetDeg() == 1.0);
+    p.setSeamInsetDeg(99.0);
+    CHECK(p.seamInsetDeg() == 6.0);
+    p.setSeamInsetDeg(std::numeric_limits<double>::quiet_NaN());
+    CHECK(p.seamInset == 0);
+    p.setSeamInsetDeg(-1.0);
+    CHECK(p.seamInset == 0);
+
+    // An out-of-range code sanitises to the default, as a fresh blob has it.
+    p.seamInset = 200;
+    CHECK(p.seamInsetDeg() == 2.6);
+    REQUIRE_FALSE(p.sanitise());
+    CHECK(p.seamInset == 0);
+
+    // Every valid code survives sanitise untouched.
+    for (int code = 0; code <= PrefsBlob::kMaxSeamInsetCode; ++code) {
+        PrefsBlob q = PrefsBlob::defaults();
+        q.seamInset = static_cast<std::uint8_t>(code);
+        REQUIRE(q.sanitise());
+        CHECK(q.seamInset == code);
+    }
+}
+
+TEST_CASE("PrefsBlob sky seam fix: on for new clips, off for old blobs, strength 100 % by default",
+          "[common][prefs][photoseam]") {
+    // A fresh blob gets rim + gain at full strength.
+    PrefsBlob p = PrefsBlob::defaults();
+    CHECK(p.photoSeamMode() == PrefsPhotoSeam::RimAndGain);
+    CHECK(p.photoStrength == 0);
+    CHECK(p.photoStrengthPercent() == 100.0);
+
+    // An older blob's zero bytes read as Off (renders exactly as before) and
+    // the default strength; both are clean values, so sanitise keeps them.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.photoSeam = 0;
+    old.photoStrength = 0;
+    REQUIRE(old.sanitise());
+    CHECK(old.photoSeamMode() == PrefsPhotoSeam::Off);
+    CHECK(old.photoStrengthPercent() == 100.0);
+
+    // Every mode round-trips through sanitise.
+    for (std::uint8_t m = 0; m < static_cast<std::uint8_t>(PrefsPhotoSeam::Count); ++m) {
+        PrefsBlob q = PrefsBlob::defaults();
+        q.photoSeam = m;
+        REQUIRE(q.sanitise());
+        CHECK(q.photoSeam == m);
+    }
+
+    // A corrupt mode lands on the default, like parallax.
+    p.photoSeam = 77;
+    REQUIRE_FALSE(p.sanitise());
+    CHECK(p.photoSeamMode() == PrefsPhotoSeam::RimAndGain);
+
+    // Strength: 100 is stored as code 0, 0 % as code 1, rounded and clamped.
+    p.setPhotoStrengthPercent(0.0);
+    CHECK(p.photoStrength == 1);
+    CHECK(p.photoStrengthPercent() == 0.0);
+    p.setPhotoStrengthPercent(49.6);
+    CHECK(p.photoStrengthPercent() == 50.0);
+    p.setPhotoStrengthPercent(100.0);
+    CHECK(p.photoStrength == 0);
+    p.setPhotoStrengthPercent(250.0);
+    CHECK(p.photoStrength == 0);
+    CHECK(p.photoStrengthPercent() == 100.0);
+    p.setPhotoStrengthPercent(std::numeric_limits<double>::quiet_NaN());
+    CHECK(p.photoStrength == 0);
+    p.setPhotoStrengthPercent(-5.0);
+    CHECK(p.photoStrength == 0);
+
+    // An out-of-range strength code reads and sanitises to the default.
+    p.photoStrength = 200;
+    CHECK(p.photoStrengthPercent() == 100.0);
+    REQUIRE_FALSE(p.sanitise());
+    CHECK(p.photoStrength == 0);
+
+    // The rest of the range is reserved: zeroed by sanitise.
+    p.photoReserved[1] = 9;
+    REQUIRE_FALSE(p.sanitise());
+    CHECK(p.photoReserved[1] == 0);
 }

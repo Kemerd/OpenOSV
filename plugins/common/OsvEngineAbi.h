@@ -60,11 +60,11 @@ extern "C" {
  *
  *  History:
  *    1  the first direct path (stitch block, planes, seam / warp tables).
- *    2  OsvEngineFrame gained the carved blend-seam table (WP-SEAM) and the
- *       Source Settings the frame was rendered with (WP-SETTINGS);
- *       OsvEngine_QuerySettings was added;
- *       OsvRenderParams grew by the flare (WP-FLARE) and look (WP-LOOK)
- *       blocks.  A version-1 effect meeting a version-2 importer (or the
+ *    2  OsvEngineFrame gained the carved blend-seam table (WP-SEAM), the
+ *       Source Settings the frame was rendered with (WP-SETTINGS) and the
+ *       photometric seam field (WP-PHOTO); OsvEngine_QuerySettings was added;
+ *       OsvRenderParams grew by the flare (WP-FLARE), look (WP-LOOK) and
+ *       photo (WP-PHOTO) blocks.  A version-1 effect meeting a version-2 importer (or the
  *       reverse) refuses the engine and renders through the equirect path. */
 #define OSV_ENGINE_ABI_VERSION 2u
 
@@ -191,6 +191,12 @@ typedef struct OsvEngineFrame {
      *  and the engine used its defaults. */
     OsvEngineClipSettings settings;
     /* ---- [/WP-SETTINGS] ----------------------------------------------------- */
+    /* ---- [WP-PHOTO] --------------------------------------------------------- */
+    /** Device copy of the photometric seam table (stitch.photoW * photoH * 3
+     *  gain floats, then stitch.photoW * 2 rim floats, see osv_kernel.h) or
+     *  NULL when stitch.photoEnabled is 0.  Freed with the lease. */
+    const float* photoDevice;
+    /* ---- [/WP-PHOTO] -------------------------------------------------------- */
 } OsvEngineFrame;
 
 /** ABI version of the loaded engine (compare with OSV_ENGINE_ABI_VERSION). */

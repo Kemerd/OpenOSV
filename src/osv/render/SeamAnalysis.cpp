@@ -57,6 +57,11 @@ Result<std::shared_ptr<DeviceBandShader>> requireDeviceShader() {
     return gpu;
 }
 
+/// A pixel counts as TRUSTED for gain estimation when BOTH lenses see it at
+/// (almost) full production weight - DJI's colour compensation uses the same
+/// alpha >= 0.99 rule.  See estimateGain.
+constexpr float kTrustedAlpha = 0.99f;
+
 /// Luma of a code-space or linear RGB triple (BT.2020 weights; for code space
 /// the exact weights do not matter as long as both lenses use the same).
 inline float lumaOf(const float* px) noexcept { return 0.2627f * px[0] + 0.6780f * px[1] + 0.0593f * px[2]; }
@@ -421,13 +426,14 @@ Result<GainEstimate> estimateGain(const geom::LensRig& rig, const video::FramePa
         return Error{ErrorCode::InvalidArgument, "estimateGain: band has no rows"};
     }
 
-    // Only the band rows are shaded (see shadeRows); the sums below walk the
-    // same rows in the same order as before, so the estimate is unchanged.
+    // Only the band rows are shaded (see shadeRows).  Alpha is each lens's own
+    // production weight (coverage alpha, the builder default, stated here
+    // because the trust test below reads it): FOV feather x occlusion ramp.
     const OsvColorParams cp = color::makeColorParams(color::kDefaultDlogMFit, color::OutputTransfer::Linear, 0.0f);
     std::vector<float> bandRgba[2];
     for (int lens = 0; lens < 2; ++lens) {
         RenderParamsBuilder builder;
-        builder.rig(rig).equirect(map).blend(blend, true).color(cp).lensEnabled(1 - lens, false);
+        builder.rig(rig).equirect(map).blend(blend, true).color(cp).alphaCoverage(true).lensEnabled(1 - lens, false);
         OSV_TRY_ASSIGN(RenderJob job, builder.build(frames));
         OSV_TRY_ASSIGN(bandRgba[lens], shadeRows(job, static_cast<std::uint32_t>(row0),
                                                   static_cast<std::uint32_t>(row1), pool));
@@ -441,7 +447,14 @@ Result<GainEstimate> estimateGain(const geom::LensRig& rig, const video::FramePa
         const float* a = bandRgba[0].data() + static_cast<std::size_t>(r - row0) * rowFloats;
         const float* b = bandRgba[1].data() + static_cast<std::size_t>(r - row0) * rowFloats;
         for (int c = 0; c < map.w; ++c) {
-            if (a[c * 4 + 3] > 0.5f && b[c * 4 + 3] > 0.5f) {
+            // TRUSTED pixels only: both lenses at full weight (DJI's
+            // alpha >= 0.99 rule).  With the analysis feather that keeps
+            // theta below ~93.8 deg in both lenses and every pixel clear of
+            // the occlusion ramp, so a lens's darkened rim (lens 0 on the
+            // sample loses 1 stop at 95 deg and 4 past 97) never enters the
+            // means.  The previous alpha > 0.5 test let that rim in and read
+            // it as "lens 1 is too bright" (NEURAL_STITCHING.md 1.4).
+            if (a[c * 4 + 3] >= kTrustedAlpha && b[c * 4 + 3] >= kTrustedAlpha) {
                 for (int k = 0; k < 3; ++k) {
                     sum[0][k] += a[c * 4 + k];
                     sum[1][k] += b[c * 4 + k];
@@ -452,7 +465,7 @@ Result<GainEstimate> estimateGain(const geom::LensRig& rig, const video::FramePa
     }
     g.samples = n;
     if (n < 64) {
-        log::warn("estimateGain: only {} co-visible pixels; gains left at 1", n);
+        log::warn("estimateGain: only {} trusted co-visible pixels; gains left at 1", n);
         return g;
     }
     const double inv = 1.0 / static_cast<double>(n);

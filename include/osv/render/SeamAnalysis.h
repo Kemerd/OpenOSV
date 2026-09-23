@@ -103,12 +103,19 @@ Result<SeamProfile> searchSeam(const geom::LensRig& rig, const video::FramePair&
 
 struct GainEstimate {
     Vec3d gain[2] = {Vec3d{1, 1, 1}, Vec3d{1, 1, 1}};  ///< Per-lens linear gains (slave, master).
-    Vec3d overlapMean[2] = {};                          ///< Mean linear RGB per lens in the band.
-    std::uint64_t samples = 0;                          ///< Co-visible pixels used.
+    Vec3d overlapMean[2] = {};                          ///< Mean linear RGB per lens over the trusted pixels.
+    std::uint64_t samples = 0;                          ///< Trusted co-visible pixels used.
 };
 
 /// Symmetric per-channel gains g0 = sqrt(m1/m0), g1 = 1/g0 (clamped to
 /// [0.5, 2]) that make the two lenses agree in the overlap band.
+///
+/// The means m0, m1 come from TRUSTED pixels only: both lenses' production
+/// weight (FOV feather x occlusion ramp, `blend`) must be >= 0.99.  A lens's
+/// darkened rim therefore never enters the statistics - measured on the
+/// sample clip, lens 0 is 1 stop dark at 95 deg while the old alpha > 0.5
+/// rule still counted it, which the estimate read as "lens 1 is too bright"
+/// (docs/research/NEURAL_STITCHING.md, sections 1.2 and 1.4).
 Result<GainEstimate> estimateGain(const geom::LensRig& rig, const video::FramePair& frames,
                                   const geom::BlendParams& blend, const BandParams& band, ThreadPool& pool);
 

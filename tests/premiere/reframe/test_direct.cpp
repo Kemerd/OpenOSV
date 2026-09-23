@@ -63,6 +63,7 @@
 #include "osv/render/CpuRenderer.h"
 #include "osv/render/ImageRGBAf.h"
 #include "osv/render/ParallaxWarp.h"
+#include "osv/render/PhotoSeam.h"  // [WP-PHOTO]
 #include "osv/render/RenderJob.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
@@ -1950,4 +1951,95 @@ TEST_CASE("launchDirect refuses host memory and a too-small output before launch
         cuModuleUnload(module);
     }
     cuDevicePrimaryCtxRelease(dev);
+}
+
+// ===========================================================================
+//  [WP-PHOTO] the photometric seam field on the direct path
+// ===========================================================================
+
+TEST_CASE("[WP-PHOTO] the direct kernel applies the photometric seam field like its CPU twin, cheaply",
+          "[reframe][direct][cuda][sample][photoseam]") {
+    const std::string noCuda = cudaUnavailableReason();
+    if (!noCuda.empty()) {
+        SKIP("no CUDA device: " << noCuda);
+    }
+    REQUIRE_SAMPLE_CLIP();
+    const auto clip = openSampleClip();
+    constexpr std::uint32_t kFrame = 32;
+    const SampleFrame soft = decodeSampleFrame(*clip, kFrame);
+    GpuRig g;
+    prepareGpuRig(g, *clip, soft, kFrame);
+
+    // The field the importer measures for this frame (the analysis blend),
+    // applied as the importer applies it in RimAndGain: rim and gain, the
+    // global gain neutral.
+    const render::PhotoSeamParams pp;
+    auto field = render::measurePhotoSeam(clip->rig, soft.pair, clip->blend, pp, pool());
+    REQUIRE(field.ok());
+    geom::EquirectMap map;
+    map.layout = geom::EquirectLayout::Standard;
+    map.w = 6000;
+    map.h = 3000;
+    render::RenderParamsBuilder photoBuilder = importerBuilder(*clip, soft);
+    photoBuilder.photo(field.value(), pp).gain(Vec3d{1, 1, 1}, Vec3d{1, 1, 1});
+    auto photoBlock = photoBuilder.equirect(map).buildParams();
+    REQUIRE(photoBlock.ok());
+    REQUIRE(photoBlock.value().photoEnabled == 1);
+    const std::vector<float> table = field.value().kernelTable();
+    StitchState photoHost;
+    photoHost.equirect = photoBlock.value();
+    photoHost.seamTable = soft.seamTable.data();
+    photoHost.photoField = table.data();
+    StitchState photoDevice = photoHost;
+    photoDevice.seamTable = uploadTable(g, soft.seamTable);
+    photoDevice.photoField = uploadTable(g, table);
+
+    // Refused when on without a table, like every other table.
+    StitchState missing = photoHost;
+    missing.photoField = nullptr;
+    const Settings across = makeSettings(Resolution::MatchSequence, 90.0, 0.0, 0.0, 100.0, 0.0);
+    CHECK(buildDirectParams(across, missing, 64, 36, SizePx{}).reject == DirectReject::PhotoField);
+
+    // ---- parity: GPU vs the CPU twin, looking along the seam in the sky ------
+    const Settings skySeam = makeSettings(Resolution::MatchSequence, 70.0, 25.0, 0.0, 100.0, 0.0);
+    for (const Settings& s : {across, skySeam}) {
+        for (const bool isHalf : {false, true}) {
+            const DirectSetup cpuSetup = buildDirectParams(s, photoHost, 1920, 1080, SizePx{});
+            const DirectSetup gpuSetup = buildDirectParams(s, photoDevice, 1920, 1080, SizePx{});
+            REQUIRE(cpuSetup.valid);
+            REQUIRE(gpuSetup.valid);
+            REQUIRE(gpuSetup.photoField == photoDevice.photoField);
+            const HostFrame gpu = renderOnGpu(g, gpuSetup, isHalf);
+            HostFrame cpuFrame(1920, 1080, isHalf ? PixelLayout::Bgra16f : PixelLayout::Bgra32f);
+            REQUIRE(renderDirectCpu(cpuSetup, g.hostPlanes, cpuFrame.view(), &pool()));
+            const render::ImageDiffStats stats = render::compareImages16(gpu.toImage(), cpuFrame.toImage());
+            WARN("[WP-PHOTO] direct GPU vs CPU twin with the photometric field (" << (isHalf ? "16f" : "32f")
+                                                                                  << "): PSNR " << stats.psnrDb
+                                                                                  << " dB, max " << stats.maxAbsCode
+                                                                                  << " codes");
+            CHECK(stats.psnrDb >= 60.0);
+        }
+    }
+
+    // ---- cost at 2560 x 1440, back to back with and without the field --------
+    render::RenderParamsBuilder plainBuilder = importerBuilder(*clip, soft);
+    auto plainBlock = plainBuilder.equirect(map).buildParams();
+    REQUIRE(plainBlock.ok());
+    StitchState plainDevice;
+    plainDevice.equirect = plainBlock.value();
+    plainDevice.seamTable = photoDevice.seamTable;
+    const DirectSetup off = buildDirectParams(across, plainDevice, 2560, 1440, SizePx{});
+    const DirectSetup on = buildDirectParams(across, photoDevice, 2560, 1440, SizePx{});
+    REQUIRE(off.valid);
+    REQUIRE(on.valid);
+    double offMs = 1e9;
+    double onMs = 1e9;
+    for (int round = 0; round < 3; ++round) {
+        offMs = std::min(offMs, kernelMs(g, off, 50));
+        onMs = std::min(onMs, kernelMs(g, on, 50));
+    }
+    WARN("[WP-PHOTO] direct kernel 2560x1440 across the seam: " << offMs << " ms without the photometric field, "
+                                                               << onMs << " ms with it (+" << (onMs - offMs)
+                                                               << " ms); best of 3 x 50 launches, shared machine");
+    CHECK(onMs > 0.0);
 }

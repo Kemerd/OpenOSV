@@ -177,6 +177,7 @@ const char* directRejectName(DirectReject reason) noexcept {
     case DirectReject::WarpGrid:     return "the warp grid is enabled without a usable grid";
     case DirectReject::Composed:     return "the composed view block came out non-finite";
     case DirectReject::BlendSeam:    return "the blend seam is enabled without a usable table";
+    case DirectReject::PhotoField:   return "the photometric seam field is enabled without a usable table";
     }
     // Unreachable for any enumerator above; a corrupt value lands here
     // rather than off the end of a table.
@@ -269,6 +270,26 @@ DirectSetup buildDirectParams(const Settings& settings, const StitchState& stitc
         }
     }
 
+    // ---- [WP-PHOTO] the photometric seam field -----------------------------
+    // Same rule again.  The kernel divides by the latitude span and the rim
+    // feather and indexes photoW x photoH cells, so the shape must be sane
+    // and every scalar finite.
+    const bool photoOn = eq.photoEnabled != 0;
+    if (photoOn) {
+        const bool shapeOk = eq.photoW > 0 && eq.photoW <= kMaxWarpEdge && eq.photoH > 1 && eq.photoH <= kMaxWarpEdge;
+        const bool spanOk = std::isfinite(eq.photoLatMinRad) && std::isfinite(eq.photoLatMaxRad) &&
+                            (eq.photoLatMaxRad - eq.photoLatMinRad) > 1e-6f;
+        const bool scalarsOk = std::isfinite(eq.photoDecayRad) && eq.photoDecayRad >= 0.0f &&
+                               std::isfinite(eq.photoChromaDecayRad) && eq.photoChromaDecayRad >= 0.0f &&
+                               std::isfinite(eq.photoRimFeatherRad) && eq.photoRimFeatherRad >= 0.0f &&
+                               std::isfinite(eq.photoStrength) && eq.photoStrength >= 0.0f &&
+                               eq.photoStrength <= 1.0f && std::isfinite(eq.photoSinLatLo) &&
+                               std::isfinite(eq.photoSinLatHi) && std::isfinite(eq.photoCodePerStop);
+        if (!shapeOk || !spanOk || !scalarsOk || stitch.photoField == nullptr) {
+            return refuse(DirectReject::PhotoField);
+        }
+    }
+
     // ---- the camera --------------------------------------------------------
     // Built by the equirect path's own function.  Non-finite controls are
     // replaced by their defaults inside it, exactly as the equirect path
@@ -324,6 +345,7 @@ DirectSetup buildDirectParams(const Settings& settings, const StitchState& stitc
     setup.seamTable = seamOn ? stitch.seamTable : nullptr;
     setup.warpGrid = warpOn ? stitch.warpGrid : nullptr;
     setup.blendSeam = blendSeamOn ? stitch.blendSeam : nullptr;  // [WP-SEAM]
+    setup.photoField = photoOn ? stitch.photoField : nullptr;     // [WP-PHOTO]
 
     // ---- final backstop ----------------------------------------------------
     // buildView() already guarantees a finite camera; this repeats the check
@@ -418,7 +440,8 @@ bool renderDirectPixel(const DirectSetup& setup, const OsvPlane* planes, int x, 
     if (x < 0 || y < 0 || x >= setup.params.outW || y >= setup.params.outH) {
         return false;
     }
-    osvShadePixelWS(&setup.params, planes, setup.seamTable, setup.warpGrid, setup.blendSeam, x, y, out);
+    osvShadePixelWSP(&setup.params, planes, setup.seamTable, setup.warpGrid, setup.blendSeam, setup.photoField,
+                     x, y, out);
     return true;
 }
 
@@ -449,7 +472,8 @@ bool renderDirectCpu(const DirectSetup& setup, const OsvPlane* planes, const Fra
         char* dstRow = static_cast<char*>(dst.rowTopDown(y));
         for (int x = 0; x < dst.width; ++x) {
             float rgba[4];
-            osvShadePixelWS(&setup.params, planes, setup.seamTable, setup.warpGrid, setup.blendSeam, x, y, rgba);
+            osvShadePixelWSP(&setup.params, planes, setup.seamTable, setup.warpGrid, setup.blendSeam,
+                             setup.photoField, x, y, rgba);
             storePixel(dstRow + static_cast<std::ptrdiff_t>(x) * static_cast<std::ptrdiff_t>(bpp), dst.layout, rgba);
         }
     };

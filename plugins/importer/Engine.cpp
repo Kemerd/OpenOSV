@@ -481,6 +481,7 @@ struct EngineLease {
     CUdeviceptr seam = 0;                    ///< Device copy of the seam table.
     CUdeviceptr warp = 0;                    ///< Device copy of the warp grid.
     CUdeviceptr blendSeam = 0;               ///< [WP-SEAM] Device copy of the carved blend-seam table.
+    CUdeviceptr photo = 0;                   ///< [WP-PHOTO] Device copy of the photometric seam table.
 
     /// Free the device tables.  The caller has pushed `context`.
     void freeTables() noexcept {
@@ -496,6 +497,11 @@ struct EngineLease {
         if (blendSeam) {
             (void)cuMemFree(blendSeam);
             blendSeam = 0;
+        }
+        // [WP-PHOTO]
+        if (photo) {
+            (void)cuMemFree(photo);
+            photo = 0;
         }
     }
 };
@@ -873,6 +879,10 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
             uploaded = uploadTable(job.params.blendSeamEnabled ? job.blendSeam : std::vector<float>{},
                                    lease->blendSeam);
         }
+        // [WP-PHOTO] the photometric seam table (~50 KB: gain grid plus rim).
+        if (uploaded.ok()) {
+            uploaded = uploadTable(job.params.photoEnabled ? job.photoField : std::vector<float>{}, lease->photo);
+        }
         if (!uploaded.ok()) {
             lease->freeTables();
             writeError(error, errorCapacity, uploaded.error().message);
@@ -887,6 +897,8 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
         out->warpDevice = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(lease->warp));
         // [WP-SEAM]
         out->blendSeamDevice = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(lease->blendSeam));
+        // [WP-PHOTO]
+        out->photoDevice = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(lease->photo));
         // The stitch block is an equirect block, whose Rout is exactly the
         // frame's body-from-world stabilisation.
         std::memcpy(out->bodyFromWorld, job.params.Rout, sizeof(out->bodyFromWorld));

@@ -4,6 +4,7 @@
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/core/Log.h"
 #include "osv/render/Flare.h"
+#include "osv/render/PhotoSeam.h"
 
 #include <algorithm>
 #include <cmath>
@@ -145,6 +146,52 @@ RenderParamsBuilder& RenderParamsBuilder::flare(const FlareModel& model) {
 RenderParamsBuilder& RenderParamsBuilder::clearFlare() {
     m_flareEnabled = 0;
     std::memset(m_flareLens.data(), 0, sizeof(OsvFlareLens) * m_flareLens.size());
+    return *this;
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-PHOTO] photometric seam field
+// ---------------------------------------------------------------------------
+RenderParamsBuilder& RenderParamsBuilder::photo(const PhotoSeamField& field, const PhotoSeamParams& params) {
+    // Off, an invalid field or a mode that asks for nothing all mean "no
+    // photo table": never a half-configured one the kernel could misread.
+    if (params.mode == PhotoSeamMode::Off || !field.valid()) {
+        return clearPhoto();
+    }
+    const double strength = std::isfinite(params.strength) ? std::clamp(params.strength, 0.0, 1.0) : 0.0;
+    const double feather = std::isfinite(params.rimFeatherDeg) ? params.rimFeatherDeg : 0.0;
+    const double decay = std::isfinite(params.decayDeg) ? std::clamp(params.decayDeg, 0.0, 90.0) : 0.0;
+    const double chroma = std::isfinite(params.chromaDecayScale) ? std::clamp(params.chromaDecayScale, 0.0, 1.0) : 0.0;
+    const float rimFeather = feather > 0.0 ? static_cast<float>(deg2rad(std::min(feather, 30.0))) : 0.0f;
+    const float gainStrength = params.mode == PhotoSeamMode::RimAndGain ? static_cast<float>(strength) : 0.0f;
+    if (rimFeather <= 0.0f && gainStrength <= 0.0f) {
+        return clearPhoto();
+    }
+    m_photo = field.kernelTable();
+    if (m_photo.empty()) {
+        return clearPhoto();
+    }
+    m_photoW = field.w;
+    m_photoH = field.h;
+    m_photoLatMin = field.latMinRad;
+    m_photoLatMax = field.latMaxRad;
+    m_photoDecay = static_cast<float>(deg2rad(decay));
+    m_photoChromaDecay = static_cast<float>(deg2rad(decay * chroma));
+    m_photoRimFeather = rimFeather;
+    m_photoStrength = gainStrength;
+    return *this;
+}
+
+RenderParamsBuilder& RenderParamsBuilder::clearPhoto() {
+    m_photo.clear();
+    m_photoW = 0;
+    m_photoH = 0;
+    m_photoLatMin = 0.0f;
+    m_photoLatMax = 0.0f;
+    m_photoDecay = 0.0f;
+    m_photoChromaDecay = 0.0f;
+    m_photoRimFeather = 0.0f;
+    m_photoStrength = 0.0f;
     return *this;
 }
 
@@ -316,6 +363,40 @@ Result<OsvRenderParams> RenderParamsBuilder::buildParams() const {
     p.flareEnabled = m_flareEnabled;
     p.flare[0] = m_flareLens[0];
     p.flare[1] = m_flareLens[1];
+
+    // [WP-PHOTO] All zero without a field (the memset above), which is what
+    // keeps every render without one exactly as it was.
+    if (!m_photo.empty()) {
+        p.photoEnabled = 1;
+        p.photoW = static_cast<int>(m_photoW);
+        p.photoH = static_cast<int>(m_photoH);
+        p.photoLatMinRad = m_photoLatMin;
+        p.photoLatMaxRad = m_photoLatMax;
+        p.photoDecayRad = m_photoDecay;
+        p.photoChromaDecayRad = m_photoChromaDecay;
+        p.photoRimFeatherRad = m_photoRimFeather;
+        p.photoStrength = m_photoStrength;
+        p.photoCodePerStop = photoCodePerStop(p.color);
+        // Early-out span.  The gain reaches decay beyond the rows.  The rim
+        // changes a weight only where some lens's theta exceeds
+        // thetaMax - rimMaxTrim - feather, i.e. within the overlap widened by
+        // how far a lens axis is tilted off +-Y; a degree of margin on top of
+        // that tilt keeps the early-out conservative.
+        double tilt = 0.0;
+        for (int i = 0; i < 2; ++i) {
+            const Vec3d axis = rig.bodyToLens[static_cast<std::size_t>(i)].transposed() * Vec3d{0.0, 0.0, 1.0};
+            const double along = (i == geom::kMasterLens) ? axis.y : -axis.y;
+            tilt = std::max(tilt, std::acos(clampd(along, -1.0, 1.0)));
+        }
+        const double rimPad = m_photoRimFeather > 0.0f ? tilt + deg2rad(1.0) : 0.0;
+        const double gainPad =
+            m_photoStrength > 0.0f ? static_cast<double>(std::max(m_photoDecay, m_photoChromaDecay)) : 0.0;
+        const double pad = std::max(rimPad, gainPad);
+        const double lo = std::max(static_cast<double>(std::min(m_photoLatMin, m_photoLatMax)) - pad, -kHalfPi);
+        const double hi = std::min(static_cast<double>(std::max(m_photoLatMin, m_photoLatMax)) + pad, kHalfPi);
+        p.photoSinLatLo = static_cast<float>(std::sin(lo));
+        p.photoSinLatHi = static_cast<float>(std::sin(hi));
+    }
     return p;
 }
 
@@ -356,6 +437,7 @@ Result<RenderJob> RenderParamsBuilder::build(const video::FramePair& frames) con
     job.seamShiftDeg = m_seam;
     job.warpGrid = m_warp;
     job.blendSeam = m_blendSeam;  // [WP-SEAM]
+    job.photoField = m_photo;     // [WP-PHOTO]
     return job;
 }
 

@@ -205,6 +205,15 @@ DirectLaunchResult launchDirect(CUfunction kernel, CUstream stream, const Direct
             return refused(DirectLaunchReject::Memory);
         }
     }
+    // [WP-PHOTO] The photometric seam table: the gain grid plus the rim.
+    if (setup.photoField) {
+        const std::uint64_t photoFloats =
+            static_cast<std::uint64_t>(setup.params.photoW) * static_cast<std::uint64_t>(setup.params.photoH) * 3u +
+            static_cast<std::uint64_t>(setup.params.photoW) * 2u;
+        if (!deviceRangeOk(setup.photoField, photoFloats * sizeof(float), device)) {
+            return refused(DirectLaunchReject::Memory);
+        }
+    }
 
     // ---- the arguments, in the order DirectKernelAbi.h pins ----------------
     // cuLaunchKernel copies every argument before it returns, so locals are
@@ -216,10 +225,11 @@ DirectLaunchResult launchDirect(CUfunction kernel, CUstream stream, const Direct
     const float* seam = setup.seamTable;
     const float* warp = setup.warpGrid;
     const float* blendSeam = setup.blendSeam;  // [WP-SEAM]
+    const float* photo = setup.photoField;     // [WP-PHOTO]
     unsigned char* dst = static_cast<unsigned char*>(out.data);
     int dstRowBytes = static_cast<int>(out.rowBytes);
     int dstIsHalf = out.isHalf ? 1 : 0;
-    void* args[] = {&params, &planes, &seam, &warp, &blendSeam, &dst, &dstRowBytes, &dstIsHalf};
+    void* args[] = {&params, &planes, &seam, &warp, &blendSeam, &photo, &dst, &dstRowBytes, &dstIsHalf};
 
     // One thread per output pixel, the grid rounded up to whole blocks (the
     // kernel guards the tail).  Heights up to 65536 need at most 4096 blocks
