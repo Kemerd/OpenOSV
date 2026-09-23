@@ -19,8 +19,10 @@ All notable changes to OpenOSV are documented here. The format follows
   dip below the sky trend falls 158 -> 21 millistops (open sky elsewhere
   scores 57-67), line x0.40 / band x0.32 / broad x0.94 / colour x0.86, the
   ground unchanged, the table stable to 0.4 % per frame; 7-10 ms of analysis
-  per bucket, nothing measurable in the render kernels. Auto for new clips,
-  Off for existing projects until set. Also in the importer dialog, osvtool
+  per bucket, nothing measurable in the render kernels. Auto for new clips
+  (and, like every control added to the Source Settings effect, for an
+  effect saved before it existed); a prefs blob written before it reads as
+  Off. Also in the importer dialog, osvtool
   (`--shading`, `--shading-strength`) and the user defaults file. Engine
   ABI 4.
 * **Seam tools in Source Settings (WP-SEAMTOOLS).** Five sliders in the

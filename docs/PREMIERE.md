@@ -618,9 +618,10 @@ without renumbering; ids 20-29 are left to the Stitching group. The lens
 shading correction's ids (34-35) come after every id already shipped. See
 "User defaults for new clips" below.
 
-An effect saved before ids 15-19 existed has no stored value for them, so
-it picks up the control defaults above (DJI look, ghost removal and the sky
-seam fix on) - a project opened in this build gets the improved stitch.
+An effect saved before ids 15-19 (or 34-35) existed has no stored value for
+them, so it picks up the control defaults above (DJI look, ghost removal, the
+sky seam fix and the lens shading correction on) - a project opened in this
+build gets the improved stitch.
 
 #### Lens shading (ids 34-35)
 
@@ -636,8 +637,11 @@ band left on every sky seam crossing, on the front lens's side.
 | Lens Shading | Auto measures the ring per bucket of eight frames and adds the missing light back in the lens's native linear light, before every gain; Off leaves the lenses as decoded. A lens whose sky shows no structure, and every sector of a lens that shows no sky (the ground), is left untouched. | The band's dip below the sky's own trend at the seam 158 -> 21 millistops (open sky elsewhere scores 57-67); seam metrics line x0.40, band x0.32, broad x0.94, colour x0.86; the ground unchanged. |
 | Shading Strength | How much of the measured correction is added. | Linear: 50 % leaves half the ring. |
 
-Auto for new clips; an older project's zero byte (`PrefsBlob` offset 46)
-reads as Off, so it renders as before until the control is set. The
+Auto for new clips, and for a project whose Source Settings effect was
+saved before the control existed (the control's default, like every control
+added after the effect shipped).  A prefs blob written before it existed -
+the modal dialog's - holds a zero at `PrefsBlob` offset 46, which reads as
+Off: that clip renders as before until the control is set. The
 correction travels inside the stitch block, so the importer's equirect, the
 Source monitor and the Program monitor's direct path show the same picture.
 Cost: 7-10 ms of analysis per bucket of eight frames; the render kernels do
