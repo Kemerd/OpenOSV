@@ -126,6 +126,59 @@ New files under `src/osv/render/cuda/` plus tests `tests/unit/test_disflow_cuda.
 * Acceptance: whole parallax measurement for one bucket (bands + bidirectional
   flow + grid) < 3 ms on the reference machine from device frames.
 
+**Settled (WP-B delivered).**  Interface, as built:
+
+  ```cpp
+  // include/osv/render/CudaAnalysis.h  (osv_render_cuda)
+  bool   cudaAnalysesAvailable(std::string* reason = nullptr);
+  Status installCudaAnalyses();          // installs both hooks below; Unsupported without a GPU
+  void   uninstallCudaAnalyses() noexcept;
+  bool   cudaAnalysesInstalled() noexcept;
+  Result<BidirFlow> cudaDisFlowBidirectional(const GrayImage&, const GrayImage&,
+                                             const DisFlowParams&, void* stream = nullptr);
+  Result<BidirFlow> cudaDisFlowBidirectionalDevice(const float* a, const float* b, uint32_t w,
+                                                   uint32_t h, size_t pitchBytes,
+                                                   const DisFlowParams&, void* stream = nullptr);
+  Result<std::vector<float>> cudaShadeBandRgba(const RenderJob&, uint32_t row0, uint32_t row1,
+                                               void* stream = nullptr);
+  Status cudaShadeBandLumaAlpha(const RenderJob&, uint32_t row0, uint32_t row1,
+                                std::vector<float>& luma, std::vector<float>& alpha,
+                                void* stream = nullptr);
+
+  // osv_render_cpu seams the CUDA library installs into
+  enum class FlowBackendKind { Auto = 0, Classical = 1, Neural = 2, ClassicalCuda = 3, Count };
+  void setCudaFlowBackendFactory(FlowBackendFactory);          // FlowBackend.h
+  class DeviceBandShader;                                      // DeviceBandShader.h
+  void setDeviceBandShader(std::shared_ptr<DeviceBandShader>);
+  Result<ParallaxWarpGrid> gridFromFlow(bands, flow, params, ThreadPool* pool = nullptr);
+  ```
+
+  A caller with device-only frames calls `installCudaAnalyses()` once; after
+  that `renderLensBands` / `searchSeam` / `estimateGain` / `overlapNcc` /
+  `measureParallaxBands` shade the band rows on the GPU automatically whenever
+  the job's planes are on the device, and `ParallaxWarpParams::backend =
+  FlowBackendKind::ClassicalCuda` puts the flow there too.  Host frames keep
+  the CPU band path unchanged.  Everything runs in the CUDA context current on
+  the calling thread (never `cudaSetDevice` / `cudaDeviceReset` /
+  `cudaDeviceSynchronize`), ordered on the caller's stream or a pooled
+  per-context one, synchronising only that stream.
+
+  Parity: the CUDA DIS field is **bit-identical** to `DisFlow.cpp` (synthetic
+  pairs and the sample's real bands, frames 0/32/64, compared with `==`), so
+  the parallax grids are identical too; GPU band shading is 108-111 dB PSNR
+  against the CPU band path.  Measured (`osv_gpu_analysis_bench`, medians,
+  frames 0/32/64): bands 0.25 ms, bidirectional flow 0.79 ms, grid 0.95-1.2 ms,
+  end to end 2.1-2.7 ms; the CPU path on 32 threads is 21-23 ms.
+
+  Deviations: the grid (`gridFromFlow`) stays on the CPU - it was ~7-9 ms
+  single-threaded, which nobody had measured, and is now split over the pool
+  and restructured to ~1 ms with a byte-identical result.  `Auto` never picks
+  `ClassicalCuda` (existing selections do not change underneath callers); the
+  plug-in preference enum is not extended yet (WP-D).  The analyses use the
+  CUDA runtime (`cudart_static`, as `osv_render_cuda` already does), bound to
+  whatever driver context is current - not the driver-only API the plug-in
+  rule asks of new Premiere-side code.
+
 ### WP-C  Fused fisheye -> view kernel for the effect
 
 Files under `plugins/reframe/` (kernel added to `ReframeKernel.cu`'s fatbin or a
