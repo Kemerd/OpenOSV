@@ -81,10 +81,11 @@ struct GpuDecoderOptions {
     /// VRAM the frame cache may occupy, in bytes.  0 = automatic:
     /// min(1.5 GiB, 20 % of the device's free VRAM measured after the NVDEC
     /// decoders were created).  The cache holds floor(budget / slotBytes)
-    /// frame pairs (55 MB each for the 3000 x 3000 streams) and never
-    /// allocates past that; a budget smaller than one frame pair fails open()
-    /// with InvalidArgument.  NVDEC's own decode surfaces are not part of
-    /// this budget (see GpuDecoderStats).
+    /// frame pairs (52.7 MiB each for the 3000 x 3000 streams; never more
+    /// than the clip has frames) and never allocates past that; a budget
+    /// smaller than one frame pair fails open() with InvalidArgument.
+    /// NVDEC's own decode surfaces are not part of this budget: ~790 MiB for
+    /// both 3000 x 3000 lenses at 3 decoder threads (see decoderThreads).
     std::size_t vramBudgetBytes = 0;
 
     /// Frames decoded ahead of the most recent request once the host is seen
