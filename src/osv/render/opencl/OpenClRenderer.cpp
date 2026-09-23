@@ -8,7 +8,12 @@
 #include "osv/core/Log.h"
 #include "osv/render/SeamTools.h"
 
+// macOS ships OpenCL as a system framework with its own header layout.
+#if defined(__APPLE__)
+#include <OpenCL/opencl.h>
+#else
 #include <CL/cl.h>
+#endif
 
 #include <algorithm>
 #include <cstring>

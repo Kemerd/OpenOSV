@@ -48,9 +48,14 @@
 #endif
 #include <windows.h>
 #else
+#include <clocale>
 #include <fstream>
+#include <locale.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <xlocale.h>  // strtod_l / newlocale
+#endif
 #endif
 
 namespace osv::premiere {
@@ -260,10 +265,26 @@ static_assert(std::size(kShadingTokens) == static_cast<std::size_t>(PrefsLensSha
         return Json(static_cast<double>(value));
     }
     double asDouble = 0.0;
+#if defined(__cpp_lib_to_chars)
     const std::from_chars_result parsed = std::from_chars(buffer, printed.ptr, asDouble);
     if (parsed.ec != std::errc()) {
         return Json(static_cast<double>(value));
     }
+#else
+    // A standard library without floating-point from_chars (Apple's libc++):
+    // strtod_l in the "C" locale reads the same shortest spelling back, and
+    // is immune to whatever locale the host process has set.  The buffer is
+    // NUL terminated (zero-initialised, one byte kept free above).
+    static const locale_t cLocale = ::newlocale(LC_ALL_MASK, "C", static_cast<locale_t>(nullptr));
+    if (!cLocale) {
+        return Json(static_cast<double>(value));
+    }
+    char* end = nullptr;
+    asDouble = ::strtod_l(buffer, &end, cLocale);
+    if (end != printed.ptr) {
+        return Json(static_cast<double>(value));
+    }
+#endif
     return Json(asDouble);
 }
 

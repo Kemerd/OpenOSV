@@ -107,7 +107,7 @@
         "CMAKE_OSX_ARCHITECTURES": "arm64",
         "CMAKE_OSX_DEPLOYMENT_TARGET": "13.3",
         "OSV_ENABLE_CUDA": "OFF",
-        "OSV_ENABLE_OPENCL": "OFF"
+        "OSV_ENABLE_OPENCL": "ON"
       },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
     },
