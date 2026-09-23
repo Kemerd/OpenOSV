@@ -33,6 +33,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <vector>
@@ -176,7 +177,11 @@ TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     // readable.  Its zero bytes read as parallax Off / backend Auto.
     static_assert(offsetof(PrefsBlob, parallax) == 20, "parallax sits at 20");
     static_assert(offsetof(PrefsBlob, flowBackend) == 21, "flowBackend follows parallax");
-    static_assert(offsetof(PrefsBlob, reserved) == 22, "reserved fills the rest");
+    // [WP-SETTINGS] owns 24-25 (docs/PARALLEL_WORK.md); 22-23 are padding
+    // until the package that owns them is merged.
+    static_assert(offsetof(PrefsBlob, padBeforeSettings) == 22, "WP-SETTINGS pads 22-23");
+    static_assert(offsetof(PrefsBlob, directColour) == 24, "directColour sits at 24");
+    static_assert(offsetof(PrefsBlob, reserved) == 25, "reserved fills the rest");
     static_assert(std::is_trivially_copyable_v<PrefsBlob>, "the blob is memcpy'd to and from the host");
 
     REQUIRE(sizeof(PrefsBlob) == PrefsBlob::kSize);
@@ -208,6 +213,12 @@ TEST_CASE("a blob from an older build still deserialises", "[common][prefs]") {
     // A FRESH blob, by contrast, has it on.
     const PrefsBlob fresh = PrefsBlob::defaults();
     CHECK(fresh.parallaxEnabled());
+
+    // [WP-SETTINGS] The direct-path colour choice came out of the reserved
+    // block too; an older project's zero byte reads as MatchClip, which is
+    // also the default of a fresh blob.
+    CHECK(old.directColourMode() == PrefsDirectColour::MatchClip);
+    CHECK(fresh.directColourMode() == PrefsDirectColour::MatchClip);
 }
 
 TEST_CASE("PrefsBlob defaults match the documented table", "[common][prefs]") {
@@ -329,11 +340,28 @@ TEST_CASE("PrefsBlob sanitise clamps every out-of-range field", "[common][prefs]
     SECTION("dirty reserved bytes are zeroed so the cache key stays stable") {
         PrefsBlob p = PrefsBlob::defaults();
         p.reserved[0] = 0xFF;
-        p.reserved[107] = 0x01;
+        // The LAST reserved byte, whatever the block's current length (a
+        // literal index here once pointed past the end of the struct).
+        p.reserved[std::size(p.reserved) - 1] = 0x01;
         REQUIRE_FALSE(p.sanitise());
         for (const std::uint8_t b : p.reserved) {
             REQUIRE(b == 0);
         }
+    }
+
+    SECTION("[WP-SETTINGS] a corrupt direct-path colour choice and dirty padding are repaired") {
+        PrefsBlob p = PrefsBlob::defaults();
+        p.directColour = 0x7F;
+        p.padBeforeSettings[0] = 0x01;
+        p.padBeforeSettings[1] = 0xFF;
+        REQUIRE_FALSE(p.sanitise());
+        CHECK(p.directColourMode() == PrefsDirectColour::MatchClip);
+        CHECK(p.padBeforeSettings[0] == 0);
+        CHECK(p.padBeforeSettings[1] == 0);
+        // Both valid values survive.
+        p.directColour = static_cast<std::uint8_t>(PrefsDirectColour::WorkingSpace);
+        REQUIRE(p.sanitise());
+        CHECK(p.directColourMode() == PrefsDirectColour::WorkingSpace);
     }
 }
 

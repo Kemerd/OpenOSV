@@ -16,6 +16,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -74,7 +75,19 @@ namespace {
                         version, static_cast<std::uint32_t>(OSV_ENGINE_ABI_VERSION));
         return api;
     }
-    PluginLog::info("reframe/direct: the importer's engine is available (ABI {})", version);
+    // [WP-SETTINGS] Optional: without it the settings reported with each
+    // frame decide, one decode later.
+    found.querySettings =
+        reinterpret_cast<OsvEngineQuerySettingsFn>(GetProcAddress(module, OSV_ENGINE_SYM_QUERY_SETTINGS));
+    ColourMode forced = ColourMode::MatchClip;
+    const bool overridden = colourModeOverride(forced);
+    PluginLog::info("reframe/direct: the importer's engine is available (ABI {}, Source Settings query {}, "
+                    "direct-path colour {})",
+                    version, found.querySettings ? "yes" : "no",
+                    !overridden ? "per clip (Source Settings)"
+                    : forced == ColourMode::FollowWorkingSpace
+                        ? "forced to the working space by OSV_DIRECT_COLOR"
+                        : "forced to match the clip by OSV_DIRECT_COLOR");
     return found;
 }
 
@@ -84,38 +97,128 @@ namespace {
 
 /// IterateNodeProperties hands every property to a C callback whose
 /// plug-in object is a 32-bit integer - too narrow for a pointer - so the
-/// lookup state is thread-local; the iteration is synchronous.
+/// lookup state is thread-local; the iteration is synchronous.  Several keys
+/// are collected in ONE pass: a pass walks every property of the node.
 struct PropertyLookup {
-    const char* key = nullptr;
-    std::string value;
-    bool found = false;
+    static constexpr std::size_t kMaxKeys = 4;
+    const char* keys[kMaxKeys] = {};
+    std::string values[kMaxKeys];
+    bool found[kMaxKeys] = {};
+    std::size_t count = 0;
 };
 thread_local PropertyLookup* t_lookup = nullptr;
 
 prSuiteError lookupProperty(csSDK_int32, const char* key, const prUTF8Char* value) {
-    if (t_lookup && key && t_lookup->key && std::strcmp(key, t_lookup->key) == 0) {
-        t_lookup->value = value ? reinterpret_cast<const char*>(value) : "";
-        t_lookup->found = true;
+    if (!t_lookup || !key) {
+        return suiteError_NoError;
+    }
+    // A C callback from the host: an allocation failure copying a value must
+    // not unwind into Premiere's stack, it just leaves that key unfound.
+    try {
+        for (std::size_t i = 0; i < t_lookup->count && i < PropertyLookup::kMaxKeys; ++i) {
+            if (t_lookup->keys[i] && std::strcmp(key, t_lookup->keys[i]) == 0) {
+                t_lookup->values[i] = value ? reinterpret_cast<const char*>(value) : "";
+                t_lookup->found[i] = true;
+            }
+        }
+    } catch (...) {
     }
     return suiteError_NoError;
 }
 
-/// Read one property of a node as UTF-8.
-[[nodiscard]] bool nodeProperty(const PrSDKVideoSegmentSuite& s, csSDK_int32 node, const char* key,
-                                std::string& out) {
+/// Read the properties named in `lookup` from a node, as UTF-8, in one pass.
+/// Returns false when the host could not iterate at all.
+[[nodiscard]] bool nodeProperties(const PrSDKVideoSegmentSuite& s, csSDK_int32 node, PropertyLookup& lookup) {
     if (!s.IterateNodeProperties) {
         return false;
     }
-    PropertyLookup lookup;
-    lookup.key = key;
     t_lookup = &lookup;
     const prSuiteError err = s.IterateNodeProperties(node, &lookupProperty, 0);
     t_lookup = nullptr;
-    if (err != suiteError_NoError || !lookup.found) {
-        return false;
+    return err == suiteError_NoError;
+}
+
+// ===========================================================================
+//  [WP-SETTINGS] Media identity evidence
+//
+//  Premiere decides whether to render the effect again from its own identity
+//  of the clip's nodes.  When a Source Settings change reaches the Program
+//  monitor, that identity must have changed; when it does not, this log
+//  line is how a field session proves which of the two happened.  One line
+//  per file per change - Premiere creates a GPU instance (and so resolves
+//  the source) for every parameter step of a drag, ~100 a second.
+// ===========================================================================
+
+/// What the media node looked like the last time a source was resolved.
+struct MediaEvidence {
+    std::string mediaHash;
+    std::string modState;
+    std::string clipId;
+};
+
+/// Last evidence per clip (file + ClipID: two track items of one file are
+/// two clips and must not be reported as one clip flapping between them),
+/// never destroyed (static-destructor order).
+struct EvidenceMemory {
+    std::mutex mutex;
+    std::map<std::wstring, MediaEvidence> byClip;
+};
+[[nodiscard]] EvidenceMemory& evidenceMemory() {
+    static EvidenceMemory* instance = new EvidenceMemory();
+    return *instance;
+}
+
+/// Log the binding's media identity when it is the first for its clip or
+/// differs from the last one seen for it.
+void noteMediaEvidence(const SourceBinding& b) noexcept {
+    try {
+        EvidenceMemory& m = evidenceMemory();
+        const std::wstring key = b.path + L"|" + std::wstring(b.clipId.begin(), b.clipId.end());
+        MediaEvidence previous;
+        bool known = false;
+        {
+            std::lock_guard<std::mutex> lock(m.mutex);
+            const auto it = m.byClip.find(key);
+            if (it != m.byClip.end()) {
+                known = true;
+                previous = it->second;
+                if (previous.mediaHash == b.mediaHash && previous.modState == b.modState &&
+                    previous.clipId == b.clipId) {
+                    return;  // Nothing new: the common case.
+                }
+            }
+            if (!known && m.byClip.size() >= 1024) {
+                m.byClip.clear();
+            }
+            MediaEvidence& slot = m.byClip[key];
+            slot.mediaHash = b.mediaHash;
+            slot.modState = b.modState;
+            slot.clipId = b.clipId;
+        }
+        const std::size_t slash = b.path.find_last_of(L"\\/");
+        const std::wstring name = slash == std::wstring::npos ? b.path : b.path.substr(slash + 1);
+        std::string nameUtf8;
+        {
+            const int n = WideCharToMultiByte(CP_UTF8, 0, name.data(), static_cast<int>(name.size()), nullptr, 0,
+                                              nullptr, nullptr);
+            if (n > 0) {
+                nameUtf8.assign(static_cast<std::size_t>(n), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, name.data(), static_cast<int>(name.size()), nameUtf8.data(), n,
+                                    nullptr, nullptr);
+            }
+        }
+        if (!known) {
+            PluginLog::info("reframe/direct: '{}' media node hash {}, mod state {}, clip id {}", nameUtf8,
+                            b.mediaHash, b.modState, b.clipId);
+        } else {
+            PluginLog::info("reframe/direct: '{}' media node CHANGED - hash {} (was {}), mod state {} (was {}), clip "
+                            "id {} (was {}): Premiere rebuilt the clip's media",
+                            nameUtf8, b.mediaHash, previous.mediaHash, b.modState, previous.modState, b.clipId,
+                            previous.clipId);
+        }
+    } catch (...) {
+        // Evidence only; never worth a failed CreateInstance.
     }
-    out = std::move(lookup.value);
-    return true;
 }
 
 /// UTF-8 to UTF-16 for a path.
@@ -197,9 +300,21 @@ SourceBinding resolveSource(const PrSDKVideoSegmentSuite* segment, int segmentVe
         csSDK_int32 flags = 0;
         const bool isMedia = segment->GetNodeInfo(media, type, &hash, &flags) == suiteError_NoError &&
                              std::strcmp(type, kVideoSegment_NodeType_Media) == 0;
-        std::string pathUtf8;
-        const bool gotPath = isMedia && nodeProperty(*segment, media, kVideoSegmentProperty_Media_InstanceString,
-                                                     pathUtf8);
+        // The path, plus [WP-SETTINGS] the media's identity evidence, in one
+        // pass over the node's properties.
+        PropertyLookup props;
+        props.keys[0] = kVideoSegmentProperty_Media_InstanceString;
+        props.keys[1] = kVideoSegmentProperty_Media_ModState;
+        props.keys[2] = kVideoSegmentProperty_Media_ClipID;
+        props.count = 3;
+        const bool gotPath = isMedia && nodeProperties(*segment, media, props) && props.found[0];
+        const std::string pathUtf8 = gotPath ? props.values[0] : std::string();
+        if (isMedia) {
+            // The GUID is NUL-terminated in a 37-byte field; never read past it.
+            b.mediaHash.assign(hash.mGUID, strnlen(hash.mGUID, sizeof(hash.mGUID)));
+            b.modState = props.found[1] ? props.values[1] : std::string("<none>");
+            b.clipId = props.found[2] ? props.values[2] : std::string("<none>");
+        }
         segment->ReleaseVideoNodeID(media);
         if (!isMedia) {
             segment->ReleaseVideoNodeID(owner);
@@ -222,6 +337,7 @@ SourceBinding resolveSource(const PrSDKVideoSegmentSuite* segment, int segmentVe
         }
         b.ownerNode = owner;
         b.ok = true;
+        noteMediaEvidence(b);  // [WP-SETTINGS]
         return b;
     } catch (...) {
         b = SourceBinding{};
@@ -303,6 +419,39 @@ bool renderDirect(const DirectRequest& request, std::string& reason) noexcept {
             return false;
         }
 
+        // ---- [WP-SETTINGS] may the direct path render this clip at all? -----------
+        // Asked BEFORE anything is decoded: the engine's answer is a map
+        // lookup, a decode is milliseconds.  A clip the rule hands to the
+        // equirect route costs nothing here on every later frame either.
+        const std::wstring& path = request.source->path;
+        OsvEngineClipSettings queried{};
+        bool haveQuery = false;
+        if (api.querySettings) {
+            queried.structSize = static_cast<std::uint32_t>(sizeof(OsvEngineClipSettings));
+            char queryError[256] = {};
+            const std::int32_t qrc =
+                api.querySettings(path.c_str(), &queried, queryError, static_cast<std::int32_t>(sizeof(queryError)));
+            if (qrc == OSV_ENGINE_OK) {
+                haveQuery = true;
+                const SettingsDecision decision =
+                    decideSettings(queried, request.transfer, colourModeFor(queried));
+                if (noteDecision(path, queried, request.transfer, decision)) {
+                    PluginLog::info("{}", describeDecision(path, queried, request.transfer, decision));
+                }
+                if (!decision.direct) {
+                    reason = std::string(kPolicyReasonPrefix) + decision.why;
+                    return false;
+                }
+            } else {
+                // A failed QUESTION is not a verdict: the frame's own
+                // settings block decides below, after the acquire.
+                PluginLog::oncef("reframe/direct/query-failed", PluginLog::Level::Warn,
+                                 "reframe/direct: the engine could not report the Source Settings ({}: {}); deciding "
+                                 "from each frame's settings instead",
+                                 qrc, queryError);
+            }
+        }
+
         // ---- clip time -> media time --------------------------------------------
         // The owning clip node's transform accounts for the in point, speed,
         // reverse and time remapping (PrSDKVideoSegmentSuite.h).
@@ -348,6 +497,22 @@ bool renderDirect(const DirectRequest& request, std::string& reason) noexcept {
         if (frame.paramsSize != sizeof(OsvRenderParams)) {
             reason = "the engine's parameter block has a different layout";
             return false;
+        }
+
+        // ---- [WP-SETTINGS] the settings the frame was ACTUALLY rendered with ----------
+        // A publication can land between the question above and the acquire;
+        // the frame's own block is authoritative, so a changed generation is
+        // decided again (and without the query, it is the only decision).
+        if (!haveQuery || frame.settings.generation != queried.generation) {
+            const SettingsDecision decision =
+                decideSettings(frame.settings, request.transfer, colourModeFor(frame.settings));
+            if (noteDecision(path, frame.settings, request.transfer, decision)) {
+                PluginLog::info("{}", describeDecision(path, frame.settings, request.transfer, decision));
+            }
+            if (!decision.direct) {
+                reason = std::string(kPolicyReasonPrefix) + decision.why;
+                return false;  // the guard releases the lease
+            }
         }
 
         // ---- the view ----------------------------------------------------------------

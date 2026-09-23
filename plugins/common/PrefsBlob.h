@@ -122,6 +122,27 @@ enum class PrefsParallax : std::uint8_t {
     Count
 };
 
+/// [WP-SETTINGS] How the reframe effect's direct path (docs/DIRECT_GPU.md)
+/// treats a clip whose colour output is not the sequence's working space.
+///
+/// The direct path renders straight from the fisheyes into the working
+/// space, so Premiere's conversion of the importer's frame never runs.  When
+/// the colour output IS the working space the two routes agree exactly; when
+/// it is not, only Premiere knows its own conversion (tone mapping, SDR in an
+/// HDR container, log interpretation), and this choice decides who renders.
+/// Persisted, so append-only.
+enum class PrefsDirectColour : std::uint8_t {
+    /// Hand such a clip to the equirect route, so the Program monitor shows
+    /// exactly what the Source monitor route produces.  The default (and
+    /// what the zero bytes of an older project read as).
+    MatchClip = 0,
+    /// Render it straight into the working space with OpenOSV's own
+    /// conversion: sharper and faster, but the colour output choice no longer
+    /// changes the reframed picture.
+    WorkingSpace = 1,
+    Count
+};
+
 /// Renderer selection; the numeric values are the ones stored in the blob
 /// and match HostContext's RenderDevicePreference.
 enum class PrefsRenderDevice : std::uint8_t {
@@ -165,7 +186,12 @@ struct PrefsBlob {
     float exposureStops = 0.0f;        ///< Exposure offset in stops.
     std::uint8_t parallax = 0;         ///< PrefsParallax; flow-based seam correction.
     std::uint8_t flowBackend = 0;      ///< PrefsFlowBackend.
-    std::uint8_t reserved[106] = {};   ///< Zero; future fields.
+    /// [WP-SETTINGS] Padding up to this package's byte range (24-25, see
+    /// docs/PARALLEL_WORK.md); the lead folds it into the fields that own
+    /// offsets 22-23 at merge.  Zero, and zeroed by sanitise().
+    std::uint8_t padBeforeSettings[2] = {};
+    std::uint8_t directColour = 0;     ///< [WP-SETTINGS] PrefsDirectColour (0 = MatchClip).
+    std::uint8_t reserved[103] = {};   ///< Zero; future fields.
 
     /// A blob with every field at its documented default.
     [[nodiscard]] static PrefsBlob defaults() noexcept {
@@ -255,6 +281,15 @@ struct PrefsBlob {
                   static_cast<std::uint8_t>(PrefsParallax::On));
         clampEnum(flowBackend, static_cast<std::uint8_t>(PrefsFlowBackend::Count),
                   static_cast<std::uint8_t>(PrefsFlowBackend::Auto));
+        // [WP-SETTINGS] Zero is the default, so a corrupt byte lands there too.
+        clampEnum(directColour, static_cast<std::uint8_t>(PrefsDirectColour::Count),
+                  static_cast<std::uint8_t>(PrefsDirectColour::MatchClip));
+        for (std::uint8_t& b : padBeforeSettings) {
+            if (b != 0) {
+                b = 0;
+                clean = false;
+            }
+        }
 
         // NaN compares false with everything, so test the valid range and
         // reset anything else (NaN, infinities, out of range).
@@ -301,6 +336,10 @@ struct PrefsBlob {
     [[nodiscard]] PrefsRenderDevice device() const noexcept { return static_cast<PrefsRenderDevice>(renderDevice); }
     [[nodiscard]] PrefsParallax parallaxMode() const noexcept { return static_cast<PrefsParallax>(parallax); }
     [[nodiscard]] PrefsFlowBackend flow() const noexcept { return static_cast<PrefsFlowBackend>(flowBackend); }
+    /// [WP-SETTINGS]
+    [[nodiscard]] PrefsDirectColour directColourMode() const noexcept {
+        return static_cast<PrefsDirectColour>(directColour);
+    }
     /// True when the flow-based parallax correction should run.
     [[nodiscard]] bool parallaxEnabled() const noexcept { return parallaxMode() == PrefsParallax::On; }
 };
@@ -319,6 +358,10 @@ static_assert(offsetof(PrefsBlob, exposureStops) == 16, "PrefsBlob layout drifte
 // project renders.  A new blob gets On from defaults().
 static_assert(offsetof(PrefsBlob, parallax) == 20, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, flowBackend) == 21, "PrefsBlob layout drifted");
-static_assert(offsetof(PrefsBlob, reserved) == 22, "PrefsBlob layout drifted");
+// [WP-SETTINGS] owns offsets 24-25 (docs/PARALLEL_WORK.md); 22-23 are padding
+// here until the lead folds in the package that owns them.  An older blob's
+// zero byte reads as PrefsDirectColour::MatchClip, the default.
+static_assert(offsetof(PrefsBlob, directColour) == 24, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, reserved) == 25, "PrefsBlob layout drifted");
 
 }  // namespace osv::premiere

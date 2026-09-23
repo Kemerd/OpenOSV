@@ -1270,20 +1270,27 @@ prSuiteError render(PrGPUFilterInstance* instanceData, const PrGPUFilterRenderPa
             if (!request.kernel) {
                 reason = "the fused kernel is not loaded";
             }
-            // Structural failures (the setup cannot express the view, the
-            // engine cannot open the file, the ABI changed) will fail again on
-            // every frame; stop trying for this instance.  Everything else -
-            // a decode hiccup - may pass, so the next frame retries.
-            const bool structural = reason.rfind("setup:", 0) == 0 || reason.find("cannot open") != std::string::npos ||
-                                    reason.find("layout") != std::string::npos ||
-                                    reason.find("not loaded") != std::string::npos;
-            if (structural) {
-                inst->directDisabled = true;
-            }
-            if (inst->directFailures < 5) {
-                ++inst->directFailures;
-                PluginLog::warn("reframe/direct: falling back to the equirect path for this frame{} - {}",
-                                structural ? " and this instance" : "", reason);
+            // [WP-SETTINGS] A deliberate hand-over by the Source Settings rule
+            // is not a failure: DirectPath logged it once for the change that
+            // caused it, and a later change can make the clip eligible, so
+            // the instance neither warns nor stops asking.
+            if (!osv::reframe::direct::isPolicyFallback(reason)) {
+                // Structural failures (the setup cannot express the view, the
+                // engine cannot open the file, the ABI changed) will fail again
+                // on every frame; stop trying for this instance.  Everything
+                // else - a decode hiccup - may pass, so the next frame retries.
+                const bool structural = reason.rfind("setup:", 0) == 0 ||
+                                        reason.find("cannot open") != std::string::npos ||
+                                        reason.find("layout") != std::string::npos ||
+                                        reason.find("not loaded") != std::string::npos;
+                if (structural) {
+                    inst->directDisabled = true;
+                }
+                if (inst->directFailures < 5) {
+                    ++inst->directFailures;
+                    PluginLog::warn("reframe/direct: falling back to the equirect path for this frame{} - {}",
+                                    structural ? " and this instance" : "", reason);
+                }
             }
         }
 
