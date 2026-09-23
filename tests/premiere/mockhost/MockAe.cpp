@@ -2,7 +2,8 @@
 // Copyright 2026 The OpenOSV Contributors
 //
 // The After Effects side of the mock host: the PF Pixel Format Suite v1, the
-// PF Utility Suite v4..v13 and the PF_InData / PF_OutData builders with
+// PF Utility Suite v4..v13, the PF Param Utils Suite v3 (PF_UpdateParamUI
+// recorded) and the PF_InData / PF_OutData builders with
 // working interaction callbacks (checkout_param, checkin_param, add_param,
 // abort, progress).
 //
@@ -36,6 +37,7 @@
 #include <algorithm>
 #include <cstring>
 #include <new>
+#include <utility>
 
 namespace osv::premiere::mock {
 
@@ -802,6 +804,154 @@ void MockHost::setSourceSettingsError(PF_ProgPtr ref, PF_Err err) {
 }
 
 // -----------------------------------------------------------------------------
+//  PF Param Utils Suite v3
+// -----------------------------------------------------------------------------
+//
+//  PF_UpdateParamUI is RECORDED: in a real host it only changes how the
+//  Effect Controls panel draws a control, so the mock keeps each accepted
+//  call on the EffectRef and a test reads back which controls an effect hid
+//  or showed.  Only the fields the SDK lets the call change are copied
+//  (AE_EffectSuites.h: ui_flags, the name, flags, and the slider display of a
+//  float slider).  Every other member answers with a defined error rather
+//  than a null pointer, so a stray call cannot crash a test.
+
+namespace {
+
+PF_Err pfParamUtilsUpdateParamUI(PF_ProgPtr effectRef, PF_ParamIndex index, const PF_ParamDef* def) {
+    MockHost::Impl* p = impl();
+    if (!p || !def) {
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+    std::lock_guard<std::recursive_mutex> lock(p->mutex);
+    EffectRef* ref = p->effectRef(effectRef);
+    if (!ref) {
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+    // Index 0 is the input layer, which has no UI to update; past the list
+    // is a control the effect never added.  A real host refuses both.
+    if (index < 1 || static_cast<std::size_t>(index) > ref->params.size()) {
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+    // An injected refusal is returned before anything is recorded.
+    const auto refused = ref->uiErrors.find(static_cast<A_long>(index));
+    if (refused != ref->uiErrors.end()) {
+        return refused->second;
+    }
+
+    ParamUiUpdate u;
+    u.index = static_cast<A_long>(index);
+    u.type = def->param_type;
+    u.uiFlags = def->ui_flags;
+    u.flags = def->flags;
+    // The name buffer is a fixed array; copy up to its NUL or its end, so a
+    // def whose name was never terminated cannot read past the struct.
+    const char* name = def->PF_DEF_NAME;
+    std::size_t length = 0;
+    while (length < sizeof(def->PF_DEF_NAME) && name[length] != '\0') {
+        ++length;
+    }
+    u.name.assign(name, length);
+    if (def->param_type == PF_Param_FLOAT_SLIDER) {
+        u.sliderMin = static_cast<float>(def->u.fs_d.slider_min);
+        u.sliderMax = static_cast<float>(def->u.fs_d.slider_max);
+        u.precision = def->u.fs_d.precision;
+        u.displayFlags = def->u.fs_d.display_flags;
+    }
+    ref->uiUpdates.push_back(std::move(u));
+    return PF_Err_NONE;
+}
+
+PF_Err pfParamUtilsGetCurrentState(PF_ProgPtr, PF_ParamIndex, const A_Time*, const A_Time*, PF_State* state) {
+    if (state) {
+        std::memset(state, 0, sizeof(*state));
+    }
+    return PF_Err_BAD_CALLBACK_PARAM;
+}
+
+PF_Err pfParamUtilsAreStatesIdentical(PF_ProgPtr, const PF_State*, const PF_State*, A_Boolean* same) {
+    if (same) {
+        *same = FALSE;
+    }
+    return PF_Err_BAD_CALLBACK_PARAM;
+}
+
+PF_Err pfParamUtilsIsIdenticalCheckout(PF_ProgPtr, PF_ParamIndex, A_long, A_long, A_u_long, A_long, A_long,
+                                       A_u_long, PF_Boolean* identical) {
+    if (identical) {
+        *identical = FALSE;
+    }
+    return PF_Err_BAD_CALLBACK_PARAM;
+}
+
+PF_Err pfParamUtilsFindKeyframeTime(PF_ProgPtr, PF_ParamIndex, A_long, A_u_long, PF_TimeDir, PF_Boolean* found,
+                                    PF_KeyIndex*, A_long*, A_u_long*) {
+    if (found) {
+        *found = FALSE;
+    }
+    return PF_Err_BAD_CALLBACK_PARAM;
+}
+
+PF_Err pfParamUtilsGetKeyframeCount(PF_ProgPtr, PF_ParamIndex, PF_KeyIndex* count) {
+    if (count) {
+        *count = PF_KeyIndex_NONE;
+    }
+    return PF_Err_BAD_CALLBACK_PARAM;
+}
+
+PF_Err pfParamUtilsCheckoutKeyframe(PF_ProgPtr, PF_ParamIndex, PF_KeyIndex, A_long*, A_u_long*, PF_ParamDef*) {
+    return PF_Err_BAD_CALLBACK_PARAM;
+}
+
+PF_Err pfParamUtilsCheckinKeyframe(PF_ProgPtr, PF_ParamDef*) { return PF_Err_BAD_CALLBACK_PARAM; }
+
+PF_Err pfParamUtilsKeyIndexToTime(PF_ProgPtr, PF_ParamIndex, PF_KeyIndex, A_long*, A_u_long*) {
+    return PF_Err_BAD_CALLBACK_PARAM;
+}
+
+}  // namespace
+
+std::vector<ParamUiUpdate> MockHost::paramUiUpdates(PF_ProgPtr ref) const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    const EffectRef* r = m_impl->effectRef(ref);
+    return r ? r->uiUpdates : std::vector<ParamUiUpdate>{};
+}
+
+std::optional<ParamUiUpdate> MockHost::paramUiState(PF_ProgPtr ref, A_long index) const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    const EffectRef* r = m_impl->effectRef(ref);
+    if (!r) {
+        return std::nullopt;
+    }
+    // The latest call wins, exactly as the panel would show it.
+    for (auto it = r->uiUpdates.rbegin(); it != r->uiUpdates.rend(); ++it) {
+        if (it->index == index) {
+            return *it;
+        }
+    }
+    return std::nullopt;
+}
+
+void MockHost::clearParamUiUpdates(PF_ProgPtr ref) {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    if (EffectRef* r = m_impl->effectRef(ref)) {
+        r->uiUpdates.clear();
+    }
+}
+
+void MockHost::setParamUiError(PF_ProgPtr ref, A_long index, PF_Err err) {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    EffectRef* r = m_impl->effectRef(ref);
+    if (!r) {
+        return;
+    }
+    if (err == PF_Err_NONE) {
+        r->uiErrors.erase(index);
+    } else {
+        r->uiErrors[index] = err;
+    }
+}
+
+// -----------------------------------------------------------------------------
 //  Registration
 // -----------------------------------------------------------------------------
 void installAeSuites(MockHost::Impl& p) {
@@ -842,6 +992,19 @@ void installAeSuites(MockHost::Impl& p) {
     p.pfSourceSettings.PerformSourceSettingsCommand = &pfSourceSettingsPerformCommand;
     p.registerSuite(kPFSourceSettingsSuite, kPFSourceSettingsSuiteVersion1, &p.pfSourceSettings);
     p.registerSuite(kPFSourceSettingsSuite, kPFSourceSettingsSuiteVersion2, &p.pfSourceSettings);
+
+    // The Param Utils Suite v3: PF_UpdateParamUI recorded, the rest defined
+    // refusals (see the section above).
+    p.pfParamUtils.PF_UpdateParamUI = &pfParamUtilsUpdateParamUI;
+    p.pfParamUtils.PF_GetCurrentState = &pfParamUtilsGetCurrentState;
+    p.pfParamUtils.PF_AreStatesIdentical = &pfParamUtilsAreStatesIdentical;
+    p.pfParamUtils.PF_IsIdenticalCheckout = &pfParamUtilsIsIdenticalCheckout;
+    p.pfParamUtils.PF_FindKeyframeTime = &pfParamUtilsFindKeyframeTime;
+    p.pfParamUtils.PF_GetKeyframeCount = &pfParamUtilsGetKeyframeCount;
+    p.pfParamUtils.PF_CheckoutKeyframe = &pfParamUtilsCheckoutKeyframe;
+    p.pfParamUtils.PF_CheckinKeyframe = &pfParamUtilsCheckinKeyframe;
+    p.pfParamUtils.PF_KeyIndexToTime = &pfParamUtilsKeyIndexToTime;
+    p.registerSuite(kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, &p.pfParamUtils);
 }
 
 }  // namespace osv::premiere::mock
