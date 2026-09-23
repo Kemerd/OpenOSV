@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// test_dji_camera.cpp - Open 360 Reframe's DJI lens ("Camera Model: DJI").
+// test_dji_camera.cpp - Open 360 Reframe's DJI lens ("Lens: DJI").
 //
 // DJI's reframe tools describe the camera with three numbers - Zoom, FOV and
 // Correction Angle - that the effect's original (Classic) lens could not
@@ -16,10 +16,15 @@
 //      CPU path and decoded from a labelled panorama;
 //   4. the Zoom control's inverse (DJI Studio's zoom path) and the
 //      Classic <-> DJI conversions that make switching seamless;
-//   5. the supervised behaviour, through the LOADED module;
+//   5. the supervised behaviour, through the LOADED module - [WP-LENSUI]
+//      now driven by the Lens popup, with the old Camera Model checkbox as
+//      its hidden mirror;
 //   6. the host-parameter plumbing: popups that arrive 0-based on the GPU
 //      side, and the matcher with the appended block;
-//   7. CPU / GPU parity of the DJI lens through the GPU filter (>= 60 dB).
+//   7. CPU / GPU parity of the DJI lens through the GPU filter (>= 60 dB);
+//   8. [WP-LENSUI] the Lens popup end to end: switching keeps the framing,
+//      an old project opens on DJI, and the GPU filter reads the popup (not
+//      the checkbox) whether the host numbers it from 0 or from 1.
 
 #include "GpuTestSupport.h"
 #include "ReframeTestSupport.h"
@@ -258,7 +263,16 @@ struct Params {
     [[nodiscard]] PF_ParamDef** data() noexcept { return pointers.data(); }
     [[nodiscard]] PF_ParamDef& at(int aeIndex) noexcept { return storage[static_cast<std::size_t>(aeIndex)]; }
     [[nodiscard]] double slider(int aeIndex) noexcept { return static_cast<double>(at(aeIndex).u.fs_d.value); }
-    [[nodiscard]] bool dji() noexcept { return at(kIndexCameraModel).u.bd.value != 0; }
+    /// [WP-LENSUI] The lens on screen: the Lens popup.
+    [[nodiscard]] bool dji() noexcept { return cameraModelFromLensPopup(at(kIndexLens).u.pd.value) == CameraModel::Dji; }
+    /// The hidden Camera Model mirror (ticked = DJI).
+    [[nodiscard]] bool mirrorDji() noexcept { return at(kIndexCameraModel).u.bd.value != 0; }
+    /// Put the instance on a lens the way a host holds it after the effect
+    /// supervised the switch: the popup AND its mirror.
+    void setLens(CameraModel model) {
+        at(kIndexLens).u.pd.value = static_cast<A_long>(lensPopupValue(model));
+        at(kIndexCameraModel).u.bd.value = (model == CameraModel::Dji) ? 1 : 0;
+    }
     [[nodiscard]] bool marked(int aeIndex) noexcept {
         return (at(aeIndex).uu.change_flags & PF_ChangeFlag_CHANGED_VALUE) != 0;
     }
@@ -560,7 +574,8 @@ TEST_CASE("a preset writes DJI's numbers and switches to DJI's lens", "[reframe]
         }
         INFO("preset '" << entry.label << "'");
         Params p(f.registered);
-        REQUIRE_FALSE(p.dji());  // a fresh instance is Classic
+        REQUIRE(p.dji());                 // [WP-LENSUI] a fresh instance is on DJI's lens...
+        p.setLens(CameraModel::Classic);  // ...so start from Classic to see the switch
         p.at(kIndexPreset).u.pd.value = static_cast<A_long>(entry.value);
         userChanged(f, p, kIndexPreset);
 
@@ -570,6 +585,9 @@ TEST_CASE("a preset writes DJI's numbers and switches to DJI's lens", "[reframe]
         CHECK(p.slider(kIndexZoom) ==
               Approx(djiZoomDeg(DjiLens{entry.djiFovLandscapeDeg, entry.correction}, kAspect169)).margin(1e-3));
         CHECK(p.dji());
+        CHECK(p.marked(kIndexLens));
+        // The hidden mirror follows the popup.
+        CHECK(p.mirrorDji());
         CHECK(p.marked(kIndexCameraModel));
         CHECK(p.marked(kIndexDjiFov));
         CHECK(p.marked(kIndexCorrection));
@@ -589,6 +607,7 @@ TEST_CASE("editing a DJI control switches to DJI's lens without a jump", "[refra
 
     SECTION("DJI FOV edited on a Classic instance keeps the Classic eye distance") {
         Params p(f.registered);
+        p.setLens(CameraModel::Classic);
         p.at(kIndexPreset).u.pd.value = static_cast<A_long>(Preset::Wide);
         p.at(kIndexFov).u.fs_d.value = 150.0f;
         p.at(kIndexDistortion).u.fs_d.value = 40.0f;
@@ -605,6 +624,7 @@ TEST_CASE("editing a DJI control switches to DJI's lens without a jump", "[refra
     }
     SECTION("Correction edited on a Classic instance keeps the Classic pinhole FOV") {
         Params p(f.registered);
+        p.setLens(CameraModel::Classic);
         p.at(kIndexFov).u.fs_d.value = 120.0f;
         p.at(kIndexDistortion).u.fs_d.value = 15.0f;
         p.at(kIndexCorrection).u.fs_d.value = 0.5f;  // the user's edit
@@ -616,7 +636,7 @@ TEST_CASE("editing a DJI control switches to DJI's lens without a jump", "[refra
     }
     SECTION("Zoom moves FOV and Correction along DJI Studio's zoom path") {
         Params p(f.registered);
-        p.at(kIndexCameraModel).u.bd.value = 1;
+        p.setLens(CameraModel::Dji);
         p.at(kIndexDjiFov).u.fs_d.value = 60.0f;
         p.at(kIndexCorrection).u.fs_d.value = 0.6f;
         p.at(kIndexZoom).u.fs_d.value = 207.1f;  // the user's edit
@@ -629,7 +649,7 @@ TEST_CASE("editing a DJI control switches to DJI's lens without a jump", "[refra
     }
     SECTION("a Zoom past DJI's limits stops at them and says so") {
         Params p(f.registered);
-        p.at(kIndexCameraModel).u.bd.value = 1;
+        p.setLens(CameraModel::Dji);
         p.at(kIndexZoom).u.fs_d.value = 359.0f;
         userChanged(f, p, kIndexZoom);
         CHECK(p.slider(kIndexDjiFov) == Approx(150.0));
@@ -638,29 +658,95 @@ TEST_CASE("editing a DJI control switches to DJI's lens without a jump", "[refra
     }
     SECTION("editing a Classic control goes back to Classic") {
         Params p(f.registered);
-        p.at(kIndexCameraModel).u.bd.value = 1;
+        p.setLens(CameraModel::Dji);
         userChanged(f, p, kIndexFov);
         CHECK_FALSE(p.dji());
+        CHECK(p.marked(kIndexLens));
+        CHECK_FALSE(p.mirrorDji());
         CHECK(p.marked(kIndexCameraModel));
     }
-    SECTION("ticking the checkbox converts Classic's look; unticking converts back") {
+    SECTION("picking DJI in the Lens popup converts Classic's look; picking Classic converts back") {
         Params p(f.registered);
+        p.setLens(CameraModel::Classic);
         p.at(kIndexFov).u.fs_d.value = 120.0f;
         p.at(kIndexDistortion).u.fs_d.value = 15.0f;
-        p.at(kIndexCameraModel).u.bd.value = 1;  // the user ticks DJI
-        userChanged(f, p, kIndexCameraModel);
+        p.at(kIndexLens).u.pd.value = static_cast<A_long>(LensPopup::Dji);  // the user picks DJI
+        userChanged(f, p, kIndexLens);
         // Classic FOV is the visible angle, so DJI's Zoom must equal it.
         CHECK(p.slider(kIndexZoom) == Approx(120.0).margin(1e-3));
         CHECK(p.marked(kIndexDjiFov));
         CHECK(p.marked(kIndexCorrection));
+        // The popup the user set is not re-marked; the mirror follows it.
+        CHECK_FALSE(p.marked(kIndexLens));
+        CHECK(p.mirrorDji());
+        CHECK(p.marked(kIndexCameraModel));
+        // The Classic controls, now hidden, keep what they held.
+        CHECK_FALSE(p.marked(kIndexFov));
+        CHECK_FALSE(p.marked(kIndexDistortion));
+        // And the panel is asked to redraw, which brings the
+        // UPDATE_PARAMS_UI that shows DJI's controls.
+        CHECK((f.out.out_flags & PF_OutFlag_REFRESH_UI) != 0);
 
         p.clearFlags();
+        f.out.out_flags = 0;
         p.at(kIndexDjiFov).u.fs_d.value = 60.0f;
         p.at(kIndexCorrection).u.fs_d.value = 0.6f;
-        p.at(kIndexCameraModel).u.bd.value = 0;  // and unticks it
-        userChanged(f, p, kIndexCameraModel);
+        p.at(kIndexLens).u.pd.value = static_cast<A_long>(LensPopup::Classic);  // and picks Classic
+        userChanged(f, p, kIndexLens);
         CHECK(p.slider(kIndexFov) == Approx(djiZoomDeg(DjiLens{60.0, 0.6}, kAspect169)).margin(1e-3));
         CHECK(p.slider(kIndexDistortion) == Approx(60.0).margin(1e-3));
+        CHECK_FALSE(p.mirrorDji());
+        CHECK_FALSE(p.marked(kIndexDjiFov));
+        CHECK((f.out.out_flags & PF_OutFlag_REFRESH_UI) != 0);
+    }
+    SECTION("ticking the hidden checkbox - a host that shows it - switches the popup the same way") {
+        Params p(f.registered);
+        p.setLens(CameraModel::Classic);
+        p.at(kIndexFov).u.fs_d.value = 120.0f;
+        p.at(kIndexDistortion).u.fs_d.value = 15.0f;
+        p.at(kIndexCameraModel).u.bd.value = 1;  // the user ticks "DJI"
+        userChanged(f, p, kIndexCameraModel);
+        CHECK(p.dji());
+        CHECK(p.marked(kIndexLens));
+        CHECK(p.slider(kIndexZoom) == Approx(120.0).margin(1e-3));
+    }
+    SECTION("re-picking the lens already on screen converts nothing") {
+        Params p(f.registered);
+        p.setLens(CameraModel::Dji);
+        p.at(kIndexPreset).u.pd.value = static_cast<A_long>(Preset::Wide);
+        p.at(kIndexDjiFov).u.fs_d.value = 103.3f;
+        p.at(kIndexCorrection).u.fs_d.value = 0.67f;
+        p.at(kIndexFov).u.fs_d.value = 150.0f;
+        userChanged(f, p, kIndexLens);  // DJI -> DJI
+        CHECK(p.slider(kIndexDjiFov) == Approx(103.3).margin(1e-4));
+        CHECK(p.slider(kIndexCorrection) == Approx(0.67).margin(1e-6));
+        CHECK(static_cast<Preset>(p.at(kIndexPreset).u.pd.value) == Preset::Wide);
+        for (int i = 1; i <= kParamCount; ++i) {
+            CHECK_FALSE(p.marked(i));
+        }
+    }
+    SECTION("a stale mirror (an old project saved unticked) still leaves Classic beside Custom") {
+        // A WP-CAMERA project saved with the checkbox unticked opens on DJI
+        // (the popup's default) with the mirror still saying Classic.
+        // Picking Classic then looks like a re-pick - nothing to convert, so
+        // the project's own Classic numbers come back - but Preset must still
+        // become Custom, the pairing the GPU path's popup decoding relies on,
+        // and the panel must still be asked to refresh.
+        Params p(f.registered);
+        p.at(kIndexLens).u.pd.value = static_cast<A_long>(LensPopup::Classic);  // the user picks Classic
+        p.at(kIndexCameraModel).u.bd.value = 0;                                 // the stale mirror
+        p.at(kIndexPreset).u.pd.value = static_cast<A_long>(Preset::Wide);
+        p.at(kIndexFov).u.fs_d.value = 133.0f;
+        p.at(kIndexDistortion).u.fs_d.value = 22.0f;
+        f.out.out_flags = 0;
+        userChanged(f, p, kIndexLens);
+        CHECK_FALSE(p.dji());
+        CHECK(p.slider(kIndexFov) == Approx(133.0));
+        CHECK(p.slider(kIndexDistortion) == Approx(22.0));
+        CHECK_FALSE(p.marked(kIndexFov));
+        CHECK(static_cast<Preset>(p.at(kIndexPreset).u.pd.value) == Preset::Custom);
+        CHECK(p.marked(kIndexPreset));
+        CHECK((f.out.out_flags & PF_OutFlag_REFRESH_UI) != 0);
     }
     SECTION("Drag Sensitivity is a preference: editing it changes nothing else") {
         Params p(f.registered);
@@ -668,7 +754,7 @@ TEST_CASE("editing a DJI control switches to DJI's lens without a jump", "[refra
         p.at(kIndexDragSensitivity).u.fs_d.value = 4.0f;
         userChanged(f, p, kIndexDragSensitivity);
         CHECK(static_cast<Preset>(p.at(kIndexPreset).u.pd.value) == Preset::Wide);
-        CHECK_FALSE(p.dji());
+        CHECK(p.dji());  // the default lens, untouched
         for (int i = 1; i <= kParamCount; ++i) {
             CHECK_FALSE(p.marked(i));
         }
@@ -678,10 +764,15 @@ TEST_CASE("editing a DJI control switches to DJI's lens without a jump", "[refra
 TEST_CASE("the DJI controls carry DJI's ranges, defaults and flags", "[reframe][params][dji]") {
     ModuleFixture f;
     const std::vector<PF_ParamDef>& r = f.registered;
+    // [WP-LENSUI] The Camera Model checkbox is the Lens popup's hidden
+    // mirror: registered invisible, ticked (DJI) like the popup's default.
     const PF_ParamDef& model = r[kIndexCameraModel - 1];
     REQUIRE(model.param_type == PF_Param_CHECKBOX);
-    CHECK(model.u.bd.dephault == OSV_REFRAME_CAMERA_MODEL_DEFAULT);  // Classic: old projects stay Classic
+    CHECK(model.u.bd.dephault == OSV_REFRAME_CAMERA_MODEL_DEFAULT);
+    CHECK(cameraModelFromCheckbox(model.u.bd.dephault) == CameraModel::Dji);
+    CHECK((model.ui_flags & PF_PUI_INVISIBLE) != 0);
     CHECK((model.flags & PF_ParamFlag_CANNOT_TIME_VARY) != 0);
+    CHECK((model.flags & PF_ParamFlag_SUPERVISE) != 0);
 
     const PF_ParamDef& zoom = r[kIndexZoom - 1];
     REQUIRE(zoom.param_type == PF_Param_FLOAT_SLIDER);
@@ -754,6 +845,15 @@ TEST_CASE("matchHostParams with the appended DJI block", "[reframe][params][dji]
         }
         CHECK(map[kIndexCameraModel] == 11);
         CHECK(map[kIndexDragSensitivity] == 15);
+        CHECK(map[kIndexLens] == 16);
+    }
+    SECTION("a list that stops before the Lens popup maps the rest; the Lens reads its default") {
+        // A host whose list predates [WP-LENSUI]: every control up to Drag
+        // Sensitivity, then nothing.
+        const std::vector<HostParamKind> noLens(kValueParamKind, kValueParamKind + kValueParamCount - 1);
+        REQUIRE(matchHostParams(noLens.data(), static_cast<int>(noLens.size()), &map));
+        CHECK(map[kIndexDragSensitivity] == 15);
+        CHECK(map[kIndexLens] == -1);
     }
     SECTION("Premiere's compact layout of the NEW list: the Source group hidden") {
         std::vector<HostParamKind> compact;
@@ -763,7 +863,7 @@ TEST_CASE("matchHostParams with the appended DJI block", "[reframe][params][dji]
                 compact.push_back(kValueParamKind[i]);
             }
         }
-        REQUIRE(compact.size() == 13u);
+        REQUIRE(compact.size() == 14u);
         REQUIRE(matchHostParams(compact.data(), static_cast<int>(compact.size()), &map));
         CHECK(map[kIndexSmooth] == 7);
         CHECK(map[kIndexCameraModel] == 8);
@@ -771,6 +871,7 @@ TEST_CASE("matchHostParams with the appended DJI block", "[reframe][params][dji]
         CHECK(map[kIndexDjiFov] == 10);
         CHECK(map[kIndexCorrection] == 11);
         CHECK(map[kIndexDragSensitivity] == 12);
+        CHECK(map[kIndexLens] == 13);
         CHECK(map[kIndexSourcePan] == -1);
     }
     SECTION("a list of nothing but appended controls is not our list") {
@@ -866,7 +967,11 @@ TEST_CASE("the GPU filter renders DJI's lens exactly as the CPU path", "[reframe
         c.pan = 144.8;
         c.tilt = -5.9;
         writeVerbatimControls(host, kNode, c);
-        putParam(host, kIndexCameraModel, kPrParamType_Bool, 1.0);
+        // [WP-LENSUI] DJI selected by the Lens popup (1-based, like the rest
+        // of this list) - and the hidden checkbox left unticked, so a filter
+        // that still read the checkbox would render Classic and fail below.
+        putParam(host, kIndexLens, kPrParamType_Int32, static_cast<double>(LensPopup::Dji));
+        putParam(host, kIndexCameraModel, kPrParamType_Bool, 0.0);
         putParam(host, kIndexZoom, kPrParamType_Float64, 200.0);
         putParam(host, kIndexDjiFov, kPrParamType_Float64, l.fov);
         putParam(host, kIndexCorrection, kPrParamType_Float64, l.correction);
@@ -882,7 +987,7 @@ TEST_CASE("the GPU filter renders DJI's lens exactly as the CPU path", "[reframe
         INFO("GPU vs CPU PSNR " << db << " dB");
         CHECK(db >= 60.0);
         // Rendering the Classic lens instead would be a different picture:
-        // the checkbox really was read.
+        // the Lens popup really was read.
         Settings classic = settingsOf(c);
         CHECK(psnr(gpu, cpuReference(classic, 640, 360)) < 30.0);
     }
@@ -902,16 +1007,18 @@ TEST_CASE("the GPU filter reads popups from a 0-based host and a 1-based one ali
         const char* name;
         int resolution;  // raw popup values as the host serves them
         int preset;
+        int lens;        // [WP-LENSUI] "Classic" in the same numbering
         const Settings* expected;
     };
     const HostCase cases[] = {
-        // Premiere 26.2.2 counts from 0: 1 is "3840 x 2160", 0 is "Custom".
-        {"0-based, settled by Preset 0", 1, 0, &uhd},
+        // Premiere 26.2.2 counts from 0: 1 is "3840 x 2160", 0 is "Custom"
+        // and 1 is "Classic".
+        {"0-based, settled by Preset 0", 1, 0, 1, &uhd},
         // ...and its Match Sequence default reads 0.
-        {"0-based, settled by Output Resolution 0", 0, 3, &match},
+        {"0-based, settled by Output Resolution 0", 0, 3, 1, &match},
         // After Effects' numbering: 2 is "3840 x 2160", 6 (the entry count)
-        // is "Dewarping" and settles it.
-        {"1-based, settled by Preset 6", 2, 6, &uhd},
+        // is "Dewarping" and settles it; 2 is "Classic".
+        {"1-based, settled by Preset 6", 2, 6, 2, &uhd},
     };
     for (const HostCase& hc : cases) {
         INFO(hc.name);
@@ -920,6 +1027,7 @@ TEST_CASE("the GPU filter reads popups from a 0-based host and a 1-based one ali
         Controls c;
         c.resolution = hc.resolution;
         c.preset = hc.preset;
+        c.lens = hc.lens;
         c.pan = 30.0;
         c.tilt = 5.0;
         c.fov = 100.0;
@@ -930,5 +1038,242 @@ TEST_CASE("the GPU filter reads popups from a 0-based host and a 1-based one ali
         const double db = psnr(gpu, cpuReference(*hc.expected, kW, kH));
         INFO("PSNR " << db << " dB");
         CHECK(db >= 60.0);
+    }
+}
+
+// ===========================================================================
+//  8. [WP-LENSUI] The Lens popup, end to end
+// ===========================================================================
+namespace {
+
+/// The Settings the renderer builds from a USER_CHANGED_PARAM array - the
+/// lens the popup selects and every control that lens reads - so a test can
+/// build the camera the host would render after the effect edited the array.
+[[nodiscard]] Settings settingsFromParams(Params& p) {
+    Settings s;
+    s.resolution = sanitiseResolution(p.at(kIndexOutputResolution).u.pd.value);
+    s.preset = sanitisePreset(p.at(kIndexPreset).u.pd.value);
+    s.cameraModel = cameraModelFromLensPopup(p.at(kIndexLens).u.pd.value);
+    s.fovDeg = p.slider(kIndexFov);
+    s.distortion = p.slider(kIndexDistortion);
+    s.djiFovDeg = p.slider(kIndexDjiFov);
+    s.correction = p.slider(kIndexCorrection);
+    s.panDeg = static_cast<double>(p.at(kIndexPan).u.ad.value) / 65536.0;
+    s.tiltDeg = static_cast<double>(p.at(kIndexTilt).u.ad.value) / 65536.0;
+    s.rollDeg = static_cast<double>(p.at(kIndexRoll).u.ad.value) / 65536.0;
+    return s;
+}
+
+/// Set an angle control of a USER_CHANGED_PARAM array, in degrees.
+void setAngleDeg(Params& p, int aeIndex, double degrees) {
+    p.at(aeIndex).u.ad.value = static_cast<PF_Fixed>(std::lround(degrees * 65536.0));
+}
+
+/// Store one registered control's value in the mock host, the way a saved
+/// project hands it back: the registered def with `write` applied.
+template <typename Write>
+void storeValue(ModuleFixture& f, int aeIndex, Write&& write) {
+    PF_ParamDef def = f.registered[static_cast<std::size_t>(aeIndex) - 1u];
+    write(def);
+    f.host.setParamValue(f.ref, aeIndex, def);
+}
+
+}  // namespace
+
+TEST_CASE("switching the Lens popup keeps the framing on screen", "[reframe][supervise][dji][lens]") {
+    ModuleFixture f;
+
+    SECTION("Classic -> DJI frames exactly what Classic framed") {
+        // The defaults, two preset looks, the automatic ramp and a wide
+        // stereographic look, each aimed away from the centre.
+        const ClassicLens looks[] = {{120.0, 15.0}, {150.0, 40.0}, {95.0, 0.0}, {210.0, 0.0}, {300.0, 100.0}};
+        for (const ClassicLens& look : looks) {
+            INFO("classic " << look.fovDeg << " / " << look.distortion);
+            Params p(f.registered);
+            p.setLens(CameraModel::Classic);
+            p.at(kIndexFov).u.fs_d.value = static_cast<PF_FpShort>(look.fovDeg);
+            p.at(kIndexDistortion).u.fs_d.value = static_cast<PF_FpShort>(look.distortion);
+            setAngleDeg(p, kIndexPan, 25.0);
+            setAngleDeg(p, kIndexTilt, -10.0);
+            setAngleDeg(p, kIndexRoll, 3.0);
+            const ViewSetup before = buildView(settingsFromParams(p), 1920, 1080, SizePx{});
+            REQUIRE(before.valid);
+            REQUIRE(before.params.projection == OSV_PROJ_EYE_OFFSET);
+
+            // The user picks DJI.
+            p.at(kIndexLens).u.pd.value = static_cast<A_long>(LensPopup::Dji);
+            userChanged(f, p, kIndexLens);
+            const ViewSetup after = buildView(settingsFromParams(p), 1920, 1080, SizePx{});
+            REQUIRE(after.valid);
+            REQUIRE(after.params.projection == OSV_PROJ_DJI_SPHERE);
+
+            // The controls hold single-precision floats, so the carried lens
+            // is the exact conversion rounded to a float - far below a pixel.
+            const double worst = worstRayDifference(before.params, after.params);
+            INFO("worst ray difference " << worst << " rad");
+            CHECK(worst >= 0.0);
+            CHECK(worst < 2e-4);
+        }
+    }
+    SECTION("DJI -> Classic frames what DJI framed whenever Classic can express it") {
+        // DJI's Wide and Dewarping: correction at most 1 and no Classic ramp
+        // above it, so the Classic look is exact.
+        const DjiLens lenses[] = {{60.0, 0.6}, {80.0, 0.2}};
+        for (const DjiLens& lens : lenses) {
+            INFO("dji " << lens.fovDeg << " / " << lens.correction);
+            Params p(f.registered);
+            p.setLens(CameraModel::Dji);
+            p.at(kIndexDjiFov).u.fs_d.value = static_cast<PF_FpShort>(lens.fovDeg);
+            p.at(kIndexCorrection).u.fs_d.value = static_cast<PF_FpShort>(lens.correction);
+            setAngleDeg(p, kIndexPan, -40.0);
+            setAngleDeg(p, kIndexTilt, 12.0);
+            const ViewSetup before = buildView(settingsFromParams(p), 1920, 1080, SizePx{});
+            REQUIRE(before.valid);
+
+            p.at(kIndexLens).u.pd.value = static_cast<A_long>(LensPopup::Classic);
+            userChanged(f, p, kIndexLens);
+            const ViewSetup after = buildView(settingsFromParams(p), 1920, 1080, SizePx{});
+            REQUIRE(after.valid);
+            REQUIRE(after.params.projection == OSV_PROJ_EYE_OFFSET);
+            const double worst = worstRayDifference(before.params, after.params);
+            INFO("worst ray difference " << worst << " rad");
+            CHECK(worst >= 0.0);
+            CHECK(worst < 2e-4);
+        }
+    }
+    SECTION("a switch never touches the framing angles") {
+        Params p(f.registered);
+        p.setLens(CameraModel::Classic);
+        setAngleDeg(p, kIndexPan, 144.8);
+        setAngleDeg(p, kIndexTilt, -5.9);
+        p.at(kIndexLens).u.pd.value = static_cast<A_long>(LensPopup::Dji);
+        userChanged(f, p, kIndexLens);
+        CHECK_FALSE(p.marked(kIndexPan));
+        CHECK_FALSE(p.marked(kIndexTilt));
+        CHECK_FALSE(p.marked(kIndexRoll));
+        CHECK(static_cast<double>(p.at(kIndexPan).u.ad.value) / 65536.0 == Approx(144.8).margin(1e-4));
+    }
+}
+
+TEST_CASE("an old project opens on the DJI lens, whatever its checkbox held", "[reframe][cpu][dji][lens][legacy]") {
+    // A project saved before the Lens popup existed has no value for it, so
+    // the host restores the popup's default - DJI.  The WP-CAMERA checkbox it
+    // DID save is the popup's hidden mirror now and is never rendered from:
+    // ticked (DJI) or unticked (Classic), the picture is DJI's.  The user
+    // accepted that a Classic project of that era opens on DJI.
+    constexpr int kW = 320;
+    constexpr int kH = 180;
+    const Settings dji = djiSettings(103.3, 0.67, 144.8, -5.9, 0.0, Resolution::Fhd1920x1080);
+    const Settings classic = classicSettings(120.0, 15.0, 144.8, -5.9, 0.0, Resolution::Fhd1920x1080);
+    const std::vector<float> djiReference = renderSettingsRgba(dji, kW, kH);
+    REQUIRE(psnr(djiReference, renderSettingsRgba(classic, kW, kH)) < 30.0);
+
+    for (const bool ticked : {true, false}) {
+        INFO("saved checkbox " << (ticked ? "ticked" : "unticked"));
+        ModuleFixture f;
+        // The saved controls.  The Lens popup is left exactly as the host
+        // restores a parameter the project does not have: at its default.
+        storeValue(f, kIndexCameraModel, [&](PF_ParamDef& d) { d.u.bd.value = ticked ? 1 : 0; });
+        storeValue(f, kIndexOutputResolution,
+                   [](PF_ParamDef& d) { d.u.pd.value = static_cast<A_long>(Resolution::Fhd1920x1080); });
+        storeValue(f, kIndexPreset, [](PF_ParamDef& d) { d.u.pd.value = static_cast<A_long>(Preset::Custom); });
+        storeValue(f, kIndexFov, [](PF_ParamDef& d) { d.u.fs_d.value = 120.0f; });
+        storeValue(f, kIndexDistortion, [](PF_ParamDef& d) { d.u.fs_d.value = 15.0f; });
+        storeValue(f, kIndexDjiFov, [](PF_ParamDef& d) { d.u.fs_d.value = 103.3f; });
+        storeValue(f, kIndexCorrection, [](PF_ParamDef& d) { d.u.fs_d.value = 0.67f; });
+        storeValue(f, kIndexPan, [](PF_ParamDef& d) { d.u.ad.value = static_cast<PF_Fixed>(std::lround(144.8 * 65536.0)); });
+        storeValue(f, kIndexTilt, [](PF_ParamDef& d) { d.u.ad.value = static_cast<PF_Fixed>(std::lround(-5.9 * 65536.0)); });
+        REQUIRE(f.host.addedParams(f.ref)[kIndexLens - 1].u.pd.value == OSV_REFRAME_LENS_DEFAULT);
+
+        // Render through the module's CPU path.
+        const Panorama& pano = panorama();
+        std::unique_ptr<osv::premiere::mock::EffectWorld> input =
+            f.host.createWorld(static_cast<std::uint32_t>(pano.width), static_cast<std::uint32_t>(pano.height),
+                               PrPixelFormat_BGRA_4444_32f);
+        REQUIRE(input != nullptr);
+        const std::vector<std::uint8_t> packed = packBgra32f(pano, input->rowBytes());
+        REQUIRE(packed.size() <= static_cast<std::size_t>(input->rowBytes()) * static_cast<std::size_t>(pano.height));
+        std::memcpy(input->pixels(), packed.data(), packed.size());
+        f.host.setInputWorld(f.ref, input.get());
+        std::unique_ptr<osv::premiere::mock::EffectWorld> output =
+            f.host.createWorld(kW, kH, PrPixelFormat_BGRA_4444_32f);
+        REQUIRE(output != nullptr);
+        std::vector<PF_ParamDef*> params = f.host.renderParams(f.ref);
+        REQUIRE(LoadedPlugin::instance().effectMain()(PF_Cmd_RENDER, &f.in, &f.out, params.data(), &output->world(),
+                                                      nullptr) == PF_Err_NONE);
+
+        std::vector<float> rendered(static_cast<std::size_t>(kW) * kH * 4u, 0.0f);
+        for (int y = 0; y < kH; ++y) {
+            for (int x = 0; x < kW; ++x) {
+                readPixelBgra32f(reinterpret_cast<const std::uint8_t*>(output->pixels()), output->rowBytes(), x, y,
+                                 rendered.data() + (static_cast<std::size_t>(y) * kW + x) * 4u);
+            }
+        }
+        const double db = psnr(rendered, djiReference);
+        INFO("module render vs the DJI reference: " << db << " dB");
+        CHECK(db >= 60.0);
+    }
+}
+
+TEST_CASE("the GPU filter reads the Lens popup, not the old checkbox, in either numbering",
+          "[reframe][gpu][cuda][dji][lens]") {
+    // A square frame, so a one-entry misread of Output Resolution would show
+    // as well as a misread of the lens.
+    constexpr int kW = 360;
+    constexpr int kH = 360;
+    const Settings djiUhd = djiSettings(90.0, 0.5, 30.0, 5.0, 0.0, Resolution::Uhd3840x2160);
+    const Settings classicUhd = classicSettings(100.0, 20.0, 30.0, 5.0, 0.0, Resolution::Uhd3840x2160);
+    REQUIRE(psnr(cpuReference(djiUhd, kW, kH), cpuReference(classicUhd, kW, kH)) < 40.0);
+
+    struct HostCase {
+        const char* name;
+        int resolution;  // raw values, as the host serves them
+        int preset;
+        int lens;
+        bool checkbox;   // the hidden mirror
+        const Settings* expected;
+    };
+    const HostCase cases[] = {
+        // Premiere 26.2.2 numbers from 0: 1 is "3840 x 2160", 3 is "Wide"
+        // (ambiguous on its own) - and the Lens popup's DJI reads 0, which
+        // settles the numbering by itself.  An old project on Premiere looks
+        // exactly like this: the restored default reads 0, and the checkbox
+        // it saved says whatever it said.
+        {"0-based, DJI (0) settles the base by itself", 1, 3, 0, false, &djiUhd},
+        {"0-based, an old project whose checkbox was ticked", 1, 3, 0, true, &djiUhd},
+        // Classic reads 1 on Premiere, which alone would be ambiguous - but
+        // the effect only ever leaves Classic beside Preset "Custom" (0).
+        // The mirror is set to DISAGREE, so reading it would fail.
+        {"0-based, Classic (1) beside Custom (0)", 1, 0, 1, true, &classicUhd},
+        // After Effects' numbering (the mock's): DJI reads 1 and nothing
+        // settles the base, which then reads 1-based...
+        {"1-based, DJI (1) with nothing else settling", 2, 4, 1, false, &djiUhd},
+        // ...and Classic reads 2, the popup's entry count, which settles it.
+        {"1-based, Classic (2) settles the base by itself", 2, 4, 2, true, &classicUhd},
+    };
+    for (const HostCase& hc : cases) {
+        INFO(hc.name);
+        MockHost host;
+        DJI_REQUIRE_GPU(host);
+        Controls c;
+        c.resolution = hc.resolution;
+        c.preset = hc.preset;
+        c.lens = hc.lens;
+        c.pan = 30.0;
+        c.tilt = 5.0;
+        c.fov = 100.0;
+        c.distortion = 20.0;
+        writeVerbatimControls(host, kNode, c);
+        putParam(host, kIndexCameraModel, kPrParamType_Bool, hc.checkbox ? 1.0 : 0.0);
+        putParam(host, kIndexDjiFov, kPrParamType_Float64, 90.0);
+        putParam(host, kIndexCorrection, kPrParamType_Float64, 0.5);
+        const std::vector<float> gpu = gpuRender(host, kW, kH);
+        REQUIRE(!gpu.empty());
+        const double db = psnr(gpu, cpuReference(*hc.expected, kW, kH));
+        INFO("PSNR against the expected lens " << db << " dB");
+        CHECK(db >= 60.0);
+        // And the other lens is a different picture: the popup decided it.
+        const Settings& other = (hc.expected == &djiUhd) ? classicUhd : djiUhd;
+        CHECK(psnr(gpu, cpuReference(other, kW, kH)) < 40.0);
     }
 }

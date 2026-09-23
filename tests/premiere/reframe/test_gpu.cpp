@@ -259,6 +259,12 @@ struct GpuRenderFixture {
         outRowBytes = outInfo->rowBytes;
 
         const std::vector<std::uint8_t> packed = isHalf ? packBgra16f(p, inRowBytes) : packBgra32f(p, inRowBytes);
+
+        // [WP-LENSUI] The effect's default lens is DJI.  Every render in this
+        // file drives the Classic camera (FOV / Distortion, compared with
+        // mirrorSettings()), so the node selects Classic in the Lens popup.
+        // 2 is "Classic" in the 1-based numbering the rest of the node uses.
+        setInt32(kIndexLens, static_cast<int>(LensPopup::Classic));
         return uploadToPPix(gpu, inFrame, packed);
     }
 
@@ -1047,6 +1053,9 @@ TEST_CASE("two concurrent instances render independently", "[reframe][gpu][cuda]
         f.host.setParam(node, gpuParamIndex(kIndexFov), 0, slider);
         slider.mFloat64 = 0.0;
         f.host.setParam(node, gpuParamIndex(kIndexDistortion), 0, slider);
+        // [WP-LENSUI] The Classic lens those numbers describe.
+        popup.mInt32 = static_cast<csSDK_int32>(LensPopup::Classic);
+        f.host.setParam(node, gpuParamIndex(kIndexLens), 0, popup);
     }
     PrParam pan{};
     pan.mType = kPrParamType_Float32;
@@ -1221,7 +1230,10 @@ TEST_CASE("the GPU path reads the right controls from an 8-parameter host", "[re
     REQUIRE(scope.result() == suiteError_NoError);
 
     // Premiere's layout, on the node the instance will read from.  Note that
-    // NOTHING is written at the AE-minus-one indices the other tests use.
+    // NOTHING is written at the AE-minus-one indices the other tests use:
+    // the node is cleared first, dropping the Lens popup prepare() selects
+    // for the other tests, so the host list is exactly the recorded eight.
+    f.host.clearNode(f.nodeId);
     const PremiereParamLayout layout;
     layout.apply(f.host, f.nodeId);
 
@@ -1266,8 +1278,18 @@ TEST_CASE("the GPU path reads the right controls from an 8-parameter host", "[re
     src.layout = PixelLayout::Bgra32f;
     src.topDown = true;
 
-    const Settings settings =
+    //
+    // [WP-LENSUI] Nor does it expose the Lens popup - the list ends at Smooth
+    // Keyframes - so the lens is the popup's default, DJI, at DJI's default
+    // FOV and Correction: exactly what the CPU path renders for an instance
+    // whose Lens popup was never changed.  FOV and Distortion are therefore
+    // not rendered from here; their mapping in this layout is pinned by the
+    // matcher tests ("matchHostParams" cases above and in
+    // test_dji_camera.cpp).  Output Resolution and the three distinctive
+    // angles still have to be read from the right entries to hit 60 dB.
+    Settings settings =
         f.mirrorSettings(kFillFrame, layout.pan, layout.tilt, layout.roll, layout.fov, layout.distortion);
+    settings.cameraModel = kDefaultCameraModel;
     const KernelSetup setup = buildParams(settings, src, kW, kH, SizePx{});
     REQUIRE(setup.valid);
 
