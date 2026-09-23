@@ -17,13 +17,17 @@
 //                           want frames in.  That registration is RETRIED
 //                           from the first PF_Cmd_RENDER if the suite was not
 //                           available here; see registerPixelFormats().
-//   PF_Cmd_PARAMS_SETUP     the 18 controls, with their permanent ids (the
-//                           DJI camera block, ids 16..20, appended last).
+//   PF_Cmd_PARAMS_SETUP     the 19 controls, with their permanent ids (the
+//                           DJI camera block, ids 16..20, and the Lens
+//                           popup, id 21, appended last).
 //   PF_Cmd_USER_CHANGED_PARAM  Preset writes the Classic and the DJI lens
-//                           and Tilt and selects DJI's lens; editing a lens
-//                           control flips Preset to Custom and selects that
-//                           control's lens, carrying the look across.
-//   PF_Cmd_UPDATE_PARAMS_UI reserved (nothing is greyed today).
+//                           and Tilt and selects DJI's lens; the Lens popup
+//                           carries the look across to the lens picked;
+//                           editing a lens control flips Preset to Custom
+//                           and selects that control's lens.
+//   PF_Cmd_UPDATE_PARAMS_UI shows the selected lens's controls and hides the
+//                           other lens's (PF_PUI_INVISIBLE through
+//                           PF_UpdateParamUI), renaming DJI FOV to "FOV".
 //   PF_Cmd_SEQUENCE_*       sequence_data stays null - see below.
 //   PF_Cmd_RENDER           the CPU path, through ReframeCpu.
 //   PF_Cmd_GLOBAL_SETDOWN   close the log, drop the shared context.
@@ -72,6 +76,10 @@
 // SPBasic.h defines SPBasicSuite itself; AE_Effect.h only forward-declares
 // it, so acquiring a suite through in_data->pica_basicP needs this header.
 #include "SPBasic.h"
+
+// The PF Param Utils Suite (PF_UpdateParamUI), which is how UPDATE_PARAMS_UI
+// shows one lens's controls at a time.
+#include "AE_EffectSuites.h"
 
 #include "PrSDKAESupport.h"
 #include "PrSDKPixelFormat.h"
@@ -133,11 +141,33 @@ static_assert(osv::reframe::kIndexCameraModel == osv::reframe::kIndexSmooth + 1 
                   osv::reframe::kIndexCorrection == osv::reframe::kIndexDjiFov + 1 &&
                   osv::reframe::kIndexDragSensitivity == osv::reframe::kIndexCorrection + 1,
               "the DJI camera block must follow Smooth Keyframes in its documented order");
-static_assert(osv::reframe::kIndexDragSensitivity == OSV_REFRAME_PARAM_COUNT,
-              "Drag Sensitivity must be the last parameter added");
 static_assert(osv::reframe::kParamIdByIndex[osv::reframe::kIndexDragSensitivity - 1] ==
                   OSV_REFRAME_ID_DRAG_SENSITIVITY,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
+
+// [WP-LENSUI] The Lens popup is appended after the DJI block and ends the
+// list, for the same reason: no saved index may move.
+static_assert(osv::reframe::kIndexLens == osv::reframe::kIndexDragSensitivity + 1,
+              "the Lens popup must follow Drag Sensitivity");
+static_assert(osv::reframe::kIndexLens == OSV_REFRAME_PARAM_COUNT, "the Lens popup must be the last parameter added");
+static_assert(osv::reframe::kParamIdByIndex[osv::reframe::kIndexLens - 1] == OSV_REFRAME_ID_LENS,
+              "kParamIdByIndex is not aligned with the ParamIndex enum");
+static_assert(OSV_REFRAME_LENS_COUNT == 2 &&
+                  static_cast<int>(osv::reframe::LensPopup::Classic) == OSV_REFRAME_LENS_COUNT,
+              "the Lens popup is exactly DJI | Classic");
+// Every lens-specific control must name a real control, and the Camera Model
+// mirror must not be one of them (it is hidden under every lens).
+static_assert(
+    [] {
+        for (const osv::reframe::LensControl& c : osv::reframe::kLensControls) {
+            if (c.aeIndex < 1 || c.aeIndex > OSV_REFRAME_PARAM_COUNT ||
+                c.aeIndex == osv::reframe::kIndexCameraModel || !c.shown || c.shown[0] == '\0') {
+                return false;
+            }
+        }
+        return true;
+    }(),
+    "ReframeParams.h: kLensControls must name real, visible-by-lens controls");
 
 namespace {
 
@@ -667,12 +697,16 @@ Settings readSettings(PF_InData* in_data, PF_ParamDef* params[]) noexcept {
     s.distortion = static_cast<double>(params[kIndexDistortion]->u.fs_d.value);
     s.smoothKeyframes = params[kIndexSmooth]->u.bd.value != 0;
 
+    // [WP-LENSUI] The lens is the Lens popup (1-based here: this is the AE
+    // parameter array).  A missing entry means the popup's default, DJI -
+    // the same lens a host that stored no value for it would restore - and
+    // never a crash.  The hidden Camera Model mirror is not read at all.
+    s.cameraModel = params[kIndexLens] ? cameraModelFromLensPopup(params[kIndexLens]->u.pd.value)
+                                       : kDefaultCameraModel;
+
     // [WP-CAMERA] The DJI block.  Each entry is null-checked: the host sizes
     // the array from num_params, but a defensive read costs nothing and a
-    // missing entry must mean "the default" (Classic), never a crash.
-    if (params[kIndexCameraModel]) {
-        s.cameraModel = cameraModelFromCheckbox(params[kIndexCameraModel]->u.bd.value);
-    }
+    // missing entry must mean "the default", never a crash.
     if (params[kIndexZoom]) {
         s.zoomDeg = static_cast<double>(params[kIndexZoom]->u.fs_d.value);
     }
@@ -875,17 +909,18 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
 
     // ---- [WP-CAMERA] 16..20. DJI's camera, appended ------------------------
     // Appended after every existing control so no saved index moves (see
-    // ReframeParams.h).  Camera Model defaults to Classic, which is what
-    // keeps an old project rendering the lens it was made with.
+    // ReframeParams.h).
     //
-    // 16. Camera Model: a checkbox labelled "DJI" (a checkbox and not a
-    //     popup because Premiere's GPU reads number popups from 0 where AE
-    //     numbers them from 1 - see ReframeParams.h).  Supervised (switching
-    //     carries the look across) and not animatable - a lens model that
-    //     changes mid-shot is not a framing anybody keyframes, and a host-held
-    //     keyframe on it would make the conversion in USER_CHANGED_PARAM
-    //     ambiguous.
+    // 16. Camera Model: WP-CAMERA's lens checkbox, retired by the Lens popup
+    //     ([WP-LENSUI], index 21) but kept, because a parameter that
+    //     disappears breaks every project saved with it.  Registered
+    //     INVISIBLE - AE_Effect.h documents PF_PUI_INVISIBLE for exactly this,
+    //     "hidden data parameters" - and kept in step with the popup as its
+    //     mirror (see OSV_REFRAME_ID_LENS).  Still supervised: a host that
+    //     shows every control lets the user tick it, and that must switch the
+    //     lens like the popup does.  Not animatable, like the popup.
     AEFX_CLR_STRUCT(def);
+    def.ui_flags = PF_PUI_INVISIBLE;
     PF_ADD_CHECKBOX("Camera Model", "DJI", OSV_REFRAME_CAMERA_MODEL_DEFAULT,
                     PF_ParamFlag_SUPERVISE | PF_ParamFlag_CANNOT_TIME_VARY, OSV_REFRAME_ID_CAMERA_MODEL);
 
@@ -920,6 +955,19 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_REFRAME_DRAG_SENSITIVITY_SLIDER_MAX, OSV_REFRAME_DRAG_SENSITIVITY_DEFAULT,
                          PF_Precision_HUNDREDTHS, PF_ValueDisplayFlag_NONE, PF_ParamFlag_CANNOT_TIME_VARY,
                          OSV_REFRAME_ID_DRAG_SENSITIVITY);
+
+    // ---- [WP-LENSUI] 21. Lens ----------------------------------------------
+    // "DJI | Classic", DJI by default: which lens renders and which lens's
+    // controls the panel shows.  Appended, not placed at the top of the
+    // Camera group, because only an append is safe however the host binds
+    // saved values (ReframeParams.h, OSV_REFRAME_ID_LENS).  Supervised:
+    // switching carries the look across and keeps the hidden Camera Model
+    // mirror in step.  Not animatable, for the reason Camera Model was not: a
+    // lens that changes mid-shot is not a framing anybody keyframes, and a
+    // host-held keyframe would make the conversion ambiguous.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUPX("Lens", OSV_REFRAME_LENS_COUNT, OSV_REFRAME_LENS_DEFAULT, OSV_REFRAME_LENS_ITEMS,
+                  PF_ParamFlag_SUPERVISE | PF_ParamFlag_CANNOT_TIME_VARY, OSV_REFRAME_ID_LENS);
 
     out_data->num_params = OSV_REFRAME_PARAM_COUNT + 1;  // + the input layer
 
@@ -960,18 +1008,32 @@ void writePopup(PF_ParamDef* def, int value) noexcept {
     def->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
 }
 
-/// Set the Camera Model checkbox and mark it changed - again only when it
-/// actually changes.
-void writeCameraModel(PF_ParamDef* params[], CameraModel model) noexcept {
-    if (!params || !params[kIndexCameraModel]) {
+/// [WP-LENSUI] Select a lens: the Lens popup and its hidden Camera Model
+/// mirror, each marked changed only when it actually changes - so the
+/// control the user just set is never re-marked, and a lens that is already
+/// selected adds nothing to the undo step.  A null entry is skipped.
+void writeLens(PF_ParamDef* params[], CameraModel model) noexcept {
+    if (!params) {
         return;
     }
-    PF_ParamDef* def = params[kIndexCameraModel];
-    if (cameraModelFromCheckbox(def->u.bd.value) == model) {
-        return;
+    // The popup: the source of truth.
+    if (PF_ParamDef* lens = params[kIndexLens]) {
+        if (lens->u.pd.value != static_cast<A_long>(lensPopupValue(model))) {
+            // Comparing the raw value, not the model it reads as, also
+            // normalises an out-of-range value that merely READS as the
+            // right lens (a corrupt project's 7 reads as DJI), so the host is
+            // left holding a real entry.
+            lens->u.pd.value = static_cast<A_long>(lensPopupValue(model));
+            lens->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
+        }
     }
-    def->u.bd.value = (model == CameraModel::Dji) ? 1 : 0;
-    def->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
+    // The mirror: ticked is DJI, exactly as the build before this one reads it.
+    if (PF_ParamDef* mirror = params[kIndexCameraModel]) {
+        if (cameraModelFromCheckbox(mirror->u.bd.value) != model) {
+            mirror->u.bd.value = (model == CameraModel::Dji) ? 1 : 0;
+            mirror->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
+        }
+    }
 }
 
 /// Flip Preset to Custom after a manual edit: the look is no longer the
@@ -1034,40 +1096,75 @@ void writeDjiLens(PF_ParamDef* params[], const DjiLens& lens, double aspect, boo
     writeSlider(params[kIndexZoom], djiZoomDeg(lens, aspect));
 }
 
-[[nodiscard]] bool isDjiModel(PF_ParamDef* params[]) noexcept {
-    return params && params[kIndexCameraModel] &&
-           cameraModelFromCheckbox(params[kIndexCameraModel]->u.bd.value) == CameraModel::Dji;
+/// [WP-LENSUI] The lens the Lens popup selects - the lens on screen.  A
+/// missing entry is the popup's default, exactly as readSettings() reads it.
+[[nodiscard]] CameraModel selectedLens(PF_ParamDef* params[]) noexcept {
+    if (!params || !params[kIndexLens]) {
+        return kDefaultCameraModel;
+    }
+    return cameraModelFromLensPopup(params[kIndexLens]->u.pd.value);
+}
+
+[[nodiscard]] bool isDjiModel(PF_ParamDef* params[]) noexcept { return selectedLens(params) == CameraModel::Dji; }
+
+/// [WP-LENSUI] Carry the picture from one lens's controls to the other's,
+/// so switching lenses does not make the framing jump.
+///
+/// `to` is the lens now selected.  Classic -> DJI is exact (djiFromClassic);
+/// DJI -> Classic is exact unless the Classic ramp or a Correction above 1
+/// makes the DJI look unrepresentable, and then the nearest Classic look
+/// (classicFromDji).  Only the controls of the lens switched TO are written.
+void carryLookTo(PF_InData* in_data, PF_ParamDef* params[], CameraModel to) noexcept {
+    if (!params) {
+        return;
+    }
+    const double aspect = framingAspectFor(in_data, params);
+    if (to == CameraModel::Dji) {
+        // Classic -> DJI: DJI's controls take the Classic look, Zoom with it.
+        writeDjiLens(params, djiFromClassic(classicLensOf(params), aspect), aspect, true, true);
+    } else {
+        // DJI -> Classic: the nearest Classic look.
+        const ClassicLens classic = classicFromDji(djiLensOf(params), aspect);
+        writeSlider(params[kIndexFov], classic.fovDeg);
+        writeSlider(params[kIndexDistortion], classic.distortion);
+    }
 }
 
 /// PF_Cmd_USER_CHANGED_PARAM: the supervised behaviour.
 ///
 /// Changing Preset writes the preset's look - the Classic FOV / Distortion,
 /// DJI's FOV / Correction Angle / Zoom for the frame's shape, and Tilt - and
-/// switches Camera Model to DJI, marking each value with
-/// PF_ChangeFlag_CHANGED_VALUE so the host records one undoable edit.
+/// selects the DJI lens, marking each value with PF_ChangeFlag_CHANGED_VALUE
+/// so the host records one undoable edit.
+///
+/// [WP-LENSUI] Picking a lens in the Lens popup converts the current look
+/// into that lens's controls (carryLookTo), updates the hidden Camera Model
+/// mirror and flips Preset to Custom; the panel then shows that lens's
+/// controls when the host sends PF_Cmd_UPDATE_PARAMS_UI.  The mirror holds
+/// the lens that was on screen BEFORE the edit, which is how a re-pick of the
+/// lens already selected is told from a switch: it converts nothing.  Ticking
+/// or unticking the mirror itself - only a host that ignores PF_PUI_INVISIBLE
+/// shows it - is the same switch, with the popup as the thing updated.
 ///
 /// Editing a lens control by hand means the look is no longer the preset, so
 /// Preset flips to Custom - which is exactly how every other reframe UI
 /// behaves and stops the popup from lying.  [WP-CAMERA] It also selects the
-/// model that control belongs to, carrying the current look across so the
-/// picture does not jump:
+/// lens that control belongs to, carrying the current look across so the
+/// picture does not jump.  With one lens's controls shown at a time this only
+/// happens through a host that shows them all, or through a keyframe:
 ///
-///   * DJI FOV / Correction Angle: Camera Model -> DJI; if it was Classic,
-///     the OTHER DJI control is set from the Classic look first; Zoom is
-///     refreshed.
-///   * Zoom: Camera Model -> DJI, and DJI FOV / Correction Angle move along
-///     DJI Studio's zoom path (fov += 130 d, correction += d) until the lens
+///   * DJI FOV / Correction Angle: Lens -> DJI; if it was Classic, the OTHER
+///     DJI control is set from the Classic look first; Zoom is refreshed.
+///   * Zoom: Lens -> DJI, and DJI FOV / Correction Angle move along DJI
+///     Studio's zoom path (fov += 130 d, correction += d) until the lens
 ///     shows that Zoom; Zoom is then rewritten with what was reached (a
 ///     request past DJI's limits stops at them, as DJI's own does).
-///   * Classic FOV / Distortion: Camera Model -> Classic.
-///   * Camera Model itself: the look is converted into the newly selected
-///     model's controls (djiFromClassic / classicFromDji).
+///   * Classic FOV / Distortion: Lens -> Classic.
 PF_Err userChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[],
                         const PF_UserChangedParamExtra* extra) noexcept {
     if (!params || !extra) {
         return PF_Err_NONE;
     }
-    (void)out_data;
 
     const PF_ParamIndex changed = extra->param_index;
     // A host index outside our list is not a control of ours to supervise.
@@ -1094,7 +1191,7 @@ PF_Err userChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
         const double aspect = framingAspectFor(in_data, params);
         const DjiLens lens = sanitiseDjiLens(DjiLens{djiPresetFovDeg(*entry, aspect), entry->correction});
         writeDjiLens(params, lens, aspect, /*writeFov=*/true, /*writeCorrection=*/true);
-        writeCameraModel(params, CameraModel::Dji);
+        writeLens(params, CameraModel::Dji);
         PluginLog::debug("reframe: preset '{}' -> classic fov {} distortion {}, DJI fov {} correction {} "
                          "(aspect {:.4f}), tilt {}",
                          entry->label, entry->fovDeg, entry->distortion, lens.fovDeg, lens.correction, aspect,
@@ -1105,7 +1202,7 @@ PF_Err userChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
     if (changed == kIndexFov || changed == kIndexDistortion) {
         presetToCustom(params, changed);
         // A Classic control was edited: the Classic lens is the picture now.
-        writeCameraModel(params, CameraModel::Classic);
+        writeLens(params, CameraModel::Classic);
         return PF_Err_NONE;
     }
 
@@ -1130,7 +1227,7 @@ PF_Err userChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
         }
         writeDjiLens(params, lens, aspect, /*writeFov=*/changed != kIndexDjiFov,
                      /*writeCorrection=*/changed != kIndexCorrection);
-        writeCameraModel(params, CameraModel::Dji);
+        writeLens(params, CameraModel::Dji);
         presetToCustom(params, changed);
         return PF_Err_NONE;
     }
@@ -1142,37 +1239,259 @@ PF_Err userChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
         const DjiLens from = isDjiModel(params) ? djiLensOf(params) : djiFromClassic(classicLensOf(params), aspect);
         const DjiLens to = djiZoomTo(target, from, aspect);
         writeDjiLens(params, to, aspect, /*writeFov=*/true, /*writeCorrection=*/true);
-        writeCameraModel(params, CameraModel::Dji);
+        writeLens(params, CameraModel::Dji);
         presetToCustom(params, changed);
         PluginLog::debug("reframe: zoom {} -> DJI fov {} correction {} (aspect {:.4f})", target, to.fovDeg,
                          to.correction, aspect);
         return PF_Err_NONE;
     }
 
-    if (changed == kIndexCameraModel) {
-        const double aspect = framingAspectFor(in_data, params);
-        if (isDjiModel(params)) {
-            // Classic -> DJI: DJI's controls take the Classic look.
-            writeDjiLens(params, djiFromClassic(classicLensOf(params), aspect), aspect, true, true);
-        } else {
-            // DJI -> Classic: the nearest Classic look (exact unless the
-            // Classic ramp or a correction above 1 makes it unrepresentable).
-            const ClassicLens classic = classicFromDji(djiLensOf(params), aspect);
-            writeSlider(params[kIndexFov], classic.fovDeg);
-            writeSlider(params[kIndexDistortion], classic.distortion);
+    // ---- [WP-LENSUI] a lens switch: the Lens popup, or its hidden mirror ----
+    if (changed == kIndexLens || changed == kIndexCameraModel) {
+        // What the user asked for, and what was on screen before the edit.
+        // The control NOT edited still holds the old lens: the mirror when
+        // the popup moved, the popup when the mirror was ticked.
+        const bool fromPopup = (changed == kIndexLens);
+        const CameraModel requested = fromPopup ? cameraModelFromLensPopup(params[kIndexLens]->u.pd.value)
+                                                : cameraModelFromCheckbox(params[kIndexCameraModel]->u.bd.value);
+        const CameraModel previous =
+            fromPopup ? (params[kIndexCameraModel] ? cameraModelFromCheckbox(params[kIndexCameraModel]->u.bd.value)
+                                                   // No mirror to ask: treat it as a real switch.
+                                                   : (requested == CameraModel::Dji ? CameraModel::Classic
+                                                                                    : CameraModel::Dji))
+                      : selectedLens(params);
+
+        // Popup and mirror now agree on the requested lens (the edited
+        // control already says it, so only the other one is written).
+        writeLens(params, requested);
+
+        // A real switch carries the look across.  A re-pick of the lens
+        // already on screen converts nothing.
+        const bool switched = (requested != previous);
+        if (switched) {
+            carryLookTo(in_data, params, requested);
         }
-        presetToCustom(params, changed);
+        // Preset stops naming a look the numbers no longer are after a
+        // switch.  And Classic is ALWAYS left beside "Custom", even on a
+        // re-pick: the GPU path decodes Classic's ambiguous "1" on Premiere
+        // with the 0 that Custom reads there (ReframeParams.h,
+        // OSV_REFRAME_LENS_ITEMS), and a project whose mirror went stale
+        // (a WP-CAMERA project saved unticked, then opened on DJI) reaches
+        // Classic through what looks like a re-pick.  On a true Classic
+        // re-pick Preset is already Custom and nothing is written.
+        if (switched || requested == CameraModel::Classic) {
+            presetToCustom(params, changed);
+        }
+
+        // Ask for the Effect Controls panel to be redrawn, which is what
+        // brings the PF_Cmd_UPDATE_PARAMS_UI that shows the selected lens's
+        // controls - on every pick, because a stale mirror can make a real
+        // change of the panel look like a re-pick.  Adobe's Supervisor sample
+        // returns the same flag from USER_CHANGED_PARAM when a mode popup
+        // changes which controls are visible (Supervisor.cpp,
+        // UserChangedParam).  The visibility itself is deliberately NOT set
+        // here: Premiere 25 was reported to ignore PF_PUI_INVISIBLE changes
+        // made during USER_CHANGED_PARAM on the first instance of an effect
+        // (Adobe tracking DVARC-3737), and the workaround is to make them in
+        // UPDATE_PARAMS_UI only.
+        if (out_data) {
+            out_data->out_flags |= PF_OutFlag_REFRESH_UI;
+        }
+        PluginLog::debug("reframe: lens {} -> {} (from the {}{})", previous == CameraModel::Dji ? "DJI" : "Classic",
+                         requested == CameraModel::Dji ? "DJI" : "Classic",
+                         fromPopup ? "Lens popup" : "Camera Model checkbox", switched ? "" : ", nothing to convert");
         return PF_Err_NONE;
     }
 
     return PF_Err_NONE;
 }
 
-/// PF_Cmd_UPDATE_PARAMS_UI: nothing is enabled or disabled today.  The
-/// handler exists (and the out-flag is set) because it is the only hook for
-/// greying controls, and adding it later would change the PiPL flags, which
-/// invalidates the plug-in cache on every installed machine.
-PF_Err updateParamsUi(PF_InData*, PF_OutData*, PF_ParamDef*[]) noexcept { return PF_Err_NONE; }
+// ---------------------------------------------------------------------------
+//  [WP-LENSUI] Showing one lens at a time
+// ---------------------------------------------------------------------------
+
+/// The controls whose Effect Controls visibility the Lens popup decides: the
+/// five lens-specific controls and the hidden Camera Model mirror.
+constexpr int kManagedUiIndices[] = {kIndexCameraModel, kIndexFov,    kIndexDistortion,
+                                     kIndexZoom,        kIndexDjiFov, kIndexCorrection};
+
+/// Re-apply the slider display fields PF_UpdateParamUI is documented to
+/// change (AE_EffectSuites.h, PF_UpdateParamUI: "slider_min, slider_max,
+/// precision, display_flags of any slider type") from the SAME constants
+/// PF_Cmd_PARAMS_SETUP registers.  The def handed to PF_UpdateParamUI is the
+/// host's copy with our changes on top, and a host whose copy arrived with
+/// empty slider fields would otherwise have its slider collapsed to 0..0 by
+/// our own update.  A test compares these with the registered values, so
+/// the two lists cannot drift apart silently.  Non-slider indices are left
+/// alone.
+void restoreSliderDisplay(PF_ParamDef& def, int aeIndex) noexcept {
+    // One place per slider, the PARAMS_SETUP arguments verbatim.
+    double sliderMin = 0.0;
+    double sliderMax = 0.0;
+    A_short precision = PF_Precision_TENTHS;
+    PF_ValueDisplayFlags display = PF_ValueDisplayFlag_NONE;
+    switch (aeIndex) {
+        case kIndexFov:
+            sliderMin = OSV_REFRAME_FOV_SLIDER_MIN;
+            sliderMax = OSV_REFRAME_FOV_SLIDER_MAX;
+            break;
+        case kIndexDistortion:
+            sliderMin = OSV_REFRAME_DISTORTION_SLIDER_MIN;
+            sliderMax = OSV_REFRAME_DISTORTION_SLIDER_MAX;
+            display = PF_ValueDisplayFlag_PERCENT;
+            break;
+        case kIndexZoom:
+            sliderMin = OSV_REFRAME_ZOOM_SLIDER_MIN;
+            sliderMax = OSV_REFRAME_ZOOM_SLIDER_MAX;
+            break;
+        case kIndexDjiFov:
+            sliderMin = OSV_REFRAME_DJI_FOV_SLIDER_MIN;
+            sliderMax = OSV_REFRAME_DJI_FOV_SLIDER_MAX;
+            break;
+        case kIndexCorrection:
+            sliderMin = OSV_REFRAME_CORRECTION_SLIDER_MIN;
+            sliderMax = OSV_REFRAME_CORRECTION_SLIDER_MAX;
+            precision = PF_Precision_HUNDREDTHS;
+            break;
+        default:
+            return;  // not one of our float sliders
+    }
+    def.u.fs_d.slider_min = static_cast<PF_FpShort>(sliderMin);
+    def.u.fs_d.slider_max = static_cast<PF_FpShort>(sliderMax);
+    def.u.fs_d.precision = precision;
+    def.u.fs_d.display_flags = display;
+}
+
+/// The def PF_UpdateParamUI receives for one managed control while `lens` is
+/// selected.
+///
+/// It starts from the host's own def when there is one - Adobe's Supervisor
+/// sample passes a COPY of the params entry, because the array handed to
+/// UPDATE_PARAMS_UI is the host's and must not be written - and then sets
+/// every field the update is allowed to change from this effect's own
+/// constants, so the result never depends on what the host left in them:
+/// the type, the name (a copy that arrived nameless would otherwise blank the
+/// label - a Premiere report of exactly that is in docs/PREMIERE.md), the
+/// PF_PUI_INVISIBLE bit and the slider display.  No value field is touched,
+/// and no change flag is set: UPDATE_PARAMS_UI may only make cosmetic
+/// changes (AE_Effect.h, PF_Cmd_UPDATE_PARAMS_UI).
+[[nodiscard]] PF_ParamDef managedUiDef(const PF_ParamDef* host, int aeIndex, CameraModel lens) noexcept {
+    PF_ParamDef def{};
+    if (host) {
+        def = *host;
+    }
+    const bool visible = controlVisible(aeIndex, lens);
+    if (aeIndex == kIndexCameraModel) {
+        // The hidden mirror: a checkbox, under its registered name and label.
+        def.param_type = PF_Param_CHECKBOX;
+        std::snprintf(def.PF_DEF_NAME, sizeof(def.PF_DEF_NAME), "%s", "Camera Model");
+        // The checkbox's own label: a def built from nothing (no host copy)
+        // must not hand the host a null label pointer.
+        if (!def.u.bd.u.PF_DEF_NAMEPTR) {
+            def.u.bd.u.PF_DEF_NAMEPTR = "DJI";
+        }
+    } else {
+        // A lens-specific float slider, under the name it is SHOWN with.
+        const LensControl* c = lensControl(aeIndex);
+        def.param_type = PF_Param_FLOAT_SLIDER;
+        std::snprintf(def.PF_DEF_NAME, sizeof(def.PF_DEF_NAME), "%s", (c && c->shown) ? c->shown : "");
+        restoreSliderDisplay(def, aeIndex);
+    }
+    if (visible) {
+        def.ui_flags &= ~static_cast<PF_ParamUIFlags>(PF_PUI_INVISIBLE);
+    } else {
+        def.ui_flags |= static_cast<PF_ParamUIFlags>(PF_PUI_INVISIBLE);
+    }
+    return def;
+}
+
+/// PF_Cmd_UPDATE_PARAMS_UI: show the selected lens's controls, hide the
+/// other lens's, and keep the Camera Model mirror hidden.
+///
+/// HOW, AND THE EVIDENCE THAT PREMIERE DOES IT
+/// -------------------------------------------
+/// PF_UpdateParamUI (PF Param Utils Suite v3) with PF_PUI_INVISIBLE set or
+/// cleared, for each managed control:
+///
+///   * AE_Effect.h, PF_PUI_INVISIBLE: "in Premiere since earlier than [CS6],
+///     this hides the parameter UI in the Effect Controls, which includes the
+///     keyframe track; for PPro only, the flag is dynamic and can be cleared
+///     to make the parameter visible again";
+///   * AE_EffectSuites.h, PF_UpdateParamUI: the fields it may change are
+///     "ui_flags: PF_PUI_ECW_SEPARATOR, PF_PUI_DISABLED only (and
+///     PF_PUI_INVISIBLE in Premiere)", the name, and the slider display;
+///   * Adobe's Supervisor sample hides and shows its advanced controls in
+///     Premiere exactly this way, from UPDATE_PARAMS_UI (its After Effects
+///     branch needs the AEGP Dynamic Stream Suite instead, which Premiere does
+///     not provide).
+///
+/// The update is applied on EVERY call, not only when the host's copy looks
+/// different: nothing documents that the params array handed to
+/// UPDATE_PARAMS_UI reflects earlier PF_UpdateParamUI calls, and trusting it
+/// would risk a control that stays hidden after switching back.  Six calls
+/// per panel refresh cost nothing measurable.
+///
+/// Every failure is non-fatal and returns PF_Err_NONE: a host without the
+/// suite, or one that refuses an update, shows every control - the layout
+/// the effect had before this - which is a worse panel but a working effect.
+PF_Err updateParamsUi(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[]) noexcept {
+    (void)out_data;
+    if (!in_data || !params) {
+        return PF_Err_NONE;  // nothing to show; never an error
+    }
+    const CameraModel lens = selectedLens(params);
+
+    // ---- the suite ---------------------------------------------------------
+    if (!in_data->pica_basicP) {
+        PluginLog::oncef("reframe/ui/params/nobasic", PluginLog::Level::Warn,
+                         "reframe: UPDATE_PARAMS_UI without a suite table; every lens control stays visible");
+        return PF_Err_NONE;
+    }
+    const void* raw = nullptr;
+    const SPErr acquired = in_data->pica_basicP->AcquireSuite(kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3, &raw);
+    const PF_ParamUtilsSuite3* suite = static_cast<const PF_ParamUtilsSuite3*>(raw);
+    if (acquired != kSPNoError || !suite) {
+        PluginLog::oncef("reframe/ui/params/nosuite", PluginLog::Level::Warn,
+                         "reframe: the PF Param Utils Suite v3 is unavailable (AcquireSuite err {}); every lens "
+                         "control stays visible",
+                         static_cast<long>(acquired));
+        return PF_Err_NONE;
+    }
+    if (!suite->PF_UpdateParamUI) {
+        in_data->pica_basicP->ReleaseSuite(kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3);
+        PluginLog::oncef("reframe/ui/params/nomember", PluginLog::Level::Warn,
+                         "reframe: the PF Param Utils Suite v3 has no PF_UpdateParamUI; every lens control stays "
+                         "visible");
+        return PF_Err_NONE;
+    }
+
+    // ---- one update per managed control ------------------------------------
+    int shown = 0;
+    int hidden = 0;
+    for (const int aeIndex : kManagedUiIndices) {
+        const PF_ParamDef def = managedUiDef(params[aeIndex], aeIndex, lens);
+        const PF_Err err = suite->PF_UpdateParamUI(in_data->effect_ref, aeIndex, &def);
+        if (err != PF_Err_NONE) {
+            // One refused control is not a reason to leave the others wrong.
+            PluginLog::oncef("reframe/ui/params/refused", PluginLog::Level::Warn,
+                             "reframe: PF_UpdateParamUI refused parameter {} (err {}); the panel may show a "
+                             "control of the other lens",
+                             aeIndex, static_cast<long>(err));
+            continue;
+        }
+        // Counted for the one debug line below.
+        if ((def.ui_flags & PF_PUI_INVISIBLE) != 0) {
+            ++hidden;
+        } else {
+            ++shown;
+        }
+    }
+    in_data->pica_basicP->ReleaseSuite(kPFParamUtilsSuite, kPFParamUtilsSuiteVersion3);
+
+    PluginLog::debug("reframe: Effect Controls show the {} lens ({} controls shown, {} hidden)",
+                     lens == CameraModel::Dji ? "DJI" : "Classic", shown, hidden);
+    return PF_Err_NONE;
+}
 
 /// PF_Cmd_RENDER: the software path.
 PF_Err render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], PF_LayerDef* output) noexcept {
@@ -1332,11 +1651,13 @@ PF_Err render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
         // never say which one.  This is the line that identifies whether the
         // CPU path read a sane FOV or garbage.
         PluginLog::oncef("reframe/render/setup-values", PluginLog::Level::Error,
-                         "reframe: setup rejected with resolution={} preset={} fov={:.3f} distortion={:.3f} "
-                         "pan={:.3f} tilt={:.3f} roll={:.3f} srcPan={:.3f} srcTilt={:.3f} srcRoll={:.3f} "
-                         "smooth={} seq={}x{}",
-                         static_cast<int>(settings.resolution), static_cast<int>(settings.preset), settings.fovDeg,
-                         settings.distortion, settings.panDeg, settings.tiltDeg, settings.rollDeg,
+                         "reframe: setup rejected with resolution={} preset={} lens={} fov={:.3f} distortion={:.3f} "
+                         "djiFov={:.3f} correction={:.3f} pan={:.3f} tilt={:.3f} roll={:.3f} srcPan={:.3f} "
+                         "srcTilt={:.3f} srcRoll={:.3f} smooth={} seq={}x{}",
+                         static_cast<int>(settings.resolution), static_cast<int>(settings.preset),
+                         settings.cameraModel == CameraModel::Dji ? "DJI" : "Classic", settings.fovDeg,
+                         settings.distortion, settings.djiFovDeg, settings.correction, settings.panDeg,
+                         settings.tiltDeg, settings.rollDeg,
                          settings.sourcePanDeg, settings.sourceTiltDeg, settings.sourceRollDeg,
                          settings.smoothKeyframes ? 1 : 0, sequenceSize(in_data).w, sequenceSize(in_data).h);
         PluginLog::oncef("reframe/render/setup", PluginLog::Level::Error,

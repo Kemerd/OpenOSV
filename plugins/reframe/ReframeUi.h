@@ -343,7 +343,7 @@ struct CameraValues {
     double rollDeg = 0.0;
     double fovDeg = OSV_REFRAME_FOV_DEFAULT;
     // [WP-CAMERA] DJI's lens.  `dji` says which lens the picture is rendered
-    // with (the Camera Model checkbox); the zoom gesture and the read-out
+    // with (the Lens popup, [WP-LENSUI]); the zoom gesture and the read-out
     // follow it.  In Classic mode the two DJI numbers ride along untouched.
     bool dji = false;
     double djiFovDeg = OSV_REFRAME_DJI_FOV_DEFAULT;       ///< DJI FOV (vertical pinhole, deg).

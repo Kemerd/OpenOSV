@@ -40,9 +40,12 @@ add_executable(osv_reframe_tests
   GpuTestSupport.cpp
   GpuTestSupport.h
   test_gpu_probe.cpp
-  # DJI's lens (Camera Model: DJI): geometry, legacy invariance, the DJI
-  # Studio field observations, supervision and CPU / GPU parity.
+  # DJI's lens (Lens: DJI): geometry, legacy invariance, the DJI Studio field
+  # observations, supervision, CPU / GPU parity and the Lens popup end to end.
   test_dji_camera.cpp
+  # [WP-LENSUI] The Effect Controls panel shows one lens at a time
+  # (PF_Cmd_UPDATE_PARAMS_UI through the mock's recording Param Utils Suite).
+  test_lens_ui.cpp
   # Compiled here too so the tests can call the geometry and the CPU
   # renderer directly; the .aex contains the identical object.
   "${_osv_reframe_src}/ReframeCpu.cpp"

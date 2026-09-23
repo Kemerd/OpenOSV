@@ -16,6 +16,13 @@ foreach(_m container meta color video geom render io)
 endforeach()
 target_link_libraries(osvtool PRIVATE ${_osvtool_libs})
 
+# render --use-user-defaults reads the Source Settings defaults the Premiere
+# plug-ins save, with the plug-ins' own (SDK-free) code, so the file means
+# exactly the same thing to both.  Only PrefsBlob.h and UserDefaults.h are
+# included from plugins/common; nothing there needs the Adobe SDKs.
+target_sources(osvtool PRIVATE "${CMAKE_SOURCE_DIR}/plugins/common/UserDefaults.cpp")
+target_include_directories(osvtool PRIVATE "${CMAKE_SOURCE_DIR}/plugins/common")
+
 set_target_properties(osvtool PROPERTIES FOLDER "tools")
 
 # Copy runtime DLLs (FFmpeg etc.) next to the executable after each build.

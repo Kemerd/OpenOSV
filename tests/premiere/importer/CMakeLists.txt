@@ -29,6 +29,7 @@ add_executable(osv_importer_tests
   test_look_paths.cpp       # [WP-LOOK] the DJI Studio look on the direct path's Rec.709 working space
   test_prefs_mapping.cpp
   test_reopen.cpp
+  test_user_defaults_importer.cpp  # [WP-DEFAULTS] new clips start from the user's saved defaults
   "${CMAKE_SOURCE_DIR}/plugins/importer/PrefsMapping.cpp"
 )
 

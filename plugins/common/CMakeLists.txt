@@ -22,6 +22,10 @@ add_library(osv_premiere_common STATIC
   PluginLog.cpp
   PluginLog.h
   PrefsBlob.h
+  # The per-user Source Settings defaults file (%APPDATA%\OpenOSV\defaults.json).
+  # SDK-free on purpose: osvtool compiles the same file for --use-user-defaults.
+  UserDefaults.cpp
+  UserDefaults.h
 )
 add_library(osv::premiere_common ALIAS osv_premiere_common)
 
@@ -33,6 +37,9 @@ target_link_libraries(osv_premiere_common
     osv_core
     osv_render
     osv_premiere_sdk
+  PRIVATE
+    # UserDefaults.cpp reads and writes the defaults file as JSON.
+    nlohmann_json::nlohmann_json
 )
 
 # The plug-ins are /MD modules; the static library must use the same CRT.

@@ -207,9 +207,34 @@
 #define OSV_REFRAME_ID_DRAG_SENSITIVITY 20
 /* ---- end [WP-CAMERA] ------------------------------------------------------ */
 
-/* Total parameters excluding the input layer: the 18 controls plus the two
+/* ---- [WP-LENSUI] the Lens popup, appended ----------------------------------
+ *
+ *   21  Lens   popup "DJI|Classic", DJI by default: which lens renders, and
+ *              which lens's controls the Effect Controls panel shows.
+ *
+ * It replaces the Camera Model checkbox (id 16) as the source of truth.  The
+ * checkbox is NOT removed - a parameter that disappears breaks every project
+ * saved with it - but registered invisible (PF_PUI_INVISIBLE) and kept in
+ * step with the popup as a mirror: it holds the lens that was on screen
+ * before an edit (how USER_CHANGED_PARAM tells a real switch from a re-pick)
+ * and it lets a project saved by this build open on the right lens in the
+ * build before it, which reads only the checkbox.
+ *
+ * WHY APPENDED AND NOT AT THE TOP OF THE CAMERA GROUP
+ * After Effects matches saved values to parameters by these ids, so it
+ * would allow an insertion anywhere (the AE SDK's "Changing Parameter
+ * Orders" chapter).  Nothing in the Premiere Pro SDK guide says Premiere
+ * does the same, and this effect is a Premiere effect: an insertion that
+ * Premiere resolved by INDEX would load every saved project's Pan into the
+ * popup and shift every control after it by one.  Appending is the one
+ * placement that is safe whichever way the host binds, so the popup sits at
+ * the end of the list, below Drag Sensitivity. */
+#define OSV_REFRAME_ID_LENS 21
+/* ---- end [WP-LENSUI] ------------------------------------------------------ */
+
+/* Total parameters excluding the input layer: the 19 controls plus the two
  * group terminators.  out_data->num_params is this + 1. */
-#define OSV_REFRAME_PARAM_COUNT 20
+#define OSV_REFRAME_PARAM_COUNT 21
 
 /* ==========================================================================
  *  Popup item strings
@@ -224,14 +249,27 @@
 #define OSV_REFRAME_PRESET_ITEMS "Custom|Crystal Ball|Asteroid|Wide|Ultra Wide|Dewarping"
 #define OSV_REFRAME_PRESET_COUNT 6
 
-/* [WP-CAMERA] Camera Model is a CHECKBOX labelled "DJI", not a popup.
- * Premiere's GPU parameter reads were seen to report popups 0-based (the
- * 26.2.2 dump reads Output Resolution 0 and Preset 3 at their 1-based
- * defaults 1 and 4, and DJI's own plug-in adds 1 to every popup it reads on
- * the GPU), while After Effects - and the CPU path - report them 1-based.  A
- * two-entry "Classic|DJI" popup would read "1" as either model depending on
- * the host; a checkbox cannot be misread, and the lens model is the one
- * control a misread would turn into a different picture. */
+/* [WP-LENSUI] The Lens popup.  DJI first, so DJI - the default - is entry 1
+ * in After Effects' numbering and entry 0 in Premiere's GPU numbering.
+ *
+ * WP-CAMERA made the lens a CHECKBOX because Premiere's GPU parameter reads
+ * number popups from 0 (the 26.2.2 dump reads Output Resolution 0 and Preset
+ * 3 at their 1-based defaults 1 and 4) while After Effects and the CPU path
+ * number them from 1, so a raw "1" is DJI on one host and Classic on the
+ * other.  A popup is safe now for three reasons, each checked by a test:
+ *
+ *   1. decodeHostPopup() learns the host's base per instance from any popup
+ *      that reads unambiguously - a 0 anywhere, or an entry count;
+ *   2. DJI reads 0 on a 0-based host, which settles the base by itself, so
+ *      the default lens can never be misread;
+ *   3. every edit the effect supervises leaves Classic paired with Preset
+ *      "Custom" (picking a preset selects DJI, and every lens switch, every
+ *      pick of Classic and every Classic edit sets Custom), and Custom reads
+ *      0 on a 0-based host
+ *      - so the one ambiguous reading, Classic's "1" on Premiere, arrives
+ *      with the 0 that decodes it. */
+#define OSV_REFRAME_LENS_ITEMS "DJI|Classic"
+#define OSV_REFRAME_LENS_COUNT 2
 
 /* ==========================================================================
  *  Ranges and defaults (the numbers PF_ADD_* is called with)
@@ -277,10 +315,19 @@
  * the SLIDER covers DJI Studio's working range, so a project typed in from
  * either tool is representable and the slider feels like DJI Studio's. */
 
-/* Camera Model: unticked (Classic) by default.  That default is the whole
- * backward compatibility guarantee - an old project loads the new control at
- * its default and therefore keeps rendering the lens it was made with. */
-#define OSV_REFRAME_CAMERA_MODEL_DEFAULT 0
+/* [WP-LENSUI] Camera Model, now the Lens popup's hidden mirror: ticked (DJI)
+ * by default, so a fresh instance's mirror agrees with the popup's default.
+ *
+ * It was unticked (Classic) while it was the source of truth, so that old
+ * projects kept the Classic lens.  The user chose DJI as the default for
+ * every project instead - one without the Lens popup loads it at DJI - and a
+ * WP-CAMERA project whose checkbox the host restores as the new default is
+ * then consistent with that choice too.  Nothing renders from this value any
+ * more (see OSV_REFRAME_ID_LENS). */
+#define OSV_REFRAME_CAMERA_MODEL_DEFAULT 1
+
+/* [WP-LENSUI] Lens: 1-based popup value; 1 = "DJI", the user's default. */
+#define OSV_REFRAME_LENS_DEFAULT 1
 
 /* DJI FOV: the vertical pinhole field of view.  DJI Studio clamps it to
  * [20, 150] (generateNewParams / setFov); DJI's plug-in allows [1, 178]. */
@@ -366,13 +413,14 @@ namespace osv::reframe {
 ///  13    Source Roll
 ///  14  (GROUP_END, Source)
 ///  15  Smooth Keyframes
-///  16  Camera Model          [WP-CAMERA]
+///  16  Camera Model          [WP-CAMERA]  (hidden since [WP-LENSUI])
 ///  17  Zoom                  [WP-CAMERA]
 ///  18  DJI FOV               [WP-CAMERA]
 ///  19  Correction Angle      [WP-CAMERA]
 ///  20  Drag Sensitivity      [WP-CAMERA]
+///  21  Lens                  [WP-LENSUI]
 ///
-/// 16..20 are siblings of Smooth Keyframes, outside both groups, and
+/// 16..21 are siblings of Smooth Keyframes, outside both groups, and
 /// deliberately so: appending is the only change that leaves the index of
 /// every existing control - and so every saved project and every host index
 /// map - exactly where it was.
@@ -398,6 +446,8 @@ enum ParamIndex : int {
     kIndexDjiFov = 18,
     kIndexCorrection = 19,
     kIndexDragSensitivity = 20,
+    // [WP-LENSUI]
+    kIndexLens = 21,
 };
 
 /// The permanent id stored with each index, in index order (index 1 first).
@@ -413,6 +463,8 @@ inline constexpr int kParamIdByIndex[OSV_REFRAME_PARAM_COUNT] = {
     // [WP-CAMERA]
     OSV_REFRAME_ID_CAMERA_MODEL,  OSV_REFRAME_ID_ZOOM,             OSV_REFRAME_ID_DJI_FOV,
     OSV_REFRAME_ID_CORRECTION,    OSV_REFRAME_ID_DRAG_SENSITIVITY,
+    // [WP-LENSUI]
+    OSV_REFRAME_ID_LENS,
 };
 
 /// Number of user-visible parameters (excludes the input layer).
@@ -438,7 +490,7 @@ inline constexpr int kParamCount = OSV_REFRAME_PARAM_COUNT;
 /// spelled independently so this header still needs no Adobe include.
 enum class HostParamKind : int {
     Unknown = 0,
-    Int32,    ///< A popup (Output Resolution, Preset): a small integer (see decodeHostPopup()).
+    Int32,    ///< A popup (Output Resolution, Preset, Lens): a small integer (see decodeHostPopup()).
     Float32,  ///< An AE angle dial (the six Pan / Tilt / Roll controls), in degrees.
     Float64,  ///< An AE float slider (FOV, Distortion, Zoom, DJI FOV, Correction Angle, Drag Sensitivity).
     Bool,     ///< A checkbox (Smooth Keyframes, Camera Model).
@@ -451,7 +503,7 @@ enum class HostParamKind : int {
 /// Number of controls that actually carry a value, i.e. everything except
 /// the four PF_Param_GROUP_START / GROUP_END markers.  This is the list a
 /// probe expects to find on the host, in this order.
-inline constexpr int kValueParamCount = 16;
+inline constexpr int kValueParamCount = 17;
 
 /// [WP-CAMERA] How many of those the effect had before the DJI camera block
 /// was appended.  A host list may stop after these (it then exposes none of
@@ -459,7 +511,7 @@ inline constexpr int kValueParamCount = 16;
 /// list end early inside the appended block.
 inline constexpr int kOriginalValueParamCount = 11;
 
-/// The AE indices of the sixteen value-carrying controls, in ADD ORDER.
+/// The AE indices of the seventeen value-carrying controls, in ADD ORDER.
 /// The group markers are absent by construction: they hold no value, so no
 /// host can report one for them and nothing ever reads them.
 inline constexpr int kValueParamAeIndex[kValueParamCount] = {
@@ -469,21 +521,25 @@ inline constexpr int kValueParamAeIndex[kValueParamCount] = {
     // [WP-CAMERA]
     kIndexCameraModel,      kIndexZoom,       kIndexDjiFov,     kIndexCorrection,
     kIndexDragSensitivity,
+    // [WP-LENSUI]
+    kIndexLens,
 };
 
 /// The PrParam kind each of those controls arrives in, in the same order.
 ///
 /// Read down the column and this is the SIGNATURE the probe matches:
 ///
-///     i32 i32 f32 f32 f32 f64 f64 f32 f32 f32 bool | bool f64 f64 f64 f64
+///     i32 i32 f32 f32 f32 f64 f64 f32 f32 f32 bool | bool f64 f64 f64 f64 i32
 ///
 /// The part before the bar is the effect's original list and is still
 /// distinctive on its own - the adjacent FOV / Distortion Float64 pair
 /// between the angle dials, and the Bool that closes it (Smooth Keyframes).
-/// The part after it is the DJI camera block appended by [WP-CAMERA]: the
-/// Camera Model checkbox followed by four float sliders.  matchHostParams()
-/// accepts a host list that stops before the block, so a host that has not
-/// (yet) exposed the appended controls still maps the original ones.
+/// The part after it was appended later: the DJI camera block of
+/// [WP-CAMERA] (the Camera Model checkbox and four float sliders) and the
+/// Lens popup of [WP-LENSUI].  matchHostParams() accepts a host list that
+/// stops anywhere inside that tail, so a host that has not (yet) exposed the
+/// appended controls still maps the original ones - and a control it does
+/// not expose reads its default.
 inline constexpr HostParamKind kValueParamKind[kValueParamCount] = {
     HostParamKind::Int32,   HostParamKind::Int32,   HostParamKind::Float32, HostParamKind::Float32,
     HostParamKind::Float32, HostParamKind::Float64, HostParamKind::Float64, HostParamKind::Float32,
@@ -491,6 +547,8 @@ inline constexpr HostParamKind kValueParamKind[kValueParamCount] = {
     // [WP-CAMERA]
     HostParamKind::Bool,    HostParamKind::Float64, HostParamKind::Float64, HostParamKind::Float64,
     HostParamKind::Float64,
+    // [WP-LENSUI]
+    HostParamKind::Int32,
 };
 
 /// The kind of EVERY parameter in AE index order (index 1 first), group
@@ -506,6 +564,8 @@ inline constexpr HostParamKind kParamKindByIndex[OSV_REFRAME_PARAM_COUNT] = {
     // [WP-CAMERA]
     HostParamKind::Bool,    HostParamKind::Float64, HostParamKind::Float64, HostParamKind::Float64,
     HostParamKind::Float64,
+    // [WP-LENSUI]
+    HostParamKind::Int32,
 };
 
 /// [WP-CAMERA] How a host numbers popup entries on the GPU side.
@@ -536,12 +596,13 @@ enum class PopupBase : int {
 /// Anything in between reads as the base already learned, and as 1-based
 /// while nothing is known - the After Effects convention and this effect's
 /// historical behaviour.  Getting it wrong while unknown is cheap by design:
-/// the only popup the renderer reads is Output Resolution, whose fixed
-/// entries are all 16:9 (so a one-step misread cannot change the framing of
-/// a fixed size), its "Match Sequence" entry is exactly the one that reads 0
-/// on a 0-based host (so the default settles the base at once), and the lens
-/// model is a checkbox precisely so it never depends on this.  A null `base`
-/// is treated as Unknown and not updated.
+/// Output Resolution's fixed entries are all 16:9 (so a one-step misread
+/// cannot change the framing of a fixed size) and its "Match Sequence"
+/// default reads 0 on a 0-based host; [WP-LENSUI] the Lens popup's DJI
+/// default reads 0 there too, and Classic always travels with Preset
+/// "Custom", which reads 0 (see OSV_REFRAME_LENS_ITEMS) - so every reading
+/// that could flip the lens arrives with the 0 that settles the base.  A
+/// null `base` is treated as Unknown and not updated.
 [[nodiscard]] inline int decodeHostPopup(int raw, int entryCount, PopupBase* base) noexcept {
     PopupBase known = base ? *base : PopupBase::Unknown;
     if (raw == 0) {
@@ -778,9 +839,9 @@ enum class Preset : int {
 ///     preset table, matching DJI's Premiere plug-in and DJI
 ///     Studio's list - with the field of view given per output shape.
 ///
-/// Choosing a preset writes both sets and switches Camera Model to DJI, so
-/// the picture is DJI's preset and the Classic controls hold the nearest
-/// Classic look should the user switch back.
+/// Choosing a preset writes both sets and selects the DJI lens, so the
+/// picture is DJI's preset and the Classic controls hold the nearest Classic
+/// look should the user switch back.
 struct PresetEntry {
     Preset value;       ///< Popup value.
     const char* label;  ///< Exactly the text in OSV_REFRAME_PRESET_ITEMS.
@@ -840,28 +901,129 @@ inline constexpr PresetEntry kPresetTable[OSV_REFRAME_PRESET_COUNT] = {
 //  Classic controls therefore gave a different picture, which is the bug the
 //  DJI model fixes: in DJI mode the same three numbers give the same frame.
 //
-//  The switch is an explicit control (the "Camera Model" checkbox) rather
-//  than an inference from which controls look "set", because nothing can
-//  tell an old project from a new instance: both load every appended control
-//  at its default.  So the default must be the one that reproduces old
-//  projects bit for bit, and that is Classic.  New work moves to DJI the
-//  moment the user does anything DJI-shaped - picks a preset, or touches
-//  Zoom, DJI FOV or Correction Angle (USER_CHANGED_PARAM ticks the box and
-//  carries the current look across, so the picture does not jump).  Editing
-//  Classic FOV or Distortion unticks it the same way.
+//  The switch is an explicit control rather than an inference from which
+//  controls look "set", because nothing can tell an old project from a new
+//  instance: both load every appended control at its default.
+//
+//  [WP-LENSUI] That control is now the "Lens" popup (DJI | Classic), and its
+//  default is DJI - the user's choice, accepted with its consequence that a
+//  project saved before the popup existed opens on the DJI lens.  The
+//  Effect Controls panel shows only the selected lens's controls (the
+//  visibility table below), so the two FOVs never appear side by side.
+//  Picking a preset still selects DJI, and editing a control of the other
+//  lens - possible only through a host that shows every control - still
+//  selects that lens; every switch carries the current look across, so the
+//  picture does not jump.  The WP-CAMERA "Camera Model" checkbox stays in the
+//  list, hidden, as the popup's mirror (see OSV_REFRAME_ID_LENS).
 // ---------------------------------------------------------------------------
 
-/// The two lens models.  The control is the "Camera Model" checkbox: ticked
-/// (labelled "DJI") is Dji, unticked is Classic.
+/// The two lens models, as the renderer sees them.
+///
+/// Settings default-constructs to Classic so a Settings block built by hand
+/// describes the Classic camera bit for bit; the READERS of the host's
+/// parameters apply the Lens popup's own default (DJI) when a host has no
+/// value for it.
 enum class CameraModel : int {
     Classic = 0,  ///< FOV (visible angle) + Distortion (eye offset, auto ramp).
     Dji = 1,      ///< DJI FOV (vertical pinhole) + Correction Angle; Zoom derived.
 };
 
 /// The model a checkbox value selects.  Any non-zero value is ticked, the
-/// same rule the host's own checkbox uses; only exactly 0 is Classic.
+/// same rule the host's own checkbox uses; only exactly 0 is Classic.  Used
+/// for the hidden Camera Model mirror, which a host that shows every control
+/// still lets the user tick.
 [[nodiscard]] inline constexpr CameraModel cameraModelFromCheckbox(long checkboxValue) noexcept {
     return (checkboxValue != 0) ? CameraModel::Dji : CameraModel::Classic;
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-LENSUI] The Lens popup
+// ---------------------------------------------------------------------------
+
+/// Popup values of "Lens" (1-based, After Effects numbering).
+enum class LensPopup : int {
+    Dji = 1,      ///< "DJI" - the default.
+    Classic = 2,  ///< "Classic".
+};
+
+/// The model a Lens popup value selects (1-based).  Exactly "Classic" is
+/// Classic; everything else - "DJI", a corrupt project's out-of-range value,
+/// garbage - is the default, DJI, the same rule every other sanitiser in
+/// this header applies to a value it cannot place.
+[[nodiscard]] inline constexpr CameraModel cameraModelFromLensPopup(long popupValue) noexcept {
+    return (popupValue == static_cast<long>(LensPopup::Classic)) ? CameraModel::Classic : CameraModel::Dji;
+}
+
+/// The 1-based Lens popup value that selects a model.
+[[nodiscard]] inline constexpr int lensPopupValue(CameraModel model) noexcept {
+    return static_cast<int>(model == CameraModel::Classic ? LensPopup::Classic : LensPopup::Dji);
+}
+
+/// The model the Lens popup selects by default (a new instance, a project
+/// saved before the popup existed, a host that does not expose it).
+inline constexpr CameraModel kDefaultCameraModel = cameraModelFromLensPopup(OSV_REFRAME_LENS_DEFAULT);
+static_assert(kDefaultCameraModel == CameraModel::Dji, "the Lens popup defaults to DJI (the user's choice)");
+static_assert(cameraModelFromCheckbox(OSV_REFRAME_CAMERA_MODEL_DEFAULT) == kDefaultCameraModel,
+              "the hidden Camera Model mirror must default to the Lens popup's default");
+
+// ---------------------------------------------------------------------------
+//  [WP-LENSUI] What the Effect Controls panel shows per lens
+//
+//  Only the selected lens's controls are visible, so a user never sees two
+//  "FOV" sliders that mean different angles - the question that started
+//  this.  PF_Cmd_UPDATE_PARAMS_UI applies the table through
+//  PF_UpdateParamUI with PF_PUI_INVISIBLE, which Premiere honours
+//  dynamically (AE_Effect.h, PF_PUI_INVISIBLE: "for PPro only, the flag is
+//  dynamic and can be cleared to make the parameter visible again"); the
+//  Camera Model mirror is registered invisible and stays so.  Everything
+//  else - Output Resolution, Preset, Pan / Tilt / Roll, the Source group,
+//  Smooth Keyframes, Drag Sensitivity and the Lens popup itself - is always
+//  shown.
+// ---------------------------------------------------------------------------
+
+/// One control that belongs to one lens.
+struct LensControl {
+    int aeIndex;        ///< kIndex* of the control.
+    CameraModel lens;   ///< Shown only while this lens is selected.
+    const char* shown;  ///< The name the panel shows while it is visible.
+};
+
+/// Every lens-specific control.
+///
+/// DJI FOV is registered as "DJI FOV" and SHOWN as "FOV": the registered name
+/// is what a host that ignores dynamic UI changes (and therefore shows every
+/// control) displays, where the two FOVs must stay distinguishable; while
+/// the panel shows one lens at a time there is one FOV on screen, and it is
+/// simply "FOV" in either lens.  Every other control is shown under the name
+/// it is registered with.
+inline constexpr LensControl kLensControls[] = {
+    {kIndexFov, CameraModel::Classic, "FOV"},
+    {kIndexDistortion, CameraModel::Classic, "Distortion"},
+    {kIndexZoom, CameraModel::Dji, "Zoom"},
+    {kIndexDjiFov, CameraModel::Dji, "FOV"},
+    {kIndexCorrection, CameraModel::Dji, "Correction Angle"},
+};
+
+/// The lens-specific entry for a control, or null for a control every lens
+/// shows (and for any index outside the list).
+[[nodiscard]] inline constexpr const LensControl* lensControl(int aeIndex) noexcept {
+    for (const LensControl& c : kLensControls) {
+        if (c.aeIndex == aeIndex) {
+            return &c;
+        }
+    }
+    return nullptr;
+}
+
+/// Whether the Effect Controls panel shows the control at `aeIndex` while
+/// `lens` is selected.  The Camera Model mirror is never shown; a
+/// lens-specific control only with its lens; every other control always.
+[[nodiscard]] inline constexpr bool controlVisible(int aeIndex, CameraModel lens) noexcept {
+    if (aeIndex == kIndexCameraModel) {
+        return false;
+    }
+    const LensControl* c = lensControl(aeIndex);
+    return c ? (c->lens == lens) : true;
 }
 
 // ---------------------------------------------------------------------------
@@ -884,7 +1046,9 @@ struct Settings {
     double sourceRollDeg = 0.0;
     bool smoothKeyframes = false;
     // [WP-CAMERA]
-    CameraModel cameraModel = CameraModel::Classic;          ///< Which lens renders.
+    /// Which lens renders: the Lens popup, decoded by the reader.  Classic
+    /// here only so a hand-built block is the Classic camera (see CameraModel).
+    CameraModel cameraModel = CameraModel::Classic;
     double zoomDeg = OSV_REFRAME_ZOOM_DEFAULT;               ///< Read-out only; never rendered from.
     double djiFovDeg = OSV_REFRAME_DJI_FOV_DEFAULT;          ///< DJI vertical pinhole FOV (deg).
     double correction = OSV_REFRAME_CORRECTION_DEFAULT;      ///< DJI eye distance (sphere radii).

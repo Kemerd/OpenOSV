@@ -37,6 +37,10 @@
 //                                    media's own "as shot" settings.
 //   PF_Cmd_TRANSLATE_PARAMS_TO_PREFS the controls -> a 128-byte PrefsBlob
 //                                    written into the host's prefs buffer.
+//   PF_Cmd_USER_CHANGED_PARAM        [WP-DEFAULTS] the Defaults group's two
+//                                    buttons: save this clip's settings as
+//                                    the defaults for new clips, or remove
+//                                    them (plugins/common/UserDefaults.h).
 //   PF_Cmd_GLOBAL_SETDOWN            close the log.
 //
 // ===========================================================================
@@ -72,6 +76,7 @@
 
 #include "PluginLog.h"
 #include "PrefsBlob.h"
+#include "UserDefaults.h"
 
 // Adobe headers.  Everything of ours is declared before these open their
 // #pragma pack(push, 1) region, and nothing of ours is declared inside it.
@@ -100,6 +105,8 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <string>
+#include <string_view>
 
 // ===========================================================================
 //  The PiPL constants really are the AE constants
@@ -126,8 +133,16 @@ static_assert(OSV_SOURCE_SETTINGS_STAGE == PF_Stage_RELEASE, "the PiPL stage wor
 namespace {
 using namespace osv::premiere::sourcesettings;
 }  // namespace
-static_assert(kIndexAdvancedTopicEnd == OSV_SOURCE_SETTINGS_PARAM_COUNT,
-              "the Advanced group terminator must be the last parameter added");
+// [WP-DEFAULTS] The Defaults group follows the Advanced group and closes the
+// list: Save, then Restore, then its terminator as the last parameter added.
+static_assert(kIndexDefaultsTopic == kIndexAdvancedTopicEnd + 1,
+              "the Defaults group opens immediately after the Advanced group closes");
+static_assert(kIndexDefaultsTopicEnd == OSV_SOURCE_SETTINGS_PARAM_COUNT,
+              "the Defaults group terminator must be the last parameter added");
+static_assert(kParamIdByIndex[kIndexSaveDefaults - 1] == OSV_SS_ID_SAVE_DEFAULTS &&
+                  kParamIdByIndex[kIndexRestoreDefaults - 1] == OSV_SS_ID_RESTORE_DEFAULTS &&
+                  kParamIdByIndex[kIndexDefaultsTopicEnd - 1] == OSV_SS_ID_DEFAULTS_TOPIC_END,
+              "kParamIdByIndex is not aligned with the ParamIndex enum");
 static_assert(kIndexFlareRemoval == kIndexCalibration + 1,
               "Sun Ghost Removal follows Calibration inside the Stitching group");  // [WP-FLARE]
 // [WP-PHOTO] the sky seam fix's three controls follow Sun Ghost Removal.
@@ -181,6 +196,24 @@ constexpr const wchar_t* kLogName = L"OpenOSVSourceSettings";
 
 using osv::premiere::PluginLog;
 using osv::premiere::PrefsBlob;
+using osv::premiere::UserDefaults;
+using osv::premiere::UserDefaultsLogLevel;
+
+/// [WP-DEFAULTS] The UserDefaults log sink of this module: every message of
+/// plugins/common/UserDefaults.cpp lands in OpenOSVSourceSettings.log.
+void logUserDefaultsMessage(UserDefaultsLogLevel level, std::string_view message) noexcept {
+    PluginLog::Level mapped = PluginLog::Level::Debug;
+    switch (level) {
+    case UserDefaultsLogLevel::Info:  mapped = PluginLog::Level::Info; break;
+    case UserDefaultsLogLevel::Warn:  mapped = PluginLog::Level::Warn; break;
+    case UserDefaultsLogLevel::Error: mapped = PluginLog::Level::Error; break;
+    case UserDefaultsLogLevel::Debug:
+    default:                          mapped = PluginLog::Level::Debug; break;
+    }
+    if (PluginLog::enabled(mapped)) {
+        PluginLog::write(mapped, message);
+    }
+}
 
 // ===========================================================================
 //  The Source Settings Suite
@@ -431,6 +464,8 @@ PF_Err globalSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     // The log file is opened here rather than in DllMain: DllMain runs under
     // the loader lock and must not touch the file system.
     PluginLog::init(kLogName);
+    // [WP-DEFAULTS] The defaults file's own messages go to this module's log.
+    osv::premiere::setUserDefaultsLogSink(&logUserDefaultsMessage);
 
     out_data->my_version =
         PF_VERSION(OSV_SOURCE_SETTINGS_VERSION_MAJOR, OSV_SOURCE_SETTINGS_VERSION_MINOR,
@@ -490,9 +525,11 @@ PF_Err globalSetdown(PF_InData*, PF_OutData*) noexcept {
     return PF_Err_NONE;
 }
 
-/// PF_Cmd_PARAMS_SETUP: the twenty controls.
+/// PF_Cmd_PARAMS_SETUP: the twenty controls, and [WP-DEFAULTS] the Defaults
+/// group's two buttons at the end (buttons hold no value, so they have no
+/// time axis to refuse and carry only PF_ParamFlag_SUPERVISE).
 ///
-/// Every one of them carries PF_ParamFlag_CANNOT_TIME_VARY.  See the file
+/// Every value control carries PF_ParamFlag_CANNOT_TIME_VARY.  See the file
 /// header for why that is a correctness requirement rather than a style
 /// choice: the values travel to the importer as one flat blob with no time
 /// axis, so a keyframe could never be read back.
@@ -662,6 +699,29 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_ADVANCED_TOPIC_END);
 
+    // ---- 25-28. Defaults [WP-DEFAULTS] -------------------------------------
+    // Two momentary buttons: store this clip's settings as the defaults every
+    // NEW clip starts from, or remove them so new clips start from the
+    // built-in defaults again.  Neither changes this clip.  A button carries
+    // no value; a click arrives as PF_Cmd_USER_CHANGED_PARAM, which is why
+    // both carry PF_ParamFlag_SUPERVISE and nothing else - exactly how
+    // Adobe's own Paramarama sample declares its button for every host,
+    // Premiere included.  Collapsed, like Advanced: it is used once, not per
+    // clip.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_TOPICX(OSV_SS_DEFAULTS_TOPIC_NAME, PF_ParamFlag_START_COLLAPSED, OSV_SS_ID_DEFAULTS_TOPIC);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_BUTTON(OSV_SS_SAVE_DEFAULTS_NAME, OSV_SS_SAVE_DEFAULTS_BUTTON, 0, PF_ParamFlag_SUPERVISE,
+                  OSV_SS_ID_SAVE_DEFAULTS);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_BUTTON(OSV_SS_RESTORE_DEFAULTS_NAME, OSV_SS_RESTORE_DEFAULTS_BUTTON, 0, PF_ParamFlag_SUPERVISE,
+                  OSV_SS_ID_RESTORE_DEFAULTS);
+
+    AEFX_CLR_STRUCT(def);
+    PF_END_TOPIC(OSV_SS_ID_DEFAULTS_TOPIC_END);
+
     out_data->num_params = OSV_SOURCE_SETTINGS_PARAM_COUNT + 1;  // + the input layer
     return PF_Err_NONE;
 }
@@ -708,8 +768,35 @@ PF_Err sequenceSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
     // that chooses to ACCEPT rather than override (a clip whose prefs are not
     // yet established) receives a valid, sanitised blob instead of zeros -
     // and so a host that calls through without reaching the importer at all
-    // leaves the controls exactly as they were.
+    // leaves the controls exactly as they were (or, for a new clip with
+    // untouched controls, on the user defaults seeded just below).
     PrefsBlob blob = prefsFromControls(readControls(params));
+
+    // [WP-DEFAULTS] A NEW clip starts from the user's saved defaults.
+    //
+    // The SDK guide is explicit that this selector is the new-clip moment:
+    // "When a clip is first imported, the effect is called with
+    // PF_Cmd_SEQUENCE_SETUP" (a saved project comes back through
+    // PF_Cmd_SEQUENCE_RESETUP).  Two more guards keep an existing clip's
+    // settings untouched even if a host ever sent this selector for one:
+    //
+    //   * only UNTOUCHED controls are replaced - controls that translate to
+    //     anything but PrefsBlob::defaults() are the clip's own settings;
+    //   * the importer still answers below, and a live instance holding the
+    //     clip's stored blob replaces this seed with it.
+    //
+    // No defaults file (or a corrupt one) leaves the seed at the built-in
+    // defaults, i.e. exactly what this code did before.
+    bool seededFromUser = false;
+    std::string seedSource;
+    if (params && blob == PrefsBlob::defaults()) {
+        const UserDefaults user = osv::premiere::currentUserDefaults();
+        if (user.fromFile && user.prefs != blob) {
+            blob = user.prefs;
+            seededFromUser = true;
+            seedSource = osv::premiere::userDefaultsPathForLog(user.path);
+        }
+    }
 
     const PF_Err err = suite->PerformSourceSettingsCommand(in_data->effect_ref, &blob,
                                                            static_cast<csSDK_uint32>(PrefsBlob::kSize));
@@ -736,6 +823,92 @@ PF_Err sequenceSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
                      "calib {}, fit {}, exposure {:+.2f}, device {}",
                      blob.colorOutput, blob.outputSize, blob.stabilization, blob.seamSearch, blob.gainMatch,
                      blob.calibration, blob.dlogmFit, static_cast<double>(blob.exposureStops), blob.renderDevice);
+    // [WP-DEFAULTS] Say, once per new clip, whether the user defaults took:
+    // the importer answers for a clip it holds stored settings for, and then
+    // those win - which is the rule, not a failure.
+    if (seededFromUser) {
+        if (blob == osv::premiere::userDefaults()) {
+            PluginLog::info("source settings: new clip - controls set to the user defaults in {}", seedSource);
+        } else {
+            PluginLog::info("source settings: new clip - the importer answered with this clip's own settings, "
+                            "which win over the user defaults in {}",
+                            seedSource);
+        }
+    }
+    return PF_Err_NONE;
+}
+
+/// [WP-DEFAULTS] Put a short confirmation where the host may show it.
+///
+/// out_data->return_msg is always filled (a host that shows it gets the
+/// sentence), but PF_OutFlag_DISPLAY_ERROR_MESSAGE - which turns it into a
+/// modal alert - is only raised outside Premiere.  That is exactly what
+/// Adobe's Paramarama sample does for its button (it sets the flag only when
+/// appl_id is not Premiere's), and a modal alert after every click of a
+/// settings button would be the "annoying" kind of confirmation anyway.  In
+/// Premiere the confirmation is the plug-in log line.
+void reportDefaultsAction(const PF_InData* in_data, PF_OutData* out_data, const char* message) noexcept {
+    if (!out_data || !message) {
+        return;
+    }
+    std::snprintf(out_data->return_msg, PF_MAX_EFFECT_MSG_LEN, "%s", message);
+    if (in_data && in_data->appl_id != kPremiereApplId) {
+        out_data->out_flags |= PF_OutFlag_DISPLAY_ERROR_MESSAGE;
+    }
+}
+
+/// [WP-DEFAULTS] PF_Cmd_USER_CHANGED_PARAM: the Defaults group's buttons.
+///
+///   Save as Default for New Clips - the controls as they stand, translated
+///       exactly as PF_Cmd_TRANSLATE_PARAMS_TO_PREFS translates them (so the
+///       defaults are precisely what this clip is decoded with), are written
+///       to the user's defaults file.
+///   Restore Built-in Defaults - the file is removed, so new clips start
+///       from PrefsBlob::defaults() again.
+///
+/// Neither touches this clip's controls or its prefs: a default is about the
+/// NEXT clip.  Every other parameter is ignored (none is supervised), and
+/// every failure is logged and reported, never returned as an error - a
+/// failing button must not make Premiere report a broken effect.
+PF_Err userChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[],
+                        const PF_UserChangedParamExtra* extra) noexcept {
+    if (!extra) {
+        return PF_Err_NONE;
+    }
+    const PF_ParamIndex which = extra->param_index;
+
+    if (which == kIndexSaveDefaults) {
+        // Without the parameter values there is nothing true to save:
+        // readControls() would hand back the built-in defaults, and saving
+        // those silently is worse than saying no.
+        if (!params || !params[kIndexColorOutput]) {
+            PluginLog::warn("source settings: Save as Default arrived without parameter values; nothing saved");
+            reportDefaultsAction(in_data, out_data, "Nothing saved: the host sent no settings.");
+            return PF_Err_NONE;
+        }
+        const PrefsBlob blob = prefsFromControls(readControls(params));
+        const osv::Status saved = osv::premiere::saveUserDefaults(blob);
+        if (saved.ok()) {
+            PluginLog::info("source settings: Save as Default for New Clips - saved");
+            reportDefaultsAction(in_data, out_data, "Saved. New clips start with these settings.");
+        } else {
+            PluginLog::error("source settings: Save as Default for New Clips failed: {}", saved.error().message);
+            reportDefaultsAction(in_data, out_data, "Could not save the defaults. See OpenOSVSourceSettings.log.");
+        }
+        return PF_Err_NONE;
+    }
+
+    if (which == kIndexRestoreDefaults) {
+        const osv::Status removed = osv::premiere::resetUserDefaults();
+        if (removed.ok()) {
+            PluginLog::info("source settings: Restore Built-in Defaults - done");
+            reportDefaultsAction(in_data, out_data, "Restored. New clips start with the built-in settings.");
+        } else {
+            PluginLog::error("source settings: Restore Built-in Defaults failed: {}", removed.error().message);
+            reportDefaultsAction(in_data, out_data, "Could not restore the defaults. See OpenOSVSourceSettings.log.");
+        }
+        return PF_Err_NONE;
+    }
     return PF_Err_NONE;
 }
 
@@ -908,6 +1081,11 @@ extern "C" __declspec(dllexport) PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_dat
             case PF_Cmd_TRANSLATE_PARAMS_TO_PREFS:
                 return translateParamsToPrefs(in_data, params,
                                               static_cast<PF_TranslateParamsToPrefsExtra*>(extra));
+
+            // [WP-DEFAULTS] A click on one of the Defaults group's buttons.
+            case PF_Cmd_USER_CHANGED_PARAM:
+                return userChangedParam(in_data, out_data, params,
+                                        static_cast<const PF_UserChangedParamExtra*>(extra));
 
             // No per-instance state, so the remaining sequence commands only
             // have to leave the handle null.  SEQUENCE_SETUP is handled above

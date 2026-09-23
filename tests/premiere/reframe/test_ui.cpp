@@ -126,6 +126,16 @@ struct UiFixture {
         in = host.makeInData(ref, {});
         in.width = static_cast<A_long>(kFrameW);
         in.height = static_cast<A_long>(kFrameH);
+
+        // [WP-LENSUI] The effect's default lens is DJI; the overlay tests
+        // below drive the Classic camera (the FOV grip, FOV-scaled drags)
+        // unless they select DJI themselves (setDjiLens), so the fixture
+        // starts on Classic.
+        std::vector<PF_ParamDef> added = host.addedParams(ref);
+        REQUIRE(added.size() >= static_cast<std::size_t>(kIndexLens));
+        PF_ParamDef lens = added[static_cast<std::size_t>(kIndexLens) - 1u];
+        lens.u.pd.value = static_cast<A_long>(LensPopup::Classic);
+        host.setParamValue(ref, kIndexLens, lens);
     }
 
     ~UiFixture() {
@@ -2322,13 +2332,20 @@ void setSlider(UiFixture& f, int index, double value) {
     f.host.setParamValue(f.ref, index, def);
 }
 
-/// Tick or untick the Camera Model ("DJI") checkbox of the fixture's instance.
+/// [WP-LENSUI] Pick DJI or Classic in the Lens popup of the fixture's
+/// instance.  The hidden Camera Model mirror is deliberately set to the
+/// OPPOSITE lens, so an overlay that still read the checkbox would show the
+/// wrong read-out and drag the wrong lens - the popup must be what decides.
 void setDjiLens(UiFixture& f, bool on) {
     std::vector<PF_ParamDef> added = f.host.addedParams(f.ref);
-    PF_ParamDef def = added[static_cast<std::size_t>(kIndexCameraModel) - 1u];
-    REQUIRE(def.param_type == PF_Param_CHECKBOX);
-    def.u.bd.value = on ? 1 : 0;
-    f.host.setParamValue(f.ref, kIndexCameraModel, def);
+    PF_ParamDef def = added[static_cast<std::size_t>(kIndexLens) - 1u];
+    REQUIRE(def.param_type == PF_Param_POPUP);
+    def.u.pd.value = static_cast<A_long>(on ? LensPopup::Dji : LensPopup::Classic);
+    f.host.setParamValue(f.ref, kIndexLens, def);
+    PF_ParamDef mirror = added[static_cast<std::size_t>(kIndexCameraModel) - 1u];
+    REQUIRE(mirror.param_type == PF_Param_CHECKBOX);
+    mirror.u.bd.value = on ? 0 : 1;
+    f.host.setParamValue(f.ref, kIndexCameraModel, mirror);
 }
 
 /// A float slider's value in an event's parameter array.
@@ -2568,7 +2585,8 @@ TEST_CASE("DRAW on DJI's lens reads Zoom, FOV and Correction as DJI Studio print
     CHECK(text.find("Pan 144.8") != std::string::npos);
     CHECK(text.find("Tilt -5.9") != std::string::npos);
 
-    // Unticked, the HUD is the Classic readout it always was.
+    // With Classic picked in the Lens popup (and the hidden checkbox now
+    // ticked, the opposite), the HUD is the Classic readout it always was.
     setDjiLens(f, false);
     params = f.params();
     f.host.clearDrawbotRecord();
@@ -2579,6 +2597,44 @@ TEST_CASE("DRAW on DJI's lens reads Zoom, FOV and Correction as DJI Studio print
     const std::string classicText = f.host.drawbotRecord().strings.front().text;
     CHECK(classicText.find("Zoom") == std::string::npos);
     CHECK(classicText.find("FOV 120.0") != std::string::npos);
+}
+
+TEST_CASE("a new instance's HUD and zoom drag follow the default lens, DJI", "[reframe][ui][module][lens]") {
+    // [WP-LENSUI] Put the Lens popup back exactly as registered - its
+    // default, DJI - undoing the fixture's Classic.
+    UiFixture f;
+    {
+        std::vector<PF_ParamDef> added = f.host.addedParams(f.ref);
+        PF_ParamDef lens = added[static_cast<std::size_t>(kIndexLens) - 1u];
+        lens.u.pd.value = lens.u.pd.dephault;
+        REQUIRE(cameraModelFromLensPopup(lens.u.pd.value) == CameraModel::Dji);
+        f.host.setParamValue(f.ref, kIndexLens, lens);
+    }
+    std::vector<PF_ParamDef*> params = f.params();
+
+    // The read-out is DJI's three numbers at their defaults.
+    f.host.clearDrawbotRecord();
+    PF_EventExtra draw = makeExtra(f.host, PF_Event_DRAW);
+    draw.u.draw.depth = 32;
+    REQUIRE(f.event(draw, params) == PF_Err_NONE);
+    REQUIRE_FALSE(f.host.drawbotRecord().strings.empty());
+    const std::string text = f.host.drawbotRecord().strings.front().text;
+    INFO("readout: " << text);
+    CHECK(text.find("Zoom") != std::string::npos);
+    CHECK(text.find("FOV 60.0") != std::string::npos);
+    CHECK(text.find("Correction 0.60") != std::string::npos);
+
+    // And a Ctrl-drag zooms DJI's lens, leaving the hidden Classic FOV alone.
+    PF_EventExtra click = makeClickAt(f.host, 960, 540);
+    click.u.do_click.modifiers = PF_Mod_CMD_CTRL_KEY;
+    REQUIRE(f.event(click, params) == PF_Err_NONE);
+    REQUIRE(click.u.do_click.send_drag == TRUE);
+    PF_EventExtra drag = makeDragFrom(f.host, click, 960, 540 + 40, false);
+    drag.u.do_click.modifiers = PF_Mod_CMD_CTRL_KEY;
+    REQUIRE(f.event(drag, params) == PF_Err_NONE);
+    CHECK(changed(params, kIndexDjiFov));
+    CHECK(changed(params, kIndexCorrection));
+    CHECK_FALSE(changed(params, kIndexFov));
 }
 
 TEST_CASE("a Ctrl-drag zoom on DJI's lens commits DJI FOV, Correction and Zoom through the module",

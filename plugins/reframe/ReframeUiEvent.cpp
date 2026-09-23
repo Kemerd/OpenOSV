@@ -486,12 +486,13 @@ void packRefcon(A_intptr_t refcon[4], int index, std::uint64_t generation) noexc
     if (params[kIndexFov]) {
         v.fovDeg = static_cast<double>(params[kIndexFov]->u.fs_d.value);
     }
-    // [WP-CAMERA] DJI's lens, and which of the two lenses renders.  A host
-    // array without these entries (a short array, an old caller) reads as
-    // Classic with DJI's defaults - exactly what the renderer would draw.
-    if (params[kIndexCameraModel]) {
-        v.dji = cameraModelFromCheckbox(params[kIndexCameraModel]->u.bd.value) == CameraModel::Dji;
-    }
+    // [WP-CAMERA] DJI's lens, and [WP-LENSUI] which of the two lenses
+    // renders: the Lens popup, read exactly as the CPU path's readSettings()
+    // reads it, so the HUD and the zoom drag always follow the lens on
+    // screen.  A host array without the popup (a short array, an old caller)
+    // reads as the popup's default, DJI - again what the renderer would draw.
+    v.dji = (params[kIndexLens] ? cameraModelFromLensPopup(params[kIndexLens]->u.pd.value) : kDefaultCameraModel) ==
+            CameraModel::Dji;
     if (params[kIndexDjiFov]) {
         v.djiFovDeg = static_cast<double>(params[kIndexDjiFov]->u.fs_d.value);
     }

@@ -36,3 +36,4 @@ vcpkg_install.err
 # Neural flow model (~36 MB of third-party weights, rebuilt from pinned
 # upstream sources by scripts/fetch_flow_model.py, never committed)
 /models/
+/.claude

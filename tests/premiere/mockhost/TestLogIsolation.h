@@ -39,6 +39,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -170,6 +171,17 @@ inline std::filesystem::path isolatePluginLogs() {
 
     detail::writeEnvironment(L"LOCALAPPDATA", mine.wstring());
 
+    // [WP-DEFAULTS] The per-user Source Settings defaults file
+    // (plugins/common/UserDefaults.h) is the other per-user file the loaded
+    // plug-ins touch.  A test run must neither READ the user's real one -
+    // every "new clip gets the built-in defaults" expectation would then
+    // depend on what the developer last saved in Premiere - nor WRITE it,
+    // which the Save as Default tests do.  OPENOSV_DEFAULTS_FILE wins over
+    // %APPDATA% in every module, so pointing it into this process's private
+    // directory isolates all of them at once; the file does not exist until
+    // a test saves one, so a fresh run starts from the built-in defaults.
+    detail::writeEnvironment(L"OPENOSV_DEFAULTS_FILE", (mine / L"OpenOSV" / L"defaults.json").wstring());
+
     // Say where the logs went when a developer asked for detail, so a failing
     // test's plug-in log is one copy-paste away rather than a hunt.
     if (std::getenv("OSV_TEST_VERBOSE")) {
@@ -177,5 +189,54 @@ inline std::filesystem::path isolatePluginLogs() {
     }
     return mine;
 }
+
+// ---------------------------------------------------------------------------
+//  [WP-DEFAULTS] A private user defaults file per test
+// ---------------------------------------------------------------------------
+
+/// Point OPENOSV_DEFAULTS_FILE at a fresh file of its own for the lifetime of
+/// the object, then put the previous value back and delete the file.
+///
+/// Every module re-reads the variable on each lookup (UserDefaults.cpp), so
+/// the test process AND every plug-in it loaded follow the switch at once.
+/// Each instance gets its own directory under this process's isolated
+/// LOCALAPPDATA, so a test that saves defaults can never leak them into the
+/// next test - or anywhere near the user's real %APPDATA%.  The file does
+/// not exist until something saves it.
+class ScopedUserDefaultsFile {
+public:
+    ScopedUserDefaultsFile() {
+        m_previous = detail::readEnvironment(L"OPENOSV_DEFAULTS_FILE");
+        // A unique directory per instance: the pid-keyed root plus a counter.
+        static std::atomic<unsigned> counter{0};
+        const std::filesystem::path root = detail::readEnvironment(L"LOCALAPPDATA");
+        const std::filesystem::path base =
+            root.empty() ? std::filesystem::temp_directory_path() : std::filesystem::path(root);
+        m_directory = base / L"OpenOSV" / (L"defaults-test-" + std::to_wstring(counter.fetch_add(1u) + 1u));
+        std::error_code ec;
+        std::filesystem::remove_all(m_directory, ec);  // a leftover of an earlier, crashed run
+        m_path = m_directory / L"defaults.json";
+        detail::writeEnvironment(L"OPENOSV_DEFAULTS_FILE", m_path.wstring());
+    }
+
+    ~ScopedUserDefaultsFile() {
+        detail::writeEnvironment(L"OPENOSV_DEFAULTS_FILE", m_previous);
+        std::error_code ec;
+        std::filesystem::remove_all(m_directory, ec);
+    }
+
+    ScopedUserDefaultsFile(const ScopedUserDefaultsFile&) = delete;
+    ScopedUserDefaultsFile& operator=(const ScopedUserDefaultsFile&) = delete;
+
+    /// The file the variable now names (it may not exist yet).
+    [[nodiscard]] const std::filesystem::path& path() const noexcept { return m_path; }
+    /// The directory holding it, removed on destruction.
+    [[nodiscard]] const std::filesystem::path& directory() const noexcept { return m_directory; }
+
+private:
+    std::wstring m_previous;
+    std::filesystem::path m_directory;
+    std::filesystem::path m_path;
+};
 
 }  // namespace osv::premiere::testsupport

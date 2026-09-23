@@ -2571,6 +2571,19 @@ TEST_CASE("every calibration choice reaches the instance; on the sample they all
         INFO(text);
         REQUIRE(text.find("Calibration slots: native_refine_slave / native_refine_master") != std::string::npos);
         REQUIRE(text.find("Lens accessory: Native") != std::string::npos);
+
+        // The camera's own exposure record, as the sample stores it in every
+        // frame: ISO 142, 1/208 s (104 degrees at 59.94 fps), f/1.9, 6545 K,
+        // LV 9.9, sensor 22-26 C over the take.
+        REQUIRE(text.find("Camera settings (as recorded):") != std::string::npos);
+        CHECK(text.find("  ISO 142\r\n") != std::string::npos);
+        CHECK(text.find("  Shutter 1/208 s (104 deg shutter angle at 59.94 fps)") != std::string::npos);
+        CHECK(text.find("  Aperture f/1.9") != std::string::npos);
+        CHECK(text.find("  White balance 6545 K") != std::string::npos);
+        CHECK(text.find("  Metered light value LV 9.9") != std::string::npos);
+        // Sampled at the first, middle and last frame, so the range's upper
+        // end depends on where the warm-up sits; the first frame is 22 C.
+        CHECK(text.find("  Sensor temperature 22") != std::string::npos);
     }
 
     // ---- the lens-protector guard ran once, and said "none" ----------------

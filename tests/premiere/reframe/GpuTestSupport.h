@@ -174,6 +174,11 @@ private:
 // ---------------------------------------------------------------------------
 
 /// Every value-carrying control of the effect, as a host would store it.
+///
+/// The three popups hold RAW host values: 1-based by default (After Effects'
+/// numbering, which the mock serves), 0-based when a test sets them the way
+/// Premiere 26.2.2 numbers popups on the GPU side.  A test that uses 0-based
+/// values sets every popup it writes 0-based, the Lens included.
 struct Controls {
     int resolution = static_cast<int>(Resolution::MatchSequence);  ///< Popup value.
     int preset = static_cast<int>(Preset::Custom);                 ///< Popup value.
@@ -186,15 +191,25 @@ struct Controls {
     double sourceTilt = 0.0;
     double sourceRoll = 0.0;
     bool smooth = false;
+    /// [WP-LENSUI] The Lens popup.  Classic by default, because FOV and
+    /// Distortion above are Classic numbers and every GPU test written before
+    /// the popup existed describes a Classic camera; the EFFECT's default is
+    /// DJI.  In 1-based numbering "Classic" is 2, the popup's entry count, so
+    /// it also settles the host's numbering as 1-based.
+    int lens = static_cast<int>(LensPopup::Classic);
 };
 
 /// Write `c` onto `node` at `time` the way Premiere 26.2.2 serves it: host
 /// index = AE index - 1 for every control, the group markers (every AE index
 /// that is not a value control, per ReframeParams.h) as Bool false, and
-/// GetParamCount pinned to OSV_REFRAME_PARAM_COUNT.
+/// GetParamCount pinned to OSV_REFRAME_PARAM_COUNT.  The DJI block is not
+/// written (it reads its defaults) except the Lens popup.
 void writeVerbatimControls(mock::MockHost& host, csSDK_int32 node, const Controls& c, PrTime time = 0);
 
-/// The Settings the effect should read from `c` (for CPU references).
+/// The Settings the effect should read from `c` (for CPU references): the
+/// popups decoded exactly as the GPU filter decodes them - the numbering
+/// learned from the three raw values together (decodeHostPopup), then each
+/// one translated.
 [[nodiscard]] Settings settingsOf(const Controls& c);
 
 // ---------------------------------------------------------------------------

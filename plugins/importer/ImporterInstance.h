@@ -65,6 +65,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -386,6 +387,35 @@ public:
     /// its prefs changes are not published back to the engine registry.
     void setEngineOwned(bool owned) noexcept { m_engineOwned = owned; }
 
+    // ---- [WP-DEFAULTS] the per-user defaults a new clip starts from --------
+    /// Start this instance from `prefs` - the user's saved Source Settings
+    /// defaults (plugins/common/UserDefaults.h) - instead of
+    /// PrefsBlob::defaults().
+    ///
+    /// For a clip that already has stored settings this is only a starting
+    /// point: the host hands the stored blob to the next prefs-carrying
+    /// selector (imGetInfo8 follows imOpenFile8) and it replaces the seed
+    /// before anything is rendered.  For a NEW clip the host has no blob, so
+    /// the seed is what the clip is decoded with until the Source Settings
+    /// effect or the dialog stores one.
+    ///
+    /// Only a fresh instance can be seeded: once it has parsed the clip,
+    /// built anything from its prefs or adopted a host blob, the call
+    /// changes nothing and returns false (re-seeding then would silently
+    /// re-stitch a clip under the user).  `source` names the file the
+    /// defaults came from, for the one log line a new clip gets; empty means
+    /// the built-in defaults, which need no announcement.  Takes lock().
+    bool seedStartingPrefs(const PrefsBlob& prefs, std::string source);
+
+    /// True exactly once per instance: when it is still running on seeded
+    /// user defaults because the host has given it no stored settings, i.e.
+    /// the clip is new.  `source` then receives the file the defaults came
+    /// from.  False for a clip with stored settings, for an instance seeded
+    /// with the built-in defaults, and on every call after the first true.
+    /// Takes lock().
+    [[nodiscard]] bool takeUserDefaultsNotice(std::string& source);
+    // ---- [/WP-DEFAULTS] -----------------------------------------------------
+
     /// The per-instance lock.  Every entry point that decodes, renders or
     /// touches the reader takes it.
     [[nodiscard]] std::mutex& lock() noexcept { return m_mutex; }
@@ -393,6 +423,13 @@ public:
     /// Human-readable summary for imAnalysis (camera, mode, colour, lens,
     /// frame rate, calibration slot).  CR/LF line endings as the host wants.
     [[nodiscard]] std::string analysisText() const;
+
+    /// The "Camera settings (as recorded)" block of analysisText(): ISO,
+    /// shutter (with its shutter angle at the clip's frame rate), aperture,
+    /// white balance, metered light value and sensor temperature, read from
+    /// the djmd metadata of the first, middle and last frame.  Caller holds
+    /// m_mutex.  `line` appends one line.
+    void appendCameraSettingsLocked(const std::function<void(const std::string&)>& line) const;
 
     /// Diagnostics gathered while opening (calibration warnings, scaling
     /// notes); written to the log once after open().
@@ -573,6 +610,14 @@ private:
     /// holds m_mutex.
     void publishSettingsLocked(bool fromHost) noexcept;
     // ---- [/WP-SETTINGS] ----------------------------------------------------
+
+    // ---- [WP-DEFAULTS] seedStartingPrefs() / takeUserDefaultsNotice() ------
+    /// The defaults file the starting prefs came from (UTF-8, for the log);
+    /// empty when the instance started from the built-in defaults.
+    std::string m_defaultsSource;
+    /// takeUserDefaultsNotice() has already answered true once.
+    bool m_defaultsNoticeTaken = false;
+    // ---- [/WP-DEFAULTS] -----------------------------------------------------
     std::unique_ptr<AudioDecoder> m_audio;
     bool m_audioProbed = false;
 

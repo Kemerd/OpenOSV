@@ -98,7 +98,8 @@
  *
  *  out_flags2:
  *    PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG 1L << 3  = 0x00000008
- *        honour PF_ParamFlag_START_COLLAPSED on the Advanced topic.
+ *        honour PF_ParamFlag_START_COLLAPSED on the Advanced topic (and
+ *        [WP-DEFAULTS] the Defaults topic).
  *    PF_OutFlag2_SUPPORTS_THREADED_RENDERING      1L << 27 = 0x08000000
  *        sequence_data is null and every handler is re-entrant, so the host
  *        may call this effect from any thread.
@@ -164,10 +165,18 @@
 #define OSV_SS_ID_SEAM_SMOOTHING 22
 #define OSV_SS_ID_NEAR_OFFSET 23
 #define OSV_SS_ID_FAR_OFFSET 24
+/* [WP-DEFAULTS] The "Defaults" group, LAST in the list (indices 25-28): two
+ * buttons that store this clip's settings as the defaults every NEW clip
+ * starts from, or remove them again (plugins/common/UserDefaults.h).  Ids
+ * from 30 up; 20-29 belong to the Stitching group's own additions. */
+#define OSV_SS_ID_DEFAULTS_TOPIC 30
+#define OSV_SS_ID_SAVE_DEFAULTS 31
+#define OSV_SS_ID_RESTORE_DEFAULTS 32
+#define OSV_SS_ID_DEFAULTS_TOPIC_END 33
 
-/* Total parameters excluding the input layer: 20 controls + 4 group markers.
- * out_data->num_params is this + 1. */
-#define OSV_SOURCE_SETTINGS_PARAM_COUNT 24
+/* Total parameters excluding the input layer: 20 value controls + 2 buttons
+ * + 6 group markers.  out_data->num_params is this + 1. */
+#define OSV_SOURCE_SETTINGS_PARAM_COUNT 28
 
 /* ==========================================================================
  *  Popup item strings
@@ -338,6 +347,14 @@
 #define OSV_SS_SEAM_OFFSET_MAX 3.0
 #define OSV_SS_SEAM_OFFSET_DEFAULT 0.0
 
+/* [WP-DEFAULTS] The Defaults group's two buttons: the parameter names (the
+ * panel's left column) and the words on the buttons themselves. */
+#define OSV_SS_DEFAULTS_TOPIC_NAME "Defaults"
+#define OSV_SS_SAVE_DEFAULTS_NAME "Save"
+#define OSV_SS_SAVE_DEFAULTS_BUTTON "Save as Default for New Clips"
+#define OSV_SS_RESTORE_DEFAULTS_NAME "Restore"
+#define OSV_SS_RESTORE_DEFAULTS_BUTTON "Restore Built-in Defaults"
+
 /* ==========================================================================
  *  Everything below is C++ only.
  * ========================================================================== */
@@ -380,6 +397,10 @@ namespace osv::premiere::sourcesettings {
 ///  22    Render Device
 ///  23    Program Monitor Colour   [WP-SETTINGS]
 ///  24  (GROUP_END, Advanced)
+///  25  Defaults           (GROUP_START, starts collapsed)   [WP-DEFAULTS]
+///  26    Save       [Save as Default for New Clips]
+///  27    Restore    [Restore Built-in Defaults]
+///  28  (GROUP_END, Defaults)
 enum ParamIndex : int {
     kIndexColorOutput = 1,
     kIndexRec709Look = 2,
@@ -405,6 +426,13 @@ enum ParamIndex : int {
     kIndexRenderDevice = 22,
     kIndexDirectColour = 23,
     kIndexAdvancedTopicEnd = 24,
+    // [WP-DEFAULTS] Always the last group, so its indices are written
+    // relative to the Advanced terminator: a control added to an earlier
+    // group moves them with it and nothing here has to be renumbered.
+    kIndexDefaultsTopic = kIndexAdvancedTopicEnd + 1,
+    kIndexSaveDefaults = kIndexDefaultsTopic + 1,
+    kIndexRestoreDefaults = kIndexSaveDefaults + 1,
+    kIndexDefaultsTopicEnd = kIndexRestoreDefaults + 1,
 };
 
 /// The permanent id stored at each index, in index order (index 1 first).
@@ -418,14 +446,18 @@ inline constexpr int kParamIdByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
     OSV_SS_ID_NEAR_OFFSET,      OSV_SS_ID_FAR_OFFSET,    OSV_SS_ID_STITCH_TOPIC_END, OSV_SS_ID_ADVANCED_TOPIC,
     OSV_SS_ID_DLOGM_FIT,        OSV_SS_ID_EXPOSURE,      OSV_SS_ID_RENDER_DEVICE,
     OSV_SS_ID_DIRECT_COLOUR,    OSV_SS_ID_ADVANCED_TOPIC_END,
+    // [WP-DEFAULTS]
+    OSV_SS_ID_DEFAULTS_TOPIC,   OSV_SS_ID_SAVE_DEFAULTS, OSV_SS_ID_RESTORE_DEFAULTS, OSV_SS_ID_DEFAULTS_TOPIC_END,
 };
 
 /// Number of user-visible parameters (excludes the input layer).
 inline constexpr int kParamCount = OSV_SOURCE_SETTINGS_PARAM_COUNT;
 
 /// Number of controls that actually carry a value, i.e. everything except the
-/// four GROUP_START / GROUP_END markers.  This is the count that has to round
-/// trip through a PrefsBlob.
+/// GROUP_START / GROUP_END markers and [WP-DEFAULTS] the two Defaults buttons
+/// (a button has no value; it only triggers PF_Cmd_USER_CHANGED_PARAM).
+/// This is the count that has to round trip through a PrefsBlob
+/// ([WP-SEAMTOOLS] five more since the seam tools).
 inline constexpr int kValueParamCount = 20;
 
 /// The parameter names, in index order, so a test can compare the built
@@ -442,6 +474,8 @@ inline constexpr const char* kParamNameByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] 
     "Seam Edge Inset", "Seam Blend",  "Parallax Blend", "Seam Smoothing", "Near Offset", "Far Offset",
     "",               "Advanced",     "D-Log M Curve",
     "Exposure",       "Render Device", "Program Monitor Colour", "",
+    // [WP-DEFAULTS]
+    OSV_SS_DEFAULTS_TOPIC_NAME, OSV_SS_SAVE_DEFAULTS_NAME, OSV_SS_RESTORE_DEFAULTS_NAME, "",
 };
 
 }  // namespace osv::premiere::sourcesettings
