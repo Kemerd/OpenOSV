@@ -22,6 +22,7 @@ add_executable(osv_importer_tests
   ImporterHarness.cpp
   ImporterHarness.h
   test_importer.cpp
+  test_importer_bitdepth.cpp
   test_engine.cpp
   test_prefs_mapping.cpp
   "${CMAKE_SOURCE_DIR}/plugins/importer/PrefsMapping.cpp"

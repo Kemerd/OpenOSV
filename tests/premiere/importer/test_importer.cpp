@@ -566,21 +566,37 @@ TEST_CASE("imGetInfo9 mirrors imGetInfo8 and claims no system-state dependency",
 //  Pixel formats, sizes and descriptors
 // =============================================================================
 
-TEST_CASE("imGetIndPixelFormat lists 32f then 8u", "[importer][format]") {
+TEST_CASE("imGetIndPixelFormat lists 32f first, then 16u for HDR or 8u for SDR", "[importer][format]") {
+    // The list depends on the clip's output signal (ImporterVideo.cpp,
+    // offeredFormatsFor): an HDR clip is never OFFERED 8 bits.  It used to be
+    // "32f then 8u" for every clip; the 8u half of that is what the default
+    // PQ output must no longer advertise.
     ImporterHarness harness;
     REQUIRE(harness.loaded());
 
+    // No prefs and no instance: the defaults, which are PQ (HDR).
     imIndPixelFormatRec rec{};
     REQUIRE(harness.sendIndexed(imGetIndPixelFormat, 0, &rec) == imNoErr);
     REQUIRE(rec.outPixelFormat == PrPixelFormat_BGRA_4444_32f);
 
     std::memset(&rec, 0, sizeof(rec));
     REQUIRE(harness.sendIndexed(imGetIndPixelFormat, 1, &rec) == imNoErr);
-    REQUIRE(rec.outPixelFormat == PrPixelFormat_BGRA_4444_8u);
+    REQUIRE(rec.outPixelFormat == PrPixelFormat_BGRA_4444_16u);
 
     std::memset(&rec, 0, sizeof(rec));
     REQUIRE(harness.sendIndexed(imGetIndPixelFormat, 2, &rec) == imBadFormatIndex);
     REQUIRE(harness.sendIndexed(imGetIndPixelFormat, -1, &rec) == imBadFormatIndex);
+
+    // Rec.709 (SDR) keeps the cheap 8-bit alternative.
+    PrefsBlob sdr = PrefsBlob::defaults();
+    sdr.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::Rec709);
+    std::memset(&rec, 0, sizeof(rec));
+    rec.prefs = &sdr;
+    REQUIRE(harness.sendIndexed(imGetIndPixelFormat, 0, &rec) == imNoErr);
+    REQUIRE(rec.outPixelFormat == PrPixelFormat_BGRA_4444_32f);
+    REQUIRE(harness.sendIndexed(imGetIndPixelFormat, 1, &rec) == imNoErr);
+    REQUIRE(rec.outPixelFormat == PrPixelFormat_BGRA_4444_8u);
+    REQUIRE(harness.sendIndexed(imGetIndPixelFormat, 2, &rec) == imBadFormatIndex);
 }
 
 TEST_CASE("imGetPreferredFrameSize enumerates native, half and quarter",
@@ -643,9 +659,14 @@ TEST_CASE("imSelectClipFrameDescriptor coerces the format and snaps the size",
     prefs.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::Native);
 
     SECTION("a supported format is kept") {
+        // Rec.709: for an SDR clip 8u is a format the importer offers, so a
+        // host that wants it gets it.  (An HDR clip's 8u wish is overruled -
+        // see test_importer_bitdepth.cpp.)
+        PrefsBlob sdr = prefs;
+        sdr.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::Rec709);
         imClipFrameDescriptorRec rec{};
         rec.inPrivateData = clip.privateData();
-        rec.inPrefs = &prefs;
+        rec.inPrefs = &sdr;
         rec.inDesiredClipFrameDescriptor.inPixelFormat = PrPixelFormat_BGRA_4444_8u;
         rec.inDesiredClipFrameDescriptor.inWidth = 6000;
         rec.inDesiredClipFrameDescriptor.inHeight = 3000;
@@ -680,16 +701,27 @@ TEST_CASE("imSelectClipFrameDescriptor coerces the format and snaps the size",
         REQUIRE(rec.outBestFrameDescriptor.inHeight == 1500);
     }
 
-    SECTION("version 2 with Maximum Bit Depth off chooses 8u") {
+    SECTION("version 2 with Maximum Bit Depth off chooses 8u for SDR and 16u for HDR") {
+        // Off is the host's "cheap path" hint.  For an SDR clip that is 8u,
+        // as it always was; for the default PQ clip it used to be 8u too,
+        // which is what put 8-bit PQ on the timeline - it is now 16u, the
+        // cheapest format that keeps the 10-bit signal.
         imClipFrameDescriptorRec2 rec{};
         rec.inPrivateData = clip.privateData();
-        rec.inPrefs = &prefs;
         rec.inDesiredClipFrameDescriptor.inPixelFormat = PrPixelFormat_BGRA_4444_32f;
         rec.inDesiredClipFrameDescriptor.inWidth = 6000;
         rec.inDesiredClipFrameDescriptor.inHeight = 3000;
         rec.inDesiredMaxBitDepth = kMaxBitDepth_Off;
+
+        PrefsBlob sdr = prefs;
+        sdr.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::Rec709);
+        rec.inPrefs = &sdr;
         REQUIRE(harness.send(imSelectClipFrameDescriptor2, nullptr, &rec) == imNoErr);
         REQUIRE(rec.outBestFrameDescriptor.inPixelFormat == PrPixelFormat_BGRA_4444_8u);
+
+        rec.inPrefs = &prefs;  // defaults: PQ
+        REQUIRE(harness.send(imSelectClipFrameDescriptor2, nullptr, &rec) == imNoErr);
+        REQUIRE(rec.outBestFrameDescriptor.inPixelFormat == PrPixelFormat_BGRA_4444_16u);
     }
 
     SECTION("version 2 is refused on a host that predates 23.2") {

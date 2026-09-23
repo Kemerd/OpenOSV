@@ -13,6 +13,9 @@
 #include "Engine.h"
 
 #include "HostContext.h"
+// The importer's own GPU frame path: pinned banded readback, the lock around
+// the shared renderer's output, the context scope.
+#include "ImporterGpuFrame.h"
 // colorSpaceTokenFor(): the per-clip colour log line names the exact token the
 // importer will hand Premiere, so the log and imGetIndColorSpace can never
 // disagree about what the host was told.
@@ -29,6 +32,7 @@
 #include "osv/render/SeamAnalysis.h"
 #if defined(OSV_HAVE_CUDA)
 #include "osv/render/CudaAnalysis.h"
+#include "osv/render/CudaRenderer.h"
 #endif
 
 #include <algorithm>
@@ -1227,7 +1231,8 @@ Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_
 }
 
 Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t index, const OutputGeometry& geometry,
-                                                                bool draft, RenderPurpose purpose) {
+                                                                bool draft, RenderPurpose purpose,
+                                                                int outputTransfer) {
     // The caller holds m_mutex (see the header contract); nothing here locks
     // again or the instance would deadlock on itself.
     if (!m_parsed) {
@@ -1239,6 +1244,15 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     if (index >= m_frameCount) {
         return Error{ErrorCode::InvalidArgument, "frame index " + std::to_string(index) + " beyond the clip"};
     }
+    if (outputTransfer > OSV_TRANSFER_PASSTHROUGH) {
+        return Error{ErrorCode::InvalidArgument, "renderFrame: unknown output transfer " + std::to_string(outputTransfer)};
+    }
+    if (!m_colorBuilt) {
+        rebuildColor();
+    }
+    // An override equal to the clip's own transfer is no override: it must
+    // share the cache key (and the pixels) of an ordinary request.
+    const int transfer = (outputTransfer >= 0 && outputTransfer != m_color.transfer) ? outputTransfer : -1;
 
     const bool wantSeam = m_prefs.seamSearch != 0 && !draft;
     // The parallax correction runs under exactly the conditions the seam
@@ -1252,13 +1266,10 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     // Cache hit: the host asked for the same frame twice (it does, once per
     // requested pixel format while scrubbing).  An Exact request is never
     // served a frame an Interactive render built with a stand-in analysis.
-    if (m_lastFrame.matches(index, geometry, m_prefs, wantSeam, wantParallax, exactWanted)) {
+    if (m_lastFrame.matches(index, geometry, m_prefs, wantSeam, wantParallax, exactWanted, transfer)) {
         return &m_lastFrame.image;
     }
 
-    if (!m_colorBuilt) {
-        rebuildColor();
-    }
     if (!m_stabBuilt) {
         rebuildStabilization();
     }
@@ -1289,9 +1300,85 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
         return pair.error();
     }
 
+    // ---- the stitch job ----------------------------------------------------
+    // Rig, colour, blend, coverage alpha, the per-bucket analyses,
+    // stabilisation and the equirect map - assembled by the one function the
+    // GPU path uses too (buildEquirectJob), so the two paths can never build
+    // different parameter blocks for the same frame.
+    AnalysisOutcome analyses;
+    auto job = buildEquirectJob(index, pair.value(), geometry, draft, purpose, *renderer.pool, analyses, transfer);
+    if (!job.ok()) {
+        return job.error();
+    }
+    const bool frameExact = analyses.exact;
+
+    // Render INTO the cached image, reusing its allocation.  At native
+    // 6000x3000 a fresh image per frame was 288 MB of allocation and
+    // zero-fill that the kernel then overwrote in full - ~50 ms of an
+    // importer frame, measured - and it bought nothing.
+    //
+    // The key is invalidated FIRST: renderInto() may leave a partially
+    // written frame behind if it fails, and a key still naming the previous
+    // frame must never match that.  The buffer itself survives the failure
+    // and is reused by the next attempt.
+    m_lastFrame.frameIndex = RenderedFrame::kNoFrame;
+    Status rendered = okStatus();
+    if (renderer.backend == "cuda") {
+        // The CUDA renderer is shared by every clip, and the GPU path of
+        // another clip may be streaming the renderer's device buffer back
+        // right now; rendering into it underneath that readback would tear
+        // the other clip's frame (see cudaRendererOutputMutex()).
+        std::lock_guard<std::mutex> outputLock(cudaRendererOutputMutex());
+        rendered = renderer.renderer->renderInto(job.value(), m_lastFrame.image);
+    } else {
+        rendered = renderer.renderer->renderInto(job.value(), m_lastFrame.image);
+    }
+    if (!rendered.ok()) {
+        return rendered.error();
+    }
+
+    m_lastFrame.frameIndex = index;
+    m_lastFrame.geometry = geometry;
+    m_lastFrame.prefs = m_prefs;
+    m_lastFrame.seamApplied = wantSeam;
+    m_lastFrame.parallaxWanted = wantParallax;
+    m_lastFrame.exact = frameExact;
+    m_lastFrame.outputTransfer = transfer;
+    return &m_lastFrame.image;
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-IMPORTER] The stitch job, shared by the host and the GPU path
+// ---------------------------------------------------------------------------
+
+OsvColorParams ImporterInstance::colorForTransfer(int outputTransfer) const {
+    // The clip's own block unless a single request asked for another
+    // transfer.  Rebuilt exactly as rebuildColor() builds m_color (and as
+    // directFrame() builds the direct path's), so an override differs from
+    // the clip's own block in the transfer and nothing else.
+    if (outputTransfer < 0 || outputTransfer > OSV_TRANSFER_PASSTHROUGH || outputTransfer == m_color.transfer) {
+        return m_color;
+    }
+    return color::makeColorParams(toDlogMFit(m_prefs.fit()), static_cast<color::OutputTransfer>(outputTransfer),
+                                  m_prefs.exposureStops, inputEncodingFor(m_format.colorMode), true,
+                                  m_format.bitDepth ? m_format.bitDepth : 10u);
+}
+
+Result<render::RenderJob> ImporterInstance::buildEquirectJob(std::uint32_t index, const video::FramePair& pair,
+                                                             const OutputGeometry& geometry, bool draft,
+                                                             RenderPurpose purpose, ThreadPool& pool,
+                                                             AnalysisOutcome& outcome, int outputTransfer) {
+    // The caller holds m_mutex (applyAnalyses and the caches need it).
+    if (!geometry.valid()) {
+        return Error{ErrorCode::InvalidArgument, "buildEquirectJob with an empty output geometry"};
+    }
+
     // ---- per-frame analyses (exactly as osvtool's render loop does them) ---
+    // The colour block is the clip's own unless this one request overrides
+    // the transfer (colorForTransfer); the analyses never depend on it.
+    const OsvColorParams frameColor = colorForTransfer(outputTransfer);
     render::RenderParamsBuilder builder;
-    builder.rig(m_rig).color(m_color).blend(m_blend, true);
+    builder.rig(m_rig).color(frameColor).blend(m_blend, true);
 
     // Alpha = lens coverage (the builder's default, stated here because it
     // has to agree with the alphaType imGetInfo8 declares).
@@ -1311,8 +1398,7 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     // cached per instance.  Shared with the direct GPU path, which feeds the
     // same routine device-resident frames, so both paths use - and fill -
     // one set of caches (see applyAnalyses).
-    const AnalysisOutcome analyses = applyAnalyses(index, pair.value(), draft, purpose, *renderer.pool, builder);
-    const bool frameExact = analyses.exact;
+    outcome = applyAnalyses(index, pair, draft, purpose, pool, builder);
 
     builder.stabilization(stabilizationFor(index));
 
@@ -1325,32 +1411,268 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     map.h = geometry.height;
     builder.equirect(map);
 
-    auto job = builder.build(pair.value());
-    if (!job.ok()) {
-        return job.error();
+    return builder.build(pair);
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-IMPORTER] The importer's own frame, straight into the host's PPix
+// ---------------------------------------------------------------------------
+
+Status ImporterInstance::renderFrameToHost(std::uint32_t index, const OutputGeometry& geometry, bool draft,
+                                           RenderPurpose purpose, const pixelcopy::HostFrame& dst,
+                                           pixelcopy::HostPixelFormat format, int outputTransfer) {
+    // The caller holds m_mutex (the header contract).
+    if (!m_parsed) {
+        return failStatus(ErrorCode::InvalidArgument, "renderFrameToHost before the clip was opened");
     }
-    // Render INTO the cached image, reusing its allocation.  At native
-    // 6000x3000 a fresh image per frame was 288 MB of allocation and
-    // zero-fill that the kernel then overwrote in full - ~50 ms of an
-    // importer frame, measured - and it bought nothing.
-    //
-    // The key is invalidated FIRST: renderInto() may leave a partially
-    // written frame behind if it fails, and a key still naming the previous
-    // frame must never match that.  The buffer itself survives the failure
-    // and is reused by the next attempt.
-    m_lastFrame.frameIndex = RenderedFrame::kNoFrame;
-    const Status rendered = renderer.renderer->renderInto(job.value(), m_lastFrame.image);
+    if (!geometry.valid() || dst.width != static_cast<std::uint32_t>(geometry.width) ||
+        dst.height != static_cast<std::uint32_t>(geometry.height) || !dst.valid(pixelcopy::bytesPerPixel(format))) {
+        return failStatus(ErrorCode::InvalidArgument, "renderFrameToHost: the host frame does not match the geometry");
+    }
+    if (index >= m_frameCount) {
+        return failStatus(ErrorCode::InvalidArgument, "frame index " + std::to_string(index) + " beyond the clip");
+    }
+    if (outputTransfer > OSV_TRANSFER_PASSTHROUGH) {
+        return failStatus(ErrorCode::InvalidArgument,
+                          "renderFrameToHost: unknown output transfer " + std::to_string(outputTransfer));
+    }
+
+    // ---- the GPU path first -------------------------------------------------
+    if (m_gpuFrameState != GpuFrameState::Disabled) {
+        auto served = renderFrameOnGpu(index, geometry, draft, purpose, dst, format, outputTransfer);
+        if (served.ok() && served.value()) {
+            m_gpuFrameFailures = 0;
+            if (m_gpuFrameState != GpuFrameState::Active) {
+                m_gpuFrameState = GpuFrameState::Active;
+            }
+            m_lastFramePath.store(static_cast<int>(FramePath::Gpu), std::memory_order_relaxed);
+            return okStatus();
+        }
+        if (!served.ok()) {
+            // A real failure on a clip the path had accepted: a driver
+            // hiccup, a lost device, VRAM pressure.  This frame takes the
+            // host path; three in a row mean it is not a hiccup.
+            ++m_gpuFrameFailures;
+            PluginLog::warn("video: GPU frame path failed on frame {} of '{}' ({}); this frame takes the host path{}",
+                            index, m_path.filename().string(), served.error().message,
+                            m_gpuFrameFailures >= 3 ? " - three in a row, so this clip stays on it" : "");
+            if (m_gpuFrameFailures >= 3) {
+                m_gpuFrameState = GpuFrameState::Disabled;
+                // Its VRAM (NVDEC surfaces + frame cache) is better spent elsewhere now.
+                if (m_gpuFrameContext) {
+                    m_gpuDecoders.erase(m_gpuFrameContext);
+                }
+            }
+        }
+        // served == false: the path does not apply; renderFrameOnGpu already
+        // set Disabled with its reason when that is permanent.
+    }
+
+    // ---- the host path -------------------------------------------------------
+    const auto tHost = std::chrono::steady_clock::now();
+    auto rendered = renderFrame(index, geometry, draft, purpose, outputTransfer);
     if (!rendered.ok()) {
         return rendered.error();
     }
+    const render::ImageRGBAf* image = rendered.value();
+    if (!image || !image->valid() || image->w != dst.width || image->h != dst.height) {
+        return failStatus(ErrorCode::Internal, "renderFrameToHost: the rendered image does not match the frame");
+    }
+    const auto tCopy = std::chrono::steady_clock::now();
+    // The pool the renderers use (HostContext's), leased so imShutdown on
+    // another thread cannot join it under the copy.
+    std::shared_ptr<ThreadPool> pool;
+    if (HostContext::exists()) {
+        pool = HostContext::instance().threadPoolShared();
+    }
+    OSV_TRY(pixelcopy::rgbaToHost(*image, dst, format, pool.get()));
+    const auto tEnd = std::chrono::steady_clock::now();
+    m_lastFramePath.store(static_cast<int>(FramePath::Host), std::memory_order_relaxed);
+    // The same "frame-cost" line as the GPU path (renderFrame covers decode,
+    // upload, stitch and readback there; copy is the conversion into dst).
+    PluginLog::debug("frame-cost path=host frame={} size={}x{} fmt={} total={:.2f} render={:.2f} copy={:.2f}", index,
+                     geometry.width, geometry.height, pixelcopy::hostPixelFormatName(format),
+                     std::chrono::duration<double, std::milli>(tEnd - tHost).count(),
+                     std::chrono::duration<double, std::milli>(tCopy - tHost).count(),
+                     std::chrono::duration<double, std::milli>(tEnd - tCopy).count());
+    return okStatus();
+}
 
-    m_lastFrame.frameIndex = index;
-    m_lastFrame.geometry = geometry;
-    m_lastFrame.prefs = m_prefs;
-    m_lastFrame.seamApplied = wantSeam;
-    m_lastFrame.parallaxWanted = wantParallax;
-    m_lastFrame.exact = frameExact;
-    return &m_lastFrame.image;
+Result<bool> ImporterInstance::renderFrameOnGpu(std::uint32_t index, const OutputGeometry& geometry, bool draft,
+                                                RenderPurpose purpose, const pixelcopy::HostFrame& dst,
+                                                pixelcopy::HostPixelFormat format, int outputTransfer) {
+#if defined(OSV_HAVE_CUDA)
+    // The caller holds m_mutex.  Every "return false" below means "this path
+    // does not apply" and leaves the frame to the host path; a permanent
+    // reason also sets Disabled and is logged once, so it is not re-probed
+    // on every frame.
+    const auto disable = [this](const std::string& reason) {
+        m_gpuFrameState = GpuFrameState::Disabled;
+        PluginLog::info("video: '{}' keeps the host frame path ({})", m_path.filename().string(), reason);
+        return false;
+    };
+
+    // ---- first use: the switch and the cheap refusals ----------------------
+    if (m_gpuFrameState == GpuFrameState::Untried) {
+        if (importerGpuDecodeDisabledByEnvironment()) {
+            return disable("OPENOSV_IMPORTER_NO_GPU_DECODE is set");
+        }
+        if (m_hwDecodeFailed) {
+            return disable("hardware decoding already failed on this clip");
+        }
+    }
+
+    // ---- the renderer: the GPU path exists only for the CUDA backend -------
+    // Asked for on every frame, exactly as renderFrame asks, so a prefs change
+    // to CPU or OpenCL takes effect at once (the host path then serves it).
+    auto lease = HostContext::instance().acquireRenderer(toDevicePreference(m_prefs.device()));
+    if (!lease.ok()) {
+        return false;  // renderFrame reports the same failure with its own message
+    }
+    HostContext::RendererLease renderer = std::move(lease).value();
+    if (!renderer.renderer || !renderer.pool || renderer.backend != "cuda") {
+        return false;  // CPU / OpenCL chosen or the only thing available: not a permanent refusal
+    }
+    auto* cuda = dynamic_cast<render::CudaRenderer*>(renderer.renderer.get());
+    if (!cuda) {
+        return disable("the CUDA backend is not a CudaRenderer");
+    }
+    m_rendererName = renderer.backend;
+    // Device frames need the GPU band shading (and get the GPU flow solver
+    // for Auto).  The flow solver is bit-identical to the CPU one; the band
+    // shader agrees with the CPU's to 108-111 dB, so with an analysis on this
+    // path's stitch matches the effect's direct path (which shades the same
+    // way) rather than the host path to the last bit - see
+    // test_importer_bitdepth.cpp for the measured difference.
+    ensureGpuAnalyses();
+    // The same lazily built state renderFrame() makes sure of: a clip whose
+    // first request carried no prefs has neither yet.
+    if (!m_colorBuilt) {
+        rebuildColor();
+    }
+    if (!m_stabBuilt) {
+        rebuildStabilization();
+    }
+
+    // ---- the readback (and with it the primary context) ----------------------
+    if (!m_gpuReadback || m_gpuReadback->device() != cuda->deviceIndex()) {
+        auto readback = GpuReadback::acquire(cuda->deviceIndex());
+        if (!readback.ok()) {
+            return disable("pinned readback unavailable: " + readback.error().message);
+        }
+        m_gpuReadback = std::move(readback).value();
+    }
+    CudaContextScope scope(m_gpuReadback->context());
+    if (!scope.ok()) {
+        return Error{ErrorCode::Gpu, "cannot make the primary context current"};
+    }
+
+    // ---- the decoder, in the renderer's own context ---------------------------
+    // Kept in m_gpuDecoders under the primary context, so imQuietFile frees
+    // it with the direct path's decoders (releaseHeavy) and it reopens on the
+    // next frame after an unquiet.
+    auto decoder = m_gpuDecoders.find(m_gpuReadback->context());
+    if (decoder == m_gpuDecoders.end() || !decoder->second) {
+        video::GpuDecoderOptions options;
+        // No context supplied: the decoder retains the device's PRIMARY
+        // context itself - the very context the CUDA runtime, and so the
+        // renderer, runs in.  Its planes are then readable by the stitch
+        // kernel in place (CudaRenderer's zero-copy branch).
+        options.cuContext = nullptr;
+        options.cudaDevice = cuda->deviceIndex();
+        const auto t0 = std::chrono::steady_clock::now();
+        auto opened = video::GpuClipDecoder::open(m_path, m_format, options);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (!opened.ok()) {
+            // Unsupported / InvalidArgument: a stream NVDEC does not take (the
+            // LRF proxy, 8-bit), no NVIDIA decoder.  Anything else (Io, Gpu,
+            // Decoder) may be transient, but reopening per frame would pay
+            // the ~50 ms open each time - one attempt per clip is the rule.
+            return disable("NVDEC decoder unavailable: " + opened.error().message);
+        }
+        if (!opened.value() || opened.value()->cuContext() != m_gpuReadback->context()) {
+            return disable("the NVDEC decoder did not open in the renderer's context");
+        }
+        const video::GpuDecoderStats stats = opened.value()->stats();
+        PluginLog::info("video: '{}' importer frames now decode on NVDEC into VRAM and stitch in place (decoder "
+                        "opened in {:.0f} ms, frame cache {} x {:.1f} MiB)",
+                        m_path.filename().string(), ms, stats.capacitySlots,
+                        static_cast<double>(stats.slotBytes) / (1024.0 * 1024.0));
+        m_gpuFrameContext = m_gpuReadback->context();
+        decoder = m_gpuDecoders.insert_or_assign(m_gpuFrameContext, std::move(opened).value()).first;
+    }
+
+    // Stage timings for the "frame-cost" debug line below (the benchmark's
+    // part F reads it: the only way to time the importer without the host's
+    // own PPix allocation in the number).
+    using StageClock = std::chrono::steady_clock;
+    const auto stageMs = [](StageClock::time_point a, StageClock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const StageClock::time_point tDecode = StageClock::now();
+
+    // ---- decode: a VRAM cache hit, or NVDEC from the right place in the GOP ---
+    OSV_TRY_ASSIGN(video::GpuFrameLease frame, decoder->second->acquire(index));
+    if (!frame.valid() || !frame.pair().onDevice()) {
+        return Error{ErrorCode::Decoder, "the decoder returned no device frame"};
+    }
+    if (frame.pair().device[0].deviceIndex != cuda->deviceIndex()) {
+        return Error{ErrorCode::Internal, "the decoded frame lives on another device than the renderer"};
+    }
+    const StageClock::time_point tJob = StageClock::now();
+
+    // ---- the job: identical assembly to the host path --------------------------
+    AnalysisOutcome analyses;
+    OSV_TRY_ASSIGN(render::RenderJob job, buildEquirectJob(index, frame.pair(), geometry, draft, purpose,
+                                                           *renderer.pool, analyses, outputTransfer));
+    if (!job.planesOnDevice[0] || !job.planesOnDevice[1]) {
+        return Error{ErrorCode::Internal, "the stitch job does not reference the device frames"};
+    }
+
+    // ---- stitch in place, stream straight into the PPix -------------------------
+    {
+        std::lock_guard<std::mutex> outputLock(cudaRendererOutputMutex());
+        const StageClock::time_point tRender = StageClock::now();
+        std::size_t pitch = 0;
+        auto device = cuda->renderToDevice(job, &pitch);
+        // renderToDevice synchronised its stream: the kernel has finished
+        // reading the fisheyes, so the slot may be recycled right away.  The
+        // job's copy of the pair shares the pin (its owner fields), so the
+        // job is emptied too - releasing only the lease would not unpin.
+        job = render::RenderJob{};
+        frame.release();
+        if (!device.ok()) {
+            return device.error();
+        }
+        const StageClock::time_point tReadback = StageClock::now();
+        ReadbackTiming timing;
+        OSV_TRY(m_gpuReadback->copyToHost(device.value(), pitch, static_cast<std::uint32_t>(geometry.width),
+                                          static_cast<std::uint32_t>(geometry.height), dst, format,
+                                          renderer.pool.get(), &timing));
+        const StageClock::time_point tEnd = StageClock::now();
+        // One line per frame, a stable "frame-cost" prefix and key=value
+        // fields: the benchmark parses exactly this.
+        PluginLog::debug("frame-cost path=gpu frame={} size={}x{} fmt={} total={:.2f} decode={:.2f} job={:.2f} "
+                         "render={:.2f} readback={:.2f} waited={:.2f} converted={:.2f} bands={}",
+                         index, geometry.width, geometry.height, pixelcopy::hostPixelFormatName(format),
+                         stageMs(tDecode, tEnd), stageMs(tDecode, tJob), stageMs(tJob, tRender),
+                         stageMs(tRender, tReadback), stageMs(tReadback, tEnd), timing.waitMs, timing.convertMs,
+                         timing.bands);
+    }
+    return true;
+#else
+    (void)index;
+    (void)geometry;
+    (void)draft;
+    (void)purpose;
+    (void)dst;
+    (void)format;
+    (void)outputTransfer;
+    // A build without the CUDA renderer has nothing to render device frames
+    // with; the host path serves every frame.
+    m_gpuFrameState = GpuFrameState::Disabled;
+    return false;
+#endif
 }
 
 // ---------------------------------------------------------------------------

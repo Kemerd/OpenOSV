@@ -10,9 +10,9 @@
 
 #include "ImporterPlugin.h"
 
+#include "Engine.h"
 #include "ImporterInstance.h"
 
-#include "HostContext.h"
 #include "PixelCopy.h"
 #include "PluginLog.h"
 
@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -31,22 +32,153 @@ namespace osv::premiere {
 
 namespace {
 
-/// The two pixel formats the importer produces, in preference order
-/// (decision D3: 32f first because the render is float and the clip is HDR;
-/// 8u second because the host may want a cheap draft).
-constexpr std::array<PrPixelFormat, 2> kPixelFormats = {PrPixelFormat_BGRA_4444_32f, PrPixelFormat_BGRA_4444_8u};
+// ---------------------------------------------------------------------------
+//  Pixel formats: what the importer can produce, and what it offers per clip
+// ---------------------------------------------------------------------------
+//
+// The importer can PRODUCE three layouts for any clip: BGRA 32f, BGRA 16u
+// (0..32768) and BGRA 8u.  What it OFFERS depends on the signal the clip's
+// Source Settings produce, because 8 bits are fine for an SDR picture and
+// ruinous for a 10-bit HDR one: PQ spends its 1024 codes over 0-10000 nits,
+// so 8-bit PQ steps are four times coarser than the camera's and band
+// visibly in every sky.
+//
+// The SDK's rules this follows (PrSDKImport.h, imGetIndPixelFormat;
+// SDK guide 7.5.8 / 7.5.10 / 5.4.1):
+//   * "Pixel formats should be returned in the preferred order" and "the
+//     host will attempt to always talk to the importer in the preferred
+//     pixel format if possible" - so the list is the importer's preference,
+//     and it may differ per clip (imIndPixelFormatRec carries privatedata
+//     and prefs, and the host re-enumerates when Source Settings change).
+//   * "all importers must support BGRA pixel format as well" - so an
+//     EXPLICIT BGRA_4444_8u request is always honoured, even for an HDR clip
+//     that does not list 8u.
+//   * imSelectClipFrameDescriptor exists so that importers can "change pixel
+//     formats based on criteria like enabled hardware and other source
+//     settings, such as HDR" - so the negotiated descriptor may overrule the
+//     host's wish (and its Maximum Bit Depth hint) for an HDR clip.
+//   * "For high-bit depth support, the 32f formats are the recommended
+//     route, rather than the 16u formats" - so 32f leads every list; 16u is
+//     the compact alternative for signals it carries without loss.
 
-/// Bytes per pixel of a format we support (0 for anything else).
-[[nodiscard]] std::size_t bytesPerPixelFor(PrPixelFormat format) noexcept {
-    switch (format) {
-    case PrPixelFormat_BGRA_4444_32f: return pixelcopy::kBytesPerPixel32f;
-    case PrPixelFormat_BGRA_4444_8u:  return pixelcopy::kBytesPerPixel8u;
-    default:                          return 0;
+/// The class of signal a clip's Source Settings produce.
+enum class SignalKind {
+    Sdr,           ///< Rec.709: display-referred, clamped to [0, 1]; 8 bits are the norm.
+    HdrBounded,    ///< PQ / HLG: 10-bit HDR, clamped to [0, 1] by the kernel (osvLinearToOutput).
+    LogUnbounded,  ///< D-Log M passthrough: the camera's log code, unclamped (narrow-range super-whites > 1).
+};
+
+[[nodiscard]] SignalKind signalKindFor(const PrefsBlob& prefs) noexcept {
+    switch (prefs.color()) {
+    case PrefsColorOutput::Rec709: return SignalKind::Sdr;
+    case PrefsColorOutput::DLogM:  return SignalKind::LogUnbounded;
+    case PrefsColorOutput::PQ:
+    case PrefsColorOutput::HLG:
+    case PrefsColorOutput::Count:
+    default:                       return SignalKind::HdrBounded;
     }
 }
 
-/// True when the importer can deliver `format`.
+[[nodiscard]] const char* signalKindName(SignalKind kind) noexcept {
+    switch (kind) {
+    case SignalKind::Sdr:          return "SDR";
+    case SignalKind::HdrBounded:   return "HDR";
+    case SignalKind::LogUnbounded: return "log";
+    default:                       return "unknown";
+    }
+}
+
+/// The formats a clip offers in imGetIndPixelFormat, in preference order.
+///
+///   SDR   32f, 8u   - unchanged: 8u is an exact enough carrier for SDR.
+///   HDR   32f, 16u  - no 8u: 16u (15 bits over [0, 1]) carries the clamped
+///                     PQ / HLG signal 32x finer than the 10-bit source at
+///                     half the bytes of 32f.
+///   log   32f       - the passthrough code can exceed [0, 1], which any
+///                     integer format would clip.
+struct OfferedFormats {
+    std::array<PrPixelFormat, 2> formats{};
+    std::size_t count = 0;
+};
+
+[[nodiscard]] OfferedFormats offeredFormatsFor(const PrefsBlob& prefs) noexcept {
+    switch (signalKindFor(prefs)) {
+    case SignalKind::Sdr:          return {{PrPixelFormat_BGRA_4444_32f, PrPixelFormat_BGRA_4444_8u}, 2};
+    case SignalKind::LogUnbounded: return {{PrPixelFormat_BGRA_4444_32f, PrPixelFormat_BGRA_4444_32f}, 1};
+    case SignalKind::HdrBounded:
+    default:                       return {{PrPixelFormat_BGRA_4444_32f, PrPixelFormat_BGRA_4444_16u}, 2};
+    }
+}
+
+/// The layout PixelCopy writes for a PrPixelFormat we produce.
+[[nodiscard]] bool hostLayoutFor(PrPixelFormat format, pixelcopy::HostPixelFormat& out) noexcept {
+    switch (format) {
+    case PrPixelFormat_BGRA_4444_32f: out = pixelcopy::HostPixelFormat::Bgra32f; return true;
+    case PrPixelFormat_BGRA_4444_16u: out = pixelcopy::HostPixelFormat::Bgra16u; return true;
+    case PrPixelFormat_BGRA_4444_8u:  out = pixelcopy::HostPixelFormat::Bgra8u;  return true;
+    default:                          return false;
+    }
+}
+
+/// Bytes per pixel of a format we produce (0 for anything else).
+[[nodiscard]] std::size_t bytesPerPixelFor(PrPixelFormat format) noexcept {
+    pixelcopy::HostPixelFormat layout{};
+    return hostLayoutFor(format, layout) ? pixelcopy::bytesPerPixel(layout) : 0;
+}
+
+/// True when the importer can produce `format` (for any clip).
 [[nodiscard]] bool isSupportedFormat(PrPixelFormat format) noexcept { return bytesPerPixelFor(format) != 0; }
+
+/// Short name of a format for the log ("32f", "16u", "8u", or the FourCC).
+[[nodiscard]] std::string formatName(PrPixelFormat format) {
+    switch (format) {
+    case PrPixelFormat_BGRA_4444_32f: return "BGRA 32f";
+    case PrPixelFormat_BGRA_4444_16u: return "BGRA 16u";
+    case PrPixelFormat_BGRA_4444_8u:  return "BGRA 8u";
+    case PrPixelFormat_Any:           return "any";
+    default: {
+        char buf[16] = {};
+        std::snprintf(buf, sizeof(buf), "0x%08X", static_cast<unsigned>(format));
+        return buf;
+    }
+    }
+}
+
+/// The format imSelectClipFrameDescriptor(2) answers for a clip.
+///
+/// `maxBitDepth` is the sequence's "Maximum Bit Depth" when the host sent
+/// imSelectClipFrameDescriptor2, kMaxBitDepth_Unknown otherwise.
+///
+///   SDR   Maximum Bit Depth off -> 8u (the cheap path the user chose);
+///         else the host's wish when we produce it, else 32f.
+///   HDR   Maximum Bit Depth off -> 16u: still the cheaper answer, but never
+///         8-bit - this used to say 8u for every clip, which is what put
+///         8-bit PQ on the timeline (sequences default to Maximum Bit Depth
+///         off, and the host then asked every frame in the format this
+///         answer named).  Otherwise the host's wish if it is 32f or 16u,
+///         else 32f.
+///   log   always 32f (see offeredFormatsFor).
+[[nodiscard]] PrPixelFormat negotiatedFormatFor(PrPixelFormat desired, csSDK_uint32 maxBitDepth,
+                                                const PrefsBlob& prefs) noexcept {
+    const bool bitDepthOff = maxBitDepth == kMaxBitDepth_Off;
+    switch (signalKindFor(prefs)) {
+    case SignalKind::Sdr:
+        if (bitDepthOff) {
+            return PrPixelFormat_BGRA_4444_8u;
+        }
+        return isSupportedFormat(desired) ? desired : PrPixelFormat_BGRA_4444_32f;
+    case SignalKind::LogUnbounded:
+        return PrPixelFormat_BGRA_4444_32f;
+    case SignalKind::HdrBounded:
+    default:
+        if (bitDepthOff) {
+            return PrPixelFormat_BGRA_4444_16u;
+        }
+        return (desired == PrPixelFormat_BGRA_4444_32f || desired == PrPixelFormat_BGRA_4444_16u)
+                   ? desired
+                   : PrPixelFormat_BGRA_4444_32f;
+    }
+}
 
 /// Copy a UTF-8 string into a prUTF16Char array (the host's path / stream
 /// name fields).  Always NUL terminated, never overruns.
@@ -117,35 +249,57 @@ void copyUtf16(prUTF16Char* dst, std::size_t capacity, const std::wstring& src) 
     return static_cast<std::uint32_t>(index);
 }
 
-/// Pick the first requested format the importer supports, and the first
-/// requested size.  A null / empty format array means "anything", which per
-/// the design doc is 32f at native size.
+/// Pick the format and size to deliver for an imGetSourceVideo request, and
+/// the first requested size.  A null / empty format array means "anything",
+/// which is the clip's preferred (first offered) format at native size.
 struct FormatChoice {
     PrPixelFormat format = PrPixelFormat_BGRA_4444_32f;
     std::int32_t width = 0;   ///< 0 = caller has no preference.
     std::int32_t height = 0;
+    /// True when the host explicitly asked for 8-bit BGRA for a clip whose
+    /// signal needs more (HDR or log) - honoured, because the SDK obliges
+    /// every importer to support BGRA, but worth a line in the log.
+    bool hostInsistedOn8u = false;
 };
 
-[[nodiscard]] FormatChoice chooseFormat(const imSourceVideoRec& rec) noexcept {
+/// The request's formats are walked in the host's order ("in order of
+/// preference", imSourceVideoRec) and the first one we produce wins:
+///   * PrPixelFormat_Any          -> the clip's preferred format;
+///   * BGRA_4444_8u               -> 8u, ALWAYS: "all importers must support
+///                                   BGRA pixel format as well";
+///   * BGRA_4444_32f              -> 32f;
+///   * BGRA_4444_16u              -> 16u, except for the unbounded log signal,
+///                                   which 16u would clip: that gets 32f, the
+///                                   lossless superset (the host converts);
+///   * anything else              -> skipped.
+/// Nothing usable: the clip's preferred format rather than a failure (the
+/// host converts if it has to).
+[[nodiscard]] FormatChoice chooseFormat(const imSourceVideoRec& rec, const PrefsBlob& prefs) noexcept {
     FormatChoice choice;
+    const SignalKind kind = signalKindFor(prefs);
+    const PrPixelFormat preferred = offeredFormatsFor(prefs).formats[0];
+    choice.format = preferred;
     if (!rec.inFrameFormats || rec.inNumFrameFormats <= 0) {
         return choice;
     }
     for (csSDK_int32 i = 0; i < rec.inNumFrameFormats; ++i) {
         const imFrameFormat& f = rec.inFrameFormats[i];
-        // inPixelFormat 0 (PrPixelFormat_Any) means any format is fine.
-        const bool formatOk = f.inPixelFormat == PrPixelFormat_Any || isSupportedFormat(f.inPixelFormat);
-        if (!formatOk) {
+        PrPixelFormat chosen = f.inPixelFormat;
+        if (chosen == PrPixelFormat_Any) {
+            chosen = preferred;
+        } else if (!isSupportedFormat(chosen)) {
             continue;
+        } else if (chosen == PrPixelFormat_BGRA_4444_16u && kind == SignalKind::LogUnbounded) {
+            chosen = PrPixelFormat_BGRA_4444_32f;
         }
-        choice.format = f.inPixelFormat == PrPixelFormat_Any ? PrPixelFormat_BGRA_4444_32f : f.inPixelFormat;
+        choice.format = chosen;
+        choice.hostInsistedOn8u = chosen == PrPixelFormat_BGRA_4444_8u && kind != SignalKind::Sdr;
         // A 0 dimension means "any", exactly as imFrameFormat documents.
         choice.width = f.inFrameWidth;
         choice.height = f.inFrameHeight;
         return choice;
     }
-    // Nothing matched: fall back to our preferred format at native size
-    // rather than failing.  The host converts if it has to.
+    // Nothing matched: our preferred format at native size.
     return choice;
 }
 
@@ -465,14 +619,34 @@ csSDK_int32 handleGetInfo9(imStdParms* stdParms, imFileAccessRec8* fileAccess, i
 // ---------------------------------------------------------------------------
 
 csSDK_int32 handleGetIndPixelFormat(imStdParms* stdParms, csSDK_int32 index, imIndPixelFormatRec* rec) {
-    (void)stdParms;  // The format list is the same for every clip instance.
     if (!rec) {
         return imOtherErr;
     }
-    if (index < 0 || static_cast<std::size_t>(index) >= kPixelFormats.size()) {
+    // The list depends on the clip's Source Settings (offeredFormatsFor).
+    // The record carries them ("prefs: new in CC"), and the host enumerates
+    // again whenever they change.  Read-only here: this selector must not
+    // re-configure the instance, so the blob is only looked at.  Without a
+    // blob the live instance's current one is used, and without an instance
+    // the defaults - which is also what an instance-less enumeration during
+    // project load describes.
+    PrefsBlob prefs = PrefsBlob::defaults();
+    if (rec->prefs) {
+        prefs = PrefsBlob::fromBytes(rec->prefs, PrefsBlob::kSize);
+    } else if (ImporterInstance* instance = instanceFromHandle(
+                   rec->privatedata, stdParms && stdParms->piSuites ? stdParms->piSuites->memFuncs : nullptr)) {
+        prefs = instance->prefs();
+    }
+    const OfferedFormats offered = offeredFormatsFor(prefs);
+    if (index < 0 || static_cast<std::size_t>(index) >= offered.count) {
         return imBadFormatIndex;
     }
-    rec->outPixelFormat = kPixelFormats[static_cast<std::size_t>(index)];
+    rec->outPixelFormat = offered.formats[static_cast<std::size_t>(index)];
+    if (index == 0) {
+        PluginLog::oncef(std::string("pixel-formats-") + signalKindName(signalKindFor(prefs)), PluginLog::Level::Info,
+                         "imGetIndPixelFormat: offering {}{}{} for a {} clip", formatName(offered.formats[0]),
+                         offered.count > 1 ? ", then " : "", offered.count > 1 ? formatName(offered.formats[1]) : "",
+                         signalKindName(signalKindFor(prefs)));
+    }
     return imNoErr;
 }
 
@@ -518,21 +692,33 @@ csSDK_int32 handleSelectClipFrameDescriptor(imStdParms* stdParms, imClipFrameDes
     instance->applyPrefs(rec->inPrefs, PrefsBlob::kSize);
     const PrefsBlob prefs = instance->prefs();
 
-    // Start from what the host wants and coerce only what we cannot serve.
+    // Start from what the host wants and coerce only what we cannot serve -
+    // or what the clip's signal cannot survive (negotiatedFormatFor).
     rec->outBestFrameDescriptor = rec->inDesiredClipFrameDescriptor;
 
-    PrPixelFormat format = rec->inDesiredClipFrameDescriptor.inPixelFormat;
-    if (!isSupportedFormat(format)) {
-        format = PrPixelFormat_BGRA_4444_32f;
-    }
+    // The sequence's "Maximum Bit Depth" arrives only with the version 2
+    // record (the dispatcher already refused it on hosts that predate 23.2).
+    csSDK_uint32 maxBitDepth = kMaxBitDepth_Unknown;
     if (isVersion2) {
-        // "Maximum Bit Depth" off is an explicit request for the cheap path.
-        const auto* rec2 = static_cast<const imClipFrameDescriptorRec2*>(rec);
-        if (rec2->inDesiredMaxBitDepth == kMaxBitDepth_Off) {
-            format = PrPixelFormat_BGRA_4444_8u;
-        }
+        maxBitDepth = static_cast<const imClipFrameDescriptorRec2*>(rec)->inDesiredMaxBitDepth;
     }
+    const PrPixelFormat desired = rec->inDesiredClipFrameDescriptor.inPixelFormat;
+    const PrPixelFormat format = negotiatedFormatFor(desired, maxBitDepth, prefs);
     rec->outBestFrameDescriptor.inPixelFormat = format;
+
+    // Once per distinct negotiation: the one line that shows, in a real
+    // host's log, what Premiere asked for and what it was told - the
+    // evidence for which format every later imGetSourceVideo will carry.
+    const char* depthName = !isVersion2                        ? "not sent"
+                            : maxBitDepth == kMaxBitDepth_Off ? "off"
+                            : maxBitDepth == kMaxBitDepth_On  ? "on"
+                                                              : "unknown";
+    PluginLog::oncef("descriptor-" + formatName(desired) + "-" + depthName + "-" + formatName(format) + "-" +
+                         signalKindName(signalKindFor(prefs)),
+                     PluginLog::Level::Info,
+                     "imSelectClipFrameDescriptor{}: host wants {}, Maximum Bit Depth {} -> answering {} for a {} clip",
+                     isVersion2 ? "2" : "", formatName(desired), depthName, formatName(format),
+                     signalKindName(signalKindFor(prefs)));
 
     const OutputGeometry g = nearestAdvertisedSize(*instance, prefs, rec->inDesiredClipFrameDescriptor.inWidth,
                                                    rec->inDesiredClipFrameDescriptor.inHeight);
@@ -646,27 +832,54 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
     // the defaults - fromBytes() would do exactly that - so the instance's
     // current blob is used instead.
     const bool haveHostPrefs = rec->prefs != nullptr && rec->prefsSize >= static_cast<csSDK_int32>(PrefsBlob::kSize);
-    PrefsBlob prefs = haveHostPrefs ? PrefsBlob::fromBytes(rec->prefs, static_cast<std::size_t>(rec->prefsSize))
-                                    : instance->prefs();
+    const PrefsBlob prefs = haveHostPrefs
+                                ? PrefsBlob::fromBytes(rec->prefs, static_cast<std::size_t>(rec->prefsSize))
+                                : instance->prefs();
 
     // The connection-space rule: when the host could not use the space we
     // declared it hands back "BT.709 RGB Full" and we must convert ourselves.
-    // Rendering with the Rec.709 transfer is exactly that conversion.  This
-    // overrides the clip's own setting for this frame only, which is why it
-    // is applied to the local blob and then pushed into the instance below -
-    // writing it back into the stored prefs would make the override sticky.
+    // Rendering with the Rec.709 transfer is exactly that conversion.
+    //
+    // It overrides the clip's own setting for THIS request only, so it is a
+    // request-local transfer handed to the render (outputTransfer) - never a
+    // change of the clip's prefs.  It used to be written into the blob that
+    // applyPrefsLocked() adopts, which (a) published "Rec.709" to the
+    // direct-path engine as if the user had changed the clip, so the effect
+    // rendered its views with the wrong colour, and (b) threw away every
+    // analysis cache each time the host switched between the two spaces.
+    //
+    // `delivered` describes what this frame IS - the clip's settings with
+    // the Rec.709 output - and is what keys the host's frame cache and picks
+    // the format, exactly as the override blob used to.  `prefs` stays the
+    // clip's own and is the only blob the instance ever adopts.
     const std::string selected = readString(rec->selectedColorProfileName);
-    if (!selected.empty() && selected == kPrOverranged709 && prefs.color() != PrefsColorOutput::Rec709) {
+    const bool connection709 =
+        !selected.empty() && selected == kPrOverranged709 && prefs.color() != PrefsColorOutput::Rec709;
+    PrefsBlob delivered = prefs;
+    int outputTransfer = -1;
+    if (connection709) {
         PluginLog::oncef("colorspace-fallback-709", PluginLog::Level::Info,
-                         "the host selected '{}'; rendering with the Rec.709 transfer instead of the declared space",
+                         "the host selected '{}'; rendering with the Rec.709 transfer instead of the declared space "
+                         "(this request only - the clip's settings are unchanged)",
                          kPrOverranged709);
-        prefs.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::Rec709);
+        delivered.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::Rec709);
+        outputTransfer = OSV_TRANSFER_REC709;
     }
 
-    const FormatChoice choice = chooseFormat(*rec);
-    const std::size_t bpp = bytesPerPixelFor(choice.format);
-    if (bpp == 0) {
+    const FormatChoice choice = chooseFormat(*rec, delivered);
+    pixelcopy::HostPixelFormat layout{};
+    if (!hostLayoutFor(choice.format, layout)) {
         return imUnsupported;
+    }
+    if (choice.hostInsistedOn8u) {
+        // Honoured (the SDK obliges every importer to deliver BGRA 8u), but a
+        // 10-bit HDR or log signal loses most of its precision in it, so the
+        // support log must say that this is the host's explicit choice.
+        PluginLog::oncef("hdr-8u-request", PluginLog::Level::Warn,
+                         "imGetSourceVideo: the host explicitly asked for 8-bit BGRA frames of a {} clip; serving "
+                         "them as the SDK requires, but they will band. The importer negotiates 16u / 32f for "
+                         "such clips (imSelectClipFrameDescriptor, imGetIndPixelFormat)",
+                         signalKindName(signalKindFor(delivered)));
     }
 
     const OutputGeometry geometry = nearestAdvertisedSize(*instance, prefs, choice.width, choice.height);
@@ -710,11 +923,11 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
         prSuiteError cacheErr = suiteError_Fail;
         if (g.suites.ppixCache->GetFrameFromCacheWithColorSpace) {
             cacheErr = g.suites.ppixCache->GetFrameFromCacheWithColorSpace(
-                importerId, 0, static_cast<csSDK_int32>(frameIndex), 1, &wanted, &cached, rec->inQuality, &prefs,
+                importerId, 0, static_cast<csSDK_int32>(frameIndex), 1, &wanted, &cached, rec->inQuality, &delivered,
                 PrefsBlob::cacheKeySize(), &rec->opaqueColorSpaceIdentifier);
         } else if (g.suites.ppixCache->GetFrameFromCache) {
             cacheErr = g.suites.ppixCache->GetFrameFromCache(importerId, 0, static_cast<csSDK_int32>(frameIndex), 1,
-                                                             &wanted, &cached, &prefs, PrefsBlob::cacheKeySize());
+                                                             &wanted, &cached, &delivered, PrefsBlob::cacheKeySize());
         }
         if (cacheErr == suiteError_NoError && cached) {
             *rec->outFrame = cached;
@@ -722,27 +935,17 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
         }
     }
 
-    // ---- render ------------------------------------------------------------
-    // One lock for decode + render + copy: the image the instance returns
-    // lives in its frame cache and must not be replaced by another thread
-    // while we are reading it.
+    // ---- one lock for decode + render + copy -------------------------------
+    // The instance renders straight into the PPix created below (GPU path)
+    // or through its one-frame cache (host path); either way nothing may
+    // change the instance's settings or caches until the pixels are in.
     std::lock_guard<std::mutex> guard(instance->lock());
     instance->applyPrefsLocked(&prefs, PrefsBlob::kSize);
 
-    auto rendered = instance->renderFrame(frameIndex, geometry, draft, renderPurposeFor(*rec));
-    if (!rendered.ok()) {
-        PluginLog::error("imGetSourceVideo: frame {} failed: {}", frameIndex, rendered.error().message);
-        // A decode failure for one frame is not a bad file; the host shows a
-        // missing frame and carries on.
-        return rendered.error().code == ErrorCode::InvalidArgument ? imFrameNotFound : imDecompressionError;
-    }
-    const render::ImageRGBAf& image = *rendered.value();
-    if (!image.valid() || image.w != static_cast<std::uint32_t>(geometry.width) ||
-        image.h != static_cast<std::uint32_t>(geometry.height)) {
-        return imOtherErr;
-    }
-
     // ---- create the PPix ---------------------------------------------------
+    // Created BEFORE the render, because the render writes into it: the GPU
+    // path streams its bands straight into these pixels, so there is no
+    // intermediate float frame to copy from afterwards.
     PPixHand frame = nullptr;
     // CreateColorManagedPPix is a PPixCreator2 v4 addition (the header marks
     // it "Pr 14.0; color managed extensions"), and the suite is now acquired
@@ -793,32 +996,26 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
     dst.rowBytes = rowBytes;
     dst.width = static_cast<std::uint32_t>(geometry.width);
     dst.height = static_cast<std::uint32_t>(geometry.height);
-
-    // Host 4444 frames are BOTTOM-LEFT origin; PixelCopy's host* functions do
-    // the row flip.  The thread pool comes from the process-wide context so
-    // a 6000x3000 copy is not single threaded.
-    //
-    // Take a shared_ptr LEASE on the pool, not a raw pointer.  HostContext is
-    // process-wide, so the per-clip mutex held here gives no protection at
-    // all against imShutdown running on another thread: that calls
-    // HostContext::shutdown(), which deletes the context, drops the last
-    // reference to the pool and JOINS its workers.  A 6000x3000 32f copy
-    // takes tens of milliseconds, which is a wide window.  The lease keeps
-    // the pool alive for the duration of the copy; an exists() test would
-    // only narrow the race, not close it, because it releases its lock
-    // before we ever touch the pool.
-    std::shared_ptr<ThreadPool> poolLease;
-    if (HostContext::exists()) {
-        poolLease = HostContext::instance().threadPoolShared();
-    }
-    ThreadPool* pool = poolLease.get();
-    Status copyStatus = choice.format == PrPixelFormat_BGRA_4444_32f
-                            ? pixelcopy::rgbaToHostBgra32f(image, dst, pool)
-                            : pixelcopy::rgbaToHostBgra8u(image, dst, pool);
-    if (!copyStatus.ok()) {
+    if (!dst.valid(pixelcopy::bytesPerPixel(layout))) {
         g.suites.ppix->Dispose(frame);
-        PluginLog::error("imGetSourceVideo: pixel copy failed: {}", copyStatus.error().message);
+        PluginLog::error("imGetSourceVideo: the host's PPix is smaller than a {}x{} {} frame (row bytes {})",
+                         geometry.width, geometry.height, pixelcopy::hostPixelFormatName(layout), rowBytes);
         return imOtherErr;
+    }
+
+    // ---- render into it ----------------------------------------------------
+    // Host 4444 frames are BOTTOM-LEFT origin; both paths do the row flip
+    // (PixelCopy's host functions).  The thread pool the conversion runs on
+    // is leased inside, from the process-wide context, so imShutdown on
+    // another thread cannot join it under a copy in progress.
+    const Status rendered =
+        instance->renderFrameToHost(frameIndex, geometry, draft, renderPurposeFor(*rec), dst, layout, outputTransfer);
+    if (!rendered.ok()) {
+        g.suites.ppix->Dispose(frame);
+        PluginLog::error("imGetSourceVideo: frame {} failed: {}", frameIndex, rendered.error().message);
+        // A decode failure for one frame is not a bad file; the host shows a
+        // missing frame and carries on.
+        return rendered.error().code == ErrorCode::InvalidArgument ? imFrameNotFound : imDecompressionError;
     }
 
     // ---- cache + hand over -------------------------------------------------
@@ -826,10 +1023,10 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
         if (g.suites.ppixCache->AddFrameToCacheWithColorSpace) {
             g.suites.ppixCache->AddFrameToCacheWithColorSpace(importerId, 0, frame,
                                                               static_cast<csSDK_int32>(frameIndex), rec->inQuality,
-                                                              &prefs, PrefsBlob::cacheKeySize(),
+                                                              &delivered, PrefsBlob::cacheKeySize(),
                                                               &rec->opaqueColorSpaceIdentifier);
         } else if (g.suites.ppixCache->AddFrameToCache) {
-            g.suites.ppixCache->AddFrameToCache(importerId, 0, frame, static_cast<csSDK_int32>(frameIndex), &prefs,
+            g.suites.ppixCache->AddFrameToCache(importerId, 0, frame, static_cast<csSDK_int32>(frameIndex), &delivered,
                                                 PrefsBlob::cacheKeySize());
         }
     }
@@ -853,7 +1050,38 @@ csSDK_int32 handleAnalysis(imStdParms* stdParms, imAnalysisRec* rec) {
     }
     instance->applyPrefs(rec->prefs, PrefsBlob::kSize);
 
-    const std::string text = instance->analysisText();
+    std::string text = instance->analysisText();
+
+    // Two facts the Properties panel is the natural place for, because both
+    // decide what a user sees and neither is visible anywhere else: which
+    // formats this clip is offered in (8-bit or not), and how its frames are
+    // actually being produced.
+    const PrefsBlob prefs = instance->prefs();
+    const OfferedFormats offered = offeredFormatsFor(prefs);
+    text += "Frame formats offered: " + formatName(offered.formats[0]);
+    if (offered.count > 1) {
+        text += ", " + formatName(offered.formats[1]);
+    }
+    text += std::string(" (") + signalKindName(signalKindFor(prefs)) + " signal)\r\n";
+    switch (instance->lastFramePath()) {
+    case ImporterInstance::FramePath::Gpu:
+        text += "Frame path: NVDEC decode into VRAM, stitched in place, streamed into the frame through pinned "
+                "memory\r\n";
+        break;
+    case ImporterInstance::FramePath::Host:
+        text += "Frame path: decoded to host memory, uploaded, stitched, copied into the frame\r\n";
+        break;
+    case ImporterInstance::FramePath::None:
+    default:
+        break;  // no frame rendered yet: nothing true to say
+    }
+    const std::uint64_t directFrames = engineDirectFrameCount(instance->path());
+    if (directFrames > 0) {
+        text += "Direct path: the reframe effect has rendered " + std::to_string(directFrames) +
+                " view(s) of this clip straight from the fisheyes" +
+                (engineDirectPathActive(instance->path()) ? " (active now)" : "") +
+                "; this equirect stays full quality as its fallback and for every view without the effect\r\n";
+    }
     // Two-step protocol: the first call has no buffer and only wants a size.
     if (!rec->buffer) {
         rec->buffersize = static_cast<csSDK_int32>(text.size() + 1u);

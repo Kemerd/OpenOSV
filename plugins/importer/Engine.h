@@ -21,6 +21,8 @@
 
 #include "PrefsBlob.h"
 
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
 
 namespace osv::premiere {
@@ -34,5 +36,41 @@ void enginePublishPrefs(const std::filesystem::path& path, const PrefsBlob& pref
 /// the CUDA driver and Premiere's context are still alive - never from
 /// DllMain.  Safe to call when the engine was never used.
 void engineShutdown() noexcept;
+
+// ---- [WP-IMPORTER] "the direct path is active for this file" ---------------
+//
+// The effect's direct path renders a clip's view from the fisheyes and
+// ignores the importer's equirect for it.  The engine knows when that is
+// happening; these two functions let the importer know too.
+//
+// What the importer does with it is deliberately NOTHING that changes a
+// pixel.  Its frame for a clip is keyed in Premiere's PPix cache by importer
+// id, stream, frame, format, quality, prefs and colour space - nothing says
+// which view asked - and the same master clip is also the Source Monitor's
+// picture, any sequence's use of it without the effect, the effect's own
+// fallback when the direct path refuses a frame, and a bypassed effect's
+// output.  A cheaper, degraded frame served "because the effect ignores it"
+// would be cached and then shown in exactly those places (docs/PREMIERE.md,
+// "The importer's own frame").  The signal is used for diagnostics only.
+
+/// How long after the last direct frame a file still counts as "direct path
+/// active": two seconds covers a paused playhead and the gaps between
+/// scrub steps without describing a clip the user has long left.
+inline constexpr std::chrono::milliseconds kDirectActiveWindow{2000};
+
+/// Record that the direct path has just served a frame of `path`.  Called by
+/// OsvEngine_AcquireFrame on every successful frame; cheap (a map update
+/// under a mutex), never throws.
+void engineNoteDirectFrame(const std::filesystem::path& path) noexcept;
+
+/// True when the direct path served a frame of `path` within `window`.
+/// Path spelling does not matter (the registry's case-insensitive,
+/// lexically normalised key).  Never throws; false on any failure.
+[[nodiscard]] bool engineDirectPathActive(const std::filesystem::path& path,
+                                          std::chrono::milliseconds window = kDirectActiveWindow) noexcept;
+
+/// Number of frames the direct path has served for `path` since the module
+/// loaded (0 when never) - for the Properties panel and the tests' evidence.
+[[nodiscard]] std::uint64_t engineDirectFrameCount(const std::filesystem::path& path) noexcept;
 
 }  // namespace osv::premiere
