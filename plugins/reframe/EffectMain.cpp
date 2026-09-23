@@ -53,6 +53,7 @@
 #include "ReframeUiEvent.h"
 
 #include "HostContext.h"
+#include "PluginExport.h"
 #include "PluginLog.h"
 
 // The library's preset table, so the static_asserts below can prove the
@@ -1935,8 +1936,8 @@ PF_Err render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[], P
 //  wrapped in a try/catch: an exception unwinding into Premiere's C stack is
 //  undefined behaviour.
 // ===========================================================================
-extern "C" __declspec(dllexport) PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data,
-                                                   PF_ParamDef* params[], PF_LayerDef* output, void* extra) {
+extern "C" OSV_PLUGIN_EXPORT PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data,
+                                               PF_ParamDef* params[], PF_LayerDef* output, void* extra) {
     try {
         switch (cmd) {
             case PF_Cmd_ABOUT:

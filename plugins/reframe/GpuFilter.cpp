@@ -38,14 +38,28 @@
 // Every extern "C" boundary catches (...): an exception unwinding into
 // Premiere's C call stack is undefined behaviour and would take the host
 // down with it.
+//
+// macOS.  Premiere on a Mac hands GPU filters METAL, not CUDA: the device
+// info carries an id<MTLDevice> and an id<MTLCommandQueue>, and a GPU PPix
+// is an id<MTLBuffer>.  Everything above that - the parameter probe and
+// reads, the keyframe easing, buildParams(), the frame inspection - is the
+// same code on both platforms; only the device plumbing and the launch
+// differ, and on a Mac they go through ReframeMetal.h instead of the CUDA
+// driver API.  The direct path (DirectPath.h) is CUDA only and absent there:
+// every view renders from the importer's equirect.
 
+#if !defined(__APPLE__)
 #include "DirectPath.h"
+#else
+#include "ReframeMetal.h"
+#endif
 #include "ReframeCpu.h"
 // [WP-EASING] The Keyframe Easing curves and keyframe walk, shared with the
 // CPU path so both compute the same eased values.
 #include "ReframeEasing.h"
 #include "ReframeParams.h"
 
+#include "PluginExport.h"
 #include "PluginLog.h"
 
 // Adobe headers are #pragma pack(push, 1); nothing of ours is declared while
@@ -59,7 +73,9 @@
 #include "PrSDKSequenceInfoSuite.h"
 #include "PrSDKVideoSegmentSuite.h"
 
+#if !defined(__APPLE__)
 #include <cuda.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -80,14 +96,17 @@
 //  global scope too (an anonymous namespace would give them internal linkage
 //  and the link would fail with an unresolved symbol).
 // ===========================================================================
+#if !defined(__APPLE__)
 extern const unsigned char kOsvReframeFatbin[];
 extern const std::size_t kOsvReframeFatbin_size;
+#endif
 
 namespace {
 
 using osv::premiere::PluginLog;
 using namespace osv::reframe;
 
+#if !defined(__APPLE__)
 /// Name the kernel is exported under (extern "C" in the .cu, so no
 /// mangling).  A mismatch here is caught by the GPU test at load time.
 constexpr const char* kKernelName = "osvReframeEquirectKernel";
@@ -101,12 +120,14 @@ constexpr unsigned kBlockDimY = 16;
 /// Largest device table we keep.  Premiere enumerates at most a handful of
 /// GPUs; 16 is generous and bounds the static state.
 constexpr unsigned kMaxDevices = 16;
+#endif
 
 /// Largest sequence edge we will believe from the Sequence Info Suite.  See
 /// the identical constant in EffectMain.cpp: a corrupt rectangle must become
 /// "unknown", not a camera dimension.
 constexpr long long kMaxSequenceEdge = 65536;
 
+#if !defined(__APPLE__)
 // ===========================================================================
 //  Small helpers
 // ===========================================================================
@@ -273,6 +294,11 @@ void releaseKernels() noexcept {
         slot = DeviceModule{};
     }
 }
+#else
+/// macOS: drop every cached Metal pipeline (ReframeMetal.h), at the same
+/// shutdown point the CUDA modules are unloaded on Windows.
+void releaseKernels() noexcept { osv::reframe::metal::releaseDevices(); }
+#endif
 
 // ===========================================================================
 //  Per-instance state (PrGPUFilterInstance::ioPrivatePluginData)
@@ -300,9 +326,15 @@ struct Instance {
     PrTimelineID timelineId = 0;
     csSDK_int32 nodeId = 0;
 
+#if !defined(__APPLE__)
     CUcontext context = nullptr;
     CUstream stream = nullptr;
     CUfunction kernel = nullptr;
+#else
+    /// The host's id<MTLDevice> and id<MTLCommandQueue>, owned by Premiere.
+    void* metalDevice = nullptr;
+    void* metalQueue = nullptr;
+#endif
 
     /// AE index -> host GetParam index, discovered once in CreateInstance by
     /// probeParams().  Constructed with the static mapping so every read is
@@ -327,6 +359,7 @@ struct Instance {
     /// numbering is a cache of what the host says, not a change of state.
     mutable std::atomic<int> popupBase{static_cast<int>(PopupBase::Unknown)};
 
+#if !defined(__APPLE__)
     // ---- the direct path (DirectPath.h) ---------------------------------
     /// The media file and owning clip node this instance renders; the node
     /// is acquired and released in DisposeInstance.
@@ -341,6 +374,7 @@ struct Instance {
     bool directDisabled = false;
     /// Failures logged so far for this instance (bounded, see render()).
     int directFailures = 0;
+#endif
 
     Instance() noexcept { paramMap.setStatic(); }
 
@@ -641,6 +675,7 @@ void logNode(const PrSDKVideoSegmentSuite& s, csSDK_int32 node, const char* role
                     static_cast<unsigned>(flags), props);
 }
 
+#if !defined(__APPLE__)
 /// Log, once, whether the CUcontext Premiere hands GPU filters is its device's
 /// PRIMARY context.  If it is, the importer's CUDA work (which runs on the
 /// primary context through the runtime API) already shares an address space
@@ -691,6 +726,7 @@ void probeHostContext(CUcontext hostContext) noexcept {
         // Diagnostics must never take the effect down.
     }
 }
+#endif
 
 /// Log the sequence's working colour space - the space the frames an effect
 /// receives, and must return, are expressed in.  A direct render from the
@@ -1404,6 +1440,7 @@ prSuiteError createInstance(PrGPUFilterInstance* io) noexcept {
             return suiteError_Fail;
         }
 
+#if !defined(__APPLE__)
         // CUDA only.  OpenCL was dropped by Premiere in 15.4, Metal is Mac
         // and DirectX is still unreleased for third parties; returning an
         // error here makes the host render this node in software, which is
@@ -1415,6 +1452,17 @@ prSuiteError createInstance(PrGPUFilterInstance* io) noexcept {
             delete inst;
             return suiteError_Fail;
         }
+#else
+        // Metal only: what Premiere renders GPU effects with on a Mac.  Any
+        // other framework gets the same documented software fallback.
+        if (info.outDeviceFramework != PrGPUDeviceFramework_Metal) {
+            PluginLog::info("reframe/gpu: device {} is not Metal (framework {}); using the CPU path",
+                            io->inDeviceIndex, static_cast<int>(info.outDeviceFramework));
+            releaseSuite(basic, kPrSDKGPUDeviceSuite, kPrSDKGPUDeviceSuiteVersion);
+            delete inst;
+            return suiteError_Fail;
+        }
+#endif
         if (!info.outMeetsMinimumRequirementsForAcceleration) {
             PluginLog::info("reframe/gpu: device {} does not meet the acceleration minimum; using the CPU path",
                             io->inDeviceIndex);
@@ -1423,6 +1471,7 @@ prSuiteError createInstance(PrGPUFilterInstance* io) noexcept {
             return suiteError_Fail;
         }
 
+#if !defined(__APPLE__)
         inst->context = static_cast<CUcontext>(info.outContextHandle);
         inst->stream = static_cast<CUstream>(info.outCommandQueueHandle);
         if (!inst->context) {
@@ -1440,6 +1489,27 @@ prSuiteError createInstance(PrGPUFilterInstance* io) noexcept {
             delete inst;
             return suiteError_Fail;
         }
+#else
+        // The host's Metal device and queue (the SDK's own Metal sample reads
+        // the same two fields).  Both stay Premiere's; nothing is retained.
+        inst->metalDevice = info.outDeviceHandle;
+        inst->metalQueue = info.outCommandQueueHandle;
+        if (!inst->metalDevice || !inst->metalQueue) {
+            PluginLog::warn("reframe/gpu: the host reported a Metal device with no device or queue handle");
+            releaseSuite(basic, kPrSDKGPUDeviceSuite, kPrSDKGPUDeviceSuiteVersion);
+            delete inst;
+            return suiteError_Fail;
+        }
+
+        // ---- the pipeline -----------------------------------------------
+        std::string pipelineError;
+        if (!osv::reframe::metal::prepareDevice(io->inDeviceIndex, inst->metalDevice, pipelineError)) {
+            PluginLog::error("reframe/gpu: {}", pipelineError);
+            releaseSuite(basic, kPrSDKGPUDeviceSuite, kPrSDKGPUDeviceSuiteVersion);
+            delete inst;
+            return suiteError_Fail;
+        }
+#endif
 
         // ---- the remaining suites ---------------------------------------
         inst->ppix = acquire<PrSDKPPixSuite>(basic, kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
@@ -1491,6 +1561,7 @@ prSuiteError createInstance(PrGPUFilterInstance* io) noexcept {
         probeParams(*inst);
         probeSourceGraph(*inst);
 
+#if !defined(__APPLE__)
         // ---- the direct path ---------------------------------------------
         // Bind this instance to its source file and learn the working
         // colour space once, here, rather than per frame.  Everything is
@@ -1508,6 +1579,7 @@ prSuiteError createInstance(PrGPUFilterInstance* io) noexcept {
                              inst->source.ok ? std::string("OSV clip") : inst->source.reason, colourReason,
                              inst->directTransfer);
         }
+#endif
 
         io->ioPrivatePluginData = inst;
         // Reframing a 6K equirect into an HD frame is a couple of samples
@@ -1545,9 +1617,11 @@ prSuiteError disposeInstance(PrGPUFilterInstance* io) noexcept {
         if (inst->sequence) {
             releaseSuite(basic, kPrSDKSequenceInfoSuite, inst->sequenceVersion);
         }
+#if !defined(__APPLE__)
         // The owner node the direct path holds must go back BEFORE the suite
         // it was acquired through.
         osv::reframe::direct::releaseSource(inst->segment, inst->source);
+#endif
         if (inst->segment) {
             releaseSuite(basic, kPrSDKVideoSegmentSuite, inst->segmentVersion);
         }
@@ -1586,9 +1660,15 @@ prSuiteError render(PrGPUFilterInstance* instanceData, const PrGPUFilterRenderPa
             return suiteError_InvalidParms;
         }
         Instance* inst = static_cast<Instance*>(instanceData->ioPrivatePluginData);
+#if !defined(__APPLE__)
         if (!inst || !inst->alive() || !inst->kernel || !inst->context) {
             return suiteError_InvalidParms;
         }
+#else
+        if (!inst || !inst->alive() || !inst->metalDevice || !inst->metalQueue) {
+            return suiteError_InvalidParms;
+        }
+#endif
 
         const GpuFrame src = inspectFrame(*inst, inFrames[0]);
         const GpuFrame dst = inspectFrame(*inst, *outFrame);
@@ -1609,7 +1689,11 @@ prSuiteError render(PrGPUFilterInstance* instanceData, const PrGPUFilterRenderPa
                          static_cast<long long>(renderParams->inSequenceTime),
                          static_cast<int>(renderParams->inQuality), renderParams->inDownsampleFactorX,
                          renderParams->inDownsampleFactorY, static_cast<long long>(renderParams->inRenderTicksPerFrame),
+#if !defined(__APPLE__)
                          static_cast<const void*>(inst->stream));
+#else
+                         static_cast<const void*>(inst->metalQueue));
+#endif
 
         // The host hands us an output in the same format as the input; if it
         // ever did not, writing half into a float buffer would corrupt it.
@@ -1649,6 +1733,38 @@ prSuiteError render(PrGPUFilterInstance* instanceData, const PrGPUFilterRenderPa
             return suiteError_Fail;
         }
 
+#if defined(__APPLE__)
+        // ---- launch (Metal) ---------------------------------------------------
+        // The frame data are id<MTLBuffer> handles, not addresses: buildParams()
+        // did its row arithmetic on the handle value, which for a top-down
+        // frame ("GPU Frames always have origin top left") leaves sourceRow0
+        // equal to the handle itself.  Anything else would mean it offset a
+        // handle, so it is refused rather than sampled.
+        if (setup.sourceRow0 != src.data) {
+            PluginLog::oncef("reframe/metal/row0", PluginLog::Level::Error,
+                             "reframe/metal: the source frame is not top-down; rendering in software");
+            return suiteError_Fail;
+        }
+        osv::reframe::metal::FrameRequest request;
+        request.device = inst->metalDevice;
+        request.queue = inst->metalQueue;
+        request.params = setup.params;
+        request.source = setup.source;
+        request.sourceBuffer = src.data;
+        request.sourceOffset = 0;
+        request.outputBuffer = dst.data;
+        request.outputRowBytes = dst.rowBytes;
+        request.outputIsHalf = dst.isHalf ? 1 : 0;
+        request.outputWidth = dst.width;
+        request.outputHeight = dst.height;
+        std::string metalError;
+        if (!osv::reframe::metal::renderFrame(inst->deviceIndex, request, metalError)) {
+            PluginLog::error("reframe/metal: {}", metalError);
+            return suiteError_Fail;
+        }
+        instanceData->outIsRealtime = kPrTrue;
+        return suiteError_NoError;
+#else
         // ---- launch -------------------------------------------------------
         ContextScope scope(inst->context);
         if (!scope.ok()) {
@@ -1765,6 +1881,7 @@ prSuiteError render(PrGPUFilterInstance* instanceData, const PrGPUFilterRenderPa
 
         instanceData->outIsRealtime = kPrTrue;
         return suiteError_NoError;
+#endif
     } catch (...) {
         return suiteError_Fail;
     }
@@ -1780,10 +1897,10 @@ prSuiteError render(PrGPUFilterInstance* instanceData, const PrGPUFilterRenderPa
 //  more than one GPU filter - it holds exactly one, so it is left alone and
 //  a non-zero index is refused.
 // ===========================================================================
-extern "C" __declspec(dllexport) prSuiteError xGPUFilterEntry(csSDK_uint32 inHostInterfaceVersion,
-                                                              csSDK_int32* ioIndex, prBool inStartup,
-                                                              piSuitesPtr piSuites, PrGPUFilter* outFilter,
-                                                              PrGPUFilterInfo* outFilterInfo) {
+extern "C" OSV_PLUGIN_EXPORT prSuiteError xGPUFilterEntry(csSDK_uint32 inHostInterfaceVersion,
+                                                          csSDK_int32* ioIndex, prBool inStartup,
+                                                          piSuitesPtr piSuites, PrGPUFilter* outFilter,
+                                                          PrGPUFilterInfo* outFilterInfo) {
     try {
         // The host tells us which interface it speaks; we implement 2 and
         // nothing older, so an older host is declined cleanly.

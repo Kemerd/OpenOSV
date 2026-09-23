@@ -22,10 +22,18 @@
 # -----------------------------------------------------------------------------
 #  1. The module
 # -----------------------------------------------------------------------------
+# DllMain (the delay-load hook) and the .rc are Windows only; a macOS bundle
+# gets its PiPL from Rez (osv_add_pipl below) and needs no hook.
+if(APPLE)
+  set(_osv_ss_platform_sources)
+else()
+  set(_osv_ss_platform_sources DllMain.cpp OpenOSVSourceSettings.rc)
+endif()
+
 osv_add_premiere_plugin(OpenOSVSourceSettings
   KIND aex
+  EXPORTS EffectMain
   SOURCES
-    DllMain.cpp
     SourceSettingsMain.cpp
     # The pure control <-> PrefsBlob arithmetic.  Its own translation unit so
     # the tests compile the very same source the .aex contains and can walk
@@ -34,7 +42,7 @@ osv_add_premiere_plugin(OpenOSVSourceSettings
     SourceSettingsMapping.cpp
     SourceSettingsMapping.h
     SourceSettingsParams.h
-    OpenOSVSourceSettings.rc
+    ${_osv_ss_platform_sources}
 )
 
 target_include_directories(OpenOSVSourceSettings PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

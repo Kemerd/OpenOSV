@@ -138,6 +138,15 @@ if(TARGET osv_render_cuda)
 endif()
 
 # -----------------------------------------------------------------------------
+#  macOS: the SDK-free half of the Premiere plug-ins (tests/macos/CMakeLists.txt
+#  explains why it is tested without the Adobe SDKs).  Needs the Metal
+#  backend, which every macOS preset builds.
+# -----------------------------------------------------------------------------
+if(APPLE AND TARGET osv_metal)
+  add_subdirectory(macos)
+endif()
+
+# -----------------------------------------------------------------------------
 #  [WP-PANEL] The companion panel's JavaScript (panel/, docs/PANEL.md).
 #
 #  Plain Node with its built-in runner (node:test) and no npm packages: the

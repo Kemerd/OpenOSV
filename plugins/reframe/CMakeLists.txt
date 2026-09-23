@@ -13,7 +13,48 @@
 #       nothing from the CUDA runtime and loads on a machine with no CUDA;
 #    3. delay loading - anything the module imports beyond the Windows API is
 #       resolved from the plug-in's own folder (plugins/common/DelayLoad.cpp).
+#
+#  macOS builds Open360Reframe.plugin instead, in the branch right below:
+#  Premiere hands GPU effects Metal there, so the GPU path is the Metal
+#  twin of the CUDA kernel (ReframeKernel.metal, ReframeMetal.mm), the PiPL
+#  goes through Rez, and the direct path - CUDA only - is not built.
 # =============================================================================
+
+if(APPLE)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/ReframeMetal.cmake")
+
+  osv_add_premiere_plugin(Open360Reframe
+    KIND aex
+    EXPORTS EffectMain xGPUFilterEntry
+    SOURCES
+      EffectMain.cpp
+      GpuFilter.cpp
+      ReframeCpu.cpp
+      ReframeCpu.h
+      ReframeParams.h
+      ReframeEasing.cpp
+      ReframeEasing.h
+      ReframeUi.cpp
+      ReframeUi.h
+      ReframeUiEvent.cpp
+      ReframeUiEvent.h
+  )
+  target_include_directories(Open360Reframe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_link_libraries(Open360Reframe PRIVATE
+    osv_premiere_common   # log, host context (brings osv_render)
+    osv_reframe_metal     # the Metal GPU path and its embedded kernel library
+  )
+
+  osv_add_pipl(Open360Reframe
+    R_FILE  "${CMAKE_CURRENT_SOURCE_DIR}/Open360Reframe.r"
+    OUT_VAR OSV_REFRAME_PIPL_RSRC
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/ReframeParams.h")
+
+  message(STATUS "Open360Reframe")
+  message(STATUS "  Match name    : OpenOSV.Open360Reframe")
+  message(STATUS "  GPU path      : Metal (${OSV_PLUGIN_STAGE_DIR}/Open360Reframe.plugin)")
+  return()
+endif()
 
 # -----------------------------------------------------------------------------
 #  1. The CUDA kernel -> fatbin -> embedded byte array

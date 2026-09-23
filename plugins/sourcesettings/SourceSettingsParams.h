@@ -269,8 +269,14 @@
 #define OSV_SS_FIT_COUNT 3
 #define OSV_SS_FIT_DEFAULT 3
 
-/* PrefsRenderDevice: Auto, Cpu, Cuda, OpenCl. */
+/* PrefsRenderDevice: Auto, Cpu, Cuda, OpenCl.  Entry 3 is the platform's GPU
+ * API - CUDA on Windows, Metal on macOS (HostContext maps the stored value
+ * the same way), so the popup names what that entry really renders with. */
+#if defined(__APPLE__)
+#define OSV_SS_DEVICE_ITEMS "Auto|CPU|Metal|OpenCL"
+#else
 #define OSV_SS_DEVICE_ITEMS "Auto|CPU|CUDA|OpenCL"
+#endif
 #define OSV_SS_DEVICE_COUNT 4
 #define OSV_SS_DEVICE_DEFAULT 1
 

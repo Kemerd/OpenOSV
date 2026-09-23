@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist of an OpenOSV Premiere Pro plug-in bundle, filled in by
+  _osv_add_premiere_bundle() in cmake/OsvPremiereSdk.cmake.
+
+  CFBundlePackageType / CFBundleSignature follow Adobe's own samples:
+  BNDL / ???? for the importer (SDK_File_Import), eFKT / FXTC for the After
+  Effects API effects.  CSResourcesFileMapped lets the host map the .rsrc
+  file (the PiPL) straight from Contents/Resources.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleExecutable</key>
+	<string>@OSV_BUNDLE_EXECUTABLE@</string>
+	<key>CFBundleIdentifier</key>
+	<string>@OSV_BUNDLE_IDENTIFIER@</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>@OSV_BUNDLE_NAME@</string>
+	<key>CFBundlePackageType</key>
+	<string>@OSV_BUNDLE_PACKAGE_TYPE@</string>
+	<key>CFBundleSignature</key>
+	<string>@OSV_BUNDLE_SIGNATURE@</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@OSV_BUNDLE_VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@OSV_BUNDLE_VERSION@</string>
+	<key>CSResourcesFileMapped</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright 2026 The OpenOSV Contributors. Apache License 2.0.</string>
+</dict>
+</plist>

@@ -140,3 +140,87 @@ jobs:
 
       - name: Test
         run: ctest --preset ci-macos
+
+      - name: Backend report
+        run: build/ci-macos/bin/osvtool --version
+
+      # -----------------------------------------------------------------------
+      #  The Premiere Pro plug-ins - only with the private SDK archive.
+      #
+      #  The archive (zip or tar) must hold the Premiere Pro C++ SDK and the
+      #  After Effects C++ SDK folders anywhere inside it; they are found by
+      #  their headers.  It lives in the runner's temp folder only, and is
+      #  deleted by the last step whatever happened.  Never uploaded.
+      # -----------------------------------------------------------------------
+      - name: Fetch the Adobe SDKs (private)
+        id: sdk
+        if: env.OSV_ADOBE_SDK_ARCHIVE_URL != ''
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/adobe-sdk"
+          archive="$RUNNER_TEMP/adobe-sdk.archive"
+          rm -rf "$dest" && mkdir -p "$dest"
+          curl -fsSL --retry 3 -o "$archive" "$OSV_ADOBE_SDK_ARCHIVE_URL"
+          if unzip -tq "$archive" >/dev/null 2>&1; then
+            unzip -q "$archive" -d "$dest"
+          else
+            tar -xf "$archive" -C "$dest"
+          fi
+          rm -f "$archive"
+          pr_header="$(find "$dest" -path '*/Examples/Headers/PrSDKImport.h' -print -quit)"
+          ae_header="$(find "$dest" -path '*/Examples/Resources/AE_General.r' -print -quit)"
+          if [ -z "$pr_header" ] || [ -z "$ae_header" ]; then
+            echo "The SDK archive must contain the Premiere Pro SDK (Examples/Headers/PrSDKImport.h) and the After Effects SDK (Examples/Resources/AE_General.r)." >&2
+            exit 1
+          fi
+          echo "premiere=$(cd "$(dirname "$pr_header")/../.." && pwd)" >> "$GITHUB_OUTPUT"
+          echo "ae=$(cd "$(dirname "$ae_header")/../.." && pwd)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure the plug-ins
+        if: steps.sdk.outcome == 'success'
+        run: >
+          cmake --preset macos-premiere-release -DVCPKG_MANIFEST_INSTALL=OFF
+          "-DOSV_PREMIERE_SDK_DIR=${{ steps.sdk.outputs.premiere }}"
+          "-DOSV_AE_SDK_DIR=${{ steps.sdk.outputs.ae }}"
+
+      - name: Build the plug-ins
+        if: steps.sdk.outcome == 'success'
+        run: cmake --build --preset macos-premiere-release -- -k 0
+
+      - name: Test the plug-in build
+        if: steps.sdk.outcome == 'success'
+        run: ctest --preset macos-premiere
+
+      - name: Skip the plug-ins (no SDK archive configured)
+        if: env.OSV_ADOBE_SDK_ARCHIVE_URL == ''
+        run: |
+          echo "OSV_ADOBE_SDK_ARCHIVE_URL is not set, so the Premiere Pro plug-ins are not built here."
+          echo "The library, osvtool and the SDK-free plug-in tests above ran; see docs/BUILDING_MAC.md."
+
+      - name: Remove the Adobe SDKs
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/adobe-sdk" "$RUNNER_TEMP/adobe-sdk.archive"
+
+      # -----------------------------------------------------------------------
+      #  The release zip.
+      # -----------------------------------------------------------------------
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^ *VERSION \([0-9][0-9.]*\)$/\1/p' CMakeLists.txt | head -1)"
+          name="OpenOSV-${version}-macos-arm64"
+          stage=""
+          if [ -d build/macos-premiere-release/plugins/OpenOSV ]; then
+            stage="--plugin-stage build/macos-premiere-release/plugins/OpenOSV"
+          fi
+          scripts/package_macos.sh --build-dir build/ci-macos --out "dist/${name}.zip" $stage
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the release zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.name }}.zip
+          if-no-files-found: error
+          retention-days: 30

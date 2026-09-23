@@ -29,6 +29,15 @@ enum class HwAccel : std::uint8_t {
     VideoToolbox = 4
 };
 
+/// The hardware back-end of this platform whose frames come back to host
+/// memory: D3D11VA on Windows (any GPU vendor), VideoToolbox on macOS.  What
+/// the importer's host-frame path and its analyses try before software.
+#if defined(__APPLE__)
+inline constexpr HwAccel kHostFrameHwAccel = HwAccel::VideoToolbox;
+#else
+inline constexpr HwAccel kHostFrameHwAccel = HwAccel::D3D11VA;
+#endif
+
 /// Stable lower-case name of a back-end ("none", "d3d11va", "cuda", "auto",
 /// "videotoolbox").
 [[nodiscard]] const char* hwAccelName(HwAccel hw) noexcept;
