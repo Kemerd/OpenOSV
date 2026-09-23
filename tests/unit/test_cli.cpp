@@ -188,6 +188,20 @@ TEST_CASE("osvtool probe/render/seam/selfcheck on the sample clip", "[cli][sampl
         REQUIRE(bad.output.find("--distortion") != std::string::npos);
     }
 
+    SECTION("render with every --stab mode, smooth + horizon lock included; an unknown one is refused") {
+        const auto png = osvtest::tempDir() / "cli_stab.png";
+        for (const char* mode : {"off", "horizon", "full", "smooth", "smooth-horizon"}) {
+            const RunResult r = runTool("render " + clip + " --frame 3 --size 160x90 --device cpu --stab " + mode +
+                                        " --out " + quoted(png));
+            INFO(mode << ": " << r.output);
+            REQUIRE(r.exitCode == 0);
+        }
+        const RunResult bad = runTool("render " + clip + " --frame 0 --size 64x36 --device cpu --stab rocksteady --out " +
+                                      quoted(png));
+        REQUIRE(bad.exitCode != 0);
+        REQUIRE(bad.output.find("unknown --stab") != std::string::npos);
+    }
+
     SECTION("render polar equirect to linear EXR") {
         const auto exr = osvtest::tempDir() / "cli_equirect.exr";
         const RunResult r = runTool("render " + clip + " --frame 0 --mode equirect-polar --size 1024x512 --color linear --device cpu --out " + quoted(exr));

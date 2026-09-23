@@ -633,7 +633,10 @@ void controlsToWidgets(HWND dialog, const DialogControls& c, const CalibrationUi
                                             L"2K (1920 x 960)"};
     fillCombo(dialog, IDC_OUTPUT_SIZE, kSizes, static_cast<int>(std::size(kSizes)), c.outputSize);
 
-    static const wchar_t* const kStab[] = {L"Off", L"Horizon lock", L"Full", L"Smooth"};
+    // Indexed by PrefsStabilization, so the combined mode (the default) is
+    // last: the enum is append-only because the value is saved in projects.
+    static const wchar_t* const kStab[] = {L"Off", L"Horizon lock", L"Full", L"Smooth",
+                                           L"Smooth + horizon lock (default)"};
     fillCombo(dialog, IDC_STABILIZATION, kStab, static_cast<int>(std::size(kStab)), c.stabilization);
 
     // Calibration: indexed by PrefsCalibrationChoice (Auto first, the

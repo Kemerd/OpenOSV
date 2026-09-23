@@ -19,6 +19,15 @@
 //                 roll are cancelled (each axis individually switchable).
 //   Smooth      : the view follows a Gaussian-smoothed orientation:
 //                 C = R_wb^T * R_smooth.
+//   SmoothLevel : Smooth and HorizonLock together, the way DJI Studio runs
+//                 RockSteady and Horizon Leveling at the same time.  The view
+//                 keeps only the level part of the smoothed orientation - its
+//                 heading about world-up - so the shake is gone AND the
+//                 horizon is level:
+//                 C = R_wb^T * R_level(R_smooth),
+//                 where R_level is exactly the HorizonLock levelling, applied
+//                 to R_smooth instead of R_wb.  With smoothing disabled (or an
+//                 orientation that is already smooth) it is HorizonLock.
 #pragma once
 
 #include "osv/core/Math.h"
@@ -30,18 +39,37 @@
 namespace osv::geom {
 
 /// Stabilisation behaviour.
-enum class StabilizationMode { Off, HorizonLock, Full, Smooth };
+///
+/// The values are listed in the order they were introduced; SmoothLevel is
+/// the newest.  Nothing persists this enum (the plug-ins store their own
+/// PrefsStabilization byte and map it), but the order is kept append-only
+/// anyway so logs from different builds read the same.
+enum class StabilizationMode {
+    Off,          ///< No correction: the view is glued to the body.
+    HorizonLock,  ///< Heading follows the body, pitch and roll are levelled.
+    Full,         ///< The view is locked to the reference (first) pose.
+    Smooth,       ///< The view follows the Gaussian-smoothed orientation.
+    SmoothLevel   ///< Smooth heading, levelled pitch and roll (Smooth + HorizonLock).
+};
 
 /// Stable name for logs / JSON.
 [[nodiscard]] const char* stabilizationModeName(StabilizationMode mode) noexcept;
 
+/// True for the modes whose correction reads the smoothed orientation
+/// sequence (Smooth and SmoothLevel).  Every caller that builds the
+/// Smoother output asks this one question, so a mode that needs the
+/// smoothed attitude can never be left without it.
+[[nodiscard]] constexpr bool stabilizationUsesSmoothing(StabilizationMode mode) noexcept {
+    return mode == StabilizationMode::Smooth || mode == StabilizationMode::SmoothLevel;
+}
+
 /// Parameters shared by every mode.
 struct StabilizationParams {
     StabilizationMode mode = StabilizationMode::Off;
-    bool lockYaw = false;            ///< HorizonLock: also cancel yaw (keeps the reference heading).
-    bool lockPitch = true;           ///< HorizonLock: cancel pitch.
-    bool lockRoll = true;            ///< HorizonLock: cancel roll.
-    double smoothSigmaFrames = 15.0; ///< Smooth: Gaussian sigma of the window (frames).
+    bool lockYaw = false;            ///< HorizonLock / SmoothLevel: also cancel yaw (keeps the reference heading).
+    bool lockPitch = true;           ///< HorizonLock / SmoothLevel: cancel pitch.
+    bool lockRoll = true;            ///< HorizonLock / SmoothLevel: cancel roll.
+    double smoothSigmaFrames = 15.0; ///< Smooth / SmoothLevel: Gaussian sigma of the window (frames).
 };
 
 /// Quaternion logarithm: rotation vector (axis * angle) of a unit quaternion.
@@ -65,8 +93,10 @@ struct EulerZXY {
 /// `worldFromBody` is the orientation of the current frame, `reference` the
 /// orientation of the reference frame (usually the first), `worldUp` the
 /// unit up axis of the world frame, and `smoothed` the smoothed orientation
-/// for Smooth mode (falls back to `worldFromBody`, i.e. no correction, when
-/// absent).  Degenerate inputs yield identity.
+/// for Smooth and SmoothLevel.  When it is absent (or not finite) both fall
+/// back to `worldFromBody` as the smoothed pose: Smooth then applies no
+/// correction and SmoothLevel still levels the horizon, exactly as
+/// HorizonLock.  Degenerate inputs yield identity.
 [[nodiscard]] Mat3d stabilizationBodyFromWorld(const Quatd& worldFromBody, const StabilizationParams& params,
                                                const Quatd& reference, const Vec3d& worldUp = Vec3d{0.0, 0.0, 1.0},
                                                const std::optional<Quatd>& smoothed = std::nullopt) noexcept;

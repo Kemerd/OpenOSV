@@ -39,6 +39,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace osv::premiere;
@@ -321,6 +322,30 @@ TEST_CASE("the written file is the documented, human-readable format", "[userdef
     // Never the raw blob: no key names a byte offset or holds 128 numbers.
     CHECK(text.find("reserved") == std::string::npos);
     CHECK(text.find("magic") == std::string::npos);
+}
+
+TEST_CASE("the built-in stabilisation is spelled smooth-horizon-lock, and every older spelling still reads",
+          "[userdefaults]") {
+    // The built-in default is written with its own word ...
+    const std::string text = userDefaultsToJson(PrefsBlob::defaults());
+    CHECK(text.find("\"stabilisation\": \"smooth-horizon-lock\"") != std::string::npos);
+    // ... and each word a person can type lands on its own mode.
+    const std::pair<const char*, PrefsStabilization> kWords[] = {
+        {"off", PrefsStabilization::Off},
+        {"horizon-lock", PrefsStabilization::HorizonLock},
+        {"full", PrefsStabilization::Full},
+        {"smooth", PrefsStabilization::Smooth},
+        {"smooth-horizon-lock", PrefsStabilization::SmoothLevel},
+    };
+    for (const auto& [word, mode] : kWords) {
+        INFO(word);
+        const auto parsed = userDefaultsFromJson(
+            std::string(R"({"format": "openosv-source-settings-defaults", "version": 1, "settings": {"stabilisation": ")") +
+            word + R"("}})");
+        REQUIRE(parsed.ok());
+        CHECK(parsed.value().prefs.stab() == mode);
+        CHECK(parsed.value().notes.empty());
+    }
 }
 
 TEST_CASE("missing keys keep the built-in values", "[userdefaults]") {

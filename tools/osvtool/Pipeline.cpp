@@ -111,10 +111,11 @@ void addPipelineOptions(CLI::App* sub, PipelineOptions& opt) {
     geomGroup->add_flag("--blend,!--no-blend", opt.blend, "Feather-blend the two lenses (off = nearest lens)");
 
     auto* stabGroup = sub->add_option_group("Stabilisation");
-    stabGroup->add_option("--stab", opt.stab, "off|horizon|full|smooth")->default_str("off");
+    stabGroup->add_option("--stab", opt.stab, "off|horizon|full|smooth|smooth-horizon")->default_str("off");
     stabGroup->add_option("--attitude-convention", opt.attitudeConvention,
                           "auto | <order>-<sense>-<up> e.g. xyzw-b2w-ny (default), wxyz-w2b-z; up = y|z|ny|nz")->default_str("auto");
-    stabGroup->add_option("--smooth-sigma", opt.smoothSigmaFrames, "Gaussian sigma in frames for --stab smooth")->default_val(15.0);
+    stabGroup->add_option("--smooth-sigma", opt.smoothSigmaFrames,
+                          "Gaussian sigma in frames for --stab smooth and smooth-horizon")->default_val(15.0);
 
     auto* colorGroup = sub->add_option_group("Colour");
     colorGroup->add_option("--color", opt.color, "pq|hlg|709|linear|dlogm")->default_str("pq");
@@ -329,6 +330,11 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     } else if (stab == "smooth") {
         p->stabParams.mode = geom::StabilizationMode::Smooth;
         p->stabParams.smoothSigmaFrames = options.smoothSigmaFrames;
+    } else if (stab == "smooth-horizon") {
+        // The smoothed heading with a level horizon (Source Settings'
+        // "Smooth + Horizon Lock"), with the same sigma as smooth.
+        p->stabParams.mode = geom::StabilizationMode::SmoothLevel;
+        p->stabParams.smoothSigmaFrames = options.smoothSigmaFrames;
     } else if (stab != "off") {
         return Error{ErrorCode::InvalidArgument, "unknown --stab '" + options.stab + "'"};
     }
@@ -360,7 +366,8 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
             return Error{ErrorCode::Malformed, "clip has no attitude samples; cannot stabilise"};
         }
         p->referenceAttitude = p->attitude->worldFromBody(p->attitude->beginUs());
-        if (p->stabParams.mode == geom::StabilizationMode::Smooth) {
+        // Both smoothing modes read the per-frame smoothed orientation.
+        if (geom::stabilizationUsesSmoothing(p->stabParams.mode)) {
             std::vector<Quatd> perFrame;
             perFrame.reserve(p->attitude->samples().size());
             for (const auto& s : p->attitude->samples()) {
@@ -393,7 +400,7 @@ Mat3d Pipeline::stabilizationFor(std::uint32_t frameIndex) const {
     }
     const Quatd wfb = attitude->worldFromBody(tUs);
     std::optional<Quatd> smoothed;
-    if (stabParams.mode == geom::StabilizationMode::Smooth && frameIndex < smoothedAttitude.size()) {
+    if (geom::stabilizationUsesSmoothing(stabParams.mode) && frameIndex < smoothedAttitude.size()) {
         smoothed = smoothedAttitude[frameIndex];
     }
     return geom::stabilizationBodyFromWorld(wfb, stabParams, referenceAttitude, attitude->worldUp(), smoothed);

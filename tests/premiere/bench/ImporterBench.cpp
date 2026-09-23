@@ -218,11 +218,11 @@ struct ImporterConfig {
     PrefsOutputSize outputSize;
     int requestW;
     int requestH;
-    bool analyses;  ///< Seam search + gain match + horizon lock (the shipping defaults).
+    bool analyses;  ///< Seam search + gain match + smooth + horizon lock (the shipping defaults).
 };
 
-/// The shipping defaults turn on seam search, gain matching and horizon
-/// lock; the importer test pins all three OFF to measure the bare frame path
+/// The shipping defaults turn on seam search, gain matching and smooth +
+/// horizon lock; the importer test pins all three OFF to measure the bare frame path
 /// (and it is that test's "~800 ms native frame 0" that prompted this tool).
 /// Both are measured so the cost of the analyses is visible on its own.
 const ImporterConfig kImporterConfigs[] = {
@@ -239,7 +239,7 @@ PrefsBlob prefsFor(const ImporterConfig& c) {
     p.seamSearch = c.analyses ? 1 : 0;
     p.gainMatch = c.analyses ? 1 : 0;
     p.stabilization =
-        static_cast<std::uint8_t>(c.analyses ? PrefsStabilization::HorizonLock : PrefsStabilization::Off);
+        static_cast<std::uint8_t>(c.analyses ? PrefsStabilization::SmoothLevel : PrefsStabilization::Off);
     return p;
 }
 
@@ -403,7 +403,7 @@ void partB(const Options& o) {
     // on its first imGetSourceVideo (decoder open, CUDA renderer lease).
     osvtool::PipelineOptions po;
     po.input = o.clip;
-    po.stab = "horizon";  // loads the attitude track, as the default prefs do
+    po.stab = "smooth-horizon";  // loads and smooths the attitude track, as the default prefs do
     po.hw = "none";       // the importer decodes in software (ensureReader)
     po.device = "cuda";
     std::unique_ptr<osvtool::Pipeline> pipe;
@@ -460,7 +460,8 @@ void partB(const Options& o) {
         const double firstReadMs = timeMs([&] { first = fresh->read(0); });
 
         // The attitude build rebuildStabilization() performs for any mode
-        // other than Off (convention probe + full-clip AttitudeTrack).
+        // other than Off (convention probe + full-clip AttitudeTrack), plus
+        // the Gaussian smoothing the default mode, smooth + horizon lock, adds.
         const double attitudeMs = timeMs([&] {
             osv::geom::AttitudeTrack::Options attOpt;
             const osv::geom::ConventionScore best = osv::geom::ConventionProbe::best(pipe->track);
@@ -468,7 +469,16 @@ void partB(const Options& o) {
                 attOpt.conv = best.conv;
             }
             auto built = osv::geom::AttitudeTrack::build(pipe->track, attOpt);
-            (void)built;
+            if (built.ok()) {
+                std::vector<osv::Quatd> perSample;
+                perSample.reserve(built.value().samples().size());
+                for (const auto& s : built.value().samples()) {
+                    perSample.push_back(s.worldFromBody);
+                }
+                const auto smoothed =
+                    osv::geom::Smoother(osv::geom::StabilizationParams{}.smoothSigmaFrames).smooth(perSample);
+                (void)smoothed;
+            }
         });
 
         // The first render() on a fresh renderer allocates the device output,
@@ -493,7 +503,7 @@ void partB(const Options& o) {
         std::printf("    first-frame anatomy (cold, each on a fresh object):\n");
         std::printf("      decoder open (2x HEVC)          %8.1f ms\n", readerOpenMs);
         std::printf("      first decode, frame 0           %8.1f ms\n", firstReadMs);
-        std::printf("      attitude build (horizon/full)   %8.1f ms\n", attitudeMs);
+        std::printf("      attitude build + smoothing      %8.1f ms\n", attitudeMs);
         std::printf("      first render() 6000x3000        %8.1f ms   (second call: %.1f ms)\n", coldRenderMs,
                     warmRenderMs);
 
@@ -902,7 +912,7 @@ void partP(const Options& o) {
         prefs.seamSearch = c.analyses ? 1 : 0;
         prefs.gainMatch = c.analyses ? 1 : 0;
         prefs.stabilization =
-            static_cast<std::uint8_t>(c.analyses ? PrefsStabilization::HorizonLock : PrefsStabilization::Off);
+            static_cast<std::uint8_t>(c.analyses ? PrefsStabilization::SmoothLevel : PrefsStabilization::Off);
 
         imFileInfoRec8 info{};
         if (harness.getInfo8(clip, info, &prefs) != imNoErr || info.vidScale <= 0 || info.vidSampleSize <= 0) {

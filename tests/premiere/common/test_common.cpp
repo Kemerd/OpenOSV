@@ -357,7 +357,8 @@ TEST_CASE("PrefsBlob defaults match the documented table", "[common][prefs]") {
     // camera recorded and the SEQUENCE decides the delivery size.  A fixed
     // default here made every reframe upscale from a quarter-area panorama.
     REQUIRE(p.size() == PrefsOutputSize::Native);
-    REQUIRE(p.stab() == PrefsStabilization::HorizonLock);
+    // RockSteady and Horizon Leveling both on, as DJI Studio can run them.
+    REQUIRE(p.stab() == PrefsStabilization::SmoothLevel);
     REQUIRE(p.seamSearch == 1);
     REQUIRE(p.gainMatch == 1);
     REQUIRE(p.calib() == PrefsCalibration::Native);
@@ -388,7 +389,7 @@ TEST_CASE("PrefsBlob sanitise clamps every out-of-range field", "[common][prefs]
         REQUIRE_FALSE(p.sanitise());
         REQUIRE(p.color() == PrefsColorOutput::PQ);
         REQUIRE(p.size() == PrefsOutputSize::Native);
-        REQUIRE(p.stab() == PrefsStabilization::HorizonLock);
+        REQUIRE(p.stab() == PrefsStabilization::SmoothLevel);
         REQUIRE(p.seamSearch == 1);
         REQUIRE(p.gainMatch == 1);
         REQUIRE(p.calib() == PrefsCalibration::Native);
@@ -441,6 +442,27 @@ TEST_CASE("PrefsBlob sanitise clamps every out-of-range field", "[common][prefs]
         REQUIRE(p.fit() == PrefsDlogmFit::Pocket3);
         REQUIRE(p.device() == PrefsRenderDevice::Cuda);
         REQUIRE(p.exposureStops == -1.5f);
+    }
+
+    SECTION("every stabilisation value keeps its meaning; the first one past the list is the default") {
+        // The byte is stored in project files: 0..3 were written before
+        // SmoothLevel (4) existed and must come back untouched.
+        const PrefsStabilization kAll[] = {PrefsStabilization::Off, PrefsStabilization::HorizonLock,
+                                           PrefsStabilization::Full, PrefsStabilization::Smooth,
+                                           PrefsStabilization::SmoothLevel};
+        REQUIRE(std::size(kAll) == static_cast<std::size_t>(PrefsStabilization::Count));
+        for (std::size_t i = 0; i < std::size(kAll); ++i) {
+            INFO("value " << i);
+            REQUIRE(static_cast<std::size_t>(kAll[i]) == i);
+            PrefsBlob p = PrefsBlob::defaults();
+            p.stabilization = static_cast<std::uint8_t>(kAll[i]);
+            REQUIRE(p.sanitise());
+            REQUIRE(p.stab() == kAll[i]);
+        }
+        PrefsBlob p = PrefsBlob::defaults();
+        p.stabilization = static_cast<std::uint8_t>(PrefsStabilization::Count);
+        REQUIRE_FALSE(p.sanitise());
+        REQUIRE(p.stab() == PrefsStabilization::SmoothLevel);
     }
 
     SECTION("exposure is clamped and NaN / infinity are reset") {

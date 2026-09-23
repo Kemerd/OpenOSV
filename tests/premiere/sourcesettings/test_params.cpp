@@ -389,6 +389,10 @@ TEST_CASE("the popup item lists are the documented ones", "[sourcesettings][para
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");
         CHECK(popupItems(params[static_cast<std::size_t>(index) - 1u]) == std::string(items));
     }
+    // Stabilisation spelled out: a project saved before the combined mode
+    // existed stores popup values 1..4, which must still name the same four
+    // modes, with Smooth + Horizon Lock appended after them.
+    CHECK(popupItems(params[kIndexStabilization - 1]) == "Off|Horizon Lock|Full|Smooth|Smooth + Horizon Lock");
 }
 
 TEST_CASE("the Exposure slider's valid range is the blob's own clamp range",

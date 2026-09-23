@@ -244,7 +244,7 @@ struct DialogControls {
     /// plugins/importer/resource.h.)
     int colorOutput = 0;
     int outputSize = 0;     ///< Combo index: 0 Native, 1 4K, 2 2560x1280, 3 2K.
-    int stabilization = 1;  ///< Combo index: 0 Off, 1 Horizon lock, 2 Full, 3 Smooth.
+    int stabilization = 4;  ///< Combo index: 0 Off, 1 Horizon lock, 2 Full, 3 Smooth, 4 Smooth + horizon lock.
     bool seamSearch = true;
     bool gainMatch = true;
     int calibration = 0;    ///< Combo index = PrefsCalibrationChoice: 0 Auto, 1 Native, 2 Lens protectors, 3 Underwater.

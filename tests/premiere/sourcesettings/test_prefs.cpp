@@ -427,7 +427,10 @@ TEST_CASE("all ten controls together round-trip as one blob", "[sourcesettings][
     // possible, which is the one an off-by-one is most likely to overflow.
     fixture.setPopup(kIndexColorOutput, OSV_SS_COLOR_COUNT);
     fixture.setPopup(kIndexOutputSize, OSV_SS_SIZE_COUNT);
-    fixture.setPopup(kIndexStabilization, OSV_SS_STAB_COUNT);
+    // Stabilisation's default IS its last item (Smooth + Horizon Lock), so it
+    // moves to the one before it, Smooth; the last item's own mapping is
+    // pinned by "the popups list every value of their prefs enum".
+    fixture.setPopup(kIndexStabilization, OSV_SS_STAB_COUNT - 1);
     fixture.setCheckbox(kIndexSeamSearch, false);
     fixture.setCheckbox(kIndexGainMatch, false);
     fixture.setPopup(kIndexCalibration, OSV_SS_CALIB_COUNT);
@@ -458,8 +461,9 @@ TEST_CASE("all ten controls together round-trip as one blob", "[sourcesettings][
     CHECK(static_cast<int>(blob.colorOutput) == OSV_SS_COLOR_COUNT - 1);
     CHECK(static_cast<int>(blob.outputSize) == static_cast<int>(PrefsOutputSize::Count) - 1);
     CHECK(static_cast<int>(blob.outputSize) == OSV_SS_SIZE_COUNT - 1);
-    CHECK(static_cast<int>(blob.stabilization) == static_cast<int>(PrefsStabilization::Count) - 1);
-    CHECK(static_cast<int>(blob.stabilization) == OSV_SS_STAB_COUNT - 1);
+    CHECK(static_cast<int>(blob.stabilization) == static_cast<int>(PrefsStabilization::Count) - 2);
+    CHECK(blob.stab() == PrefsStabilization::Smooth);
+    CHECK(blob.stab() != PrefsBlob::defaults().stab());
     // Calibration's last item is the forced bare-lens set (its list is not
     // in enum order; see kCalibrationChoiceByPopup).
     CHECK(blob.calibrationChoice() == sourcesettings::kCalibrationChoiceByPopup[OSV_SS_CALIB_COUNT - 1]);
