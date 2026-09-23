@@ -20,6 +20,7 @@
  *   OsvDirectPlanes      planes        the two lens frames, DEVICE addresses
  *   const float*         seam          seam table (device) or NULL
  *   const float*         warp          warp grid (device) or NULL
+ *   const float*         blendSeam     [WP-SEAM] carved blend-seam table (device) or NULL
  *   unsigned char*       dst           top-left pixel of the output frame (device)
  *   int                  dstRowBytes   positive row pitch in bytes
  *   int                  dstIsHalf     1 = BGRA 16f, 0 = BGRA 32f

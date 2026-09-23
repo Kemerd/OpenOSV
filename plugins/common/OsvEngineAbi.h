@@ -107,6 +107,12 @@ typedef struct OsvEngineFrame {
     uint32_t frameIndex;          /**< The media frame that was decoded. */
     int32_t exact;                /**< 0 when an interactive request got a stand-in analysis. */
     void* lease;                  /**< Opaque; hand to OsvEngine_ReleaseFrame exactly once. */
+    /* ---- [WP-SEAM] ---------------------------------------------------------- */
+    /** Device copy of the carved blend-seam table (stitch.blendSeamColumns
+     *  interleaved (latitude, half width) radian pairs, see osv_kernel.h) or
+     *  NULL when stitch.blendSeamEnabled is 0.  Freed with the lease. */
+    const float* blendSeamDevice;
+    /* ---- [/WP-SEAM] --------------------------------------------------------- */
 } OsvEngineFrame;
 
 /** ABI version of the loaded engine (compare with OSV_ENGINE_ABI_VERSION). */

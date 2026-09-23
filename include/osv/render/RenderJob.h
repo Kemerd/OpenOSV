@@ -35,6 +35,11 @@ struct RenderJob {
     /// pairs (empty when disabled).  See osv_kernel.h and ParallaxWarp.h.
     std::vector<float> warpGrid;
 
+    /// [WP-SEAM] Carved blend-seam table: interleaved (latitude, feather half
+    /// width) radian pairs, blendSeamColumns of them (empty when disabled).
+    /// See osv_kernel.h and SeamCarve.h.
+    std::vector<float> blendSeam;
+
     /// True when both planes describe usable memory and the output size is sane.
     [[nodiscard]] bool valid() const noexcept {
         if (params.outW <= 0 || params.outH <= 0 || params.outW > 32768 || params.outH > 32768) {
@@ -57,6 +62,14 @@ struct RenderJob {
             const std::size_t need = static_cast<std::size_t>(params.warpW) *
                                      static_cast<std::size_t>(params.warpH) * 2u;
             if (warpGrid.size() != need) {
+                return false;
+            }
+        }
+        // [WP-SEAM] The kernel reads two floats per blend-seam column; a
+        // table of any other length would be indexed past its end.
+        if (params.blendSeamEnabled) {
+            if (params.blendSeamColumns <= 0 ||
+                blendSeam.size() != static_cast<std::size_t>(params.blendSeamColumns) * 2u) {
                 return false;
             }
         }

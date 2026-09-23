@@ -355,6 +355,7 @@ bool renderDirect(const DirectRequest& request, std::string& reason) noexcept {
         stitch.equirect = frame.stitch;
         stitch.seamTable = frame.seamDevice;
         stitch.warpGrid = frame.warpDevice;
+        stitch.blendSeam = frame.blendSeamDevice;  // [WP-SEAM] pass-through of the carved seam table
         const DirectSetup setup = buildDirectParams(request.settings, stitch, request.output.width,
                                                     request.output.height, request.sequenceSize);
         if (!setup.valid) {

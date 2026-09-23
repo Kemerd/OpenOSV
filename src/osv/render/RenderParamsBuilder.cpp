@@ -81,6 +81,50 @@ RenderParamsBuilder& RenderParamsBuilder::clearWarp() {
     return *this;
 }
 
+// ---------------------------------------------------------------------------
+//  [WP-SEAM] carved blend seam
+// ---------------------------------------------------------------------------
+RenderParamsBuilder& RenderParamsBuilder::blendSeam(const std::vector<float>& table, std::uint32_t columns,
+                                                    float edgeRad) {
+    // The kernel reads exactly two floats per column and interpolates them,
+    // so the payload must match the declared size and every entry must be a
+    // usable number: a NaN latitude would poison every ray of its column.
+    const std::size_t need = static_cast<std::size_t>(columns) * 2u;
+    bool sane = columns > 0 && columns <= 65536u && table.size() == need;
+    for (std::size_t i = 0; sane && i < table.size(); ++i) {
+        sane = std::isfinite(table[i]);
+        // Odd entries are feather half widths: never negative, never wider
+        // than a quarter turn (a wider feather is not a seam any more).
+        if (sane && (i % 2u) == 1u) {
+            sane = table[i] >= 0.0f && table[i] <= 1.5707964f;
+        }
+        // Even entries are latitudes of the polar-axis layout.
+        if (sane && (i % 2u) == 0u) {
+            sane = std::fabs(table[i]) <= 1.5707964f;
+        }
+    }
+    sane = sane && std::isfinite(edgeRad) && edgeRad >= 0.0f && edgeRad <= 1.5707964f;
+    if (!sane) {
+        if (!table.empty()) {
+            log::warn("blend seam table refused ({} floats for {} columns, or a non-finite value); rendering "
+                      "without it",
+                      table.size(), columns);
+        }
+        return clearBlendSeam();
+    }
+    m_blendSeam = table;
+    m_blendSeamColumns = columns;
+    m_blendSeamEdgeRad = edgeRad;
+    return *this;
+}
+
+RenderParamsBuilder& RenderParamsBuilder::clearBlendSeam() {
+    m_blendSeam.clear();
+    m_blendSeamColumns = 0;
+    m_blendSeamEdgeRad = 0.0f;
+    return *this;
+}
+
 RenderParamsBuilder& RenderParamsBuilder::color(const OsvColorParams& params) {
     m_color = params;
     return *this;
@@ -240,6 +284,11 @@ Result<OsvRenderParams> RenderParamsBuilder::buildParams() const {
     }
     p.outputAlphaCoverage = m_alphaCoverage ? 1 : 0;
     p.color = *m_color;
+    // [WP-SEAM] All zero without a table (the memset above), which is what
+    // keeps every render without a carved seam exactly as it was.
+    p.blendSeamEnabled = m_blendSeam.empty() ? 0 : 1;
+    p.blendSeamColumns = m_blendSeam.empty() ? 0 : static_cast<int>(m_blendSeamColumns);
+    p.blendSeamEdgeRad = m_blendSeam.empty() ? 0.0f : m_blendSeamEdgeRad;
     return p;
 }
 
@@ -279,6 +328,7 @@ Result<RenderJob> RenderParamsBuilder::build(const video::FramePair& frames) con
     }
     job.seamShiftDeg = m_seam;
     job.warpGrid = m_warp;
+    job.blendSeam = m_blendSeam;  // [WP-SEAM]
     return job;
 }
 

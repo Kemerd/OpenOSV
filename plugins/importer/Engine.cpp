@@ -208,8 +208,9 @@ struct EngineLease {
     CUcontext context = nullptr;
     CUdeviceptr seam = 0;                    ///< Device copy of the seam table.
     CUdeviceptr warp = 0;                    ///< Device copy of the warp grid.
+    CUdeviceptr blendSeam = 0;               ///< [WP-SEAM] Device copy of the carved blend-seam table.
 
-    /// Free the two device tables.  The caller has pushed `context`.
+    /// Free the device tables.  The caller has pushed `context`.
     void freeTables() noexcept {
         if (seam) {
             (void)cuMemFree(seam);
@@ -218,6 +219,11 @@ struct EngineLease {
         if (warp) {
             (void)cuMemFree(warp);
             warp = 0;
+        }
+        // [WP-SEAM]
+        if (blendSeam) {
+            (void)cuMemFree(blendSeam);
+            blendSeam = 0;
         }
     }
 };
@@ -415,6 +421,11 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
         if (uploaded.ok()) {
             uploaded = uploadTable(job.params.warpEnabled ? job.warpGrid : std::vector<float>{}, lease->warp);
         }
+        // [WP-SEAM] the carved blend-seam table, a few KB like the others.
+        if (uploaded.ok()) {
+            uploaded = uploadTable(job.params.blendSeamEnabled ? job.blendSeam : std::vector<float>{},
+                                   lease->blendSeam);
+        }
         if (!uploaded.ok()) {
             lease->freeTables();
             writeError(error, errorCapacity, uploaded.error().message);
@@ -427,6 +438,8 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
         out->planes[1] = job.planes[1];
         out->seamDevice = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(lease->seam));
         out->warpDevice = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(lease->warp));
+        // [WP-SEAM]
+        out->blendSeamDevice = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(lease->blendSeam));
         // The stitch block is an equirect block, whose Rout is exactly the
         // frame's body-from-world stabilisation.
         std::memcpy(out->bodyFromWorld, job.params.Rout, sizeof(out->bodyFromWorld));
@@ -436,9 +449,11 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
         g_liveLeases.fetch_add(1);
 
         PluginLog::oncef("direct/first-frame", PluginLog::Level::Info,
-                         "direct: first frame served - '{}' frame {} (media {} ticks), transfer {}, seam {}, warp {}",
+                         "direct: first frame served - '{}' frame {} (media {} ticks), transfer {}, seam {}, warp {}, "
+                         "blend seam {}",
                          path.filename().string(), index, static_cast<long long>(request->mediaTicks),
-                         out->stitch.color.transfer, out->seamDevice ? "yes" : "no", out->warpDevice ? "yes" : "no");
+                         out->stitch.color.transfer, out->seamDevice ? "yes" : "no", out->warpDevice ? "yes" : "no",
+                         out->blendSeamDevice ? "yes" : "no");
         return OSV_ENGINE_OK;
     } catch (const std::exception& e) {
         writeError(error, errorCapacity, std::string("internal error: ") + e.what());

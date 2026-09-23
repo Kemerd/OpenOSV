@@ -16,9 +16,11 @@ struct OsvPlanePair {
     OsvPlane p[2];
 };
 
-/// Launch the reframe kernel asynchronously on `stream`.
+/// Launch the reframe kernel asynchronously on `stream`.  `blendSeam` is the
+/// device copy of the carved blend-seam table ([WP-SEAM]) or null.
 cudaError_t osvCudaLaunchReframe(const OsvRenderParams& params, const OsvPlanePair& planes, const float* seam,
-                                 const float* warp, float* out, int outPitchFloats, cudaStream_t stream);
+                                 const float* warp, const float* blendSeam, float* out, int outPitchFloats,
+                                 cudaStream_t stream);
 
 /// Launch the equirect reframe kernel (osvReframeEquirectPixel) asynchronously
 /// on `stream`.  `pixels` is the device copy of the source equirect described

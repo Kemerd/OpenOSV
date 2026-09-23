@@ -125,6 +125,7 @@ struct OpenClRenderer::Impl {
     ClBuffer y[2], u[2], v[2];
     ClBuffer seam;
     ClBuffer warp;
+    ClBuffer blendSeam;  // [WP-SEAM] carved blend-seam table
     ClBuffer out;
     std::mutex mutex;
 
@@ -139,6 +140,7 @@ struct OpenClRenderer::Impl {
         }
         seam.release();
         warp.release();
+        blendSeam.release();
         out.release();
         if (kernel) {
             clReleaseKernel(kernel);
@@ -359,6 +361,21 @@ Result<ImageRGBAf> OpenClRenderer::render(const RenderJob& job) {
         }
     }
     err |= clSetKernelArg(impl.kernel, arg++, sizeof(cl_mem), &impl.warp.mem);
+
+    // [WP-SEAM] Carved blend-seam table: bound always (a valid buffer object
+    // even when empty, for the same reason as above), read only when
+    // params.blendSeamEnabled says so.
+    const std::size_t blendSeamBytes = std::max<std::size_t>(job.blendSeam.size(), 1) * sizeof(float);
+    OSV_TRY(impl.blendSeam.ensure(impl.context, blendSeamBytes, CL_MEM_READ_ONLY));
+    if (!job.blendSeam.empty()) {
+        const cl_int berr = clEnqueueWriteBuffer(impl.queue, impl.blendSeam.mem, CL_FALSE, 0,
+                                                 job.blendSeam.size() * sizeof(float), job.blendSeam.data(), 0,
+                                                 nullptr, nullptr);
+        if (berr != CL_SUCCESS) {
+            return Error{ErrorCode::Gpu, clMessage("upload blend seam", berr)};
+        }
+    }
+    err |= clSetKernelArg(impl.kernel, arg++, sizeof(cl_mem), &impl.blendSeam.mem);
 
     // Output buffer (tightly packed float4 rows).
     OSV_TRY_ASSIGN(ImageRGBAf image, ImageRGBAf::create(static_cast<std::uint32_t>(job.params.outW),
