@@ -92,16 +92,6 @@
  *        interactive reframe overlay (plugins/reframe/ReframeUi*).  Without
  *        this flag PF_Cmd_EVENT is never sent at all, and the
  *        PF_CustomUIInfo that PF_Cmd_PARAMS_SETUP registers is ignored.
- *    PF_OutFlag_USE_OUTPUT_EXTENT      1L << 6  = 0x00000040
- *        the host may hand us an extent hint smaller than the frame.  We
- *        render the whole output regardless, which is always correct.  Set
- *        because it is one of the two flags BOTH known-good Premiere GPU
- *        effects carry and this one lacked - Adobe's SDK_ProcAmp sample
- *        (eGLO 0x40, eGL2 0x100) and GoPro Reframe (eGLO 0x06088040,
- *        eGL2 0x08001588), read from their PiPLs - while every real
- *        Premiere session on record loaded our xGPUFilterEntry and then
- *        never called CreateInstance, rendering on the CPU (red render
- *        bar).  See PRESERVES_FULLY_OPAQUE_PIXELS below for the other.
  *
  *  Deliberately NOT set alongside it:
  *    PF_OutFlag_FORCE_RERENDER - the overlay commits values with
@@ -122,22 +112,16 @@
  *    PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG 1L << 3  = 0x00000008
  *        honour PF_ParamFlag_START_COLLAPSED on our two topics.
  *    PF_OutFlag2_REVEALS_ZERO_ALPHA               1L << 7  = 0x00000080
- *        directions no lens covers (the nadir under the stick) are genuinely
- *        transparent; the host must not assume zero alpha means "nothing
- *        here".
- *    PF_OutFlag2_PRESERVES_FULLY_OPAQUE_PIXELS    1L << 8  = 0x00000100
- *        Premiere only: an opaque input gives an opaque output.  True here -
- *        every output pixel is a bilinear sample of the input, and a sample
- *        of all-opaque texels is opaque.  The second flag shared by both
- *        known-good GPU effects (see USE_OUTPUT_EXTENT above).
+ *        the letterbox is genuinely transparent black; the host must not
+ *        assume zero alpha means "nothing here".
  *    PF_OutFlag2_FLOAT_COLOR_AWARE                1L << 12 = 0x00001000
  *        32-bit float worlds are handled natively.
  *    PF_OutFlag2_SUPPORTS_THREADED_RENDERING      1L << 27 = 0x08000000
  *        PF_Cmd_RENDER is re-entrant: sequence_data is null and every piece
  *        of per-render state is a local.
  * ========================================================================== */
-#define OSV_REFRAME_OUT_FLAGS 0x06008040
-#define OSV_REFRAME_OUT_FLAGS_2 0x08001188
+#define OSV_REFRAME_OUT_FLAGS 0x06008000
+#define OSV_REFRAME_OUT_FLAGS_2 0x08001088
 
 /* AE_Effect_Info_Flags: none. */
 #define OSV_REFRAME_INFO_FLAGS 0

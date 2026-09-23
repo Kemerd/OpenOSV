@@ -92,13 +92,12 @@
 //  being a lie: if a future AE SDK renumbers a bit, the build breaks here
 //  instead of shipping a PiPL Premiere will reject at load time.
 // ===========================================================================
-static_assert(OSV_REFRAME_OUT_FLAGS == (PF_OutFlag_DEEP_COLOR_AWARE | PF_OutFlag_SEND_UPDATE_PARAMS_UI |
-                                        PF_OutFlag_CUSTOM_UI | PF_OutFlag_USE_OUTPUT_EXTENT),
+static_assert(OSV_REFRAME_OUT_FLAGS ==
+                  (PF_OutFlag_DEEP_COLOR_AWARE | PF_OutFlag_SEND_UPDATE_PARAMS_UI | PF_OutFlag_CUSTOM_UI),
               "OSV_REFRAME_OUT_FLAGS in ReframeParams.h no longer matches AE_Effect.h");
 static_assert(OSV_REFRAME_OUT_FLAGS_2 ==
                   (PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG | PF_OutFlag2_REVEALS_ZERO_ALPHA |
-                   PF_OutFlag2_PRESERVES_FULLY_OPAQUE_PIXELS | PF_OutFlag2_FLOAT_COLOR_AWARE |
-                   PF_OutFlag2_SUPPORTS_THREADED_RENDERING),
+                   PF_OutFlag2_FLOAT_COLOR_AWARE | PF_OutFlag2_SUPPORTS_THREADED_RENDERING),
               "OSV_REFRAME_OUT_FLAGS_2 in ReframeParams.h no longer matches AE_Effect.h");
 static_assert(OSV_REFRAME_PIPL_VERSION ==
                   PF_VERSION(OSV_REFRAME_VERSION_MAJOR, OSV_REFRAME_VERSION_MINOR, OSV_REFRAME_VERSION_BUG,

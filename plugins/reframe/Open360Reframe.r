@@ -81,12 +81,9 @@ resource 'PiPL' (16000) {
         },
 
         /* [9] The out-flags, identical to what PF_Cmd_GLOBAL_SETUP reports.
-         *     out_flags : DEEP_COLOR_AWARE | SEND_UPDATE_PARAMS_UI | CUSTOM_UI
-         *                 | USE_OUTPUT_EXTENT
+         *     out_flags : DEEP_COLOR_AWARE | SEND_UPDATE_PARAMS_UI
          *     out_flags2: PARAM_GROUP_START_COLLAPSED | REVEALS_ZERO_ALPHA
-         *                 | PRESERVES_FULLY_OPAQUE_PIXELS | FLOAT_COLOR_AWARE
-         *                 | SUPPORTS_THREADED_RENDERING
-         *     (ReframeParams.h explains each bit.) */
+         *                 | FLOAT_COLOR_AWARE | SUPPORTS_THREADED_RENDERING */
         AE_Effect_Global_OutFlags {
             OSV_REFRAME_OUT_FLAGS
         },
