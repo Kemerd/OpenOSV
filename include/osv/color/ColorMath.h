@@ -78,6 +78,14 @@
 #define OSV_DLOGM_CUT_GIVEN 0
 #define OSV_DLOGM_CUT_INTERSECTION 1
 
+/** Looks understood by osvLookApply (OsvLookParams::id).  The values are
+ *  persisted through osv::color::Look, so they are never renumbered. */
+#define OSV_LOOK_STANDARD 0
+#define OSV_LOOK_DJI 1
+
+/** Tone knots an OsvLookParams can carry (a uniform grid over code [0,1]). */
+#define OSV_LOOK_MAX_KNOTS 17
+
 /* ---------------------------------------------------------------------------
  *  POD types
  * ------------------------------------------------------------------------- */
@@ -111,6 +119,47 @@ typedef struct OsvMat3f {
 } OsvMat3f;
 
 /**
+ * @brief A display "look": scene-linear working RGB -> Rec.709 signal.
+ *
+ * Evaluated by osvLookApply.  The stages, in order (docs in
+ * include/osv/color/Look.h, fit in scripts/fit_look.py):
+ *
+ *   x   = toLook * working               3x3, rows sum to 1
+ *   u_c = shaper(x_c)                    scene-linear -> log code (the inverse
+ *                                        of `shaper`, continued linearly below
+ *                                        code 0 so negatives stay defined)
+ *   y_c = T(u_c)                         monotone cubic Hermite through
+ *                                        `knots` uniform knots over [0,1]
+ *   y  += a * (yh - y)                   highlight hue preservation
+ *   y   = display * y                    3x3 in signal space, rows sum to 1
+ *   y   = gamut-compress(y)              soft, per channel, below max(y)
+ *   out = clamp(y, 0, 1)
+ *
+ * id == OSV_LOOK_STANDARD (the zero-initialised block) means "no look": the
+ * pipeline renders exactly as it did before looks existed.  The host fills
+ * every derived value (tangents, gamut scales, shaper continuation) so the
+ * kernel does no set-up work per pixel.
+ */
+typedef struct OsvLookParams {
+    int id;                                /**< OSV_LOOK_STANDARD or OSV_LOOK_DJI. */
+    int knots;                             /**< Tone knots used, 2..OSV_LOOK_MAX_KNOTS. */
+    OsvMat3f toLook;                       /**< Working (Rec.2020 scene-linear) -> look RGB. */
+    OsvDlogMCurve shaper;                  /**< Log curve whose inverse maps light to tone code. */
+    float shaperLin0;                      /**< The shaper curve at code 0. */
+    float shaperCodePerLin0;               /**< d(code)/d(lin) at code 0 (continuation below). */
+    float tone[OSV_LOOK_MAX_KNOTS];        /**< T at code k / (knots - 1). */
+    float toneSlope[OSV_LOOK_MAX_KNOTS];   /**< dT/dcode at each knot (monotone tangents). */
+    float hueStart;                        /**< Tone of max(x) where hue preservation begins. */
+    float hueWidth;                        /**< Tone span over which it ramps in (> 0). */
+    float hueAmount;                       /**< Blend weight once fully ramped in (0..1). */
+    float hueExponent;                     /**< Exponent applied to the channel ratio. */
+    OsvMat3f display;                      /**< Signal-space 3x3 after the tone curve. */
+    float gamutThreshold[3];               /**< Distance below max(y) left untouched. */
+    float gamutScale[3];                   /**< Compression scale (host-derived from the limit). */
+    float gamutPower;                      /**< Compression curve power (>= 1). */
+} OsvLookParams;
+
+/**
  * @brief Everything the per-pixel colour shader needs, packed by value.
  *
  * Built on the host by osv::color::makeColorParams(); the kernels receive it
@@ -133,6 +182,9 @@ typedef struct OsvColorParams {
     float yuvScaleC;              /**< 1 / chroma range (1/896 for narrow 10-bit). */
     float yuvToRgb[9];            /**< Row-major Y'CbCr -> R'G'B' matrix on normalised values. */
     int bitDepth;                 /**< Sample bit depth of the YCbCr input (chroma centre = 2^(bitDepth-1)). */
+    /* Appended last so every field above keeps its offset; a zeroed block
+     * (id == OSV_LOOK_STANDARD) renders exactly as before looks existed. */
+    OsvLookParams look;           /**< Display look for the Rec.709 output (see osvLookApply). */
 } OsvColorParams;
 
 /* ---------------------------------------------------------------------------
@@ -339,6 +391,203 @@ OSV_HD float osvBt2390Eetf(float pqCode, float srcPeakNits, float dstPeakNits) {
 }
 
 /* ---------------------------------------------------------------------------
+ *  Display looks (see OsvLookParams and include/osv/color/Look.h)
+ *
+ *  Defined ahead of the pipeline stages because osvLinearToOutput dispatches
+ *  to osvLookApply; C and OpenCL C both need the definition before the call.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * @brief Inverse of osvDlogmToLinear: scene-linear -> D-Log M code.
+ *
+ * Closed form on both branches (the toe branch is linear in tmp, the main
+ * branch proportional to it, and tmp = 2^(scale * code + yShift) + xShift is
+ * inverted with log2f).  The toe inverse is tried first and kept while it
+ * lands below the cut, which is the correct branch choice for a monotonic
+ * curve in either cut mode.
+ *
+ * Only meaningful for lin >= osvDlogmToLinear(curve, 0): below that the log
+ * argument can reach zero, so the result is floored at a large negative code
+ * rather than going to -inf / NaN.  osvLookShaper continues the curve linearly
+ * there instead of calling this.  A degenerate curve (zero slopes, scale or
+ * mid-grey scaling) returns 0 rather than dividing by zero.
+ */
+OSV_HD float osvDlogmToCode(const OsvDlogMCurve* curve, float lin) {
+    if (curve == 0) {
+        return lin;
+    }
+    /* Defensive: every divisor below must be usable. */
+    if (fabsf(curve->midGrayScaling) < 1e-30f || fabsf(curve->scale) < 1e-12f || fabsf(curve->slope) < 1e-12f ||
+        fabsf(curve->slope2) < 1e-12f) {
+        return 0.0f;
+    }
+    /* Undo the final multiplier, then pick the branch: the toe inverse is the
+     * right one exactly while it stays on the toe side of the cut. */
+    const float pw = lin / curve->midGrayScaling;
+    const float cut = osvDlogmCut(curve);
+    float tmp = (pw - curve->intercept) / curve->slope;
+    if (!(tmp < cut)) {
+        tmp = pw / curve->slope2;
+    }
+    /* Invert the exponential; floor the argument so log2f never sees <= 0. */
+    const float arg = fmaxf(tmp - curve->xShift, 1e-30f);
+    return (log2f(arg) - curve->yShift) / curve->scale;
+}
+
+/**
+ * @brief Look shaper: scene-linear -> tone-curve coordinate (a log code).
+ *
+ * At and above the shaper curve's code-0 light level this is the exact
+ * inverse of that curve; below it the curve is continued along its tangent at
+ * code 0, so the shaper is defined, continuous and increasing for every real
+ * input, including the negative values a wide-gamut matrix produces for
+ * colours outside the output gamut.
+ */
+OSV_HD float osvLookShaper(const OsvLookParams* look, float x) {
+    if (look == 0) {
+        return x;
+    }
+    if (x >= look->shaperLin0) {
+        return osvDlogmToCode(&look->shaper, x);
+    }
+    /* Linear continuation below code 0 (the host precomputes the slope). */
+    return (x - look->shaperLin0) * look->shaperCodePerLin0;
+}
+
+/**
+ * @brief Look tone curve T(u): monotone cubic Hermite through the knots.
+ *
+ * The knots sit at u = k / (knots - 1); the tangents are the host's
+ * Fritsch-Carlson values, which keep a monotonic knot set monotonic between
+ * the knots.  Outside [0, 1] the curve continues along its end tangents, so
+ * T is C1 everywhere and nothing is clipped here.
+ */
+OSV_HD float osvLookTone(const OsvLookParams* look, float u) {
+    if (look == 0) {
+        return u;
+    }
+    /* Defensive: a corrupt knot count must not index outside the arrays. */
+    int count = look->knots;
+    if (count < 2) {
+        count = 2;
+    }
+    if (count > OSV_LOOK_MAX_KNOTS) {
+        count = OSV_LOOK_MAX_KNOTS;
+    }
+    /* Linear continuation outside the knot range. */
+    if (u <= 0.0f) {
+        return look->tone[0] + look->toneSlope[0] * u;
+    }
+    if (u >= 1.0f) {
+        return look->tone[count - 1] + look->toneSlope[count - 1] * (u - 1.0f);
+    }
+    /* Segment index and local parameter on the uniform grid.  The position is
+     * clamped before the float -> int conversion: a NaN input fails both
+     * range tests above, and fmaxf / fminf map it onto knot 0 here instead of
+     * handing the conversion an undefined value. */
+    const float h = 1.0f / (float)(count - 1);
+    const float s = fminf(fmaxf(u * (float)(count - 1), 0.0f), (float)(count - 1));
+    int i = (int)floorf(s);
+    if (i < 0) {
+        i = 0;
+    }
+    if (i > count - 2) {
+        i = count - 2;
+    }
+    const float t = s - (float)i;
+    const float t2 = t * t;
+    const float t3 = t2 * t;
+    /* Cubic Hermite basis; tangents are per unit u, hence the h factors. */
+    return (2.0f * t3 - 3.0f * t2 + 1.0f) * look->tone[i] + (t3 - 2.0f * t2 + t) * h * look->toneSlope[i] +
+           (-2.0f * t3 + 3.0f * t2) * look->tone[i + 1] + (t3 - t2) * h * look->toneSlope[i + 1];
+}
+
+/**
+ * @brief Apply a display look: working scene-linear RGB -> Rec.709 signal.
+ *
+ * `in` is the pipeline's working value after the camera matrix and exposure
+ * (Rec.2020 primaries, 18 % grey = 0.18, no scene scale).  The output is the
+ * final encoded signal, clamped to [0, 1].  Stage by stage (OsvLookParams):
+ *
+ *  1. toLook matrix; tone curve per channel through the shaper.
+ *  2. Highlight hue preservation: the tone of max(x), scaled by each
+ *     channel's ratio to that max raised to hueExponent, blended in with a
+ *     smoothstep weight that rises across [hueStart, hueStart + hueWidth] of
+ *     the max's tone.  Bright saturated colours then keep their hue instead
+ *     of sliding towards the secondary as their largest channel shoulders.
+ *  3. display matrix (signal space).
+ *  4. Soft gamut compression, per channel, of the distance below max(y) -
+ *     the ACES reference gamut compression curve - so colours the matrices
+ *     push outside [0, 1] bend back in instead of clipping hard.
+ *
+ * Both matrices have unit row sums and stages 2 and 4 leave neutrals alone,
+ * so for a neutral input the whole look is exactly T(shaper(x)).
+ */
+OSV_HD void osvLookApply(const OsvLookParams* look, const float in[3], float out[3]) {
+    float x[3];
+    float y[3];
+    int i;
+    if (look == 0) {
+        out[0] = osvSaturatef(in[0]);
+        out[1] = osvSaturatef(in[1]);
+        out[2] = osvSaturatef(in[2]);
+        return;
+    }
+
+    /* 1. Look primaries, then the tone curve per channel. */
+    osvMat3Apply(&look->toLook, in[0], in[1], in[2], x);
+    for (i = 0; i < 3; ++i) {
+        y[i] = osvLookTone(look, osvLookShaper(look, x[i]));
+    }
+
+    /* 2. Highlight hue preservation (skipped when switched off or when no
+     *    channel carries positive light, where a ratio has no meaning). */
+    if (look->hueAmount > 0.0f) {
+        const float peak = fmaxf(fmaxf(x[0], x[1]), x[2]);
+        if (peak > 1e-9f) {
+            const float peakTone = osvLookTone(look, osvLookShaper(look, peak));
+            const float width = fmaxf(look->hueWidth, 1e-6f);
+            float a = osvSaturatef((peakTone - look->hueStart) / width);
+            a = a * a * (3.0f - 2.0f * a) * look->hueAmount;
+            if (a > 0.0f) {
+                const float inv = 1.0f / peak;
+                for (i = 0; i < 3; ++i) {
+                    const float ratio = osvSaturatef(x[i] * inv);
+                    const float held = peakTone * powf(ratio, look->hueExponent);
+                    y[i] += a * (held - y[i]);
+                }
+            }
+        }
+    }
+
+    /* 3. Signal-space matrix. */
+    osvMat3Apply(&look->display, y[0], y[1], y[2], out);
+
+    /* 4. Soft gamut compression relative to the largest channel. */
+    {
+        const float ach = fmaxf(fmaxf(out[0], out[1]), out[2]);
+        if (ach > 1e-6f) {
+            const float power = fmaxf(look->gamutPower, 1.0f);
+            for (i = 0; i < 3; ++i) {
+                float d = (ach - out[i]) / ach;
+                const float thr = look->gamutThreshold[i];
+                if (d > thr) {
+                    const float scale = fmaxf(look->gamutScale[i], 1e-6f);
+                    const float e = (d - thr) / scale;
+                    d = thr + (d - thr) / powf(1.0f + powf(e, power), 1.0f / power);
+                }
+                out[i] = ach - d * ach;
+            }
+        }
+    }
+
+    /* Final clamp to the legal signal range. */
+    for (i = 0; i < 3; ++i) {
+        out[i] = osvSaturatef(out[i]);
+    }
+}
+
+/* ---------------------------------------------------------------------------
  *  Pipeline stages
  * ------------------------------------------------------------------------- */
 
@@ -419,9 +668,11 @@ OSV_HD void osvCodeToLinear(const OsvColorParams* params, const float code[3], f
  *  - HLG:     * sceneScale, workingToOutput, HLG OETF per channel.
  *  - PQ:      * sceneScale, workingToOutput, HLG OOTF (peakNits, ootfGamma on
  *             BT.2020 luminance), PQ inverse EOTF per channel.
- *  - Rec709:  * sceneScale, OOTF to peakNits, PQ encode, BT.2390 EETF
- *             peakNits -> sdrPeakNits, PQ decode, / sdrPeakNits,
- *             workingToOutput (2020 -> 709), clamp, BT.709 OETF.
+ *  - Rec709:  with look.id == OSV_LOOK_DJI, osvLookApply on the working
+ *             value (the DJI Studio look, Look.h).  Otherwise the standard
+ *             rendering: * sceneScale, workingToOutput (2020 -> 709) in
+ *             linear light, HLG OETF - the HLG signal is the SDR picture
+ *             (BT.2390 "HLG on an SDR display"), see the branch below.
  *  - Linear:  workingToOutput applied, no sceneScale (grey stays 0.18);
  *             this is what the EXR writer stores.
  *  - Passthrough: input copied unchanged (see osvCodeToOutput).
@@ -446,6 +697,17 @@ OSV_HD void osvLinearToOutput(const OsvColorParams* params, const float lin[3], 
     if (params->transfer == OSV_TRANSFER_LINEAR) {
         /* Raw scene-linear in the output primaries; nothing else applied. */
         osvMat3Apply(&params->workingToOutput, working[0], working[1], working[2], out);
+        return;
+    }
+
+    /* Display look on the Rec.709 output: it takes the working value after
+     * exposure and produces the final signal itself, replacing the scene
+     * scale and the HLG-in-709 encode below.  A zeroed look block
+     * (OSV_LOOK_STANDARD) skips this line, so the standard rendering is
+     * bit-for-bit what it was before looks existed; any other id, including
+     * a corrupt one, also falls through to the standard rendering. */
+    if (params->transfer == OSV_TRANSFER_REC709 && params->look.id == OSV_LOOK_DJI) {
+        osvLookApply(&params->look, working, out);
         return;
     }
 

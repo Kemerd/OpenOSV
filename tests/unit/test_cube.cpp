@@ -429,7 +429,7 @@ TEST_CASE("The committed LUTs match the current pipeline", "[color][cube]") {
         {"OpenOSV_Osmo360_DLogM_to_Rec2100_HLG.cube", OutputTransfer::HLG,
          "OpenOSV Osmo 360 D-Log M to Rec.2100 HLG (osmo360 curve)"},
         {"OpenOSV_Osmo360_DLogM_to_Rec709.cube", OutputTransfer::Rec709,
-         "OpenOSV Osmo 360 D-Log M to Rec.709 (osmo360 curve)"},
+         "OpenOSV Osmo 360 D-Log M to Rec.709 (osmo360 curve, DJI Studio look)"},
     };
 
     const std::filesystem::path dir = osvtest::lutsDir();
@@ -516,15 +516,20 @@ TEST_CASE("The committed LUTs land the BT.2408 anchors", "[color][cube]") {
         double grey;   ///< expected value at grid 26
         double white;  ///< expected value at grid 46
     };
-    // HLG and Rec.709 are identical on the neutral axis by construction (see
-    // include/osv/color/DlogM.h); PQ differs because the OOTF and the PQ
-    // inverse EOTF replace the HLG OETF.  BT.2408 reference points: 18 % grey
-    // is 38 % HLG and 38 % PQ (26 nit); diffuse white is 75 % HLG and 58 % PQ
-    // (203 nit), and the PQ column below lands on 0.5794 against that 0.5807.
+    // PQ differs from HLG because the OOTF and the PQ inverse EOTF replace the
+    // HLG OETF.  BT.2408 reference points: 18 % grey is 38 % HLG and 38 % PQ
+    // (26 nit); diffuse white is 75 % HLG and 58 % PQ (203 nit), and the PQ
+    // column below lands on 0.5794 against that 0.5807.
+    //
+    // Rec.709 carries the default DJI Studio look (include/osv/color/Look.h),
+    // whose neutral axis is DJI's own grey scale rather than the HLG signal:
+    // DJI's Osmo 360 file reads 0.3882 and 0.7404 at these two grid points,
+    // the look 0.3847 and 0.7457.  (Before the look existed this row equalled
+    // the HLG row, 0.3873 / 0.7479; Look::Standard still renders that.)
     static const Anchor kAnchors[] = {
         {"OpenOSV_Osmo360_DLogM_to_Rec2100_PQ.cube", 0.3849, 0.5794},
         {"OpenOSV_Osmo360_DLogM_to_Rec2100_HLG.cube", 0.3873, 0.7479},
-        {"OpenOSV_Osmo360_DLogM_to_Rec709.cube", 0.3873, 0.7479},
+        {"OpenOSV_Osmo360_DLogM_to_Rec709.cube", 0.3847, 0.7457},
     };
 
     for (const Anchor& an : kAnchors) {

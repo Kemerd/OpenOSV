@@ -141,14 +141,18 @@
  * reused one, placed inside the Advanced group (so its index is 13 and the
  * group terminator moved to 14 - indices are not persisted, ids are). */
 #define OSV_SS_ID_DIRECT_COLOUR 14
+/* [WP-LOOK] The Rec.709 display look.  A NEW id, placed right under Colour
+ * Output (index 2) because the two are read together; every index after it
+ * moved up by one, which is harmless - indices are not persisted, ids are. */
+#define OSV_SS_ID_REC709_LOOK 15
 /* [WP-FLARE] "Sun Ghost Removal", a NEW id placed inside the Stitching group
- * after Calibration: its index is 8 and everything after it moved up by one
- * (indices are not persisted, ids are). */
-#define OSV_SS_ID_FLARE_REMOVAL 15
+ * after Calibration (index 9); everything after it moved up by one - indices
+ * are not persisted, ids are. */
+#define OSV_SS_ID_FLARE_REMOVAL 16
 
-/* Total parameters excluding the input layer: 11 controls + 4 group markers.
+/* Total parameters excluding the input layer: 12 controls + 4 group markers.
  * out_data->num_params is this + 1. */
-#define OSV_SOURCE_SETTINGS_PARAM_COUNT 15
+#define OSV_SOURCE_SETTINGS_PARAM_COUNT 16
 
 /* ==========================================================================
  *  Popup item strings
@@ -228,6 +232,18 @@
 #define OSV_SS_DIRECT_COLOUR_COUNT 2
 #define OSV_SS_DIRECT_COLOUR_DEFAULT 1
 
+/* [WP-LOOK] "Look (Rec. 709 only)" - PrefsLook: DjiStudio, Standard.
+ *
+ * The display look of the Rec. 709 Colour Output: DJI Studio's own D-Log M
+ * rendering (fitted to DJI's Osmo 360 LUT, the default) or OpenOSV's standard
+ * rendering (the HLG signal in Rec. 709 primaries, what Rec. 709 was before
+ * the look existed).  PQ, HLG and the passthrough ignore it; the name says so
+ * because a source settings effect has no dependable way to grey a control
+ * out in Premiere.  Default 1 = DJI (PrefsLook::DjiStudio is 0). */
+#define OSV_SS_LOOK_ITEMS "DJI (default)|OpenOSV standard"
+#define OSV_SS_LOOK_COUNT 2
+#define OSV_SS_LOOK_DEFAULT 1
+
 /* ==========================================================================
  *  Checkbox and slider ranges / defaults
  * ========================================================================== */
@@ -264,47 +280,49 @@ namespace osv::premiere::sourcesettings {
 /// deriving it from the ids is precisely the mistake that unbalances groups.
 ///
 ///   1  Colour Output
-///   2  Output Size
-///   3  Stabilisation
-///   4  Stitching          (GROUP_START)
-///   5    Seam Search
-///   6    Exposure Match
-///   7    Calibration
-///   8    Sun Ghost Removal        [WP-FLARE]
-///   9  (GROUP_END, Stitching)
-///  10  Advanced           (GROUP_START, starts collapsed)
-///  11    D-Log M Curve
-///  12    Exposure
-///  13    Render Device
-///  14    Program Monitor Colour   [WP-SETTINGS]
-///  15  (GROUP_END, Advanced)
+///   2  Look (Rec. 709 only)     [WP-LOOK]
+///   3  Output Size
+///   4  Stabilisation
+///   5  Stitching          (GROUP_START)
+///   6    Seam Search
+///   7    Exposure Match
+///   8    Calibration
+///   9    Sun Ghost Removal        [WP-FLARE]
+///  10  (GROUP_END, Stitching)
+///  11  Advanced           (GROUP_START, starts collapsed)
+///  12    D-Log M Curve
+///  13    Exposure
+///  14    Render Device
+///  15    Program Monitor Colour   [WP-SETTINGS]
+///  16  (GROUP_END, Advanced)
 enum ParamIndex : int {
     kIndexColorOutput = 1,
-    kIndexOutputSize = 2,
-    kIndexStabilization = 3,
-    kIndexStitchTopic = 4,
-    kIndexSeamSearch = 5,
-    kIndexGainMatch = 6,
-    kIndexCalibration = 7,
-    kIndexFlareRemoval = 8,  // [WP-FLARE]
-    kIndexStitchTopicEnd = 9,
-    kIndexAdvancedTopic = 10,
-    kIndexDlogmFit = 11,
-    kIndexExposure = 12,
-    kIndexRenderDevice = 13,
-    kIndexDirectColour = 14,
-    kIndexAdvancedTopicEnd = 15,
+    kIndexRec709Look = 2,
+    kIndexOutputSize = 3,
+    kIndexStabilization = 4,
+    kIndexStitchTopic = 5,
+    kIndexSeamSearch = 6,
+    kIndexGainMatch = 7,
+    kIndexCalibration = 8,
+    kIndexFlareRemoval = 9,  // [WP-FLARE]
+    kIndexStitchTopicEnd = 10,
+    kIndexAdvancedTopic = 11,
+    kIndexDlogmFit = 12,
+    kIndexExposure = 13,
+    kIndexRenderDevice = 14,
+    kIndexDirectColour = 15,
+    kIndexAdvancedTopicEnd = 16,
 };
 
 /// The permanent id stored at each index, in index order (index 1 first).
 /// paramsSetup() adds them in this order and a test walks this table against
 /// the list the built module actually produced.
 inline constexpr int kParamIdByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
-    OSV_SS_ID_COLOR_OUTPUT,     OSV_SS_ID_OUTPUT_SIZE,   OSV_SS_ID_STABILIZATION,
+    OSV_SS_ID_COLOR_OUTPUT,     OSV_SS_ID_REC709_LOOK,   OSV_SS_ID_OUTPUT_SIZE,   OSV_SS_ID_STABILIZATION,
     OSV_SS_ID_STITCH_TOPIC,     OSV_SS_ID_SEAM_SEARCH,   OSV_SS_ID_GAIN_MATCH,
-    OSV_SS_ID_CALIBRATION,      OSV_SS_ID_FLARE_REMOVAL, OSV_SS_ID_STITCH_TOPIC_END,
-    OSV_SS_ID_ADVANCED_TOPIC,   OSV_SS_ID_DLOGM_FIT,     OSV_SS_ID_EXPOSURE,
-    OSV_SS_ID_RENDER_DEVICE,    OSV_SS_ID_DIRECT_COLOUR, OSV_SS_ID_ADVANCED_TOPIC_END,
+    OSV_SS_ID_CALIBRATION,      OSV_SS_ID_FLARE_REMOVAL, OSV_SS_ID_STITCH_TOPIC_END, OSV_SS_ID_ADVANCED_TOPIC,
+    OSV_SS_ID_DLOGM_FIT,        OSV_SS_ID_EXPOSURE,      OSV_SS_ID_RENDER_DEVICE,
+    OSV_SS_ID_DIRECT_COLOUR,    OSV_SS_ID_ADVANCED_TOPIC_END,
 };
 
 /// Number of user-visible parameters (excludes the input layer).
@@ -313,7 +331,7 @@ inline constexpr int kParamCount = OSV_SOURCE_SETTINGS_PARAM_COUNT;
 /// Number of controls that actually carry a value, i.e. everything except the
 /// four GROUP_START / GROUP_END markers.  This is the count that has to round
 /// trip through a PrefsBlob.
-inline constexpr int kValueParamCount = 11;
+inline constexpr int kValueParamCount = 12;
 
 /// The parameter names, in index order, so a test can compare the built
 /// module's list without repeating the strings.
@@ -324,9 +342,9 @@ inline constexpr int kValueParamCount = 11;
 /// rather than a labelled control.  Writing "Stitching" here would have
 /// described a field the SDK never fills.
 inline constexpr const char* kParamNameByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
-    "Colour Output",  "Output Size",   "Stabilisation", "Stitching",     "Seam Search",
-    "Exposure Match", "Calibration",   "Sun Ghost Removal", "",          "Advanced",
-    "D-Log M Curve",  "Exposure",      "Render Device", "Program Monitor Colour", "",
+    "Colour Output", "Look (Rec. 709 only)", "Output Size", "Stabilisation", "Stitching", "Seam Search",
+    "Exposure Match", "Calibration",  "Sun Ghost Removal",  "",          "Advanced",  "D-Log M Curve",
+    "Exposure",       "Render Device", "Program Monitor Colour", "",
 };
 
 }  // namespace osv::premiere::sourcesettings

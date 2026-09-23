@@ -61,6 +61,11 @@
 
 namespace osv::video {
 
+namespace detail {
+/// Internal: the type-erased parking lot both pools are built on.
+class IdlePool;
+}  // namespace detail
+
 class ReaderPool {
 public:
     /// How much the pool may hold, and for how long.
@@ -146,13 +151,9 @@ public:
     /// True when the reaper thread is running (tests).
     [[nodiscard]] bool reaperRunning() const noexcept;
 
-    /// The pool's shared state.  Opaque: it is named here only so the
-    /// implementation's reaper thread, which may outlive a private pool, can
-    /// hold a reference to it.
-    struct State;
-
 private:
-    std::shared_ptr<State> m_state;
+    /// The parking logic, shared with GpuDecoderPool (src/osv/video/IdlePool.h).
+    std::unique_ptr<detail::IdlePool> m_core;
 };
 
 }  // namespace osv::video

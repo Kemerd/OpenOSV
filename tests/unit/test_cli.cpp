@@ -9,7 +9,10 @@
 
 #include "osv/io/ImageWriter.h"
 
+#include <algorithm>
 #include <array>
+#include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -262,4 +265,80 @@ TEST_CASE("osvtool probe lists the calibration sets, the accessory and every cho
     REQUIRE(cal["choices"]["lens-guards"]["protectorCorrection"] == true);
     REQUIRE(cal["choices"]["auto"]["protectorCorrection"] == false);
     REQUIRE(cal["choices"]["underwater"]["protectorCorrection"] == false);
+}
+
+// [WP-LOOK] The Rec.709 look is selectable on both colour commands.
+TEST_CASE("osvtool --look selects the Rec.709 look and refuses unknown names", "[cli][look]") {
+    if (std::string(kToolPath).empty() || !std::filesystem::exists(kToolPath)) {
+        SKIP("osvtool not built");
+    }
+    // Every data line of a .cube as text: two LUTs of the same size are the
+    // same transform exactly when these match.
+    const auto dataOf = [](const std::filesystem::path& path) {
+        std::ifstream in(path);
+        std::string line;
+        std::string data;
+        while (std::getline(in, line)) {
+            if (!line.empty() && (std::isdigit(static_cast<unsigned char>(line[0])) || line[0] == '-')) {
+                data += line;
+                data += '\n';
+            }
+        }
+        return data;
+    };
+    const auto dji = osvtest::tempDir() / "cli_look_dji.cube";
+    const auto standard = osvtest::tempDir() / "cli_look_standard.cube";
+    const auto implicit = osvtest::tempDir() / "cli_look_default.cube";
+    REQUIRE(runTool("lut --out-transfer 709 --size 9 --look dji " + quoted(dji)).exitCode == 0);
+    REQUIRE(runTool("lut --out-transfer 709 --size 9 --look standard " + quoted(standard)).exitCode == 0);
+    REQUIRE(runTool("lut --out-transfer 709 --size 9 " + quoted(implicit)).exitCode == 0);
+    const std::string a = dataOf(dji);
+    REQUIRE(a.size() > 9u * 9u * 9u * 10u);
+    // Two different Rec.709 renderings; the default is the DJI look.
+    CHECK(a != dataOf(standard));
+    CHECK(a == dataOf(implicit));
+    // HDR outputs have no look: the flag changes nothing there.
+    const auto hlgDji = osvtest::tempDir() / "cli_look_hlg_dji.cube";
+    const auto hlgStd = osvtest::tempDir() / "cli_look_hlg_std.cube";
+    REQUIRE(runTool("lut --out-transfer hlg --size 9 --look dji " + quoted(hlgDji)).exitCode == 0);
+    REQUIRE(runTool("lut --out-transfer hlg --size 9 --look standard " + quoted(hlgStd)).exitCode == 0);
+    CHECK(dataOf(hlgDji) == dataOf(hlgStd));
+    // An unknown look is a usage error, not a silent default.
+    const RunResult badLut = runTool("lut --out-transfer 709 --look vivid " + quoted(osvtest::tempDir() / "x.cube"));
+    CHECK(badLut.exitCode == 1);
+    CHECK(badLut.output.find("--look") != std::string::npos);
+}
+
+// [WP-LOOK] osvtool render --look on the sample clip: the two Rec.709 looks
+// render different pictures, and a bad name is refused.
+TEST_CASE("osvtool render --look switches the Rec.709 look", "[cli][look][sample]") {
+    OSV_REQUIRE_SAMPLE();
+    if (std::string(kToolPath).empty() || !std::filesystem::exists(kToolPath)) {
+        SKIP("osvtool not built");
+    }
+    const std::string clip = quoted(osvtest::sampleOsv());
+    const auto djiTif = osvtest::tempDir() / "cli_look_dji.tif";
+    const auto stdTif = osvtest::tempDir() / "cli_look_standard.tif";
+    const std::string common = " --frame 0 --size 320x180 --device cpu --color 709 --out ";
+    const RunResult a = runTool("render " + clip + common + quoted(djiTif) + " --look dji");
+    INFO(a.output);
+    REQUIRE(a.exitCode == 0);
+    const RunResult b = runTool("render " + clip + common + quoted(stdTif) + " --look standard");
+    INFO(b.output);
+    REQUIRE(b.exitCode == 0);
+    auto imgA = osv::io::readImage(djiTif);
+    auto imgB = osv::io::readImage(stdTif);
+    REQUIRE(imgA.ok());
+    REQUIRE(imgB.ok());
+    REQUIRE(imgA.value().data.size() == imgB.value().data.size());
+    float worst = 0.0f;
+    for (std::size_t i = 0; i < imgA.value().data.size(); ++i) {
+        worst = std::max(worst, std::fabs(imgA.value().data[i] - imgB.value().data[i]));
+    }
+    CHECK(worst > 0.02f);
+    // Refused with the reason named, like an unknown --color or --fit (the
+    // render command reports every pipeline set-up error with the same code).
+    const RunResult bad = runTool("render " + clip + common + quoted(djiTif) + " --look vivid");
+    CHECK(bad.exitCode != 0);
+    CHECK(bad.output.find("--look") != std::string::npos);
 }

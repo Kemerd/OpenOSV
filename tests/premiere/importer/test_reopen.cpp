@@ -87,6 +87,23 @@ private:
     bool m_hadPrevious = false;
 };
 
+/// Pin the importer's frames to the HOST path for the lifetime of the object.
+///
+/// Everything in this file is about the host decode path's reader
+/// (ensureReader, ReaderPool).  With a CUDA device the importer renders its
+/// frames on the GPU path instead - NVDEC into VRAM, no DualStreamReader at
+/// all (docs/PREMIERE.md, "The importer's own frame") - so these tests use
+/// the importer's documented switch, OPENOSV_IMPORTER_NO_GPU_DECODE, to keep
+/// exercising the path they describe.  Each clip reads it at its first
+/// frame, so the guard must exist before the first render.
+class HostFramePath {
+public:
+    HostFramePath() { ::_putenv_s("OPENOSV_IMPORTER_NO_GPU_DECODE", "1"); }
+    ~HostFramePath() { ::_putenv_s("OPENOSV_IMPORTER_NO_GPU_DECODE", ""); }
+    HostFramePath(const HostFramePath&) = delete;
+    HostFramePath& operator=(const HostFramePath&) = delete;
+};
+
 /// The importer's log file for this process (LOCALAPPDATA was redirected by
 /// isolatePluginLogs() in TestMain).
 [[nodiscard]] std::filesystem::path importerLogPath() {
@@ -211,6 +228,7 @@ private:
 TEST_CASE("an unquiet takes the reader back warm and renders the same pixels", "[importer][reopen][sample]") {
     REOPEN_REQUIRE_SAMPLE_CLIP();
     InfoLogLevel info;
+    HostFramePath hostPath;
     ImporterHarness harness;
     REQUIRE(harness.loaded());
     PPixSuite ppix(harness.host());
@@ -250,6 +268,7 @@ TEST_CASE("an unquiet takes the reader back warm and renders the same pixels", "
 TEST_CASE("a new instance of a clip takes the reader a closed instance released", "[importer][reopen][sample]") {
     REOPEN_REQUIRE_SAMPLE_CLIP();
     InfoLogLevel info;
+    HostFramePath hostPath;
     ImporterHarness harness;
     REQUIRE(harness.loaded());
     PPixSuite ppix(harness.host());
@@ -277,6 +296,7 @@ TEST_CASE("a new instance of a clip takes the reader a closed instance released"
 TEST_CASE("two live instances of one clip each decode with their own reader", "[importer][reopen][sample]") {
     REOPEN_REQUIRE_SAMPLE_CLIP();
     InfoLogLevel info;
+    HostFramePath hostPath;
     ImporterHarness harness;
     REQUIRE(harness.loaded());
     PPixSuite ppix(harness.host());
@@ -323,6 +343,7 @@ TEST_CASE("two live instances of one clip each decode with their own reader", "[
 
 TEST_CASE("imShutdown with a parked reader neither hangs nor crashes", "[importer][reopen][sample]") {
     REOPEN_REQUIRE_SAMPLE_CLIP();
+    HostFramePath hostPath;  // the host path is the one that parks a reader
     {
         ImporterHarness harness;
         REQUIRE(harness.loaded());
@@ -337,6 +358,197 @@ TEST_CASE("imShutdown with a parked reader neither hangs nor crashes", "[importe
         REQUIRE(clip.quiet() == imNoErr);
     }
     // A fresh load in the same process still works end to end.
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    PPixSuite ppix(harness.host());
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+    imFileInfoRec8 fileInfo{};
+    REQUIRE(harness.getInfo8(clip, fileInfo) == imNoErr);
+    REQUIRE_FALSE(renderBytes(harness, clip, ppix.get(), 3).empty());
+}
+
+// =============================================================================
+//  The GPU frame path: NVDEC decoders parked in GpuDecoderPool
+// =============================================================================
+//
+// With a CUDA device the importer renders its own frame on the GPU path
+// (NVDEC into VRAM, stitched in place) and never builds a DualStreamReader.
+// Its decoder is parked in video::GpuDecoderPool by releaseHeavy() and taken
+// back by the next open of the same file.  The importer says which happened
+// in its log, which is how these tests tell a warm decoder from a new one.
+
+namespace {
+
+/// Make sure the GPU frame path is allowed for the lifetime of the object
+/// (clears the switch the host-path tests above set and restore).
+class GpuFramePath {
+public:
+    GpuFramePath() { ::_putenv_s("OPENOSV_IMPORTER_NO_GPU_DECODE", ""); }
+    ~GpuFramePath() { ::_putenv_s("OPENOSV_IMPORTER_NO_GPU_DECODE", ""); }
+    GpuFramePath(const GpuFramePath&) = delete;
+    GpuFramePath& operator=(const GpuFramePath&) = delete;
+};
+
+/// The two lines the GPU frame path writes when it gets its decoder: a new
+/// one, or a warm one from the pool.
+constexpr const char* kGpuColdLine = "importer frames now decode on NVDEC into VRAM";
+constexpr const char* kGpuWarmLine = "warm decoder from the pool";
+
+/// GPU-path decoders handed to instances so far, warm or new.
+[[nodiscard]] std::size_t gpuDecoderLines(const std::string& log) {
+    return countOf(log, kGpuColdLine) + countOf(log, kGpuWarmLine);
+}
+
+/// Render the first frame of a clip and SKIP when it did not take the GPU
+/// path (no CUDA device, no NVDEC): nothing below applies then.
+[[nodiscard]] std::vector<std::uint8_t> firstGpuFrame(ImporterHarness& harness, ImporterHarness::ClipHandle& clip,
+                                                      const PrSDKPPixSuite* ppix, std::uint32_t index) {
+    const std::size_t before = gpuDecoderLines(importerLog());
+    std::vector<std::uint8_t> bytes = renderBytes(harness, clip, ppix, index);
+    if (gpuDecoderLines(importerLog()) != before + 1) {
+        SKIP("the importer frame did not take the GPU path on this machine (no CUDA renderer or NVDEC)");
+    }
+    return bytes;
+}
+
+}  // namespace
+
+TEST_CASE("an unquiet on the GPU frame path takes the NVDEC decoder back warm with the same pixels",
+          "[importer][reopen][gpu][sample]") {
+    REOPEN_REQUIRE_SAMPLE_CLIP();
+    InfoLogLevel info;
+    GpuFramePath gpuPath;
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    PPixSuite ppix(harness.host());
+
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+    imFileInfoRec8 fileInfo{};
+    REQUIRE(harness.getInfo8(clip, fileInfo) == imNoErr);
+
+    const std::vector<std::uint8_t> before = firstGpuFrame(harness, clip, ppix.get(), 17);
+    const std::size_t warmBefore = countOf(importerLog(), kGpuWarmLine);
+    const std::size_t coldBefore = countOf(importerLog(), kGpuColdLine);
+
+    // Quiet (the decoder is parked), then the same frame: the warm decoder
+    // serves it - from its kept frames - and the pixels are the same.
+    REQUIRE(clip.quiet() == imNoErr);
+    const std::vector<std::uint8_t> after = renderBytes(harness, clip, ppix.get(), 17);
+    INFO("importer log: " << importerLogPath().string());
+    REQUIRE(countOf(importerLog(), kGpuWarmLine) == warmBefore + 1);
+    REQUIRE(countOf(importerLog(), kGpuColdLine) == coldBefore);  // no second open
+    REQUIRE(after == before);
+
+    // Round trip again, then a frame in the other GOP (the warm decoder has
+    // to restart there) - still right, still no new decoder.
+    REQUIRE(clip.quiet() == imNoErr);
+    const std::vector<std::uint8_t> otherGop = renderBytes(harness, clip, ppix.get(), 62);
+    REQUIRE(countOf(importerLog(), kGpuWarmLine) == warmBefore + 2);
+    REQUIRE(countOf(importerLog(), kGpuColdLine) == coldBefore);
+    REQUIRE(otherGop != before);
+    // And back: frame 17 through a decoder that has been parked twice.
+    REQUIRE(renderBytes(harness, clip, ppix.get(), 17) == before);
+}
+
+TEST_CASE("a new instance on the GPU frame path takes the decoder a closed instance parked",
+          "[importer][reopen][gpu][sample]") {
+    REOPEN_REQUIRE_SAMPLE_CLIP();
+    InfoLogLevel info;
+    GpuFramePath gpuPath;
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    PPixSuite ppix(harness.host());
+
+    std::vector<std::uint8_t> first;
+    {
+        auto clip = harness.openClip(sampleClipPath(), 21);
+        REQUIRE(clip.open());
+        imFileInfoRec8 fileInfo{};
+        REQUIRE(harness.getInfo8(clip, fileInfo) == imNoErr);
+        first = firstGpuFrame(harness, clip, ppix.get(), 30);
+        REQUIRE(clip.close() == imNoErr);  // what Premiere does to the old instance
+    }
+    const std::size_t warmBefore = countOf(importerLog(), kGpuWarmLine);
+    const std::size_t coldBefore = countOf(importerLog(), kGpuColdLine);
+
+    auto again = harness.openClip(sampleClipPath(), 22);
+    REQUIRE(again.open());
+    imFileInfoRec8 fileInfo{};
+    REQUIRE(harness.getInfo8(again, fileInfo) == imNoErr);
+    const std::vector<std::uint8_t> second = renderBytes(harness, again, ppix.get(), 30);
+    REQUIRE(countOf(importerLog(), kGpuWarmLine) == warmBefore + 1);
+    REQUIRE(countOf(importerLog(), kGpuColdLine) == coldBefore);
+    REQUIRE(second == first);
+}
+
+TEST_CASE("two live instances on the GPU frame path decode with their own decoders, interleaved",
+          "[importer][reopen][gpu][sample]") {
+    REOPEN_REQUIRE_SAMPLE_CLIP();
+    InfoLogLevel info;
+    GpuFramePath gpuPath;
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    PPixSuite ppix(harness.host());
+
+    auto a = harness.openClip(sampleClipPath(), 31);
+    auto b = harness.openClip(sampleClipPath(), 32);
+    REQUIRE(a.open());
+    REQUIRE(b.open());
+    imFileInfoRec8 infoA{};
+    imFileInfoRec8 infoB{};
+    REQUIRE(harness.getInfo8(a, infoA) == imNoErr);
+    REQUIRE(harness.getInfo8(b, infoB) == imNoErr);
+
+    // Each gets a decoder of its own (new, or one an earlier test parked -
+    // never the same one twice: the pool hands each out once).
+    const std::size_t before = gpuDecoderLines(importerLog());
+    const std::vector<std::uint8_t> a20 = firstGpuFrame(harness, a, ppix.get(), 20);
+    const std::vector<std::uint8_t> b20 = renderBytes(harness, b, ppix.get(), 20);
+    REQUIRE(gpuDecoderLines(importerLog()) == before + 2);
+    REQUIRE(a20 == b20);
+
+    // Interleaved requests at different places do not disturb each other.
+    const std::vector<std::uint8_t> a45 = renderBytes(harness, a, ppix.get(), 45);
+    const std::vector<std::uint8_t> b5 = renderBytes(harness, b, ppix.get(), 5);
+    const std::vector<std::uint8_t> a5 = renderBytes(harness, a, ppix.get(), 5);
+    const std::vector<std::uint8_t> b45 = renderBytes(harness, b, ppix.get(), 45);
+    REQUIRE(a45 == b45);
+    REQUIRE(a5 == b5);
+    REQUIRE(a45 != a5);
+
+    // A closes (its decoder is parked) while B keeps rendering; then B
+    // quiets and wakes and takes a parked decoder - A's or its own, both
+    // exact matches.  The pixels prove no decoder is ever in two places.
+    const std::size_t warmBefore = countOf(importerLog(), kGpuWarmLine);
+    REQUIRE(a.close() == imNoErr);
+    REQUIRE(renderBytes(harness, b, ppix.get(), 50) != a45);
+    REQUIRE(b.quiet() == imNoErr);
+    REQUIRE(renderBytes(harness, b, ppix.get(), 20) == a20);
+    REQUIRE(countOf(importerLog(), kGpuWarmLine) == warmBefore + 1);
+    REQUIRE(renderBytes(harness, b, ppix.get(), 45) == a45);
+}
+
+TEST_CASE("imShutdown with a parked NVDEC decoder neither hangs nor crashes", "[importer][reopen][gpu][sample]") {
+    REOPEN_REQUIRE_SAMPLE_CLIP();
+    GpuFramePath gpuPath;
+    {
+        InfoLogLevel info;
+        ImporterHarness harness;
+        REQUIRE(harness.loaded());
+        PPixSuite ppix(harness.host());
+        auto clip = harness.openClip(sampleClipPath());
+        REQUIRE(clip.open());
+        imFileInfoRec8 fileInfo{};
+        REQUIRE(harness.getInfo8(clip, fileInfo) == imNoErr);
+        (void)firstGpuFrame(harness, clip, ppix.get(), 3);
+        // Quiet parks the decoder in the primary context; then the clip
+        // closes and the harness sends imShutdown - which must clear the GPU
+        // pool before the renderer pool goes - and unloads the module.
+        REQUIRE(clip.quiet() == imNoErr);
+    }
+    // A fresh load in the same process still decodes on the GPU end to end.
     ImporterHarness harness;
     REQUIRE(harness.loaded());
     PPixSuite ppix(harness.host());
