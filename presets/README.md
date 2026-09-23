@@ -45,16 +45,12 @@ than guessed:
    `Timecode Presets` and `Track Height Presets` - written by the application
    itself, not by us.
 2. The subfolder for sequence presets is `SequencePresets`, spelled without a
-   space. Every one of the folder names above appears as a literal string
-   inside `Adobe Premiere Pro 2026\Mezzanine.dll`, the module whose exports
-   include `SequenceSettingsCache::GetSequencePresetsFromCache` and
-   `SequencePreviewPresets::CollectSequencePresets`; `SequencePresets` appears
-   there too, while `Sequence Presets` (with a space) does not. It is also
-   exactly the folder name the shipped presets live in under
-   `Program Files`.
-3. `.sqpreset` is confirmed as the extension by the string table in
-   `ScriptLayerPProQE.dll`, where `SequencePresets` and `sqpreset` sit
-   adjacent.
+   space. Premiere Pro 2026's own installed files name it that way, alongside
+   every one of the folder names above, and never as `Sequence Presets` (with
+   a space). It is also exactly the folder name the shipped presets live in
+   under `Program Files`.
+3. `.sqpreset` is the extension of the presets Premiere Pro ships, and the
+   application's own installed files pair it with `SequencePresets`.
 
 What is **not** verified is the end-to-end behaviour, because Premiere Pro was
 not launched: that the application picks these three files up from that

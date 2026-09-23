@@ -63,8 +63,8 @@ All notable changes to OpenOSV are documented here. The format follows
   motion 0.0001 deg/frame. On whenever Seam search is on.
 * **DJI's camera in the reframe effect (WP-CAMERA).** Camera Model "DJI" adds
   DJI Studio's FOV (vertical pinhole angle), Correction Angle (eye distance
-  behind the sphere centre) and its read-out Zoom, recovered from DJI Studio
-  and DJI's Premiere plug-in; the same numbers give the same framing. DJI
+  behind the sphere centre) and its read-out Zoom, matching DJI Studio and
+  DJI's Premiere plug-in; the same numbers give the same framing. DJI
   preset values, a Drag Sensitivity control (default 2.0), and popups read
   correctly whether the host numbers them from 0 or 1.
 * **Source Settings reach the Program monitor (WP-SETTINGS).** The engine
@@ -266,9 +266,8 @@ All notable changes to OpenOSV are documented here. The format follows
   `Documents\Adobe\Premiere Pro\<ver>\Profile-<user>\Settings\SequencePresets\OpenOSV\`,
   where they appear as a group called OpenOSV under File > New > Sequence.
   `-NoPresets` skips them and `-PresetDestination` overrides the location.
-  The path was derived from the installed application (the folder-name
-  literals in `Mezzanine.dll` alongside the `Settings\` subfolders Premiere
-  itself creates), not guessed; the script discovers the version and
+  The path was derived from the installed application (its own files and
+  the `Settings\` subfolders Premiere itself creates), not guessed; the script discovers the version and
   `Profile-*` folders rather than assembling them from `$env:USERNAME`, and
   when it finds no settings root it says so and skips instead of inventing a
   path. The presets are installed by the UNELEVATED parent process, because a
