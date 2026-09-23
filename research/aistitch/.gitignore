@@ -1,0 +1,7 @@
+.venv/
+models/
+bin/
+out/
+third_party/
+__pycache__/
+*.pyc
