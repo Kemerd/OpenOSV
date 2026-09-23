@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  Copyright 2026 The OpenOSV Contributors
+
+  The OpenOSV panel, CEP flavour.  The interface is built by shared/view.js
+  (the same one the UXP panel uses); this page only loads the scripts in
+  dependency order.  The installer stages panel/shared next to this file.
+-->
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OpenOSV</title>
+    <link rel="stylesheet" href="shared/panel.css">
+</head>
+<body>
+    <div id="app"><div class="osv-boot">Loading OpenOSV...</div></div>
+    <script src="shared/osvcore.js"></script>
+    <script src="shared/spring.js"></script>
+    <script src="shared/controller.js"></script>
+    <script src="shared/view.js"></script>
+    <script src="shared/boot.js"></script>
+    <script src="cepAdapter.js"></script>
+    <script src="main.js"></script>
+</body>
+</html>
