@@ -87,6 +87,23 @@ private:
     bool m_hadPrevious = false;
 };
 
+/// Pin the importer's frames to the HOST path for the lifetime of the object.
+///
+/// Everything in this file is about the host decode path's reader
+/// (ensureReader, ReaderPool).  With a CUDA device the importer renders its
+/// frames on the GPU path instead - NVDEC into VRAM, no DualStreamReader at
+/// all (docs/PREMIERE.md, "The importer's own frame") - so these tests use
+/// the importer's documented switch, OPENOSV_IMPORTER_NO_GPU_DECODE, to keep
+/// exercising the path they describe.  Each clip reads it at its first
+/// frame, so the guard must exist before the first render.
+class HostFramePath {
+public:
+    HostFramePath() { ::_putenv_s("OPENOSV_IMPORTER_NO_GPU_DECODE", "1"); }
+    ~HostFramePath() { ::_putenv_s("OPENOSV_IMPORTER_NO_GPU_DECODE", ""); }
+    HostFramePath(const HostFramePath&) = delete;
+    HostFramePath& operator=(const HostFramePath&) = delete;
+};
+
 /// The importer's log file for this process (LOCALAPPDATA was redirected by
 /// isolatePluginLogs() in TestMain).
 [[nodiscard]] std::filesystem::path importerLogPath() {
@@ -211,6 +228,7 @@ private:
 TEST_CASE("an unquiet takes the reader back warm and renders the same pixels", "[importer][reopen][sample]") {
     REOPEN_REQUIRE_SAMPLE_CLIP();
     InfoLogLevel info;
+    HostFramePath hostPath;
     ImporterHarness harness;
     REQUIRE(harness.loaded());
     PPixSuite ppix(harness.host());
@@ -250,6 +268,7 @@ TEST_CASE("an unquiet takes the reader back warm and renders the same pixels", "
 TEST_CASE("a new instance of a clip takes the reader a closed instance released", "[importer][reopen][sample]") {
     REOPEN_REQUIRE_SAMPLE_CLIP();
     InfoLogLevel info;
+    HostFramePath hostPath;
     ImporterHarness harness;
     REQUIRE(harness.loaded());
     PPixSuite ppix(harness.host());
@@ -277,6 +296,7 @@ TEST_CASE("a new instance of a clip takes the reader a closed instance released"
 TEST_CASE("two live instances of one clip each decode with their own reader", "[importer][reopen][sample]") {
     REOPEN_REQUIRE_SAMPLE_CLIP();
     InfoLogLevel info;
+    HostFramePath hostPath;
     ImporterHarness harness;
     REQUIRE(harness.loaded());
     PPixSuite ppix(harness.host());
@@ -323,6 +343,7 @@ TEST_CASE("two live instances of one clip each decode with their own reader", "[
 
 TEST_CASE("imShutdown with a parked reader neither hangs nor crashes", "[importer][reopen][sample]") {
     REOPEN_REQUIRE_SAMPLE_CLIP();
+    HostFramePath hostPath;  // the host path is the one that parks a reader
     {
         ImporterHarness harness;
         REQUIRE(harness.loaded());

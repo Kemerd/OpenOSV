@@ -223,10 +223,19 @@ struct PrefsBlob {
     /// PrefsDirectColour: how the effect's direct path treats this clip's
     /// colour output (0 = SequenceSpace, the default; see DIRECT_GPU.md).
     std::uint8_t directColour = 0;
+    /// Offsets 25-29: the byte ranges of WP-SETTINGS, WP-SEAM and WP-LOOK
+    /// (docs/PARALLEL_WORK.md), unused on the WP-FLARE branch.  Zero, and
+    /// zeroed by sanitise(); the lead folds them into those fields at merge.
+    std::uint8_t padBeforeFlare[5] = {};
+    /// [WP-FLARE] 1 = remove the sun's internal-reflection ghosts from the
+    /// lens that sees the sun (osv/render/Flare.h); 0 = off, the default, so
+    /// every blob written before this byte existed renders exactly as before.
+    std::uint8_t flareRemoval = 0;
+    /// Offset 31: the rest of WP-FLARE's range, kept for the overlap veil
+    /// estimate, which must stay off until it is cleared legally
+    /// (docs/research/FLARE.md).  Zero, and zeroed by sanitise().
+    std::uint8_t padAfterFlare = 0;
     // ---- [WP-PHOTO] ---------------------------------------------------------
-    /// Offsets 25-31 belong to other packages (docs/PARALLEL_WORK.md); zero
-    /// here, and folded into their real fields at merge.
-    std::uint8_t padBeforePhoto[7] = {};
     /// Seam edge inset of the RENDER blend (the analyses keep the calibrated
     /// FOV): 0 = the default kDefaultSeamInsetTenths, otherwise (value - 1)
     /// tenths of a degree, 1 = no inset (the render blend before this field
@@ -353,6 +362,19 @@ struct PrefsBlob {
             padAfterCalibration = 0;
             clean = false;
         }
+        // [WP-FLARE] a boolean byte: anything but 0/1 is corruption and
+        // lands on the default (off); its padding stays zero.
+        clampEnum(flareRemoval, 2, 0);
+        for (std::uint8_t& b : padBeforeFlare) {
+            if (b != 0) {
+                b = 0;
+                clean = false;
+            }
+        }
+        if (padAfterFlare != 0) {
+            padAfterFlare = 0;
+            clean = false;
+        }
 
         // NaN compares false with everything, so test the valid range and
         // reset anything else (NaN, infinities, out of range).
@@ -368,15 +390,8 @@ struct PrefsBlob {
                 clean = false;
             }
         }
-        // [WP-PHOTO] Other packages' bytes are reserved in this build, and an
-        // out-of-range inset code falls back to the default (code 0), the
-        // setting a fresh blob would have.
-        for (std::uint8_t& b : padBeforePhoto) {
-            if (b != 0) {
-                b = 0;
-                clean = false;
-            }
-        }
+        // [WP-PHOTO] An out-of-range inset code falls back to the default
+        // (code 0), the setting a fresh blob would have.
         if (seamInset > kMaxSeamInsetCode) {
             seamInset = 0;
             clean = false;
@@ -520,10 +535,17 @@ static_assert(offsetof(PrefsBlob, calibrationForceNative) == 22, "PrefsBlob layo
 // PrefsDirectColour::SequenceSpace, the default.
 static_assert(offsetof(PrefsBlob, padAfterCalibration) == 23, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, directColour) == 24, "PrefsBlob layout drifted");
-// [WP-PHOTO] owns offsets 32-37 (docs/PARALLEL_WORK.md).  seamInset is the
-// photometric seam fix's stage 1; zero means the default inset, so an old
-// project gets the thinner seam band without a Source Settings visit.
-static_assert(offsetof(PrefsBlob, padBeforePhoto) == 25, "PrefsBlob layout drifted");
+// [WP-FLARE] flareRemoval takes offset 30 of the range the harness assigned
+// (30-31); 25-29 are padded for the packages whose ranges they are.  An older
+// blob's zero byte reads as "off", which is how every project rendered
+// before the removal existed.
+static_assert(offsetof(PrefsBlob, padBeforeFlare) == 25, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, flareRemoval) == 30, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, padAfterFlare) == 31, "PrefsBlob layout drifted");
+// [WP-PHOTO] owns offsets 32-37 (docs/PARALLEL_WORK.md), taken from the front
+// of the reserved block.  seamInset is the photometric seam fix's stage 1;
+// zero means the default inset, so an old project gets the thinner seam band
+// without a Source Settings visit.
 static_assert(offsetof(PrefsBlob, seamInset) == 32, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, reserved) == 33, "PrefsBlob layout drifted");
 

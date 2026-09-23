@@ -661,6 +661,84 @@ void engineShutdown() noexcept {
     }
 }
 
+// ===========================================================================
+//  [WP-IMPORTER] direct-path activity per file (see Engine.h)
+// ===========================================================================
+
+namespace {
+
+/// When each file last had a direct frame served, and how many so far.
+/// Created on first use and never destroyed, like the registry: it holds no
+/// CUDA state, but it is reached from render threads that may outlive a
+/// static destructor's ordering at process exit.
+struct DirectActivity {
+    struct Entry {
+        std::chrono::steady_clock::time_point last{};
+        std::uint64_t frames = 0;
+    };
+    std::mutex mutex;
+    std::unordered_map<std::wstring, Entry> files;
+};
+
+[[nodiscard]] DirectActivity& directActivity() {
+    static DirectActivity* instance = new DirectActivity();
+    return *instance;
+}
+
+}  // namespace
+
+void engineNoteDirectFrame(const std::filesystem::path& path) noexcept {
+    try {
+        const std::wstring key = keyFor(path);
+        bool first = false;
+        {
+            DirectActivity& a = directActivity();
+            std::lock_guard<std::mutex> lock(a.mutex);
+            DirectActivity::Entry& entry = a.files[key];
+            first = entry.frames == 0;
+            entry.last = std::chrono::steady_clock::now();
+            ++entry.frames;
+        }
+        if (first) {
+            PluginLog::info("direct: the effect renders '{}' from the fisheyes; the importer's equirect of it stays "
+                            "full quality (it is the effect's fallback and every other view's picture)",
+                            path.filename().string());
+        }
+    } catch (...) {
+        // Diagnostics only: a failed note must never fail a frame.
+    }
+}
+
+bool engineDirectPathActive(const std::filesystem::path& path, std::chrono::milliseconds window) noexcept {
+    try {
+        if (window.count() < 0) {
+            return false;
+        }
+        const std::wstring key = keyFor(path);
+        DirectActivity& a = directActivity();
+        std::lock_guard<std::mutex> lock(a.mutex);
+        const auto it = a.files.find(key);
+        if (it == a.files.end() || it->second.frames == 0) {
+            return false;
+        }
+        return std::chrono::steady_clock::now() - it->second.last <= window;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::uint64_t engineDirectFrameCount(const std::filesystem::path& path) noexcept {
+    try {
+        const std::wstring key = keyFor(path);
+        DirectActivity& a = directActivity();
+        std::lock_guard<std::mutex> lock(a.mutex);
+        const auto it = a.files.find(key);
+        return it == a.files.end() ? 0u : it->second.frames;
+    } catch (...) {
+        return 0;
+    }
+}
+
 }  // namespace osv::premiere
 
 // ===========================================================================
@@ -828,6 +906,11 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
         out->settings = frameSettings;  // [WP-SETTINGS]
         out->lease = lease.release();
         g_liveLeases.fetch_add(1);
+
+        // [WP-IMPORTER] the importer's side learns that this file is being
+        // rendered directly (diagnostics only - see Engine.h for why the
+        // importer's own frame must not change because of it).
+        engineNoteDirectFrame(path);
 
         PluginLog::oncef("direct/first-frame", PluginLog::Level::Info,
                          "direct: first frame served - '{}' frame {} (media {} ticks), transfer {}, seam {}, warp {}, "

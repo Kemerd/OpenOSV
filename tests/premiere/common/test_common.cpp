@@ -183,9 +183,11 @@ TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     static_assert(offsetof(PrefsBlob, calibrationForceNative) == 22, "calibrationForceNative follows flowBackend");
     static_assert(offsetof(PrefsBlob, padAfterCalibration) == 23, "offset 23 is unused padding");
     static_assert(offsetof(PrefsBlob, directColour) == 24, "directColour sits at 24");
-    // [WP-PHOTO] offsets 25-31 are other packages' (padded in this build),
-    // seamInset sits at 32 and the reserved block now starts at 33.
-    static_assert(offsetof(PrefsBlob, padBeforePhoto) == 25, "the other packages' bytes start at 25");
+    // [WP-FLARE] flareRemoval at 30 (its range is 30-31), 25-29 padded for
+    // the packages that own them; reserved now starts at 32.
+    static_assert(offsetof(PrefsBlob, flareRemoval) == 30, "flareRemoval sits at 30");
+    // [WP-PHOTO] seamInset at 32 (its range is 32-37), taken from the front of
+    // the reserved block, which now starts at 33.
     static_assert(offsetof(PrefsBlob, seamInset) == 32, "seamInset sits at 32");
     static_assert(offsetof(PrefsBlob, reserved) == 33, "reserved fills the rest");
     static_assert(std::is_trivially_copyable_v<PrefsBlob>, "the blob is memcpy'd to and from the host");
@@ -452,10 +454,16 @@ TEST_CASE("PrefsBlob sanitise clamps every out-of-range field", "[common][prefs]
         PrefsBlob p = PrefsBlob::defaults();
         p.directColour = 0x7F;
         p.padAfterCalibration = 0xFF;
+        p.flareRemoval = 0x42;
+        p.padBeforeFlare[2] = 0x11;
+        p.padAfterFlare = 0x99;
         REQUIRE_FALSE(p.sanitise());
         // A corrupt byte lands on the default, as a fresh blob would.
         CHECK(p.directColourMode() == PrefsDirectColour::SequenceSpace);
         CHECK(p.padAfterCalibration == 0);
+        CHECK(p.flareRemoval == 0);
+        CHECK(p.padBeforeFlare[2] == 0);
+        CHECK(p.padAfterFlare == 0);
         // Both valid values survive.
         p.directColour = static_cast<std::uint8_t>(PrefsDirectColour::MatchSource);
         REQUIRE(p.sanitise());
@@ -463,6 +471,10 @@ TEST_CASE("PrefsBlob sanitise clamps every out-of-range field", "[common][prefs]
         p.directColour = static_cast<std::uint8_t>(PrefsDirectColour::SequenceSpace);
         REQUIRE(p.sanitise());
         CHECK(p.directColourMode() == PrefsDirectColour::SequenceSpace);
+        // [WP-FLARE] the ghost removal switch keeps its "on".
+        p.flareRemoval = 1;
+        REQUIRE(p.sanitise());
+        CHECK(p.flareRemoval == 1);
     }
 }
 
@@ -1233,14 +1245,11 @@ TEST_CASE("PrefsBlob seam edge inset: zero is the default, code 1 is no inset", 
     p.setSeamInsetDeg(-1.0);
     CHECK(p.seamInset == 0);
 
-    // An out-of-range code sanitises to the default, as a fresh blob has it,
-    // and so do the other packages' still-reserved bytes.
+    // An out-of-range code sanitises to the default, as a fresh blob has it.
     p.seamInset = 200;
-    p.padBeforePhoto[3] = 7;
     CHECK(p.seamInsetDeg() == 2.6);
     REQUIRE_FALSE(p.sanitise());
     CHECK(p.seamInset == 0);
-    CHECK(p.padBeforePhoto[3] == 0);
 
     // Every valid code survives sanitise untouched.
     for (int code = 0; code <= PrefsBlob::kMaxSeamInsetCode; ++code) {
