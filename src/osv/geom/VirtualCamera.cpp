@@ -178,4 +178,119 @@ bool VirtualCamera::pixelToRay(double px, double py, Vec3d& dirView) const noexc
     return dirView.isFinite();
 }
 
+// ===========================================================================
+//  DJI's reframe camera (see the header and docs/research/DJI_CAMERA.md)
+// ===========================================================================
+
+double djiZoomDeg(double vfovDeg, double eyeDistance, double aspect) noexcept {
+    // DJI Studio returns 0 for any of these; so do we, so a garbage input
+    // prints the same number in both tools rather than a NaN here.
+    if (!std::isfinite(vfovDeg) || !std::isfinite(eyeDistance) || !std::isfinite(aspect)) {
+        return 0.0;
+    }
+    if (!(aspect > 0.0) || !(vfovDeg > 0.0) || eyeDistance < 0.0) {
+        return 0.0;
+    }
+
+    // Tangent of the pinhole's HORIZONTAL half angle.  DJI caps the field of
+    // view at 180 before halving it; tan(90 deg) then overflows to a huge
+    // finite number in double, which the formula below handles as the limit.
+    const double halfV = deg2rad(0.5 * std::min(vfovDeg, 180.0));
+    const double a = std::tan(halfV) * aspect;
+    // DJI's own epsilon guard (DBL_EPSILON on |a|).
+    if (!(std::fabs(a) >= 2.220446049250313e-16)) {
+        return 0.0;
+    }
+
+    // 360 - 2 atan(1/a) - 2 acos(d a / sqrt(1 + a^2)), in degrees.  Written
+    // with 1 / a exactly as DJI writes it so the rounding matches too.
+    const double complement = std::atan(1.0 / a);
+    const double s = std::sqrt(1.0 + 1.0 / (a * a));
+    const double q = clampd(eyeDistance / s, -1.0, 1.0);
+    const double zoom = 360.0 - 2.0 * rad2deg(complement) - 2.0 * rad2deg(std::acos(q));
+    return std::isfinite(zoom) ? zoom : 0.0;
+}
+
+double djiPinholeHalfAngleRad(double visibleHalfRad, double eyeDistance) noexcept {
+    if (!std::isfinite(visibleHalfRad) || !std::isfinite(eyeDistance)) {
+        return -1.0;
+    }
+    if (visibleHalfRad < 0.0 || eyeDistance < 0.0) {
+        return -1.0;
+    }
+    // tan(alpha) = sin(theta) / (d + cos(theta)): the eye sits d radii behind
+    // the centre, so the sphere point at angle theta is seen along
+    // (sin theta, d + cos theta).  A non-positive denominator means the point
+    // is at or behind the eye's horizon on the sphere - not visible.
+    const double denom = eyeDistance + std::cos(visibleHalfRad);
+    const double numer = std::sin(visibleHalfRad);
+    if (!(denom > 0.0) || numer < 0.0) {
+        return -1.0;
+    }
+    return std::atan2(numer, denom);
+}
+
+bool DjiSphereCamera::isValid() const noexcept {
+    if (w <= 0 || h <= 0) {
+        return false;
+    }
+    if (!std::isfinite(vfovDeg) || !(vfovDeg > 0.0) || !(vfovDeg < 180.0)) {
+        return false;
+    }
+    return std::isfinite(eyeDistance) && eyeDistance >= 0.0 && eyeDistance <= kDjiMaxEyeDistance;
+}
+
+double DjiSphereCamera::focalPx() const noexcept {
+    if (!isValid()) {
+        return 0.0;
+    }
+    // The pinhole's focal length for the vertical field of view across the
+    // full frame height - exactly GLKMatrix4MakePerspective(fovy, aspect, ..)
+    // expressed in pixels.
+    const double t = std::tan(deg2rad(0.5 * vfovDeg));
+    return (t > 0.0 && std::isfinite(t)) ? (0.5 * static_cast<double>(h)) / t : 0.0;
+}
+
+double DjiSphereCamera::zoomDeg() const noexcept {
+    if (!isValid()) {
+        return 0.0;
+    }
+    return djiZoomDeg(vfovDeg, eyeDistance, static_cast<double>(w) / static_cast<double>(h));
+}
+
+bool DjiSphereCamera::pixelToRay(double px, double py, Vec3d& dirView) const noexcept {
+    if (!isValid() || !std::isfinite(px) || !std::isfinite(py)) {
+        return false;
+    }
+    const double f = focalPx();
+    if (!(f > 0.0)) {
+        return false;
+    }
+    // Centred offsets, +x right, +y UP, pixel centres at index + 0.5 - the
+    // same convention as every other projection above and as the kernel.
+    const double sx = (px + 0.5) - 0.5 * static_cast<double>(w);
+    const double sy = 0.5 * static_cast<double>(h) - (py + 0.5);
+
+    // Unit pinhole ray (view frame: X right, Y forward, Z up).
+    const Vec3d u = Vec3d{sx, f, sy}.normalized();
+    if (!u.isFinite() || !(u.norm() > 0.0)) {
+        return false;
+    }
+
+    // Far root of |E + t u| = 1 with the eye at E = (0, -e, 0).
+    const double e = eyeDistance;
+    const double sin2 = (sx * sx + sy * sy) / (sx * sx + sy * sy + f * f);
+    const double disc = 1.0 - e * e * sin2;
+    if (!(disc >= 0.0)) {
+        return false;  // the eye is outside the sphere and this ray misses it
+    }
+    const double t = e * u.y + std::sqrt(disc);
+    if (!(t > 0.0)) {
+        return false;
+    }
+    const Vec3d p{t * u.x, t * u.y - e, t * u.z};
+    dirView = p.normalized();
+    return dirView.isFinite();
+}
+
 }  // namespace osv::geom

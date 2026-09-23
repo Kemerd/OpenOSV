@@ -42,9 +42,18 @@ public:
     ContainerSource& operator=(const ContainerSource&) = delete;
 
     /// Open `path` with osv::OsvFile and select track `trackId`.
+    ///
+    /// The parsed movie is shared: every ContainerSource of the same file
+    /// (same path, size and modification time) that is alive at the same time
+    /// uses ONE OsvFile - one mapping, one moov parse - so the two lenses of a
+    /// reader, and a second reader of a clip that is already open, skip the
+    /// parse.  The table is weak; the movie is freed with its last user.
     /// Errors: Io (cannot map), Malformed / Truncated (parser rejected the
     /// file), NotFound (no such track, not a video track, or no samples).
     static Result<std::unique_ptr<ContainerSource>> open(const std::filesystem::path& path, std::uint32_t trackId);
+
+    /// True when open() found the movie already parsed by a live user.
+    [[nodiscard]] bool reusedParse() const noexcept;
 
     /// ISO BMFF track id that was selected.
     [[nodiscard]] std::uint32_t trackId() const noexcept;

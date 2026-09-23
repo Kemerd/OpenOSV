@@ -28,6 +28,7 @@
 #include "Engine.h"
 #include "HostContext.h"
 #include "PluginLog.h"
+#include "osv/video/ReaderPool.h"
 
 #include "PrSDKEntry.h"
 #include "PrSDKMALErrors.h"
@@ -347,6 +348,15 @@ csSDK_int32 doShutdown() {
     // still alive.  Then the renderers (and with them any CUDA / OpenCL
     // context of our own), also here and never from DllMain.
     engineShutdown();
+
+    // Readers parked by quiet / close (osv::video::ReaderPool) hold decoders,
+    // hardware devices and a file mapping for up to a minute so that a reopen
+    // is instant.  At shutdown nobody will reopen anything: release them now,
+    // while the D3D11 / CUDA runtimes are certainly alive, instead of letting
+    // the pool's idle timer do it after the host has moved on.  The pool's
+    // background thread also pins this module while it runs, so clearing here
+    // lets the module unload promptly.
+    osv::video::ReaderPool::instance().clear();
     HostContext::shutdown();
 
     // Same lock the acquisition uses.  imShutdown arrives on one thread while

@@ -607,4 +607,102 @@ void MockHost::setNodeProperty(csSDK_int32 nodeId, std::string_view key, std::st
     m_impl->nodes[nodeId].properties[std::string(key)] = std::string(value);
 }
 
+void MockHost::setParamCount(csSDK_int32 nodeId, csSDK_int32 count) {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    // Any negative value means "derive it", so the override can be undone.
+    m_impl->nodes[nodeId].paramCountOverride = count < 0 ? -1 : count;
+}
+
+void MockHost::setParamReadError(csSDK_int32 nodeId, csSDK_int32 index, prSuiteError error,
+                                 std::optional<PrTime> onlyAt) {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    NodeRecord& node = m_impl->nodes[nodeId];
+    if (error == suiteError_NoError) {
+        node.readFailures.erase(index);
+        return;
+    }
+    ParamReadFailure f;
+    f.error = error;
+    f.onlyAtTime = onlyAt.has_value();
+    f.time = onlyAt.value_or(0);
+    node.readFailures[index] = f;
+}
+
+std::vector<ParamReadRecord> MockHost::paramReads() const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    return m_impl->paramReads;
+}
+
+void MockHost::clearParamReads() {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    m_impl->paramReads.clear();
+    m_impl->paramReadsDropped = 0;
+}
+
+// -----------------------------------------------------------------------------
+//  Segment graph
+// -----------------------------------------------------------------------------
+
+void MockHost::setNodeType(csSDK_int32 nodeId, std::string_view type) {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    m_impl->nodes[nodeId].type = std::string(type);
+}
+
+void MockHost::setNodeOwner(csSDK_int32 operatorNodeId, csSDK_int32 ownerNodeId) {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    m_impl->nodes[operatorNodeId].owner = ownerNodeId;
+    // The owner is a node in its own right: create it so the walk that
+    // follows the edge finds something to answer GetNodeInfo with.
+    if (ownerNodeId != 0) {
+        (void)m_impl->nodes[ownerNodeId];
+    }
+}
+
+void MockHost::addNodeInput(csSDK_int32 nodeId, csSDK_int32 inputNodeId, PrTime offset) {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    NodeInput input;
+    input.node = inputNodeId;
+    input.offset = offset;
+    m_impl->nodes[nodeId].inputs.push_back(input);
+    (void)m_impl->nodes[inputNodeId];
+}
+
+void MockHost::setNodeTimeTransform(csSDK_int32 nodeId, PrTime origin, std::int64_t rateNum, std::int64_t rateDen) {
+    // A zero or negative denominator describes no transform at all; refusing
+    // it here keeps TransformNodeTime from ever dividing by it.
+    if (rateDen <= 0) {
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    NodeRecord& node = m_impl->nodes[nodeId];
+    node.timeOrigin = origin;
+    node.rateNum = rateNum;
+    node.rateDen = rateDen;
+}
+
+void MockHost::setNodeTimeTransformError(csSDK_int32 nodeId, prSuiteError error) {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    m_impl->nodes[nodeId].transformError = error;
+}
+
+int MockHost::nodeRefCount(csSDK_int32 nodeId) const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    const auto it = m_impl->nodes.find(nodeId);
+    return it == m_impl->nodes.end() ? 0 : it->second.refs;
+}
+
+int MockHost::totalNodeRefs() const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    int total = 0;
+    for (const auto& entry : m_impl->nodes) {
+        total += entry.second.refs;
+    }
+    return total;
+}
+
+std::size_t MockHost::invalidNodeReleases() const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    return m_impl->invalidNodeReleases;
+}
+
 }  // namespace osv::premiere::mock

@@ -18,6 +18,7 @@
 #include "osv/io/ImageWriter.h"
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"
+#include "osv/render/SeamCarve.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
 
@@ -52,6 +53,7 @@ struct RenderOptions {
     std::string size = "1920x1080";
     bool seamSearch = false;
     bool parallax = false;         ///< 2-D flow-based parallax correction
+    bool seamCarve = false;        ///< DP-carved seam with a narrow blend (SeamCarve.h)
     std::string flowBackend = "auto";
     bool gain = false;
     // [WP-PHOTO] The RENDER blend (the analyses keep --lens-fov / --feather).
@@ -137,7 +139,7 @@ int runRender(const RenderOptions& o) {
     // The per-frame analyses shade bands from host planes, so they decide
     // whether a CUDA decode may keep its frames on the GPU.
     PipelineOptions pipelineOptions = o.pipeline;
-    pipelineOptions.hostFramesRequired = o.seamSearch || o.gain || o.parallax;
+    pipelineOptions.hostFramesRequired = o.seamSearch || o.gain || o.parallax || o.seamCarve;
     auto pipe = Pipeline::open(pipelineOptions, true);
     if (!pipe.ok()) {
         std::fprintf(stderr, "error: %s\n", log::safe(pipe.value() ? "" : pipe.error().toString()).c_str());
@@ -358,6 +360,8 @@ int runRender(const RenderOptions& o) {
     std::vector<float> seamTable;
     render::ParallaxWarpGrid warpGrid;
     bool haveWarp = false;
+    render::BlendSeam blendSeam;  // the carved seam in force (--seam-carve)
+    bool haveBlendSeam = false;
     for (std::uint32_t f = first; f <= last && !writerFailed; ++f) {
         auto pair = P.reader->read(f);
         if (!pair.ok()) {
@@ -366,7 +370,7 @@ int runRender(const RenderOptions& o) {
             break;
         }
         // Optional per-frame analysis (every seamInterval frames).
-        const bool analyse = (o.seamSearch || o.gain || o.parallax) &&
+        const bool analyse = (o.seamSearch || o.gain || o.parallax || o.seamCarve) &&
                              ((f - first) % static_cast<std::uint32_t>(std::max(1, o.seamInterval)) == 0);
         // 2-D parallax correction first.  When it yields a grid, the grid
         // REPLACES the seam table rather than composing with it - the same
@@ -413,6 +417,36 @@ int runRender(const RenderOptions& o) {
                 log::warn("frame {}: seam search failed: {}", f, profile.error().message);
             }
         }
+        // The carved seam, through whichever correction is in force this
+        // frame, steered by the previous one (frames render in order here).
+        if (analyse && o.seamCarve) {
+            render::WarpGridView warpView;
+            render::SeamCorrection correction;
+            if (useWarp) {
+                warpView.uv = warpGrid.uv.data();
+                warpView.w = warpGrid.w;
+                warpView.h = warpGrid.h;
+                warpView.latMinRad = warpGrid.latMinRad;
+                warpView.latMaxRad = warpGrid.latMaxRad;
+                correction.warp = &warpView;
+            } else if (o.seamSearch && !seamTable.empty()) {
+                correction.seamShiftDeg = &seamTable;
+            }
+            auto carved = render::carveSeam(P.rig, pair.value(), P.blendParams, render::ParallaxWarpParams{}.band,
+                                            correction, render::SeamCarveParams{}, haveBlendSeam ? &blendSeam : nullptr,
+                                            *P.pool);
+            if (carved.ok()) {
+                blendSeam = std::move(carved).value();
+                haveBlendSeam = true;
+                log::info("frame {}: seam carved in {:.1f} ms, latitude mean {:+.2f} / max {:.2f} deg, feather {:.2f} "
+                          "deg mean, {} narrow / {} forced columns",
+                          f, blendSeam.carveMs, blendSeam.meanLatDeg, blendSeam.maxAbsLatDeg,
+                          blendSeam.meanHalfWidthDeg, blendSeam.narrowColumns, blendSeam.forcedColumns);
+            } else {
+                log::warn("frame {}: seam carve failed ({}); using the feather blend", f,
+                          log::safe(carved.error().message));
+            }
+        }
         if (analyse && o.gain) {
             render::BandParams band;
             auto g = render::estimateGain(P.rig, pair.value(), P.blendParams, band, *P.pool);
@@ -430,6 +464,11 @@ int runRender(const RenderOptions& o) {
             if (o.seamSearch) {
                 builder.seam(seamTable);
             }
+        }
+        if (o.seamCarve && haveBlendSeam) {
+            render::applyBlendSeam(builder, blendSeam);
+        } else {
+            builder.clearBlendSeam();
         }
         builder.stabilization(P.stabilizationFor(f));
 
@@ -503,6 +542,9 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
     outGeom->add_flag("--parallax", opt->parallax,
                       "2-D optical-flow parallax correction at the seam; when accepted it replaces --seam-search, "
                       "which remains the fallback");
+    outGeom->add_flag("--seam-carve", opt->seamCarve,
+                      "Carve the seam through the overlap by dynamic programming and blend narrowly along it "
+                      "(no doubled near objects); composes with --parallax / --seam-search");
     outGeom->add_option("--flow-backend", opt->flowBackend, "auto|classical|neural")->default_str("auto");
     outGeom->add_flag("--gain", opt->gain, "Exposure matching between lenses");
     outGeom

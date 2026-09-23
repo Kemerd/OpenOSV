@@ -9,8 +9,9 @@
 // Controls panel whenever the clip is selected, and their values are handed
 // to OpenOSVImporter.prm as a flat preferences blob.  It exists so the stitch
 // options (colour output, output size, stabilisation, seam search, exposure
-// match, calibration slot, D-Log M curve, exposure, render device) are simply
-// VISIBLE, instead of hiding behind the modal dialog in imGetPrefs8.
+// match, calibration slot, D-Log M curve, exposure, render device, and the
+// reframe effect's Program Monitor Colour) are simply VISIBLE, instead of
+// hiding behind the modal dialog in imGetPrefs8.
 //
 // How the two halves find each other: the importer sets
 // imImportInfoRec::hasSourceSettingsEffect and puts this effect's match name
@@ -27,7 +28,7 @@
 //                                    SetIsSourceSettingsEffect(), which is
 //                                    what tells Premiere this is a master
 //                                    clip settings effect and not a filter.
-//   PF_Cmd_PARAMS_SETUP              the nine controls, each flagged
+//   PF_Cmd_PARAMS_SETUP              the ten controls, each flagged
 //                                    PF_ParamFlag_CANNOT_TIME_VARY.
 //   PF_Cmd_SEQUENCE_SETUP            PerformSourceSettingsCommand(), which
 //                                    round-trips a blob through the importer
@@ -128,11 +129,15 @@ static_assert(kIndexAdvancedTopicEnd == OSV_SOURCE_SETTINGS_PARAM_COUNT,
               "the Advanced group terminator must be the last parameter added");
 static_assert(kIndexStitchTopicEnd == kIndexCalibration + 1,
               "the Stitching group must close immediately after Calibration");
-static_assert(kIndexAdvancedTopicEnd == kIndexRenderDevice + 1,
-              "the Advanced group must close immediately after Render Device");
+static_assert(kIndexDirectColour == kIndexRenderDevice + 1,
+              "Program Monitor Colour follows Render Device inside the Advanced group");
+static_assert(kIndexAdvancedTopicEnd == kIndexDirectColour + 1,
+              "the Advanced group must close immediately after Program Monitor Colour");
 static_assert(kParamIdByIndex[kIndexColorOutput - 1] == OSV_SS_ID_COLOR_OUTPUT,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
 static_assert(kParamIdByIndex[kIndexRenderDevice - 1] == OSV_SS_ID_RENDER_DEVICE,
+              "kParamIdByIndex is not aligned with the ParamIndex enum");
+static_assert(kParamIdByIndex[kIndexDirectColour - 1] == OSV_SS_ID_DIRECT_COLOUR,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
 
 namespace {
@@ -256,6 +261,10 @@ private:
     if (const PF_ParamDef* p = def(kIndexRenderDevice)) {
         c.renderDevice = static_cast<int>(p->u.pd.value);
     }
+    // [WP-SETTINGS]
+    if (const PF_ParamDef* p = def(kIndexDirectColour)) {
+        c.directColour = static_cast<int>(p->u.pd.value);
+    }
     return c;
 }
 
@@ -313,6 +322,7 @@ void writeControls(PF_ParamDef* params[], const ControlValues& wanted) noexcept 
     setPopup(kIndexDlogmFit, wanted.dlogmFit);
     setSlider(kIndexExposure, wanted.exposureStops);
     setPopup(kIndexRenderDevice, wanted.renderDevice);
+    setPopup(kIndexDirectColour, wanted.directColour);  // [WP-SETTINGS]
 }
 
 // ===========================================================================
@@ -362,7 +372,7 @@ PF_Err globalSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     // Without this the host treats the module as an ordinary video filter:
     // it appears in the Effects panel to be dragged onto clips, it is never
     // attached to a master clip, and PF_Cmd_TRANSLATE_PARAMS_TO_PREFS never
-    // arrives - so the panel would show nine controls that do nothing.
+    // arrives - so the panel would show ten controls that do nothing.
     //
     // It is only meaningful inside Premiere (After Effects has no such
     // concept and does not publish the suite), so the call is gated on the
@@ -407,7 +417,7 @@ PF_Err globalSetdown(PF_InData*, PF_OutData*) noexcept {
     return PF_Err_NONE;
 }
 
-/// PF_Cmd_PARAMS_SETUP: the nine controls.
+/// PF_Cmd_PARAMS_SETUP: the ten controls.
 ///
 /// Every one of them carries PF_ParamFlag_CANNOT_TIME_VARY.  See the file
 /// header for why that is a correctness requirement rather than a style
@@ -492,7 +502,17 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Render Device", OSV_SS_DEVICE_COUNT, OSV_SS_DEVICE_DEFAULT, OSV_SS_DEVICE_ITEMS, kStaticFlags,
                   OSV_SS_ID_RENDER_DEVICE);
 
-    // ---- 13. Close the Advanced group --------------------------------------
+    // ---- 13. Program Monitor Colour [WP-SETTINGS] --------------------------
+    // What Open 360 Reframe shows when this clip's Colour Output is not the
+    // sequence's working space: the scene rendered straight into it (fast,
+    // the default) or Premiere's own conversion of the output (matches the
+    // Source monitor) - see OSV_SS_DIRECT_COLOUR_ITEMS.  Static like every
+    // control here: it reaches the effect through the same flat blob.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUPX("Program Monitor Colour", OSV_SS_DIRECT_COLOUR_COUNT, OSV_SS_DIRECT_COLOUR_DEFAULT,
+                  OSV_SS_DIRECT_COLOUR_ITEMS, kStaticFlags, OSV_SS_ID_DIRECT_COLOUR);
+
+    // ---- 14. Close the Advanced group --------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_ADVANCED_TOPIC_END);
 
@@ -662,6 +682,8 @@ static_assert(OSV_SS_FIT_COUNT == static_cast<int>(osv::premiere::PrefsDlogmFit:
               "the D-Log M Curve popup does not list every PrefsDlogmFit value");
 static_assert(OSV_SS_DEVICE_COUNT == static_cast<int>(osv::premiere::PrefsRenderDevice::Count),
               "the Render Device popup does not list every PrefsRenderDevice value");
+static_assert(OSV_SS_DIRECT_COLOUR_COUNT == static_cast<int>(osv::premiere::PrefsDirectColour::Count),
+              "the Program Monitor Colour popup does not list every PrefsDirectColour value");
 
 // ===========================================================================
 //  The exported entry point

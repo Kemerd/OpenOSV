@@ -51,6 +51,7 @@
 #include "osv/meta/Types.h"
 #include "osv/render/ImageRGBAf.h"
 #include "osv/render/ParallaxWarp.h"
+#include "osv/render/SeamCarve.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/video/DualStreamReader.h"
 #include "osv/video/GpuClipDecoder.h"
@@ -160,7 +161,10 @@ public:
     [[nodiscard]] Status open();
 
     /// Drop the decoders, the renderer lease, the audio decoder and the OS
-    /// handle but keep the parsed metadata (imQuietFile).  Idempotent.
+    /// handle but keep the parsed metadata (imQuietFile).  The video reader
+    /// is parked in video::ReaderPool rather than destroyed, so the next open
+    /// of the same file - this instance's unquiet or a new instance - takes
+    /// it back warm; the pool releases it after an idle minute.  Idempotent.
     void releaseHeavy() noexcept;
 
     /// True between a successful open() and releaseHeavy().
@@ -457,9 +461,10 @@ private:
     std::int64_t m_audioDuration = 0;
     std::uint32_t m_audioTrackId = 0;
 
-    /// The calibration slot the current rig was built for, so rebuildRig()
-    /// can skip the work when the prefs did not touch it.
-    PrefsCalibration m_rigCalibration = PrefsCalibration::Native;
+    /// The calibration choice the current rig was built for, so rebuildRig()
+    /// can skip the work when the prefs did not touch it.  The choice rather
+    /// than the stored byte: Auto and a forced Native share calibration 0.
+    PrefsCalibrationChoice m_rigCalibration = PrefsCalibrationChoice::Auto;
     bool m_rigBuilt = false;
 
     /// Set once a hardware decoder has failed on this clip: every reader
@@ -476,6 +481,23 @@ private:
     std::map<void*, std::unique_ptr<video::GpuClipDecoder>> m_gpuDecoders;
     /// True for the engine registry's own instance (see setEngineOwned).
     bool m_engineOwned = false;
+
+    // ---- [WP-SETTINGS] Source Settings publication (Engine.h) -------------
+    /// This instance's publisher token, taken at its first publication
+    /// (right after imOpenFile8); 0 until then.  Larger means opened later,
+    /// which is how the engine lets the newest instance of a file win.
+    std::uint64_t m_settingsPublisher = 0;
+    /// True once a blob the HOST handed over has been published from here.
+    /// Until then the instance may have run on its defaults (a selector
+    /// without prefs) and must publish the host's blob even when it happens
+    /// to equal them, or an older instance's settings would stay in force.
+    bool m_settingsPublishedFromHost = false;
+    /// Publish m_prefs to the engine registry.  `fromHost`: the blob came
+    /// from the host (false: the host gave none and the defaults are in
+    /// force).  Never publishes from the engine's own instance.  The caller
+    /// holds m_mutex.
+    void publishSettingsLocked(bool fromHost) noexcept;
+    // ---- [/WP-SETTINGS] ----------------------------------------------------
     std::unique_ptr<AudioDecoder> m_audio;
     bool m_audioProbed = false;
 
@@ -560,6 +582,26 @@ private:
     /// Invalidate every measurement: clear the cache, drop the pending job
     /// and bump the generation.  Takes m_parallaxMutex.
     void resetParallaxLocked() noexcept;
+
+    // ---- [WP-SEAM] carved blend seam, keyed by bucket ------------------------
+    /// Carved seams per bucket (SeamCarve.h), each measured through its own
+    /// bucket's correction (its parallax grid, else its seam table).  Guarded
+    /// by m_parallaxMutex and cleared with the parallax state in
+    /// resetParallaxLocked(), because a seam is only as current as the
+    /// correction it was carved through.  ~8 KB each.
+    std::map<std::uint32_t, std::shared_ptr<const render::BlendSeam>> m_blendSeams;
+
+    /// Carve (or fetch) the blend seam for frame `index` and hand it to
+    /// `builder`: glided from the previous bucket's seam like the parallax
+    /// grid, steered by a neighbouring bucket's seam when one is cached.  An
+    /// Interactive request whose bucket cannot be carved yet (its parallax
+    /// grid is still being measured) borrows a nearby bucket's seam and
+    /// clears `frameExact`.  Called by applyAnalyses with m_mutex held;
+    /// takes m_parallaxMutex itself.  Failures are logged and leave the frame
+    /// on the ordinary feather.
+    void applyCarvedSeam(std::uint32_t index, const video::FramePair& pair, bool wantParallax, RenderPurpose purpose,
+                         ThreadPool& pool, render::RenderParamsBuilder& builder, bool& frameExact);
+    // ---- [/WP-SEAM] ----------------------------------------------------------
 
     RenderedFrame m_lastFrame;
     std::string m_rendererName;

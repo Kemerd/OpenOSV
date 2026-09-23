@@ -72,11 +72,33 @@ enum class PrefsStabilization : std::uint8_t {
     Count
 };
 
-/// Lens calibration slot.
+/// Lens calibration slot, as stored in the `calibration` byte.
+///
+/// Native (0) has always meant "whatever the clip recorded" in practice: the
+/// importer never forced the native set, it passed no override and let the
+/// recorded StreamMeta.extri_lens_mode decide.  That behaviour is now named
+/// Auto, and a forced Native is expressed with `calibrationForceNative`
+/// (see PrefsCalibrationChoice), so every blob ever written keeps rendering
+/// exactly as it did.
 enum class PrefsCalibration : std::uint8_t {
     Native = 0,
     LensGuards = 1,
     Underwater = 2,
+    Count
+};
+
+/// The calibration as the user chooses it: the four entries a Source
+/// Settings UI lists, in that order.
+///
+/// NOT a stored value.  It is derived from the `calibration` byte and the
+/// `calibrationForceNative` byte by PrefsBlob::calibrationChoice() and
+/// written back by setCalibrationChoice(), so the UI order is free to put
+/// Auto first without renumbering anything already in a project file.
+enum class PrefsCalibrationChoice : std::uint8_t {
+    Auto = 0,        ///< Follow the accessory the camera recorded (the default).
+    Native = 1,      ///< Bare lenses, whatever the camera recorded.
+    LensGuards = 2,  ///< Force the lens-guard set.
+    Underwater = 3,  ///< Force the underwater set.
     Count
 };
 
@@ -119,6 +141,31 @@ enum class PrefsFlowBackend : std::uint8_t {
 enum class PrefsParallax : std::uint8_t {
     Off = 0,
     On = 1,
+    Count
+};
+
+/// [WP-SETTINGS] "Program Monitor Colour": how the reframe effect's direct
+/// path (docs/DIRECT_GPU.md) treats a clip whose colour output is not the
+/// sequence's working space.
+///
+/// The direct path renders straight from the fisheyes into the working
+/// space, so Premiere's conversion of the importer's frame never runs.  When
+/// the colour output IS the working space the two routes agree exactly.
+/// When it is not, PQ, HLG and Rec.709 are still three encodings of the same
+/// scene, and rendering that scene straight into the working space with
+/// OpenOSV's own tone mapping is the colour-managed answer - it just is not
+/// Premiere's generic conversion, which is what the Source monitor shows.
+/// Persisted, so append-only.
+enum class PrefsDirectColour : std::uint8_t {
+    /// Render straight into the sequence's working space with OpenOSV's own
+    /// conversion: the direct path's speed and sharpness for every graded
+    /// colour output.  The default - and what the zero byte of an older
+    /// project reads as.
+    SequenceSpace = 0,
+    /// Hand a clip whose colour output is not the working space to the
+    /// equirect route, so the Program monitor shows exactly what Premiere's
+    /// own conversion makes of it (the Source monitor route).
+    MatchSource = 1,
     Count
 };
 
@@ -165,10 +212,21 @@ struct PrefsBlob {
     float exposureStops = 0.0f;        ///< Exposure offset in stops.
     std::uint8_t parallax = 0;         ///< PrefsParallax; flow-based seam correction.
     std::uint8_t flowBackend = 0;      ///< PrefsFlowBackend.
+    /// 1 when the user forced the Native set; only meaningful while
+    /// `calibration` is Native (sanitise() clears it otherwise).  0 - every
+    /// blob written before this byte existed, and every fresh one - keeps
+    /// calibration 0 meaning Auto.  Read it through calibrationChoice().
+    std::uint8_t calibrationForceNative = 0;
+    /// Offset 23: the rest of WP-CALIB's byte range, unused.  Zero, and
+    /// zeroed by sanitise(), so it is free for a future calibration field.
+    std::uint8_t padAfterCalibration = 0;
+    /// PrefsDirectColour: how the effect's direct path treats this clip's
+    /// colour output (0 = SequenceSpace, the default; see DIRECT_GPU.md).
+    std::uint8_t directColour = 0;
     // ---- [WP-PHOTO] ---------------------------------------------------------
-    /// Offsets 22-31 belong to other packages (docs/PARALLEL_WORK.md); zero
+    /// Offsets 25-31 belong to other packages (docs/PARALLEL_WORK.md); zero
     /// here, and folded into their real fields at merge.
-    std::uint8_t padBeforePhoto[10] = {};
+    std::uint8_t padBeforePhoto[7] = {};
     /// Seam edge inset of the RENDER blend (the analyses keep the calibrated
     /// FOV): 0 = the default kDefaultSeamInsetTenths, otherwise (value - 1)
     /// tenths of a degree, 1 = no inset (the render blend before this field
@@ -209,7 +267,11 @@ struct PrefsBlob {
         p.stabilization = static_cast<std::uint8_t>(PrefsStabilization::HorizonLock);
         p.seamSearch = 1;
         p.gainMatch = 1;
+        // Auto: follow the lens accessory the camera recorded.  It is the
+        // only choice that is right for footage shot with AND without the
+        // lens protectors, and it is what calibration 0 always did.
         p.calibration = static_cast<std::uint8_t>(PrefsCalibration::Native);
+        p.calibrationForceNative = 0;
         p.dlogmFit = static_cast<std::uint8_t>(PrefsDlogmFit::Osmo360);
         p.exposureStops = 0.0f;
         p.renderDevice = static_cast<std::uint8_t>(PrefsRenderDevice::Auto);
@@ -262,6 +324,9 @@ struct PrefsBlob {
         clampEnum(stabilization, static_cast<std::uint8_t>(PrefsStabilization::Count), 1);
         clampEnum(seamSearch, 2, 1);
         clampEnum(gainMatch, 2, 1);
+        // Remembered for calibrationForceNative below: a garbage calibration
+        // byte must land on the default CHOICE (Auto), not on a forced Native.
+        const bool calibrationWasGarbage = calibration >= static_cast<std::uint8_t>(PrefsCalibration::Count);
         clampEnum(calibration, static_cast<std::uint8_t>(PrefsCalibration::Count), 0);
         clampEnum(dlogmFit, static_cast<std::uint8_t>(PrefsDlogmFit::Count), 0);
         clampEnum(renderDevice, static_cast<std::uint8_t>(PrefsRenderDevice::Count), 0);
@@ -272,6 +337,22 @@ struct PrefsBlob {
                   static_cast<std::uint8_t>(PrefsParallax::On));
         clampEnum(flowBackend, static_cast<std::uint8_t>(PrefsFlowBackend::Count),
                   static_cast<std::uint8_t>(PrefsFlowBackend::Auto));
+        // A boolean byte: anything but 0/1 is corruption and lands on the
+        // default (0, Auto).  It only qualifies Native, so it is cleared for
+        // the other sets - one meaning, one byte pattern, one cache key.
+        clampEnum(calibrationForceNative, 2, 0);
+        if (calibrationForceNative != 0 &&
+            (calibrationWasGarbage || calibration != static_cast<std::uint8_t>(PrefsCalibration::Native))) {
+            calibrationForceNative = 0;
+            clean = false;
+        }
+        // Zero is the default, so a corrupt byte lands there too.
+        clampEnum(directColour, static_cast<std::uint8_t>(PrefsDirectColour::Count),
+                  static_cast<std::uint8_t>(PrefsDirectColour::SequenceSpace));
+        if (padAfterCalibration != 0) {
+            padAfterCalibration = 0;
+            clean = false;
+        }
 
         // NaN compares false with everything, so test the valid range and
         // reset anything else (NaN, infinities, out of range).
@@ -331,8 +412,60 @@ struct PrefsBlob {
     [[nodiscard]] PrefsRenderDevice device() const noexcept { return static_cast<PrefsRenderDevice>(renderDevice); }
     [[nodiscard]] PrefsParallax parallaxMode() const noexcept { return static_cast<PrefsParallax>(parallax); }
     [[nodiscard]] PrefsFlowBackend flow() const noexcept { return static_cast<PrefsFlowBackend>(flowBackend); }
+    /// [WP-SETTINGS]
+    [[nodiscard]] PrefsDirectColour directColourMode() const noexcept {
+        return static_cast<PrefsDirectColour>(directColour);
+    }
     /// True when the flow-based parallax correction should run.
     [[nodiscard]] bool parallaxEnabled() const noexcept { return parallaxMode() == PrefsParallax::On; }
+
+    /// The user's calibration choice, decoded from the two stored bytes:
+    ///
+    ///     calibration   calibrationForceNative   choice
+    ///     Native (0)    0                        Auto        (every old blob, every fresh one)
+    ///     Native (0)    1                        Native      (forced)
+    ///     LensGuards    -                        LensGuards
+    ///     Underwater    -                        Underwater
+    ///
+    /// An out-of-range calibration byte (an unsanitised blob) reads as Auto,
+    /// the default, rather than as an arbitrary set.
+    [[nodiscard]] PrefsCalibrationChoice calibrationChoice() const noexcept {
+        switch (calib()) {
+        case PrefsCalibration::LensGuards: return PrefsCalibrationChoice::LensGuards;
+        case PrefsCalibration::Underwater: return PrefsCalibrationChoice::Underwater;
+        case PrefsCalibration::Native:
+            return calibrationForceNative != 0 ? PrefsCalibrationChoice::Native : PrefsCalibrationChoice::Auto;
+        case PrefsCalibration::Count:
+        default: break;
+        }
+        return PrefsCalibrationChoice::Auto;
+    }
+
+    /// Store a calibration choice in its canonical byte pattern (the table
+    /// above), so equal choices always produce equal blobs and cache keys.
+    /// An out-of-range choice stores Auto.
+    void setCalibrationChoice(PrefsCalibrationChoice choice) noexcept {
+        switch (choice) {
+        case PrefsCalibrationChoice::Native:
+            calibration = static_cast<std::uint8_t>(PrefsCalibration::Native);
+            calibrationForceNative = 1;
+            return;
+        case PrefsCalibrationChoice::LensGuards:
+            calibration = static_cast<std::uint8_t>(PrefsCalibration::LensGuards);
+            calibrationForceNative = 0;
+            return;
+        case PrefsCalibrationChoice::Underwater:
+            calibration = static_cast<std::uint8_t>(PrefsCalibration::Underwater);
+            calibrationForceNative = 0;
+            return;
+        case PrefsCalibrationChoice::Auto:
+        case PrefsCalibrationChoice::Count:
+        default:
+            calibration = static_cast<std::uint8_t>(PrefsCalibration::Native);
+            calibrationForceNative = 0;
+            return;
+        }
+    }
 
     // [WP-PHOTO]
     /// The render-blend seam edge inset in degrees: code 0 = the default
@@ -373,10 +506,24 @@ static_assert(offsetof(PrefsBlob, exposureStops) == 16, "PrefsBlob layout drifte
 // project renders.  A new blob gets On from defaults().
 static_assert(offsetof(PrefsBlob, parallax) == 20, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, flowBackend) == 21, "PrefsBlob layout drifted");
+// calibrationForceNative was taken from the front of the reserved block the
+// same way.  Its zero in an old blob means "calibration 0 is Auto", which is
+// exactly how calibration 0 always behaved (the importer passed no override
+// for it and followed the recorded accessory), so an old project renders as
+// before; a user who wants the native set regardless of the recording now
+// has a choice that says so.
+static_assert(offsetof(PrefsBlob, calibration) == 13, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, calibrationForceNative) == 22, "PrefsBlob layout drifted");
+// directColour was taken from the reserved block the same way, at offset 24
+// (offset 23 stays unused so each field keeps the offset it was built and
+// tested against).  An older blob's zero byte reads as
+// PrefsDirectColour::SequenceSpace, the default.
+static_assert(offsetof(PrefsBlob, padAfterCalibration) == 23, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, directColour) == 24, "PrefsBlob layout drifted");
 // [WP-PHOTO] owns offsets 32-37 (docs/PARALLEL_WORK.md).  seamInset is the
 // photometric seam fix's stage 1; zero means the default inset, so an old
 // project gets the thinner seam band without a Source Settings visit.
-static_assert(offsetof(PrefsBlob, padBeforePhoto) == 22, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, padBeforePhoto) == 25, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, seamInset) == 32, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, reserved) == 33, "PrefsBlob layout drifted");
 

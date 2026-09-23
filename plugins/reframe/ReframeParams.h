@@ -186,9 +186,30 @@
 #define OSV_REFRAME_ID_CAMERA_TOPIC_END 14
 #define OSV_REFRAME_ID_SOURCE_TOPIC_END 15
 
-/* Total parameters excluding the input layer: the 13 controls plus the two
+/* ---- [WP-CAMERA] DJI's camera, appended ------------------------------------
+ * Five controls added after Smooth Keyframes, with NEW ids and at the END of
+ * the list, so every index before them - and every saved project - is
+ * untouched.  An old project simply loads them at their defaults, and the
+ * default Camera Model is "Classic", which renders exactly what the project
+ * rendered before (see CameraModel below for the whole compatibility story).
+ *
+ *   16  Camera Model      checkbox "DJI": which lens model renders.
+ *   17  Zoom              DJI's visible-angle read-out; editing it moves FOV
+ *                         and Correction Angle along DJI's own zoom path.
+ *   18  DJI FOV           DJI's vertical pinhole field of view.
+ *   19  Correction Angle  DJI's eye distance behind the sphere's centre.
+ *   20  Drag Sensitivity  how much faster than the hand an overlay drag turns
+ *                         the view (was the constant kPanTiltSensitivity). */
+#define OSV_REFRAME_ID_CAMERA_MODEL 16
+#define OSV_REFRAME_ID_ZOOM 17
+#define OSV_REFRAME_ID_DJI_FOV 18
+#define OSV_REFRAME_ID_CORRECTION 19
+#define OSV_REFRAME_ID_DRAG_SENSITIVITY 20
+/* ---- end [WP-CAMERA] ------------------------------------------------------ */
+
+/* Total parameters excluding the input layer: the 18 controls plus the two
  * group terminators.  out_data->num_params is this + 1. */
-#define OSV_REFRAME_PARAM_COUNT 15
+#define OSV_REFRAME_PARAM_COUNT 20
 
 /* ==========================================================================
  *  Popup item strings
@@ -202,6 +223,15 @@
 
 #define OSV_REFRAME_PRESET_ITEMS "Custom|Crystal Ball|Asteroid|Wide|Ultra Wide|Dewarping"
 #define OSV_REFRAME_PRESET_COUNT 6
+
+/* [WP-CAMERA] Camera Model is a CHECKBOX labelled "DJI", not a popup.
+ * Premiere's GPU parameter reads were seen to report popups 0-based (the
+ * 26.2.2 dump reads Output Resolution 0 and Preset 3 at their 1-based
+ * defaults 1 and 4, and DJI's own plug-in adds 1 to every popup it reads on
+ * the GPU), while After Effects - and the CPU path - report them 1-based.  A
+ * two-entry "Classic|DJI" popup would read "1" as either model depending on
+ * the host; a checkbox cannot be misread, and the lens model is the one
+ * control a misread would turn into a different picture. */
 
 /* ==========================================================================
  *  Ranges and defaults (the numbers PF_ADD_* is called with)
@@ -240,6 +270,67 @@
  * frame and changes the look, so it is opt-in. */
 #define OSV_REFRAME_SMOOTH_DEFAULT 0
 
+/* ---- [WP-CAMERA] DJI camera ranges -----------------------------------------
+ * Every number below is DJI's own (docs/research/DJI_CAMERA.md has the
+ * addresses).  Two DJI tools disagree on the limits, so the VALID range is
+ * the wider one (DJI's Premiere plug-in: FOV 1..178, Correction 0..1.8) and
+ * the SLIDER covers DJI Studio's working range, so a project typed in from
+ * either tool is representable and the slider feels like DJI Studio's. */
+
+/* Camera Model: unticked (Classic) by default.  That default is the whole
+ * backward compatibility guarantee - an old project loads the new control at
+ * its default and therefore keeps rendering the lens it was made with. */
+#define OSV_REFRAME_CAMERA_MODEL_DEFAULT 0
+
+/* DJI FOV: the vertical pinhole field of view.  DJI Studio clamps it to
+ * [20, 150] (generateNewParams / setFov); DJI's plug-in allows [1, 178]. */
+#define OSV_REFRAME_DJI_FOV_VALID_MIN 1.0
+#define OSV_REFRAME_DJI_FOV_VALID_MAX 178.0
+#define OSV_REFRAME_DJI_FOV_SLIDER_MIN 20.0
+#define OSV_REFRAME_DJI_FOV_SLIDER_MAX 150.0
+/* DJI's "Wide" on a landscape frame, which is also where both DJI tools
+ * start a fresh clip (Studio: fov 60 / distortion 0.6; plug-in: 60.01 /
+ * 0.601 sentinels that resolve to Wide). */
+#define OSV_REFRAME_DJI_FOV_DEFAULT 60.0
+
+/* Correction Angle: the eye's distance behind the sphere's centre in sphere
+ * radii.  Studio clamps it to [0, 1]; the plug-in allows up to 1.8, which is
+ * exactly its Crystal Ball preset (the eye outside the sphere). */
+#define OSV_REFRAME_CORRECTION_VALID_MIN 0.0
+#define OSV_REFRAME_CORRECTION_VALID_MAX 1.8
+#define OSV_REFRAME_CORRECTION_SLIDER_MIN 0.0
+#define OSV_REFRAME_CORRECTION_SLIDER_MAX 1.8
+#define OSV_REFRAME_CORRECTION_DEFAULT 0.6
+
+/* Zoom: DJI's derived visible horizontal angle.  It can legitimately exceed
+ * 180 (the frame's edges look behind the camera) and approaches 360 for the
+ * Asteroid look, so the valid range is the whole circle.  The default is the
+ * value of the default DJI FOV / Correction on a 16:9 frame, rounded to the
+ * slider's tenths (142.397 -> 142.4). */
+#define OSV_REFRAME_ZOOM_VALID_MIN 0.0
+#define OSV_REFRAME_ZOOM_VALID_MAX 360.0
+#define OSV_REFRAME_ZOOM_SLIDER_MIN 30.0
+#define OSV_REFRAME_ZOOM_SLIDER_MAX 330.0
+#define OSV_REFRAME_ZOOM_DEFAULT 142.4
+
+/* DJI Studio's zoom gesture moves
+ * both lens controls together: fov += 130 * delta, correction += delta.  The
+ * Zoom control and the overlay's zoom drag follow the same path. */
+#define OSV_REFRAME_DJI_ZOOM_FOV_PER_CORRECTION 130.0
+/* The limits DJI Studio clamps that path to (setFov / setDistortion). */
+#define OSV_REFRAME_DJI_STUDIO_FOV_MIN 20.0
+#define OSV_REFRAME_DJI_STUDIO_FOV_MAX 150.0
+#define OSV_REFRAME_DJI_STUDIO_CORRECTION_MAX 1.0
+
+/* Drag Sensitivity: how many times faster than the hand an overlay pan /
+ * tilt drag turns the view.  2.0 is the value the constant used to have. */
+#define OSV_REFRAME_DRAG_SENSITIVITY_VALID_MIN 0.1
+#define OSV_REFRAME_DRAG_SENSITIVITY_VALID_MAX 10.0
+#define OSV_REFRAME_DRAG_SENSITIVITY_SLIDER_MIN 0.25
+#define OSV_REFRAME_DRAG_SENSITIVITY_SLIDER_MAX 5.0
+#define OSV_REFRAME_DRAG_SENSITIVITY_DEFAULT 2.0
+/* ---- end [WP-CAMERA] ------------------------------------------------------ */
+
 /* ==========================================================================
  *  Everything below is C++ only.
  * ========================================================================== */
@@ -275,6 +366,16 @@ namespace osv::reframe {
 ///  13    Source Roll
 ///  14  (GROUP_END, Source)
 ///  15  Smooth Keyframes
+///  16  Camera Model          [WP-CAMERA]
+///  17  Zoom                  [WP-CAMERA]
+///  18  DJI FOV               [WP-CAMERA]
+///  19  Correction Angle      [WP-CAMERA]
+///  20  Drag Sensitivity      [WP-CAMERA]
+///
+/// 16..20 are siblings of Smooth Keyframes, outside both groups, and
+/// deliberately so: appending is the only change that leaves the index of
+/// every existing control - and so every saved project and every host index
+/// map - exactly where it was.
 enum ParamIndex : int {
     kIndexOutputResolution = 1,
     kIndexCameraTopic = 2,
@@ -291,6 +392,12 @@ enum ParamIndex : int {
     kIndexSourceRoll = 13,
     kIndexSourceTopicEnd = 14,
     kIndexSmooth = 15,
+    // [WP-CAMERA]
+    kIndexCameraModel = 16,
+    kIndexZoom = 17,
+    kIndexDjiFov = 18,
+    kIndexCorrection = 19,
+    kIndexDragSensitivity = 20,
 };
 
 /// The permanent id stored with each index, in index order (index 1 first).
@@ -303,6 +410,9 @@ inline constexpr int kParamIdByIndex[OSV_REFRAME_PARAM_COUNT] = {
     OSV_REFRAME_ID_FOV,           OSV_REFRAME_ID_DISTORTION,       OSV_REFRAME_ID_CAMERA_TOPIC_END,
     OSV_REFRAME_ID_SOURCE_TOPIC,  OSV_REFRAME_ID_SOURCE_PAN,       OSV_REFRAME_ID_SOURCE_TILT,
     OSV_REFRAME_ID_SOURCE_ROLL,   OSV_REFRAME_ID_SOURCE_TOPIC_END, OSV_REFRAME_ID_SMOOTH,
+    // [WP-CAMERA]
+    OSV_REFRAME_ID_CAMERA_MODEL,  OSV_REFRAME_ID_ZOOM,             OSV_REFRAME_ID_DJI_FOV,
+    OSV_REFRAME_ID_CORRECTION,    OSV_REFRAME_ID_DRAG_SENSITIVITY,
 };
 
 /// Number of user-visible parameters (excludes the input layer).
@@ -328,41 +438,122 @@ inline constexpr int kParamCount = OSV_REFRAME_PARAM_COUNT;
 /// spelled independently so this header still needs no Adobe include.
 enum class HostParamKind : int {
     Unknown = 0,
-    Int32,    ///< A popup (Output Resolution, Preset): a small 1-based integer.
+    Int32,    ///< A popup (Output Resolution, Preset): a small integer (see decodeHostPopup()).
     Float32,  ///< An AE angle dial (the six Pan / Tilt / Roll controls), in degrees.
-    Float64,  ///< An AE float slider (FOV, Distortion).
-    Bool,     ///< A checkbox (Smooth Keyframes).
+    Float64,  ///< An AE float slider (FOV, Distortion, Zoom, DJI FOV, Correction Angle, Drag Sensitivity).
+    Bool,     ///< A checkbox (Smooth Keyframes, Camera Model).
+    /// A PF_Param_GROUP_START / GROUP_END marker.  It carries no value; a host
+    /// that lists it at all reports it as a Bool or refuses to type it.  Only
+    /// kParamKindByIndex below uses this - the value signature never does.
+    Group,
 };
 
 /// Number of controls that actually carry a value, i.e. everything except
 /// the four PF_Param_GROUP_START / GROUP_END markers.  This is the list a
 /// probe expects to find on the host, in this order.
-inline constexpr int kValueParamCount = 11;
+inline constexpr int kValueParamCount = 16;
 
-/// The AE indices of the eleven value-carrying controls, in ADD ORDER.
+/// [WP-CAMERA] How many of those the effect had before the DJI camera block
+/// was appended.  A host list may stop after these (it then exposes none of
+/// the appended controls), never before them: matchHostParams() only lets a
+/// list end early inside the appended block.
+inline constexpr int kOriginalValueParamCount = 11;
+
+/// The AE indices of the sixteen value-carrying controls, in ADD ORDER.
 /// The group markers are absent by construction: they hold no value, so no
 /// host can report one for them and nothing ever reads them.
 inline constexpr int kValueParamAeIndex[kValueParamCount] = {
-    kIndexOutputResolution, kIndexPreset, kIndexPan,        kIndexTilt,
-    kIndexRoll,         kIndexFov,        kIndexDistortion, kIndexSourcePan,
-    kIndexSourceTilt,   kIndexSourceRoll, kIndexSmooth,
+    kIndexOutputResolution, kIndexPreset,     kIndexPan,        kIndexTilt,
+    kIndexRoll,             kIndexFov,        kIndexDistortion, kIndexSourcePan,
+    kIndexSourceTilt,       kIndexSourceRoll, kIndexSmooth,
+    // [WP-CAMERA]
+    kIndexCameraModel,      kIndexZoom,       kIndexDjiFov,     kIndexCorrection,
+    kIndexDragSensitivity,
 };
 
 /// The PrParam kind each of those controls arrives in, in the same order.
 ///
 /// Read down the column and this is the SIGNATURE the probe matches:
 ///
-///     i32 i32 f32 f32 f32 f64 f64 f32 f32 f32 bool
+///     i32 i32 f32 f32 f32 f64 f64 f32 f32 f32 bool | bool f64 f64 f64 f64
 ///
-/// It is highly distinctive - in particular the adjacent Float64 pair (FOV
-/// and Distortion, the only two float sliders) and the single trailing Bool
-/// (Smooth Keyframes, the only checkbox) pin the sequence down even when a
-/// host reports a different number of entries than we added.
+/// The part before the bar is the effect's original list and is still
+/// distinctive on its own - the adjacent FOV / Distortion Float64 pair
+/// between the angle dials, and the Bool that closes it (Smooth Keyframes).
+/// The part after it is the DJI camera block appended by [WP-CAMERA]: the
+/// Camera Model checkbox followed by four float sliders.  matchHostParams()
+/// accepts a host list that stops before the block, so a host that has not
+/// (yet) exposed the appended controls still maps the original ones.
 inline constexpr HostParamKind kValueParamKind[kValueParamCount] = {
     HostParamKind::Int32,   HostParamKind::Int32,   HostParamKind::Float32, HostParamKind::Float32,
     HostParamKind::Float32, HostParamKind::Float64, HostParamKind::Float64, HostParamKind::Float32,
     HostParamKind::Float32, HostParamKind::Float32, HostParamKind::Bool,
+    // [WP-CAMERA]
+    HostParamKind::Bool,    HostParamKind::Float64, HostParamKind::Float64, HostParamKind::Float64,
+    HostParamKind::Float64,
 };
+
+/// The kind of EVERY parameter in AE index order (index 1 first), group
+/// markers included - the full list PF_Cmd_PARAMS_SETUP adds, for a probe
+/// that sees the host list with its group entries still in it.  Derived
+/// from the same facts as the two tables above; a static_assert in
+/// EffectMain.cpp checks the three agree.
+inline constexpr HostParamKind kParamKindByIndex[OSV_REFRAME_PARAM_COUNT] = {
+    HostParamKind::Int32,   HostParamKind::Group,   HostParamKind::Int32,   HostParamKind::Float32,
+    HostParamKind::Float32, HostParamKind::Float32, HostParamKind::Float64, HostParamKind::Float64,
+    HostParamKind::Group,   HostParamKind::Group,   HostParamKind::Float32, HostParamKind::Float32,
+    HostParamKind::Float32, HostParamKind::Group,   HostParamKind::Bool,
+    // [WP-CAMERA]
+    HostParamKind::Bool,    HostParamKind::Float64, HostParamKind::Float64, HostParamKind::Float64,
+    HostParamKind::Float64,
+};
+
+/// [WP-CAMERA] How a host numbers popup entries on the GPU side.
+///
+/// After Effects - and therefore the CPU path, PF_ParamDef::u.pd.value -
+/// numbers popup entries from 1.  Premiere Pro's Video Segment Suite was
+/// seen to hand GPU filters the SAME controls numbered from 0: the 26.2.2
+/// dump reads Output Resolution 0 and Preset 3 at their defaults 1 and 4,
+/// and DJI's own Premiere plug-in adds 1 to every popup it reads there.  The
+/// mock host, like After Effects, serves them from 1.  Which base a host uses
+/// is learned from the values themselves (decodeHostPopup()).
+enum class PopupBase : int {
+    Unknown = -1,  ///< Nothing seen yet that settles it; read as 1-based.
+    Zero = 0,      ///< A popup read 0: entries count from 0.
+    One = 1,       ///< A popup read its own entry count: entries count from 1.
+};
+
+/// Translate a popup value read from a host into the 1-based value every
+/// sanitiser in this header expects, learning the host's base as it goes.
+///
+/// `raw` is what the host returned, `entryCount` the popup's number of
+/// entries, and `base` the instance's knowledge so far (updated in place).
+/// Two readings are unambiguous and settle the base for the instance:
+///
+///   raw == 0            only a 0-based host can say that   -> Zero;
+///   raw == entryCount   only a 1-based host can say that   -> One.
+///
+/// Anything in between reads as the base already learned, and as 1-based
+/// while nothing is known - the After Effects convention and this effect's
+/// historical behaviour.  Getting it wrong while unknown is cheap by design:
+/// the only popup the renderer reads is Output Resolution, whose fixed
+/// entries are all 16:9 (so a one-step misread cannot change the framing of
+/// a fixed size), its "Match Sequence" entry is exactly the one that reads 0
+/// on a 0-based host (so the default settles the base at once), and the lens
+/// model is a checkbox precisely so it never depends on this.  A null `base`
+/// is treated as Unknown and not updated.
+[[nodiscard]] inline int decodeHostPopup(int raw, int entryCount, PopupBase* base) noexcept {
+    PopupBase known = base ? *base : PopupBase::Unknown;
+    if (raw == 0) {
+        known = PopupBase::Zero;
+    } else if (entryCount > 0 && raw == entryCount) {
+        known = PopupBase::One;
+    }
+    if (base) {
+        *base = known;
+    }
+    return (known == PopupBase::Zero) ? raw + 1 : raw;
+}
 
 /// Runtime map from an AE parameter index to the index the host's
 /// VideoSegmentSuite::GetParam wants.
@@ -437,12 +628,20 @@ struct HostParamMap {
 ///   -  3 controls inside the START_COLLAPSED "Source" group
 ///   =  8, which is what GetParamCount reports.
 ///
-/// So the host list is our eleven controls with a CONTIGUOUS RUN dropped out
-/// of the middle.  That is the shape the matcher below is built for: it
-/// aligns our signature against the host list allowing exactly one contiguous
-/// gap, which covers the unreduced case (an 11-entry host, gap length zero)
-/// and the observed case (an 8-entry host, gap length three) with the same
-/// code and no special-casing of either number.
+/// So the host list is our controls with a CONTIGUOUS RUN dropped out of the
+/// middle.  That is the shape the matcher below is built for: it aligns our
+/// signature against the host list allowing exactly one contiguous gap, which
+/// covers the unreduced case (gap length zero) and the observed case (the
+/// three collapsed Source controls) with the same code and no special-casing
+/// of either number.
+///
+/// [WP-CAMERA] The list may also STOP EARLY: the DJI camera controls were
+/// appended after Smooth Keyframes, and a host whose list ends before them
+/// (the 8-entry layout above, recorded before they existed) is still our
+/// list - it just exposes none of the new controls.  The matcher therefore
+/// aligns against every PREFIX of the signature (one gap inside it), and the
+/// uniqueness rule is applied to the resulting MAPPINGS, so two alignments
+/// that describe the same table are one answer, not an ambiguity.
 ///
 /// Three rules make the result safe rather than merely plausible:
 ///
@@ -568,27 +767,44 @@ enum class Preset : int {
     Dewarping = 6,
 };
 
-/// One preset: the three values the popup writes into the controls.  The
-/// numbers mirror osv::geom::kPresets (include/osv/geom/Presets.h) - the
-/// same looks the CLI renderer offers - with the distortion expressed as the
-/// percentage the slider shows.
+/// One preset: the values the popup writes into the controls.
+///
+/// A preset carries BOTH lens descriptions of its look:
+///
+///   * the Classic numbers (fovDeg / distortion) mirror osv::geom::kPresets
+///     (include/osv/geom/Presets.h) - the looks the CLI renderer offers -
+///     with the distortion expressed as the percentage the slider shows;
+///   * [WP-CAMERA] the DJI numbers mirror osv::geom::kDjiPresets - DJI's own
+///     preset table, matching DJI's Premiere plug-in and DJI
+///     Studio's list - with the field of view given per output shape.
+///
+/// Choosing a preset writes both sets and switches Camera Model to DJI, so
+/// the picture is DJI's preset and the Classic controls hold the nearest
+/// Classic look should the user switch back.
 struct PresetEntry {
     Preset value;       ///< Popup value.
     const char* label;  ///< Exactly the text in OSV_REFRAME_PRESET_ITEMS.
-    double fovDeg;      ///< Written into FOV.
-    double distortion;  ///< Written into Distortion (percent, = 100 * eye offset).
+    double fovDeg;      ///< Written into FOV (Classic).
+    double distortion;  ///< Written into Distortion (Classic, percent, = 100 * eye offset).
     double tiltDeg;     ///< Written into Tilt.
     bool writesControls;  ///< False for Custom, which only reflects manual edits.
+    // [WP-CAMERA] DJI's numbers for the same look.
+    double djiFovLandscapeDeg;   ///< DJI FOV on a landscape or square frame.
+    double djiFovPortrait916Deg; ///< DJI FOV on a 9:16 frame.
+    double djiFovPortrait34Deg;  ///< DJI FOV on a 3:4 frame.
+    double correction;           ///< Written into Correction Angle.
 };
 
 /// The preset table.  Order and labels must match OSV_REFRAME_PRESET_ITEMS.
 inline constexpr PresetEntry kPresetTable[OSV_REFRAME_PRESET_COUNT] = {
-    {Preset::Custom, "Custom", OSV_REFRAME_FOV_DEFAULT, OSV_REFRAME_DISTORTION_DEFAULT, 0.0, false},
-    {Preset::CrystalBall, "Crystal Ball", 240.0, 100.0, 0.0, true},
-    {Preset::Asteroid, "Asteroid", 300.0, 100.0, -90.0, true},
-    {Preset::Wide, "Wide", 120.0, 15.0, 0.0, true},
-    {Preset::UltraWide, "Ultra Wide", 150.0, 40.0, 0.0, true},
-    {Preset::Dewarping, "Dewarping", 95.0, 0.0, 0.0, true},
+    {Preset::Custom, "Custom", OSV_REFRAME_FOV_DEFAULT, OSV_REFRAME_DISTORTION_DEFAULT, 0.0, false,
+     OSV_REFRAME_DJI_FOV_DEFAULT, OSV_REFRAME_DJI_FOV_DEFAULT, OSV_REFRAME_DJI_FOV_DEFAULT,
+     OSV_REFRAME_CORRECTION_DEFAULT},
+    {Preset::CrystalBall, "Crystal Ball", 240.0, 100.0, 0.0, true, 75.0, 110.0, 87.0, 1.8},
+    {Preset::Asteroid, "Asteroid", 300.0, 100.0, -90.0, true, 138.0, 147.0, 147.0, 1.0},
+    {Preset::Wide, "Wide", 120.0, 15.0, 0.0, true, 60.0, 90.0, 72.0, 0.6},
+    {Preset::UltraWide, "Ultra Wide", 150.0, 40.0, 0.0, true, 78.0, 110.0, 95.0, 0.5},
+    {Preset::Dewarping, "Dewarping", 95.0, 0.0, 0.0, true, 80.0, 112.0, 97.0, 0.2},
 };
 
 /// Clamp an arbitrary popup value into the valid range.
@@ -611,6 +827,44 @@ inline constexpr PresetEntry kPresetTable[OSV_REFRAME_PRESET_COUNT] = {
 }
 
 // ---------------------------------------------------------------------------
+//  [WP-CAMERA] The camera model
+//
+//  WHY TWO MODELS, AND WHY "CLASSIC" IS THE DEFAULT
+//  ------------------------------------------------
+//  The effect's original lens is the eye-offset projection driven by FOV
+//  (the visible horizontal angle) and Distortion (the eye offset, with an
+//  automatic ramp by FOV).  DJI's tools describe the SAME family of cameras -
+//  a pinhole looking at the panorama sphere from behind its centre - but by
+//  different numbers: a vertical pinhole field of view and the eye distance,
+//  with the visible angle ("Zoom") derived.  Typing DJI's numbers into the
+//  Classic controls therefore gave a different picture, which is the bug the
+//  DJI model fixes: in DJI mode the same three numbers give the same frame.
+//
+//  The switch is an explicit control (the "Camera Model" checkbox) rather
+//  than an inference from which controls look "set", because nothing can
+//  tell an old project from a new instance: both load every appended control
+//  at its default.  So the default must be the one that reproduces old
+//  projects bit for bit, and that is Classic.  New work moves to DJI the
+//  moment the user does anything DJI-shaped - picks a preset, or touches
+//  Zoom, DJI FOV or Correction Angle (USER_CHANGED_PARAM ticks the box and
+//  carries the current look across, so the picture does not jump).  Editing
+//  Classic FOV or Distortion unticks it the same way.
+// ---------------------------------------------------------------------------
+
+/// The two lens models.  The control is the "Camera Model" checkbox: ticked
+/// (labelled "DJI") is Dji, unticked is Classic.
+enum class CameraModel : int {
+    Classic = 0,  ///< FOV (visible angle) + Distortion (eye offset, auto ramp).
+    Dji = 1,      ///< DJI FOV (vertical pinhole) + Correction Angle; Zoom derived.
+};
+
+/// The model a checkbox value selects.  Any non-zero value is ticked, the
+/// same rule the host's own checkbox uses; only exactly 0 is Classic.
+[[nodiscard]] inline constexpr CameraModel cameraModelFromCheckbox(long checkboxValue) noexcept {
+    return (checkboxValue != 0) ? CameraModel::Dji : CameraModel::Classic;
+}
+
+// ---------------------------------------------------------------------------
 //  The resolved parameter set
 // ---------------------------------------------------------------------------
 
@@ -629,7 +883,82 @@ struct Settings {
     double sourceTiltDeg = 0.0;
     double sourceRollDeg = 0.0;
     bool smoothKeyframes = false;
+    // [WP-CAMERA]
+    CameraModel cameraModel = CameraModel::Classic;          ///< Which lens renders.
+    double zoomDeg = OSV_REFRAME_ZOOM_DEFAULT;               ///< Read-out only; never rendered from.
+    double djiFovDeg = OSV_REFRAME_DJI_FOV_DEFAULT;          ///< DJI vertical pinhole FOV (deg).
+    double correction = OSV_REFRAME_CORRECTION_DEFAULT;      ///< DJI eye distance (sphere radii).
+    double dragSensitivity = OSV_REFRAME_DRAG_SENSITIVITY_DEFAULT;  ///< Overlay only; never rendered from.
 };
+
+// ---------------------------------------------------------------------------
+//  [WP-CAMERA] DJI camera helpers (implemented in ReframeCpu.cpp)
+// ---------------------------------------------------------------------------
+
+/// The two numbers that fully describe DJI's lens.
+struct DjiLens {
+    double fovDeg = OSV_REFRAME_DJI_FOV_DEFAULT;       ///< Vertical pinhole field of view (deg).
+    double correction = OSV_REFRAME_CORRECTION_DEFAULT;  ///< Eye distance behind the centre (radii).
+};
+
+/// The two numbers that describe the Classic lens, as the controls hold them.
+struct ClassicLens {
+    double fovDeg = OSV_REFRAME_FOV_DEFAULT;             ///< Visible horizontal angle (deg).
+    double distortion = OSV_REFRAME_DISTORTION_DEFAULT;  ///< Eye offset in percent.
+};
+
+/// Clamp a DJI lens into the controls' VALID ranges, replacing non-finite
+/// values with the defaults.  Every helper below sanitises its inputs with
+/// this, so none of them can hand a NaN back to a parameter.
+[[nodiscard]] DjiLens sanitiseDjiLens(DjiLens lens) noexcept;
+
+/// DJI's "Zoom" for a lens on a frame of shape `aspect` (width / height):
+/// DJI Studio's own Zoom formula (osv::geom::djiZoomDeg).  A lens or
+/// aspect that DJI would answer 0 for answers 0 here too.
+[[nodiscard]] double djiZoomDeg(DjiLens lens, double aspect) noexcept;
+
+/// Move a lens along DJI Studio's zoom path until its Zoom equals
+/// `targetZoomDeg`.
+///
+/// DJI Studio has no inverse for Zoom: its zoom gesture moves the two real
+/// controls together, fov += 130 * delta and correction += delta, each
+/// clamped (FOV to [20, 150], Correction to [0, 1]).  This finds the delta
+/// whose result shows the requested Zoom, by bisection - Zoom grows
+/// monotonically along the path, so the answer is unique.  A target past
+/// either end of the path returns that end.  The clamps are widened to
+/// include the starting lens, so a Crystal Ball (correction 1.8) is not
+/// snapped back to 1.0 by the first zoom edit.
+[[nodiscard]] DjiLens djiZoomTo(double targetZoomDeg, DjiLens from, double aspect) noexcept;
+
+/// The DJI lens that frames exactly what a Classic lens frames, on a frame
+/// of shape `aspect`.
+///
+/// Classic FOV is the visible angle across the frame WIDTH, at the eye offset
+/// effectiveEyeOffset(distortion, fov) (the ramp included), clamped exactly
+/// as the renderer clamps it.  With that eye distance d, the pinhole's
+/// horizontal half angle is alpha = atan2(sin(fov/2), d + cos(fov/2)) and
+/// DJI's vertical FOV follows from the shape: 2 atan(tan(alpha) / aspect).
+/// Used when the user switches to DJI, so the picture carries straight over.
+[[nodiscard]] DjiLens djiFromClassic(ClassicLens classic, double aspect) noexcept;
+
+/// The Classic lens closest to a DJI lens: FOV = the DJI Zoom (the same
+/// visible angle across the width) and Distortion = 100 x Correction.
+///
+/// Exact whenever the Classic ramp does not raise the eye offset above the
+/// DJI correction and the correction is at most 1; beyond that the Classic
+/// model cannot express the DJI look and this is the nearest it can do (the
+/// values are clamped to the Classic controls' valid ranges).
+[[nodiscard]] ClassicLens classicFromDji(DjiLens lens, double aspect) noexcept;
+
+/// The DJI FOV a preset uses on a frame of shape `aspect` - the preset's
+/// landscape, 9:16 or 3:4 column (see osv::geom::djiPresetVfovDeg).
+[[nodiscard]] double djiPresetFovDeg(const PresetEntry& preset, double aspect) noexcept;
+
+/// The shape (width / height) the camera frames for: the resolution the user
+/// named, falling back to the sequence and then to 16:9 - the shape DJI
+/// Studio projects default to - when neither is known.  Used by the
+/// parameter UI (Zoom and the conversions), which runs without a frame.
+[[nodiscard]] double framingAspect(Resolution resolution, SizePx sequenceSize) noexcept;
 
 /// The pixel size the user asked for.
 ///

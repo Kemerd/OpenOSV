@@ -196,6 +196,22 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
             CHECK(translate(fixture, buffer).renderDevice == static_cast<std::uint8_t>(item - 1));
         }
     }
+    SECTION("Program Monitor Colour") {
+        // [WP-SETTINGS] "Sequence space (fast)" -> 0 (SequenceSpace, the
+        // default), "Match Source monitor" -> 1 (MatchSource).
+        for (int item = 1; item <= OSV_SS_DIRECT_COLOUR_COUNT; ++item) {
+            PrefsBuffer buffer;
+            fixture.setPopup(kIndexDirectColour, item);
+            INFO("popup value " << item);
+            CHECK(translate(fixture, buffer).directColour == static_cast<std::uint8_t>(item - 1));
+        }
+        PrefsBuffer first;
+        fixture.setPopup(kIndexDirectColour, 1);
+        CHECK(translate(fixture, first).directColourMode() == PrefsDirectColour::SequenceSpace);
+        PrefsBuffer second;
+        fixture.setPopup(kIndexDirectColour, 2);
+        CHECK(translate(fixture, second).directColourMode() == PrefsDirectColour::MatchSource);
+    }
     SECTION("Seam Search") {
         for (const bool on : {false, true}) {
             PrefsBuffer buffer;
@@ -224,7 +240,7 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
     }
 }
 
-TEST_CASE("all nine controls together round-trip as one blob", "[sourcesettings][prefs]") {
+TEST_CASE("all ten controls together round-trip as one blob", "[sourcesettings][prefs]") {
     EffectFixture fixture;
     REQUIRE(LoadedPlugin::instance().ok());
     PrefsBuffer buffer;
@@ -242,6 +258,7 @@ TEST_CASE("all nine controls together round-trip as one blob", "[sourcesettings]
     fixture.setPopup(kIndexDlogmFit, OSV_SS_FIT_COUNT);
     fixture.setSlider(kIndexExposure, -2.5);
     fixture.setPopup(kIndexRenderDevice, OSV_SS_DEVICE_COUNT);
+    fixture.setPopup(kIndexDirectColour, OSV_SS_DIRECT_COLOUR_COUNT);
 
     // The LAST item of each list, so these track the enums rather than being
     // re-typed every time one grows - Colour Output has already gained
@@ -268,6 +285,8 @@ TEST_CASE("all nine controls together round-trip as one blob", "[sourcesettings]
     CHECK(static_cast<int>(blob.dlogmFit) == OSV_SS_FIT_COUNT - 1);
     CHECK(static_cast<int>(blob.renderDevice) == static_cast<int>(PrefsRenderDevice::Count) - 1);
     CHECK(static_cast<int>(blob.renderDevice) == OSV_SS_DEVICE_COUNT - 1);
+    CHECK(static_cast<int>(blob.directColour) == static_cast<int>(PrefsDirectColour::Count) - 1);
+    CHECK(static_cast<int>(blob.directColour) == OSV_SS_DIRECT_COLOUR_COUNT - 1);
 
     // The two checkboxes and the slider were moved away from their defaults
     // too, so no field is left able to hide behind one.
@@ -403,6 +422,7 @@ TEST_CASE("SEQUENCE_SETUP asks the importer and seeds the controls from the answ
     fromImporter.dlogmFit = static_cast<std::uint8_t>(PrefsDlogmFit::Pocket3);
     fromImporter.exposureStops = 1.5f;
     fromImporter.renderDevice = static_cast<std::uint8_t>(PrefsRenderDevice::Cuda);
+    fromImporter.directColour = static_cast<std::uint8_t>(PrefsDirectColour::MatchSource);  // not the default
     REQUIRE(fromImporter.sanitise());
 
     const char* raw = reinterpret_cast<const char*>(&fromImporter);
@@ -435,6 +455,7 @@ TEST_CASE("SEQUENCE_SETUP asks the importer and seeds the controls from the answ
     CHECK(fixture.popup(kIndexDlogmFit) == static_cast<int>(fromImporter.dlogmFit) + 1);
     CHECK(fixture.slider(kIndexExposure) == Catch::Approx(1.5));
     CHECK(fixture.popup(kIndexRenderDevice) == static_cast<int>(fromImporter.renderDevice) + 1);
+    CHECK(fixture.popup(kIndexDirectColour) == static_cast<int>(fromImporter.directColour) + 1);
 
     // A round trip proves the seeding and the translation agree: translating
     // the seeded controls must reproduce the importer's blob exactly.
@@ -582,6 +603,18 @@ TEST_CASE("the pure mapping round-trips every value of every field",
     }
 }
 
+TEST_CASE("the pure mapping round-trips the Program Monitor Colour choice", "[sourcesettings][mapping]") {
+    // [WP-SETTINGS]
+    for (int item = 1; item <= OSV_SS_DIRECT_COLOUR_COUNT; ++item) {
+        ControlValues c;
+        c.directColour = item;
+        const PrefsBlob blob = prefsFromControls(c);
+        REQUIRE(blob.isValid());
+        CHECK(blob.directColour == static_cast<std::uint8_t>(item - 1));
+        CHECK(controlsFromPrefs(blob).directColour == item);
+    }
+}
+
 TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesettings][mapping]") {
     // A default-constructed ControlValues is what the header's defaults say;
     // translating it must give exactly PrefsBlob::defaults().
@@ -595,6 +628,7 @@ TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesetting
     CHECK(c.calibration == OSV_SS_CALIB_DEFAULT);
     CHECK(c.dlogmFit == OSV_SS_FIT_DEFAULT);
     CHECK(c.renderDevice == OSV_SS_DEVICE_DEFAULT);
+    CHECK(c.directColour == OSV_SS_DIRECT_COLOUR_DEFAULT);
     CHECK(c.seamSearch == (OSV_SS_SEAM_SEARCH_DEFAULT != 0));
     CHECK(c.gainMatch == (OSV_SS_GAIN_MATCH_DEFAULT != 0));
     CHECK(c.exposureStops == Catch::Approx(OSV_SS_EXPOSURE_DEFAULT));
@@ -631,6 +665,7 @@ TEST_CASE("the pure mapping never produces a blob that needs repair",
         c.calibration = v;
         c.dlogmFit = v;
         c.renderDevice = v;
+        c.directColour = v;
         c.exposureStops = static_cast<double>(v);
         PrefsBlob blob = prefsFromControls(c);
         INFO("hostile control value " << v);

@@ -37,8 +37,11 @@ struct DecoderOptions {
     /// Which hardware path to use (see HwAccel).
     HwAccel hw = HwAccel::None;
 
-    /// Software decoder thread count (0 = let libavcodec pick from the CPU
-    /// count).  Ignored by the hardware paths.
+    /// libavcodec thread count (0 = let libavcodec pick from the CPU count,
+    /// at most 16).  Applies to the hardware paths too: libavcodec pipelines
+    /// hardware submissions over its frame threads, and every frame thread
+    /// adds one decoder surface to the hardware pool and one frame of delay
+    /// before the first picture comes out.
     int threads = 0;
 
     /// CUDA only: leave decoded frames in device memory and expose them via
@@ -83,6 +86,35 @@ struct DecoderOptions {
     /// whose sample entry carries an hvcC (native OSV streams) or avcC (LRF
     /// proxy) record; anything else returns Unsupported.
     bool useContainerSamples = false;
+
+    /// Hardware paths (D3D11VA / CUDA without `cudaContext`): take the
+    /// process-wide shared device of this type and adapter when one is alive
+    /// instead of creating a device per decoder.  Creating a device costs
+    /// ~120 ms (D3D11) / ~50 ms (CUDA) on the sample machine, more than
+    /// everything else in open() together.  Devices are held weakly: one
+    /// lives while a decoder or a frame uses it, so a process that stops
+    /// decoding gets the GPU memory back.  false restores a private device
+    /// per decoder.
+    bool shareHwDevice = true;
+
+    /// Which of the shared devices of one type and adapter to use (0 = the
+    /// common one).  FFmpeg serialises every surface download of a D3D11
+    /// device behind one lock, so two decoders that run in PARALLEL on one
+    /// device download one after the other; giving them different slots keeps
+    /// their downloads concurrent while still sharing each device with every
+    /// other decoder of the same slot.  Ignored without `shareHwDevice`.
+    int hwDeviceSlot = 0;
+
+    /// Skip decoding frame 0 inside open() when the container's parameter
+    /// sets already describe the stream (size and pixel format known after
+    /// avcodec_open2 - always the case for the hvcC streams in container-
+    /// sample mode).  open() then costs no decode at all; the first
+    /// decodeFrame() pays for what it decodes anyway, and a stream the GPU
+    /// cannot decode falls back to software on that first decode (activeHw()
+    /// reports the fallback from then on) instead of inside open().  When
+    /// the parameters are NOT known up front the probe runs as usual, so the
+    /// reported geometry is never a guess.
+    bool deferFirstFrame = false;
 };
 
 }  // namespace osv::video

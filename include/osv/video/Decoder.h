@@ -26,6 +26,12 @@
 //     widened samples are stored as value << 2 so they sit on the same
 //     10-bit scale (narrow range 64..940) as the native streams; the frame
 //     reports bitDepth 10 and the decoder reports sourceBitDepth() == 8.
+//   * Open cost.  On the sample clip an open was a hardware device (~120 ms
+//     D3D11, ~50-85 ms CUDA) plus a probe decode of frame 0 (~100-140 ms);
+//     the libavformat probe was ~3 ms.  Hardware devices are therefore
+//     shared process-wide (DecoderOptions::shareHwDevice) and the probe can
+//     be skipped when the parameter sets describe the stream
+//     (DecoderOptions::deferFirstFrame).  openTimings() records the phases.
 #pragma once
 
 #include "osv/core/Result.h"
@@ -45,6 +51,32 @@ namespace osv::video {
 struct TimeBase {
     std::int32_t num = 1;
     std::int32_t den = 60000;
+};
+
+/// Where the wall-clock time of one HevcStreamDecoder::open() went.
+///
+/// Every phase is measured with a steady clock around the call that does the
+/// work, so the phases add up to (almost) totalMs; the remainder is option
+/// plumbing and allocation.  A phase that did not run in the chosen mode stays
+/// at 0 (demuxOpenMs / streamInfoMs in container-sample mode, hwDeviceMs on
+/// the software path or when an existing device was reused).
+///
+/// Exists because "the decoder takes 200 ms to open" is not actionable: the
+/// cure for a slow libavformat probe (feed container samples) is different
+/// from the cure for a slow device creation (share the device) or a slow
+/// first picture (nothing - that is the decode itself).
+struct DecoderOpenTimings {
+    double mapMs = 0.0;          ///< Memory-mapping the file for the libavformat AVIO callbacks.
+    double containerMs = 0.0;    ///< OpenOSV container parse (or parsed-index cache lookup) and track selection.
+    double demuxOpenMs = 0.0;    ///< avformat_open_input (libavformat mode only).
+    double streamInfoMs = 0.0;   ///< avformat_find_stream_info (libavformat mode only).
+    double hwDeviceMs = 0.0;     ///< Hardware device creation or lookup (0 on the software path).
+    double codecOpenMs = 0.0;    ///< Codec context setup + avcodec_open2 (hardware device excluded).
+    double firstFrameMs = 0.0;   ///< Decoding (and on hardware, reading back) frame 0 to learn the real geometry.
+    double totalMs = 0.0;        ///< The whole open() call.
+    bool hwDeviceReused = false; ///< True when a live shared hardware device served this decoder.
+    bool containerReused = false;///< True when an already parsed container index served this decoder.
+    bool firstFrameDeferred = false; ///< True when open() skipped the frame-0 decode (DecoderOptions::deferFirstFrame).
 };
 
 class HevcStreamDecoder {
@@ -102,6 +134,11 @@ public:
 
     /// Time base of the presentation timestamps (ticks per second = den/num).
     [[nodiscard]] TimeBase timeBase() const noexcept;
+
+    /// Where the time of the open() that produced this decoder went (all
+    /// zero on an unopened decoder).  Cheap to call; the numbers are frozen
+    /// when open() returns.
+    [[nodiscard]] DecoderOpenTimings openTimings() const noexcept;
 
     /// Index the next call to next() will return.
     [[nodiscard]] std::uint32_t nextIndex() const noexcept;

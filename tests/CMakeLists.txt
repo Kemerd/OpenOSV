@@ -64,6 +64,16 @@ if(OSV_ENABLE_CUDA AND TARGET CUDA::cuda_driver)
   set_target_properties(osv_gpu_decode_bench PROPERTIES FOLDER "osv/bench")
 endif()
 
+# -----------------------------------------------------------------------------
+#  osv_decoder_open_bench: what opening (and re-opening) a video decoder costs,
+#  phase by phase, per back-end and demux mode.  Run by hand; NOT registered
+#  with ctest for the same reason as the GPU decode bench.
+# -----------------------------------------------------------------------------
+add_executable(osv_decoder_open_bench bench/DecoderOpenBench.cpp)
+target_link_libraries(osv_decoder_open_bench PRIVATE osv_video osv_meta osv_container osv_core)
+target_compile_definitions(osv_decoder_open_bench PRIVATE OSV_SAMPLE_FILE="${OSV_SAMPLE_FILE}")
+set_target_properties(osv_decoder_open_bench PROPERTIES FOLDER "osv/bench")
+
 catch_discover_tests(osv_tests
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   PROPERTIES SKIP_RETURN_CODE 4
@@ -89,3 +99,20 @@ if(TARGET osv_render_cuda)
             $<TARGET_FILE_DIR:osv_gpu_analysis_bench>
     COMMAND_EXPAND_LISTS)
 endif()
+
+# -----------------------------------------------------------------------------
+#  osv_seam_carve_bench - [WP-SEAM] the carved seam against the feather blend
+#  on the sample clip: ghost / seam-edge metrics, TIFF crops, seam jitter over
+#  time and the render / carve cost (see bench/SeamCarveBench.cpp).
+#
+#  A measurement tool, NOT a test: it asserts nothing and is never registered
+#  with ctest.
+# -----------------------------------------------------------------------------
+add_executable(osv_seam_carve_bench bench/SeamCarveBench.cpp)
+target_link_libraries(osv_seam_carve_bench PRIVATE ${_osv_test_libs})
+target_compile_definitions(osv_seam_carve_bench PRIVATE OSV_SAMPLE_FILE="${OSV_SAMPLE_FILE}")
+set_target_properties(osv_seam_carve_bench PROPERTIES FOLDER "tests")
+add_custom_command(TARGET osv_seam_carve_bench POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:osv_seam_carve_bench>
+          $<TARGET_FILE_DIR:osv_seam_carve_bench>
+  COMMAND_EXPAND_LISTS)
