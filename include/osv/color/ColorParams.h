@@ -61,6 +61,56 @@ enum class Look : int {
 /// The look new code and the CLI select, and what a zeroed preference means.
 inline constexpr Look kDefaultLook = Look::DjiStudio;
 
+// -----------------------------------------------------------------------------
+//  [WP-HDRPEAK] HDR peak brightness (the PQ output's highlight roll-off)
+// -----------------------------------------------------------------------------
+
+/// The PQ output's target display peak when none is chosen: the 1000-nit
+/// display of the OOTF itself, which means no roll-off at all - the PQ
+/// output of every build before the setting existed, bit for bit.
+inline constexpr float kDefaultHdrPeakNits = kDefaultPeakNits;
+
+/// The lowest target setHdrPeak accepts (the SDR reference peak); a lower
+/// request is raised to it.  At 100 nits the BT.2408 knee sits at 27 nits,
+/// just above 18 % grey, so nothing lower is a meaningful HDR target.
+inline constexpr float kMinHdrPeakNits = 100.0f;
+
+/// The targets the Source Settings offer, in PrefsHdrPeak order (the order
+/// is persisted, so it is append-only): the untouched 1000-nit master, two
+/// common consumer HDR peaks, and 203 nits - BT.2408's HDR reference white,
+/// the "SDR-safe" choice (nothing brighter than diffuse white).
+inline constexpr float kHdrPeakChoicesNits[] = {1000.0f, 600.0f, 400.0f, 203.0f};
+
+/**
+ * @brief Set the PQ output's target display peak on an already built block.
+ *
+ * Fills the block's hdrPeak* group for osvHdrPeakRolloff (ColorMath.h): the
+ * target, PQ(peakNits), the target normalised to that source range and the
+ * BT.2408 knee start KS = 1.5 * maxLum - 0.5.  The group is ZEROED (no
+ * roll-off) when the block's transfer is not PQ, when the target is not
+ * finite or not positive, or when it is not below the block's own peakNits
+ * (1000) - so a 1000-nit request leaves a block byte-identical to one built
+ * before the setting existed.  Positive targets below kMinHdrPeakNits are
+ * raised to it.
+ */
+void setHdrPeak(OsvColorParams& params, float targetNits) noexcept;
+
+/// The peak the block's PQ output can reach in nits: its roll-off target
+/// when one is active, otherwise its OOTF peak (1000).  0 for a block that
+/// is not PQ, because only PQ output is an absolute display light level.
+[[nodiscard]] float hdrPeakNitsOf(const OsvColorParams& params) noexcept;
+
+/// Where the roll-off starts for a target, in nits: the BT.2408 knee
+/// PQ^-1(KS * PQ(sourcePeakNits)).  Everything at or below it is untouched.
+/// Returns sourcePeakNits when the target is not below it (no roll-off) and
+/// 0 for non-finite or non-positive arguments.
+[[nodiscard]] float hdrPeakKneeNits(float targetNits, float sourcePeakNits = kDefaultPeakNits) noexcept;
+
+/// Parse a target peak: "1000", "600", "400" or "203" (the Source Settings
+/// choices), also spelled with a "nits" suffix, and "sdr" / "sdr-safe" for
+/// 203.  Returns false and leaves `nits` untouched for anything else.
+[[nodiscard]] bool parseHdrPeak(std::string_view text, float& nits) noexcept;
+
 /// Stable lower-case names ("dji", "pocket3", "osmo360").
 [[nodiscard]] const char* dlogMFitName(DlogMFit fit) noexcept;
 /// Stable lower-case names ("hlg", "pq", "709", "linear", "dlogm").
@@ -123,18 +173,22 @@ inline constexpr Look kDefaultLook = Look::DjiStudio;
  * @param look           Display look for the Rec.709 output (DJI Studio by
  *                       default; Look::Standard keeps the pre-look rendering).
  *                       Ignored by every other transfer.
+ * @param hdrPeakNits    [WP-HDRPEAK] Target display peak of the PQ output
+ *                       (see setHdrPeak).  The default, 1000, is no roll-off.
+ *                       Ignored by every other transfer.
  *
  * Inputs outside their valid range are clamped (bit depth to 8..16, non-finite
  * stops to 0, non-positive scene scale to the BT.2408 default, an unknown look
- * to the standard rendering) rather than rejected, so the function can never
- * produce a block that crashes a kernel.
+ * to the standard rendering, a non-finite HDR peak to no roll-off) rather than
+ * rejected, so the function can never produce a block that crashes a kernel.
  */
 [[nodiscard]] OsvColorParams makeColorParams(DlogMFit fit, OutputTransfer transfer, float exposureStops,
                                              InputEncoding input = InputEncoding::DLogM, bool narrowInput = true,
                                              std::uint32_t bitDepth = 10,
                                              const OsvDlogMCurve* curveOverride = nullptr,
                                              float sceneScale = kBt2408SceneScale,
-                                             Look look = kDefaultLook) noexcept;
+                                             Look look = kDefaultLook,
+                                             float hdrPeakNits = kDefaultHdrPeakNits) noexcept;
 
 /// A disabled block (every stage copies input to output).
 [[nodiscard]] OsvColorParams makeDisabledColorParams() noexcept;

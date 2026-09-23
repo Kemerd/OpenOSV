@@ -173,10 +173,15 @@
 #define OSV_SS_ID_SAVE_DEFAULTS 31
 #define OSV_SS_ID_RESTORE_DEFAULTS 32
 #define OSV_SS_ID_DEFAULTS_TOPIC_END 33
+/* [WP-HDRPEAK] "HDR Peak (PQ only)": a NEW id from this package's range
+ * (46-47), placed at the top level right after Look (index 3) because the
+ * three colour controls are read together; every index after it moved up by
+ * one - indices are not persisted, ids are. */
+#define OSV_SS_ID_HDR_PEAK 46
 
-/* Total parameters excluding the input layer: 20 value controls + 2 buttons
+/* Total parameters excluding the input layer: 21 value controls + 2 buttons
  * + 6 group markers.  out_data->num_params is this + 1. */
-#define OSV_SOURCE_SETTINGS_PARAM_COUNT 28
+#define OSV_SOURCE_SETTINGS_PARAM_COUNT 29
 
 /* ==========================================================================
  *  Popup item strings
@@ -275,6 +280,23 @@
 #define OSV_SS_LOOK_ITEMS "DJI (default)|OpenOSV standard"
 #define OSV_SS_LOOK_COUNT 2
 #define OSV_SS_LOOK_DEFAULT 1
+
+/* [WP-HDRPEAK] "HDR Peak (PQ only)" - PrefsHdrPeak: Nits1000, Nits600,
+ * Nits400, Nits203.
+ *
+ * The display peak the BT.2100 PQ output's highlights roll off into (the
+ * BT.2408 Annex 5 EETF, per component).  Everything below the knee - 464 /
+ * 251 nits for 600 / 400, so diffuse white (203 nits) and every face and
+ * mid-tone - stays exactly where it was; only highlights above it compress.
+ * "203 nits (SDR-safe)" keeps the whole picture at or below HDR reference
+ * white: its knee is 88 nits, so diffuse white itself drops to 159 nits.
+ * HLG is display-relative (the display applies its own peak) and Rec. 709,
+ * linear and the passthrough have no HDR highlights, so the name says "PQ
+ * only" - a source settings effect has no dependable way to grey it out.
+ * Default 1 = 1000 nits (PrefsHdrPeak::Nits1000 is 0), no roll-off. */
+#define OSV_SS_HDR_PEAK_ITEMS "1000 nits (default)|600 nits|400 nits|203 nits (SDR-safe)"
+#define OSV_SS_HDR_PEAK_COUNT 4
+#define OSV_SS_HDR_PEAK_DEFAULT 1
 
 /* [WP-PHOTO] "Sky Seam Fix" - PrefsPhotoSeam: Off, RimOnly, RimAndGain.
  *
@@ -375,57 +397,59 @@ namespace osv::premiere::sourcesettings {
 ///
 ///   1  Colour Output
 ///   2  Look (Rec. 709 only)     [WP-LOOK]
-///   3  Output Size
-///   4  Stabilisation
-///   5  Stitching          (GROUP_START)
-///   6    Seam Search
-///   7    Exposure Match
-///   8    Calibration
-///   9    Sun Ghost Removal        [WP-FLARE]
-///  10    Sky Seam Fix             [WP-PHOTO]
-///  11    Sky Seam Strength        [WP-PHOTO]
-///  12    Seam Edge Inset          [WP-PHOTO]
-///  13    Seam Blend               [WP-SEAMTOOLS]
-///  14    Parallax Blend           [WP-SEAMTOOLS]
-///  15    Seam Smoothing           [WP-SEAMTOOLS]
-///  16    Near Offset              [WP-SEAMTOOLS]
-///  17    Far Offset               [WP-SEAMTOOLS]
-///  18  (GROUP_END, Stitching)
-///  19  Advanced           (GROUP_START, starts collapsed)
-///  20    D-Log M Curve
-///  21    Exposure
-///  22    Render Device
-///  23    Program Monitor Colour   [WP-SETTINGS]
-///  24  (GROUP_END, Advanced)
-///  25  Defaults           (GROUP_START, starts collapsed)   [WP-DEFAULTS]
-///  26    Save       [Save as Default for New Clips]
-///  27    Restore    [Restore Built-in Defaults]
-///  28  (GROUP_END, Defaults)
+///   3  HDR Peak (PQ only)       [WP-HDRPEAK]
+///   4  Output Size
+///   5  Stabilisation
+///   6  Stitching          (GROUP_START)
+///   7    Seam Search
+///   8    Exposure Match
+///   9    Calibration
+///  10    Sun Ghost Removal        [WP-FLARE]
+///  11    Sky Seam Fix             [WP-PHOTO]
+///  12    Sky Seam Strength        [WP-PHOTO]
+///  13    Seam Edge Inset          [WP-PHOTO]
+///  14    Seam Blend               [WP-SEAMTOOLS]
+///  15    Parallax Blend           [WP-SEAMTOOLS]
+///  16    Seam Smoothing           [WP-SEAMTOOLS]
+///  17    Near Offset              [WP-SEAMTOOLS]
+///  18    Far Offset               [WP-SEAMTOOLS]
+///  19  (GROUP_END, Stitching)
+///  20  Advanced           (GROUP_START, starts collapsed)
+///  21    D-Log M Curve
+///  22    Exposure
+///  23    Render Device
+///  24    Program Monitor Colour   [WP-SETTINGS]
+///  25  (GROUP_END, Advanced)
+///  26  Defaults           (GROUP_START, starts collapsed)   [WP-DEFAULTS]
+///  27    Save       [Save as Default for New Clips]
+///  28    Restore    [Restore Built-in Defaults]
+///  29  (GROUP_END, Defaults)
 enum ParamIndex : int {
     kIndexColorOutput = 1,
     kIndexRec709Look = 2,
-    kIndexOutputSize = 3,
-    kIndexStabilization = 4,
-    kIndexStitchTopic = 5,
-    kIndexSeamSearch = 6,
-    kIndexGainMatch = 7,
-    kIndexCalibration = 8,
-    kIndexFlareRemoval = 9,     // [WP-FLARE]
-    kIndexPhotoSeam = 10,       // [WP-PHOTO]
-    kIndexPhotoStrength = 11,   // [WP-PHOTO]
-    kIndexSeamInset = 12,       // [WP-PHOTO]
-    kIndexSeamBlend = 13,       // [WP-SEAMTOOLS]
-    kIndexParallaxBlend = 14,   // [WP-SEAMTOOLS]
-    kIndexSeamSmoothing = 15,   // [WP-SEAMTOOLS]
-    kIndexNearOffset = 16,      // [WP-SEAMTOOLS]
-    kIndexFarOffset = 17,       // [WP-SEAMTOOLS]
-    kIndexStitchTopicEnd = 18,
-    kIndexAdvancedTopic = 19,
-    kIndexDlogmFit = 20,
-    kIndexExposure = 21,
-    kIndexRenderDevice = 22,
-    kIndexDirectColour = 23,
-    kIndexAdvancedTopicEnd = 24,
+    kIndexHdrPeak = 3,          // [WP-HDRPEAK]
+    kIndexOutputSize = 4,
+    kIndexStabilization = 5,
+    kIndexStitchTopic = 6,
+    kIndexSeamSearch = 7,
+    kIndexGainMatch = 8,
+    kIndexCalibration = 9,
+    kIndexFlareRemoval = 10,    // [WP-FLARE]
+    kIndexPhotoSeam = 11,       // [WP-PHOTO]
+    kIndexPhotoStrength = 12,   // [WP-PHOTO]
+    kIndexSeamInset = 13,       // [WP-PHOTO]
+    kIndexSeamBlend = 14,       // [WP-SEAMTOOLS]
+    kIndexParallaxBlend = 15,   // [WP-SEAMTOOLS]
+    kIndexSeamSmoothing = 16,   // [WP-SEAMTOOLS]
+    kIndexNearOffset = 17,      // [WP-SEAMTOOLS]
+    kIndexFarOffset = 18,       // [WP-SEAMTOOLS]
+    kIndexStitchTopicEnd = 19,
+    kIndexAdvancedTopic = 20,
+    kIndexDlogmFit = 21,
+    kIndexExposure = 22,
+    kIndexRenderDevice = 23,
+    kIndexDirectColour = 24,
+    kIndexAdvancedTopicEnd = 25,
     // [WP-DEFAULTS] Always the last group, so its indices are written
     // relative to the Advanced terminator: a control added to an earlier
     // group moves them with it and nothing here has to be renumbered.
@@ -439,7 +463,9 @@ enum ParamIndex : int {
 /// paramsSetup() adds them in this order and a test walks this table against
 /// the list the built module actually produced.
 inline constexpr int kParamIdByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
-    OSV_SS_ID_COLOR_OUTPUT,     OSV_SS_ID_REC709_LOOK,   OSV_SS_ID_OUTPUT_SIZE,   OSV_SS_ID_STABILIZATION,
+    OSV_SS_ID_COLOR_OUTPUT,     OSV_SS_ID_REC709_LOOK,
+    OSV_SS_ID_HDR_PEAK,  // [WP-HDRPEAK]
+    OSV_SS_ID_OUTPUT_SIZE,   OSV_SS_ID_STABILIZATION,
     OSV_SS_ID_STITCH_TOPIC,     OSV_SS_ID_SEAM_SEARCH,   OSV_SS_ID_GAIN_MATCH,
     OSV_SS_ID_CALIBRATION,      OSV_SS_ID_FLARE_REMOVAL, OSV_SS_ID_PHOTO_SEAM, OSV_SS_ID_PHOTO_STRENGTH,
     OSV_SS_ID_SEAM_INSET,       OSV_SS_ID_SEAM_BLEND,    OSV_SS_ID_PARALLAX_BLEND, OSV_SS_ID_SEAM_SMOOTHING,
@@ -457,8 +483,9 @@ inline constexpr int kParamCount = OSV_SOURCE_SETTINGS_PARAM_COUNT;
 /// GROUP_START / GROUP_END markers and [WP-DEFAULTS] the two Defaults buttons
 /// (a button has no value; it only triggers PF_Cmd_USER_CHANGED_PARAM).
 /// This is the count that has to round trip through a PrefsBlob
-/// ([WP-SEAMTOOLS] five more since the seam tools).
-inline constexpr int kValueParamCount = 20;
+/// ([WP-SEAMTOOLS] five more since the seam tools, [WP-HDRPEAK] one more for
+/// the HDR peak).
+inline constexpr int kValueParamCount = 21;
 
 /// The parameter names, in index order, so a test can compare the built
 /// module's list without repeating the strings.
@@ -469,7 +496,8 @@ inline constexpr int kValueParamCount = 20;
 /// rather than a labelled control.  Writing "Stitching" here would have
 /// described a field the SDK never fills.
 inline constexpr const char* kParamNameByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
-    "Colour Output", "Look (Rec. 709 only)", "Output Size", "Stabilisation", "Stitching", "Seam Search",
+    "Colour Output", "Look (Rec. 709 only)", "HDR Peak (PQ only)" /* [WP-HDRPEAK] */, "Output Size",
+    "Stabilisation", "Stitching", "Seam Search",
     "Exposure Match", "Calibration",  "Sun Ghost Removal",  "Sky Seam Fix", "Sky Seam Strength",
     "Seam Edge Inset", "Seam Blend",  "Parallax Blend", "Seam Smoothing", "Near Offset", "Far Offset",
     "",               "Advanced",     "D-Log M Curve",

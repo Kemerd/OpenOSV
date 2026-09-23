@@ -74,6 +74,7 @@ struct ControlValues {
     double seamSmoothingDeg = OSV_SS_SEAM_SMOOTHING_DEFAULT;  ///< Seam Smoothing (0 = off).
     double nearOffsetDeg = OSV_SS_SEAM_OFFSET_DEFAULT;        ///< Near Offset.
     double farOffsetDeg = OSV_SS_SEAM_OFFSET_DEFAULT;         ///< Far Offset.
+    int hdrPeak = OSV_SS_HDR_PEAK_DEFAULT;  ///< [WP-HDRPEAK] 1-based popup value (PrefsHdrPeak + 1).
 };
 
 /// Control values -> PrefsBlob.

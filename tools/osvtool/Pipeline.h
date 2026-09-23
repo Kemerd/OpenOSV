@@ -68,6 +68,7 @@ struct PipelineOptions {
     std::string inputEncoding = "auto";           ///< auto | dlogm | hlg | normal
     double exposureStops = 0.0;
     std::string look = "dji";                     ///< dji | standard (Rec.709 output only)
+    std::string hdrPeak = "1000";                 ///< [WP-HDRPEAK] 1000 | 600 | 400 | 203 nits (PQ output only)
 
     // Decode / render backends
     std::string hw = "none";                      ///< none | d3d11va | cuda | auto

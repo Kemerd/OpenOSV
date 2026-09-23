@@ -264,6 +264,9 @@ struct DialogControls {
     double nearOffsetDeg = 0.0;      ///< Near Offset along the seam, -3..3 deg.
     double farOffsetDeg = 0.0;       ///< Far Offset along the seam, -3..3 deg.
     // ---- [/WP-SEAMTOOLS] -----------------------------------------------------
+    /// [WP-HDRPEAK] Combo index = PrefsHdrPeak: 0 1000 nits (default), 1 600,
+    /// 2 400, 3 203 (SDR-safe).  Only the PQ output uses it.
+    int hdrPeak = 0;
 };
 
 /// PrefsBlob -> control state.  Every field is already in range because the

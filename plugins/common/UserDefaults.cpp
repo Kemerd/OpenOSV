@@ -312,6 +312,26 @@ const FieldSpec kFields[] = {
     {{"rec709Look", OSV_UD_FIELD(look), 0, 0},
      [](const PrefsBlob& p) { return tokenJson(p.look, kLookTokens); },
      [](const Json& v, PrefsBlob& p, std::string& why, bool&) { return tokenFrom(v, kLookTokens, p.look, why); }},
+    // [WP-HDRPEAK] The PQ output's peak, written as its number of nits (1000,
+    // 600, 400 or 203) because that is what the panel says.  Any other number
+    // is refused rather than rounded: the choices are four specific displays,
+    // not a scale, and a hand-typed 800 must not silently become 600.
+    {{"hdrPeakNits", OSV_UD_FIELD(hdrPeak), 0, 0},
+     [](const PrefsBlob& p) { return Json(static_cast<int>(std::lround(p.hdrPeakNits()))); },
+     [](const Json& v, PrefsBlob& p, std::string& why, bool&) {
+         double nits = 0.0;
+         if (!numberFrom(v, nits, why)) {
+             return false;
+         }
+         for (std::size_t i = 0; i < std::size(kPrefsHdrPeakNits); ++i) {
+             if (nits == static_cast<double>(kPrefsHdrPeakNits[i])) {
+                 p.hdrPeak = static_cast<std::uint8_t>(i);
+                 return true;
+             }
+         }
+         why = "expected one of 1000, 600, 400 or 203 (nits)";
+         return false;
+     }},
     {{"outputSize", OSV_UD_FIELD(outputSize), 0, 0},
      [](const PrefsBlob& p) { return tokenJson(p.outputSize, kSizeTokens); },
      [](const Json& v, PrefsBlob& p, std::string& why, bool&) { return tokenFrom(v, kSizeTokens, p.outputSize, why); }},

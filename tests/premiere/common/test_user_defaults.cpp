@@ -101,6 +101,7 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
     p.exposureStops = -1.7f;
     p.renderDevice = static_cast<std::uint8_t>(PrefsRenderDevice::OpenCl);
     p.directColour = static_cast<std::uint8_t>(PrefsDirectColour::MatchSource);
+    p.hdrPeak = static_cast<std::uint8_t>(PrefsHdrPeak::Nits400);  // [WP-HDRPEAK]
     REQUIRE(p.sanitise());  // already clean: every value above is in range
     return p;
 }
@@ -185,6 +186,7 @@ TEST_CASE("the defaults file round-trips every value of every setting bit for bi
         each([](PrefsBlob& p, std::uint8_t v) { p.parallax = v; }, static_cast<int>(PrefsParallax::Count));
         each([](PrefsBlob& p, std::uint8_t v) { p.photoSeam = v; }, static_cast<int>(PrefsPhotoSeam::Count));
         each([](PrefsBlob& p, std::uint8_t v) { p.directColour = v; }, static_cast<int>(PrefsDirectColour::Count));
+        each([](PrefsBlob& p, std::uint8_t v) { p.hdrPeak = v; }, static_cast<int>(PrefsHdrPeak::Count));  // [WP-HDRPEAK]
         each([](PrefsBlob& p, std::uint8_t v) { p.seamSearch = v; }, 2);
         each([](PrefsBlob& p, std::uint8_t v) { p.gainMatch = v; }, 2);
         each([](PrefsBlob& p, std::uint8_t v) { p.flareRemoval = v; }, 2);
@@ -231,6 +233,11 @@ TEST_CASE("the defaults file covers every byte of the blob that holds a setting"
     for (std::size_t i = 0; i < sizeof(PrefsBlob::photoReserved); ++i) {
         padding.insert(offsetof(PrefsBlob, photoReserved) + i);
     }
+    // [WP-HDRPEAK] the other packages' bytes before hdrPeak, and its own spare.
+    for (std::size_t i = 0; i < sizeof(PrefsBlob::padBeforeHdrPeak); ++i) {
+        padding.insert(offsetof(PrefsBlob, padBeforeHdrPeak) + i);
+    }
+    padding.insert(offsetof(PrefsBlob, padAfterHdrPeak));
 
     std::vector<int> owners(PrefsBlob::kSize, 0);
     std::set<std::string> keys;
@@ -281,6 +288,7 @@ TEST_CASE("the written file is the documented, human-readable format", "[userdef
     CHECK(text.find("\"farOffsetDeg\": -0.42") != std::string::npos);
     CHECK(text.find("\"exposureStops\": -1.7") != std::string::npos);
     CHECK(text.find("\"programMonitorColour\": \"match-source\"") != std::string::npos);
+    CHECK(text.find("\"hdrPeakNits\": 400") != std::string::npos);  // [WP-HDRPEAK]
     // Plain ASCII text ending with a newline.
     CHECK(std::all_of(text.begin(), text.end(), [](char c) { return static_cast<unsigned char>(c) < 0x80; }));
     REQUIRE_FALSE(text.empty());
@@ -621,4 +629,36 @@ TEST_CASE("the summary names every setting in the file's own words", "[userdefau
     }
     CHECK(summary.find("colourOutput rec709") != std::string::npos);
     CHECK(summary.find("calibration underwater") != std::string::npos);
+}
+
+TEST_CASE("the HDR peak is saved as its nits and only the four choices read back", "[userdefaults][hdrpeak]") {
+    // [WP-HDRPEAK] Every choice round-trips as the number the panel shows.
+    for (int i = 0; i < static_cast<int>(PrefsHdrPeak::Count); ++i) {
+        PrefsBlob p = PrefsBlob::defaults();
+        p.hdrPeak = static_cast<std::uint8_t>(i);
+        const std::string text = userDefaultsToJson(p);
+        const std::string expected =
+            "\"hdrPeakNits\": " + std::to_string(static_cast<int>(kPrefsHdrPeakNits[static_cast<std::size_t>(i)]));
+        INFO(expected);
+        CHECK(text.find(expected) != std::string::npos);
+        CHECK(roundTrip(p) == p);
+    }
+    // A number that is not one of the displays is refused (and noted), never
+    // rounded to a neighbour; a string is refused the same way.
+    for (const char* bad : {"800", "0", "-600", "\"600\"", "1e9"}) {
+        const std::string doc = std::string(R"({"format": "openosv-source-settings-defaults", "version": 1, )") +
+                                R"("settings": {"hdrPeakNits": )" + bad + "}}";
+        const auto parsed = userDefaultsFromJson(doc);
+        INFO(doc);
+        REQUIRE(parsed.ok());
+        CHECK(parsed.value().prefs.hdrPeakChoice() == PrefsHdrPeak::Nits1000);
+        const auto& notes = parsed.value().notes;
+        CHECK(std::any_of(notes.begin(), notes.end(),
+                          [](const std::string& n) { return n.find("\"hdrPeakNits\"") != std::string::npos; }));
+    }
+    // 600 written as a float is still 600.
+    const auto parsed = userDefaultsFromJson(
+        R"({"format": "openosv-source-settings-defaults", "version": 1, "settings": {"hdrPeakNits": 600.0}})");
+    REQUIRE(parsed.ok());
+    CHECK(parsed.value().prefs.hdrPeakChoice() == PrefsHdrPeak::Nits600);
 }

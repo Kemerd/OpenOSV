@@ -104,6 +104,10 @@ PrefsBlob prefsFromControls(const ControlValues& controls) noexcept {
     blob.setNearOffsetDeg(controls.nearOffsetDeg);
     blob.setFarOffsetDeg(controls.farOffsetDeg);
 
+    // [WP-HDRPEAK] The PQ output's peak (ignored by the other outputs); an
+    // out-of-range popup value keeps the default from defaults(), 1000 nits.
+    blob.hdrPeak = fromPopup(controls.hdrPeak, OSV_SS_HDR_PEAK_COUNT, blob.hdrPeak);
+
     // Clamp everything into range and zero the reserved bytes.  After this
     // the blob is byte-for-byte what the importer expects, which is the
     // property the round-trip test pins.
@@ -157,6 +161,7 @@ ControlValues controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.seamSmoothingDeg = clean.seamSmoothingDeg();
     c.nearOffsetDeg = clean.nearOffsetDeg();
     c.farOffsetDeg = clean.farOffsetDeg();
+    c.hdrPeak = toPopup(clean.hdrPeak, OSV_SS_HDR_PEAK_COUNT);  // [WP-HDRPEAK]
     return c;
 }
 

@@ -113,6 +113,8 @@ constexpr const char* kCliDevice[] = {"auto", "cpu", "cuda", "opencl"};
 constexpr const char* kCliLook[] = {"dji", "standard"};
 constexpr const char* kCliFlow[] = {"auto", "classical", "neural"};
 constexpr const char* kCliPhoto[] = {"off", "rim", "full"};
+constexpr const char* kCliHdrPeak[] = {"1000", "600", "400", "203"};  // [WP-HDRPEAK] PrefsHdrPeak order
+static_assert(std::size(kCliHdrPeak) == static_cast<std::size_t>(osv::premiere::PrefsHdrPeak::Count));
 static_assert(std::size(kCliColor) == static_cast<std::size_t>(osv::premiere::PrefsColorOutput::Count));
 static_assert(std::size(kCliStab) == static_cast<std::size_t>(osv::premiere::PrefsStabilization::Count));
 static_assert(std::size(kCliCalib) == static_cast<std::size_t>(osv::premiere::PrefsCalibrationChoice::Count));
@@ -157,6 +159,9 @@ void applyUserDefaults(RenderOptions& o, const CLI::App& sub) {
     }
     if (!given("--look")) {
         o.pipeline.look = cliToken(kCliLook, p.look);
+    }
+    if (!given("--hdr-peak")) {  // [WP-HDRPEAK]
+        o.pipeline.hdrPeak = cliToken(kCliHdrPeak, p.hdrPeak);
     }
     if (!given("--stab")) {
         o.pipeline.stab = cliToken(kCliStab, p.stabilization);
@@ -457,6 +462,11 @@ int runRender(const RenderOptions& o) {
     case color::OutputTransfer::Rec709: tag.transfer = io::ImageTransfer::Rec709; break;
     case color::OutputTransfer::Linear: tag.transfer = io::ImageTransfer::Linear; break;
     case color::OutputTransfer::Passthrough: tag.transfer = io::ImageTransfer::DLogM; break;
+    }
+    // [WP-HDRPEAK] A PQ still records the peak its highlights were rolled
+    // off into (1000, the OOTF display, when --hdr-peak is left alone).
+    if (P.outputTransfer == color::OutputTransfer::PQ) {
+        tag.peakNits = color::hdrPeakNitsOf(P.color);
     }
     if (toVideo) {
         if (P.outputTransfer == color::OutputTransfer::Linear || P.outputTransfer == color::OutputTransfer::Passthrough) {
