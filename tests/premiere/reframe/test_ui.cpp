@@ -2242,3 +2242,323 @@ TEST_CASE("while a drag is in flight the readout shows its values even if the ho
     REQUIRE(f.event(afterReal, params) == PF_Err_NONE);
     CHECK(drewText(f.host.drawbotRecord(), panReadout(panMove2)));
 }
+
+// ===========================================================================
+//  [WP-CAMERA] DJI's lens and the Drag Sensitivity control
+// ===========================================================================
+namespace {
+
+/// Set a float slider of the fixture's instance.
+void setSlider(UiFixture& f, int index, double value) {
+    std::vector<PF_ParamDef> added = f.host.addedParams(f.ref);
+    REQUIRE(static_cast<std::size_t>(index) <= added.size());
+    PF_ParamDef def = added[static_cast<std::size_t>(index) - 1u];
+    REQUIRE(def.param_type == PF_Param_FLOAT_SLIDER);
+    def.u.fs_d.value = static_cast<PF_FpShort>(value);
+    f.host.setParamValue(f.ref, index, def);
+}
+
+/// Tick or untick the Camera Model ("DJI") checkbox of the fixture's instance.
+void setDjiLens(UiFixture& f, bool on) {
+    std::vector<PF_ParamDef> added = f.host.addedParams(f.ref);
+    PF_ParamDef def = added[static_cast<std::size_t>(kIndexCameraModel) - 1u];
+    REQUIRE(def.param_type == PF_Param_CHECKBOX);
+    def.u.bd.value = on ? 1 : 0;
+    f.host.setParamValue(f.ref, kIndexCameraModel, def);
+}
+
+/// A float slider's value in an event's parameter array.
+[[nodiscard]] double sliderOf(const std::vector<PF_ParamDef*>& array, int index) {
+    return static_cast<double>(array[static_cast<std::size_t>(index)]->u.fs_d.value);
+}
+
+/// The direction of the sphere under `pointer` through DJI's lens - the
+/// renderer's own camera (buildView on DJI's lens) and rotation.
+[[nodiscard]] bool djiRayUnderPointer(const Layout& layout, double djiFov, double correction,
+                                      const CameraValues& cam, const PointF& pointer, double out[3]) {
+    Settings s;
+    s.cameraModel = CameraModel::Dji;
+    s.djiFovDeg = djiFov;
+    s.correction = correction;
+    s.panDeg = cam.panDeg;
+    s.tiltDeg = cam.tiltDeg;
+    s.rollDeg = cam.rollDeg;
+    const int w = static_cast<int>(std::lround(layout.viewport.w));
+    const int h = static_cast<int>(std::lround(layout.viewport.h));
+    const ViewSetup view = buildView(s, w, h, SizePx{w, h});
+    if (!view.valid) {
+        return false;
+    }
+    const OsvReframeParams& p = view.params;
+    const float nx = static_cast<float>((pointer.x - layout.viewport.x) - 0.5 * layout.viewport.w);
+    const float ny = static_cast<float>(0.5 * layout.viewport.h - (pointer.y - layout.viewport.y));
+    float d[3] = {0.0f, 0.0f, 0.0f};
+    if (!osvViewRay(p.projection, p.focalPx, p.eyeOffset, p.tanHalfH, p.tanHalfV, static_cast<float>(w),
+                    static_cast<float>(h), nx, ny, d)) {
+        return false;
+    }
+    for (int r = 0; r < 3; ++r) {
+        out[r] = static_cast<double>(p.Rout[r * 3 + 0]) * d[0] + static_cast<double>(p.Rout[r * 3 + 1]) * d[1] +
+                 static_cast<double>(p.Rout[r * 3 + 2]) * d[2];
+    }
+    const double n = std::sqrt(out[0] * out[0] + out[1] * out[1] + out[2] * out[2]);
+    if (!(n > 0.0)) {
+        return false;
+    }
+    for (int r = 0; r < 3; ++r) {
+        out[r] /= n;
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST_CASE("Drag Sensitivity sets how much faster than the hand a drag turns the view", "[reframe][ui][dji]") {
+    // The fixed-rate path (no grab): the rate is sensitivity * FOV / width,
+    // so doubling the control doubles the turn for the same hand movement.
+    const Layout layout = computeLayout(fullFrame());
+    CameraValues start;
+    start.fovDeg = 90.0;
+    for (const double s : {1.0, 2.0, 4.0}) {
+        INFO("sensitivity " << s);
+        DragState state = beginDrag(layout, layout.centre, start, kModNone);
+        REQUIRE_FALSE(state.grab.valid);
+        state.sensitivity = s;
+        const CameraValues v = applyDrag(state, PointF{layout.centre.x + 100.0, layout.centre.y}, kModNone);
+        CHECK(v.panDeg == Approx(s * 90.0 / kFrameW * 100.0).margin(1e-9));
+    }
+    // A fresh gesture uses the old constant, and nonsense falls back to it.
+    CHECK(DragState{}.sensitivity == kPanTiltSensitivity);
+    CHECK(kPanTiltSensitivity == OSV_REFRAME_DRAG_SENSITIVITY_DEFAULT);
+    CHECK(effectiveSensitivity(std::numeric_limits<double>::quiet_NaN()) == kPanTiltSensitivity);
+    CHECK(effectiveSensitivity(1e9) == OSV_REFRAME_DRAG_SENSITIVITY_VALID_MAX);
+    CHECK(effectiveSensitivity(-3.0) == OSV_REFRAME_DRAG_SENSITIVITY_VALID_MIN);
+    CHECK(effectiveSensitivity(1.25) == 1.25);
+}
+
+TEST_CASE("a grab through DJI's lens keeps the grabbed point under the pointer", "[reframe][ui][grab][dji]") {
+    // The grab is cast through whatever lens renders; on DJI's lens (the
+    // pinhole-behind-the-sphere camera) the invariant is exactly the Classic
+    // one: after the drag, the direction grabbed at the click is under the
+    // (sensitivity-scaled) pointer again.
+    const Layout layout = computeLayout(fullFrame());
+    CameraValues start;
+    start.dji = true;
+    start.djiFovDeg = 103.3;
+    start.correction = 0.67;
+    start.panDeg = 20.0;
+    start.tiltDeg = -5.9;
+    const PointF anchor{layout.centre.x + 150.0, layout.centre.y - 80.0};
+
+    Settings s;
+    s.cameraModel = CameraModel::Dji;
+    s.djiFovDeg = start.djiFovDeg;
+    s.correction = start.correction;
+    s.panDeg = start.panDeg;
+    s.tiltDeg = start.tiltDeg;
+    const ViewSetup view = buildView(s, 1920, 1080, SizePx{1920, 1080});
+    REQUIRE(view.valid);
+    REQUIRE(view.params.projection == OSV_PROJ_DJI_SPHERE);
+
+    for (const double sensitivity : {1.0, 2.0}) {
+        INFO("sensitivity " << sensitivity);
+        DragState state = beginDrag(layout, anchor, start, kModNone);
+        state.sensitivity = sensitivity;
+        state.grab = beginSphereGrab(view.params.projection, view.params.focalPx, view.params.eyeOffset,
+                                     view.params.tanHalfH, view.params.tanHalfV, layout, start, anchor);
+        REQUIRE(state.grab.valid);
+        const PointF to{anchor.x + 120.0, anchor.y + 60.0};
+        const CameraValues after = applyDrag(state, to, kModNone);
+        double grabbed[3];
+        double now[3];
+        REQUIRE(djiRayUnderPointer(layout, start.djiFovDeg, start.correction, start, anchor, grabbed));
+        const PointF quickened{anchor.x + sensitivity * 120.0, anchor.y + sensitivity * 60.0};
+        REQUIRE(djiRayUnderPointer(layout, start.djiFovDeg, start.correction, after, quickened, now));
+        INFO("grabbed point is " << angleBetweenDeg(grabbed, now) << " deg from the pointer");
+        CHECK(angleBetweenDeg(grabbed, now) < 0.01);
+        // A grab changes neither the lens nor the roll.
+        CHECK(after.djiFovDeg == start.djiFovDeg);
+        CHECK(after.correction == start.correction);
+        CHECK(after.rollDeg == start.rollDeg);
+    }
+}
+
+TEST_CASE("a zoom drag on DJI's lens walks DJI Studio's zoom path", "[reframe][ui][dji]") {
+    const Layout layout = computeLayout(fullFrame());
+    RectF grips[4];
+    REQUIRE(fovGripRects(layout, grips) == 4);
+    CameraValues start;
+    start.dji = true;
+    start.fovDeg = 120.0;
+    start.djiFovDeg = 60.0;
+    start.correction = 0.6;
+
+    SECTION("both DJI controls move together; the Classic FOV does not") {
+        DragState state = beginDrag(layout, grips[3].centre(), start, kModNone);
+        REQUIRE(state.handle == Handle::Fov);
+        const CameraValues v = applyDrag(state, PointF{grips[3].centre().x, grips[3].centre().y + 80.0}, kModNone);
+        // FOV at the Classic rate, correction 1/130 of it (DJI's gesture).
+        CHECK(v.djiFovDeg == Approx(60.0 + 80.0 * kFovDegPerPixel));
+        CHECK(v.correction == Approx(0.6 + 80.0 * kFovDegPerPixel / OSV_REFRAME_DJI_ZOOM_FOV_PER_CORRECTION));
+        CHECK(v.fovDeg == 120.0);
+        CHECK(changedFieldsFor(DragMode::Fov, true) == (kChangedDjiFov | kChangedCorrection));
+    }
+    SECTION("the path stops at DJI Studio's limits") {
+        DragState state = beginDrag(layout, grips[3].centre(), start, kModNone);
+        const CameraValues out =
+            applyDrag(state, PointF{grips[3].centre().x, grips[3].centre().y + 5000.0}, kModNone);
+        CHECK(out.djiFovDeg == Approx(150.0));
+        CHECK(out.correction == Approx(1.0));
+        DragState state2 = beginDrag(layout, grips[3].centre(), start, kModNone);
+        const CameraValues in =
+            applyDrag(state2, PointF{grips[3].centre().x, grips[3].centre().y - 5000.0}, kModNone);
+        CHECK(in.djiFovDeg == Approx(20.0));
+        CHECK(in.correction == Approx(0.0));
+    }
+    SECTION("a Crystal Ball is not snapped back to DJI Studio's 1.0") {
+        CameraValues crystal = start;
+        crystal.djiFovDeg = 75.0;
+        crystal.correction = 1.8;
+        DragState state = beginDrag(layout, grips[3].centre(), crystal, kModNone);
+        const CameraValues v = applyDrag(state, PointF{grips[3].centre().x, grips[3].centre().y - 40.0}, kModNone);
+        CHECK(v.correction < 1.8);
+        CHECK(v.correction > 1.0);
+        CHECK(v.djiFovDeg < 75.0);
+    }
+    SECTION("every other mode writes the same fields on either lens") {
+        for (const DragMode m :
+             {DragMode::PanTilt, DragMode::PanOnly, DragMode::TiltOnly, DragMode::Roll, DragMode::None}) {
+            CHECK(changedFieldsFor(m, true) == changedFieldsFor(m));
+        }
+        CHECK(changedFieldsFor(DragMode::Fov, false) == kChangedFov);
+    }
+}
+
+TEST_CASE("the live readout and sanitise know DJI's lens", "[reframe][ui][readout][dji]") {
+    CameraValues host;
+    host.dji = true;
+    host.djiFovDeg = 60.0;
+    host.correction = 0.6;
+    CameraValues live = host;
+    live.djiFovDeg = 80.0;
+    live.correction = 0.75;
+    // The gesture's DJI numbers are shown while it is in flight...
+    const CameraValues shown = mergeLiveReadout(host, live, kChangedDjiFov | kChangedCorrection);
+    CHECK(shown.djiFovDeg == 80.0);
+    CHECK(shown.correction == 0.75);
+    // ...unless it was made on the other lens: then it is some other state.
+    CameraValues otherLens = live;
+    otherLens.dji = false;
+    const CameraValues hostWins = mergeLiveReadout(host, otherLens, kChangedDjiFov | kChangedCorrection);
+    CHECK(hostWins.djiFovDeg == 60.0);
+    CHECK(hostWins.correction == 0.6);
+
+    CameraValues wild;
+    wild.djiFovDeg = 1e6;
+    wild.correction = std::numeric_limits<double>::quiet_NaN();
+    const CameraValues clean = sanitise(wild);
+    CHECK(clean.djiFovDeg == OSV_REFRAME_DJI_FOV_VALID_MAX);
+    CHECK(clean.correction == OSV_REFRAME_CORRECTION_DEFAULT);
+    wild.correction = 9.0;
+    CHECK(sanitise(wild).correction == OSV_REFRAME_CORRECTION_VALID_MAX);
+}
+
+TEST_CASE("DRAW on DJI's lens reads Zoom, FOV and Correction as DJI Studio prints them",
+          "[reframe][ui][module][draw][dji]") {
+    UiFixture f;
+    setDjiLens(f, true);
+    setSlider(f, kIndexDjiFov, 103.3);
+    setSlider(f, kIndexCorrection, 0.67);
+    f.setAngle(kIndexPan, 144.8);
+    f.setAngle(kIndexTilt, -5.9);
+    std::vector<PF_ParamDef*> params = f.params();
+
+    f.host.clearDrawbotRecord();
+    PF_EventExtra extra = makeExtra(f.host, PF_Event_DRAW);
+    extra.u.draw.depth = 32;
+    REQUIRE(f.event(extra, params) == PF_Err_NONE);
+    const DrawbotRecord record = f.host.drawbotRecord();
+    REQUIRE_FALSE(record.strings.empty());
+    const std::string& text = record.strings.front().text;
+    INFO("readout: " << text);
+    // DJI Studio printed Zoom 207.1 for these numbers; the formula at the
+    // displayed Correction gives 207.5 (docs/research/DJI_CAMERA.md: the
+    // difference is DJI's rounding of the Correction it displays).
+    CHECK(text.find("Zoom 207.5") != std::string::npos);
+    CHECK(text.find("FOV 103.3") != std::string::npos);
+    CHECK(text.find("Correction 0.67") != std::string::npos);
+    CHECK(text.find("Pan 144.8") != std::string::npos);
+    CHECK(text.find("Tilt -5.9") != std::string::npos);
+
+    // Unticked, the HUD is the Classic readout it always was.
+    setDjiLens(f, false);
+    params = f.params();
+    f.host.clearDrawbotRecord();
+    PF_EventExtra classic = makeExtra(f.host, PF_Event_DRAW);
+    classic.u.draw.depth = 32;
+    REQUIRE(f.event(classic, params) == PF_Err_NONE);
+    REQUIRE_FALSE(f.host.drawbotRecord().strings.empty());
+    const std::string classicText = f.host.drawbotRecord().strings.front().text;
+    CHECK(classicText.find("Zoom") == std::string::npos);
+    CHECK(classicText.find("FOV 120.0") != std::string::npos);
+}
+
+TEST_CASE("a Ctrl-drag zoom on DJI's lens commits DJI FOV, Correction and Zoom through the module",
+          "[reframe][ui][module][dji]") {
+    UiFixture f;
+    setDjiLens(f, true);
+    setSlider(f, kIndexDjiFov, 60.0);
+    setSlider(f, kIndexCorrection, 0.6);
+    std::vector<PF_ParamDef*> params = f.params();
+
+    PF_EventExtra click = makeClickAt(f.host, 960, 540);
+    click.u.do_click.modifiers = PF_Mod_CMD_CTRL_KEY;
+    REQUIRE(f.event(click, params) == PF_Err_NONE);
+    REQUIRE(click.u.do_click.send_drag == TRUE);
+    PF_EventExtra drag = makeDragFrom(f.host, click, 960, 540 + 80, false);
+    drag.u.do_click.modifiers = PF_Mod_CMD_CTRL_KEY;
+    REQUIRE(f.event(drag, params) == PF_Err_NONE);
+
+    CHECK(changed(params, kIndexDjiFov));
+    CHECK(changed(params, kIndexCorrection));
+    CHECK(changed(params, kIndexZoom));
+    CHECK_FALSE(changed(params, kIndexFov));
+    CHECK_FALSE(changed(params, kIndexPan));
+    const double fov = sliderOf(params, kIndexDjiFov);
+    const double cor = sliderOf(params, kIndexCorrection);
+    CHECK(fov == Approx(60.0 + 80.0 * kFovDegPerPixel).margin(1e-3));
+    CHECK(cor == Approx(0.6 + 80.0 * kFovDegPerPixel / OSV_REFRAME_DJI_ZOOM_FOV_PER_CORRECTION).margin(1e-4));
+    // The Zoom read-out follows the lens (the frame is 16:9).
+    CHECK(sliderOf(params, kIndexZoom) == Approx(djiZoomDeg(DjiLens{fov, cor}, kFrameW / kFrameH)).margin(1e-2));
+}
+
+TEST_CASE("the Drag Sensitivity control reaches the module's drag", "[reframe][ui][module][dji]") {
+    // With the control at 1.0 the drag is the exact grab: the direction under
+    // the pointer at the click is under the pointer - not twice as far - after.
+    UiFixture f;
+    f.setAngle(kIndexPan, 0.0);
+    f.setAngle(kIndexTilt, 0.0);
+    f.setFov(90.0);
+    setSlider(f, kIndexDragSensitivity, 1.0);
+    std::vector<PF_ParamDef*> params = f.params();
+
+    PF_EventExtra click = makeClickAt(f.host, 960, 540);
+    REQUIRE(f.event(click, params) == PF_Err_NONE);
+    PF_EventExtra drag = makeDragFrom(f.host, click, 960 + 300, 540 + 100, false);
+    REQUIRE(f.event(drag, params) == PF_Err_NONE);
+    REQUIRE(changed(params, kIndexPan));
+
+    const Layout layout = computeLayout(fullFrame());
+    const double distortion = static_cast<double>(params[kIndexDistortion]->u.fs_d.value);
+    CameraValues before;
+    before.fovDeg = 90.0;
+    CameraValues after = before;
+    after.panDeg = angleOf(params, kIndexPan);
+    after.tiltDeg = angleOf(params, kIndexTilt);
+    double grabbed[3];
+    double now[3];
+    REQUIRE(rayUnderPointer(layout, 90.0, distortion, before, PointF{960.0, 540.0}, grabbed));
+    REQUIRE(rayUnderPointer(layout, 90.0, distortion, after, PointF{960.0 + 300.0, 540.0 + 100.0}, now));
+    INFO("grabbed point is " << angleBetweenDeg(grabbed, now) << " deg from the pointer");
+    CHECK(angleBetweenDeg(grabbed, now) < 0.01);
+}

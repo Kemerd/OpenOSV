@@ -33,6 +33,16 @@ add_executable(osv_reframe_tests
   test_pipl.cpp
   test_ui.cpp
   test_direct.cpp
+  test_direct_settings.cpp  # [WP-SETTINGS] which clips the direct path renders
+  # The GPU filter driven the way Premiere drives it (frames through the GPU
+  # Device Suite, instances through the PrGPUFilter table), shared by the
+  # parameter-probe tests and the direct path's end-to-end tests below.
+  GpuTestSupport.cpp
+  GpuTestSupport.h
+  test_gpu_probe.cpp
+  # DJI's lens (Camera Model: DJI): geometry, legacy invariance, the DJI
+  # Studio field observations, supervision and CPU / GPU parity.
+  test_dji_camera.cpp
   # Compiled here too so the tests can call the geometry and the CPU
   # renderer directly; the .aex contains the identical object.
   "${_osv_reframe_src}/ReframeCpu.cpp"
@@ -41,6 +51,9 @@ add_executable(osv_reframe_tests
   # contains, against the equirect path it must frame identically.
   "${_osv_reframe_src}/DirectRender.cpp"
   "${_osv_reframe_src}/DirectLaunch.cpp"
+  # [WP-SETTINGS] The direct path's Source Settings rule, pure, pinned by
+  # test_direct_settings.cpp against the source the .aex contains.
+  "${_osv_reframe_src}/DirectPathSettings.cpp"
   # The overlay's interaction core, for the same reason: test_ui.cpp pins the
   # drag-to-degrees mapping AND ITS SIGNS as pure arithmetic, with no host and
   # no window, against the very source the .aex contains.  ReframeUiEvent.cpp
@@ -99,6 +112,24 @@ target_compile_definitions(osv_reframe_tests PRIVATE
 
 # Without this the tests would silently run against a stale .aex.
 add_dependencies(osv_reframe_tests Open360Reframe)
+
+# The direct path end to end (test_direct_e2e.cpp): the effect finds the
+# importer's engine by looking for the LOADED importer module, so the test
+# process loads the built OpenOSVImporter.prm next to the .aex - through the
+# importer tests' own harness, which also owns the mock host both modules
+# share.  Without the importer target there is nothing to load and the file
+# is left out.
+if(TARGET OpenOSVImporter)
+  target_sources(osv_reframe_tests PRIVATE
+    test_direct_e2e.cpp
+    "${CMAKE_SOURCE_DIR}/tests/premiere/importer/ImporterHarness.cpp"
+  )
+  target_include_directories(osv_reframe_tests PRIVATE "${CMAKE_SOURCE_DIR}/tests/premiere/importer")
+  target_compile_definitions(osv_reframe_tests PRIVATE
+    OSV_IMPORTER_MODULE_PATH="$<TARGET_FILE:OpenOSVImporter>"
+  )
+  add_dependencies(osv_reframe_tests OpenOSVImporter)
+endif()
 
 # SKIP_RETURN_CODE 4 is Catch2's SKIP(); ctest then reports "Not Run" instead
 # of a failure for the [cuda] tests on a machine without a device.

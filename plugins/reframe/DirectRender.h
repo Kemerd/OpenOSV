@@ -114,6 +114,12 @@ struct StitchState {
     /// radian pairs, or nullptr when `equirect.warpEnabled` is 0.  Device or
     /// host pointer by the same rule as `seamTable`; never dereferenced here.
     const float* warpGrid = nullptr;
+
+    /// [WP-SEAM] The carved blend-seam table, `equirect.blendSeamColumns`
+    /// interleaved (latitude, feather half width) radian pairs, or nullptr
+    /// when `equirect.blendSeamEnabled` is 0.  Device or host pointer by the
+    /// same rule as `seamTable`; never dereferenced here.
+    const float* blendSeam = nullptr;
 };
 
 // ===========================================================================
@@ -133,6 +139,7 @@ enum class DirectReject {
     SeamTable,     ///< Seam shift is on but the table is missing or its size is implausible.
     WarpGrid,      ///< The warp grid is on but missing, degenerate or non-finite in its span.
     Composed,      ///< The composed view block came out non-finite (defensive backstop).
+    BlendSeam,     ///< [WP-SEAM] The blend seam is on but its table is missing or its shape implausible.
 };
 
 /// Human-readable name of a refusal reason, for the log line.
@@ -142,13 +149,14 @@ enum class DirectReject {
 ///
 /// `params` is a complete OsvRenderParams in OSV_MODE_REFRAME: the camera from
 /// buildView(), the stitch from StitchState::equirect, and Rout composed as
-/// R_stab * Rout_view.  `seamTable` / `warpGrid` are the StitchState pointers,
+/// R_stab * Rout_view.  `seamTable` / `warpGrid` / `blendSeam` are the StitchState pointers,
 /// forwarded untouched when their feature is enabled and nulled when it is
 /// not, so the kernel never receives a pointer it will not use.
 struct DirectSetup {
     OsvRenderParams params{};           ///< The block the shader reads.
     const float* seamTable = nullptr;   ///< Seam table (host or device), or nullptr.
     const float* warpGrid = nullptr;    ///< Warp grid (host or device), or nullptr.
+    const float* blendSeam = nullptr;   ///< [WP-SEAM] Blend-seam table (host or device), or nullptr.
     bool valid = false;                 ///< False when any input was unusable.
     DirectReject reject = DirectReject::View;  ///< `None` exactly when `valid`.
     /// The camera's own refusal reason when `reject == DirectReject::View`;
@@ -199,7 +207,7 @@ struct DirectSetup {
 //  The CPU twin
 // ===========================================================================
 
-/// One pixel of the direct render on the CPU: osvShadePixelW() in
+/// One pixel of the direct render on the CPU: osvShadePixelWS() in
 /// OSV_MODE_REFRAME, with no layout conversion.  `planes` must be HOST
 /// descriptors (and the setup's seam/warp pointers host pointers).  Writes
 /// transparent black and returns false for an invalid setup, unusable planes

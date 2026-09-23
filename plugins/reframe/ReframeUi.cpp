@@ -508,8 +508,35 @@ std::uint32_t changedFieldsFor(DragMode mode) noexcept {
     }
 }
 
+std::uint32_t changedFieldsFor(DragMode mode, bool dji) noexcept {
+    // Only the zoom differs between the lenses: DJI's zoom gesture moves its
+    // two lens controls together, and never touches the Classic FOV.
+    if (dji && mode == DragMode::Fov) {
+        return kChangedDjiFov | kChangedCorrection;
+    }
+    return changedFieldsFor(mode);
+}
+
+double effectiveSensitivity(double requested) noexcept {
+    if (!std::isfinite(requested)) {
+        return kPanTiltSensitivity;
+    }
+    return std::clamp(requested, OSV_REFRAME_DRAG_SENSITIVITY_VALID_MIN, OSV_REFRAME_DRAG_SENSITIVITY_VALID_MAX);
+}
+
 CameraValues sanitise(const CameraValues& values) noexcept {
     CameraValues out;
+
+    // [WP-CAMERA] DJI's lens: the model flag is copied as is; the two numbers
+    // clamp to their controls' VALID ranges (Crystal Ball's 1.8 included).
+    out.dji = values.dji;
+    out.djiFovDeg = std::isfinite(values.djiFovDeg)
+                        ? std::clamp(values.djiFovDeg, OSV_REFRAME_DJI_FOV_VALID_MIN, OSV_REFRAME_DJI_FOV_VALID_MAX)
+                        : OSV_REFRAME_DJI_FOV_DEFAULT;
+    out.correction = std::isfinite(values.correction)
+                         ? std::clamp(values.correction, OSV_REFRAME_CORRECTION_VALID_MIN,
+                                      OSV_REFRAME_CORRECTION_VALID_MAX)
+                         : OSV_REFRAME_CORRECTION_DEFAULT;
 
     // Pan and Roll are unbounded dials (a full turn must be keyframeable),
     // so they are only checked for finiteness, never clamped.
@@ -553,12 +580,20 @@ CameraValues mergeLiveReadout(const CameraValues& fromHost, const CameraValues& 
         {host.tiltDeg, gesture.tiltDeg, kChangedTilt},
         {host.rollDeg, gesture.rollDeg, kChangedRoll},
         {host.fovDeg, gesture.fovDeg, kChangedFov},
+        // [WP-CAMERA]
+        {host.djiFovDeg, gesture.djiFovDeg, kChangedDjiFov},
+        {host.correction, gesture.correction, kChangedCorrection},
     };
 
     // Consistency: every field the gesture never wrote must already agree
     // with the host.  If one does not, `live` describes some other state and
     // the host stays the authority - wholesale, not field by field, because
     // a mismatch means NONE of the gesture's numbers can be trusted here.
+    // [WP-CAMERA] No gesture writes the lens model, so a gesture made under
+    // the other model is by definition some other state.
+    if (host.dji != gesture.dji) {
+        return host;
+    }
     for (const Field& f : fields) {
         if ((touchedFields & f.bit) == 0u && std::fabs(f.hostValue - f.gestureValue) > kLiveReadoutMatchEpsDeg) {
             return host;
@@ -579,6 +614,12 @@ CameraValues mergeLiveReadout(const CameraValues& fromHost, const CameraValues& 
     }
     if ((touchedFields & kChangedFov) != 0u) {
         out.fovDeg = gesture.fovDeg;
+    }
+    if ((touchedFields & kChangedDjiFov) != 0u) {
+        out.djiFovDeg = gesture.djiFovDeg;
+    }
+    if ((touchedFields & kChangedCorrection) != 0u) {
+        out.correction = gesture.correction;
     }
     return out;
 }
@@ -640,10 +681,12 @@ CameraValues applyDrag(DragState& state, const PointF& current, std::uint32_t mo
         // the pointer has left the projection's valid area.
         //
         // Sensitivity: the pointer's travel from the anchor is scaled before
-        // the solve, so the sphere turns kPanTiltSensitivity times faster
-        // than the hand while still moving as one rigid piece.
-        const PointF quickened{state.anchor.x + kPanTiltSensitivity * dxTotal,
-                               state.anchor.y + kPanTiltSensitivity * dyTotal};
+        // the solve, so the sphere turns `sensitivity` times faster than the
+        // hand while still moving as one rigid piece.  [WP-CAMERA] The factor
+        // is the Drag Sensitivity control captured at the click
+        // (kPanTiltSensitivity, the old constant, is its default).
+        const double sensitivity = effectiveSensitivity(state.sensitivity);
+        const PointF quickened{state.anchor.x + sensitivity * dxTotal, state.anchor.y + sensitivity * dyTotal};
         CameraValues grabbed;
         if (solveSphereGrab(state.grab, state.layout, state.start, quickened, mode, grabbed)) {
             result.panDeg = grabbed.panDeg;
@@ -654,7 +697,7 @@ CameraValues applyDrag(DragState& state, const PointF& current, std::uint32_t mo
         // Rate scales with the FOV AT GRAB TIME.  Using the live FOV would
         // change the rate mid-drag if a preset or another keyframe moved it,
         // which would make the picture slide out from under the cursor.
-        const double rate = kPanTiltSensitivity * dragScaleDegPerPixel(state.start.fovDeg, state.layout.viewport.w);
+        const double rate = sensitivity * dragScaleDegPerPixel(state.start.fovDeg, state.layout.viewport.w);
 
         // The signs are derived in the header from the kernel's ray,
         // rotation order and equirect lookup.  In short: increasing Pan
@@ -698,7 +741,24 @@ CameraValues applyDrag(DragState& state, const PointF& current, std::uint32_t mo
         // outward (down, away from the centre for the bottom grips) showing
         // more of the world is the resize-grip mental model, and Ctrl+drag
         // inherits the same direction so the two never disagree.
-        result.fovDeg = state.start.fovDeg + kFovDegPerPixel * dyTotal;
+        if (!state.start.dji) {
+            result.fovDeg = state.start.fovDeg + kFovDegPerPixel * dyTotal;
+            break;
+        }
+        // [WP-CAMERA] DJI's lens zooms the way DJI Studio's zoom gesture does:
+        // both controls move
+        // together, fov += 130 * delta and correction += delta, each clamped
+        // to DJI Studio's limits (widened to include the starting lens, so a
+        // Crystal Ball is not snapped back to 1.0 by a nudge).  The FOV
+        // moves at the same kFovDegPerPixel as the Classic zoom, so the grip
+        // feels the same whichever lens is on.
+        const double delta = kFovDegPerPixel * dyTotal / OSV_REFRAME_DJI_ZOOM_FOV_PER_CORRECTION;
+        const double fovMin = std::min(OSV_REFRAME_DJI_STUDIO_FOV_MIN, state.start.djiFovDeg);
+        const double fovMax = std::max(OSV_REFRAME_DJI_STUDIO_FOV_MAX, state.start.djiFovDeg);
+        const double corMax = std::max(OSV_REFRAME_DJI_STUDIO_CORRECTION_MAX, state.start.correction);
+        result.djiFovDeg = std::clamp(state.start.djiFovDeg + OSV_REFRAME_DJI_ZOOM_FOV_PER_CORRECTION * delta,
+                                      fovMin, fovMax);
+        result.correction = std::clamp(state.start.correction + delta, OSV_REFRAME_CORRECTION_VALID_MIN, corMax);
         break;
     }
 

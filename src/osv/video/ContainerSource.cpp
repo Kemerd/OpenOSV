@@ -8,25 +8,88 @@
 
 #include "ContainerSource.h"
 
+#include "FileIdentity.h"
 #include "osv/container/OsvFile.h"
 #include "osv/core/Log.h"
 
+#include <iterator>
+#include <map>
+#include <mutex>
 #include <string>
 #include <utility>
 
 namespace osv::video::detail {
 
+namespace {
+
+// -----------------------------------------------------------------------------
+//  The shared-parse table
+// -----------------------------------------------------------------------------
+//
+// Weak references only: a parsed movie lives exactly as long as some
+// ContainerSource uses it, so the table never pins a mapping of a file the
+// application has finished with, and its own destruction releases nothing.
+struct ParseTable {
+    std::mutex mutex;
+    std::map<std::wstring, std::weak_ptr<const OsvFile>> movies;
+};
+
+ParseTable& parseTable() {
+    static ParseTable instance;
+    return instance;
+}
+
+/// The parsed movie of `path`: the live one when another source holds it,
+/// otherwise a fresh parse that is published for the next caller.  The parse
+/// runs under the table lock on purpose - the two lens decoders of a reader
+/// open at the same moment, and without the lock both would parse.
+Result<std::shared_ptr<const OsvFile>> sharedParse(const std::filesystem::path& path, bool* reused) {
+    if (reused) {
+        *reused = false;
+    }
+    // A file that cannot even be stat'ed is not cached; OsvFile::open then
+    // reports the real reason (Io) exactly as it always did.
+    auto identity = fileIdentity(path);
+    if (!identity.ok()) {
+        OSV_TRY_ASSIGN(OsvFile parsed, OsvFile::open(path));
+        return std::make_shared<const OsvFile>(std::move(parsed));
+    }
+    ParseTable& table = parseTable();
+    std::lock_guard<std::mutex> guard(table.mutex);
+    const auto it = table.movies.find(identity.value());
+    if (it != table.movies.end()) {
+        if (std::shared_ptr<const OsvFile> live = it->second.lock()) {
+            if (reused) {
+                *reused = true;
+            }
+            return live;
+        }
+    }
+    OSV_TRY_ASSIGN(OsvFile parsed, OsvFile::open(path));
+    auto movie = std::make_shared<const OsvFile>(std::move(parsed));
+    table.movies[identity.value()] = movie;
+    // Sweep dead entries so a long session that touches many clips does not
+    // keep one key per clip it ever opened.
+    for (auto e = table.movies.begin(); e != table.movies.end();) {
+        e = e->second.expired() ? table.movies.erase(e) : std::next(e);
+    }
+    return movie;
+}
+
+}  // namespace
+
 // -----------------------------------------------------------------------------
 //  Impl
 // -----------------------------------------------------------------------------
 struct ContainerSource::Impl {
-    OsvFile file;                          ///< Parsed movie (owns the mapping every span aliases).
-    const TrackInfo* track = nullptr;      ///< Selected track (points into `file`).
+    std::shared_ptr<const OsvFile> file;   ///< Parsed movie (owns the mapping every span aliases).
+    const TrackInfo* track = nullptr;      ///< Selected track (points into `*file`).
     std::uint32_t trackId = 0;
     std::uint32_t sampleCount = 0;
     std::uint32_t timescale = 0;
     double fps = 0.0;
     TrackCodec codec = TrackCodec::Unknown;
+    bool reusedParse = false;              ///< The movie came from a live user.
 };
 
 ContainerSource::ContainerSource() = default;
@@ -37,19 +100,25 @@ ContainerSource::~ContainerSource() = default;
 // -----------------------------------------------------------------------------
 Result<std::unique_ptr<ContainerSource>> ContainerSource::open(const std::filesystem::path& path,
                                                                std::uint32_t trackId) {
-    // Parse the container first; a file that is not an ISO BMFF movie fails
-    // here with the parser's own error code (Malformed / Truncated / Io).
-    OSV_TRY_ASSIGN(OsvFile parsed, OsvFile::open(path));
+    // Parse the container first (or share a live parse); a file that is not
+    // an ISO BMFF movie fails here with the parser's own error code
+    // (Malformed / Truncated / Io).
+    bool reused = false;
+    OSV_TRY_ASSIGN(std::shared_ptr<const OsvFile> parsed, sharedParse(path, &reused));
+    if (!parsed) {
+        return Error{ErrorCode::Internal, "container: parse produced no movie"};
+    }
 
     std::unique_ptr<ContainerSource> self(new ContainerSource());
     self->m_impl = std::make_unique<Impl>();
     Impl& impl = *self->m_impl;
     impl.file = std::move(parsed);
     impl.trackId = trackId;
+    impl.reusedParse = reused;
 
-    // Select the track.  The pointer is owned by `impl.file`, which lives as
+    // Select the track.  The pointer is owned by `*impl.file`, which lives as
     // long as this object, so it is safe to keep.
-    impl.track = impl.file.track(trackId);
+    impl.track = impl.file->track(trackId);
     if (!impl.track) {
         return Error{ErrorCode::NotFound, "container: no track with id " + std::to_string(trackId)};
     }
@@ -103,6 +172,8 @@ Result<std::unique_ptr<ContainerSource>> ContainerSource::open(const std::filesy
 // -----------------------------------------------------------------------------
 //  Accessors
 // -----------------------------------------------------------------------------
+bool ContainerSource::reusedParse() const noexcept { return m_impl != nullptr && m_impl->reusedParse; }
+
 std::uint32_t ContainerSource::trackId() const noexcept { return m_impl ? m_impl->trackId : 0; }
 
 std::uint32_t ContainerSource::sampleCount() const noexcept { return m_impl ? m_impl->sampleCount : 0; }
@@ -133,7 +204,10 @@ Result<SampleView> ContainerSource::sample(std::uint32_t index) const {
 
     // The sample must lie entirely inside the file; a truncated recording
     // (camera lost power) is reported instead of read past the mapping.
-    const ByteSpan file = m_impl->file.span();
+    if (!m_impl->file) {
+        return Error{ErrorCode::InvalidArgument, "container source has no movie"};
+    }
+    const ByteSpan file = m_impl->file->span();
     if (!file.contains(loc.offset, loc.size)) {
         return Error{ErrorCode::Truncated, "sample " + std::to_string(index) + " of track " +
                                                std::to_string(m_impl->trackId) + " lies outside the file"};

@@ -14,11 +14,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "CalibrationUi.h"
 #include "ImporterPlugin.h"
 #include "PrefsBlob.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -36,7 +38,7 @@ TEST_CASE("the defaults round trip through the control mapping", "[importer][pre
         REQUIRE(controls.stabilization == 1);   // Horizon lock
         REQUIRE(controls.seamSearch == true);
         REQUIRE(controls.gainMatch == true);
-        REQUIRE(controls.calibration == 0);     // Native
+        REQUIRE(controls.calibration == 0);     // Auto (follow the recorded accessory)
         REQUIRE(controls.dlogmFit == static_cast<int>(PrefsDlogmFit::Osmo360));
         REQUIRE(controls.exposureStops == 0.0);
         REQUIRE(controls.renderDevice == 0);    // Auto
@@ -229,5 +231,232 @@ TEST_CASE("the colour-space token follows the colour output", "[importer][prefs]
         codes = seiCodesFor(blob);
         REQUIRE(codes.primaries == 1);   // BT.709
         REQUIRE(codes.transfer == 1);
+    }
+}
+
+// =============================================================================
+//  Calibration: the combo lists the CHOICE, and the labels tell the truth
+// =============================================================================
+
+TEST_CASE("the calibration combo maps to the choice and old blobs read as Auto", "[importer][prefs][mapping]") {
+    // Combo index == PrefsCalibrationChoice: Auto, Native, Lens protectors,
+    // Underwater.  Each index must produce its canonical blob and come back.
+    for (int index = 0; index < static_cast<int>(PrefsCalibrationChoice::Count); ++index) {
+        DialogControls controls = controlsFromPrefs(PrefsBlob::defaults());
+        controls.calibration = index;
+        const PrefsBlob blob = prefsFromControls(controls);
+        INFO("combo index " << index);
+        REQUIRE(static_cast<int>(blob.calibrationChoice()) == index);
+        REQUIRE(controlsFromPrefs(blob).calibration == index);
+        PrefsBlob copy = blob;
+        REQUIRE(copy.sanitise());  // canonical: nothing to fix
+    }
+
+    // A blob saved before the choice existed: calibration 0 with a zero
+    // (formerly reserved) force byte.  It rendered by the recorded accessory,
+    // and it shows - and stays - Auto.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.calibration = 0;
+    old.calibrationForceNative = 0;
+    REQUIRE(controlsFromPrefs(old).calibration == static_cast<int>(PrefsCalibrationChoice::Auto));
+    REQUIRE(prefsFromControls(controlsFromPrefs(old)) == old);
+
+    // A forced Native and Auto are different blobs (different cache keys).
+    DialogControls native = controlsFromPrefs(PrefsBlob::defaults());
+    native.calibration = static_cast<int>(PrefsCalibrationChoice::Native);
+    REQUIRE(prefsFromControls(native) != PrefsBlob::defaults());
+    REQUIRE(prefsFromControls(native).calibration == 0);
+    REQUIRE(prefsFromControls(native).calibrationForceNative == 1);
+}
+
+TEST_CASE("the calibration labels say which sets the clip holds", "[importer][prefs][mapping]") {
+    constexpr auto kAuto = static_cast<std::size_t>(PrefsCalibrationChoice::Auto);
+    constexpr auto kNative = static_cast<std::size_t>(PrefsCalibrationChoice::Native);
+    constexpr auto kGuards = static_cast<std::size_t>(PrefsCalibrationChoice::LensGuards);
+    constexpr auto kWater = static_cast<std::size_t>(PrefsCalibrationChoice::Underwater);
+
+    SECTION("no clip facts: plain names") {
+        const auto labels = calibrationChoiceLabels(CalibrationUiFacts{});
+        REQUIRE(labels[kAuto] == L"Auto (follow the camera)");
+        REQUIRE(labels[kNative] == L"Native (bare lenses)");
+        REQUIRE(labels[kGuards] == L"Lens protectors / ND filters");
+        REQUIRE(labels[kWater] == L"Underwater");
+    }
+
+    SECTION("the sample clip: recorded bare lenses, no accessory sets") {
+        CalibrationUiFacts facts;
+        facts.known = true;
+        facts.recordedAccessory = 0;
+        facts.underwater = CalibrationAvailability::Missing;
+        const auto labels = calibrationChoiceLabels(facts);
+        REQUIRE(labels[kAuto] == L"Auto (camera: no lens protectors)");
+        // Lens protectors always do something (their own set or the
+        // field-angle correction on native), so they are never marked.
+        REQUIRE(labels[kGuards] == L"Lens protectors / ND filters");
+        REQUIRE(labels[kWater] == L"Underwater (not in clip: Native)");
+    }
+
+    SECTION("a clip shot with lens protectors") {
+        CalibrationUiFacts facts;
+        facts.known = true;
+        facts.recordedAccessory = 1;
+        facts.underwater = CalibrationAvailability::Missing;
+        const auto labels = calibrationChoiceLabels(facts);
+        REQUIRE(labels[kAuto] == L"Auto (camera: lens protectors)");
+        REQUIRE(labels[kGuards] == L"Lens protectors / ND filters");
+        // A copy of native is marked as such - for underwater, which has no
+        // correction to fall back on.
+        facts.underwater = CalibrationAvailability::SameAsNative;
+        REQUIRE(calibrationChoiceLabels(facts)[kWater] == L"Underwater (same as Native here)");
+    }
+
+    SECTION("nothing recorded, underwater recorded, unknown accessory") {
+        CalibrationUiFacts facts;
+        facts.known = true;
+        facts.recordedAccessory = -1;
+        REQUIRE(calibrationChoiceLabels(facts)[kAuto] == L"Auto (nothing recorded: Native)");
+        facts.recordedAccessory = 2;
+        facts.underwater = CalibrationAvailability::Usable;
+        REQUIRE(calibrationChoiceLabels(facts)[kAuto] == L"Auto (camera: underwater)");
+        facts.recordedAccessory = 9;
+        REQUIRE(calibrationChoiceLabels(facts)[kAuto] == L"Auto (unknown accessory: Native)");
+    }
+
+    SECTION("every label fits the closed combo box") {
+        // The combo is 179 dialog units wide: about 42 characters of the
+        // dialog font.  A longer label is cut off exactly where it says
+        // "Native", which is the part that matters.
+        for (const int recorded : {-1, 0, 1, 2, 7}) {
+            for (const CalibrationAvailability a :
+                 {CalibrationAvailability::Unknown, CalibrationAvailability::Usable,
+                  CalibrationAvailability::SameAsNative, CalibrationAvailability::Missing}) {
+                CalibrationUiFacts facts;
+                facts.known = true;
+                facts.recordedAccessory = recorded;
+                facts.underwater = a;
+                for (const std::wstring& label : calibrationChoiceLabels(facts)) {
+                    REQUIRE(!label.empty());
+                    REQUIRE(label.size() <= 40u);
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+//  Fields the dialog does not show survive an OK
+// =============================================================================
+
+TEST_CASE("OK keeps every field the dialog does not show", "[importer][prefs][mapping][regression]") {
+    // Regression: prefsFromControls used to start from defaults(), so
+    // clicking OK in the Win32 dialog silently turned parallax back On and
+    // the flow backend back to Auto - fields the dialog has no control for.
+    PrefsBlob incoming = PrefsBlob::defaults();
+    incoming.parallax = static_cast<std::uint8_t>(PrefsParallax::Off);
+    incoming.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Neural);
+    incoming.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::HLG);
+
+    SECTION("an unchanged OK returns the incoming blob byte for byte") {
+        const PrefsBlob back = prefsFromControls(controlsFromPrefs(incoming), incoming);
+        REQUIRE(back == incoming);
+        REQUIRE(back.parallaxMode() == PrefsParallax::Off);
+        REQUIRE(back.flow() == PrefsFlowBackend::Neural);
+    }
+
+    SECTION("a changed shown field changes only that field") {
+        DialogControls c = controlsFromPrefs(incoming);
+        c.colorOutput = static_cast<int>(PrefsColorOutput::Rec709);
+        c.calibration = static_cast<int>(PrefsCalibrationChoice::LensGuards);
+        const PrefsBlob back = prefsFromControls(c, incoming);
+        REQUIRE(back.color() == PrefsColorOutput::Rec709);
+        REQUIRE(back.calibrationChoice() == PrefsCalibrationChoice::LensGuards);
+        REQUIRE(back.parallaxMode() == PrefsParallax::Off);        // hidden: kept
+        REQUIRE(back.flow() == PrefsFlowBackend::Neural);          // hidden: kept
+        REQUIRE(back.exposureStops == incoming.exposureStops);
+    }
+
+    SECTION("the one-argument form is still defaults-based") {
+        // Kept for callers that have no incoming blob; documented behaviour.
+        const PrefsBlob fresh = prefsFromControls(controlsFromPrefs(incoming));
+        REQUIRE(fresh.parallaxMode() == PrefsParallax::On);
+        REQUIRE(fresh.flow() == PrefsFlowBackend::Auto);
+    }
+
+    SECTION("every valid hidden byte survives, including offset 24 (WP-SETTINGS' Direct Path Colour)") {
+        // Generic over the whole blob, so fields other packages append from
+        // the reserved block (WP-SETTINGS at 24, WP-PHOTO at 32..37, ...) are
+        // covered without this test knowing their names: for every byte the
+        // dialog does not map, a value that the blob accepts as clean must
+        // come back from an unchanged OK.  On a branch where an offset is
+        // still reserved, sanitise() rejects a non-zero value there and the
+        // byte is skipped; once the field exists it is checked.
+        const DialogControls shown = controlsFromPrefs(incoming);
+        int checked = 0;
+        bool offset24Checked = false;
+        for (std::size_t off = offsetof(PrefsBlob, parallax); off < PrefsBlob::kSize; ++off) {
+            for (const std::uint8_t value : {std::uint8_t{1}, std::uint8_t{2}}) {
+                PrefsBlob probe = incoming;
+                reinterpret_cast<std::uint8_t*>(&probe)[off] = value;
+                PrefsBlob clean = probe;
+                if (!clean.sanitise() || controlsFromPrefs(probe).calibration != shown.calibration) {
+                    continue;  // Reserved here, out of range, or a shown field.
+                }
+                const PrefsBlob back = prefsFromControls(controlsFromPrefs(probe), probe);
+                INFO("offset " << off << " value " << static_cast<int>(value));
+                REQUIRE(reinterpret_cast<const std::uint8_t*>(&back)[off] == value);
+                REQUIRE(back == probe);
+                ++checked;
+                offset24Checked = offset24Checked || off == 24;
+            }
+        }
+        // parallax (20) and flowBackend (21) are hidden and valid for 1 and 2.
+        REQUIRE(checked >= 3);
+        if (!offset24Checked) {
+            // Offset 24 is still `reserved` on this branch (the field arrives
+            // with WP-SETTINGS at merge); a reserved byte is zeroed by
+            // sanitise() by design, which the loop above already respects.
+            WARN("offset 24 is reserved on this branch; it is covered once WP-SETTINGS' field is merged");
+        }
+    }
+
+    SECTION("a damaged incoming blob cannot smuggle a bad hidden field through") {
+        PrefsBlob damaged = incoming;
+        damaged.flowBackend = 200;
+        damaged.parallax = 9;
+        const PrefsBlob back = prefsFromControls(controlsFromPrefs(incoming), damaged);
+        PrefsBlob copy = back;
+        REQUIRE(copy.sanitise());  // already clean
+        REQUIRE(back.flow() == PrefsFlowBackend::Auto);
+        REQUIRE(back.parallaxMode() == PrefsParallax::On);
+    }
+}
+
+// =============================================================================
+//  RefreshFileAsync after OK
+// =============================================================================
+
+TEST_CASE("a changed OK names the file to refresh, from the instance or the access record",
+          "[importer][prefs][mapping][refresh]") {
+    // The SDK guide asks the importer to call RefreshFileAsync on the main
+    // file whenever the Clip Source Settings changed in a way that needs the
+    // frames reimported.  imGetPrefs8 has no instance, so the path must come
+    // from the imFileAccessRec8 there - the case the old code skipped.
+    const PrefsBlob before = PrefsBlob::defaults();
+    PrefsBlob after = before;
+    after.setCalibrationChoice(PrefsCalibrationChoice::LensGuards);
+
+    SECTION("unchanged settings refresh nothing") {
+        REQUIRE(prefsRefreshTarget(before, before, L"C:\\clip.OSV", L"C:\\clip.OSV").empty());
+    }
+    SECTION("imGetInstancePrefs: the instance path") {
+        REQUIRE(prefsRefreshTarget(before, after, L"C:\\a.OSV", L"C:\\b.OSV") == L"C:\\a.OSV");
+    }
+    SECTION("imGetPrefs8: no instance, the access record's path") {
+        REQUIRE(prefsRefreshTarget(before, after, nullptr, L"C:\\b.OSV") == L"C:\\b.OSV");
+        REQUIRE(prefsRefreshTarget(before, after, L"", L"C:\\b.OSV") == L"C:\\b.OSV");
+    }
+    SECTION("no path at all: nothing to refresh") {
+        REQUIRE(prefsRefreshTarget(before, after, nullptr, nullptr).empty());
+        REQUIRE(prefsRefreshTarget(before, after, L"", L"").empty());
     }
 }

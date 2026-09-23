@@ -224,7 +224,7 @@ TEST_CASE("GLOBAL_SETUP and GLOBAL_SETDOWN leave no suite acquired", "[reframe][
 // ===========================================================================
 //  PARAMS_SETUP
 // ===========================================================================
-TEST_CASE("PARAMS_SETUP registers the 13 documented parameters", "[reframe][params]") {
+TEST_CASE("PARAMS_SETUP registers the 18 documented parameters", "[reframe][params]") {
     EffectFixture f;
     const std::vector<PF_ParamDef> params = setupParams(f);
 
@@ -235,18 +235,26 @@ TEST_CASE("PARAMS_SETUP registers the 13 documented parameters", "[reframe][para
     // The list includes the two PF_Param_GROUP_END terminators: PF_END_TOPIC
     // issues its own PF_ADD_PARAM, so a group terminator is a real parameter
     // occupying a real index in the MIDDLE of the list.
+    //
+    // [WP-CAMERA] The DJI camera block (ids 16..20) is APPENDED after Smooth
+    // Keyframes: every entry above it keeps the index and id it had, which
+    // is the whole backward-compatibility argument for old projects.
     const int expectedIds[kParamCount] = {
         OSV_REFRAME_ID_OUTPUT_RESOLUTION, OSV_REFRAME_ID_CAMERA_TOPIC, OSV_REFRAME_ID_PRESET,
         OSV_REFRAME_ID_PAN,              OSV_REFRAME_ID_TILT,         OSV_REFRAME_ID_ROLL,
         OSV_REFRAME_ID_FOV,              OSV_REFRAME_ID_DISTORTION,   OSV_REFRAME_ID_CAMERA_TOPIC_END,
         OSV_REFRAME_ID_SOURCE_TOPIC,     OSV_REFRAME_ID_SOURCE_PAN,   OSV_REFRAME_ID_SOURCE_TILT,
         OSV_REFRAME_ID_SOURCE_ROLL,      OSV_REFRAME_ID_SOURCE_TOPIC_END, OSV_REFRAME_ID_SMOOTH,
+        OSV_REFRAME_ID_CAMERA_MODEL,     OSV_REFRAME_ID_ZOOM,         OSV_REFRAME_ID_DJI_FOV,
+        OSV_REFRAME_ID_CORRECTION,       OSV_REFRAME_ID_DRAG_SENSITIVITY,
     };
     const PF_ParamType expectedTypes[kParamCount] = {
         PF_Param_POPUP,       PF_Param_GROUP_START, PF_Param_POPUP,        PF_Param_ANGLE,
         PF_Param_ANGLE,       PF_Param_ANGLE,       PF_Param_FLOAT_SLIDER, PF_Param_FLOAT_SLIDER,
         PF_Param_GROUP_END,   PF_Param_GROUP_START, PF_Param_ANGLE,        PF_Param_ANGLE,
         PF_Param_ANGLE,       PF_Param_GROUP_END,   PF_Param_CHECKBOX,
+        PF_Param_CHECKBOX,    PF_Param_FLOAT_SLIDER, PF_Param_FLOAT_SLIDER, PF_Param_FLOAT_SLIDER,
+        PF_Param_FLOAT_SLIDER,
     };
     // PF_END_TOPIC sets no name, and AEFX_CLR_STRUCT zeroes the def before
     // it, so a terminator's name is the empty string.
@@ -254,6 +262,7 @@ TEST_CASE("PARAMS_SETUP registers the 13 documented parameters", "[reframe][para
         "Output Resolution", "Camera",  "Preset",           "Pan",  "Tilt",
         "Roll",          "FOV",         "Distortion",       "",     "Source",
         "Source Pan",    "Source Tilt", "Source Roll",      "",     "Smooth Keyframes",
+        "Camera Model",  "Zoom",        "DJI FOV",          "Correction Angle", "Drag Sensitivity",
     };
 
     for (int i = 0; i < kParamCount; ++i) {
@@ -401,6 +410,12 @@ TEST_CASE("exactly the supervised parameters carry PF_ParamFlag_SUPERVISE", "[re
     // Supervision is what makes PF_Cmd_USER_CHANGED_PARAM arrive at all.
     // Preset needs it to write the other three; FOV, Distortion and Tilt
     // need it so editing one flips Preset to Custom.
+    //
+    // [WP-CAMERA] One entry per parameter in list order, group terminators
+    // included (the table used to omit the two terminators and stayed right
+    // only because every entry after them happened to be false).  The DJI
+    // block's lens controls are supervised - each one selects its model and
+    // carries the look across - while Drag Sensitivity is a UI preference.
     const bool expected[kParamCount] = {
         true,   // Output Resolution (reserved for future UI enabling)
         false,  // Camera topic
@@ -410,11 +425,18 @@ TEST_CASE("exactly the supervised parameters carry PF_ParamFlag_SUPERVISE", "[re
         false,  // Roll
         true,   // FOV
         true,   // Distortion
+        false,  // Camera topic end
         false,  // Source topic
         false,  // Source Pan
         false,  // Source Tilt
         false,  // Source Roll
+        false,  // Source topic end
         false,  // Smooth Keyframes
+        true,   // Camera Model
+        true,   // Zoom
+        true,   // DJI FOV
+        true,   // Correction Angle
+        false,  // Drag Sensitivity
     };
     for (int i = 0; i < kParamCount; ++i) {
         INFO("parameter " << (i + 1) << " (" << params[static_cast<std::size_t>(i)].PF_DEF_NAME << ")");

@@ -32,9 +32,13 @@
 // match name.  The same header the effect's PiPL is generated from, which is
 // what makes the importer/effect binding provably one string.
 #include "SourceSettingsIdentity.h"
+#include "TestLogIsolation.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 #include <cmath>
 #include <cstddef>
@@ -2131,15 +2135,41 @@ TEST_CASE("parallax correction changes only the overlap band, and only when aske
         REQUIRE(maxChannelDiff(frameOld, frameOff) == 0.0f);
     }
 
-    SECTION("when the grid is available it replaces the seam table") {
+    SECTION("when the grid is available the seam setting only carves the seam") {
         // Measured: table + grid is worse than the grid alone (see
         // ImporterInstance::renderFrame), so with both enabled the importer
-        // uses the grid only and the seam search setting makes no difference.
+        // uses the grid and never the 1-D seam table.  Since [WP-SEAM] the
+        // seam setting ALSO carves where the two lenses meet (SeamCarve.h),
+        // which replaces the wide feather inside the overlap - so turning it
+        // on must change the overlap band, and nothing outside it.  (Before
+        // the carved seam this section required the two renders to be
+        // identical; that expectation described a setting that did nothing
+        // once the grid was accepted.)
         PrefsBlob onWithSeam = on;
         onWithSeam.seamSearch = 1;
         harness.host().clearCache();
         const DecodedFrame frameBoth = renderFrame(harness, clip, ppix, request, onWithSeam);
-        REQUIRE(maxChannelDiff(frameBoth, frameOn) == 0.0f);
+        REQUIRE(frameBoth.width == frameOn.width);
+        REQUIRE(frameBoth.height == frameOn.height);
+        std::uint64_t seamInside = 0;
+        std::uint64_t seamOutside = 0;
+        for (std::uint32_t y = 0; y < frameOn.height; ++y) {
+            for (std::uint32_t x = 0; x < frameOn.width; ++x) {
+                const float* a = frameOn.pixel(x, y);
+                const float* b = frameBoth.pixel(x, y);
+                if (a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]) {
+                    continue;
+                }
+                if (std::fabs(seamLatitudeDeg(x, y, frameOn.width, frameOn.height)) > 9.5) {
+                    ++seamOutside;
+                } else {
+                    ++seamInside;
+                }
+            }
+        }
+        INFO("carved seam changed " << seamInside << " pixels inside the overlap, " << seamOutside << " outside");
+        REQUIRE(seamOutside == 0);
+        REQUIRE(seamInside > 10000);
     }
 
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
@@ -2432,6 +2462,133 @@ TEST_CASE("quieting or closing a clip while a background measurement is queued n
         const auto t0 = std::chrono::steady_clock::now();
         REQUIRE(clip.close() == imNoErr);
         REQUIRE(std::chrono::steady_clock::now() - t0 < kMaxJoin);
+    }
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
+// =============================================================================
+//  Calibration choice
+// =============================================================================
+
+namespace {
+
+/// The imAnalysis text for `clip` under `prefs` (the Properties panel).
+[[nodiscard]] std::string analysisText(ImporterHarness& harness, ImporterHarness::ClipHandle& clip, PrefsBlob prefs) {
+    imAnalysisRec rec{};
+    rec.privatedata = clip.privateData();
+    rec.prefs = &prefs;
+    REQUIRE(harness.send(imAnalysis, nullptr, &rec) == imNoErr);  // size first
+    REQUIRE(rec.buffersize > 0);
+    std::vector<char> buffer(static_cast<std::size_t>(rec.buffersize), '\0');
+    rec.buffer = buffer.data();
+    REQUIRE(harness.send(imAnalysis, nullptr, &rec) == imNoErr);
+    return std::string(buffer.data());
+}
+
+}  // namespace
+
+TEST_CASE("every calibration choice reaches the instance; on the sample they all stitch native",
+          "[importer][video][calibration][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+
+    // Nothing but the calibration differs between the renders.  Everything
+    // that depends on image content is off, so the comparison is exact.
+    PrefsBlob base = PrefsBlob::defaults();
+    base.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::Native);
+    base.seamSearch = 0;
+    base.gainMatch = 0;
+    base.stabilization = static_cast<std::uint8_t>(PrefsStabilization::Off);
+    base.parallax = static_cast<std::uint8_t>(PrefsParallax::Off);
+
+    ImporterHarness::SourceVideoRequest request;
+    request.frameTime = 0;
+    request.width = 3000;
+    request.height = 1500;
+
+    PrefsBlob autoBlob = base;
+    autoBlob.setCalibrationChoice(PrefsCalibrationChoice::Auto);
+    const DecodedFrame frameAuto = renderFrame(harness, clip, ppix, request, autoBlob);
+
+    // The sample was shot with the camera's Lens Protection Mode off and
+    // carries no lens-guard or underwater calibration (slots 5..10 are
+    // zero-filled placeholders), so every choice must stitch native_refine
+    // and produce the very same pixels.  A different picture here would mean
+    // a choice silently used something other than what it reports.
+    for (const PrefsCalibrationChoice choice : {PrefsCalibrationChoice::Native, PrefsCalibrationChoice::LensGuards,
+                                                PrefsCalibrationChoice::Underwater}) {
+        PrefsBlob p = base;
+        p.setCalibrationChoice(choice);
+        INFO("choice " << static_cast<int>(choice));
+        harness.host().clearCache();
+        const DecodedFrame frame = renderFrame(harness, clip, ppix, request, p);
+        REQUIRE(maxChannelDiff(frame, frameAuto) == 0.0f);
+
+        // The Properties panel names the slots actually in use.
+        const std::string text = analysisText(harness, clip, p);
+        INFO(text);
+        REQUIRE(text.find("Calibration slots: native_refine_slave / native_refine_master") != std::string::npos);
+        REQUIRE(text.find("Lens accessory: Native") != std::string::npos);
+    }
+
+    // ---- the lens-protector guard ran once, and said "none" ----------------
+    //
+    // Forcing Lens protectors on this bare-lens clip brings the protector
+    // field-angle correction into play; the guard scores frame 0 with and
+    // without it, finds the correction clearly worse and switches it off -
+    // which is why the LensGuards render above is pixel-identical to Auto.
+    // Its verdict is cached on disk (next to the isolated plug-in log), one
+    // line per clip, and a second instance must not measure again.
+    const std::filesystem::path cacheFile =
+        std::filesystem::path(osv::premiere::testsupport::detail::readEnvironment(L"LOCALAPPDATA")) / L"OpenOSV" /
+        L"lens-protector-guard.tsv";
+    auto cacheLines = [&cacheFile]() {
+        std::vector<std::string> lines;
+        std::ifstream in(cacheFile, std::ios::binary);
+        std::string line;
+        while (std::getline(in, line)) {
+            std::string lower = line;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (lower.find("example_footage_dlogm.osv") != std::string::npos) {
+                lines.push_back(line);
+            }
+        }
+        return lines;
+    };
+    {
+        const std::vector<std::string> lines = cacheLines();
+        INFO("cache file " << cacheFile.string());
+        REQUIRE(lines.size() == 1);
+        CHECK(lines[0].rfind("1\t", 0) == 0);
+        CHECK(lines[0].find("\tnone\t") != std::string::npos);
+    }
+    {
+        auto again = harness.openClip(sampleClipPath());
+        REQUIRE(again.open());
+        PrefsBlob p = base;
+        p.setCalibrationChoice(PrefsCalibrationChoice::LensGuards);
+        harness.host().clearCache();
+        REQUIRE(maxChannelDiff(renderFrame(harness, again, ppix, request, p), frameAuto) == 0.0f);
+        CHECK(cacheLines().size() == 1);  // served from the cache, not re-measured
+    }
+
+    SECTION("a blob saved before the choice existed renders exactly as Auto") {
+        std::uint8_t bytes[PrefsBlob::kSize];
+        std::memcpy(bytes, &autoBlob, PrefsBlob::kSize);
+        bytes[offsetof(PrefsBlob, calibrationForceNative)] = 0;  // an older build's reserved byte
+        const PrefsBlob old = PrefsBlob::fromBytes(bytes, sizeof(bytes));
+        REQUIRE(old.calibrationChoice() == PrefsCalibrationChoice::Auto);
+        harness.host().clearCache();
+        REQUIRE(maxChannelDiff(renderFrame(harness, clip, ppix, request, old), frameAuto) == 0.0f);
     }
 
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);

@@ -268,6 +268,29 @@ typedef struct OsvRenderParams {
     float warpSinLatHi;
     OsvColorParams color;    /* colour pipeline (see ColorMath.h)              */
 
+    /* ---- [WP-SEAM] carved blend seam (optional) ---------------------------
+     * The FOV feather above cross-fades the two lenses over the whole overlap
+     * band - with the default 4 degree feather both lenses sit at 50 % over
+     * a ~7 degree strip.  Wherever the lenses disagree (a wing fin a few
+     * centimetres from the camera, which no warp can align because each lens
+     * sees a different side of it) that strip shows BOTH copies.
+     *
+     * The blend-seam table replaces the wide cross-fade with a seam carved by
+     * dynamic programming through the places the lenses agree (SeamCarve.h):
+     * per longitude column of the polar-axis layout it holds the seam
+     * latitude and a feather half width, both in radians, interleaved
+     * (lat, halfWidth).  Inside the overlap each lens is used on its own side
+     * of that seam and the two are mixed only within the (narrow) feather.
+     * Coverage still rules: where the chosen lens cannot see a direction
+     * (stick occlusion, past its field of view) the other lens fills in.
+     *
+     * All zero (the builder's default) = the table is ignored and every
+     * render is exactly what it was without it. */
+    int blendSeamEnabled;      /* 1 = lens weights follow the blend-seam table */
+    int blendSeamColumns;      /* longitude columns in the table (2 floats each) */
+    float blendSeamEdgeRad;    /* validity ramp below thetaMax for the seam weights */
+    /* ---- [/WP-SEAM] ------------------------------------------------------ */
+
     /* ---- [WP-FLARE] lens-flare removal (0 = off: render unchanged) ------- */
     int flareEnabled;        /* 1 = subtract flare[i] from lens i              */
     OsvFlareLens flare[2];   /* per lens, indexed like lens[]                  */
@@ -401,6 +424,21 @@ OSV_HD float osvEyeOffsetTheta(float r, float focalPx, float d) {
     return theta;
 }
 
+/* ---- [WP-CAMERA] DJI sphere camera: id and forward declaration ------------
+ * The projection DJI's reframe tools render with (DJI Studio and DJI's own
+ * Premiere plug-in): a pinhole camera with a VERTICAL field of view, placed
+ * `eyeZ` sphere radii behind the centre of the unit panorama sphere and
+ * looking through it.  The sphere point it sees is the FAR intersection of
+ * the pinhole ray with the sphere.  In OsvReframeParams / OsvRenderParams the
+ * existing fields carry it: focalPx = the PINHOLE focal length in pixels
+ * ((H / 2) / tan(vfov / 2)), eyeOffset = eyeZ (any value >= 0; above 1 the
+ * eye is outside the sphere and rays that miss it are uncovered).  The
+ * function itself lives in the [WP-CAMERA] region at the end of this file.
+ * See docs/research/DJI_CAMERA.md for the recovery of the model. */
+#define OSV_PROJ_DJI_SPHERE 4
+OSV_HD int osvDjiSphereRay(float focalPx, float eyeZ, float nx, float ny, float* d);
+/* ---- end [WP-CAMERA] ------------------------------------------------------ */
+
 /* Unit view ray for a centred pixel offset (nx right, ny up, in pixels) of a
  * W x H viewport under one of the OSV_PROJ_* camera models.  Shared by the
  * fisheye stitching shader and the equirect reframe entry point so both
@@ -408,6 +446,11 @@ OSV_HD float osvEyeOffsetTheta(float r, float focalPx, float d) {
  * pixel maps to no direction (outside the image circle / valid radius). */
 OSV_HD int osvViewRay(int projection, float focalPx, float eyeOffset, float tanHalfH, float tanHalfV, float W,
                       float H, float nx, float ny, float* d) {
+    /* [WP-CAMERA] DJI's pinhole-behind-the-sphere camera has its own ray
+     * construction (a ray / sphere intersection, not a radial angle map). */
+    if (projection == OSV_PROJ_DJI_SPHERE) {
+        return osvDjiSphereRay(focalPx, eyeOffset, nx, ny, d);
+    }
     if (projection == OSV_PROJ_RECTILINEAR) {
         const float u = (nx / (0.5f * W)) * tanHalfH;
         const float v = (ny / (0.5f * H)) * tanHalfV;
@@ -752,16 +795,169 @@ OSV_HD void osvPolarDisplace(const float* d, float dLon, float dLat, float* out)
 }
 
 /* ------------------------------------------------------------------------- */
+/*  [WP-SEAM] Carved blend seam                                               */
+/* ------------------------------------------------------------------------- */
+/* These helpers sit directly in front of the shader that calls them rather
+ * than in a region at the end of the file: every dialect needs a function
+ * defined before its first use, and a forward declaration would have to be
+ * spelled three different ways (static inline, __forceinline__, OpenCL's C99
+ * inline) to stay legal in all of them.  Nothing here runs unless
+ * OsvRenderParams::blendSeamEnabled is set. */
+
+/* How much lens L can be TRUSTED for a ray, independent of the blend.
+ *
+ * The lens weight the shader computes (osvLensWeight) is the FOV feather
+ * times the occlusion factor.  The feather is a blending device - with a
+ * carved seam it is exactly what must NOT decide the mix - but the occlusion
+ * factor (the selfie stick) and the hard end of the field of view are facts
+ * about the lens.  So the feather is divided back out, and replaced by a
+ * much shorter ramp (blendSeamEdgeRad) that only keeps the very rim, where
+ * the image is soft and vignetted, from switching on as a hard edge.
+ *
+ * `theta` is the ray's angle from the optical axis and `w` the shader's
+ * lens weight for it (0 when the lens does not see the ray at all). */
+OSV_HD float osvSeamVisibility(const OsvRenderParams* p, const OsvLens* L, float theta, float w) {
+    if (!(w > 0.0f)) {
+        return 0.0f;
+    }
+    /* The FOV feather osvLensWeight applied, recomputed with its own
+     * expression so the division below recovers the occlusion factor. */
+    float fov = 1.0f;
+    if (L->featherRad > 0.0f) {
+        fov = osvSmoothstep((L->thetaMax - theta) / L->featherRad);
+    }
+    /* At the very rim the feather is ~0 and the quotient meaningless; the
+     * edge ramp below is ~0 there as well, so 1 is a safe stand-in. */
+    const float occl = (fov > 1e-3f) ? osvClampf(w / fov, 0.0f, 1.0f) : 1.0f;
+    float edge = 1.0f;
+    if (p->blendSeamEdgeRad > 0.0f) {
+        edge = osvSmoothstep((L->thetaMax - theta) / p->blendSeamEdgeRad);
+    }
+    return occl * edge;
+}
+
+/* Blend weights for a seam that asks for master weight `t1` (slave 1 - t1),
+ * given what each lens can actually see (`vis`, from osvSeamVisibility).
+ *
+ *     a_i = vis_i * t_i                  what the seam asks for and gets
+ *     w_i = a_i + (1 - sum a) * vis_i / sum vis
+ *
+ * The second term hands whatever the chosen lens cannot see to the lens that
+ * can, in proportion to what it sees - so an occluded or out-of-field side
+ * never leaves a hole or a dark smear, and the weights always sum to 1 and
+ * vary continuously with every input.  Where both lenses see the ray fully
+ * (the normal case) it is simply (1 - t1, t1). */
+OSV_HD void osvSeamMix(const float* vis, float t1, float* w) {
+    const float a0 = vis[0] * (1.0f - t1);
+    const float a1 = vis[1] * t1;
+    const float deficit = fmaxf(1.0f - (a0 + a1), 0.0f);
+    const float visSum = vis[0] + vis[1];
+    if (!(visSum > 0.0f)) {
+        /* Defensive: the caller only gets here with both lenses visible. */
+        w[0] = 1.0f - t1;
+        w[1] = t1;
+        return;
+    }
+    w[0] = a0 + deficit * (vis[0] / visSum);
+    w[1] = a1 + deficit * (vis[1] / visSum);
+}
+
+/* Seam latitude and feather half width (radians) at longitude `lon`.
+ *
+ * The table holds one (lat, halfWidth) pair per longitude column, sampled at
+ * the column CENTRES, and is interpolated linearly between them with the
+ * longitude wrapping - a nearest-column lookup would draw the seam as a
+ * staircase once a view is zoomed in far enough for one column to span a
+ * few dozen output pixels. */
+OSV_HD void osvBlendSeamLookup(const OsvRenderParams* p, OSV_GLOBAL const float* table, float lon, float* lat,
+                               float* halfWidth) {
+    const int n = p->blendSeamColumns;
+    /* Continuous column position with centres at integer + 0.5. */
+    const float fx = ((lon + OSV_KERNEL_PI) / OSV_KERNEL_TWO_PI) * (float)n - 0.5f;
+    const float flx = floorf(fx);
+    const float t = fx - flx;
+    int c0 = (int)flx;
+    int c1 = c0 + 1;
+    /* Wrap both taps into [0, n): column n - 1 is adjacent to column 0. */
+    c0 = ((c0 % n) + n) % n;
+    c1 = ((c1 % n) + n) % n;
+    const float s0 = table[c0 * 2];
+    const float s1 = table[c1 * 2];
+    const float h0 = table[c0 * 2 + 1];
+    const float h1 = table[c1 * 2 + 1];
+    *lat = s0 + (s1 - s0) * t;
+    *halfWidth = h0 + (h1 - h0) * t;
+}
+
+/* Weight of the master lens for a ray at latitude `lat` of a seam at `s`
+ * with feather half width `hw`: 0 at s - hw, 1 at s + hw, smoothstep in
+ * between (the master lens, lens[1], owns the +Y pole, i.e. the north side
+ * of the polar-axis layout).  A zero width is a hard cut. */
+OSV_HD float osvSeamSide(float lat, float s, float hw) {
+    if (!(hw > 0.0f)) {
+        return (lat >= s) ? 1.0f : 0.0f;
+    }
+    return osvSmoothstep(0.5f + 0.5f * (lat - s) / hw);
+}
+
+/* Re-weight the blend of one ray by the carved seam; the shader's single
+ * [WP-SEAM] call.
+ *
+ * `dBody` is the output ray in the body frame (where the table is defined,
+ * before any seam shift or warp moves the sampling direction), `theta` each
+ * lens's angle from its axis for that ray and `w` the shader's lens weights,
+ * which are REPLACED by the seam's weights.  Returns their sum - the value
+ * the shader normalises the colour by - or `wsum` unchanged (and `w`
+ * untouched) for a ray the seam does not concern: one only a single lens
+ * sees, a nearest-lens render, or no table.
+ *
+ * Why only rays BOTH lenses see: everywhere else one lens is all there is,
+ * and the coverage weights already say so - the carved seam changes nothing
+ * outside the overlap, by construction. */
+OSV_HD float osvBlendSeamApply(const OsvRenderParams* p, OSV_GLOBAL const float* table, const float* dBody,
+                               const float* theta, float* w, float wsum) {
+    if (!p->blendSeamEnabled || table == 0 || p->blendSeamColumns <= 0 || !p->blendEnabled || !(w[0] > 0.0f) ||
+        !(w[1] > 0.0f)) {
+        return wsum;
+    }
+    /* Polar-axis longitude / latitude of the ray (see osvSeamColumn). */
+    const float lon = atan2f(dBody[0], dBody[2]);
+    const float lat = asinf(osvClampf(dBody[1], -1.0f, 1.0f));
+    float s = 0.0f;
+    float hw = 0.0f;
+    osvBlendSeamLookup(p, table, lon, &s, &hw);
+
+    /* What each lens can be trusted for, without the FOV feather, then the
+     * seam's choice filled in by coverage (osvSeamMix sums to 1). */
+    float vis[2];
+    vis[0] = osvSeamVisibility(p, &p->lens[0], theta[0], w[0]);
+    vis[1] = osvSeamVisibility(p, &p->lens[1], theta[1], w[1]);
+    float seamW[2];
+    osvSeamMix(vis, osvSeamSide(lat, s, hw), seamW);
+    const float sum = seamW[0] + seamW[1];
+    if (!(sum > 1e-6f)) {
+        return wsum; /* defensive: cannot happen with both lenses visible */
+    }
+    w[0] = seamW[0];
+    w[1] = seamW[1];
+    return sum;
+}
+/* ---- [/WP-SEAM] ---------------------------------------------------------- */
+
+/* ------------------------------------------------------------------------- */
 /*  The shader                                                                */
 /* ------------------------------------------------------------------------- */
 
 /* Compute output pixel (x, y).  `planes` holds the two lens frames, `seam`
  * the optional per-column seam shift table in degrees (may be 0 when
  * seamShiftEnabled == 0), `warp` the optional 2-D parallax grid (may be 0
- * when warpEnabled == 0).  `out` receives R, G, B in the output encoding and
- * A = coverage (or 1).  Pixels seen by neither lens are (0,0,0,0). */
-OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
-                           OSV_GLOBAL const float* warp, int x, int y, float* out) {
+ * when warpEnabled == 0), `blendSeam` the optional carved blend-seam table
+ * (may be 0 when blendSeamEnabled == 0).  `out` receives R, G, B in the
+ * output encoding and A = coverage (or 1).  Pixels seen by neither lens are
+ * (0,0,0,0). */
+OSV_HD void osvShadePixelWS(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
+                            OSV_GLOBAL const float* warp, OSV_GLOBAL const float* blendSeam, int x, int y,
+                            float* out) {
     float dView[3];
     if (!osvRayForPixel(p, (float)x, (float)y, dView)) {
         out[0] = out[1] = out[2] = out[3] = 0.0f;
@@ -804,6 +1000,9 @@ OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV
      * early - leaving them untouched - for a ray past thetaMax, so a rescue
      * that read px/py without checking this would sample pixel (0, 0). */
     int projected[2] = {0, 0};
+    /* [WP-SEAM] each lens's angle from its axis, for the carved seam's
+     * visibility (osvSeamVisibility); unused without a blend-seam table. */
+    float thetaL[2] = {0.0f, 0.0f};
     for (int i = 0; i < 2; ++i) {
         const OsvLens* L = &p->lens[i];
         if (!L->enabled) {
@@ -844,6 +1043,7 @@ OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV
         if (osvProjectLens(L, dl, &px[i], &py[i], &theta)) {
             w[i] = osvLensWeight(L, theta, px[i], py[i]);
             projected[i] = 1;
+            thetaL[i] = theta;
         }
     }
 
@@ -904,6 +1104,10 @@ OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV
         return;
     }
 
+    /* [WP-SEAM] carved seam: re-weights the blend; alpha keeps the coverage. */
+    const float coverage = wsum;
+    wsum = osvBlendSeamApply(p, blendSeam, dBody, thetaL, w, wsum);
+
     /* Fetch, decode and accumulate.  Passthrough blends in code space
      * because the log curve has no device-side inverse; every other transfer
      * blends in scene-linear light. */
@@ -949,7 +1153,16 @@ OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV
     } else {
         osvLinearToOutput(&p->color, acc, out);
     }
-    out[3] = p->outputAlphaCoverage ? fminf(wsum, 1.0f) : 1.0f;
+    out[3] = p->outputAlphaCoverage ? fminf(coverage, 1.0f) : 1.0f; /* [WP-SEAM] coverage */
+}
+
+/* [WP-SEAM] The entry point every caller used before the carved seam
+ * existed: shade with no blend-seam table.  Kept under its old name so the
+ * band analyses (which render each lens ALONE and must never see a seam) and
+ * every existing call site keep their exact behaviour and signature. */
+OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
+                           OSV_GLOBAL const float* warp, int x, int y, float* out) {
+    osvShadePixelWS(p, planes, seam, warp, (OSV_GLOBAL const float*)0, x, y, out);
 }
 
 /* Back-compatible entry point: shade with no 2-D warp grid.
@@ -1130,6 +1343,73 @@ OSV_FN void osvReframeEquirectPixel(const OsvReframeParams* p, const OsvRgbaSour
         out[3] = 1.0f;
     }
 }
+
+/* ========================================================================= */
+/*  [WP-CAMERA] DJI sphere camera                                            */
+/* ========================================================================= */
+
+/* View ray of DJI's reframe camera for a centred pixel offset (nx right,
+ * ny up, pixels).
+ *
+ * THE MODEL (matching DJI Studio and DJI's Premiere plug-in, see
+ * docs/research/DJI_CAMERA.md): the panorama is a unit sphere at the origin;
+ * the camera is an ordinary pinhole with focal length `focalPx` (pixels),
+ * looking along +Y (view frame: X right, Y forward, Z up), with its eye at
+ * E = (0, -eyeZ, 0), i.e. eyeZ radii BEHIND the centre.  A pixel sees the
+ * point where its pinhole ray leaves the sphere - the far root of
+ * |E + t u| = 1 - which is also the only face DJI's renderer keeps (it culls
+ * the faces seen from outside).  The returned direction is that sphere
+ * point, which on a unit sphere is already the direction from the centre.
+ *
+ *   eyeZ = 0      plain rectilinear (pinhole at the centre);
+ *   eyeZ = 1      stereographic (DJI's "Asteroid");
+ *   eyeZ > 1      the eye is OUTSIDE the sphere ("Crystal Ball"): rays that
+ *                 miss it are uncovered and the function returns 0.
+ *
+ * For eyeZ <= 1 this is the same map as OSV_PROJ_EYE_OFFSET with
+ * f_eye = focalPx / (1 + eyeZ); it is written as an intersection instead of
+ * an angle inversion because that form needs no trigonometry, stays exact
+ * past eyeZ = 1 and is parameterised the way DJI's controls are (a pinhole
+ * field of view, not a visible angle).
+ *
+ * Numerics: sin^2 of the ray's angle is formed as (nx^2 + ny^2) / |ray|^2
+ * rather than 1 - cos^2, so the discriminant keeps full precision near the
+ * view axis; the result is renormalised to absorb the last ulp of drift. */
+OSV_HD int osvDjiSphereRay(float focalPx, float eyeZ, float nx, float ny, float* d) {
+    /* Every comparison is written so a NaN fails it. */
+    if (!(focalPx > 0.0f) || !(eyeZ >= 0.0f)) {
+        return 0;
+    }
+    const float r2 = nx * nx + ny * ny;
+    const float len2 = r2 + focalPx * focalPx;
+    if (!(len2 > 0.0f)) {
+        return 0;
+    }
+    const float invLen = 1.0f / sqrtf(len2);
+    /* Unit pinhole ray. */
+    const float ux = nx * invLen;
+    const float uy = focalPx * invLen;
+    const float uz = ny * invLen;
+    /* |E + t u|^2 = 1 with E = (0, -e, 0):
+     *   t^2 - 2 e uy t + (e^2 - 1) = 0
+     *   t = e uy + sqrt(1 - e^2 sin^2(alpha)),  sin^2(alpha) = r2 / len2. */
+    const float sin2 = r2 / len2;
+    const float disc = 1.0f - eyeZ * eyeZ * sin2;
+    if (!(disc >= 0.0f)) {
+        return 0; /* eye outside the sphere and the ray passes it by */
+    }
+    const float t = eyeZ * uy + sqrtf(disc);
+    if (!(t > 0.0f)) {
+        return 0;
+    }
+    d[0] = t * ux;
+    d[1] = t * uy - eyeZ;
+    d[2] = t * uz;
+    osvNormalize3(d);
+    return 1;
+}
+
+/* ---- end [WP-CAMERA] ------------------------------------------------------ */
 
 /* ========================================================================= */
 /*  [WP-FLARE] lens-flare removal: functions                                  */

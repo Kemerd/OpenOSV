@@ -131,10 +131,51 @@ struct ParamTrack {
     std::map<PrTime, PrParam> keys;
 };
 
+/// One input edge of the segment graph: the node AcquireInputNodeID hands
+/// out for an index, and the offset it reports with it.
+struct NodeInput {
+    csSDK_int32 node = 0;
+    PrTime offset = 0;
+};
+
+/// A GetParam failure injected on one (node, index): at every time, or only
+/// at one exact time (the "unreadable at t = 0 on a fresh node" behaviour a
+/// real Premiere 26.2.2 showed for the trailing entries).
+struct ParamReadFailure {
+    prSuiteError error = suiteError_Fail;
+    bool onlyAtTime = false;
+    PrTime time = 0;
+};
+
 /// Everything about one node.
 struct NodeRecord {
     std::map<csSDK_int32, ParamTrack> params;
     std::map<std::string, std::string> properties;
+
+    // ---- segment graph -------------------------------------------------------
+    /// GetNodeInfo's type string; empty reports kVideoSegment_NodeType_Effect,
+    /// which is what every node answered before the graph was modelled.
+    std::string type;
+    /// The node AcquireOperatorOwnerNodeID returns for this one (0 = none).
+    csSDK_int32 owner = 0;
+    /// AcquireInputNodeID's answers, by index.
+    std::vector<NodeInput> inputs;
+    /// TransformNodeTime: media = timeOrigin + time * rateNum / rateDen.  The
+    /// default is the identity, the mock's original behaviour.
+    PrTime timeOrigin = 0;
+    std::int64_t rateNum = 1;
+    std::int64_t rateDen = 1;
+    /// Forced TransformNodeTime result (suiteError_NoError = compute).
+    prSuiteError transformError = suiteError_NoError;
+    /// Acquires through AcquireOperatorOwnerNodeID / AcquireInputNodeID not yet
+    /// given back through ReleaseVideoNodeID.
+    int refs = 0;
+
+    // ---- parameter reads -----------------------------------------------------
+    /// GetParamCount override; negative = derive it from the keyframed indices.
+    csSDK_int32 paramCountOverride = -1;
+    /// Injected GetParam failures by index.
+    std::map<csSDK_int32, ParamReadFailure> readFailures;
 };
 
 /// The opaque effect reference behind PF_ProgPtr.
@@ -259,6 +300,10 @@ struct GpuState {
     bool available = false;
     std::string failure;
     int deviceOrdinal = 0;
+    /// Which kind of context ensureGpu() creates (MockHost::setGpuContextKind).
+    /// A private context is what Premiere really hands a GPU filter; the
+    /// primary one is the original default of this mock.
+    GpuContextKind kind = GpuContextKind::Primary;
     void* device = nullptr;     ///< CUdevice stored as pointer-sized value.
     void* context = nullptr;    ///< CUcontext.
     void* stream = nullptr;     ///< CUstream.
@@ -350,6 +395,15 @@ struct MockHost::Impl {
 
     // Video segment.
     std::map<csSDK_int32, NodeRecord> nodes;
+    /// Every GetParam call, oldest first, capped at kMaxParamReads so a long
+    /// render loop cannot grow it without bound (later calls are counted in
+    /// paramReadsDropped instead).
+    std::vector<ParamReadRecord> paramReads;
+    std::size_t paramReadsDropped = 0;
+    static constexpr std::size_t kMaxParamReads = 1u << 16;
+    /// ReleaseVideoNodeID calls on a node that had nothing outstanding (or
+    /// that does not exist) - always a plug-in bug.
+    std::size_t invalidNodeReleases = 0;
 
     // GPU.
     GpuState gpuState;

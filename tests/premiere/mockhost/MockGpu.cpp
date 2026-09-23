@@ -7,7 +7,11 @@
 // CUcontext (the host's own) and a CUstream, plus device / pinned memory and
 // GPU PPixes.  The mock recreates that with cuInit / cuDevicePrimaryCtxRetain
 // on device 0 so the effect's xGPUFilterEntry path can be tested end to end
-// against a real kernel launch.  GPU PPixes use the private formats
+// against a real kernel launch - or, after setGpuContextKind(Private), with a
+// context of its own made by cuCtxCreate, which is what Premiere really hands
+// a GPU filter and the only faithful setting for code that shares device
+// memory across modules (the direct path's engine decodes INTO the context
+// it is given).  GPU PPixes use the private formats
 // PrPixelFormat_GPU_BGRA_4444_16f / _32f, have a TOP-LEFT origin and a pitch
 // rounded up to 256 bytes.
 //
@@ -70,7 +74,22 @@ struct ContextScope {
     }
 };
 
-/// Initialise once: driver, device 0, primary context, a stream.
+/// Give back the context ensureGpu() made, whichever kind it is.  The caller
+/// has no context of ours pushed.
+void releaseContext(GpuState& g, CUdevice dev) {
+    if (!g.context) {
+        return;
+    }
+    if (g.kind == GpuContextKind::Private) {
+        cuCtxDestroy(static_cast<CUcontext>(g.context));
+    } else {
+        cuDevicePrimaryCtxRelease(dev);
+    }
+    g.context = nullptr;
+}
+
+/// Initialise once: driver, device 0, the context (primary or private, per
+/// g.kind), a stream.
 void ensureGpu(GpuState& g) {
     if (g.initialised) {
         return;
@@ -94,10 +113,24 @@ void ensureGpu(GpuState& g) {
         return;
     }
     CUcontext ctx = nullptr;
-    r = cuDevicePrimaryCtxRetain(&ctx, dev);
-    if (r != CUDA_SUCCESS) {
-        g.failure = cuMessage("cuDevicePrimaryCtxRetain", r);
-        return;
+    if (g.kind == GpuContextKind::Private) {
+        // A context of its own, like Premiere's.  cuCtxCreate also makes it
+        // current on this thread; it is popped straight away so the thread is
+        // left exactly as found and every consumer has to push it itself -
+        // which is part of what the plug-ins' own tests prove.
+        r = cuCtxCreate(&ctx, 0, dev);
+        if (r != CUDA_SUCCESS || !ctx) {
+            g.failure = cuMessage("cuCtxCreate", r);
+            return;
+        }
+        CUcontext popped = nullptr;
+        cuCtxPopCurrent(&popped);
+    } else {
+        r = cuDevicePrimaryCtxRetain(&ctx, dev);
+        if (r != CUDA_SUCCESS) {
+            g.failure = cuMessage("cuDevicePrimaryCtxRetain", r);
+            return;
+        }
     }
     g.device = reinterpret_cast<void*>(static_cast<std::intptr_t>(dev));
     g.context = ctx;
@@ -105,8 +138,7 @@ void ensureGpu(GpuState& g) {
     r = cuCtxPushCurrent(ctx);
     if (r != CUDA_SUCCESS) {
         g.failure = cuMessage("cuCtxPushCurrent", r);
-        cuDevicePrimaryCtxRelease(dev);
-        g.context = nullptr;
+        releaseContext(g, dev);
         return;
     }
     CUstream stream = nullptr;
@@ -115,8 +147,7 @@ void ensureGpu(GpuState& g) {
     cuCtxPopCurrent(&ignored);
     if (r != CUDA_SUCCESS) {
         g.failure = cuMessage("cuStreamCreate", r);
-        cuDevicePrimaryCtxRelease(dev);
-        g.context = nullptr;
+        releaseContext(g, dev);
         return;
     }
     g.stream = stream;
@@ -431,12 +462,28 @@ void MockHost::Impl::shutdownGpu() {
     g.deviceAllocations.clear();
     g.hostAllocations.clear();
     g.stream = nullptr;
-    if (g.context) {
-        cuDevicePrimaryCtxRelease(static_cast<CUdevice>(reinterpret_cast<std::intptr_t>(g.device)));
-        g.context = nullptr;
-    }
+    // Primary: drop our retain.  Private: destroy it - nothing else owns it.
+    releaseContext(g, static_cast<CUdevice>(reinterpret_cast<std::intptr_t>(g.device)));
     g.available = false;
 #endif
+}
+
+bool MockHost::setGpuContextKind(GpuContextKind kind) {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    GpuState& g = m_impl->gpuState;
+    // Switching after the context exists would pull it out from under
+    // whatever already holds pointers into it; only the same answer is
+    // accepted then.
+    if (g.initialised) {
+        return g.kind == kind;
+    }
+    g.kind = kind;
+    return true;
+}
+
+GpuContextKind MockHost::gpuContextKind() const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    return m_impl->gpuState.kind;
 }
 
 bool MockHost::gpuAvailable() {

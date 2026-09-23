@@ -235,11 +235,17 @@ CPU / CUDA / OpenCL exactly like the fisheye path.
 * `imOpenFile8`: `CreateFileW(GENERIC_READ, FILE_SHARE_READ)`; sniff the ISO
   header with `osv::OsvFile` (fails -> close and `imBadFile`); allocate
   privateData (host `newHandle`) holding a pointer to an `ImporterInstance`.
-* `imQuietFile`: close the handle, release decoders, renderer references and
-  device memory, keep parsed metadata.
-* `imCloseFile`: delete the instance, dispose privateData, release suites.
-* `imShutdown`: destroy the process-wide `HostContext` (renderers, FFmpeg
-  hardware contexts, thread pool). Never from `DllMain`.
+* `imQuietFile`: close the handle and release renderer references and device
+  memory, keep parsed metadata. The dual decoder is PARKED in
+  `osv::video::ReaderPool` (at most 2 idle readers, 60 s, dropped under memory
+  pressure) rather than destroyed, so the unquiet - or the new instance
+  Premiere opens after a Source Settings change - takes it back warm instead
+  of paying ~200-400 ms for hardware device creation and a frame-0 decode.
+* `imCloseFile`: delete the instance (parking its reader the same way),
+  dispose privateData, release suites.
+* `imShutdown`: release the direct-GPU engine, clear the reader pool, then
+  destroy the process-wide `HostContext` (renderers, FFmpeg hardware
+  contexts, thread pool). Never from `DllMain`.
 
 ### Information (`imGetInfo8`, mirrored by `imGetInfo9`)
 

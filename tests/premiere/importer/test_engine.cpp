@@ -32,6 +32,7 @@
 
 #include <cuda.h>
 
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -246,6 +247,30 @@ TEST_CASE("the engine serves a frame as device planes in the caller's context, p
         CHECK(contextOf(frame.warpDevice) == cuda.context);
         CUcontext popped = nullptr;
         (void)cuCtxPopCurrent(&popped);
+    }
+
+    // ---- [WP-SEAM] the carved seam travels with the default seam setting -----
+    // One (latitude, half width) pair per column, in our context, every entry
+    // a usable number: the direct kernel reads it straight from here.
+    CHECK(frame.stitch.blendSeamEnabled == 1);
+    REQUIRE(frame.blendSeamDevice != nullptr);
+    REQUIRE(frame.stitch.blendSeamColumns > 0);
+    {
+        REQUIRE(cuCtxPushCurrent(cuda.context) == CUDA_SUCCESS);
+        CHECK(contextOf(frame.blendSeamDevice) == cuda.context);
+        std::vector<float> table(static_cast<std::size_t>(frame.stitch.blendSeamColumns) * 2u);
+        const auto src = static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(frame.blendSeamDevice));
+        REQUIRE(cuMemcpyDtoH(table.data(), src, table.size() * sizeof(float)) == CUDA_SUCCESS);
+        CUcontext popped = nullptr;
+        (void)cuCtxPopCurrent(&popped);
+        std::size_t bad = 0;
+        for (std::size_t i = 0; i < table.size(); i += 2) {
+            // Latitude inside the overlap band, a positive feather.
+            if (!std::isfinite(table[i]) || std::fabs(table[i]) > 0.2f || !(table[i + 1] > 0.0f)) {
+                ++bad;
+            }
+        }
+        CHECK(bad == 0);
     }
 
     // ---- ...and hold exactly the software decode's pixels -------------------

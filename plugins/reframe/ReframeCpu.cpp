@@ -25,6 +25,7 @@
 #include "PluginLog.h"
 
 #include "osv/core/Math.h"
+#include "osv/geom/Presets.h"
 #include "osv/geom/VirtualCamera.h"
 
 #include <algorithm>
@@ -276,42 +277,82 @@ bool sourceRowsRunForward(const ConstFrameView& src) noexcept {
 ///
 /// Anything less certain is refused: no pair, or more than one, means the
 /// anchor is not unique and the caller keeps its documented fallback.
+///
+/// [WP-CAMERA] GENERALISED FROM ONE PAIR TO ONE OFFSET
+/// ---------------------------------------------------
+/// The DJI camera block appended four more Float64 sliders, so "the only
+/// adjacent Float64 pair" no longer exists in our own signature.  What the
+/// anchor really established was an OFFSET between the host list and ours,
+/// and that is what is searched for now: every offset is tried, a host entry
+/// that the host typed must agree with our control at that offset (one
+/// contradiction rules the offset out, exactly as before), and the offset
+/// that explains the most typed entries wins - provided it is the ONLY one
+/// that explains that many, it explains at least five, and among them is an
+/// adjacent Float64 pair (the anchor the old rule demanded).  For the logged
+/// list above the answer is still +1, and for every list the old rule
+/// accepted it is the same offset.
 [[nodiscard]] bool matchByFov64Pair(const HostParamKind* kinds, int count, HostParamMap* outMap) noexcept {
     if (!kinds || !outMap || count <= 0) {
         return false;
     }
 
-    // Where the pair sits in OUR index space, derived rather than hard-coded
-    // so reordering kValueParamKind cannot silently invalidate this.
-    int ourPair = -1;
-    for (int i = 0; i + 1 < kValueParamCount; ++i) {
-        if (kValueParamKind[i] == HostParamKind::Float64 && kValueParamKind[i + 1] == HostParamKind::Float64) {
-            if (ourPair >= 0) {
-                return false;  // our own signature is no longer distinctive
+    // ---- score every offset --------------------------------------------------
+    // host = ours + offset, so the offsets that put at least one of our
+    // controls inside the host list run from -(ours - 1) to (count - 1).
+    int bestOffset = 0;
+    int bestMatches = -1;
+    int bestTies = 0;
+    for (int offset = -(kValueParamCount - 1); offset <= count - 1; ++offset) {
+        int matches = 0;
+        // [WP-CAMERA] The evidence must come from the ORIGINAL controls: the
+        // appended DJI block is a checkbox and four float sliders, a pattern
+        // common enough that a list of nothing else would otherwise "match"
+        // at some offset without a single original control agreeing.
+        int originalMatches = 0;
+        bool contradicted = false;
+        bool anchored = false;
+        for (int ours = 0; ours < kValueParamCount; ++ours) {
+            const int host = ours + offset;
+            if (host < 0 || host >= count || kinds[host] == HostParamKind::Unknown) {
+                continue;  // outside the host list, or a type the host refused
             }
-            ourPair = i;
+            if (kinds[host] != kValueParamKind[ours]) {
+                contradicted = true;  // at this offset the list is not ours
+                break;
+            }
+            ++matches;
+            if (ours < kOriginalValueParamCount) {
+                ++originalMatches;
+            }
+            // The anchor: two adjacent host entries agreeing as Float64.
+            if (kValueParamKind[ours] == HostParamKind::Float64 && ours + 1 < kValueParamCount &&
+                host + 1 < count && kinds[host + 1] == HostParamKind::Float64 &&
+                kValueParamKind[ours + 1] == HostParamKind::Float64) {
+                anchored = true;
+            }
+        }
+        // The anchor pair and at least three more agreeing entries: a pair and
+        // one neighbour could be coincidence in any short list.  All five
+        // must be original controls (see originalMatches above).
+        if (contradicted || !anchored || originalMatches < 5) {
+            continue;
+        }
+        if (matches > bestMatches) {
+            bestMatches = matches;
+            bestOffset = offset;
+            bestTies = 1;
+        } else if (matches == bestMatches) {
+            ++bestTies;
         }
     }
-    if (ourPair < 0) {
-        return false;
-    }
-
-    // Where it sits in the host's, and it must be unique there too.
-    int hostPair = -1;
-    for (int i = 0; i + 1 < count; ++i) {
-        if (kinds[i] == HostParamKind::Float64 && kinds[i + 1] == HostParamKind::Float64) {
-            if (hostPair >= 0) {
-                return false;  // two candidate anchors: no single right answer
-            }
-            hostPair = i;
-        }
-    }
-    if (hostPair < 0) {
+    // No candidate, or two offsets explain the list equally well: no single
+    // right answer, so the caller keeps its documented fallback.
+    if (bestMatches < 0 || bestTies != 1) {
         return false;
     }
 
     // ---- lay our controls down at that offset -----------------------------
-    const int offset = hostPair - ourPair;
+    const int offset = bestOffset;
     HostParamMap map{};
     for (int i = 0; i <= OSV_REFRAME_PARAM_COUNT; ++i) {
         map.hostIndex[i] = -1;
@@ -366,83 +407,120 @@ bool matchHostParams(const HostParamKind* kinds, int count, HostParamMap* outMap
         return false;
     }
 
-    // The host list is our eleven controls with one contiguous run removed,
-    // so it is fully described by two numbers: where the gap starts (in OUR
-    // index space) and how long it is.  The length follows from the count,
-    // which leaves a single unknown to search over.
-    const int gapLength = kValueParamCount - count;
-
-    // Every possible position an EMPTY gap could sit in describes the same
-    // alignment, so a zero-length gap has exactly one candidate, not twelve.
-    // Without this the uniqueness rule below would reject the unreduced
-    // 11-entry case as "ambiguous" purely because the loop enumerated the
-    // same answer repeatedly.
-    const int gapPositions = (gapLength == 0) ? 1 : (kValueParamCount - gapLength + 1);
-
-    int matchedGapStart = -1;
-    int matchCount = 0;
-    for (int gapStart = 0; gapStart < gapPositions; ++gapStart) {
-        // Walk our eleven controls, skipping the candidate gap, and compare
-        // each survivor with the next host entry.  Consuming the host list
-        // strictly left to right is what enforces rule 3 (no leftovers): the
-        // walk ends with hostPos == count or it is not a match at all.
-        int hostPos = 0;
-        bool ok = true;
-        for (int ours = 0; ours < kValueParamCount; ++ours) {
-            if (ours >= gapStart && ours < gapStart + gapLength) {
-                continue;  // this control is one the host did not expose
+    // The host list is a PREFIX of our controls (a host may stop before the
+    // appended DJI block) with one contiguous run removed, so it is fully
+    // described by three numbers: how long the prefix is, where the gap
+    // starts (in OUR index space) and how long the gap is.  The gap length
+    // follows from the other two, which leaves a small space to search.
+    //
+    // Distinct alignments can describe the SAME table - an empty gap in any
+    // position, or a gap at the very end of a longer prefix, is just a
+    // shorter prefix - so uniqueness (rule 1) is judged on the tables the
+    // alignments produce, not on how many alignments were enumerated.
+    // Without that the unreduced case would be rejected as "ambiguous"
+    // purely because the loops found the same answer more than once.
+    //
+    // [WP-CAMERA] The search runs from the SHORTEST gap up and stops at the
+    // first gap length that explains the list: an explanation that hides
+    // fewer controls in the middle of our list wins over one that hides
+    // more.  That is not a guess but the only reading that keeps a known
+    // layout identifiable once the list grows: the 8-entry Premiere list
+    // "... FOV Distortion <bool>" is our original list with the Source group
+    // hidden (gap 3), and with the Camera Model checkbox appended it could
+    // also be read as "Source AND Smooth Keyframes hidden, the bool is Camera
+    // Model" (gap 4) - a layout no host has produced, since Smooth Keyframes
+    // sits in no group.  Two DIFFERENT tables at the same gap length are
+    // still refused.
+    //
+    // The prefix may only end inside the appended block (it is at least
+    // kOriginalValueParamCount long): a host that predates the DJI controls
+    // is a real case, a host that stops before Smooth Keyframes is not, and
+    // allowing it would let a two-entry "f64 f64" list pass as FOV and
+    // Distortion with everything around them missing.  For the same reason
+    // the gap must lie within the ORIGINAL controls - the hidden run the
+    // compact layout really produces is the collapsed Source group - so a
+    // list made only of appended controls can never be read as "the whole
+    // original list hidden".
+    //
+    // And the host must still expose at least five of the original controls
+    // - the same evidence bar the Float64 anchor below demands - so a hidden
+    // run can never swallow so much of the list that what is left matches by
+    // coincidence.
+    static_assert(kOriginalValueParamCount > 0 && kOriginalValueParamCount <= kValueParamCount,
+                  "the original value controls must be a prefix of the value list");
+    constexpr int kMinOriginalShown = 5;
+    constexpr int kMaxGap = kOriginalValueParamCount - kMinOriginalShown;
+    HostParamMap found{};
+    bool haveFound = false;
+    const int minGap = (count < kOriginalValueParamCount) ? (kOriginalValueParamCount - count) : 0;
+    const int maxGap = std::min(kValueParamCount - count, kMaxGap);
+    for (int gapLength = minGap; gapLength <= maxGap && !haveFound; ++gapLength) {
+        const int prefix = count + gapLength;
+        const int gapPositions = (gapLength == 0) ? 1 : (prefix - gapLength + 1);
+        for (int gapStart = 0; gapStart < gapPositions; ++gapStart) {
+            if (gapLength > 0 && gapStart + gapLength > kOriginalValueParamCount) {
+                continue;  // a hidden run reaching into the appended block
             }
-            if (hostPos >= count) {
-                ok = false;  // ran out of host entries: not this alignment
-                break;
+            // Walk the prefix, skipping the candidate gap, and compare each
+            // survivor with the next host entry.  Consuming the host list
+            // strictly left to right is what enforces rule 3 (no leftovers):
+            // the walk ends with hostPos == count or it is not a match.
+            HostParamMap candidate{};
+            for (int i = 0; i <= OSV_REFRAME_PARAM_COUNT; ++i) {
+                candidate.hostIndex[i] = -1;
             }
-            // HostParamKind::Unknown is deliberately excluded by the
-            // equality test: an entry we could not read matches nothing, so
-            // a failed GetParam can only ever reduce the candidate set.
-            // (When the host refuses so many types that this exact match
-            // fails outright, matchByFov64Pair below takes over.)
-            if (kinds[hostPos] != kValueParamKind[ours]) {
-                ok = false;
-                break;
+            int hostPos = 0;
+            bool ok = true;
+            for (int ours = 0; ours < prefix; ++ours) {
+                if (ours >= gapStart && ours < gapStart + gapLength) {
+                    continue;  // this control is one the host did not expose
+                }
+                if (hostPos >= count) {
+                    ok = false;  // ran out of host entries: not this alignment
+                    break;
+                }
+                // HostParamKind::Unknown is deliberately excluded by the
+                // equality test: an entry we could not read matches nothing,
+                // so a failed GetParam can only ever reduce the candidate set.
+                // (When the host refuses so many types that this exact match
+                // fails outright, matchByFov64Pair below takes over.)
+                if (kinds[hostPos] != kValueParamKind[ours]) {
+                    ok = false;
+                    break;
+                }
+                // Controls in the gap - and every group marker - stay at -1,
+                // so the caller falls back to their documented defaults
+                // instead of reading a neighbour's value.
+                candidate.hostIndex[kValueParamAeIndex[ours]] = hostPos;
+                ++hostPos;
             }
-            ++hostPos;
-        }
-        if (!ok || hostPos != count) {
-            continue;
-        }
-        ++matchCount;
-        matchedGapStart = gapStart;
-        // Two viable alignments mean the answer is a coin toss.  Stop and
-        // refuse rather than commit to one of them (rule 1).
-        if (matchCount > 1) {
-            return false;
+            if (!ok || hostPos != count) {
+                continue;
+            }
+            if (!haveFound) {
+                found = candidate;
+                haveFound = true;
+                continue;
+            }
+            // A second viable alignment: harmless if it is the same table,
+            // a coin toss if it is not - and then we refuse rather than
+            // commit to one of them (rule 1).
+            for (int i = 0; i <= OSV_REFRAME_PARAM_COUNT; ++i) {
+                if (found.hostIndex[i] != candidate.hostIndex[i]) {
+                    return false;
+                }
+            }
         }
     }
-    if (matchCount != 1 || matchedGapStart < 0) {
+    if (!haveFound) {
         // The exact walk could not identify the list.  Before giving up and
         // letting the caller use the static mapping - which is the mapping
         // that reads the WRONG control - try the structural anchor below.
         return matchByFov64Pair(kinds, count, outMap);
     }
 
-    // ---- build the table --------------------------------------------------
-    // Start from "no host entry" everywhere, so the four group markers - and
-    // any control inside the gap - are left at -1 and the caller falls back
-    // to their documented defaults instead of reading a neighbour's value.
-    HostParamMap map{};
-    for (int i = 0; i <= OSV_REFRAME_PARAM_COUNT; ++i) {
-        map.hostIndex[i] = -1;
-    }
-    int hostPos = 0;
-    for (int ours = 0; ours < kValueParamCount; ++ours) {
-        if (ours >= matchedGapStart && ours < matchedGapStart + gapLength) {
-            continue;
-        }
-        map.hostIndex[kValueParamAeIndex[ours]] = hostPos;
-        ++hostPos;
-    }
-    map.probed = true;
-    *outMap = map;
+    found.probed = true;
+    *outMap = found;
     return true;
 }
 
@@ -561,6 +639,256 @@ const char* setupRejectName(SetupReject reason) noexcept {
     return "unknown";
 }
 
+// ---------------------------------------------------------------------------
+//  [WP-CAMERA] DJI camera helpers (declared in ReframeParams.h)
+// ---------------------------------------------------------------------------
+namespace {
+
+/// The shape every parameter-UI computation falls back to when no frame and
+/// no sequence can be asked: DJI Studio's default canvas.
+constexpr double kDefaultFramingAspect = 16.0 / 9.0;
+
+/// A finite, positive aspect or the 16:9 fallback.
+[[nodiscard]] double aspectOr169(double aspect) noexcept {
+    return (std::isfinite(aspect) && aspect > 0.0) ? aspect : kDefaultFramingAspect;
+}
+
+/// Rout = R_source * R_camera, the body <- view rotation of every lens model.
+///
+/// Both factors use the same Rz(yaw) Rx(pitch) Ry(roll) order
+/// (geom::VirtualCamera::rotation) so a source rotation reads exactly like a
+/// camera one.  Non-finite angles become 0; the two tilts are clamped to
+/// +-OSV_REFRAME_TILT_LIMIT_DEG in code because the dials themselves are
+/// unbounded (so a user can keyframe smoothly through a turn).
+[[nodiscard]] Mat3d viewRotation(const Settings& settings) noexcept {
+    const double pan = std::isfinite(settings.panDeg) ? settings.panDeg : 0.0;
+    const double tilt = std::isfinite(settings.tiltDeg)
+                            ? std::clamp(settings.tiltDeg, -OSV_REFRAME_TILT_LIMIT_DEG, OSV_REFRAME_TILT_LIMIT_DEG)
+                            : 0.0;
+    const double roll = std::isfinite(settings.rollDeg) ? settings.rollDeg : 0.0;
+    const double srcPan = std::isfinite(settings.sourcePanDeg) ? settings.sourcePanDeg : 0.0;
+    const double srcTilt = std::isfinite(settings.sourceTiltDeg)
+                               ? std::clamp(settings.sourceTiltDeg, -OSV_REFRAME_TILT_LIMIT_DEG,
+                                            OSV_REFRAME_TILT_LIMIT_DEG)
+                               : 0.0;
+    const double srcRoll = std::isfinite(settings.sourceRollDeg) ? settings.sourceRollDeg : 0.0;
+
+    geom::VirtualCamera camera;
+    camera.yawDeg = pan;
+    camera.pitchDeg = tilt;
+    camera.rollDeg = roll;
+    geom::VirtualCamera sourceCamera;
+    sourceCamera.yawDeg = srcPan;
+    sourceCamera.pitchDeg = srcTilt;
+    sourceCamera.rollDeg = srcRoll;
+    return sourceCamera.rotation() * camera.rotation();
+}
+
+/// buildView()'s DJI half: the frame checks and the requested size are
+/// already done by the caller, and `reqWxOutH` / `reqHxOutW` are its exact
+/// cover-fit cross products.
+///
+/// DJI's field of view is VERTICAL and spans the HEIGHT of the requested
+/// picture (GLKMatrix4MakePerspective's fovy; DJI's plug-in renders into a
+/// viewport of the chosen resolution).  That picture is cover-fitted onto
+/// the frame exactly like the Classic one:
+///
+///   requested the same shape, or relatively WIDER than the frame
+///       its height is the frame height, the sides are cropped:
+///       f = (outH / 2) / tan(fov / 2) - and for the same shape (Match
+///       Sequence, every preview-scaled frame) that is exact, with no
+///       floating-point ratio anywhere near it;
+///   requested relatively TALLER
+///       its width is the frame width, so its height in frame pixels is
+///       outW * reqH / reqW and the top and bottom are cropped.
+///
+/// The eye distance is the Correction Angle as the user typed it (no ramp:
+/// DJI has none), and the kernel's OSV_PROJ_DJI_SPHERE does the rest.
+[[nodiscard]] ViewSetup buildDjiView(const Settings& settings, const Viewport& view, int outW, int outH,
+                                     std::int64_t reqWxOutH, std::int64_t reqHxOutW, SizePx requestedSize) noexcept {
+    ViewSetup setup;
+    if (view.w <= 0 || view.h <= 0 || !requestedSize.valid()) {
+        setup.reject = SetupReject::Viewport;
+        return setup;
+    }
+
+    // ---- the lens ------------------------------------------------------------
+    const DjiLens lens = sanitiseDjiLens(DjiLens{settings.djiFovDeg, settings.correction});
+
+    // ---- which edge of the requested picture meets the frame -----------------
+    double halfSpanPx = 0.5 * static_cast<double>(outH);
+    if (reqWxOutH < reqHxOutW) {
+        halfSpanPx = 0.5 * static_cast<double>(outW) * static_cast<double>(requestedSize.h) /
+                     static_cast<double>(requestedSize.w);
+    }
+
+    // ---- the pinhole focal length --------------------------------------------
+    // The field of view is inside [1, 178] after sanitising, so the tangent is
+    // finite and positive; the check below is the backstop for a clamp that
+    // somebody widens past 180 in future.
+    const double t = std::tan(0.5 * lens.fovDeg * kPi / 180.0);
+    const double focal = (std::isfinite(t) && t > 0.0) ? halfSpanPx / t : 0.0;
+    if (!(focal > 0.0) || !std::isfinite(focal)) {
+        osv::premiere::PluginLog::oncef("reframe/geometry/dji-degenerate", osv::premiere::PluginLog::Level::Error,
+                                        "reframe: degenerate DJI camera ({}x{} frame, FOV {} deg, correction {}); "
+                                        "no frame can be built",
+                                        outW, outH, lens.fovDeg, lens.correction);
+        setup.reject = SetupReject::DegenerateCamera;
+        return setup;
+    }
+
+    // ---- fill the plain-old-data block ----------------------------------------
+    const Mat3d rout = viewRotation(settings);
+    OsvReframeParams& p = setup.params;
+    p.outW = outW;
+    p.outH = outH;
+    p.viewX = view.x;
+    p.viewY = view.y;
+    p.viewW = view.w;
+    p.viewH = view.h;
+    p.projection = OSV_PROJ_DJI_SPHERE;
+    // The eye distance travels in the eye-offset slot; OSV_PROJ_DJI_SPHERE
+    // documents that it may exceed 1 (the eye outside the sphere).
+    p.eyeOffset = static_cast<float>(lens.correction);
+    p.focalPx = static_cast<float>(focal);
+    // The tangent-plane half extents of the frame through this pinhole - the
+    // same meaning the rectilinear helpers have for every other projection.
+    p.tanHalfH = static_cast<float>(0.5 * static_cast<double>(view.w) / focal);
+    p.tanHalfV = static_cast<float>(0.5 * static_cast<double>(view.h) / focal);
+    for (int i = 0; i < 9; ++i) {
+        p.Rout[i] = static_cast<float>(rout.m[i]);
+    }
+    // Rays that miss the sphere (eye outside it, Crystal Ball) come back
+    // transparent, which on Premiere's black is DJI's black surround.
+    p.fillAlphaOne = 0;
+
+    setup.valid = true;
+    setup.reject = SetupReject::None;
+    return setup;
+}
+
+}  // namespace
+
+DjiLens sanitiseDjiLens(DjiLens lens) noexcept {
+    DjiLens out;
+    out.fovDeg = std::isfinite(lens.fovDeg)
+                     ? std::clamp(lens.fovDeg, OSV_REFRAME_DJI_FOV_VALID_MIN, OSV_REFRAME_DJI_FOV_VALID_MAX)
+                     : OSV_REFRAME_DJI_FOV_DEFAULT;
+    out.correction = std::isfinite(lens.correction)
+                         ? std::clamp(lens.correction, OSV_REFRAME_CORRECTION_VALID_MIN, OSV_REFRAME_CORRECTION_VALID_MAX)
+                         : OSV_REFRAME_CORRECTION_DEFAULT;
+    return out;
+}
+
+double djiZoomDeg(DjiLens lens, double aspect) noexcept {
+    // Sanitised first so a NaN control reads as its default, never as 0.
+    const DjiLens s = sanitiseDjiLens(lens);
+    return geom::djiZoomDeg(s.fovDeg, s.correction, aspectOr169(aspect));
+}
+
+DjiLens djiZoomTo(double targetZoomDeg, DjiLens from, double aspect) noexcept {
+    const DjiLens start = sanitiseDjiLens(from);
+    const double a = aspectOr169(aspect);
+    if (!std::isfinite(targetZoomDeg)) {
+        return start;  // nothing sensible to aim at: leave the lens alone
+    }
+
+    // DJI Studio's limits for the path, widened to include the start so a
+    // lens outside them (a Crystal Ball, a project typed in from the plug-in)
+    // is never snapped back by the first zoom edit.
+    const double fovMin = std::min(OSV_REFRAME_DJI_STUDIO_FOV_MIN, start.fovDeg);
+    const double fovMax = std::max(OSV_REFRAME_DJI_STUDIO_FOV_MAX, start.fovDeg);
+    const double corMin = std::min(OSV_REFRAME_CORRECTION_VALID_MIN, start.correction);
+    const double corMax = std::max(OSV_REFRAME_DJI_STUDIO_CORRECTION_MAX, start.correction);
+    constexpr double kRate = OSV_REFRAME_DJI_ZOOM_FOV_PER_CORRECTION;
+
+    // The lens at path parameter delta: both controls move, each clamped.
+    const auto at = [&](double delta) noexcept {
+        DjiLens l;
+        l.fovDeg = std::clamp(start.fovDeg + kRate * delta, fovMin, fovMax);
+        l.correction = std::clamp(start.correction + delta, corMin, corMax);
+        return l;
+    };
+
+    // The whole path: from both controls at their minimum to both at their
+    // maximum.  Zoom never decreases along it (both controls only grow), so
+    // bisection finds the one delta with the requested Zoom.
+    double lo = std::min((fovMin - start.fovDeg) / kRate, corMin - start.correction);
+    double hi = std::max((fovMax - start.fovDeg) / kRate, corMax - start.correction);
+    if (djiZoomDeg(at(lo), a) >= targetZoomDeg) {
+        return at(lo);
+    }
+    if (djiZoomDeg(at(hi), a) <= targetZoomDeg) {
+        return at(hi);
+    }
+    // 64 halvings take any path length below double resolution.
+    for (int i = 0; i < 64; ++i) {
+        const double mid = 0.5 * (lo + hi);
+        if (djiZoomDeg(at(mid), a) < targetZoomDeg) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return at(0.5 * (lo + hi));
+}
+
+DjiLens djiFromClassic(ClassicLens classic, double aspect) noexcept {
+    const double a = aspectOr169(aspect);
+
+    // The Classic lens exactly as the renderer resolves it: the same clamps,
+    // the same automatic eye-offset ramp, the same invertibility clamp.
+    const double distortion = std::isfinite(classic.distortion) ? std::clamp(classic.distortion, 0.0, 100.0)
+                                                                : OSV_REFRAME_DISTORTION_DEFAULT;
+    const double fov = std::isfinite(classic.fovDeg)
+                           ? std::clamp(classic.fovDeg, OSV_REFRAME_FOV_VALID_MIN, OSV_REFRAME_FOV_VALID_MAX)
+                           : OSV_REFRAME_FOV_DEFAULT;
+    geom::VirtualCamera camera;
+    camera.projection = geom::Projection::EyeOffset;
+    camera.hfovDeg = fov;
+    camera.eyeOffset = effectiveEyeOffset(distortion, fov);
+
+    // The visible half angle across the width, and the pinhole half angle
+    // that reaches it from an eye camera.eyeOffset radii behind the centre.
+    const double visibleHalf = 0.5 * camera.effectiveHfovDeg() * kPi / 180.0;
+    const double alpha = geom::djiPinholeHalfAngleRad(visibleHalf, camera.eyeOffset);
+    DjiLens lens;
+    lens.correction = camera.eyeOffset;
+    lens.fovDeg = (alpha > 0.0) ? 2.0 * std::atan(std::tan(alpha) / a) * 180.0 / kPi : OSV_REFRAME_DJI_FOV_DEFAULT;
+    return sanitiseDjiLens(lens);
+}
+
+ClassicLens classicFromDji(DjiLens lens, double aspect) noexcept {
+    const DjiLens s = sanitiseDjiLens(lens);
+    ClassicLens classic;
+    // The visible angle across the width is exactly what Classic FOV means.
+    const double zoom = geom::djiZoomDeg(s.fovDeg, s.correction, aspectOr169(aspect));
+    classic.fovDeg = (zoom > 0.0) ? std::clamp(zoom, OSV_REFRAME_FOV_VALID_MIN, OSV_REFRAME_FOV_VALID_MAX)
+                                  : OSV_REFRAME_FOV_DEFAULT;
+    classic.distortion = std::clamp(100.0 * s.correction, OSV_REFRAME_DISTORTION_VALID_MIN,
+                                    OSV_REFRAME_DISTORTION_VALID_MAX);
+    return classic;
+}
+
+double djiPresetFovDeg(const PresetEntry& preset, double aspect) noexcept {
+    // One mapping rule from shape to DJI column, shared with the library.
+    geom::DjiPreset columns{};
+    columns.vfovLandscapeDeg = preset.djiFovLandscapeDeg;
+    columns.vfovPortrait916Deg = preset.djiFovPortrait916Deg;
+    columns.vfovPortrait34Deg = preset.djiFovPortrait34Deg;
+    return geom::djiPresetVfovDeg(columns, aspect);
+}
+
+double framingAspect(Resolution resolution, SizePx sequenceSize) noexcept {
+    // The named resolution, else the sequence; no frame exists here, so the
+    // last resort is DJI Studio's default canvas shape.
+    const SizePx size = resolveOutputSize(resolution, sequenceSize, SizePx{});
+    if (!size.valid()) {
+        return kDefaultFramingAspect;
+    }
+    return static_cast<double>(size.w) / static_cast<double>(size.h);
+}
+
 ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenceSize) noexcept {
     ViewSetup setup;
 
@@ -636,6 +964,16 @@ ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenc
         coverScale = 1.0;
     }
 
+    // ---- [WP-CAMERA] DJI's camera ----------------------------------------
+    // A separate lens with its own parameterisation; everything above (the
+    // frame, the requested size) is shared, and the Classic code below
+    // computes exactly what it always did (its six angles moved into
+    // viewRotation() with the same arithmetic), so a Classic render - every
+    // old project - is bit for bit what it was.
+    if (settings.cameraModel == CameraModel::Dji) {
+        return buildDjiView(settings, view, outW, outH, reqWxOutH, reqHxOutW, requestedSize);
+    }
+
     // ---- the virtual camera ----------------------------------------------
     // Distortion is a percentage of the eye offset d; everything else comes
     // straight from the controls.  Non-finite values (a corrupt project, an
@@ -657,32 +995,18 @@ ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenc
     // ramp and the focal length below always agree about which field of view
     // is being rendered.
     const double eyeOffset = effectiveEyeOffset(distortion, fov);
-    const double pan = std::isfinite(settings.panDeg) ? settings.panDeg : 0.0;
-    // Tilt is clamped in code (the dial itself is unbounded so it can be
-    // keyframed smoothly through a turn).
-    const double tilt = std::isfinite(settings.tiltDeg)
-                            ? std::clamp(settings.tiltDeg, -OSV_REFRAME_TILT_LIMIT_DEG, OSV_REFRAME_TILT_LIMIT_DEG)
-                            : 0.0;
-    const double roll = std::isfinite(settings.rollDeg) ? settings.rollDeg : 0.0;
-    const double srcPan = std::isfinite(settings.sourcePanDeg) ? settings.sourcePanDeg : 0.0;
-    const double srcTilt = std::isfinite(settings.sourceTiltDeg)
-                               ? std::clamp(settings.sourceTiltDeg, -OSV_REFRAME_TILT_LIMIT_DEG,
-                                            OSV_REFRAME_TILT_LIMIT_DEG)
-                               : 0.0;
-    const double srcRoll = std::isfinite(settings.sourceRollDeg) ? settings.sourceRollDeg : 0.0;
 
     // The library's own camera does the focal-length maths, including the
     // clamp that keeps the eye-offset model invertible (the effective field
-    // of view is never allowed to reach 2 acos(-d)).
+    // of view is never allowed to reach 2 acos(-d)).  Its orientation comes
+    // from viewRotation() below, the one place the six angles are sanitised
+    // for both lens models.
     geom::VirtualCamera camera;
     camera.projection = geom::Projection::EyeOffset;
     camera.w = view.w;
     camera.h = view.h;
     camera.hfovDeg = fov;
     camera.eyeOffset = eyeOffset;
-    camera.yawDeg = pan;
-    camera.pitchDeg = tilt;
-    camera.rollDeg = roll;
     // The focal length is the one number a bad parameter read can turn into
     // something unusable, so it gets a second chance rather than killing the
     // frame.
@@ -722,13 +1046,8 @@ ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenc
         }
     }
 
-    // Rout = R_source * R_camera.  Both use the same Rz(yaw) Rx(pitch)
-    // Ry(roll) order so a source rotation reads exactly like a camera one.
-    geom::VirtualCamera sourceCamera;
-    sourceCamera.yawDeg = srcPan;
-    sourceCamera.pitchDeg = srcTilt;
-    sourceCamera.rollDeg = srcRoll;
-    const Mat3d rout = sourceCamera.rotation() * camera.rotation();
+    // Rout = R_source * R_camera (see viewRotation()).
+    const Mat3d rout = viewRotation(settings);
 
     // ---- fill the plain-old-data blocks ----------------------------------
     OsvReframeParams& p = setup.params;

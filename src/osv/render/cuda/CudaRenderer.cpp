@@ -108,6 +108,7 @@ struct CudaRenderer::Impl {
     DeviceBuffer v[2];
     DeviceBuffer seam;
     DeviceBuffer warp;
+    DeviceBuffer blendSeam;  // [WP-SEAM] carved blend-seam table
     DeviceBuffer out;
     PinnedBuffer staging;
     std::mutex mutex;  // one render at a time per renderer
@@ -124,6 +125,7 @@ struct CudaRenderer::Impl {
         }
         seam.release();
         warp.release();
+        blendSeam.release();
         out.release();
         staging.release();
     }
@@ -259,6 +261,19 @@ struct CudaRenderer::Impl {
             warpPtr = static_cast<const float*>(warp.ptr);
         }
 
+        // [WP-SEAM] Carved blend-seam table (optional): two floats per
+        // longitude column, a few KB, uploaded per frame like the grid.
+        const float* blendSeamPtr = nullptr;
+        if (job.params.blendSeamEnabled && !job.blendSeam.empty()) {
+            const std::size_t bytes = job.blendSeam.size() * sizeof(float);
+            OSV_TRY(blendSeam.ensure(bytes, 1));
+            err = cudaMemcpyAsync(blendSeam.ptr, job.blendSeam.data(), bytes, cudaMemcpyHostToDevice, stream);
+            if (err != cudaSuccess) {
+                return failStatus(ErrorCode::Gpu, cudaMessage("upload blend seam", err));
+            }
+            blendSeamPtr = static_cast<const float*>(blendSeam.ptr);
+        }
+
         // Output buffer.
         const std::size_t outWidthBytes = static_cast<std::size_t>(job.params.outW) * 4 * sizeof(float);
         OSV_TRY(out.ensure(outWidthBytes, static_cast<std::size_t>(job.params.outH)));
@@ -268,7 +283,8 @@ struct CudaRenderer::Impl {
         OsvPlanePair pair;
         pair.p[0] = devPlanes[0];
         pair.p[1] = devPlanes[1];
-        err = osvCudaLaunchReframe(job.params, pair, seamPtr, warpPtr, static_cast<float*>(out.ptr), outPitchFloats, stream);
+        err = osvCudaLaunchReframe(job.params, pair, seamPtr, warpPtr, blendSeamPtr, static_cast<float*>(out.ptr),
+                                   outPitchFloats, stream);
         if (err != cudaSuccess) {
             return failStatus(ErrorCode::Gpu, cudaMessage("kernel launch", err));
         }

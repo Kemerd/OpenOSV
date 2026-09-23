@@ -24,6 +24,7 @@
 #include "osv/render/Flare.h"
 #include "osv/render/ImageRGBAf.h"
 #include "osv/render/RenderParamsBuilder.h"
+#include "osv/render/SeamCarve.h"
 #include "osv/video/DualStreamReader.h"
 #if defined(OSV_HAVE_CUDA)
 #include "osv/render/CudaRenderer.h"
@@ -35,6 +36,7 @@
 #include <cstring>
 #include <memory>
 #include <random>
+#include <type_traits>
 #include <vector>
 
 using namespace osv;
@@ -782,6 +784,24 @@ TEST_CASE("FlareSeamPenalty feeds the seam a ghost in the overlap and nothing el
     REQUIRE_FALSE(render::FlareSeamPenalty::hook(band, ps, pm, &source));
     source.clear();
     REQUIRE_FALSE(render::FlareSeamPenalty::hook(band, ps, pm, &source));
+}
+
+// The adapter is WP-SEAM's hook type exactly: the one registration call the
+// importer needs compiles, installs and uninstalls.
+static_assert(std::is_same_v<decltype(&render::FlareSeamPenalty::hook), render::SeamLensPenaltyFn>,
+              "FlareSeamPenalty::hook must match SeamLensPenaltyFn");
+
+TEST_CASE("FlareSeamPenalty registers in WP-SEAM's flare slot", "[flare]") {
+    const render::SeamPenaltyHook before = render::seamPenaltyHook(render::SeamPenaltySlot::Flare);
+    render::FlareSeamPenalty source;
+    render::setSeamPenaltyHook(render::SeamPenaltySlot::Flare, {&render::FlareSeamPenalty::hook, &source, 1.0});
+    const render::SeamPenaltyHook installed = render::seamPenaltyHook(render::SeamPenaltySlot::Flare);
+    REQUIRE(installed.installed());
+    REQUIRE(installed.fn == &render::FlareSeamPenalty::hook);
+    REQUIRE(installed.user == &source);
+    // Leave the process-wide slot as it was for the rest of the suite.
+    render::setSeamPenaltyHook(render::SeamPenaltySlot::Flare, before);
+    REQUIRE(render::seamPenaltyHook(render::SeamPenaltySlot::Flare).fn == before.fn);
 }
 
 // =============================================================================
