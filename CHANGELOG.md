@@ -292,6 +292,14 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ### Changed
 
+* **Open 360 Reframe: a "Lens" dropdown, DJI by default, and one FOV on
+  screen (WP-LENSUI).** "DJI | Classic" replaces the Camera Model checkbox
+  and decides what the Effect Controls panel shows: DJI shows Zoom, FOV and
+  Correction Angle; Classic shows FOV and Distortion. The two lenses measure
+  FOV differently (DJI's is the vertical pinhole angle, Classic's the visible
+  angle across the width), so they are no longer shown side by side.
+  Switching carries the framing across. Projects saved before this open on
+  DJI; the old checkbox stays hidden in the list so they still load.
 * **The default D-Log M curve is now `kDlogMOsmo360`** (`--fit osmo360`,
   "Osmo 360" in Source Settings). Existing projects keep their stored curve;
   only new clips pick up the new default. See the Added entry for the

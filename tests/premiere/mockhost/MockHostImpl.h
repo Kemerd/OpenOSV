@@ -238,6 +238,16 @@ struct EffectRef {
     std::vector<char> sourceSettingsSent;
     csSDK_uint32 sourceSettingsSentSize = 0;
     std::size_t sourceSettingsCallCount = 0;
+
+    // ---- PF Param Utils Suite v3 --------------------------------------------
+
+    /// Every accepted PF_UpdateParamUI call, oldest first.  The panel a real
+    /// host draws is the only other place these would show, so the mock keeps
+    /// them for a test to read back.
+    std::vector<ParamUiUpdate> uiUpdates;
+    /// Injected refusals: parameter index -> the error PF_UpdateParamUI
+    /// returns for it (absent = accept).
+    std::map<A_long, PF_Err> uiErrors;
 };
 
 /// The surface translation the mock tracks.
@@ -345,6 +355,7 @@ struct MockHost::Impl {
     PF_PixelFormatSuite1 pfPixelFormat{};
     PF_UtilitySuite4 pfUtility{};
     PF_SourceSettingsSuite pfSourceSettings{};
+    PF_ParamUtilsSuite3 pfParamUtils{};
 
     // Custom UI / DrawBot (MockDrawbot.cpp).
     PF_EffectCustomUISuite2 pfCustomUi{};

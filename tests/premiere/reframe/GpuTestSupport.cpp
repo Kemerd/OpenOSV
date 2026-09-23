@@ -384,6 +384,8 @@ void writeVerbatimControls(MockHost& host, csSDK_int32 node, const Controls& c, 
     putF32(host, node, kIndexSourceTilt, c.sourceTilt, time);
     putF32(host, node, kIndexSourceRoll, c.sourceRoll, time);
     putBool(host, node, kIndexSmooth, c.smooth, time);
+    // [WP-LENSUI] The Lens popup, in the same raw numbering as the others.
+    putI32(host, node, kIndexLens, c.lens, time);
     // The count a host with this layout reports, whatever this build added
     // after the controls written here.
     host.setParamCount(node, kParamCount);
@@ -391,8 +393,16 @@ void writeVerbatimControls(MockHost& host, csSDK_int32 node, const Controls& c, 
 
 Settings settingsOf(const Controls& c) {
     Settings s;
-    s.resolution = sanitiseResolution(c.resolution);
-    s.preset = sanitisePreset(c.preset);
+    // Learn the numbering from all three popups first, then decode each -
+    // the order GpuFilter.cpp's readSettings() uses, so a 0-based test and a
+    // 1-based one both get the Settings the filter should have read.
+    PopupBase base = PopupBase::Unknown;
+    (void)decodeHostPopup(c.resolution, OSV_REFRAME_RESOLUTION_COUNT, &base);
+    (void)decodeHostPopup(c.preset, OSV_REFRAME_PRESET_COUNT, &base);
+    (void)decodeHostPopup(c.lens, OSV_REFRAME_LENS_COUNT, &base);
+    s.resolution = sanitiseResolution(decodeHostPopup(c.resolution, OSV_REFRAME_RESOLUTION_COUNT, &base));
+    s.preset = sanitisePreset(decodeHostPopup(c.preset, OSV_REFRAME_PRESET_COUNT, &base));
+    s.cameraModel = cameraModelFromLensPopup(decodeHostPopup(c.lens, OSV_REFRAME_LENS_COUNT, &base));
     s.panDeg = c.pan;
     s.tiltDeg = c.tilt;
     s.rollDeg = c.roll;

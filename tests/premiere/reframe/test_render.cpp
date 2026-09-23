@@ -1301,6 +1301,12 @@ struct RenderFixture {
 
         output = host.createWorld(static_cast<std::uint32_t>(outW), static_cast<std::uint32_t>(outH), format);
         REQUIRE(output != nullptr);
+
+        // [WP-LENSUI] The effect's default lens is DJI.  Every render here
+        // drives the Classic camera (FOV / Distortion) and compares it with
+        // Classic references, so the fixture selects Classic in the Lens
+        // popup; test_dji_camera.cpp covers DJI's lens through the module.
+        setPopup(kIndexLens, static_cast<int>(LensPopup::Classic));
     }
 
     ~RenderFixture() {
@@ -1989,6 +1995,11 @@ TEST_CASE("the render path still produces a picture when the pixel format suite 
         PF_ParamDef dist = params[static_cast<std::size_t>(kIndexDistortion) - 1u];
         dist.u.fs_d.value = static_cast<PF_FpShort>(0.0);
         host.setParamValue(ref, kIndexDistortion, dist);
+        // [WP-LENSUI] The Classic lens those two numbers describe (the
+        // effect's default lens is DJI).
+        PF_ParamDef lens = params[static_cast<std::size_t>(kIndexLens) - 1u];
+        lens.u.pd.value = static_cast<A_long>(LensPopup::Classic);
+        host.setParamValue(ref, kIndexLens, lens);
     }
 
     PF_InData in = host.makeInData(ref, {});

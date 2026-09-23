@@ -18,9 +18,10 @@
 //   types, operator owners, inputs, properties and a per-node clip-time ->
 //   media-time transform), GPU Device v2 (a real CUDA driver-API context -
 //   the primary one, or a private one like Premiere's - when the
-//   build has CUDA and a device is present), PF Pixel Format v1 and
-//   PF Utility v4 (AE side) plus PF_InData / PF_OutData builders with
-//   working checkout_param / add_param callbacks.
+//   build has CUDA and a device is present), PF Pixel Format v1,
+//   PF Utility v4 and PF Param Utils v3 (AE side; PF_UpdateParamUI calls
+//   are recorded) plus PF_InData / PF_OutData builders with working
+//   checkout_param / add_param callbacks.
 //
 // Everything is inspectable: created PPixes, cache hits, live strings,
 // acquire/release reference counts, error events, and every suite can be
@@ -275,6 +276,31 @@ struct ParamReadRecord {
     csSDK_int32 index = 0;
     PrTime time = 0;
     prSuiteError result = suiteError_NoError;
+};
+
+/// One PF_ParamUtilsSuite3::PF_UpdateParamUI call, as the host saw it.
+///
+/// Recorded because the call leaves no trace anywhere else: in a real host it
+/// only changes how the Effect Controls panel draws a control.  A test reads
+/// these back to prove WHICH controls an effect hid or showed, under which
+/// name, and that it left the slider display intact.  Only the fields
+/// PF_UpdateParamUI is documented to change are kept (AE_EffectSuites.h:
+/// ui_flags, name, the COLLAPSE_TWIRLY flag, slider range / precision /
+/// display flags).
+struct ParamUiUpdate {
+    A_long index = 0;                        ///< The AE parameter index the update named.
+    PF_ParamType type = PF_Param_RESERVED;   ///< param_type of the def passed.
+    PF_ParamUIFlags uiFlags = 0;             ///< ui_flags of the def passed.
+    PF_ParamFlags flags = 0;                 ///< flags of the def passed.
+    std::string name;                        ///< The display name passed (NUL-terminated copy).
+    // Float sliders only (zero for every other type).
+    float sliderMin = 0.0f;
+    float sliderMax = 0.0f;
+    A_short precision = 0;
+    PF_ValueDisplayFlags displayFlags = 0;
+
+    /// True when the update hides the control (PF_PUI_INVISIBLE).
+    [[nodiscard]] bool invisible() const noexcept { return (uiFlags & PF_PUI_INVISIBLE) != 0; }
 };
 
 /// Which CUDA context the mock GPU Device Suite hands out.
@@ -536,6 +562,19 @@ public:
     /// Pixel formats registered by the effect through
     /// PF_PixelFormatSuite::AddSupportedPixelFormat, in order.
     [[nodiscard]] std::vector<PrPixelFormat> supportedPixelFormats(PF_ProgPtr ref) const;
+
+    // ---- PF Param Utils Suite v3 -------------------------------------------
+    /// Every PF_UpdateParamUI call made on `ref` since the last
+    /// clearParamUiUpdates(), oldest first (refused calls are not recorded).
+    [[nodiscard]] std::vector<ParamUiUpdate> paramUiUpdates(PF_ProgPtr ref) const;
+    /// The latest PF_UpdateParamUI call made on `ref` for `index` - the UI
+    /// state the panel would show - or nullopt when there was none.
+    [[nodiscard]] std::optional<ParamUiUpdate> paramUiState(PF_ProgPtr ref, A_long index) const;
+    /// Forget the recorded calls (and with them the per-index state).
+    void clearParamUiUpdates(PF_ProgPtr ref);
+    /// Make PF_UpdateParamUI refuse `index` on `ref` with `err`
+    /// (PF_Err_NONE removes the injection).  A refused call is not recorded.
+    void setParamUiError(PF_ProgPtr ref, A_long index, PF_Err err);
 
     /// Parameters the effect added through PF_ADD_PARAM (index 1..n).
     [[nodiscard]] std::vector<PF_ParamDef> addedParams(PF_ProgPtr ref) const;

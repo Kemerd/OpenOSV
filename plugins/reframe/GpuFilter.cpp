@@ -1028,10 +1028,20 @@ Settings readSettings(const Instance& inst, PrTime clipTime, PrTime ticksPerFram
     // control the host did not answer takes its documented (1-based) default
     // directly: it was never in the host's numbering, so it is neither
     // decoded nor allowed to teach the instance anything.
+    //
+    // [WP-LENSUI] The Lens popup joins them.  Its two unambiguous readings
+    // teach the base like the others' do - DJI reads 0 on a 0-based host,
+    // Classic reads 2 (its entry count) on a 1-based one - and its one
+    // ambiguous reading, 1, is decoded with whatever the three popups settled
+    // between them.  On Premiere that "1" is Classic, and Classic only ever
+    // arrives with Preset "Custom" reading 0 (ReframeParams.h,
+    // OSV_REFRAME_LENS_ITEMS), so the base is settled on the same frame.
     int rawResolution = 0;
     int rawPreset = 0;
+    int rawLens = 0;
     const bool haveResolution = readPopupRaw(inst, kIndexOutputResolution, clipTime, &rawResolution);
     const bool havePreset = readPopupRaw(inst, kIndexPreset, clipTime, &rawPreset);
+    const bool haveLens = readPopupRaw(inst, kIndexLens, clipTime, &rawLens);
     PopupBase base = static_cast<PopupBase>(inst.popupBase.load(std::memory_order_relaxed));
     if (haveResolution) {
         (void)decodeHostPopup(rawResolution, OSV_REFRAME_RESOLUTION_COUNT, &base);
@@ -1039,17 +1049,27 @@ Settings readSettings(const Instance& inst, PrTime clipTime, PrTime ticksPerFram
     if (havePreset) {
         (void)decodeHostPopup(rawPreset, OSV_REFRAME_PRESET_COUNT, &base);
     }
+    if (haveLens) {
+        (void)decodeHostPopup(rawLens, OSV_REFRAME_LENS_COUNT, &base);
+    }
     const PopupBase learned = base;
     s.resolution = sanitiseResolution(haveResolution
                                           ? decodeHostPopup(rawResolution, OSV_REFRAME_RESOLUTION_COUNT, &base)
                                           : OSV_REFRAME_RESOLUTION_DEFAULT);
     s.preset = sanitisePreset(havePreset ? decodeHostPopup(rawPreset, OSV_REFRAME_PRESET_COUNT, &base)
                                          : OSV_REFRAME_PRESET_DEFAULT);
+    // A host that does not expose the Lens popup (a list that ends before
+    // it, a probe that mapped it to nothing) yields the popup's default, DJI:
+    // what the CPU path reads for a project that has no value for it.
+    s.cameraModel = cameraModelFromLensPopup(haveLens ? decodeHostPopup(rawLens, OSV_REFRAME_LENS_COUNT, &base)
+                                                      : OSV_REFRAME_LENS_DEFAULT);
     if (learned != PopupBase::Unknown) {
         const int previous = inst.popupBase.exchange(static_cast<int>(learned), std::memory_order_relaxed);
         if (previous != static_cast<int>(learned)) {
-            PluginLog::info("reframe/gpu: this host numbers popups from {} (Output Resolution read {}, Preset {})",
-                            learned == PopupBase::Zero ? 0 : 1, rawResolution, rawPreset);
+            PluginLog::info("reframe/gpu: this host numbers popups from {} (Output Resolution read {}, Preset {}, "
+                            "Lens {})",
+                            learned == PopupBase::Zero ? 0 : 1, rawResolution, rawPreset,
+                            haveLens ? rawLens : -1);
         }
     }
 
@@ -1058,13 +1078,10 @@ Settings readSettings(const Instance& inst, PrTime clipTime, PrTime ticksPerFram
     s.smoothKeyframes = readBool(inst, kIndexSmooth, clipTime, false);
 
     // ---- [WP-CAMERA] DJI's camera ----------------------------------------------
-    // Camera Model is a checkbox, so it reads the same on every host; a host
-    // that does not expose it (or a probe that mapped it to nothing) yields
-    // Classic, the lens every project had before the control existed.  Zoom
-    // and Drag Sensitivity are never rendered from but are read so the
-    // Settings block is complete for the log line on a rejected setup.
-    s.cameraModel = cameraModelFromCheckbox(
-        readBool(inst, kIndexCameraModel, clipTime, OSV_REFRAME_CAMERA_MODEL_DEFAULT != 0) ? 1 : 0);
+    // The lens itself was decoded above from the Lens popup; the hidden
+    // Camera Model mirror is not read.  Zoom and Drag Sensitivity are never
+    // rendered from but are read so the Settings block is complete for the
+    // log line on a rejected setup.
     s.zoomDeg = readFloat(inst, kIndexZoom, clipTime, OSV_REFRAME_ZOOM_DEFAULT);
     s.djiFovDeg = readFloat(inst, kIndexDjiFov, clipTime, OSV_REFRAME_DJI_FOV_DEFAULT);
     s.correction = readFloat(inst, kIndexCorrection, clipTime, OSV_REFRAME_CORRECTION_DEFAULT);

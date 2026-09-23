@@ -159,6 +159,10 @@ TEST_CASE("the probe identifies Premiere 26.2.2's verbatim list, markers and unr
     Controls c;
     c.resolution = 0;  // [0]i32:0
     c.preset = 3;      // [2]i32:3
+    // [WP-LENSUI] The Lens popup did not exist when the dump was taken; in
+    // the same 0-based numbering, 1 is "Classic" - the lens FOV 120 /
+    // Distortion 15 describe.
+    c.lens = 1;
     c.fov = 120.0;     // [6]f64:120
     c.distortion = 15.0;  // [7]f64:15
     // The trailing entries did not answer at t = 0, so the dump cannot say

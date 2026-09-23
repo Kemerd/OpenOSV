@@ -305,9 +305,10 @@ bool sourceRowsRunForward(const ConstFrameView& src) noexcept {
     for (int offset = -(kValueParamCount - 1); offset <= count - 1; ++offset) {
         int matches = 0;
         // [WP-CAMERA] The evidence must come from the ORIGINAL controls: the
-        // appended DJI block is a checkbox and four float sliders, a pattern
-        // common enough that a list of nothing else would otherwise "match"
-        // at some offset without a single original control agreeing.
+        // appended tail is a checkbox, four float sliders and ([WP-LENSUI])
+        // a popup, a pattern common enough that a list of nothing else would
+        // otherwise "match" at some offset without a single original control
+        // agreeing.
         int originalMatches = 0;
         bool contradicted = false;
         bool anchored = false;
