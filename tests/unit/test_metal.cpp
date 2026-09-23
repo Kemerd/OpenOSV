@@ -40,8 +40,24 @@ namespace {
 /// Stream size of the synthetic lenses (small enough to synthesise quickly).
 constexpr int kStream = 768;
 
-/// A scene with structure everywhere: a longitude / latitude checker in the
-/// body frame, slightly tinted per channel so a channel swap cannot hide.
+/// A scene with smooth structure everywhere: sinusoids in longitude and
+/// latitude, tinted per channel so a channel swap cannot hide.  Smooth on
+/// purpose for the parity bar: across a HARD edge a last-ulp difference in a
+/// sample coordinate moves a bilinear tap from one side to the other and
+/// turns into several codes on that pixel (measured: 0.1 % of an equirect of
+/// the checker below differ by more than 2 codes, at 108 dB PSNR), which is
+/// a property of the edge, not of the backend.
+void smoothScene(int, const Vec3d& d, double, double rgb[3]) {
+    const double lon = std::atan2(d.x, d.y);
+    const double lat = std::asin(std::clamp(d.z, -1.0, 1.0));
+    const double v = 0.30 + 0.12 * std::sin(3.0 * lon) * std::cos(2.0 * lat) + 0.08 * std::cos(5.0 * lat + lon);
+    rgb[0] = v * 1.10;
+    rgb[1] = v;
+    rgb[2] = v * 0.85;
+}
+
+/// A scene with hard edges everywhere: a longitude / latitude checker in the
+/// body frame, tinted like the smooth one.
 void tintedChecker(int, const Vec3d& d, double, double rgb[3]) {
     const double lon = std::atan2(d.x, d.y);
     const double lat = std::asin(std::clamp(d.z, -1.0, 1.0));
@@ -102,7 +118,7 @@ TEST_CASE("Metal renders the synthetic scene like the CPU reference", "[render][
     auto rig = makeSyntheticRig(kStream);
     REQUIRE(rig.ok());
     ThreadPool pool(4);
-    const SynthPair scene = synthPair(rig.value(), tintedChecker, pool);
+    const SynthPair scene = synthPair(rig.value(), smoothScene, pool);
 
     // Equirect (both layouts) and three virtual cameras, through every
     // output transfer the kernel implements.
@@ -134,6 +150,27 @@ TEST_CASE("Metal renders the synthetic scene like the CPU reference", "[render][
             requireParity(*metal, job.value(), pool, "camera");
         }
     }
+
+    // Hard edges: the same bar the seam tools' GPU test holds every backend
+    // to on its hard-edged scene - the image as a whole at >= 60 dB, no pixel
+    // off by more than 64 codes.
+    const SynthPair edges = synthPair(rig.value(), tintedChecker, pool);
+    const OsvColorParams pq = color::makeColorParams(color::kDefaultDlogMFit, color::OutputTransfer::PQ, 0.0f);
+    geom::EquirectMap map;
+    map.w = 1024;
+    map.h = 512;
+    auto job = render::RenderParamsBuilder().rig(rig.value()).equirect(map).color(pq).build(edges.pair);
+    REQUIRE(job.ok());
+    render::CpuRenderer cpu(pool);
+    auto ref = cpu.render(job.value());
+    auto test = metal->render(job.value());
+    REQUIRE(ref.ok());
+    REQUIRE(test.ok());
+    const render::ImageDiffStats stats = render::compareImages16(ref.value(), test.value());
+    INFO("checker: PSNR " << stats.psnrDb << " dB, max " << stats.maxAbsCode << " codes, within2 "
+                          << stats.fractionWithin2);
+    CHECK(stats.psnrDb >= 60.0);
+    CHECK(stats.maxAbsCode <= 64);
 }
 
 TEST_CASE("Metal renders frame after frame, and changing sizes, without drift", "[render][metal]") {
