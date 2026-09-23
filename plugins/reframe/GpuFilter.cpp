@@ -55,6 +55,8 @@
 
 #include <cuda.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -374,6 +376,126 @@ bool readParam(const Instance& inst, int aeIndex, PrTime time, PrParam* out) noe
 /// Cost: one GetParamCount plus at most kValueParamCount GetParam calls, all
 /// at t = 0, on a code path Premiere runs when an effect is applied or a
 /// parameter changes - not per frame.
+void probeParams(Instance& inst) noexcept;
+
+// ===========================================================================
+//  Source-graph probe (diagnostic, once per process)
+//
+//  Can the effect find the clip it is applied to?  If the effect node can
+//  walk to its media node and read which file and which media time it is
+//  rendering, the reframe can sample the two FISHEYES directly on the GPU -
+//  one resampling instead of fisheye -> equirect -> view, and no 18 MP
+//  equirect round trip through host memory at all.  The Video Segment Suite
+//  documents the walk (operator -> owner clip node -> input media node ->
+//  "MediaNode::MediaInstanceString" and friends) but not what the values
+//  hold in practice, so the first instance in a process logs every property
+//  it can reach.  It changes nothing about rendering.
+// ===========================================================================
+
+/// Collects IterateNodeProperties callbacks.  The callback's plug-in object
+/// is a csSDK_int32 - too narrow for a pointer on 64-bit - so the
+/// accumulator is thread-local; the iteration is synchronous on this thread.
+thread_local std::string* t_propertySink = nullptr;
+
+prSuiteError collectProperty(csSDK_int32, const char* key, const prUTF8Char* value) {
+    if (!t_propertySink) {
+        return suiteError_NoError;
+    }
+    std::string v = value ? reinterpret_cast<const char*>(value) : "<null>";
+    // Values can be long XML blobs; the head is enough to identify them.
+    constexpr std::size_t kMaxValue = 240;
+    if (v.size() > kMaxValue) {
+        v = v.substr(0, kMaxValue) + "...(" + std::to_string(v.size()) + " bytes)";
+    }
+    t_propertySink->append("\n    ").append(key ? key : "<null>").append(" = ").append(v);
+    return suiteError_NoError;
+}
+
+/// Log one node's type and all of its properties.
+void logNode(const PrSDKVideoSegmentSuite& s, csSDK_int32 node, const char* role) {
+    char type[kMaxNodeTypeStringSize] = {};
+    prPluginID hash{};
+    csSDK_int32 flags = 0;
+    if (s.GetNodeInfo) {
+        (void)s.GetNodeInfo(node, type, &hash, &flags);
+    }
+    std::string props;
+    if (s.IterateNodeProperties) {
+        t_propertySink = &props;
+        const prSuiteError err = s.IterateNodeProperties(node, &collectProperty, 0);
+        t_propertySink = nullptr;
+        if (err != suiteError_NoError) {
+            props.append("\n    (IterateNodeProperties failed: ").append(std::to_string(err)).append(")");
+        }
+    }
+    PluginLog::info("reframe/gpu/source: {} node {} type '{}' flags 0x{:x}{}", role, node, type,
+                    static_cast<unsigned>(flags), props);
+}
+
+void probeSourceGraph(const Instance& inst) noexcept {
+    try {
+        static std::atomic<bool> done{false};
+        if (done.exchange(true)) {
+            return;
+        }
+        const PrSDKVideoSegmentSuite* s = inst.segment;
+        if (!s || inst.segmentVersion < kPrSDKVideoSegmentSuiteVersion6 || !s->AcquireOperatorOwnerNodeID ||
+            !s->ReleaseVideoNodeID) {
+            PluginLog::info("reframe/gpu/source: the Video Segment Suite (v{}) cannot walk to the owner node",
+                            inst.segmentVersion);
+            return;
+        }
+        logNode(*s, inst.nodeId, "effect");
+
+        csSDK_int32 owner = 0;
+        const prSuiteError ownerErr = s->AcquireOperatorOwnerNodeID(inst.nodeId, &owner);
+        if (ownerErr != suiteError_NoError || owner == 0) {
+            PluginLog::info("reframe/gpu/source: AcquireOperatorOwnerNodeID failed ({})", ownerErr);
+            return;
+        }
+        logNode(*s, owner, "owner");
+
+        // The owner's inputs: for a clip node, the media node.  Two levels
+        // deep covers a clip whose input is itself wrapped (multicam, nest).
+        csSDK_int32 inputs = 0;
+        if (s->GetNodeInputCount && s->GetNodeInputCount(owner, &inputs) == suiteError_NoError &&
+            s->AcquireInputNodeID) {
+            for (csSDK_int32 i = 0; i < std::min<csSDK_int32>(inputs, 4); ++i) {
+                PrTime offset = 0;
+                csSDK_int32 input = 0;
+                if (s->AcquireInputNodeID(owner, i, &offset, &input) != suiteError_NoError || input == 0) {
+                    continue;
+                }
+                logNode(*s, input, "input");
+                csSDK_int32 nested = 0;
+                if (s->GetNodeInputCount && s->GetNodeInputCount(input, &nested) == suiteError_NoError) {
+                    for (csSDK_int32 j = 0; j < std::min<csSDK_int32>(nested, 4); ++j) {
+                        PrTime nestedOffset = 0;
+                        csSDK_int32 grand = 0;
+                        if (s->AcquireInputNodeID(input, j, &nestedOffset, &grand) == suiteError_NoError &&
+                            grand != 0) {
+                            logNode(*s, grand, "input-of-input");
+                            s->ReleaseVideoNodeID(grand);
+                        }
+                    }
+                }
+                s->ReleaseVideoNodeID(input);
+            }
+        }
+        // Clip time 0 through the owner's time transform: the media time the
+        // first frame of the clip maps to (in point, speed, reverse applied).
+        if (s->TransformNodeTime) {
+            PrTime media = 0;
+            const prSuiteError terr = s->TransformNodeTime(owner, 0, &media);
+            PluginLog::info("reframe/gpu/source: TransformNodeTime(owner, 0) -> {} (err {})",
+                            static_cast<long long>(media), terr);
+        }
+        s->ReleaseVideoNodeID(owner);
+    } catch (...) {
+        // Diagnostics must never take the effect down.
+    }
+}
+
 void probeParams(Instance& inst) noexcept {
     if (!inst.segment || !inst.segment->GetParamCount || !inst.segment->GetParam) {
         PluginLog::oncef("reframe/gpu/probe-nosuite", PluginLog::Level::Warn,
@@ -792,6 +914,7 @@ prSuiteError createInstance(PrGPUFilterInstance* io) noexcept {
         // leaves the static mapping in place, which is exactly the behaviour
         // that existed before, and says so in the log.
         probeParams(*inst);
+        probeSourceGraph(*inst);
 
         io->ioPrivatePluginData = inst;
         // Reframing a 6K equirect into an HD frame is a couple of samples
