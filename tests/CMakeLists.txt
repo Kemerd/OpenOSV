@@ -50,3 +50,23 @@ catch_discover_tests(osv_tests
   PROPERTIES SKIP_RETURN_CODE 4
   DISCOVERY_MODE PRE_TEST
 )
+
+# -----------------------------------------------------------------------------
+#  osv_gpu_analysis_bench - what one parallax measurement costs on the CPU and
+#  on the GPU (docs/DIRECT_GPU.md, WP-B; see bench/GpuAnalysisBench.cpp).
+#
+#  A measurement tool, NOT a test: its numbers depend on the machine and it
+#  asserts nothing, so it is built with the suite (always against the modules
+#  just built) but never registered with ctest.
+# -----------------------------------------------------------------------------
+if(TARGET osv_render_cuda)
+  add_executable(osv_gpu_analysis_bench bench/GpuAnalysisBench.cpp)
+  target_link_libraries(osv_gpu_analysis_bench PRIVATE ${_osv_test_libs})
+  target_compile_definitions(osv_gpu_analysis_bench PRIVATE OSV_SAMPLE_FILE="${OSV_SAMPLE_FILE}")
+  set_target_properties(osv_gpu_analysis_bench PROPERTIES FOLDER "tests")
+  # FFmpeg and friends beside the executable, as osvtool does.
+  add_custom_command(TARGET osv_gpu_analysis_bench POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:osv_gpu_analysis_bench>
+            $<TARGET_FILE_DIR:osv_gpu_analysis_bench>
+    COMMAND_EXPAND_LISTS)
+endif()
