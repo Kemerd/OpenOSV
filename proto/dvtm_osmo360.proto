@@ -1,19 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// Clean-room transcription of the "dvtm" metadata schema carried by the
+// OpenOSV's own transcription of the "dvtm" metadata schema carried by the
 // 'djmd' tracks of DJI Osmo 360 .OSV / .LRF files (proto file name reported
 // by the camera: "dvtm_oq101.proto", library version 02.01.15).
 //
+// Provenance: the message layout, field numbers, scalar types and the
+// message, field and enum names were determined from recorded clips and from
+// the protobuf schema as found in DJI's software (DJI Studio for Windows and
+// DJI's macOS Premiere importer), and cross-checked against the
+// dvtm_oq101.proto published by the open-source telemetry-parser project
+// (github.com/AdrianEddy/telemetry-parser, MIT OR Apache-2.0).  The comments,
+// the layout of this file and the placeholder names are OpenOSV's own; see
+// docs/LEGAL.md.
+//
 // This file documents the wire layout that src/osv/meta/DjmdDecoder.cpp
-// decodes by hand; the library does not depend on protoc.  Field numbers and
-// scalar types were established by observation of recorded clips, so:
+// decodes by hand; the library does not depend on protoc.  So:
 //   * every field is optional (proto3 semantics),
 //   * repeated scalars may appear packed or unpacked in the files,
 //   * fields marked "unknown" have been seen but their meaning is not
-//     established; names are descriptive placeholders,
-//   * message and field names follow the ones printed in ClipMetaHeader and
-//     the library's public JSON key names where no better name is known.
+//     established; their names are descriptive placeholders,
+//   * where no schema name is known, names follow the library's public JSON
+//     key names.
 //
 // Compile check: protoc --cpp_out=/tmp proto/dvtm_osmo360.proto
 syntax = "proto3";

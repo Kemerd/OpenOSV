@@ -1,5 +1,5 @@
 # =============================================================================
-#  OpenOSV - clean-room DJI Osmo 360 (.OSV) toolkit
+#  OpenOSV - independent, open-source DJI Osmo 360 (.OSV) toolkit
 #
 #  Top-level build script.  Everything is opt-in through cache options so the
 #  same tree builds a CPU-only library on a laptop, a CUDA + OpenCL build on a

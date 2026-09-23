@@ -15,8 +15,10 @@ namespace osv::color {
 inline constexpr OsvMat3f kIdentity3 = {{1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f}};
 
 /// Camera native primaries (DJI D-Log M, Pocket 3 fit) -> Rec.2020 linear.
-/// Derived from a least-squares fit of the Pocket 3 colour chart against a
-/// Rec.2020 reference.  Rows sum to 1.
+/// Thatcher Freeman's published colour-chart matrix for the Pocket 3 (camera
+/// native -> DaVinci Wide Gamut, "DJI Pocket 3 D-Log M to DWG.dctl",
+/// github.com/thatcherfreeman/dwg-transforms) composed with the DaVinci Wide
+/// Gamut -> Rec.2020 primaries conversion (see NOTICE).  Rows sum to 1.
 ///
 /// This was the Osmo 360 default until kNativeToRec2020_Osmo360 below was
 /// fitted, on the assumption that a shared D-Log M curve implied shared
