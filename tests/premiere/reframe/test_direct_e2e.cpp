@@ -110,6 +110,26 @@ constexpr float kMarker[4] = {0.125f, 0.875f, 0.25f, 1.0f};
 /// control's half pixel.  The measured values are printed with every run.
 constexpr double kFramingTolerancePx = 0.15;
 
+/// The same bar for a view the lens seam crosses.
+///
+/// Since the carved seam (WP-SEAM) each lens is cut off within ~0.35 deg of
+/// the seam where the lenses disagree, instead of fading over the old 4 deg
+/// feather.  The direct path draws that cut crisply per output ray; the
+/// equirect path draws it into a 6000 x 3000 panorama (0.06 deg per pixel,
+/// coarser than this 1280-wide, 100 deg view) and then resamples it, which
+/// softens the cut by about one panorama pixel.  Where the two lenses show
+/// different content across the cut (the wing), a crisp and a softened step
+/// between two DIFFERENT images low-pass to slightly different tile centroids
+/// - measured 0.165 px in one tile, with the median at 0.0002 px.  That is a
+/// resampling difference at the cut, not framing, so the seam view gets a
+/// looser worst-tile bar while its median stays under the strict one below;
+/// the negative control's half-pixel pan still reads 0.6 px, far above both.
+constexpr double kSeamFramingTolerancePx = 0.25;
+
+/// The median tile shift of every view: the framing itself, which no cut or
+/// resampling difference moves.
+constexpr double kMedianFramingTolerancePx = 0.02;
+
 /// Which path drew a frame, judged by the marker (see kMarker).
 enum class DrawnBy { Direct, Equirect, Unclear };
 
@@ -510,6 +530,9 @@ TEST_CASE("the direct path renders the sample from the fisheyes and frames it ex
     struct View {
         const char* name;
         Controls c;
+        /// Worst-tile bar for this view: kSeamFramingTolerancePx when the
+        /// lens seam crosses the frame, kFramingTolerancePx otherwise.
+        double maxShiftTolerancePx = kFramingTolerancePx;
     };
     auto view = [](double pan, double tilt, double roll, double fov, double distortion, double sp = 0.0,
                    double st = 0.0, double sr = 0.0) {
@@ -529,7 +552,7 @@ TEST_CASE("the direct path renders the sample from the fisheyes and frames it ex
         {"narrow 40, master lens centre", view(0.0, 0.0, 0.0, 40.0, 0.0)},
         {"narrow 40, slave lens centre", view(180.0, -10.0, 0.0, 40.0, 0.0)},
         {"wide eye-offset 150 + distortion 40", view(-60.0, -5.0, 0.0, 150.0, 40.0)},
-        {"across the lens seam (pan 90)", view(90.0, 0.0, 0.0, 100.0, 0.0)},
+        {"across the lens seam (pan 90)", view(90.0, 0.0, 0.0, 100.0, 0.0), kSeamFramingTolerancePx},
         {"rolled + source-rotated", view(-40.0, 15.0, 25.0, 110.0, 20.0, 30.0, -12.0, 8.0)},
         {"tiny planet (Asteroid 300)", view(0.0, -90.0, 0.0, 300.0, 100.0)},
     };
@@ -553,7 +576,11 @@ TEST_CASE("the direct path renders the sample from the fisheyes and frames it ex
                  << al.maxShiftPx << " px, median (" << al.medianDx << ", " << al.medianDy << ") px");
         CHECK(al.tilesUsed >= 6);
         CHECK(al.ncc > 0.98);
-        CHECK(al.maxShiftPx < kFramingTolerancePx);
+        CHECK(al.maxShiftPx < v.maxShiftTolerancePx);
+        // The framing itself: every view, the seam one included, under the
+        // strict median bar.
+        CHECK(std::fabs(al.medianDx) < kMedianFramingTolerancePx);
+        CHECK(std::fabs(al.medianDy) < kMedianFramingTolerancePx);
     }
 
     // ---- negative control: half a pixel of framing error is seen ------------------
