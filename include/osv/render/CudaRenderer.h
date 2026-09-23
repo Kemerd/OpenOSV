@@ -69,4 +69,19 @@ private:
 Result<ImageRGBAf> cudaReframeEquirect(int deviceIndex, const OsvReframeParams& params, const OsvRgbaSource& src,
                                        const void* pixels);
 
+/// [WP-SEAMTOOLS] Build the seam smoothing's two-lens low band (SeamTools.h)
+/// from DEVICE planes in the CUDA context current on this thread, on
+/// `stream` (a cudaStream_t / CUstream of that context, or null for its
+/// default stream), WITHOUT synchronising: whoever reads `dst` must order
+/// its work after `stream`.
+///
+/// `dst` and `scratch` are device buffers of seamLowTableFloats(params)
+/// floats each in that context; `planes` the two lens descriptors of
+/// `params` (render::fillDevicePlane).  This is the direct path's build: the
+/// importer's engine calls it in the effect's context, on the effect's
+/// stream.  InvalidArgument for smoothing that is off, malformed fields or a
+/// null buffer; Gpu for a launch the driver refused.
+[[nodiscard]] Status cudaBuildSeamLowBand(const OsvRenderParams& params, const OsvPlane planes[2], float* dst,
+                                          float* scratch, void* stream);
+
 }  // namespace osv::render

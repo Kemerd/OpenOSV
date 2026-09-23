@@ -29,6 +29,7 @@
 #include "ImporterInstance.h"
 
 #include "PluginLog.h"
+#include "UserDefaults.h"
 #include "resource.h"
 
 #include "osv/container/OsvFile.h"
@@ -103,6 +104,10 @@ void fillCombo(HWND dialog, int control, const wchar_t* const* items, int count,
     return sel == CB_ERR ? 0 : static_cast<int>(sel);
 }
 
+/// Read the widgets back into the controls (defined below the loaders; the
+/// [WP-DEFAULTS] Save as Default handler needs it earlier).
+void widgetsToControls(HWND dialog, DialogControls& c) noexcept;
+
 /// [WP-LOOK] Grey the Rec.709 look (and its label) unless Colour output is
 /// Rec.709: PQ, HLG and the passthrough have no look, so the control would
 /// otherwise look like it does something it cannot.  The selection itself is
@@ -148,6 +153,11 @@ struct DialogState {
     /// exist.  known == false (plain labels) when no clip could be read.
     CalibrationUiFacts calibrationFacts;
     bool accepted = false;
+    /// [WP-DEFAULTS] The blob the dialog was opened with.  "Save as Default"
+    /// builds its blob on top of it exactly as OK does, so the fields the
+    /// dialog does not show (parallax, flow backend, ...) are saved as the
+    /// clip has them rather than reset to the built-in values.
+    PrefsBlob base = PrefsBlob::defaults();
 };
 
 /// Fill a combo box from owned wide strings and select `index`.
@@ -250,12 +260,15 @@ HWND addDialogChild(HWND dialog, const wchar_t* cls, const wchar_t* text, DWORD 
     return child;
 }
 
-/// Append the sky seam rows and load `c` into them.  The rows take the
-/// place of the OK / Cancel row (wherever the template puts it), and the
-/// buttons - and the window - move down by the rows' height.
-void addPhotoSeamRows(HWND dialog, const DialogControls& c) noexcept {
-    constexpr int kRowStep = 20;           // the template's row pitch, dialog units
-    constexpr int kGrow = 3 * kRowStep;    // three rows
+/// The template's row pitch, dialog units.
+constexpr int kRowStep = 20;
+
+/// Make room for `rows` appended rows where the OK / Cancel row is now
+/// (wherever the template - or an earlier call - put it): the window grows
+/// by their height and the buttons move down with it.  Returns the first
+/// row's top in dialog units.
+int growDialogForRows(HWND dialog, int rows) noexcept {
+    const int kGrow = rows * kRowStep;
     // The first row sits where the OK button is now, in dialog units (the
     // template's own layout decides; 209 is what it says today).
     int firstRow = 208;
@@ -267,7 +280,6 @@ void addPhotoSeamRows(HWND dialog, const DialogControls& c) noexcept {
         ::ScreenToClient(dialog, &okTop);
         firstRow = ::MulDiv(okTop.y, 100, unit.bottom) - 1;
     }
-    const int kFirstRow = firstRow;
     // Grow the window and move OK / Cancel down by the rows' height.
     RECT grow{0, 0, 0, kGrow};
     ::MapDialogRect(dialog, &grow);
@@ -287,6 +299,14 @@ void addPhotoSeamRows(HWND dialog, const DialogControls& c) noexcept {
                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
+    return firstRow;
+}
+
+/// Append the sky seam rows and load `c` into them.  The rows take the
+/// place of the OK / Cancel row (wherever the template puts it), and the
+/// buttons - and the window - move down by the rows' height.
+void addPhotoSeamRows(HWND dialog, const DialogControls& c) noexcept {
+    const int kFirstRow = growDialogForRows(dialog, 3);
     // Row 1: what the fix corrects.  The combo index IS the PrefsPhotoSeam
     // value, so the list is in enum order.
     addDialogChild(dialog, L"STATIC", L"Sk&y seam fix:", SS_LEFT, kIdcStaticPhotoSeam, 7, kFirstRow + 3, 70, 8);
@@ -326,6 +346,124 @@ void photoWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
     c.seamInsetDeg = getEditDouble(dialog, kIdcSeamInset, c.seamInsetDeg);
 }
 // ---- [/WP-PHOTO] -------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+//  [WP-SEAMTOOLS] the seam tool rows
+// ---------------------------------------------------------------------------
+// Five number rows appended below the sky seam rows, the same way.  Ids are
+// clear of resource.h and of the sky seam rows (1040-1042, 1140-1144).
+
+/// One row: its label and the control ids of the label, the edit box and the
+/// "deg" unit after it.
+struct SeamToolRow {
+    const wchar_t* label;
+    int editId;
+    int labelId;
+    int unitId;
+};
+
+/// The rows, in the order the Effect Controls panel lists them (Seam Blend,
+/// Parallax Blend, Seam Smoothing, Near Offset, Far Offset).
+constexpr SeamToolRow kSeamToolRows[] = {
+    {L"Seam &blend:", 1043, 1145, 1150},     {L"&Parallax blend:", 1044, 1146, 1151},
+    {L"Seam s&moothing:", 1045, 1147, 1152}, {L"&Near offset:", 1046, 1148, 1153},
+    {L"&Far offset:", 1047, 1149, 1154},
+};
+
+/// The value of row `i` in `c` (the same order as kSeamToolRows).
+double* seamToolValue(DialogControls& c, std::size_t i) noexcept {
+    switch (i) {
+    case 0: return &c.seamBlendDeg;
+    case 1: return &c.parallaxBlendDeg;
+    case 2: return &c.seamSmoothingDeg;
+    case 3: return &c.nearOffsetDeg;
+    case 4: return &c.farOffsetDeg;
+    default: return nullptr;
+    }
+}
+
+/// Append the seam tool rows and load `c` into them.
+void addSeamToolRows(HWND dialog, const DialogControls& c) noexcept {
+    const int firstRow = growDialogForRows(dialog, static_cast<int>(std::size(kSeamToolRows)));
+    DialogControls values = c;  // seamToolValue hands out pointers into a copy
+    for (std::size_t i = 0; i < std::size(kSeamToolRows); ++i) {
+        const SeamToolRow& row = kSeamToolRows[i];
+        const int y = firstRow + static_cast<int>(i) * kRowStep;
+        addDialogChild(dialog, L"STATIC", row.label, SS_LEFT, row.labelId, 7, y + 3, 70, 8);
+        addDialogChild(dialog, L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, row.editId, 82, y, 50, 14);
+        addDialogChild(dialog, L"STATIC", L"deg", SS_LEFT, row.unitId, 137, y + 3, 40, 8);
+        const double* v = seamToolValue(values, i);
+        wchar_t text[32] = {};
+        ::swprintf_s(text, L"%.2f", v ? *v : 0.0);
+        ::SetDlgItemTextW(dialog, row.editId, text);
+    }
+}
+
+/// Read the seam tool rows back.  A missing or unparseable row keeps what the
+/// dialog opened with; the blob setters then round and clamp what was typed.
+void seamToolWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
+    for (std::size_t i = 0; i < std::size(kSeamToolRows); ++i) {
+        if (double* v = seamToolValue(c, i)) {
+            *v = getEditDouble(dialog, kSeamToolRows[i].editId, *v);
+        }
+    }
+}
+// ---- [/WP-SEAMTOOLS] ---------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+//  [WP-DEFAULTS] "Save as Default"
+// ---------------------------------------------------------------------------
+// The template puts the button and its status line at the left of the OK /
+// Cancel row.  Rows appended in code above that row (the sky seam rows) move
+// OK and Cancel down, so the button is re-aligned with OK afterwards instead
+// of each appended block having to know it exists.
+
+/// Put the Save as Default button and its status text on OK's row, keeping
+/// the vertical offset the template gives the text against the button.
+void placeDefaultsRow(HWND dialog) noexcept {
+    HWND ok = ::GetDlgItem(dialog, IDOK);
+    HWND button = ::GetDlgItem(dialog, IDC_SAVE_AS_DEFAULT);
+    RECT okRect{};
+    RECT buttonRect{};
+    if (!ok || !button || !::GetWindowRect(ok, &okRect) || !::GetWindowRect(button, &buttonRect)) {
+        return;  // nothing to align with: leave the template's layout
+    }
+    // How far the rows above pushed OK below where the button still sits.
+    const int shift = okRect.top - buttonRect.top;
+    if (shift == 0) {
+        return;
+    }
+    for (const int id : {IDC_SAVE_AS_DEFAULT, IDC_STATIC_DEFAULT_SAVED}) {
+        HWND control = ::GetDlgItem(dialog, id);
+        RECT r{};
+        if (!control || !::GetWindowRect(control, &r)) {
+            continue;
+        }
+        POINT topLeft{r.left, r.top};
+        ::ScreenToClient(dialog, &topLeft);
+        ::SetWindowPos(control, nullptr, topLeft.x, topLeft.y + shift, 0, 0,
+                       SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+/// Store what the widgets say right now as the user's defaults for new
+/// clips, and say how that went on the status line.  The dialog stays open:
+/// saving a default is not accepting the dialog, and Cancel still leaves
+/// this clip exactly as it was.
+void saveWidgetsAsDefault(HWND dialog, const DialogState& state) noexcept {
+    DialogControls now = state.controls;
+    widgetsToControls(dialog, now);
+    // On top of the incoming blob, like OK, so hidden fields are the clip's.
+    const PrefsBlob blob = prefsFromControls(now, state.base);
+    const Status saved = saveUserDefaults(blob);
+    ::SetDlgItemTextW(dialog, IDC_STATIC_DEFAULT_SAVED, saved.ok() ? L"Saved." : L"Could not save.");
+    if (saved.ok()) {
+        PluginLog::info("source settings dialog: saved as the default for new clips");
+    } else {
+        PluginLog::error("source settings dialog: could not save the default for new clips: {}",
+                         saved.error().message);
+    }
+}
 
 /// Load the controls into the widgets.
 void controlsToWidgets(HWND dialog, const DialogControls& c, const CalibrationUiFacts& calibrationFacts) noexcept {
@@ -422,6 +560,7 @@ void widgetsToControls(HWND dialog, DialogControls& c) noexcept {
     c.exposureStops = getEditDouble(dialog, IDC_EXPOSURE, c.exposureStops);
     c.look = comboSelection(dialog, IDC_REC709_LOOK);  // [WP-LOOK]
     photoWidgetsToControls(dialog, c);  // [WP-PHOTO]
+    seamToolWidgetsToControls(dialog, c);  // [WP-SEAMTOOLS]
 }
 
 /// The dialog procedure.  It never throws (a C callback crossing back into
@@ -435,7 +574,9 @@ INT_PTR CALLBACK sourceSettingsProc(HWND dialog, UINT message, WPARAM wParam, LP
         if (state) {
             controlsToWidgets(dialog, state->controls, state->calibrationFacts);
             addPhotoSeamRows(dialog, state->controls);  // [WP-PHOTO]
+            addSeamToolRows(dialog, state->controls);   // [WP-SEAMTOOLS]
         }
+        placeDefaultsRow(dialog);  // [WP-DEFAULTS] after every block that moves OK
         return TRUE;  // Let the dialog manager set the initial focus.
     }
     case WM_COMMAND: {
@@ -451,6 +592,13 @@ INT_PTR CALLBACK sourceSettingsProc(HWND dialog, UINT message, WPARAM wParam, LP
         }
         if (id == IDCANCEL) {
             ::EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        // [WP-DEFAULTS] Save as Default: store, report, stay open.
+        if (id == IDC_SAVE_AS_DEFAULT && HIWORD(wParam) == BN_CLICKED) {
+            if (state) {
+                saveWidgetsAsDefault(dialog, *state);
+            }
             return TRUE;
         }
         // [WP-LOOK] A new Colour output re-evaluates whether the look applies.
@@ -499,6 +647,7 @@ bool showDialogWithFacts(void* ownerWindow, PrefsBlob& prefs, const CalibrationU
     DialogState state;
     state.controls = controlsFromPrefs(prefs);
     state.calibrationFacts = calibrationFacts;
+    state.base = prefs;  // [WP-DEFAULTS] the hidden fields Save as Default keeps
 
     const INT_PTR result = ::DialogBoxParamW(module, MAKEINTRESOURCEW(IDD_SOURCE_SETTINGS),
                                              static_cast<HWND>(ownerWindow), &sourceSettingsProc,
@@ -530,6 +679,26 @@ bool showSourceSettingsDialog(void* ownerWindow, PrefsBlob& prefs) noexcept {
 
 namespace {
 
+/// [WP-DEFAULTS] Log that the prefs dialog of a clip with no stored settings
+/// opens on the user's saved defaults, naming the clip and the file.
+void logDialogStartsFromDefaults(ImporterInstance* instance, const imFileAccessRec8* fileAccess, bool firstTime,
+                                 const UserDefaults& startedFrom) noexcept {
+    try {
+        // The clip's name from the live instance, else from the record.
+        std::string clip = "a clip";
+        if (instance) {
+            clip = "'" + userDefaultsPathForLog(instance->path().filename()) + "'";
+        } else if (fileAccess && fileAccess->filepath && fileAccess->filepath[0] != 0) {
+            const std::filesystem::path named(reinterpret_cast<const wchar_t*>(fileAccess->filepath));
+            clip = "'" + userDefaultsPathForLog(named.filename()) + "'";
+        }
+        PluginLog::info("source settings: {} has no stored settings{}; starting from the user defaults in {}", clip,
+                        firstTime ? " (first-time call)" : "", userDefaultsPathForLog(startedFrom.path));
+    } catch (...) {
+        // Formatting only; the settings themselves are unaffected.
+    }
+}
+
 /// The shared body of both prefs selectors.  `instance` may be null
 /// (imGetPrefs8 has no privateData by design); `fileAccess` may be null too,
 /// and is only read to label the calibration choices for the clip.
@@ -551,10 +720,19 @@ namespace {
         return imNoErr;
     }
 
-    // Step 2: the buffer exists.  Anything that is not one of our blobs (a
-    // first-time call, a blob from another importer, garbage) becomes the
-    // documented defaults.
-    PrefsBlob blob = PrefsBlob::fromBytes(rec->prefs, static_cast<std::size_t>(rec->prefsLength));
+    // Step 2: the buffer exists.  A blob of ours is the clip's stored
+    // settings and is used as is (sanitised).  [WP-DEFAULTS] Anything else -
+    // a first-time call (rec->firstTime), a zero-filled buffer, a blob from
+    // another importer, garbage - is a clip with no settings yet, and it
+    // starts from the user's saved defaults instead of the built-in ones
+    // (which is what those are when nothing was saved).
+    UserDefaults startedFrom;
+    bool fromUserDefaults = false;
+    PrefsBlob blob = storedPrefsOrUserDefaults(rec->prefs, static_cast<std::size_t>(rec->prefsLength), &startedFrom,
+                                               &fromUserDefaults);
+    if (fromUserDefaults && startedFrom.fromFile) {
+        logDialogStartsFromDefaults(instance, fileAccess, rec->firstTime != 0, startedFrom);
+    }
     // What the clip was using before the dialog, to tell whether OK changed
     // anything the frames depend on (see the refresh below).
     const PrefsBlob before = blob;
@@ -639,6 +817,27 @@ csSDK_int32 handleGetInstancePrefs(imStdParms* stdParms, imFileAccessRec8* fileA
 }
 
 // ---------------------------------------------------------------------------
+//  [WP-DEFAULTS] the new-clip log line
+// ---------------------------------------------------------------------------
+
+void noteNewClipDefaults(ImporterInstance* instance, const char* where) noexcept {
+    if (!instance) {
+        return;
+    }
+    try {
+        std::string source;
+        if (!instance->takeUserDefaultsNotice(source)) {
+            return;  // stored settings, the built-in defaults, or already said
+        }
+        PluginLog::info("new clip '{}' ({}): no stored Source Settings; starting from the user defaults in {} - {}",
+                        userDefaultsPathForLog(instance->path().filename()), where ? where : "?", source,
+                        userDefaultsSummary(instance->prefs()));
+    } catch (...) {
+        // Allocation failure while formatting: the clip is unaffected.
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  imPerformSourceSettingsCommand (selector 66)
 // ---------------------------------------------------------------------------
 //
@@ -705,6 +904,10 @@ csSDK_int32 handlePerformSourceSettingsCommand(imStdParms* stdParms, imFileAcces
     // makes the panel show "as shot" after a project reopen.
     const PrefsBlob current = instance->prefs();
     std::memcpy(rec->ioData, &current, PrefsBlob::kSize);
+    // [WP-DEFAULTS] For a NEW clip that blob is the user defaults the
+    // instance was seeded with, and the effect's controls are about to show
+    // them: the one log line a new clip gets, unless imGetInfo8 wrote it.
+    noteNewClipDefaults(instance, "imPerformSourceSettingsCommand");
 
     PluginLog::debug("imPerformSourceSettingsCommand: '{}' reports colour {}, size {}, stab {}, seam {}, "
                      "gain {}, calib {}, fit {}, exposure {:+.2f}, device {}",

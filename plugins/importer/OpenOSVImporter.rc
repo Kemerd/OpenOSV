@@ -96,6 +96,15 @@ BEGIN
     // ---- Buttons ----------------------------------------------------------
     DEFPUSHBUTTON   "OK", IDOK, 156, 223, 50, 16
     PUSHBUTTON      "Cancel", IDCANCEL, 211, 223, 50, 16
+
+    // ---- [WP-DEFAULTS] Save as Default, on the OK / Cancel row ------------
+    // Stores the settings shown as the defaults every NEW clip starts from;
+    // the dialog stays open and this clip is only changed by OK.  The status
+    // text says "Saved." or "Could not save."; the dialog code keeps both on
+    // OK's row when rows are appended above it.  "&f", because D, S and E
+    // are already Render device's, Output size's and Exposure's mnemonics.
+    PUSHBUTTON      "Save as De&fault", IDC_SAVE_AS_DEFAULT, 7, 223, 70, 16
+    LTEXT           "", IDC_STATIC_DEFAULT_SAVED, 82, 227, 70, 8
 END
 
 // ---------------------------------------------------------------------------

@@ -1,10 +1,10 @@
 # OpenOSV
 
-**Clean-room, open-source toolkit for DJI Osmo 360 `.OSV` footage on Windows.**
+**Independent, open-source toolkit for DJI Osmo 360 `.OSV` footage on Windows.**
 Parse the container, read the embedded lens calibration and IMU data, stitch and
 reframe the dual-fisheye streams on CPU, CUDA or OpenCL, and convert 10-bit
-D-Log M to Rec.2100 PQ / HLG (or Rec.709) with public colour math — then edit
-it natively in Adobe Premiere Pro.
+D-Log M to Rec.2100 PQ / HLG (or Rec.709) with open, documented colour math —
+then edit it natively in Adobe Premiere Pro.
 
 > Status: the core library, the `osvtool` CLI and both Premiere Pro plug-ins
 > are implemented and tested. See `docs/PREMIERE.md` for the plug-ins and
@@ -152,3 +152,18 @@ See `docs/ARCHITECTURE.md`, `docs/FORMAT.md`, `docs/GEOMETRY.md` and
 
 Apache-2.0. See `LICENSE` and `NOTICE`. FFmpeg is used under the LGPL and is
 linked dynamically; no GPL components are enabled.
+
+## Legal
+
+OpenOSV is an independent project, not affiliated with, endorsed by or
+sponsored by DJI or Adobe. DJI, Osmo and Osmo 360 are trademarks of SZ DJI
+Technology Co., Ltd.; Adobe, Premiere Pro and After Effects are trademarks of
+Adobe Inc. The names are used only to say what OpenOSV works with.
+
+It contains no DJI code, binaries, neural-network models, LUT files or
+artwork. DJI's publicly distributed software was analysed so OpenOSV can read
+the camera's files and render them the way DJI's own tools do; the numbers
+and formulas taken from that analysis are re-implemented in OpenOSV's own code
+and listed, with how each was obtained, in `docs/LEGAL.md`. Third-party
+licences are in `NOTICE`; the papers and standards the project builds on are in
+`docs/CITATIONS.md`.

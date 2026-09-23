@@ -220,7 +220,8 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
 
     const std::vector<PF_ParamDef> params = addedParams(fixture);
 
-    // Nineteen: fifteen controls plus the four group markers.  PF_ADD_TOPIC and
+    // Twenty-eight: twenty value controls, the two Defaults buttons and the
+    // six group markers.  PF_ADD_TOPIC and
     // PF_END_TOPIC each issue their own PF_ADD_PARAM, so a group occupies two
     // real slots - counting only the controls is the mistake that shifts
     // every index after the first group.
@@ -254,6 +255,9 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
             {kIndexCalibration, PF_Param_POPUP},     {kIndexFlareRemoval, PF_Param_CHECKBOX},
             {kIndexPhotoSeam, PF_Param_POPUP},       {kIndexPhotoStrength, PF_Param_FLOAT_SLIDER},  // [WP-PHOTO]
             {kIndexSeamInset, PF_Param_FLOAT_SLIDER},
+            {kIndexSeamBlend, PF_Param_FLOAT_SLIDER},  {kIndexParallaxBlend, PF_Param_FLOAT_SLIDER},  // [WP-SEAMTOOLS]
+            {kIndexSeamSmoothing, PF_Param_FLOAT_SLIDER}, {kIndexNearOffset, PF_Param_FLOAT_SLIDER},
+            {kIndexFarOffset, PF_Param_FLOAT_SLIDER},
             {kIndexStitchTopicEnd, PF_Param_GROUP_END},
             {kIndexAdvancedTopic, PF_Param_GROUP_START}, {kIndexDlogmFit, PF_Param_POPUP},
             {kIndexExposure, PF_Param_FLOAT_SLIDER}, {kIndexRenderDevice, PF_Param_POPUP},
@@ -283,8 +287,10 @@ TEST_CASE("every value-carrying control refuses to vary over time", "[sourcesett
         kIndexFlareRemoval,
         kIndexRec709Look,
         kIndexPhotoSeam, kIndexPhotoStrength, kIndexSeamInset,  // [WP-PHOTO]
+        kIndexSeamBlend, kIndexParallaxBlend, kIndexSeamSmoothing, kIndexNearOffset, kIndexFarOffset,  // [WP-SEAMTOOLS]
     };
     for (const int index : valueIndices) {
+        REQUIRE(index >= 1);  // a short initialiser list would leave zeros behind
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");
         CHECK((params[static_cast<std::size_t>(index) - 1u].flags & PF_ParamFlag_CANNOT_TIME_VARY) != 0);
     }
@@ -342,8 +348,9 @@ TEST_CASE("the two groups are balanced and every control is inside the intended 
         CHECK(depthAt[static_cast<std::size_t>(index)] == 0);
     }
     for (const int index : {kIndexSeamSearch, kIndexGainMatch, kIndexCalibration, kIndexFlareRemoval, kIndexPhotoSeam,
-                            kIndexPhotoStrength, kIndexSeamInset, kIndexDlogmFit, kIndexExposure, kIndexRenderDevice,
-                            kIndexDirectColour}) {
+                            kIndexPhotoStrength, kIndexSeamInset, kIndexSeamBlend, kIndexParallaxBlend,
+                            kIndexSeamSmoothing, kIndexNearOffset, kIndexFarOffset, kIndexDlogmFit, kIndexExposure,
+                            kIndexRenderDevice, kIndexDirectColour}) {
         INFO("grouped index " << index);
         CHECK(depthAt[static_cast<std::size_t>(index)] == 1);
     }
@@ -495,4 +502,48 @@ TEST_CASE("the sky seam sliders offer exactly what the blob stores", "[sourceset
     CHECK(static_cast<double>(inset.u.fs_d.slider_min) == Catch::Approx(0.0));
     CHECK(static_cast<double>(inset.u.fs_d.slider_max) == Catch::Approx(6.0));
     CHECK(inset.u.fs_d.precision == PF_Precision_TENTHS);
+}
+
+TEST_CASE("the seam tool sliders offer exactly what the blob stores", "[sourcesettings][params][seamtools]") {
+    // [WP-SEAMTOOLS] Each slider's valid and slider range is its blob field's
+    // stored range, its default the blob's default, shown in hundredths.
+    EffectFixture fixture;
+    REQUIRE(LoadedPlugin::instance().ok());
+    const std::vector<PF_ParamDef> params = addedParams(fixture);
+    REQUIRE(params.size() == static_cast<std::size_t>(OSV_SOURCE_SETTINGS_PARAM_COUNT));
+    const PrefsBlob defaults = PrefsBlob::defaults();
+    struct Expected {
+        int index;
+        double lo;
+        double hi;
+        double dflt;
+    };
+    const double step = static_cast<double>(PrefsBlob::kSeamToolStepsPerDeg);
+    const double offsetMax = static_cast<double>(PrefsBlob::kMaxSeamOffsetHundredths) / 100.0;
+    const Expected expected[] = {
+        {kIndexSeamBlend, (PrefsBlob::kMinSeamBlendCode - 1) / step, (PrefsBlob::kMaxSeamBlendCode - 1) / step,
+         defaults.seamBlendDeg()},
+        {kIndexParallaxBlend, 0.0, (PrefsBlob::kMaxParallaxBlendCode - 1) / step, defaults.parallaxBlendDeg()},
+        {kIndexSeamSmoothing, 0.0, (PrefsBlob::kMaxSeamSmoothingCode - 1) / step, defaults.seamSmoothingDeg()},
+        {kIndexNearOffset, -offsetMax, offsetMax, defaults.nearOffsetDeg()},
+        {kIndexFarOffset, -offsetMax, offsetMax, defaults.farOffsetDeg()},
+    };
+    for (const Expected& e : expected) {
+        const PF_ParamDef& def = params[static_cast<std::size_t>(e.index) - 1u];
+        INFO("index " << e.index << " (" << kParamNameByIndex[e.index - 1] << ")");
+        CHECK(def.param_type == PF_Param_FLOAT_SLIDER);
+        CHECK(static_cast<double>(def.u.fs_d.valid_min) == Catch::Approx(e.lo));
+        CHECK(static_cast<double>(def.u.fs_d.valid_max) == Catch::Approx(e.hi));
+        CHECK(static_cast<double>(def.u.fs_d.slider_min) == Catch::Approx(e.lo));
+        CHECK(static_cast<double>(def.u.fs_d.slider_max) == Catch::Approx(e.hi));
+        CHECK(static_cast<double>(def.u.fs_d.dephault) == Catch::Approx(e.dflt));
+        CHECK(def.u.fs_d.precision == PF_Precision_HUNDREDTHS);
+        CHECK((def.flags & PF_ParamFlag_CANNOT_TIME_VARY) != 0);
+    }
+    // Their permanent ids are this package's range, 20-29.
+    for (const int id : {OSV_SS_ID_SEAM_BLEND, OSV_SS_ID_PARALLAX_BLEND, OSV_SS_ID_SEAM_SMOOTHING,
+                         OSV_SS_ID_NEAR_OFFSET, OSV_SS_ID_FAR_OFFSET}) {
+        CHECK(id >= 20);
+        CHECK(id <= 29);
+    }
 }

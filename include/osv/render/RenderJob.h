@@ -97,8 +97,20 @@ struct RenderJob {
                 return false;
             }
         }
+        // [WP-SEAMTOOLS] The seam smoothing's low band is built by the
+        // renderer from the planes, so the job carries no table - only the
+        // fields that size and blur it, which must describe something every
+        // backend can build and index safely.
+        if (params.seamSmoothEnabled && !seamSmoothFieldsValid(params)) {
+            return false;
+        }
         return true;
     }
+
+    /// [WP-SEAMTOOLS] True when the seam smoothing fields of `p` are usable
+    /// (defined in SeamTools.cpp as seamSmoothParamsValid; declared here so
+    /// the job's own check needs no extra include).
+    [[nodiscard]] static bool seamSmoothFieldsValid(const OsvRenderParams& p) noexcept;
 };
 
 /// Fill an OsvPlane descriptor from a decoded frame.  Returns false when the

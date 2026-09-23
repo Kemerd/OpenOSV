@@ -199,6 +199,7 @@ extern "C" __global__ void osvReframeDirectKernel(OSV_GRID_CONST const OsvRender
                                                   const float* __restrict__ seam, const float* __restrict__ warp,
                                                   const float* __restrict__ blendSeam,
                                                   const float* __restrict__ photo,
+                                                  const float* __restrict__ seamLow,
                                                   unsigned char* __restrict__ dstBase, int dstRowBytes,
                                                   int dstIsHalf) {
     const int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
@@ -214,8 +215,9 @@ extern "C" __global__ void osvReframeDirectKernel(OSV_GRID_CONST const OsvRender
      * come back transparent black, so no clear pass is needed. */
     float rgba[4];
     /* [WP-SEAM] blendSeam is the carved seam table, or NULL without one;
-     * [WP-PHOTO] photo is the photometric seam table, or NULL without one. */
-    osvShadePixelWSP(&params, planes.lens, seam, warp, blendSeam, photo, x, y, rgba);
+     * [WP-PHOTO] photo is the photometric seam table, or NULL without one;
+     * [WP-SEAMTOOLS] seamLow is the engine's seam low band, or NULL. */
+    osvShadePixelWSPL(&params, planes.lens, seam, warp, blendSeam, photo, seamLow, x, y, rgba);
 
     /* Premiere GPU frame: top-left origin, positive pitch. */
     unsigned char* row = dstBase + (size_t)y * (size_t)dstRowBytes;

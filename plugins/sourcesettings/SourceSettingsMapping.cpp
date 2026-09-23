@@ -93,6 +93,17 @@ PrefsBlob prefsFromControls(const ControlValues& controls) noexcept {
     blob.setPhotoStrengthPercent(controls.photoStrengthPercent);
     blob.setSeamInsetDeg(controls.seamInsetDeg);
 
+    // [WP-SEAMTOOLS] The five seam tools, through the blob's setters in the
+    // same way: rounded to the stored step (a twentieth of a degree for the
+    // widths, a hundredth for the offsets), clamped, NaN / infinities to the
+    // default, the default stored as zero - an untouched control leaves the
+    // blob byte-identical to PrefsBlob::defaults().
+    blob.setSeamBlendDeg(controls.seamBlendDeg);
+    blob.setParallaxBlendDeg(controls.parallaxBlendDeg);
+    blob.setSeamSmoothingDeg(controls.seamSmoothingDeg);
+    blob.setNearOffsetDeg(controls.nearOffsetDeg);
+    blob.setFarOffsetDeg(controls.farOffsetDeg);
+
     // Clamp everything into range and zero the reserved bytes.  After this
     // the blob is byte-for-byte what the importer expects, which is the
     // property the round-trip test pins.
@@ -140,6 +151,12 @@ ControlValues controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.photoSeam = toPopup(clean.photoSeam, OSV_SS_PHOTO_SEAM_COUNT);
     c.photoStrengthPercent = clean.photoStrengthPercent();
     c.seamInsetDeg = clean.seamInsetDeg();
+    // [WP-SEAMTOOLS] Likewise: code 0 decodes to each tool's default.
+    c.seamBlendDeg = clean.seamBlendDeg();
+    c.parallaxBlendDeg = clean.parallaxBlendDeg();
+    c.seamSmoothingDeg = clean.seamSmoothingDeg();
+    c.nearOffsetDeg = clean.nearOffsetDeg();
+    c.farOffsetDeg = clean.farOffsetDeg();
     return c;
 }
 

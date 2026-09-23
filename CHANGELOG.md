@@ -8,6 +8,34 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ### Added
 
+* **Seam tools in Source Settings (WP-SEAMTOOLS).** Five sliders in the
+  Stitching group tweak the carved seam; every default is the seam as it
+  rendered before (bit-identical), and each changes only the overlap. Seam
+  Blend / Parallax Blend set the feather where the lenses agree / disagree
+  (1.5 / 0.35 deg; the seam's path never moves). Seam Smoothing is a real
+  two-band blend (DJI's multiband): colour blends wide while detail still
+  switches at the seam, from a per-frame low band built on the GPU for NVDEC
+  frames and the direct path - at 1-2 deg the nacelle's seam edge falls 46-59 %
+  (0.32 -> 0.17 / 0.13) with a sharp double image of 2.1-2.5 instead of
+  Parallax Blend's 4.9-6.2 at the same edge, for +0.1-0.3 ms per frame on the
+  GPU. Near / Far Offset shift content along the seam where the lenses
+  disagree / agree (on the sample the carve's mask does not isolate the
+  nacelle; see docs/PREMIERE.md). Also in the importer dialog, osvtool
+  (`--seam-blend`, `--parallax-blend`, `--seam-smoothing`, `--near-offset`,
+  `--far-offset`) and the user defaults file. Engine ABI 3.
+* **Defaults for new clips (WP-DEFAULTS).** Set a clip up the way you like,
+  open the Source Settings effect's "Defaults" group and click "Save as
+  Default for New Clips" (or "Save as Default" in the Source Settings
+  dialog): every clip imported afterwards starts with those settings -
+  colour output and look, output size, stabilisation, seam / sky seam / sun
+  ghost options, calibration, D-Log M curve, exposure, render device,
+  Program Monitor Colour. Clips that already have settings keep them.
+  "Restore Built-in Defaults" goes back. The settings live in
+  `%APPDATA%\OpenOSV\defaults.json` (one named key per setting, written
+  atomically; `OPENOSV_DEFAULTS_FILE` overrides the location), and
+  `osvtool render --use-user-defaults` renders with them on request. A
+  zero-filled prefs buffer is no longer adopted as the built-in defaults, so
+  a new clip keeps the settings it started with.
 * **Companion panel "OpenOSV" (WP-PANEL): Open 360 Reframe goes on every
   OSV clip you drop.** A small Premiere panel watches the timeline and
   applies the effect to every `.OSV` / `.LRF` clip added to a sequence, once,

@@ -163,10 +163,17 @@ template <class Body> void forRange(ThreadPool* pool, std::size_t n, std::size_t
     if (p.columns == 0 || p.columns > 65536u) {
         return failStatus(ErrorCode::InvalidArgument, "carveSeam: columns must be in [1, 65536]");
     }
-    if (!(p.narrowHalfWidthDeg > 0.0) || !std::isfinite(p.narrowHalfWidthDeg) || !(p.wideHalfWidthDeg > 0.0) ||
+    // [WP-SEAMTOOLS] narrow may be 0 - a hard cut where the lenses disagree
+    // ("Parallax Blend" at 0); the kernel draws a zero feather as exactly
+    // that, and nothing below divides by it.
+    if (!(p.narrowHalfWidthDeg >= 0.0) || !std::isfinite(p.narrowHalfWidthDeg) || !(p.wideHalfWidthDeg > 0.0) ||
         !std::isfinite(p.wideHalfWidthDeg) || p.narrowHalfWidthDeg > p.wideHalfWidthDeg || p.wideHalfWidthDeg > 30.0) {
         return failStatus(ErrorCode::InvalidArgument,
-                          "carveSeam: feather half widths must satisfy 0 < narrow <= wide <= 30 degrees");
+                          "carveSeam: feather half widths must satisfy 0 <= narrow <= wide <= 30 degrees");
+    }
+    // [WP-SEAMTOOLS] The cost window: a real window, at most a band's worth.
+    if (!(p.costWindowDeg > 0.0) || !std::isfinite(p.costWindowDeg) || p.costWindowDeg > 30.0) {
+        return failStatus(ErrorCode::InvalidArgument, "carveSeam: costWindowDeg must be in (0, 30] degrees");
     }
     if (!finiteNonNeg(p.agreeResidual) || !std::isfinite(p.disagreeResidual) ||
         !(p.disagreeResidual > p.agreeResidual)) {
@@ -177,7 +184,7 @@ template <class Body> void forRange(ThreadPool* pool, std::size_t n, std::size_t
     }
     if (!finiteNonNeg(p.diffWeight) || !finiteNonNeg(p.gradWeight) || !finiteNonNeg(p.centreWeight) ||
         !finiteNonNeg(p.temporalWeight) || !finiteNonNeg(p.coverageWeight) || !finiteNonNeg(p.stepPenalty) ||
-        !finiteNonNeg(p.smoothSigmaCols) || !finiteNonNeg(p.widthSigmaCols)) {
+        !finiteNonNeg(p.smoothSigmaCols) || !finiteNonNeg(p.widthSigmaCols) || !finiteNonNeg(p.nearSigmaCols)) {
         return failStatus(ErrorCode::InvalidArgument, "carveSeam: weights must be finite and >= 0");
     }
     if (!(p.temporalNormDeg > 0.0) || !std::isfinite(p.temporalNormDeg) || !(p.temporalClampDeg > 0.0) ||
@@ -458,6 +465,18 @@ bool BlendSeam::valid() const noexcept {
             return false;
         }
     }
+    // [WP-SEAMTOOLS] The near weight is optional, but when present it is one
+    // weight in [0, 1] per column - an offset composer indexes it by column.
+    if (!nearWeight.empty()) {
+        if (nearWeight.size() != static_cast<std::size_t>(columns)) {
+            return false;
+        }
+        for (const float v : nearWeight) {
+            if (!(v >= 0.0f && v <= 1.0f)) {
+                return false;  // NaN fails both comparisons
+            }
+        }
+    }
     return std::isfinite(edgeRad) && edgeRad >= 0.0f;
 }
 
@@ -714,8 +733,11 @@ Result<BlendSeam> carveSeamFromBands(const LensBands& bands, const SeamCorrectio
     }
 
     // ---- 6. the cost of a seam at each (row, column) -----------------------
-    // Feather window: +/- mw rows around the seam row, both lenses mixed.
-    const int mw = std::max(1, static_cast<int>(std::lround(params.narrowHalfWidthDeg * rowsPerDeg)));
+    // Cost window: +/- mw rows around the seam row, where the default narrow
+    // feather mixes both lenses.  [WP-SEAMTOOLS] Its own parameter (equal to
+    // the default narrow feather), so the Source Settings feather widths
+    // never move the seam.
+    const int mw = std::max(1, static_cast<int>(std::lround(params.costWindowDeg * rowsPerDeg)));
     const int Hi = static_cast<int>(H);
     const double rc = 0.5 * static_cast<double>(Hi - 1);  // the geometric seam: the band is symmetric about it
     const double halfH = std::max(1.0, 0.5 * static_cast<double>(Hi));
@@ -813,6 +835,9 @@ Result<BlendSeam> carveSeamFromBands(const LensBands& bands, const SeamCorrectio
     // they do not.
     std::vector<double> width(N, params.wideHalfWidthDeg);
     std::vector<double> residual(N, 0.0);
+    // [WP-SEAMTOOLS] The same disagreement weight, kept for the Near / Far
+    // Offset (BlendSeam::nearWeight): 0 = the lenses agree, 1 = they do not.
+    std::vector<double> disagree(N, 0.0);
     for (std::uint32_t c = 0; c < N; ++c) {
         const int rr = std::clamp(static_cast<int>(std::lround(rows[c])), 0, Hi - 1);
         double e = 0.0;
@@ -825,10 +850,19 @@ Result<BlendSeam> carveSeamFromBands(const LensBands& bands, const SeamCorrectio
         residual[c] = e;
         const double t = smoothstep01((e - params.agreeResidual) / (params.disagreeResidual - params.agreeResidual));
         width[c] = params.wideHalfWidthDeg + (params.narrowHalfWidthDeg - params.wideHalfWidthDeg) * t;
+        disagree[c] = t;
     }
     width = smoothRing(width, params.widthSigmaCols);
+    // [WP-SEAMTOOLS] Smoothed along the ring on its own (wider) scale; a
+    // Gaussian of values in [0, 1] stays in [0, 1], the clamp only absorbs
+    // rounding.
+    disagree = smoothRing(disagree, params.nearSigmaCols);
 
     seam.table.assign(static_cast<std::size_t>(N) * 2u, 0.0f);
+    seam.nearWeight.assign(N, 0.0f);  // [WP-SEAMTOOLS]
+    for (std::uint32_t c = 0; c < N; ++c) {
+        seam.nearWeight[c] = static_cast<float>(std::clamp(disagree[c], 0.0, 1.0));
+    }
     double latSum = 0.0, latMax = 0.0, widthSum = 0.0, residualSum = 0.0, priorStep = 0.0;
     for (std::uint32_t c = 0; c < N; ++c) {
         // Never so wide that the feather reaches a row where either lens is
@@ -903,6 +937,13 @@ Result<BlendSeam> blendSeams(const BlendSeam& from, const BlendSeam& to, double 
     // that bucket's own seam, not one rounding step away from it.
     for (std::size_t i = 0; i < out.table.size(); ++i) {
         out.table[i] = from.table[i] * (1.0f - k) + to.table[i] * k;
+    }
+    // [WP-SEAMTOOLS] The near weight glides with the seam, by the same exact-
+    // ends rule; a seam without one leaves `to`'s (possibly empty) as it is.
+    if (from.nearWeight.size() == to.nearWeight.size() && !to.nearWeight.empty()) {
+        for (std::size_t i = 0; i < out.nearWeight.size(); ++i) {
+            out.nearWeight[i] = std::clamp(from.nearWeight[i] * (1.0f - k) + to.nearWeight[i] * k, 0.0f, 1.0f);
+        }
     }
     return out;
 }

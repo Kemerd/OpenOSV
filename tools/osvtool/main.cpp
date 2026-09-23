@@ -57,7 +57,7 @@ std::string toUtf8(const wchar_t* wide) {
 
 int runApp(std::vector<std::string> args) {
     CLI::App app{std::string(osv::Version::productName()) + " " + osv::Version::string() +
-                 " - clean-room DJI Osmo 360 (.OSV) toolkit"};
+                 " - independent open-source DJI Osmo 360 (.OSV) toolkit"};
     app.set_help_all_flag("--help-all", "Show help for every sub-command");
     app.require_subcommand(0, 1);
 

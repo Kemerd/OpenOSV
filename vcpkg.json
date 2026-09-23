@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "openosv",
   "version-string": "0.1.0",
-  "description": "Clean-room DJI Osmo 360 .OSV toolkit: parser, stitcher, reframer, HDR colour pipeline",
+  "description": "Independent open-source DJI Osmo 360 .OSV toolkit: parser, stitcher, reframer, HDR colour pipeline",
   "license": "Apache-2.0",
   "builtin-baseline": "a97c98d785fc0b1710bc711acf47767b756e6b7c",
   "dependencies": [

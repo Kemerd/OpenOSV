@@ -55,6 +55,7 @@
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"
 #include "osv/render/SeamCarve.h"
+#include "osv/render/SeamTools.h"  // [WP-SEAMTOOLS]
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/video/DualStreamReader.h"
 #include "osv/video/GpuClipDecoder.h"
@@ -386,6 +387,35 @@ public:
     /// its prefs changes are not published back to the engine registry.
     void setEngineOwned(bool owned) noexcept { m_engineOwned = owned; }
 
+    // ---- [WP-DEFAULTS] the per-user defaults a new clip starts from --------
+    /// Start this instance from `prefs` - the user's saved Source Settings
+    /// defaults (plugins/common/UserDefaults.h) - instead of
+    /// PrefsBlob::defaults().
+    ///
+    /// For a clip that already has stored settings this is only a starting
+    /// point: the host hands the stored blob to the next prefs-carrying
+    /// selector (imGetInfo8 follows imOpenFile8) and it replaces the seed
+    /// before anything is rendered.  For a NEW clip the host has no blob, so
+    /// the seed is what the clip is decoded with until the Source Settings
+    /// effect or the dialog stores one.
+    ///
+    /// Only a fresh instance can be seeded: once it has parsed the clip,
+    /// built anything from its prefs or adopted a host blob, the call
+    /// changes nothing and returns false (re-seeding then would silently
+    /// re-stitch a clip under the user).  `source` names the file the
+    /// defaults came from, for the one log line a new clip gets; empty means
+    /// the built-in defaults, which need no announcement.  Takes lock().
+    bool seedStartingPrefs(const PrefsBlob& prefs, std::string source);
+
+    /// True exactly once per instance: when it is still running on seeded
+    /// user defaults because the host has given it no stored settings, i.e.
+    /// the clip is new.  `source` then receives the file the defaults came
+    /// from.  False for a clip with stored settings, for an instance seeded
+    /// with the built-in defaults, and on every call after the first true.
+    /// Takes lock().
+    [[nodiscard]] bool takeUserDefaultsNotice(std::string& source);
+    // ---- [/WP-DEFAULTS] -----------------------------------------------------
+
     /// The per-instance lock.  Every entry point that decodes, renders or
     /// touches the reader takes it.
     [[nodiscard]] std::mutex& lock() noexcept { return m_mutex; }
@@ -580,6 +610,14 @@ private:
     /// holds m_mutex.
     void publishSettingsLocked(bool fromHost) noexcept;
     // ---- [/WP-SETTINGS] ----------------------------------------------------
+
+    // ---- [WP-DEFAULTS] seedStartingPrefs() / takeUserDefaultsNotice() ------
+    /// The defaults file the starting prefs came from (UTF-8, for the log);
+    /// empty when the instance started from the built-in defaults.
+    std::string m_defaultsSource;
+    /// takeUserDefaultsNotice() has already answered true once.
+    bool m_defaultsNoticeTaken = false;
+    // ---- [/WP-DEFAULTS] -----------------------------------------------------
     std::unique_ptr<AudioDecoder> m_audio;
     bool m_audioProbed = false;
 
@@ -680,10 +718,28 @@ private:
     /// grid is still being measured) borrows a nearby bucket's seam and
     /// clears `frameExact`.  Called by applyAnalyses with m_mutex held;
     /// takes m_parallaxMutex itself.  Failures are logged and leave the frame
-    /// on the ordinary feather.
-    void applyCarvedSeam(std::uint32_t index, const video::FramePair& pair, bool wantParallax, RenderPurpose purpose,
-                         ThreadPool& pool, render::RenderParamsBuilder& builder, bool& frameExact);
+    /// on the ordinary feather.  [WP-SEAMTOOLS] Carves with the Source
+    /// Settings Seam Blend / Parallax Blend, and returns the seam it applied
+    /// (null when none) for the seam tools that follow it.
+    std::shared_ptr<const render::BlendSeam> applyCarvedSeam(std::uint32_t index, const video::FramePair& pair,
+                                                             bool wantParallax, RenderPurpose purpose,
+                                                             ThreadPool& pool, render::RenderParamsBuilder& builder,
+                                                             bool& frameExact);
     // ---- [/WP-SEAM] ----------------------------------------------------------
+
+    // ---- [WP-SEAMTOOLS] the carved seam's tweaks (SeamTools.h) ----------------
+    /// The five seam tools the current prefs ask for.
+    [[nodiscard]] render::SeamTools seamToolsLocked() const noexcept;
+
+    /// After the carve: add the Near / Far Offset to the frame's warp grid
+    /// (`grid`, the parallax grid applied, or null) along `seam`, and switch
+    /// on the Seam Smoothing - both only with a carved seam in force (`seam`
+    /// non-null), both no-ops at their defaults, so a frame with default
+    /// prefs is built exactly as before.  Failures are logged and leave the
+    /// frame without that tool.
+    void applySeamTools(std::uint32_t index, const render::BlendSeam* seam, const render::ParallaxWarpGrid* grid,
+                        render::RenderParamsBuilder& builder);
+    // ---- [/WP-SEAMTOOLS] --------------------------------------------------------
 
     // ---- [WP-FLARE] sun ghost removal (FlareStage.h) --------------------------
     /// Per-bucket ghost models, their background worker and the seam penalty.

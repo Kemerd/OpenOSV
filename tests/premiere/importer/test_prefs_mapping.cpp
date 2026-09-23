@@ -550,3 +550,70 @@ TEST_CASE("the sky seam fix controls round trip and refuse garbage", "[importer]
     REQUIRE(blob.seamInsetDeg() == 2.6);
     REQUIRE(blob.sanitise());
 }
+
+// ---------------------------------------------------------------------------
+//  [WP-SEAMTOOLS] the seam tool rows
+// ---------------------------------------------------------------------------
+
+TEST_CASE("the seam tool controls round trip and refuse garbage", "[importer][prefs][mapping][seamtools]") {
+    // Defaults: the carved seam exactly as it renders without the tools.
+    const DialogControls shown = controlsFromPrefs(PrefsBlob::defaults());
+    REQUIRE(shown.seamBlendDeg == 1.5);
+    REQUIRE(shown.parallaxBlendDeg == 0.35);
+    REQUIRE(shown.seamSmoothingDeg == 0.0);
+    REQUIRE(shown.nearOffsetDeg == 0.0);
+    REQUIRE(shown.farOffsetDeg == 0.0);
+    // The dialog's own defaults agree (a dialog opened without a blob).
+    const DialogControls fresh;
+    REQUIRE(fresh.seamBlendDeg == shown.seamBlendDeg);
+    REQUIRE(fresh.parallaxBlendDeg == shown.parallaxBlendDeg);
+    REQUIRE(fresh.seamSmoothingDeg == shown.seamSmoothingDeg);
+
+    // A spread of every tool survives the round trip, blob -> rows -> blob.
+    for (const double blend : {0.2, 1.5, 3.25, 8.0}) {
+        for (const double parallax : {0.0, 0.35, 1.0, 4.0}) {
+            for (const double smoothing : {0.0, 0.5, 2.0, 8.0}) {
+                for (const double offset : {-3.0, -0.42, 0.0, 1.37, 3.0}) {
+                    PrefsBlob original = PrefsBlob::defaults();
+                    original.setSeamBlendDeg(blend);
+                    original.setParallaxBlendDeg(parallax);
+                    original.setSeamSmoothingDeg(smoothing);
+                    original.setNearOffsetDeg(offset);
+                    original.setFarOffsetDeg(-offset);
+                    const DialogControls controls = controlsFromPrefs(original);
+                    INFO("blend " << blend << " parallax " << parallax << " smoothing " << smoothing << " offset "
+                                  << offset);
+                    REQUIRE(std::abs(controls.seamBlendDeg - blend) < 1e-9);
+                    REQUIRE(std::abs(controls.parallaxBlendDeg - parallax) < 1e-9);
+                    REQUIRE(std::abs(controls.seamSmoothingDeg - smoothing) < 1e-9);
+                    REQUIRE(std::abs(controls.nearOffsetDeg - offset) < 1e-9);
+                    REQUIRE(prefsFromControls(controls) == original);
+                }
+            }
+        }
+    }
+
+    // An old project (bytes 38-45 zero) reads as the defaults, and OK keeps it.
+    PrefsBlob old = PrefsBlob::defaults();
+    REQUIRE(prefsFromControls(controlsFromPrefs(old), old) == old);
+
+    // Garbage typed into the rows lands on the defaults or the range's end,
+    // never on a bad blob.
+    DialogControls bad = controlsFromPrefs(PrefsBlob::defaults());
+    bad.seamBlendDeg = std::numeric_limits<double>::quiet_NaN();
+    bad.parallaxBlendDeg = -5.0;
+    bad.seamSmoothingDeg = 50.0;  // typed past the end: clamped to it
+    bad.nearOffsetDeg = std::numeric_limits<double>::infinity();
+    bad.farOffsetDeg = -40.0;
+    PrefsBlob blob = prefsFromControls(bad);
+    REQUIRE(blob.seamBlendDeg() == 1.5);
+    REQUIRE(blob.parallaxBlendDeg() == 0.0);
+    REQUIRE(blob.seamSmoothingDeg() == 8.0);
+    REQUIRE(blob.nearOffsetDeg() == 0.0);
+    REQUIRE(blob.farOffsetDeg() == -3.0);
+    REQUIRE(blob.sanitise());
+    // An absurd magnitude is garbage, not a request for the maximum: the
+    // default, like the sky seam sliders' setters.
+    bad.seamSmoothingDeg = 1e9;
+    REQUIRE(prefsFromControls(bad).seamSmoothingDeg() == 0.0);
+}

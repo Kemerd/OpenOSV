@@ -63,3 +63,10 @@
 // change appends there cannot collide with it.
 #define IDC_REC709_LOOK    1030
 #define IDC_STATIC_LOOK    1130
+
+// [WP-DEFAULTS] "Save as Default": store the dialog's settings as the user's
+// defaults for new clips (plugins/common/UserDefaults.h), with a one-word
+// status line beside it.  Clear of every id above and of the ids the dialog
+// code creates at run time (1040-1042, 1140-1144).
+#define IDC_SAVE_AS_DEFAULT       1060
+#define IDC_STATIC_DEFAULT_SAVED  1160

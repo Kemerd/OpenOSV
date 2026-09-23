@@ -211,6 +211,12 @@ typedef struct OsvFlareLens {
 
 /* ======================= [/WP-FLARE] types ============================== */
 
+/* [WP-SEAMTOOLS] Largest Gaussian radius (taps each side of the centre) of
+ * the seam low band's blur, and so the size of OsvRenderParams::seamLowTaps.
+ * 15 taps of an 8x decimated lens reach 120 lens pixels, ~8 degrees at the
+ * rim of the Osmo 360's fisheye - the widest Seam Smoothing on offer. */
+#define OSV_SEAM_LOW_MAX_RADIUS 15
+
 /* Everything the shader needs besides the planes and the seam table. */
 typedef struct OsvRenderParams {
     int outW, outH;          /* output size in pixels                          */
@@ -321,6 +327,43 @@ typedef struct OsvRenderParams {
     float photoSinLatHi;        /*   (lo >= hi disables the early-out)         */
     float photoCodePerStop;     /* passthrough: log code units per stop        */
     /* ---- [/WP-PHOTO] ------------------------------------------------------ */
+
+    /* ---- [WP-SEAMTOOLS] two-band seam smoothing (SeamTools.h) --------------
+     * The carved seam ([WP-SEAM]) mixes the lenses inside a narrow feather,
+     * so a near object is never shown twice - but where the two lenses see
+     * it from different angles its copies do not line up and the cut shows
+     * as a step.  Seam smoothing softens that step the way DJI's multiband
+     * blend does (Burt & Adelson 1983, two bands):
+     *
+     *     out = blend_wide(lowA, lowB) + blend_seam(A - lowA, B - lowB)
+     *
+     * The LOW frequencies of both lenses mix across a wide band around the
+     * seam (half width seamSmoothHalfRad), the HIGH frequencies still switch
+     * inside the carved seam's own feather: colour and shading glide across,
+     * fine detail stays single.
+     *
+     * The low band of each lens is a pre-filtered copy of its fisheye frame
+     * (the "seamLow" table the renderer builds per frame, SeamTools.h):
+     * seamLowFactor x seamLowFactor blocks box-averaged, decoded to linear
+     * light (code values for passthrough), weighted by how much of the block
+     * the lens really sees, then blurred by a separable Gaussian whose taps
+     * are seamLowTaps.  RGB is stored premultiplied by that coverage (A), so
+     * the lookup's division is a normalised convolution (Knutsson & Westin
+     * 1993): the black outside the image circle and the selfie stick never
+     * bleed into the low band.
+     *
+     * All zero (the builder's default) = no low band: the shader never reads
+     * the table and every render is exactly what it was without it. */
+    int seamSmoothEnabled;      /* 1 = two-band blend along the carved seam    */
+    int seamLowFactor;          /* lens pixels per low-band pixel (even, >= 2) */
+    int seamLowW, seamLowH;     /* low-band size of each lens                  */
+    int seamLowRadius;          /* Gaussian taps each side, <= MAX_RADIUS      */
+    float seamSmoothHalfRad;    /* low-frequency blend half width (radians)    */
+    /* Gaussian tap k (|offset| = k low-band pixels), unnormalised; the blur
+     * divides by their sum.  Precomputed on the host so every backend runs
+     * the same numbers instead of its own expf. */
+    float seamLowTaps[OSV_SEAM_LOW_MAX_RADIUS + 1];
+    /* ---- [/WP-SEAMTOOLS] ----------------------------------------------------- */
 } OsvRenderParams;
 
 /* ------------------------------------------------------------------------- */
@@ -1358,6 +1401,266 @@ OSV_HD void osvPhotoApplyGain(const OsvRenderParams* p, const OsvPhotoPixel* ph,
 /* ---- [/WP-PHOTO] --------------------------------------------------------- */
 
 /* ------------------------------------------------------------------------- */
+/*  [WP-SEAMTOOLS] Two-band seam smoothing                                    */
+/* ------------------------------------------------------------------------- */
+/* The low band's build stages and its lookup, in front of the shader for the
+ * same reason as the [WP-SEAM] helpers.  The table layout (one RGBA texel per
+ * low-band pixel, lens 0 then lens 1, row-major, RGB premultiplied by the
+ * coverage in A) and the reasoning are in OsvRenderParams above and in
+ * include/osv/render/SeamTools.h.  Nothing here runs unless
+ * OsvRenderParams::seamSmoothEnabled is set and a table is passed. */
+
+/* Build stage 1: low-band texel (lx, ly) of lens `lens` from its decoded
+ * planes `P`, written to `out` as (R * a, G * a, B * a, a).
+ *
+ * The block's samples are AVERAGED IN CODE SPACE and the mean is decoded
+ * once: 64 cheap loads instead of 64 log decodes per texel, which is what
+ * keeps the build a fraction of a millisecond.  That low band is not the
+ * exact linear-light low-pass of the frame, but it does not have to be: the
+ * shader only ever uses the DIFFERENCE of the two lenses' low bands, both
+ * built by this same operator, and it is zero wherever the lenses agree.
+ *
+ * Coverage a = the share of the block inside the lens's usable circle
+ * (normalised radius <= thetaD(thetaMax)) times the selfie-stick factor at
+ * the block centre.  Only covered pixels are averaged, so a texel on the rim
+ * holds the colour of the image, never of the black beyond it. */
+OSV_HD void osvSeamLowDecimatePixel(const OsvRenderParams* p, const OsvPlane* P, int lens, int lx, int ly,
+                                    float* out) {
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    if (lens < 0 || lens > 1 || P == 0) {
+        return;
+    }
+    const OsvLens* L = &p->lens[lens];
+    const int F = p->seamLowFactor;
+    /* Defensive: an odd or tiny factor would break the 2 x 2 chroma walk,
+     * a disabled lens or an empty plane has nothing to average. */
+    if (!L->enabled || F < 2 || (F & 1) != 0 || P->w <= 0 || P->h <= 0 || !(L->fx > 0.0f) || !(L->fy > 0.0f)) {
+        return;
+    }
+    /* The usable circle in normalised image coordinates. */
+    const float rMax = osvThetaD(L, L->thetaMax);
+    const float rMax2 = rMax * rMax;
+    const float invFx = 1.0f / L->fx;
+    const float invFy = 1.0f / L->fy;
+    const int step = P->chromaInterleaved ? 2 : 1;
+    const int x0 = lx * F;
+    const int y0 = ly * F;
+    float sumY = 0.0f;
+    float sumCb = 0.0f;
+    float sumCr = 0.0f;
+    int count = 0;
+    /* 2 x 2 luma quads: one chroma sample (4:2:0) per quad, weighted by how
+     * many of its four luma pixels are inside the circle. */
+    for (int qy = 0; qy < F; qy += 2) {
+        for (int qx = 0; qx < F; qx += 2) {
+            float quadY = 0.0f;
+            int n = 0;
+            for (int j = 0; j < 2; ++j) {
+                for (int i = 0; i < 2; ++i) {
+                    const int x = x0 + qx + i;
+                    const int y = y0 + qy + j;
+                    if (x >= P->w || y >= P->h) {
+                        continue; /* a partial block at the right / bottom edge */
+                    }
+                    const float nx = ((float)x + 0.5f - L->cx) * invFx;
+                    const float ny = ((float)y + 0.5f - L->cy) * invFy;
+                    if (nx * nx + ny * ny > rMax2) {
+                        continue; /* outside the usable circle: not image data */
+                    }
+                    quadY += osvFetchPlane(P->y, P->strideY, 1, P->w, P->h, x, y, P->bitShift);
+                    ++n;
+                }
+            }
+            if (n == 0) {
+                continue;
+            }
+            const int cx = (x0 + qx) >> 1;
+            const int cy = (y0 + qy) >> 1;
+            const float cb = osvFetchPlane(P->u, P->strideC, step, P->cw, P->ch, cx, cy, P->bitShift);
+            const float cr = osvFetchPlane(P->v, P->strideC, step, P->cw, P->ch, cx, cy, P->bitShift);
+            sumY += quadY;
+            sumCb += cb * (float)n;
+            sumCr += cr * (float)n;
+            count += n;
+        }
+    }
+    if (count == 0) {
+        return; /* nothing of the lens here: coverage 0, colour 0 */
+    }
+    /* Decode the block mean once, into the space the shader blends in. */
+    const float inv = 1.0f / (float)count;
+    float code[3];
+    osvYuvToCode(&p->color, sumY * inv, sumCb * inv, sumCr * inv, code);
+    float val[3];
+    if (p->color.transfer == OSV_TRANSFER_PASSTHROUGH) {
+        val[0] = code[0];
+        val[1] = code[1];
+        val[2] = code[2];
+    } else {
+        osvCodeToLinear(&p->color, code, val);
+    }
+    /* Coverage: circle share times the stick at the block centre. */
+    const float share = (float)count / (float)(F * F);
+    const float stick = osvOcclusionFactor(L, (float)x0 + 0.5f * (float)F, (float)y0 + 0.5f * (float)F);
+    const float a = share * stick;
+    out[0] = val[0] * a;
+    out[1] = val[1] * a;
+    out[2] = val[2] * a;
+    out[3] = a;
+}
+
+/* Build stages 2 and 3: one texel of the separable Gaussian blur of lens
+ * `lens`'s low band `src` (the whole two-lens table), along x when
+ * `horizontal` is non-zero, along y otherwise.  Clamp-to-edge addressing;
+ * the taps are normalised by their own sum, so the blur never changes the
+ * mean (and the premultiplied RGB / A ratio survives it exactly). */
+OSV_HD void osvSeamLowBlurPixel(const OsvRenderParams* p, OSV_GLOBAL const float* src, int lens, int x, int y,
+                                int horizontal, float* out) {
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    const int W = p->seamLowW;
+    const int H = p->seamLowH;
+    if (src == 0 || W <= 0 || H <= 0 || lens < 0 || lens > 1 || x < 0 || y < 0 || x >= W || y >= H) {
+        return;
+    }
+    int R = p->seamLowRadius;
+    R = R < 0 ? 0 : (R > OSV_SEAM_LOW_MAX_RADIUS ? OSV_SEAM_LOW_MAX_RADIUS : R);
+    OSV_GLOBAL const float* base = src + (size_t)lens * (size_t)W * (size_t)H * 4u;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float wsum = 0.0f;
+    for (int k = -R; k <= R; ++k) {
+        int xx = x;
+        int yy = y;
+        if (horizontal) {
+            xx = x + k;
+            xx = xx < 0 ? 0 : (xx >= W ? W - 1 : xx);
+        } else {
+            yy = y + k;
+            yy = yy < 0 ? 0 : (yy >= H ? H - 1 : yy);
+        }
+        const float t = p->seamLowTaps[k < 0 ? -k : k];
+        OSV_GLOBAL const float* s = base + ((size_t)yy * (size_t)W + (size_t)xx) * 4u;
+        acc[0] += t * s[0];
+        acc[1] += t * s[1];
+        acc[2] += t * s[2];
+        acc[3] += t * s[3];
+        wsum += t;
+    }
+    if (!(wsum > 0.0f)) {
+        return; /* all-zero taps: a malformed block, never a division by zero */
+    }
+    const float inv = 1.0f / wsum;
+    out[0] = acc[0] * inv;
+    out[1] = acc[1] * inv;
+    out[2] = acc[2] * inv;
+    out[3] = acc[3] * inv;
+}
+
+/* The low band of lens `lens` at lens pixel (px, py) (the coordinates
+ * osvProjectLens returned), bilinear, un-premultiplied into `rgb`.  Returns
+ * the coverage there; 0 (and rgb 0) when the lens has no image data nearby,
+ * which the shader answers by leaving that pixel single-band. */
+OSV_HD float osvSeamLowSample(const OsvRenderParams* p, OSV_GLOBAL const float* low, int lens, float px, float py,
+                              float* rgb) {
+    rgb[0] = rgb[1] = rgb[2] = 0.0f;
+    const int W = p->seamLowW;
+    const int H = p->seamLowH;
+    if (low == 0 || W <= 0 || H <= 0 || p->seamLowFactor < 2 || lens < 0 || lens > 1) {
+        return 0.0f;
+    }
+    /* Low-band pixel j covers lens pixels [jF, jF + F) and is centred on
+     * lens coordinate (j + 0.5) F, so the continuous low-band coordinate is
+     * px / F with centres at integer + 0.5 - the osvBilinear convention. */
+    const float F = (float)p->seamLowFactor;
+    const float fx = px / F - 0.5f;
+    const float fy = py / F - 0.5f;
+    const float flx = floorf(fx);
+    const float fly = floorf(fy);
+    const float tx = fx - flx;
+    const float ty = fy - fly;
+    int x0 = (int)flx;
+    int y0 = (int)fly;
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    x0 = x0 < 0 ? 0 : (x0 >= W ? W - 1 : x0);
+    x1 = x1 < 0 ? 0 : (x1 >= W ? W - 1 : x1);
+    y0 = y0 < 0 ? 0 : (y0 >= H ? H - 1 : y0);
+    y1 = y1 < 0 ? 0 : (y1 >= H ? H - 1 : y1);
+    OSV_GLOBAL const float* base = low + (size_t)lens * (size_t)W * (size_t)H * 4u;
+    float v[4];
+    for (int c = 0; c < 4; ++c) {
+        const float a = base[((size_t)y0 * (size_t)W + (size_t)x0) * 4u + (size_t)c];
+        const float b = base[((size_t)y0 * (size_t)W + (size_t)x1) * 4u + (size_t)c];
+        const float d0 = base[((size_t)y1 * (size_t)W + (size_t)x0) * 4u + (size_t)c];
+        const float d1 = base[((size_t)y1 * (size_t)W + (size_t)x1) * 4u + (size_t)c];
+        const float top = a + (b - a) * tx;
+        const float bot = d0 + (d1 - d0) * tx;
+        v[c] = top + (bot - top) * ty;
+    }
+    /* Below a thousandth of a covered texel the ratio is noise, not colour. */
+    if (!(v[3] > 1e-3f)) {
+        return 0.0f;
+    }
+    const float inv = 1.0f / v[3];
+    rgb[0] = v[0] * inv;
+    rgb[1] = v[1] * inv;
+    rgb[2] = v[2] * inv;
+    return v[3];
+}
+
+/* The low band's blend weights for one ray: the carved seam's own mix
+ * (osvSeamMix over osvSeamVisibility) with the feather widened to
+ * max(seamSmoothHalfRad, the seam's half width), normalised to sum 1.
+ * `theta` and `wPre` are each lens's angle and the shader's weights BEFORE
+ * the carved seam re-weighted them.  Returns 0 - leave the pixel single-band
+ * - exactly where osvBlendSeamApply leaves it alone too, and when smoothing
+ * is off.  Beyond the widened feather both mixes saturate to the same
+ * values, so the two bands' weights agree and the pixel is unchanged. */
+OSV_HD int osvSeamSmoothWeights(const OsvRenderParams* p, OSV_GLOBAL const float* table, const float* dBody,
+                                const float* theta, const float* wPre, float* wl) {
+    wl[0] = wl[1] = 0.0f;
+    if (!p->seamSmoothEnabled || !p->blendSeamEnabled || table == 0 || p->blendSeamColumns <= 0 ||
+        !p->blendEnabled || !(wPre[0] > 0.0f) || !(wPre[1] > 0.0f)) {
+        return 0;
+    }
+    /* The same polar-axis position and seam lookup as osvBlendSeamApply. */
+    const float lon = atan2f(dBody[0], dBody[2]);
+    const float lat = asinf(osvClampf(dBody[1], -1.0f, 1.0f));
+    float s = 0.0f;
+    float hw = 0.0f;
+    osvBlendSeamLookup(p, table, lon, &s, &hw);
+    const float hwWide = fmaxf(p->seamSmoothHalfRad, hw);
+    float vis[2];
+    vis[0] = osvSeamVisibility(p, &p->lens[0], theta[0], wPre[0]);
+    vis[1] = osvSeamVisibility(p, &p->lens[1], theta[1], wPre[1]);
+    osvSeamMix(vis, osvSeamSide(lat, s, hwWide), wl);
+    const float sum = wl[0] + wl[1];
+    if (!(sum > 1e-6f)) {
+        return 0; /* defensive: cannot happen with both lenses visible */
+    }
+    wl[0] = wl[0] / sum;
+    wl[1] = wl[1] / sum;
+    return 1;
+}
+
+/* Put a low-band sample of lens i through exactly what its full sample goes
+ * through after the decode - the flare removal, the lens gain, the photo
+ * gain - so the two bands of one lens stay in one space and the difference
+ * the shader adds is a difference of like with like. */
+OSV_HD void osvSeamLowShade(const OsvRenderParams* p, const OsvPhotoPixel* photoPx, int i, int passthrough,
+                            float px, float py, float* val) {
+    if (!passthrough) {
+        if (p->flareEnabled) {
+            osvFlareRemove(&p->flare[i], px, py, val);
+        }
+        val[0] *= p->lens[i].gain[0];
+        val[1] *= p->lens[i].gain[1];
+        val[2] *= p->lens[i].gain[2];
+    }
+    osvPhotoApplyGain(p, photoPx, i, passthrough, val);
+}
+/* ---- [/WP-SEAMTOOLS] ----------------------------------------------------- */
+
+/* ------------------------------------------------------------------------- */
 /*  The shader                                                                */
 /* ------------------------------------------------------------------------- */
 
@@ -1366,16 +1669,18 @@ OSV_HD void osvPhotoApplyGain(const OsvRenderParams* p, const OsvPhotoPixel* ph,
  * seamShiftEnabled == 0), `warp` the optional 2-D parallax grid (may be 0
  * when warpEnabled == 0), `blendSeam` the optional carved blend-seam table
  * (may be 0 when blendSeamEnabled == 0), `photo` the optional photometric
- * seam table (may be 0 when photoEnabled == 0).  `out` receives R, G, B in
- * the output encoding and A = coverage (or 1).  Pixels seen by neither lens
- * are (0,0,0,0).
+ * seam table (may be 0 when photoEnabled == 0), `seamLow` the optional
+ * two-lens low-band table of the seam smoothing (may be 0 when
+ * seamSmoothEnabled == 0).  `out` receives R, G, B in the output encoding and
+ * A = coverage (or 1).  Pixels seen by neither lens are (0,0,0,0).
  *
  * The ONE full entry point: every table the kernel knows.  The older names
- * below (osvShadePixelWS, osvShadePixelW, osvShadePixel) are thin wrappers
- * passing null for the tables they predate. */
-OSV_HD void osvShadePixelWSP(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
-                             OSV_GLOBAL const float* warp, OSV_GLOBAL const float* blendSeam,
-                             OSV_GLOBAL const float* photo, int x, int y, float* out) {
+ * below (osvShadePixelWSP, osvShadePixelWS, osvShadePixelW, osvShadePixel)
+ * are thin wrappers passing null for the tables they predate. */
+OSV_HD void osvShadePixelWSPL(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
+                              OSV_GLOBAL const float* warp, OSV_GLOBAL const float* blendSeam,
+                              OSV_GLOBAL const float* photo, OSV_GLOBAL const float* seamLow, int x, int y,
+                              float* out) {
     float dView[3];
     if (!osvRayForPixel(p, (float)x, (float)y, dView)) {
         out[0] = out[1] = out[2] = out[3] = 0.0f;
@@ -1528,9 +1833,19 @@ OSV_HD void osvShadePixelWSP(const OsvRenderParams* p, const OsvPlane* planes, O
         return;
     }
 
+    /* [WP-SEAMTOOLS] the weights BEFORE the carved seam replaces them: the
+     * low band's wide mix is computed from the same visibility they carry.
+     * A copy only - nothing below reads it unless smoothing is on. */
+    const float wPre[2] = {w[0], w[1]};
+
     /* [WP-SEAM] carved seam: re-weights the blend; alpha keeps the coverage. */
     const float coverage = wsum;
     wsum = osvBlendSeamApply(p, blendSeam, dBody, thetaL, w, wsum);
+
+    /* [WP-SEAMTOOLS] the low band's own (wide) weights, when this ray is one
+     * the carved seam re-weighted and a low-band table was built. */
+    float wLow[2] = {0.0f, 0.0f};
+    const int smooth = (seamLow != 0) ? osvSeamSmoothWeights(p, blendSeam, dBody, thetaL, wPre, wLow) : 0;
 
     /* Fetch, decode and accumulate.  Passthrough blends in code space
      * because the log curve has no device-side inverse; every other transfer
@@ -1571,6 +1886,36 @@ OSV_HD void osvShadePixelWSP(const OsvRenderParams* p, const OsvPlane* planes, O
     acc[1] /= wsum;
     acc[2] /= wsum;
 
+    /* [WP-SEAMTOOLS] Two-band seam smoothing.  With both mixes normalised,
+     *     sum_i wSeam_i (val_i - low_i) + sum_i wLow_i low_i
+     *   = acc + d1 (low_1 - low_0),   d1 = wLow_1 - wSeam_1,
+     * so the high band stays exactly the carved seam's single-lens blend and
+     * only the lenses' low-band DIFFERENCE is glided across the wide band.
+     * Beyond the widened feather d1 is exactly 0 and the pixel untouched. */
+    if (smooth) {
+        const float d1 = wLow[1] - w[1] / wsum;
+        if (d1 != 0.0f) {
+            float low0[3];
+            float low1[3];
+            const float cov0 = osvSeamLowSample(p, seamLow, 0, px[0], py[0], low0);
+            const float cov1 = osvSeamLowSample(p, seamLow, 1, px[1], py[1], low1);
+            /* A lens with no image data nearby contributes no difference:
+             * the pixel stays single-band rather than inventing colour. */
+            if (cov0 > 0.0f && cov1 > 0.0f) {
+                osvSeamLowShade(p, &photoPx, 0, passthrough, px[0], py[0], low0);
+                osvSeamLowShade(p, &photoPx, 1, passthrough, px[1], py[1], low1);
+                for (int c = 0; c < 3; ++c) {
+                    acc[c] += d1 * (low1[c] - low0[c]);
+                    /* Linear light cannot go negative; a dark detail under a
+                     * bright neighbour's low band could, briefly. */
+                    if (!passthrough) {
+                        acc[c] = fmaxf(acc[c], 0.0f);
+                    }
+                }
+            }
+        }
+    }
+
     if (passthrough) {
         out[0] = acc[0];
         out[1] = acc[1];
@@ -1579,6 +1924,15 @@ OSV_HD void osvShadePixelWSP(const OsvRenderParams* p, const OsvPlane* planes, O
         osvLinearToOutput(&p->color, acc, out);
     }
     out[3] = p->outputAlphaCoverage ? fminf(coverage, 1.0f) : 1.0f; /* [WP-SEAM] coverage */
+}
+
+/* [WP-SEAMTOOLS] The entry point from before the seam smoothing's low band:
+ * shade with every other table and no low band - bit for bit the shader as
+ * it was, since nothing of the two-band path runs without the table. */
+OSV_HD void osvShadePixelWSP(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
+                             OSV_GLOBAL const float* warp, OSV_GLOBAL const float* blendSeam,
+                             OSV_GLOBAL const float* photo, int x, int y, float* out) {
+    osvShadePixelWSPL(p, planes, seam, warp, blendSeam, photo, (OSV_GLOBAL const float*)0, x, y, out);
 }
 
 /* [WP-PHOTO] The entry point from before the photometric seam table: shade

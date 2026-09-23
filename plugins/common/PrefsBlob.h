@@ -285,7 +285,30 @@ struct PrefsBlob {
     /// sanitise().
     std::uint8_t photoReserved[3] = {};
     // ---- [/WP-PHOTO] --------------------------------------------------------
-    std::uint8_t reserved[90] = {};    ///< Zero; future fields.
+    // ---- [WP-SEAMTOOLS] the carved seam's tweaks (osv/render/SeamTools.h) ----
+    /// Seam Blend, the feather where the lenses agree: 0 = the default
+    /// (kDefaultSeamBlendDeg), otherwise (value - 1) / 20 degrees, valid codes
+    /// kMinSeamBlendCode..kMaxSeamBlendCode (0.2..8.0 deg).  See seamBlendDeg().
+    std::uint8_t seamBlend = 0;
+    /// Parallax Blend, the feather where they disagree: 0 = the default
+    /// (kDefaultParallaxBlendDeg), otherwise (value - 1) / 20 degrees, codes
+    /// 1..kMaxParallaxBlendCode (0.0..4.0 deg).  See parallaxBlendDeg().
+    std::uint8_t parallaxBlend = 0;
+    /// Seam Smoothing, the two-band blend's half width: 0 = off (the
+    /// default), otherwise (value - 1) / 20 degrees, codes
+    /// 1..kMaxSeamSmoothingCode (0.0..8.0 deg).  See seamSmoothingDeg().
+    std::uint8_t seamSmoothing = 0;
+    /// Offset 41: zero, and zeroed by sanitise(); keeps the two offsets below
+    /// on even offsets.
+    std::uint8_t seamToolsPad = 0;
+    /// Near Offset, hundredths of a degree along the seam where the lenses
+    /// disagree, -kMaxSeamOffsetHundredths..+kMaxSeamOffsetHundredths; 0 = none
+    /// (the default).  Little-endian, like every multi-byte field here.
+    std::int16_t nearOffset = 0;
+    /// Far Offset, the same where they agree.
+    std::int16_t farOffset = 0;
+    // ---- [/WP-SEAMTOOLS] ------------------------------------------------------
+    std::uint8_t reserved[82] = {};    ///< Zero; future fields.
 
     /// seamInset: the default inset in tenths of a degree (2.6 deg - the
     /// render weight then ends at 95.0 deg on the calibrated 97.59 deg lens;
@@ -295,6 +318,22 @@ struct PrefsBlob {
     static constexpr std::uint8_t kMaxSeamInsetCode = 61;
     /// photoStrength: the largest stored code (101 = 100 %).
     static constexpr std::uint8_t kMaxPhotoStrengthCode = 101;
+    // [WP-SEAMTOOLS] The seam tools' codes: (code - 1) / kSeamToolStepsPerDeg
+    // degrees, 0 = the default.  Twentieths of a degree, because the
+    // defaults are 1.5 and 0.35 and both must be exactly representable.
+    static constexpr int kSeamToolStepsPerDeg = 20;
+    /// Seam Blend default and range (mirror render::kDefaultSeamBlendDeg and
+    /// the SeamTools.h range; a static_assert in the importer ties them).
+    static constexpr double kDefaultSeamBlendDeg = 1.5;
+    static constexpr std::uint8_t kMinSeamBlendCode = 5;    ///< 0.2 deg.
+    static constexpr std::uint8_t kMaxSeamBlendCode = 161;  ///< 8.0 deg.
+    /// Parallax Blend default and range.
+    static constexpr double kDefaultParallaxBlendDeg = 0.35;
+    static constexpr std::uint8_t kMaxParallaxBlendCode = 81;  ///< 4.0 deg.
+    /// Seam Smoothing range (the default is 0 = off).
+    static constexpr std::uint8_t kMaxSeamSmoothingCode = 161;  ///< 8.0 deg.
+    /// Near / Far Offset range, hundredths of a degree either way (3.00 deg).
+    static constexpr std::int16_t kMaxSeamOffsetHundredths = 300;
 
     /// A blob with every field at its documented default.
     [[nodiscard]] static PrefsBlob defaults() noexcept {
@@ -471,6 +510,34 @@ struct PrefsBlob {
             seamInset = 0;
             clean = false;
         }
+        // [WP-SEAMTOOLS] Out-of-range codes land on the default (0), the
+        // setting a fresh blob has; so does a Seam Blend code below 0.2 deg,
+        // which no setter writes.  A code that spells the default value
+        // itself is rewritten as 0 too - one meaning, one byte pattern, one
+        // cache key, exactly what the setters write.  The pad byte stays zero.
+        const auto canonical = [&clean](std::uint8_t& code, std::uint8_t minCode, std::uint8_t maxCode,
+                                        double defaultDeg) {
+            const long defaultCode = static_cast<long>(defaultDeg * kSeamToolStepsPerDeg + 0.5) + 1;
+            if (code != 0 && (code < minCode || code > maxCode || static_cast<long>(code) == defaultCode)) {
+                code = 0;
+                clean = false;
+            }
+        };
+        canonical(seamBlend, kMinSeamBlendCode, kMaxSeamBlendCode, kDefaultSeamBlendDeg);
+        canonical(parallaxBlend, 1, kMaxParallaxBlendCode, kDefaultParallaxBlendDeg);
+        canonical(seamSmoothing, 1, kMaxSeamSmoothingCode, 0.0);
+        if (seamToolsPad != 0) {
+            seamToolsPad = 0;
+            clean = false;
+        }
+        if (nearOffset > kMaxSeamOffsetHundredths || nearOffset < -kMaxSeamOffsetHundredths) {
+            nearOffset = 0;
+            clean = false;
+        }
+        if (farOffset > kMaxSeamOffsetHundredths || farOffset < -kMaxSeamOffsetHundredths) {
+            farOffset = 0;
+            clean = false;
+        }
         if (magic != kMagic || version != kVersion) {
             magic = kMagic;
             version = kVersion;
@@ -604,6 +671,86 @@ struct PrefsBlob {
         }
         photoStrength = p == 100 ? std::uint8_t{0} : static_cast<std::uint8_t>(p + 1);
     }
+
+    // ---- [WP-SEAMTOOLS] ------------------------------------------------------
+    /// Seam Blend in degrees (code 0 or out of range = the default 1.5).
+    [[nodiscard]] double seamBlendDeg() const noexcept {
+        return decodeSeamTool(seamBlend, kMinSeamBlendCode, kMaxSeamBlendCode, kDefaultSeamBlendDeg);
+    }
+    /// Store a Seam Blend (rounded to a twentieth, clamped to 0.2..8.0); the
+    /// default is stored as code 0, NaN / infinities as the default too.
+    void setSeamBlendDeg(double deg) noexcept {
+        seamBlend = encodeSeamTool(deg, kMinSeamBlendCode, kMaxSeamBlendCode, kDefaultSeamBlendDeg);
+    }
+    /// Parallax Blend in degrees (code 0 or out of range = the default 0.35).
+    [[nodiscard]] double parallaxBlendDeg() const noexcept {
+        return decodeSeamTool(parallaxBlend, 1, kMaxParallaxBlendCode, kDefaultParallaxBlendDeg);
+    }
+    /// Store a Parallax Blend (rounded, clamped to 0..4.0; 0 is a hard cut).
+    void setParallaxBlendDeg(double deg) noexcept {
+        parallaxBlend = encodeSeamTool(deg, 1, kMaxParallaxBlendCode, kDefaultParallaxBlendDeg);
+    }
+    /// Seam Smoothing in degrees (code 0 = off, the default).
+    [[nodiscard]] double seamSmoothingDeg() const noexcept {
+        return decodeSeamTool(seamSmoothing, 1, kMaxSeamSmoothingCode, 0.0);
+    }
+    /// Store a Seam Smoothing (rounded, clamped to 0..8.0; 0 = off = code 0).
+    void setSeamSmoothingDeg(double deg) noexcept {
+        seamSmoothing = encodeSeamTool(deg, 1, kMaxSeamSmoothingCode, 0.0);
+    }
+    /// Near Offset in degrees (out of range = 0, the default).
+    [[nodiscard]] double nearOffsetDeg() const noexcept { return decodeSeamOffset(nearOffset); }
+    /// Store a Near Offset (rounded to a hundredth, clamped to +/- 3.00;
+    /// NaN / infinities = 0).
+    void setNearOffsetDeg(double deg) noexcept { nearOffset = encodeSeamOffset(deg); }
+    /// Far Offset in degrees.
+    [[nodiscard]] double farOffsetDeg() const noexcept { return decodeSeamOffset(farOffset); }
+    /// Store a Far Offset.
+    void setFarOffsetDeg(double deg) noexcept { farOffset = encodeSeamOffset(deg); }
+
+private:
+    /// A seam tool code as degrees: 0 or anything outside [minCode, maxCode]
+    /// is the default, otherwise (code - 1) / kSeamToolStepsPerDeg - a
+    /// division, so a code decodes to exactly the double its decimal literal
+    /// is (30 -> 1.5, 7 -> 0.35).
+    [[nodiscard]] static double decodeSeamTool(std::uint8_t code, std::uint8_t minCode, std::uint8_t maxCode,
+                                               double defaultDeg) noexcept {
+        if (code == 0 || code < minCode || code > maxCode) {
+            return defaultDeg;
+        }
+        return static_cast<double>(code - 1) / static_cast<double>(kSeamToolStepsPerDeg);
+    }
+    /// Degrees as a seam tool code: rounded to a step, clamped to the code
+    /// range, the default stored as 0; NaN / infinities are the default.
+    [[nodiscard]] static std::uint8_t encodeSeamTool(double deg, std::uint8_t minCode, std::uint8_t maxCode,
+                                                     double defaultDeg) noexcept {
+        if (!(deg > -1e6 && deg < 1e6)) {
+            return 0;  // NaN, infinities, absurd magnitudes: the default
+        }
+        long steps = static_cast<long>(deg * static_cast<double>(kSeamToolStepsPerDeg) + (deg >= 0.0 ? 0.5 : -0.5));
+        steps = steps < static_cast<long>(minCode) - 1 ? static_cast<long>(minCode) - 1 : steps;
+        steps = steps > static_cast<long>(maxCode) - 1 ? static_cast<long>(maxCode) - 1 : steps;
+        const long defaultSteps =
+            static_cast<long>(defaultDeg * static_cast<double>(kSeamToolStepsPerDeg) + 0.5);
+        return steps == defaultSteps ? std::uint8_t{0} : static_cast<std::uint8_t>(steps + 1);
+    }
+    /// An offset in hundredths as degrees (out of range = 0).
+    [[nodiscard]] static double decodeSeamOffset(std::int16_t hundredths) noexcept {
+        if (hundredths > kMaxSeamOffsetHundredths || hundredths < -kMaxSeamOffsetHundredths) {
+            return 0.0;
+        }
+        return static_cast<double>(hundredths) / 100.0;
+    }
+    /// Degrees as hundredths, rounded half away from zero and clamped.
+    [[nodiscard]] static std::int16_t encodeSeamOffset(double deg) noexcept {
+        if (!(deg > -1e6 && deg < 1e6)) {
+            return 0;
+        }
+        long h = static_cast<long>(deg * 100.0 + (deg >= 0.0 ? 0.5 : -0.5));
+        h = h > kMaxSeamOffsetHundredths ? kMaxSeamOffsetHundredths : h;
+        h = h < -kMaxSeamOffsetHundredths ? -kMaxSeamOffsetHundredths : h;
+        return static_cast<std::int16_t>(h);
+    }
 };
 
 #pragma pack(pop)
@@ -655,6 +802,20 @@ static_assert(offsetof(PrefsBlob, seamInset) == 32, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, photoSeam) == 33, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, photoStrength) == 34, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, photoReserved) == 35, "PrefsBlob layout drifted");
-static_assert(offsetof(PrefsBlob, reserved) == 38, "PrefsBlob layout drifted");
+// [WP-SEAMTOOLS] The seam tools take offsets 38-45 from the front of the
+// reserved block.  Every zero in an older blob reads as the default - the
+// seam exactly as it rendered before the tools existed.
+static_assert(offsetof(PrefsBlob, seamBlend) == 38, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, parallaxBlend) == 39, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, seamSmoothing) == 40, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, seamToolsPad) == 41, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, nearOffset) == 42, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, farOffset) == 44, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, reserved) == 46, "PrefsBlob layout drifted");
+// The codes' upper bounds are the ranges the controls offer.
+static_assert(PrefsBlob::kMaxSeamBlendCode == 8 * PrefsBlob::kSeamToolStepsPerDeg + 1, "Seam Blend reaches 8 deg");
+static_assert(PrefsBlob::kMinSeamBlendCode == 4 + 1, "Seam Blend starts at 0.2 deg");
+static_assert(PrefsBlob::kMaxParallaxBlendCode == 4 * PrefsBlob::kSeamToolStepsPerDeg + 1, "Parallax Blend reaches 4");
+static_assert(PrefsBlob::kMaxSeamSmoothingCode == 8 * PrefsBlob::kSeamToolStepsPerDeg + 1, "Smoothing reaches 8 deg");
 
 }  // namespace osv::premiere

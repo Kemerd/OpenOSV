@@ -762,7 +762,7 @@ PF_Err about(PF_InData* in_data, PF_OutData* out_data) noexcept {
     std::snprintf(out_data->return_msg, PF_MAX_EFFECT_MSG_LEN,
                   "%s v%d.%d.%d\r"
                   "Reframe an equirectangular 360 clip with a virtual camera.\r"
-                  "Part of OpenOSV, the clean-room DJI Osmo 360 toolkit.\r"
+                  "Part of OpenOSV, the independent open-source DJI Osmo 360 toolkit.\r"
                   "Apache-2.0.",
                   OSV_REFRAME_DISPLAY_NAME, OSV_REFRAME_VERSION_MAJOR, OSV_REFRAME_VERSION_MINOR,
                   OSV_REFRAME_VERSION_BUG);
