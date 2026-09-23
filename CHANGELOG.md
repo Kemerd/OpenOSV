@@ -8,6 +8,26 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ### Added
 
+* **RockSteady and Horizon Leveling together, on by default
+  (WP-STABPAIR).** DJI Studio runs its two stabilisation switches
+  independently, and both can be on. The Stabilisation popup in Source
+  Settings gains "Smooth + Horizon Lock" as its fifth item: the view follows
+  the heading of the Gaussian-smoothed orientation (the shake is gone, as in
+  Smooth) with pitch and roll levelled to the world horizon (as in Horizon
+  Lock) - the Horizon Lock levelling applied to the smoothed pose. New clips
+  start on it. On the sample clip it is level on every frame, and the view's
+  forward axis swings 0.87 deg in total from frame to frame over the clip,
+  against 1.84 deg with Horizon Lock. The item is appended, so a project saved
+  before it keeps its entries 1-4 exactly. Also in the importer dialog, the
+  user defaults file (`smooth-horizon-lock`), osvtool (`render --stab
+  smooth-horizon`; the command line still defaults to `off`) and the engine
+  (the smoothed attitude reaches the direct path's frames). The companion
+  panel's Stabilisation card is now DJI Studio's two switches, RockSteady and
+  Horizon Leveling, both on by default; the pair picks the Source Settings
+  entry and the card names it. Full, which no pair spells, is left alone
+  until Apply is pressed, and the status line says when Apply replaced it.
+  A panel that remembered the older single choice starts from the matching
+  switches (its old default, Horizon Leveling, as the new one, both on).
 * **Steady seam and Lens Alignment (WP-STEADY).** The "slight movement at
   the seam" was the seam corrections being re-measured every eight frames.
   Rendered with the corrections of every frame on one frozen frame, the
@@ -78,8 +98,9 @@ All notable changes to OpenOSV are documented here. The format follows
   Studio's Manual Framing (Crystal Ball / Asteroid / Ultra Wide / Wide /
   Dewarp, a Zoom stepper along DJI Studio's zoom path, and live FOV /
   Correction / Pan / Tilt / Roll read-outs of the selected clip at the
-  playhead, keyframed controls keyed there); RockSteady / Horizon Leveling /
-  Off set on the master clips' OpenOSV Source Settings; and a card listing
+  playhead, keyframed controls keyed there); DJI Studio's RockSteady and
+  Horizon Leveling switches set on the master clips' OpenOSV Source
+  Settings; and a card listing
   every Program Monitor gesture, open for a new user. On UXP every button
   press is one undo step; on CEP each value is its own History step, and the
   panel says so (docs/PANEL.md).

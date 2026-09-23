@@ -462,7 +462,7 @@ share a demuxer, so conforming cannot disturb video seeks.
 | `magic` `'OOSV'`, `version` 1 | | |
 | `colorOutput` | 0 PQ, 1 HLG, 2 Rec.709, 3 D-Log M passthrough (appended; never renumber) | 0 |
 | `outputSize` | 0 native, 1 4K (3840x1920), 2 2K (1920x960) | 0 |
-| `stabilization` | 0 off, 1 horizon lock, 2 full, 3 smooth | 1 |
+| `stabilization` | 0 off, 1 horizon lock, 2 full, 3 smooth, 4 smooth + horizon lock (appended; never renumber) | 4 |
 | `seamSearch` | 0/1 | 1 |
 | `gainMatch` | 0/1 | 1 |
 | `calibration` | 0 native, 1 lens guards, 2 underwater | 0 |
@@ -585,7 +585,7 @@ meaning; forcing the bare-lens set is new and therefore last.
 | 2 | 15 | Look (Rec. 709 only) | popup | DJI (default) \| OpenOSV standard | DJI | `look` |
 | 3 | 46 | HDR Peak (PQ only) | popup | 1000 nits (default) \| 600 nits \| 400 nits \| 203 nits (SDR-safe) | 1000 nits | `hdrPeak` |
 | 4 | 2 | Output Size | popup | Native (2 x decoded height) \| 4K (3840 x 1920) \| 2560 x 1280 \| 2K (1920 x 960) | Native | `outputSize` |
-| 5 | 3 | Stabilisation | popup | Off \| Horizon Lock \| Full \| Smooth | Horizon Lock | `stabilization` |
+| 5 | 3 | Stabilisation | popup | Off \| Horizon Lock \| Full \| Smooth \| Smooth + Horizon Lock | Smooth + Horizon Lock | `stabilization` |
 | 6 | 4 | Stitching | topic (GROUP_START) | | | |
 | 7 | 5 | Seam Search | checkbox (also carves the seam) | | on | `seamSearch` |
 | 8 | 6 | Exposure Match | checkbox | | on | `gainMatch` |
@@ -627,6 +627,33 @@ value for them, so it picks up the control defaults above (DJI look, ghost
 removal, the sky seam fix, the lens shading correction, the steady seam and
 lens alignment on) - a project opened in this build gets the improved
 stitch.
+
+#### Stabilisation (id 3)
+
+The clip's IMU attitude becomes a rotation between the view and the lenses
+(`include/osv/geom/Stabilization.h`). DJI Studio offers RockSteady and
+Horizon Leveling as two independent switches, and both can be on at once;
+the popup lists every combination, plus Full:
+
+| Item | What the view does | DJI Studio's switches |
+|---|---|---|
+| Off | follows the camera body | both off |
+| Horizon Lock | the heading follows the body, pitch and roll are levelled to the world horizon | Horizon Leveling |
+| Full | locked to the first frame's orientation | (none) |
+| Smooth | follows the Gaussian-smoothed orientation (sigma 15 frames): the shake is gone and the view keeps turning with the rider, but a tilted camera stays tilted | RockSteady |
+| Smooth + Horizon Lock (default) | the heading of the smoothed orientation with pitch and roll level: `C = R_wb^T * R_level(R_smooth)`, the Horizon Lock levelling applied to the smoothed pose instead of the raw one | RockSteady + Horizon Leveling |
+
+Smooth + Horizon Lock is the fifth item, not a new third one: a project
+stores the popup value, so a project saved before it existed keeps entries
+1-4 exactly as it chose them. New clips start on it, and the companion panel
+shows the same pair as two switches (docs/PANEL.md, "Stabilisation"). A
+frame with no smoothed pose (past the end of the attitude track) falls back
+to Horizon Lock exactly, never to an unlevelled view, and a camera that does
+not shake gets Horizon Lock's picture. On the sample clip (65 frames) it is
+level on every frame, and
+the view's forward axis swings 0.87 deg in total from frame to frame over
+the clip, against 1.84 deg with Horizon Lock, which carries the body's
+heading shake.
 
 #### Lens shading (ids 34-35)
 
@@ -1101,7 +1128,7 @@ One named key per setting - never a dump of the 128 bytes, so it survives
     "colourOutput": "rec709",             // pq | hlg | rec709 | dlogm
     "rec709Look": "dji",                  // dji | standard
     "outputSize": "2560x1280",            // native | 3840x1920 | 2560x1280 | 1920x960
-    "stabilisation": "horizon-lock",      // off | horizon-lock | full | smooth
+    "stabilisation": "smooth-horizon-lock", // off | horizon-lock | full | smooth | smooth-horizon-lock
     "seamSearch": true,
     "exposureMatch": true,
     "calibration": "auto",                // auto | native | lens-protectors | underwater
