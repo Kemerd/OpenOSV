@@ -8,6 +8,8 @@ ref/
 
 # ---- build outputs ----
 build/
+# disposable research probes' binaries (research/*/build_*.cmd)
+research/*/bin/
 out/
 vcpkg_installed/
 *.user

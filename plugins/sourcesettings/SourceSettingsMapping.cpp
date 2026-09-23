@@ -104,6 +104,11 @@ PrefsBlob prefsFromControls(const ControlValues& controls) noexcept {
     blob.setNearOffsetDeg(controls.nearOffsetDeg);
     blob.setFarOffsetDeg(controls.farOffsetDeg);
 
+    // [WP-VIGNETTE] The lens shading correction: a popup and a percent
+    // slider through the blob's setter, exactly like the sky seam fix.
+    blob.lensShading = fromPopup(controls.lensShading, OSV_SS_LENS_SHADING_COUNT, blob.lensShading);
+    blob.setShadingStrengthPercent(controls.shadingStrengthPercent);
+
     // [WP-HDRPEAK] The PQ output's peak (ignored by the other outputs); an
     // out-of-range popup value keeps the default from defaults(), 1000 nits.
     blob.hdrPeak = fromPopup(controls.hdrPeak, OSV_SS_HDR_PEAK_COUNT, blob.hdrPeak);
@@ -161,6 +166,9 @@ ControlValues controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.seamSmoothingDeg = clean.seamSmoothingDeg();
     c.nearOffsetDeg = clean.nearOffsetDeg();
     c.farOffsetDeg = clean.farOffsetDeg();
+    // [WP-VIGNETTE] Code 0 decodes to the default strength.
+    c.lensShading = toPopup(clean.lensShading, OSV_SS_LENS_SHADING_COUNT);
+    c.shadingStrengthPercent = clean.shadingStrengthPercent();
     c.hdrPeak = toPopup(clean.hdrPeak, OSV_SS_HDR_PEAK_COUNT);  // [WP-HDRPEAK]
     return c;
 }

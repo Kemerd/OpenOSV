@@ -327,9 +327,14 @@ struct RgbLensBands {
 /// Shade the per-lens bands: host frames on the CPU (shadeJobRows), device
 /// frames through the installed DeviceBandShader (the GPU band hook
 /// installCudaAnalyses() provides).  `blend` is the ANALYSIS blend.
+///
+/// [WP-VIGNETTE] `shading`, when given and active, is applied to both lenses
+/// exactly as the kernel applies it to a render (LensShading.h), so the
+/// field is measured on the lenses the blend will actually see; null (the
+/// default) shades the raw lenses, bit for bit as before.
 [[nodiscard]] Result<RgbLensBands> renderPhotoBands(const geom::LensRig& rig, const video::FramePair& frames,
                                                     const geom::BlendParams& blend, const PhotoSeamParams& params,
-                                                    ThreadPool& pool);
+                                                    ThreadPool& pool, const LensShadingModel* shading = nullptr);
 
 /// The field from bands (pure).  `pool` may be null (single-threaded).
 /// Unsupported when fewer than minTrustedFraction of the band's pixels are
@@ -338,9 +343,10 @@ struct RgbLensBands {
                                                         ThreadPool* pool);
 
 /// renderPhotoBands + photoSeamFromBands, with the timings filled in.
+/// [WP-VIGNETTE] `shading` as for renderPhotoBands.
 [[nodiscard]] Result<PhotoSeamField> measurePhotoSeam(const geom::LensRig& rig, const video::FramePair& frames,
                                                       const geom::BlendParams& blend, const PhotoSeamParams& params,
-                                                      ThreadPool& pool);
+                                                      ThreadPool& pool, const LensShadingModel* shading = nullptr);
 
 /// from + (to - from) * t on the gain and the rim; t is clamped to [0, 1]
 /// and the endpoints return `from` / `to` exactly.  InvalidArgument for a

@@ -95,6 +95,9 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
     p.setSeamSmoothingDeg(2.5);
     p.setNearOffsetDeg(1.37);
     p.setFarOffsetDeg(-0.42);
+    // [WP-VIGNETTE] the lens shading correction
+    p.lensShading = static_cast<std::uint8_t>(PrefsLensShading::Off);
+    p.setShadingStrengthPercent(63.0);
     p.parallax = static_cast<std::uint8_t>(PrefsParallax::Off);
     p.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Classical);
     p.dlogmFit = static_cast<std::uint8_t>(PrefsDlogmFit::Pocket3);
@@ -185,6 +188,8 @@ TEST_CASE("the defaults file round-trips every value of every setting bit for bi
         each([](PrefsBlob& p, std::uint8_t v) { p.flowBackend = v; }, static_cast<int>(PrefsFlowBackend::Count));
         each([](PrefsBlob& p, std::uint8_t v) { p.parallax = v; }, static_cast<int>(PrefsParallax::Count));
         each([](PrefsBlob& p, std::uint8_t v) { p.photoSeam = v; }, static_cast<int>(PrefsPhotoSeam::Count));
+        each([](PrefsBlob& p, std::uint8_t v) { p.lensShading = v; },
+             static_cast<int>(PrefsLensShading::Count));  // [WP-VIGNETTE]
         each([](PrefsBlob& p, std::uint8_t v) { p.directColour = v; }, static_cast<int>(PrefsDirectColour::Count));
         each([](PrefsBlob& p, std::uint8_t v) { p.hdrPeak = v; }, static_cast<int>(PrefsHdrPeak::Count));  // [WP-HDRPEAK]
         each([](PrefsBlob& p, std::uint8_t v) { p.seamSearch = v; }, 2);
@@ -197,6 +202,13 @@ TEST_CASE("the defaults file round-trips every value of every setting bit for bi
             p.setPhotoStrengthPercent(percent);
             const PrefsBlob back = roundTrip(p);
             INFO("strength " << percent << ": " << firstDifference(back, p));
+            CHECK(back == p);
+        }
+        for (int percent = 0; percent <= 100; ++percent) {  // [WP-VIGNETTE]
+            PrefsBlob p = PrefsBlob::defaults();
+            p.setShadingStrengthPercent(percent);
+            const PrefsBlob back = roundTrip(p);
+            INFO("shading strength " << percent << ": " << firstDifference(back, p));
             CHECK(back == p);
         }
         for (int tenths = 0; tenths <= 60; ++tenths) {
@@ -286,6 +298,8 @@ TEST_CASE("the written file is the documented, human-readable format", "[userdef
     CHECK(text.find("\"seamSmoothingDeg\": 2.5") != std::string::npos);
     CHECK(text.find("\"nearOffsetDeg\": 1.37") != std::string::npos);
     CHECK(text.find("\"farOffsetDeg\": -0.42") != std::string::npos);
+    CHECK(text.find("\"lensShading\": \"off\"") != std::string::npos);  // [WP-VIGNETTE]
+    CHECK(text.find("\"shadingStrengthPercent\": 63") != std::string::npos);
     CHECK(text.find("\"exposureStops\": -1.7") != std::string::npos);
     CHECK(text.find("\"programMonitorColour\": \"match-source\"") != std::string::npos);
     CHECK(text.find("\"hdrPeakNits\": 400") != std::string::npos);  // [WP-HDRPEAK]
@@ -345,6 +359,8 @@ TEST_CASE("an old file without the newer settings reads them as built-in", "[use
     CHECK(p.photoSeam == d.photoSeam);
     CHECK(p.photoStrength == d.photoStrength);
     CHECK(p.seamInset == d.seamInset);
+    CHECK(p.lensShading == d.lensShading);  // [WP-VIGNETTE]
+    CHECK(p.shadingStrength == d.shadingStrength);
     CHECK(p.directColour == d.directColour);
     CHECK(p.parallax == d.parallax);
     CHECK(p.flowBackend == d.flowBackend);

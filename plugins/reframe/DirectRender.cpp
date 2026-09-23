@@ -21,6 +21,7 @@
 #include "DirectRender.h"
 
 #include "osv/color/ColorParams.h"
+#include "osv/render/LensShading.h"  // [WP-VIGNETTE]
 #include "osv/render/SeamTools.h"
 
 #include <cmath>
@@ -180,6 +181,7 @@ const char* directRejectName(DirectReject reason) noexcept {
     case DirectReject::BlendSeam:    return "the blend seam is enabled without a usable table";
     case DirectReject::PhotoField:   return "the photometric seam field is enabled without a usable table";
     case DirectReject::SeamLow:      return "seam smoothing is enabled without a usable low band";
+    case DirectReject::Shading:      return "the lens shading correction carries a non-finite or out-of-range value";
     }
     // Unreachable for any enumerator above; a corrupt value lands here
     // rather than off the end of a table.
@@ -300,6 +302,13 @@ DirectSetup buildDirectParams(const Settings& settings, const StitchState& stitc
     const bool seamLowOn = eq.seamSmoothEnabled != 0;
     if (seamLowOn && (!render::seamSmoothParamsValid(eq) || stitch.seamLow == nullptr)) {
         return refuse(DirectReject::SeamLow);
+    }
+
+    // ---- [WP-VIGNETTE] the lens shading block --------------------------------
+    // It travels inside the block itself (no table), so the only thing to
+    // check is that a kernel can evaluate it: the library's own rule.
+    if (!render::lensShadingBlockValid(eq)) {
+        return refuse(DirectReject::Shading);
     }
 
     // ---- the camera --------------------------------------------------------

@@ -140,6 +140,7 @@ constexpr const char* kDeviceTokens[] = {"auto", "cpu", "cuda", "opencl"};
 constexpr const char* kFlowTokens[] = {"auto", "classical", "neural"};
 constexpr const char* kPhotoTokens[] = {"off", "rim-only", "rim-and-colour"};
 constexpr const char* kDirectTokens[] = {"sequence-space", "match-source"};
+constexpr const char* kShadingTokens[] = {"off", "auto"};  // [WP-VIGNETTE]
 
 static_assert(std::size(kColourTokens) == static_cast<std::size_t>(PrefsColorOutput::Count),
               "colourOutput does not spell every PrefsColorOutput value");
@@ -161,6 +162,8 @@ static_assert(std::size(kPhotoTokens) == static_cast<std::size_t>(PrefsPhotoSeam
               "skySeamFix does not spell every PrefsPhotoSeam value");
 static_assert(std::size(kDirectTokens) == static_cast<std::size_t>(PrefsDirectColour::Count),
               "programMonitorColour does not spell every PrefsDirectColour value");
+static_assert(std::size(kShadingTokens) == static_cast<std::size_t>(PrefsLensShading::Count),
+              "lensShading does not spell every PrefsLensShading value");
 
 /// ASCII case-insensitive equality, so "HLG" typed by hand still reads.
 [[nodiscard]] bool sameToken(std::string_view a, std::string_view b) noexcept {
@@ -465,6 +468,25 @@ const FieldSpec kFields[] = {
              return false;
          }
          p.setFarOffsetDeg(deg);
+         return true;
+     }},
+    // [WP-VIGNETTE] The lens shading correction: the mode as a token, the
+    // strength in whole percent through the blob's own setter (which rounds
+    // and clamps to 0..100, exactly as the panel's slider does).
+    {{"lensShading", OSV_UD_FIELD(lensShading), 0, 0},
+     [](const PrefsBlob& p) { return tokenJson(p.lensShading, kShadingTokens); },
+     [](const Json& v, PrefsBlob& p, std::string& why, bool&) {
+         return tokenFrom(v, kShadingTokens, p.lensShading, why);
+     }},
+    {{"shadingStrengthPercent", OSV_UD_FIELD(shadingStrength), 0, 0},
+     [](const PrefsBlob& p) { return Json(static_cast<int>(std::lround(p.shadingStrengthPercent()))); },
+     [](const Json& v, PrefsBlob& p, std::string& why, bool& clamped) {
+         double percent = 0.0;
+         if (!numberFrom(v, percent, why)) {
+             return false;
+         }
+         clamped = percent < 0.0 || percent > 100.0;
+         p.setShadingStrengthPercent(std::clamp(percent, 0.0, 100.0));
          return true;
      }},
     // Not in the Source Settings effect (only the modal dialog's hidden

@@ -8,6 +8,23 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ### Added
 
+* **Lens Shading in Source Settings (WP-VIGNETTE).** The soft darker band
+  that stayed on every sky seam crossing after the sky seam fix is a ring in
+  the front lens's own image - 83-89 deg from its axis, up to 0.34 stop deep
+  on the side facing the sun, and additive (R, G and B lose the same light:
+  0.52 / 0.31 / 0.10 stop), so a lens-to-lens ratio could never remove it.
+  "Lens Shading" (Auto / Off) measures each lens's rim structure from its own
+  sky per bucket of eight frames and adds the missing light back before the
+  lenses are blended; "Shading Strength" scales it. On the sample the band's
+  dip below the sky trend falls 158 -> 21 millistops (open sky elsewhere
+  scores 57-67), line x0.40 / band x0.32 / broad x0.94 / colour x0.86, the
+  ground unchanged, the table stable to 0.4 % per frame; 7-10 ms of analysis
+  per bucket, nothing measurable in the render kernels. Auto for new clips
+  (and, like every control added to the Source Settings effect, for an
+  effect saved before it existed); a prefs blob written before it reads as
+  Off. Also in the importer dialog, osvtool
+  (`--shading`, `--shading-strength`) and the user defaults file. Engine
+  ABI 4.
 * **Seam tools in Source Settings (WP-SEAMTOOLS).** Five sliders in the
   Stitching group tweak the carved seam; every default is the seam as it
   rendered before (bit-identical), and each changes only the overlap. Seam

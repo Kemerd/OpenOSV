@@ -220,7 +220,7 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
 
     const std::vector<PF_ParamDef> params = addedParams(fixture);
 
-    // Twenty-nine: twenty-one value controls, the two Defaults buttons and
+    // Thirty-one: twenty-three value controls, the two Defaults buttons and
     // the six group markers.  PF_ADD_TOPIC and
     // PF_END_TOPIC each issue their own PF_ADD_PARAM, so a group occupies two
     // real slots - counting only the controls is the mistake that shifts
@@ -259,6 +259,7 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
             {kIndexSeamBlend, PF_Param_FLOAT_SLIDER},  {kIndexParallaxBlend, PF_Param_FLOAT_SLIDER},  // [WP-SEAMTOOLS]
             {kIndexSeamSmoothing, PF_Param_FLOAT_SLIDER}, {kIndexNearOffset, PF_Param_FLOAT_SLIDER},
             {kIndexFarOffset, PF_Param_FLOAT_SLIDER},
+            {kIndexLensShading, PF_Param_POPUP},     {kIndexShadingStrength, PF_Param_FLOAT_SLIDER},  // [WP-VIGNETTE]
             {kIndexStitchTopicEnd, PF_Param_GROUP_END},
             {kIndexAdvancedTopic, PF_Param_GROUP_START}, {kIndexDlogmFit, PF_Param_POPUP},
             {kIndexExposure, PF_Param_FLOAT_SLIDER}, {kIndexRenderDevice, PF_Param_POPUP},
@@ -290,6 +291,7 @@ TEST_CASE("every value-carrying control refuses to vary over time", "[sourcesett
         kIndexHdrPeak,  // [WP-HDRPEAK]
         kIndexPhotoSeam, kIndexPhotoStrength, kIndexSeamInset,  // [WP-PHOTO]
         kIndexSeamBlend, kIndexParallaxBlend, kIndexSeamSmoothing, kIndexNearOffset, kIndexFarOffset,  // [WP-SEAMTOOLS]
+        kIndexLensShading, kIndexShadingStrength,  // [WP-VIGNETTE]
     };
     for (const int index : valueIndices) {
         REQUIRE(index >= 1);  // a short initialiser list would leave zeros behind
@@ -352,8 +354,9 @@ TEST_CASE("the two groups are balanced and every control is inside the intended 
     }
     for (const int index : {kIndexSeamSearch, kIndexGainMatch, kIndexCalibration, kIndexFlareRemoval, kIndexPhotoSeam,
                             kIndexPhotoStrength, kIndexSeamInset, kIndexSeamBlend, kIndexParallaxBlend,
-                            kIndexSeamSmoothing, kIndexNearOffset, kIndexFarOffset, kIndexDlogmFit, kIndexExposure,
-                            kIndexRenderDevice, kIndexDirectColour}) {
+                            kIndexSeamSmoothing, kIndexNearOffset, kIndexFarOffset, kIndexLensShading,
+                            kIndexShadingStrength, kIndexDlogmFit, kIndexExposure, kIndexRenderDevice,
+                            kIndexDirectColour}) {
         INFO("grouped index " << index);
         CHECK(depthAt[static_cast<std::size_t>(index)] == 1);
     }
@@ -376,6 +379,7 @@ TEST_CASE("the popup item lists are the documented ones", "[sourcesettings][para
         {kIndexDlogmFit, OSV_SS_FIT_ITEMS},        {kIndexRenderDevice, OSV_SS_DEVICE_ITEMS},
         {kIndexDirectColour, OSV_SS_DIRECT_COLOUR_ITEMS},
         {kIndexPhotoSeam, OSV_SS_PHOTO_SEAM_ITEMS},  // [WP-PHOTO]
+        {kIndexLensShading, OSV_SS_LENS_SHADING_ITEMS},  // [WP-VIGNETTE]
     };
     for (const auto& [index, items] : expected) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");
@@ -471,6 +475,7 @@ TEST_CASE("the popups list every value of their prefs enum", "[sourcesettings][p
         {kIndexRec709Look, static_cast<int>(PrefsLook::Count)},
         {kIndexHdrPeak, static_cast<int>(PrefsHdrPeak::Count)},  // [WP-HDRPEAK]
         {kIndexPhotoSeam, static_cast<int>(PrefsPhotoSeam::Count)},  // [WP-PHOTO]
+        {kIndexLensShading, static_cast<int>(PrefsLensShading::Count)},  // [WP-VIGNETTE]
     };
     for (const auto& [index, count] : expected) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");
@@ -508,6 +513,41 @@ TEST_CASE("the sky seam sliders offer exactly what the blob stores", "[sourceset
     CHECK(static_cast<double>(inset.u.fs_d.slider_min) == Catch::Approx(0.0));
     CHECK(static_cast<double>(inset.u.fs_d.slider_max) == Catch::Approx(6.0));
     CHECK(inset.u.fs_d.precision == PF_Precision_TENTHS);
+}
+
+TEST_CASE("the lens shading controls offer exactly what the blob stores", "[sourcesettings][params][lensshading]") {
+    // [WP-VIGNETTE] Lens Shading is a two-item popup whose default is the
+    // blob's (Auto); Shading Strength is whole percent 0..100, the blob's
+    // shadingStrength codes, shown with the percent sign.
+    EffectFixture fixture;
+    REQUIRE(LoadedPlugin::instance().ok());
+    const std::vector<PF_ParamDef> params = addedParams(fixture);
+    REQUIRE(params.size() == static_cast<std::size_t>(OSV_SOURCE_SETTINGS_PARAM_COUNT));
+    const PrefsBlob defaults = PrefsBlob::defaults();
+
+    const PF_ParamDef& mode = params[kIndexLensShading - 1];
+    CHECK(mode.param_type == PF_Param_POPUP);
+    CHECK(mode.u.pd.dephault == static_cast<int>(defaults.lensShading) + 1);
+    CHECK((mode.flags & PF_ParamFlag_CANNOT_TIME_VARY) != 0);
+
+    const PF_ParamDef& strength = params[kIndexShadingStrength - 1];
+    CHECK(strength.param_type == PF_Param_FLOAT_SLIDER);
+    CHECK(static_cast<double>(strength.u.fs_d.valid_min) == Catch::Approx(0.0));
+    CHECK(static_cast<double>(strength.u.fs_d.valid_max) ==
+          Catch::Approx(static_cast<double>(PrefsBlob::kMaxShadingStrengthCode - 1)));
+    CHECK(static_cast<double>(strength.u.fs_d.slider_min) == Catch::Approx(0.0));
+    CHECK(static_cast<double>(strength.u.fs_d.slider_max) == Catch::Approx(100.0));
+    CHECK(static_cast<double>(strength.u.fs_d.dephault) == Catch::Approx(defaults.shadingStrengthPercent()));
+    CHECK(strength.u.fs_d.precision == PF_Precision_INTEGER);
+    CHECK(strength.u.fs_d.display_flags == PF_ValueDisplayFlag_PERCENT);
+    CHECK((strength.flags & PF_ParamFlag_CANNOT_TIME_VARY) != 0);
+
+    // Their permanent ids come after every id already shipped, and the
+    // Defaults group is still the last one.
+    for (const int id : {OSV_SS_ID_LENS_SHADING, OSV_SS_ID_SHADING_STRENGTH}) {
+        CHECK(id > OSV_SS_ID_DEFAULTS_TOPIC_END);
+    }
+    CHECK(kIndexDefaultsTopicEnd == OSV_SOURCE_SETTINGS_PARAM_COUNT);
 }
 
 TEST_CASE("the seam tool sliders offer exactly what the blob stores", "[sourcesettings][params][seamtools]") {

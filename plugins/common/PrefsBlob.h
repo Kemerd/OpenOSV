@@ -230,6 +230,17 @@ enum class PrefsPhotoSeam : std::uint8_t {
     Count
 };
 
+/// [WP-VIGNETTE] The per-lens shading correction ("Lens Shading" in Source
+/// Settings): osv::render::LensShadingMode, same values.
+///
+/// Off is 0 so an older blob - whose byte is zero - keeps rendering exactly
+/// as it did, the `photoSeam` rule; a fresh blob gets Auto from defaults().
+enum class PrefsLensShading : std::uint8_t {
+    Off = 0,   ///< Nothing is measured or added.
+    Auto = 1,  ///< Each lens's rim structure measured from its own sky and added back.
+    Count
+};
+
 #pragma pack(push, 1)
 
 /// The 128-byte preferences record.  Use defaults() to construct one,
@@ -332,11 +343,19 @@ struct PrefsBlob {
     /// Far Offset, the same where they agree.
     std::int16_t farOffset = 0;
     // ---- [/WP-SEAMTOOLS] ------------------------------------------------------
+    // ---- [WP-VIGNETTE] the lens shading correction (osv/render/LensShading.h) --
+    /// PrefsLensShading; 0 = Off, so an older blob renders as it did.
+    std::uint8_t lensShading = 0;
+    /// Strength of the correction: 0 = the default (100 %), otherwise
+    /// (value - 1) percent, so 1 is 0 % and 101 is 100 %.  See
+    /// shadingStrengthPercent().
+    std::uint8_t shadingStrength = 0;
+    // ---- [/WP-VIGNETTE] -------------------------------------------------------
     // ---- [WP-HDRPEAK] the PQ output's peak brightness -------------------------
-    /// Offsets 46-53: the byte ranges of the packages working alongside this
-    /// one (docs/PARALLEL_WORK.md).  Zero, and zeroed by sanitise(); the lead
-    /// folds them into those packages' fields at merge.
-    std::uint8_t padBeforeHdrPeak[8] = {};
+    /// Offsets 48-53: the byte ranges of the packages still working alongside
+    /// this one (docs/PARALLEL_WORK.md).  Zero, and zeroed by sanitise(); the
+    /// lead folds them into those packages' fields at merge.
+    std::uint8_t padBeforeHdrPeak[6] = {};
     /// PrefsHdrPeak: the display peak the PQ output's highlights roll off
     /// into.  0 = 1000 nits (no roll-off), the default and every older blob.
     std::uint8_t hdrPeak = 0;
@@ -354,6 +373,8 @@ struct PrefsBlob {
     static constexpr std::uint8_t kMaxSeamInsetCode = 61;
     /// photoStrength: the largest stored code (101 = 100 %).
     static constexpr std::uint8_t kMaxPhotoStrengthCode = 101;
+    /// [WP-VIGNETTE] shadingStrength: the largest stored code (101 = 100 %).
+    static constexpr std::uint8_t kMaxShadingStrengthCode = 101;
     // [WP-SEAMTOOLS] The seam tools' codes: (code - 1) / kSeamToolStepsPerDeg
     // degrees, 0 = the default.  Twentieths of a degree, because the
     // defaults are 1.5 and 0.35 and both must be exactly representable.
@@ -418,6 +439,12 @@ struct PrefsBlob {
         // strength; the inset stays at its default (code 0).
         p.photoSeam = static_cast<std::uint8_t>(PrefsPhotoSeam::RimAndGain);
         p.photoStrength = 0;
+        // [WP-VIGNETTE] The lens shading correction ON for new clips: on the
+        // sample it removes the soft dark band the master lens's rim ring
+        // leaves on every sky seam crossing (NEURAL_STITCHING.md, section 9),
+        // and a lens whose sky shows no structure is left untouched.
+        p.lensShading = static_cast<std::uint8_t>(PrefsLensShading::Auto);
+        p.shadingStrength = 0;
         return p;
     }
 
@@ -572,6 +599,14 @@ struct PrefsBlob {
         }
         if (farOffset > kMaxSeamOffsetHundredths || farOffset < -kMaxSeamOffsetHundredths) {
             farOffset = 0;
+            clean = false;
+        }
+        // [WP-VIGNETTE] A corrupt mode lands on the DEFAULT (Auto), like
+        // photoSeam; a corrupt strength on the default 100 %.
+        clampEnum(lensShading, static_cast<std::uint8_t>(PrefsLensShading::Count),
+                  static_cast<std::uint8_t>(PrefsLensShading::Auto));
+        if (shadingStrength > kMaxShadingStrengthCode) {
+            shadingStrength = 0;
             clean = false;
         }
         // [WP-HDRPEAK] zero is the default (1000 nits, no roll-off), so a
@@ -768,6 +803,32 @@ struct PrefsBlob {
     /// Store a Far Offset.
     void setFarOffsetDeg(double deg) noexcept { farOffset = encodeSeamOffset(deg); }
 
+    // ---- [WP-VIGNETTE] ---------------------------------------------------------
+    /// The lens shading correction mode.
+    [[nodiscard]] PrefsLensShading lensShadingMode() const noexcept {
+        return static_cast<PrefsLensShading>(lensShading);
+    }
+    /// Its strength in percent (code 0 or out of range = the default 100).
+    [[nodiscard]] double shadingStrengthPercent() const noexcept {
+        if (shadingStrength == 0 || shadingStrength > kMaxShadingStrengthCode) {
+            return 100.0;
+        }
+        return static_cast<double>(shadingStrength - 1);
+    }
+    /// Store a strength in percent (rounded, clamped to 0..100); 100 is
+    /// stored as code 0 so it keeps tracking the default.
+    void setShadingStrengthPercent(double percent) noexcept {
+        if (!(percent >= 0.0) || percent > 1e6) {
+            shadingStrength = 0;  // NaN, infinities, negatives: the default
+            return;
+        }
+        long p = static_cast<long>(percent + 0.5);
+        if (p > 100) {
+            p = 100;
+        }
+        shadingStrength = p == 100 ? std::uint8_t{0} : static_cast<std::uint8_t>(p + 1);
+    }
+
 private:
     /// A seam tool code as degrees: 0 or anything outside [minCode, maxCode]
     /// is the default, otherwise (code - 1) / kSeamToolStepsPerDeg - a
@@ -871,10 +932,15 @@ static_assert(offsetof(PrefsBlob, seamSmoothing) == 40, "PrefsBlob layout drifte
 static_assert(offsetof(PrefsBlob, seamToolsPad) == 41, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, nearOffset) == 42, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, farOffset) == 44, "PrefsBlob layout drifted");
-// [WP-HDRPEAK] hdrPeak takes offset 54 of its assigned range (54-55); 46-53
+// [WP-VIGNETTE] The lens shading correction takes offsets 46-47 from the
+// front of the reserved block.  lensShading's zero in an older blob reads as
+// Off, so an old project renders as before; a fresh blob gets Auto.
+static_assert(offsetof(PrefsBlob, lensShading) == 46, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, shadingStrength) == 47, "PrefsBlob layout drifted");
+// [WP-HDRPEAK] hdrPeak takes offset 54 of its assigned range (54-55); 48-53
 // are padded for the packages that own them.  An older blob's zero byte reads
 // as PrefsHdrPeak::Nits1000 - no roll-off, the PQ output it always had.
-static_assert(offsetof(PrefsBlob, padBeforeHdrPeak) == 46, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, padBeforeHdrPeak) == 48, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, hdrPeak) == 54, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, padAfterHdrPeak) == 55, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, reserved) == 56, "PrefsBlob layout drifted");

@@ -488,6 +488,87 @@ TEST_CASE("a device frame carries the fitted sun ghosts in its stitch block, and
 }
 
 // =============================================================================
+//  [WP-VIGNETTE] the lens shading correction reaches the direct path
+// =============================================================================
+
+TEST_CASE("a device frame carries the lens shading correction in its stitch block, and none when switched off",
+          "[importer][engine][lensshading][cuda][sample]") {
+    if (!sampleClipAvailable()) {
+        SKIP("the sample clip is not present at " << sampleClipPath().string());
+    }
+    TestContext cuda;  // before the harness: outlives imShutdown
+    if (!cuda.context) {
+        SKIP("CUDA unavailable: " << cuda.reason);
+    }
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const EngineApi api = resolveEngine();
+    REQUIRE(api.ok());
+    const std::wstring path = sampleClipPath().wstring();
+    char error[512] = {};
+
+    // ---- default settings: Auto, measured from the frames in VRAM --------------
+    // The correction travels inside the stitch block itself (no table), so the
+    // direct kernel adds exactly what the importer's equirect adds.  On the
+    // sample the master lens (stream 1) carries the ring at ~86 deg; the
+    // slave's table, if any, stays small.
+    {
+        OsvEngineFrameRequest request = requestFor(path, 12, cuda.context);
+        OsvEngineFrame frame = emptyFrame();
+        const std::int32_t rc = api.acquire(&request, &frame, error, sizeof(error));
+        INFO("engine error: " << error);
+        REQUIRE(rc == OSV_ENGINE_OK);
+        CHECK(frame.exact == 1);
+        REQUIRE(frame.stitch.shadeEnabled == 1);
+        CHECK(frame.stitch.shadeStrength == Catch::Approx(1.0));
+        CHECK(frame.stitch.shadeDThetaRad > 0.0f);
+        // The master's radial factor peaks near 86 deg: knot (86 - 76) / 0.5.
+        const float thetaDeg0 = frame.stitch.shadeTheta0Rad * 57.2957795f;
+        const float stepDeg = frame.stitch.shadeDThetaRad * 57.2957795f;
+        float peak = 0.0f;
+        int peakKnot = -1;
+        for (int k = 0; k < OSV_SHADE_THETA_N; ++k) {
+            // The product with the largest azimuth weight, for either sign
+            // convention of the separable factors.
+            float amax = 0.0f;
+            for (int s = 0; s < OSV_SHADE_PHI_N; ++s) {
+                amax = std::max(amax, std::fabs(frame.stitch.shade[1].azimuth[0][s]));
+            }
+            const float v = std::fabs(frame.stitch.shade[1].radial[0][k]) * amax;
+            if (v > peak) {
+                peak = v;
+                peakKnot = k;
+            }
+        }
+        REQUIRE(peakKnot >= 0);
+        const float peakDeg = thetaDeg0 + stepDeg * static_cast<float>(peakKnot);
+        INFO("master peak " << peak << " at " << peakDeg << " deg");
+        CHECK(peakDeg > 84.0f);
+        CHECK(peakDeg < 88.5f);
+        CHECK(peak > 0.005f);
+        api.release(frame.lease, nullptr);
+    }
+
+    // ---- switched off in Source Settings: the block carries nothing -------------
+    osv::premiere::PrefsBlob prefs = osv::premiere::PrefsBlob::defaults();
+    prefs.lensShading = static_cast<std::uint8_t>(osv::premiere::PrefsLensShading::Off);
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+    imFileInfoRec8 info{};
+    REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+    {
+        OsvEngineFrameRequest request = requestFor(path, 13, cuda.context);
+        OsvEngineFrame frame = emptyFrame();
+        const std::int32_t rc = api.acquire(&request, &frame, error, sizeof(error));
+        INFO("engine error: " << error);
+        REQUIRE(rc == OSV_ENGINE_OK);
+        CHECK(frame.stitch.shadeEnabled == 0);
+        CHECK(frame.stitch.shade[1].radial[0][20] == 0.0f);
+        api.release(frame.lease, nullptr);
+    }
+}
+
+// =============================================================================
 //  [WP-SEAMTOOLS] the seam smoothing's low band reaches the direct path
 // =============================================================================
 

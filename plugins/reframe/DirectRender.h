@@ -155,6 +155,7 @@ enum class DirectReject {
     BlendSeam,     ///< [WP-SEAM] The blend seam is on but its table is missing or its shape implausible.
     PhotoField,    ///< [WP-PHOTO] The photo table is on but missing, degenerate or non-finite in its span.
     SeamLow,       ///< [WP-SEAMTOOLS] Seam smoothing is on but its low band is missing or its fields malformed.
+    Shading,       ///< [WP-VIGNETTE] The lens shading block is on but carries a non-finite or out-of-range value.
 };
 
 /// Human-readable name of a refusal reason, for the log line.

@@ -306,6 +306,26 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
         fixture.setPopup(kIndexPhotoSeam, OSV_SS_PHOTO_SEAM_COUNT);
         CHECK(translate(fixture, full).photoSeamMode() == PrefsPhotoSeam::RimAndGain);
     }
+    SECTION("Lens Shading") {  // [WP-VIGNETTE]
+        // "Off" -> 0, "Auto" -> 1.
+        for (int item = 1; item <= OSV_SS_LENS_SHADING_COUNT; ++item) {
+            PrefsBuffer buffer;
+            fixture.setPopup(kIndexLensShading, item);
+            INFO("popup value " << item);
+            CHECK(translate(fixture, buffer).lensShading == static_cast<std::uint8_t>(item - 1));
+        }
+        PrefsBuffer off;
+        fixture.setPopup(kIndexLensShading, 1);
+        CHECK(translate(fixture, off).lensShadingMode() == PrefsLensShading::Off);
+    }
+    SECTION("Shading Strength") {  // [WP-VIGNETTE]
+        for (const double percent : {0.0, 1.0, 42.0, 99.0, 100.0}) {
+            PrefsBuffer buffer;
+            fixture.setSlider(kIndexShadingStrength, percent);
+            INFO("percent " << percent);
+            CHECK(translate(fixture, buffer).shadingStrengthPercent() == Catch::Approx(percent));
+        }
+    }
     SECTION("Sky Seam Strength") {  // [WP-PHOTO]
         for (const double percent : {0.0, 1.0, 37.0, 99.0, 100.0}) {
             PrefsBuffer buffer;
@@ -849,6 +869,43 @@ TEST_CASE("the pure mapping round-trips the sky seam fix", "[sourcesettings][map
     CHECK(shown.seamInsetDeg == Catch::Approx(2.6));
 }
 
+TEST_CASE("the pure mapping round-trips the lens shading correction", "[sourcesettings][mapping][lensshading]") {
+    // [WP-VIGNETTE] Both modes x a spread of strengths, both ways.
+    for (int item = 1; item <= OSV_SS_LENS_SHADING_COUNT; ++item) {
+        for (const double percent : {0.0, 1.0, 50.0, 99.0, 100.0}) {
+            ControlValues c;
+            c.lensShading = item;
+            c.shadingStrengthPercent = percent;
+            const PrefsBlob blob = prefsFromControls(c);
+            INFO("mode " << item << ", strength " << percent);
+            REQUIRE(blob.isValid());
+            CHECK(blob.lensShading == static_cast<std::uint8_t>(item - 1));
+            const ControlValues back = controlsFromPrefs(blob);
+            CHECK(back.lensShading == item);
+            CHECK(back.shadingStrengthPercent == Catch::Approx(percent));
+        }
+    }
+    // Hostile popup values and slider values: the defaults, never a blob
+    // needing repair.
+    for (const int hostile : {std::numeric_limits<int>::min(), -1, 0, OSV_SS_LENS_SHADING_COUNT + 1, 77}) {
+        ControlValues c;
+        c.lensShading = hostile;
+        c.shadingStrengthPercent = std::numeric_limits<double>::quiet_NaN();
+        PrefsBlob blob = prefsFromControls(c);
+        CHECK(blob.lensShadingMode() == PrefsLensShading::Auto);
+        CHECK(blob.shadingStrengthPercent() == Catch::Approx(100.0));
+        CHECK(blob.sanitise());
+    }
+    // An older project's blob (zero bytes) shows Off at 100 % - what it
+    // renders with.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.lensShading = 0;
+    old.shadingStrength = 0;
+    const ControlValues shown = controlsFromPrefs(old);
+    CHECK(shown.lensShading == 1);
+    CHECK(shown.shadingStrengthPercent == Catch::Approx(100.0));
+}
+
 TEST_CASE("the pure mapping round-trips the Program Monitor Colour choice", "[sourcesettings][mapping]") {
     // [WP-SETTINGS]
     for (int item = 1; item <= OSV_SS_DIRECT_COLOUR_COUNT; ++item) {
@@ -942,6 +999,9 @@ TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesetting
     CHECK(c.seamSmoothingDeg == OSV_SS_SEAM_SMOOTHING_DEFAULT);
     CHECK(c.nearOffsetDeg == OSV_SS_SEAM_OFFSET_DEFAULT);
     CHECK(c.farOffsetDeg == OSV_SS_SEAM_OFFSET_DEFAULT);
+    // [WP-VIGNETTE] the lens shading correction: Auto at full strength.
+    CHECK(c.lensShading == OSV_SS_LENS_SHADING_DEFAULT);
+    CHECK(c.shadingStrengthPercent == Catch::Approx(OSV_SS_SHADING_STRENGTH_DEFAULT));
 }
 
 TEST_CASE("the pure mapping round-trips the seam tools", "[sourcesettings][mapping][seamtools]") {
