@@ -700,8 +700,9 @@ on frame 64: 0.373-0.377 deg, constant across the clip to 0.004 deg.
 Fitted instead to per-pixel DIS or to the production grid it is 0.353-0.361
 deg (`rotation_check.py`), ground NCC 0.880-0.894.
 Residual 0.24-0.25 px RMS (2048 scale, 0.04 deg) on the far field. This is
-the "0.66 deg cross-meridian error" NEURAL_STITCHING 1.6 attributed to
-calibration, now measured as one rigid rotation. Three numbers take the ground
+most likely the calibration error NEURAL_STITCHING 1.6 inferred from the
+ground's raw NCC of 0.36 (quoted there as ~0.66 deg cross-meridian), now
+measured as one rigid rotation of 0.35-0.38 deg. Three numbers take the ground
 from 0.37 to 0.89 NCC, 97 % of what the per-bucket DIS grid achieves through
 the same warp (0.904). Because it is global and constant, it also fixes the
 sky and the rest of the far field, where no flow can measure anything, and it
