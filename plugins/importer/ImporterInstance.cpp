@@ -31,6 +31,7 @@
 #include <cmath>
 #include <exception>
 #include <iterator>
+#include <vector>
 
 namespace osv::premiere {
 
@@ -489,22 +490,104 @@ Status ImporterInstance::ensureReader() {
     if (m_reader && m_reader->isOpen()) {
         return okStatus();
     }
-    // Software decode: the importer hands host memory back to Premiere, so a
-    // GPU-resident decode would only add a download.  (keepOnDevice is a
-    // CUDA-renderer optimisation the osvtool path uses when both the decoder
-    // and the renderer sit on the same device; the plug-in's renderer comes
-    // from a shared pool whose device is not known here.)
-    video::DecoderOptions opt;
-    opt.hw = video::HwAccel::None;
-    opt.threads = 0;
-    opt.keepOnDevice = false;
 
-    auto reader = video::DualStreamReader::open(m_path, m_format, opt);
-    if (!reader.ok()) {
-        return reader.error();
+    // ---- which decoder --------------------------------------------------------
+    // RANDOM ACCESS decides this, not playback.  Every time the user drops
+    // the playhead somewhere new, Premiere asks for that one frame (intent
+    // Stopped) and waits for it.  Reaching it means decoding forward from
+    // the previous sync sample - up to a full GOP, 60 frames on camera
+    // files - for BOTH 3000x3000 10-bit lenses.  Measured on the sample clip
+    // (osv_importer_bench --part P, twelve scattered landings):
+    //
+    //     software (libavcodec, frame threads)   median  949 ms, worst 1925 ms
+    //     D3D11VA, frames copied back to host    median   52 ms, worst  109 ms
+    //     NVDEC (CUDA), copied back to host      median   59 ms, worst   92 ms
+    //
+    // Software is slow here twice over: it pays the GOP, and after every
+    // seek its frame threads must refill a pipeline of a dozen or more
+    // in-flight frames before the first one comes out - which is why even a
+    // frame three past a keyframe cost ~680 ms.
+    //
+    // D3D11VA goes first: it is as fast as NVDEC, it works on every GPU
+    // vendor Premiere supports, and a D3D11 device is far lighter than the
+    // private CUDA context FFmpeg would create per decoder.  The frames are
+    // copied back to host memory (keepOnDevice stays false) because the
+    // renderer comes from a shared pool whose device is not known here.
+    // Software is the last resort, and the only choice once hardware has
+    // failed on this clip (m_hwDecodeFailed, see readPair()).
+    std::vector<video::HwAccel> order;
+    if (!m_hwDecodeFailed) {
+        order.push_back(video::HwAccel::D3D11VA);
+        order.push_back(video::HwAccel::Cuda);
     }
-    m_reader = std::make_unique<video::DualStreamReader>(std::move(reader).value());
-    return okStatus();
+    order.push_back(video::HwAccel::None);
+
+    Status lastError = okStatus();
+    for (const video::HwAccel hw : order) {
+        video::DecoderOptions opt;
+        opt.hw = hw;
+        opt.threads = 0;  // software only: let libavcodec size its thread pool
+        opt.keepOnDevice = false;
+
+        const auto t0 = std::chrono::steady_clock::now();
+        auto reader = video::DualStreamReader::open(m_path, m_format, opt);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (!reader.ok()) {
+            // Expected on a machine without that back-end; the next one is
+            // tried, so this is informational rather than a warning.
+            PluginLog::info("video: {} decoding unavailable for '{}' ({}); trying the next decoder",
+                            video::hwAccelName(hw), m_path.filename().string(), reader.error().message);
+            lastError = reader.error();
+            continue;
+        }
+        m_reader = std::make_unique<video::DualStreamReader>(std::move(reader).value());
+
+        // The decoder may still have dropped to software inside open() (its
+        // get_format callback does when the GPU cannot decode this profile),
+        // so report what is really running, not what was asked for.
+        const video::HevcStreamDecoder* d = m_reader->decoder(0);
+        const video::HwAccel active = d ? d->activeHw() : video::HwAccel::None;
+        PluginLog::info("video: '{}' decoding with {} (opened in {:.0f} ms)", m_path.filename().string(),
+                        video::hwAccelName(active), ms);
+        return okStatus();
+    }
+    // Software is always in the list, so reaching here means even it failed
+    // and lastError holds its reason; the fallback message covers an empty
+    // list, which the code above cannot build but a later edit might.
+    if (!lastError.ok()) {
+        return lastError;
+    }
+    return Error{ErrorCode::Decoder, "no video decoder could be opened"};
+}
+
+Result<video::FramePair> ImporterInstance::readPair(std::uint32_t index) {
+    // The caller holds m_mutex (renderFrame's contract).
+    if (!m_reader || !m_reader->isOpen()) {
+        return Error{ErrorCode::InvalidArgument, "readPair without an open reader"};
+    }
+    auto pair = m_reader->read(index);
+    if (pair.ok()) {
+        return pair;
+    }
+
+    // A software failure is a real decode error (a damaged file); retrying
+    // it would only fail again.  A HARDWARE failure may be the driver, a
+    // lost device or a surface the GPU cannot handle - software can still
+    // decode the frame, so fall back for the rest of this clip's life.
+    const video::HevcStreamDecoder* d = m_reader->decoder(0);
+    const video::HwAccel active = d ? d->activeHw() : video::HwAccel::None;
+    if (active == video::HwAccel::None) {
+        return pair;
+    }
+    PluginLog::warn("video: {} decoding failed on frame {} of '{}' ({}); switching this clip to software decoding",
+                    video::hwAccelName(active), index, m_path.filename().string(), pair.error().message);
+    m_hwDecodeFailed = true;
+    m_reader.reset();
+    const Status reopened = ensureReader();
+    if (!reopened.ok()) {
+        return reopened.error();
+    }
+    return m_reader->read(index);
 }
 
 void ImporterInstance::releaseHeavy() noexcept {
@@ -844,7 +927,7 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     m_rendererName = renderer.backend;
 
     // ---- decode ------------------------------------------------------------
-    auto pair = m_reader->read(index);
+    auto pair = readPair(index);
     if (!pair.ok()) {
         return pair.error();
     }

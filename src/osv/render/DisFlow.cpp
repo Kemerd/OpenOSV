@@ -29,10 +29,53 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 
 namespace osv::render {
 
 namespace {
+
+// ---------------------------------------------------------------------------
+//  Threading
+//
+//  Every stage below is data-parallel, and every one is written so that a
+//  worker writes ONLY the rows (or patches) it was handed and reads only
+//  data nobody writes during that stage.  The consequence is the property
+//  the importer depends on: the field is BIT-IDENTICAL with or without a
+//  pool, on any number of threads.  The importer's background parallax
+//  worker solves with no pool and the render thread with one, and an export
+//  must never depend on which of the two happened to measure a bucket.
+//
+//  The per-pixel arithmetic order is preserved exactly - including the order
+//  in which overlapping patches are summed into a pixel by densify() - so
+//  "identical" here means identical floats, not "within a tolerance".
+// ---------------------------------------------------------------------------
+
+/// Rows per chunk for the image-sized passes: large enough that the pool's
+/// per-chunk handshake is noise, small enough that a band a few hundred rows
+/// tall still spreads over every core.
+constexpr std::size_t kRowGrain = 4;
+
+/// Patches per chunk for the inverse-search solve.  One patch is a few
+/// hundred bilinear samples, so 64 of them amortise the handshake.
+constexpr std::size_t kPatchGrain = 64;
+
+/// Run `body(row)` for every row in [0, rows): on `pool` when there is one
+/// and the work splits, otherwise inline on the calling thread.
+///
+/// Only for bodies that are pure functions of their inputs writing their own
+/// row: a parallel run that fails part-way (a body threw, in practice out of
+/// memory) is then safely redone from scratch on this thread.
+void forRows(ThreadPool* pool, std::size_t rows, std::size_t grain, const std::function<void(std::size_t)>& body) {
+    if (pool != nullptr && pool->size() > 1 && rows > grain) {
+        if (pool->parallelRows(rows, grain, body).ok()) {
+            return;
+        }
+    }
+    for (std::size_t row = 0; row < rows; ++row) {
+        body(row);
+    }
+}
 
 /// Largest image edge the solver will accept.  A band is a few thousand
 /// pixels wide at most; anything past this is a corrupt size that would
@@ -58,8 +101,11 @@ struct Patch {
     bool usable = false;  ///< False when the tensor was singular.
 };
 
-/// Separable Gaussian blur of a single plane, clamp-to-edge.
-void blurPlane(std::vector<float>& plane, std::uint32_t w, std::uint32_t h, double sigma) {
+/// Separable Gaussian blur of a single plane, clamp-to-edge.  Both passes are
+/// row-parallel: the horizontal pass writes row y of `tmp` from row y of the
+/// plane, the vertical pass writes row y of the plane from rows of `tmp`
+/// only, so no row ever reads what another row is writing.
+void blurPlane(std::vector<float>& plane, std::uint32_t w, std::uint32_t h, double sigma, ThreadPool* pool) {
     if (sigma <= 0.0 || w == 0 || h == 0) {
         return;
     }
@@ -88,8 +134,8 @@ void blurPlane(std::vector<float>& plane, std::uint32_t w, std::uint32_t h, doub
     std::vector<float> tmp(plane.size(), 0.0f);
 
     // Horizontal pass.
-    for (std::uint32_t y = 0; y < h; ++y) {
-        const std::size_t row = static_cast<std::size_t>(y) * w;
+    forRows(pool, h, kRowGrain, [&](std::size_t y) {
+        const std::size_t row = y * w;
         for (std::uint32_t x = 0; x < w; ++x) {
             float acc = 0.0f;
             for (int i = -radius; i <= radius; ++i) {
@@ -98,18 +144,18 @@ void blurPlane(std::vector<float>& plane, std::uint32_t w, std::uint32_t h, doub
             }
             tmp[row + x] = acc;
         }
-    }
+    });
     // Vertical pass.
-    for (std::uint32_t y = 0; y < h; ++y) {
+    forRows(pool, h, kRowGrain, [&](std::size_t y) {
         for (std::uint32_t x = 0; x < w; ++x) {
             float acc = 0.0f;
             for (int i = -radius; i <= radius; ++i) {
                 const int sy = std::clamp(static_cast<int>(y) + i, 0, static_cast<int>(h) - 1);
                 acc += tmp[static_cast<std::size_t>(sy) * w + x] * kernel[static_cast<std::size_t>(i + radius)];
             }
-            plane[static_cast<std::size_t>(y) * w + x] = acc;
+            plane[y * w + x] = acc;
         }
-    }
+    });
 }
 
 /// Half-scale an image with a 2x2 box filter after a light Gaussian.
@@ -117,33 +163,35 @@ void blurPlane(std::vector<float>& plane, std::uint32_t w, std::uint32_t h, doub
 /// The pre-blur matters: decimating without it aliases high-frequency detail
 /// into the coarse level, and the coarse level is what seeds every finer one,
 /// so the alias would propagate all the way up as a confident wrong answer.
-GrayImage halfScale(const GrayImage& src) {
+GrayImage halfScale(const GrayImage& src, ThreadPool* pool) {
     GrayImage dst;
     if (!src.valid() || src.w < 2 || src.h < 2) {
         return dst;
     }
     GrayImage blurred = src;
-    blurPlane(blurred.data, blurred.w, blurred.h, 0.8);  // sigma for a 2x decimation
+    blurPlane(blurred.data, blurred.w, blurred.h, 0.8, pool);  // sigma for a 2x decimation
 
     dst.w = src.w / 2;
     dst.h = src.h / 2;
     dst.data.assign(static_cast<std::size_t>(dst.w) * dst.h, 0.0f);
-    for (std::uint32_t y = 0; y < dst.h; ++y) {
+    // Row-parallel decimation: destination row y reads blurred rows 2y and
+    // 2y + 1 only.
+    forRows(pool, dst.h, kRowGrain, [&](std::size_t y) {
         for (std::uint32_t x = 0; x < dst.w; ++x) {
             const std::uint32_t sx = x * 2;
-            const std::uint32_t sy = y * 2;
+            const std::uint32_t sy = static_cast<std::uint32_t>(y) * 2;
             const float a = blurred.at(static_cast<int>(sx), static_cast<int>(sy));
             const float b = blurred.at(static_cast<int>(sx + 1), static_cast<int>(sy));
             const float c = blurred.at(static_cast<int>(sx), static_cast<int>(sy + 1));
             const float d = blurred.at(static_cast<int>(sx + 1), static_cast<int>(sy + 1));
-            dst.data[static_cast<std::size_t>(y) * dst.w + x] = 0.25f * (a + b + c + d);
+            dst.data[y * dst.w + x] = 0.25f * (a + b + c + d);
         }
-    }
+    });
     return dst;
 }
 
 /// Build the coarse-to-fine pyramid.  Index 0 is the FINEST (the input).
-std::vector<GrayImage> buildPyramid(const GrayImage& base, int levels) {
+std::vector<GrayImage> buildPyramid(const GrayImage& base, int levels, ThreadPool* pool) {
     std::vector<GrayImage> pyramid;
     pyramid.reserve(static_cast<std::size_t>(std::clamp(levels, 1, kMaxLevels)));
     pyramid.push_back(base);
@@ -154,7 +202,7 @@ std::vector<GrayImage> buildPyramid(const GrayImage& base, int levels) {
         if (prev.w / 2 < kMinPyramidEdge || prev.h / 2 < kMinPyramidEdge) {
             break;
         }
-        GrayImage next = halfScale(prev);
+        GrayImage next = halfScale(prev, pool);
         if (!next.valid()) {
             break;
         }
@@ -164,19 +212,31 @@ std::vector<GrayImage> buildPyramid(const GrayImage& base, int levels) {
 }
 
 /// Central-difference gradients of one level, same size as the image.
-void gradients(const GrayImage& img, std::vector<float>& gx, std::vector<float>& gy) {
+/// Row-parallel: row y of gx / gy reads rows y - 1 .. y + 1 of the image.
+void gradients(const GrayImage& img, std::vector<float>& gx, std::vector<float>& gy, ThreadPool* pool) {
     gx.assign(img.data.size(), 0.0f);
     gy.assign(img.data.size(), 0.0f);
-    for (std::uint32_t y = 0; y < img.h; ++y) {
+    forRows(pool, img.h, kRowGrain, [&](std::size_t y) {
+        const int yi = static_cast<int>(y);
         for (std::uint32_t x = 0; x < img.w; ++x) {
             const int xi = static_cast<int>(x);
-            const int yi = static_cast<int>(y);
             // 0.5 * (I(x+1) - I(x-1)), clamped at the edges by at().
-            gx[static_cast<std::size_t>(y) * img.w + x] = 0.5f * (img.at(xi + 1, yi) - img.at(xi - 1, yi));
-            gy[static_cast<std::size_t>(y) * img.w + x] = 0.5f * (img.at(xi, yi + 1) - img.at(xi, yi - 1));
+            gx[y * img.w + x] = 0.5f * (img.at(xi + 1, yi) - img.at(xi - 1, yi));
+            gy[y * img.w + x] = 0.5f * (img.at(xi, yi + 1) - img.at(xi, yi - 1));
         }
-    }
+    });
 }
+
+/// The patch grid of one pyramid level: the patches in row-major order plus
+/// the layout densify() needs to find, for an output row, the patch rows
+/// that cover it without scanning every patch.
+struct PatchGrid {
+    std::vector<Patch> patches;  ///< rows * cols, row-major, top-left first.
+    int rows = 0;
+    int cols = 0;
+    int half = 0;    ///< patchSize / 2: the centre's offset from the patch's first pixel.
+    int stride = 1;  ///< Pixels between neighbouring patch centres.
+};
 
 /// Lay out the patch grid for a level and precompute each patch's inverse
 /// structure tensor.
@@ -192,21 +252,36 @@ void gradients(const GrayImage& img, std::vector<float>& gx, std::vector<float>&
 /// whose H is near-singular is marked unusable here rather than producing a
 /// huge displacement later - that is the flat-sky case, and it is the common
 /// case in this application, where most of the overlap band is empty blue.
-std::vector<Patch> precomputeTensors(const GrayImage& img, const std::vector<float>& gx, const std::vector<float>& gy,
-                                     const DisFlowParams& params) {
-    std::vector<Patch> patches;
+PatchGrid precomputeTensors(const GrayImage& img, const std::vector<float>& gx, const std::vector<float>& gy,
+                            const DisFlowParams& params, ThreadPool* pool) {
+    PatchGrid grid;
     const int ps = std::max(2, params.patchSize);
     const int half = ps / 2;
     // Stride in pixels, as DJI specifies it; at least one so the loop ends.
     const int stride = std::max(1, params.patchStridePx);
+    grid.half = half;
+    grid.stride = stride;
     if (img.w < static_cast<std::uint32_t>(ps) || img.h < static_cast<std::uint32_t>(ps)) {
-        return patches;
+        return grid;
     }
 
+    // Centres run from `half` to the last position that keeps the patch
+    // inside the image, `stride` apart - the same positions a nested
+    // "cy += stride" loop visits, counted up front so every row of the grid
+    // can be filled independently.
     const int lastX = static_cast<int>(img.w) - half - 1;
     const int lastY = static_cast<int>(img.h) - half - 1;
-    for (int cy = half; cy <= lastY; cy += stride) {
-        for (int cx = half; cx <= lastX; cx += stride) {
+    if (lastX < half || lastY < half) {
+        return grid;
+    }
+    grid.cols = (lastX - half) / stride + 1;
+    grid.rows = (lastY - half) / stride + 1;
+    grid.patches.resize(static_cast<std::size_t>(grid.rows) * static_cast<std::size_t>(grid.cols));
+
+    forRows(pool, static_cast<std::size_t>(grid.rows), 1, [&](std::size_t row) {
+        const int cy = half + static_cast<int>(row) * stride;
+        for (int col = 0; col < grid.cols; ++col) {
+            const int cx = half + col * stride;
             Patch p;
             p.x = static_cast<float>(cx);
             p.y = static_cast<float>(cy);
@@ -240,10 +315,10 @@ std::vector<Patch> precomputeTensors(const GrayImage& img, const std::vector<flo
                 p.iHyy = static_cast<float>(hxx * invDet);
                 p.usable = true;
             }
-            patches.push_back(p);
+            grid.patches[row * static_cast<std::size_t>(grid.cols) + static_cast<std::size_t>(col)] = p;
         }
-    }
-    return patches;
+    });
+    return grid;
 }
 
 /// Solve one patch by inverse search, starting from (u, v).
@@ -255,8 +330,13 @@ std::vector<Patch> precomputeTensors(const GrayImage& img, const std::vector<flo
 /// is what makes this robust to the exposure difference between the two
 /// lenses, and it is why DJI's stitcher also mean-normalises rather than
 /// using a plain SSD.
+///
+/// `tmpl` and `target` are caller-owned scratch, reused across every patch a
+/// worker solves: allocating them per patch was one heap round trip for each
+/// of the tens of thousands of patches in a band.
 void solvePatch(Patch& patch, const GrayImage& from, const GrayImage& to, const std::vector<float>& gx,
-                const std::vector<float>& gy, const DisFlowParams& params) {
+                const std::vector<float>& gy, const DisFlowParams& params, std::vector<float>& tmpl,
+                std::vector<float>& target) {
     if (!patch.usable) {
         patch.quality = 0.0f;
         return;
@@ -265,9 +345,11 @@ void solvePatch(Patch& patch, const GrayImage& from, const GrayImage& to, const 
     const int half = ps / 2;
     const int cx = static_cast<int>(patch.x);
     const int cy = static_cast<int>(patch.y);
+    const std::size_t patchPixels = static_cast<std::size_t>(ps) * static_cast<std::size_t>(ps);
 
     // The template and its mean, computed once - the template never moves.
-    std::vector<float> tmpl(static_cast<std::size_t>(ps) * static_cast<std::size_t>(ps), 0.0f);
+    tmpl.assign(patchPixels, 0.0f);
+    target.assign(patchPixels, 0.0f);
     double tmplSum = 0.0;
     for (int dy = -half; dy < ps - half; ++dy) {
         for (int dx = -half; dx < ps - half; ++dx) {
@@ -283,11 +365,15 @@ void solvePatch(Patch& patch, const GrayImage& from, const GrayImage& to, const 
     double lastResidual = 0.0;
 
     for (int iter = 0; iter < std::max(1, params.iterations); ++iter) {
-        // Target window at the current displacement, and its own mean.
+        // Target window at the current displacement, and its own mean.  The
+        // samples are kept: the residual pass below needs exactly the same
+        // values, and a bilinear fetch is the most expensive thing in here.
         double targetSum = 0.0;
         for (int dy = -half; dy < ps - half; ++dy) {
             for (int dx = -half; dx < ps - half; ++dx) {
-                targetSum += to.sample(static_cast<float>(cx + dx) + u, static_cast<float>(cy + dy) + v);
+                const float s = to.sample(static_cast<float>(cx + dx) + u, static_cast<float>(cy + dy) + v);
+                target[static_cast<std::size_t>(dy + half) * ps + static_cast<std::size_t>(dx + half)] = s;
+                targetSum += s;
             }
         }
         const float targetMean = static_cast<float>(targetSum / (static_cast<double>(ps) * ps));
@@ -301,10 +387,9 @@ void solvePatch(Patch& patch, const GrayImage& from, const GrayImage& to, const 
                 const int sx = std::clamp(cx + dx, 0, static_cast<int>(from.w) - 1);
                 const int sy = std::clamp(cy + dy, 0, static_cast<int>(from.h) - 1);
                 const std::size_t gidx = static_cast<std::size_t>(sy) * from.w + static_cast<std::size_t>(sx);
-                const float t = tmpl[static_cast<std::size_t>(dy + half) * ps + static_cast<std::size_t>(dx + half)] -
-                                tmplMean;
-                const float s = to.sample(static_cast<float>(cx + dx) + u, static_cast<float>(cy + dy) + v) -
-                                targetMean;
+                const std::size_t k = static_cast<std::size_t>(dy + half) * ps + static_cast<std::size_t>(dx + half);
+                const float t = tmpl[k] - tmplMean;
+                const float s = target[k] - targetMean;
                 const float residual = s - t;
                 absResidual += std::fabs(static_cast<double>(residual));
                 bx += static_cast<double>(residual) * gx[gidx];
@@ -373,14 +458,14 @@ void solvePatch(Patch& patch, const GrayImage& from, const GrayImage& to, const 
 /// being match quality times a spatial falloff from the patch centre.  The
 /// spatial term stops a patch from imposing its displacement on pixels near
 /// its edge that a better-centred neighbour describes.
-FlowField densify(const std::vector<Patch>& patches, std::uint32_t w, std::uint32_t h, const DisFlowParams& params) {
+FlowField densify(const PatchGrid& grid, std::uint32_t w, std::uint32_t h, const DisFlowParams& params,
+                  ThreadPool* pool) {
     FlowField flow;
     flow.resize(w, h);
     if (w == 0 || h == 0) {
         return flow;
     }
 
-    std::vector<float> weight(static_cast<std::size_t>(w) * h, 0.0f);
     const int ps = std::max(2, params.patchSize);
     const int half = ps / 2;
 
@@ -402,41 +487,67 @@ FlowField densify(const std::vector<Patch>& patches, std::uint32_t w, std::uint3
     // patch.quality carries the same quantity, computed once per patch from
     // its mean residual, because a per-pixel residual would need the target
     // image here and densify() deliberately does not take one.
-    for (const Patch& p : patches) {
-        if (!p.usable || !(p.quality > 0.0f)) {
-            continue;
-        }
-        const int cx = static_cast<int>(p.x);
-        const int cy = static_cast<int>(p.y);
-        for (int dy = -half; dy < ps - half; ++dy) {
-            const int y = cy + dy;
-            if (y < 0 || y >= static_cast<int>(h)) {
-                continue;
+    //
+    // A GATHER, one output row per task, instead of a scatter over patches:
+    // a scatter from several threads would race on the pixels overlapping
+    // patches share.  Output row y is covered by exactly the patch rows whose
+    // centre cy satisfies  cy - half <= y <= cy - half + ps - 1,  a handful
+    // of rows found by arithmetic.  They are visited top to bottom and each
+    // left to right - the order the old scatter visited patches in - so every
+    // pixel sums the same terms in the same order and the field is identical
+    // to the sequential one bit for bit.
+    if (grid.rows <= 0 || grid.cols <= 0 || grid.patches.size() != static_cast<std::size_t>(grid.rows) * grid.cols) {
+        return flow;  // no patches: an all-zero field, as the scatter gave
+    }
+    const int stride = std::max(1, grid.stride);
+    forRows(pool, h, kRowGrain, [&](std::size_t yRow) {
+        const int y = static_cast<int>(yRow);
+        float* rowU = flow.u.data() + yRow * w;
+        float* rowV = flow.v.data() + yRow * w;
+        // Per-row weights live on the task's own stack of work, so no two
+        // rows ever share an accumulator.
+        std::vector<float> weight(w, 0.0f);
+
+        // Patch rows r cover y when  half + r*stride - half <= y  and
+        // y <= half + r*stride - half + ps - 1, i.e.
+        //     (y - ps + 1) / stride <= r <= y / stride   (rounded inward).
+        const int firstRow = std::max(0, (y - ps + 1 + stride - 1) / stride);
+        const int lastRow = std::min(grid.rows - 1, y / stride);
+        for (int r = firstRow; r <= lastRow; ++r) {
+            const int cy = grid.half + r * stride;
+            const int dy = y - cy;
+            if (dy < -half || dy >= ps - half) {
+                continue;  // guards the rounding above; never taken in practice
             }
-            for (int dx = -half; dx < ps - half; ++dx) {
-                const int x = cx + dx;
-                if (x < 0 || x >= static_cast<int>(w)) {
+            const Patch* rowPatches = grid.patches.data() + static_cast<std::size_t>(r) * grid.cols;
+            for (int c = 0; c < grid.cols; ++c) {
+                const Patch& p = rowPatches[c];
+                if (!p.usable || !(p.quality > 0.0f)) {
                     continue;
                 }
+                const int cx = static_cast<int>(p.x);
                 const float wgt = p.quality;
-                const std::size_t idx = static_cast<std::size_t>(y) * w + static_cast<std::size_t>(x);
-                flow.u[idx] += p.u * wgt;
-                flow.v[idx] += p.v * wgt;
-                weight[idx] += wgt;
+                const int x0 = std::max(0, cx - half);
+                const int x1 = std::min(static_cast<int>(w) - 1, cx + ps - half - 1);
+                for (int x = x0; x <= x1; ++x) {
+                    rowU[x] += p.u * wgt;
+                    rowV[x] += p.v * wgt;
+                    weight[static_cast<std::size_t>(x)] += wgt;
+                }
             }
         }
-    }
 
-    // Normalise.  A pixel no usable patch reached keeps zero flow, which is
-    // the honest answer: nothing measured it.  repairFlow() can fill those
-    // from neighbours when the caller wants a dense field.
-    for (std::size_t i = 0; i < flow.u.size(); ++i) {
-        if (weight[i] > 0.0f) {
-            const float inv = 1.0f / weight[i];
-            flow.u[i] *= inv;
-            flow.v[i] *= inv;
+        // Normalise.  A pixel no usable patch reached keeps zero flow, which
+        // is the honest answer: nothing measured it.  repairFlow() can fill
+        // those from neighbours when the caller wants a dense field.
+        for (std::uint32_t x = 0; x < w; ++x) {
+            if (weight[x] > 0.0f) {
+                const float inv = 1.0f / weight[x];
+                rowU[x] *= inv;
+                rowV[x] *= inv;
+            }
         }
-    }
+    });
     return flow;
 }
 
@@ -507,12 +618,12 @@ float FlowField::atV(int x, int y) const noexcept {
 // ---------------------------------------------------------------------------
 //  Flow post-processing
 // ---------------------------------------------------------------------------
-void smoothFlow(FlowField& flow, double sigmaPx) {
+void smoothFlow(FlowField& flow, double sigmaPx, ThreadPool* pool) {
     if (!flow.valid() || sigmaPx <= 0.0) {
         return;
     }
-    blurPlane(flow.u, flow.w, flow.h, sigmaPx);
-    blurPlane(flow.v, flow.w, flow.h, sigmaPx);
+    blurPlane(flow.u, flow.w, flow.h, sigmaPx, pool);
+    blurPlane(flow.v, flow.w, flow.h, sigmaPx, pool);
 }
 
 std::uint64_t repairFlow(FlowField& flow, const std::vector<std::uint8_t>& ok) {
@@ -590,8 +701,6 @@ std::uint64_t repairFlow(FlowField& flow, const std::vector<std::uint8_t>& ok) {
 //  The solver
 // ---------------------------------------------------------------------------
 Result<FlowField> disFlow(const GrayImage& from, const GrayImage& to, const DisFlowParams& params, ThreadPool* pool) {
-    (void)pool;  // The per-level solve is sequential; see the note below.
-
     if (!from.valid() || !to.valid()) {
         return Error{ErrorCode::InvalidArgument, "disFlow: an input image is empty or malformed"};
     }
@@ -624,8 +733,8 @@ Result<FlowField> disFlow(const GrayImage& from, const GrayImage& to, const DisF
         }
     }
 
-    const std::vector<GrayImage> pyrFrom = buildPyramid(scaledFrom, std::max(1, params.levels));
-    const std::vector<GrayImage> pyrTo = buildPyramid(scaledTo, std::max(1, params.levels));
+    const std::vector<GrayImage> pyrFrom = buildPyramid(scaledFrom, std::max(1, params.levels), pool);
+    const std::vector<GrayImage> pyrTo = buildPyramid(scaledTo, std::max(1, params.levels), pool);
     if (pyrFrom.empty() || pyrTo.empty() || pyrFrom.size() != pyrTo.size()) {
         return Error{ErrorCode::Internal, "disFlow: pyramid construction failed"};
     }
@@ -638,40 +747,55 @@ Result<FlowField> disFlow(const GrayImage& from, const GrayImage& to, const DisF
 
         std::vector<float> gx;
         std::vector<float> gy;
-        gradients(imgFrom, gx, gy);
+        gradients(imgFrom, gx, gy, pool);
 
-        std::vector<Patch> patches = precomputeTensors(imgFrom, gx, gy, params);
-        if (patches.empty()) {
+        PatchGrid grid = precomputeTensors(imgFrom, gx, gy, params, pool);
+        if (grid.patches.empty()) {
             continue;  // level too small for a grid; the finer ones still run
         }
 
-        // Seed each patch from the field carried up from the coarser level,
-        // doubling the displacement because this level is twice the size.
-        if (flow.valid()) {
-            for (Patch& p : patches) {
-                const int sx = static_cast<int>(p.x * 0.5f);
-                const int sy = static_cast<int>(p.y * 0.5f);
-                p.u = flow.atU(sx, sy) * 2.0f;
-                p.v = flow.atV(sx, sy) * 2.0f;
+        // Seed and solve every patch.  The measured cost of this stage was
+        // ~100 ms per direction on the importer's bands - it had been left
+        // sequential on the belief that it took milliseconds - so it runs
+        // across the pool.  Each patch reads the two images, the gradients
+        // and the coarser field, and writes only itself; each chunk owns
+        // its scratch.  Unlike the row passes this body is NOT idempotent
+        // (a patch refines its own seed in place), so a failed parallel run
+        // is reported rather than redone.
+        const bool seeded = flow.valid();
+        const FlowField& coarse = flow;
+        const ThreadPool::ChunkBody solveRange = [&](std::size_t begin, std::size_t end) {
+            std::vector<float> tmpl;
+            std::vector<float> target;
+            for (std::size_t i = begin; i < end; ++i) {
+                Patch& p = grid.patches[i];
+                // Seed from the field carried up from the coarser level,
+                // doubling the displacement because this level is twice
+                // the size.
+                if (seeded) {
+                    const int sx = static_cast<int>(p.x * 0.5f);
+                    const int sy = static_cast<int>(p.y * 0.5f);
+                    p.u = coarse.atU(sx, sy) * 2.0f;
+                    p.v = coarse.atV(sx, sy) * 2.0f;
+                }
+                solvePatch(p, imgFrom, imgTo, gx, gy, params, tmpl, target);
             }
+        };
+        const std::size_t patchCount = grid.patches.size();
+        if (pool != nullptr && pool->size() > 1 && patchCount > kPatchGrain) {
+            const Status solved = pool->parallelFor(0, patchCount, kPatchGrain, solveRange);
+            if (!solved.ok()) {
+                return Error{ErrorCode::Internal, "disFlow: parallel patch solve failed: " + solved.error().message};
+            }
+        } else {
+            solveRange(0, patchCount);
         }
 
-        // The patch solve is embarrassingly parallel - every patch reads the
-        // two images and writes only itself - but it is left sequential here
-        // deliberately.  The band this runs on is a few hundred rows, the
-        // whole solve is milliseconds, and ThreadPool::parallelFor has a
-        // per-call synchronisation cost that dominates at that size.  The
-        // pool parameter is kept in the signature so the decision can be
-        // revisited for full-frame use without an API change.
-        for (Patch& p : patches) {
-            solvePatch(p, imgFrom, imgTo, gx, gy, params);
-        }
-
-        flow = densify(patches, imgFrom.w, imgFrom.h, params);
+        flow = densify(grid, imgFrom.w, imgFrom.h, params, pool);
         // Smooth at every level, not only the last: the field is the seed for
         // the next level, and an unsmoothed seed propagates each patch's
         // blockiness into the finer solve.
-        smoothFlow(flow, params.smoothSigmaPx);
+        smoothFlow(flow, params.smoothSigmaPx, pool);
     }
 
     if (!flow.valid()) {
@@ -700,9 +824,14 @@ Result<BidirFlow> disFlowBidirectional(const GrayImage& a, const GrayImage& b, c
     const int h = static_cast<int>(out.forward.h);
     const double tol = std::max(0.0, params.consistencyTolPx);
     const double tol2 = tol * tol;
-    for (int y = 0; y < h; ++y) {
+    // Row-parallel; each row counts its own agreements and the total is
+    // summed afterwards, so no counter is shared between threads.
+    std::vector<std::uint64_t> rowConsistent(static_cast<std::size_t>(std::max(0, h)), 0u);
+    forRows(pool, static_cast<std::size_t>(std::max(0, h)), kRowGrain, [&](std::size_t yRow) {
+        const int y = static_cast<int>(yRow);
+        std::uint64_t count = 0;
         for (int x = 0; x < w; ++x) {
-            const std::size_t idx = static_cast<std::size_t>(y) * out.forward.w + static_cast<std::size_t>(x);
+            const std::size_t idx = yRow * out.forward.w + static_cast<std::size_t>(x);
             const float fu = out.forward.u[idx];
             const float fv = out.forward.v[idx];
             if (!std::isfinite(fu) || !std::isfinite(fv)) {
@@ -718,9 +847,13 @@ Result<BidirFlow> disFlowBidirectional(const GrayImage& a, const GrayImage& b, c
             const double ey = static_cast<double>(fv) + bv;
             if (ex * ex + ey * ey <= tol2) {
                 out.ok[idx] = 1u;
-                ++out.consistent;
+                ++count;
             }
         }
+        rowConsistent[yRow] = count;
+    });
+    for (const std::uint64_t count : rowConsistent) {
+        out.consistent += count;
     }
 
     return out;

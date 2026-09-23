@@ -7,7 +7,7 @@
 // registered with ctest, because its numbers depend on the machine and would
 // only make the suite slow and flaky.  Run it by hand:
 //
-//     build\<dir>\bin\osv_importer_bench.exe [clip.OSV] [--frames N] [--part A|B|C|D|all]
+//     build\<dir>\bin\osv_importer_bench.exe [clip.OSV] [--frames N] [--part A|B|C|D|P|all]
 //
 // WHY IT EXISTS
 // -------------
@@ -35,6 +35,11 @@
 //      PPix, so upload and readback are not the effect's cost.
 //
 //   D  the reframe effect's CPU path (renderCpu), for the software renderer.
+//
+//   P  parking the playhead: the Stopped / 8u / full-size requests Premiere
+//      sends when the user clicks somewhere new on the timeline, at scattered
+//      frames so no decode-ahead can hide the cost - plus the decoder's
+//      random-access cost alone, for comparison.
 //
 // Output is plain ASCII so it survives any Windows console code page.
 
@@ -819,6 +824,155 @@ void partD(const Options&) {
     }
 }
 
+// ===========================================================================
+//  Part P - parking the playhead on a frame (the Stopped path)
+// ===========================================================================
+
+/// Where the playhead lands, in the order it lands there.  Deliberately
+/// scattered across the clip's GOPs (the sample has sync samples at 1 and 61)
+/// and never sequential, so the decoder cannot coast on frames it already
+/// decoded ahead - this is clicking around a timeline, not playing it.
+constexpr std::uint32_t kParkFrames[] = {27, 45, 10, 63, 32, 5, 50, 18, 40, 2, 58, 23};
+
+/// One parking configuration: the prefs, and what the host asks for.
+struct ParkConfig {
+    const char* name;
+    bool parallax;
+    bool analyses;
+};
+
+void partP(const Options& o) {
+    std::printf("\n=== P. Parking on a frame: imGetSourceVideo, intent Stopped, BGRA_4444_8u, 6000x3000 ===\n");
+    std::printf("    Exactly what Premiere logged when the playhead is dropped somewhere new:\n");
+    std::printf("    a full-resolution, non-draft, EXACT request for a frame nowhere near the last one.\n\n");
+
+    ImporterHarness harness;
+    if (!harness.loaded()) {
+        std::printf("    cannot load the importer: %s\n", harness.loadError().c_str());
+        return;
+    }
+    const void* rawSuite = nullptr;
+    if (harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &rawSuite) != kSPNoError ||
+        !rawSuite) {
+        std::printf("    cannot acquire the PPix suite from the mock host\n");
+        return;
+    }
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(rawSuite);
+
+    // Classical flow, as inside Premiere today (the neural runtime is not
+    // staged there), so the numbers describe what the user is waiting for.
+    const ParkConfig configs[] = {
+        {"defaults (parallax on)  ", true, true},
+        {"parallax off            ", false, true},
+        {"all analyses off        ", false, false},
+    };
+
+    csSDK_int32 importerId = 500;
+    for (const ParkConfig& c : configs) {
+        harness.host().clearCache();
+        auto clip = harness.openClip(o.clip, importerId++);
+        if (!clip.open()) {
+            std::printf("    %s open failed (%d)\n", c.name, static_cast<int>(clip.openResult()));
+            continue;
+        }
+        PrefsBlob prefs = PrefsBlob::defaults();
+        prefs.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::Native);
+        prefs.parallax = static_cast<std::uint8_t>(c.parallax ? osv::premiere::PrefsParallax::On
+                                                              : osv::premiere::PrefsParallax::Off);
+        prefs.flowBackend = static_cast<std::uint8_t>(osv::premiere::PrefsFlowBackend::Classical);
+        prefs.seamSearch = c.analyses ? 1 : 0;
+        prefs.gainMatch = c.analyses ? 1 : 0;
+        prefs.stabilization =
+            static_cast<std::uint8_t>(c.analyses ? PrefsStabilization::HorizonLock : PrefsStabilization::Off);
+
+        imFileInfoRec8 info{};
+        if (harness.getInfo8(clip, info, &prefs) != imNoErr || info.vidScale <= 0 || info.vidSampleSize <= 0) {
+            std::printf("    %s imGetInfo8 failed\n", c.name);
+            continue;
+        }
+        const PrTime ticksPerFrame = kTicksPerSecond * info.vidSampleSize / info.vidScale;
+
+        std::printf("    %s", c.name);
+        std::vector<double> ms;
+        for (const std::uint32_t frame : kParkFrames) {
+            ImporterHarness::SourceVideoRequest request;
+            request.frameTime = ticksPerFrame * static_cast<PrTime>(frame);
+            request.format = PrPixelFormat_BGRA_4444_8u;
+            request.width = 6000;
+            request.height = 3000;
+            request.intent = imRenderIntent_Stopped;
+            request.playbackRatio = 1.0;
+            // Each park is a NEW frame; the host's cache must not serve it.
+            harness.host().clearCache();
+            PPixHand hand = nullptr;
+            const Clock::time_point t0 = Clock::now();
+            const csSDK_int32 err = harness.getSourceVideo(clip, request, prefs, hand);
+            ms.push_back(msSince(t0));
+            if (err != imNoErr || !hand) {
+                std::printf("  frame %u failed (%d)", frame, static_cast<int>(err));
+                break;
+            }
+            ppix->Dispose(hand);
+            std::printf(" %u:%.0f", frame, ms.back());
+        }
+        // The first park also opens the decoders; the rest are the steady
+        // cost of dropping the playhead somewhere new.
+        std::printf("\n      -> first %.0f ms, then median %.0f ms, worst %.0f ms\n", ms.empty() ? 0.0 : ms.front(),
+                    median(tail(ms, 1)), ms.size() > 1 ? *std::max_element(ms.begin() + 1, ms.end()) : 0.0);
+        clip.close();
+    }
+
+    // ---- the decoder alone ------------------------------------------------------
+    // A random access decodes forward from the previous sync sample, so its
+    // cost grows with the distance into the GOP.  Timed on its own reader so
+    // nothing else competes for the cores, once per decode back-end: software
+    // (what the importer uses today) and the two hardware paths, each copying
+    // its frames back to host memory exactly as the importer would need.
+    auto parsed = osvtool::Pipeline::open(
+        [&] {
+            osvtool::PipelineOptions po;
+            po.input = o.clip;
+            po.hw = "none";
+            po.device = "cpu";
+            return po;
+        }(),
+        /*needRenderer=*/false);
+    if (!parsed.ok()) {
+        std::printf("    Pipeline::open failed: %s\n", parsed.error().message.c_str());
+    } else {
+        std::printf("\n    decode alone (both lenses, host frames), same landing order:\n");
+        for (const osv::video::HwAccel hw :
+             {osv::video::HwAccel::None, osv::video::HwAccel::Cuda, osv::video::HwAccel::D3D11VA}) {
+            osv::video::DecoderOptions decOpt;
+            decOpt.hw = hw;
+            decOpt.threads = 0;
+            decOpt.keepOnDevice = false;
+            std::printf("      %-8s", osv::video::hwAccelName(hw));
+            osv::Result<osv::video::DualStreamReader> reader = osv::Error{osv::ErrorCode::Internal, "not opened"};
+            const double openMs =
+                timeMs([&] { reader = osv::video::DualStreamReader::open(o.clip, parsed.value()->format, decOpt); });
+            if (!reader.ok()) {
+                std::printf(" open failed: %s\n", reader.error().message.c_str());
+                continue;
+            }
+            std::printf(" open %.0f ms |", openMs);
+            std::vector<double> ms;
+            for (const std::uint32_t frame : kParkFrames) {
+                osv::Result<osv::video::FramePair> pair = osv::Error{osv::ErrorCode::Internal, "not read"};
+                ms.push_back(timeMs([&] { pair = reader.value().read(frame); }));
+                if (!pair.ok()) {
+                    std::printf(" %u:FAILED (%s)", frame, pair.error().message.c_str());
+                    break;
+                }
+                std::printf(" %u:%.0f", frame, ms.back());
+            }
+            std::printf("\n               -> median %.0f ms, worst %.0f ms\n", median(ms),
+                        ms.empty() ? 0.0 : *std::max_element(ms.begin(), ms.end()));
+        }
+    }
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -831,7 +985,7 @@ int main(int argc, char** argv) {
 
     const Options o = parseArgs(argc, argv);
     if (o.clip.empty() || !std::filesystem::exists(o.clip)) {
-        std::printf("usage: osv_importer_bench [clip.OSV] [--frames N] [--part A|B|C|D|all]\n");
+        std::printf("usage: osv_importer_bench [clip.OSV] [--frames N] [--part A|B|C|D|P|all]\n");
         std::printf("clip not found: '%s'\n", o.clip.string().c_str());
         return 2;
     }
@@ -851,6 +1005,9 @@ int main(int argc, char** argv) {
     }
     if (wantPart(o, 'D')) {
         partD(o);
+    }
+    if (wantPart(o, 'P')) {
+        partP(o);
     }
     return 0;
 }

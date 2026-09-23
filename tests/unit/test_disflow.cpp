@@ -366,3 +366,47 @@ TEST_CASE("repairFlow fills holes from measured neighbours", "[render][flow]") {
         CHECK(repairFlow(f, wrong) == 0);
     }
 }
+
+TEST_CASE("the pooled solve is bit-identical to the sequential one", "[render][flow]") {
+    // The importer measures a parallax bucket on the render thread WITH a
+    // pool and in its background worker WITHOUT one, and an export must not
+    // depend on which of the two got there first.  That only holds if the
+    // field is identical to the last bit, not merely close - so this compares
+    // floats with ==, over a band-shaped image (wide and short, like the
+    // overlap bands) whose motion varies across it so densify's overlapping
+    // patches really do disagree and their summation order matters.
+    GrayImage a = textured(1500, 120);
+    GrayImage b = shifted(a, 1.7, -0.6);
+    // A second, spatially varying displacement on the right half, so the
+    // field is not one constant vector every order of summation agrees on.
+    for (std::uint32_t y = 0; y < b.h; ++y) {
+        for (std::uint32_t x = b.w / 2; x < b.w; ++x) {
+            const double dx = 3.0 + 2.0 * std::sin(0.01 * static_cast<double>(x));
+            b.data[static_cast<std::size_t>(y) * b.w + x] =
+                a.sample(static_cast<float>(static_cast<double>(x) - dx), static_cast<float>(y) + 0.8f);
+        }
+    }
+
+    DisFlowParams params;
+    const auto sequential = disFlowBidirectional(a, b, params, nullptr);
+    REQUIRE(sequential.ok());
+
+    // Several pool sizes: a different thread count changes how the rows and
+    // patches are chunked, which must change nothing.
+    for (const unsigned threads : {2u, 7u, 32u}) {
+        osv::ThreadPool pool(threads);
+        const auto pooled = disFlowBidirectional(a, b, params, &pool);
+        REQUIRE(pooled.ok());
+        const BidirFlow& s = sequential.value();
+        const BidirFlow& p = pooled.value();
+        INFO("pool of " << threads << " threads");
+        REQUIRE(p.forward.w == s.forward.w);
+        REQUIRE(p.forward.h == s.forward.h);
+        CHECK(p.forward.u == s.forward.u);
+        CHECK(p.forward.v == s.forward.v);
+        CHECK(p.backward.u == s.backward.u);
+        CHECK(p.backward.v == s.backward.v);
+        CHECK(p.ok == s.ok);
+        CHECK(p.consistent == s.consistent);
+    }
+}

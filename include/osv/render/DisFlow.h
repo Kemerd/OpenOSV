@@ -212,9 +212,12 @@ struct GrayImage {
 /// Compute flow from `from` to `to`: the field says, for each pixel of
 /// `from`, where that content moved to in `to`.
 ///
-/// Both images must be the same non-zero size.  `pool` parallelises the patch
-/// solve and the densify across rows of the patch grid; nullptr runs on the
-/// calling thread.
+/// Both images must be the same non-zero size.  `pool` parallelises every
+/// stage - pyramid, gradients, tensors, the patch solve, densify and the
+/// smoothing; nullptr runs on the calling thread.  The field is bit-identical
+/// either way (each worker writes only its own rows or patches, and densify
+/// sums overlapping patches in the sequential order), so a caller may mix
+/// pooled and unpooled solves and still get reproducible results.
 ///
 /// Returns InvalidArgument for mismatched or empty inputs, or for parameters
 /// that describe no solvable problem (a non-positive patch size, zero
@@ -254,7 +257,9 @@ struct BidirFlow {
 /// Separable, clamp-to-edge, and a no-op for sigma <= 0 or a field smaller
 /// than the kernel.  Exposed because the warp stage wants to re-smooth after
 /// it has masked inconsistent vectors out, not only where disFlow() does it.
-void smoothFlow(FlowField& flow, double sigmaPx);
+/// `pool` (optional) splits both passes by rows; the result is bit-identical
+/// with or without it.
+void smoothFlow(FlowField& flow, double sigmaPx, ThreadPool* pool = nullptr);
 
 /// Replace flow vectors where `ok` is 0 by an average of their valid
 /// neighbours, spreading outward until every hole is filled or no progress is

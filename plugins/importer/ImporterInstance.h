@@ -331,8 +331,16 @@ private:
     /// Parse the container, metadata, calibration and rig (once).
     [[nodiscard]] Status parseOnce();
 
-    /// Create the DualStreamReader if it does not exist yet.
+    /// Create the DualStreamReader if it does not exist yet, on the fastest
+    /// decode back-end this machine offers (see the implementation for the
+    /// order and why random access is what decides it).
     [[nodiscard]] Status ensureReader();
+
+    /// Decode frame `index` from both lenses.  If a hardware decoder fails,
+    /// the clip is switched to software decoding for good and the frame is
+    /// retried once, so a driver hiccup costs one slow frame instead of a
+    /// "media offline" in the Program Monitor.
+    [[nodiscard]] Result<video::FramePair> readPair(std::uint32_t index);
 
     /// The body of audio() / audioLocked(); assumes the lock is held.
     [[nodiscard]] AudioDecoder* audioImpl();
@@ -379,6 +387,12 @@ private:
     /// can skip the work when the prefs did not touch it.
     PrefsCalibration m_rigCalibration = PrefsCalibration::Native;
     bool m_rigBuilt = false;
+
+    /// Set once a hardware decoder has failed on this clip: every reader
+    /// opened afterwards is software.  Deliberately NOT reset by
+    /// releaseHeavy() - a quiet / unquiet does not make a GPU that could not
+    /// decode this stream able to, and retrying would pay the failure again.
+    bool m_hwDecodeFailed = false;
 
     // ---- heavy, dropped by releaseHeavy() ---------------------------------
     std::unique_ptr<video::DualStreamReader> m_reader;
