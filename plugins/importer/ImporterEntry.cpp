@@ -28,6 +28,7 @@
 #include "Engine.h"
 #include "HostContext.h"
 #include "PluginLog.h"
+#include "osv/video/GpuDecoderPool.h"
 #include "osv/video/ReaderPool.h"
 
 #include "PrSDKEntry.h"
@@ -357,6 +358,11 @@ csSDK_int32 doShutdown() {
     // background thread also pins this module while it runs, so clearing here
     // lets the module unload promptly.
     osv::video::ReaderPool::instance().clear();
+    // The same for the importer frame's NVDEC decoders parked by quiet /
+    // close (osv::video::GpuDecoderPool).  They live in the primary context
+    // of the renderer's device and hold VRAM there, so they go BEFORE the
+    // renderer pool below and while the CUDA driver is certainly alive.
+    osv::video::GpuDecoderPool::instance().clear();
     HostContext::shutdown();
 
     // Same lock the acquisition uses.  imShutdown arrives on one thread while
