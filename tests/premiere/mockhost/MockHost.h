@@ -14,7 +14,10 @@
 //   Time v1, MediaCore StringSuite v1, App Info v3, Error v3,
 //   Color Management v1, Memory Manager v4, Importer File Manager v4,
 //   Sequence Info v9, Video Segment v9/v8/v7/v6 (keyframe table with
-//   interpolation), GPU Device v2 (a real CUDA driver-API context when the
+//   interpolation, injectable read failures, and a segment graph: node
+//   types, operator owners, inputs, properties and a per-node clip-time ->
+//   media-time transform), GPU Device v2 (a real CUDA driver-API context -
+//   the primary one, or a private one like Premiere's - when the
 //   build has CUDA and a device is present), PF Pixel Format v1 and
 //   PF Utility v4 (AE side) plus PF_InData / PF_OutData builders with
 //   working checkout_param / add_param callbacks.
@@ -260,6 +263,34 @@ struct DrawbotRecord {
     }
 };
 
+/// One PrSDKVideoSegmentSuite::GetParam call, as the host saw it.
+///
+/// Recorded so a test can tell HOW a plug-in read its parameters, not only
+/// what it rendered: the GPU filter's parameter probe reads every entry at
+/// t = 0 and re-runs on the next Render when it could not identify the list,
+/// so "no read at t = 0 during Render" is the observable proof that the
+/// probe succeeded at CreateInstance.
+struct ParamReadRecord {
+    csSDK_int32 nodeId = 0;
+    csSDK_int32 index = 0;
+    PrTime time = 0;
+    prSuiteError result = suiteError_NoError;
+};
+
+/// Which CUDA context the mock GPU Device Suite hands out.
+///
+/// Premiere hands a GPU filter a PRIVATE context, not the device's primary
+/// one (the first real session logged "host CUDA context ... is NOT the
+/// primary context"), and that matters: device memory allocated in one
+/// context is not addressable from the other, so a test that wants to prove
+/// the direct path really works in Premiere's setting must use a private
+/// context.  Primary stays the default because every existing GPU test was
+/// written against it.
+enum class GpuContextKind : int {
+    Primary = 0,  ///< cuDevicePrimaryCtxRetain (the original behaviour).
+    Private = 1,  ///< cuCtxCreate: a context of its own, like Premiere's.
+};
+
 /// Counters of the PPix cache.
 struct CacheStats {
     std::size_t hits = 0;
@@ -400,10 +431,73 @@ public:
     void setParam(csSDK_int32 nodeId, csSDK_int32 index, PrTime time, const PrParam& value);
     /// Remove every keyframe (and property) of a node.
     void clearNode(csSDK_int32 nodeId);
-    /// Node property served by GetNodeProperty (UTF-8).
+    /// Node property served by GetNodeProperty and IterateNodeProperties
+    /// (UTF-8).
     void setNodeProperty(csSDK_int32 nodeId, std::string_view key, std::string_view value);
 
+    /// GetParamCount's answer for a node, overriding the default (one past
+    /// the highest keyframed index).  A negative count restores the default.
+    /// Lets a node report entries it cannot serve, as a real host does.
+    void setParamCount(csSDK_int32 nodeId, csSDK_int32 count);
+
+    /// Make GetParam on (node, index) fail with `error` - at every time, or
+    /// only at exactly `onlyAt` when given.  suiteError_NoError removes the
+    /// injection.  The keyframes stay in place, so the same entry reads fine
+    /// at any other time.
+    void setParamReadError(csSDK_int32 nodeId, csSDK_int32 index, prSuiteError error,
+                           std::optional<PrTime> onlyAt = std::nullopt);
+
+    /// Every GetParam call since the last clearParamReads(), oldest first.
+    [[nodiscard]] std::vector<ParamReadRecord> paramReads() const;
+    void clearParamReads();
+
+    // ---- segment graph -----------------------------------------------------
+    //
+    //  Premiere describes what a clip is made of as a graph of nodes: an
+    //  effect node is an OPERATOR of a clip node, whose input is the media
+    //  node that names the file.  The GPU filter walks exactly that
+    //  (AcquireOperatorOwnerNodeID -> AcquireInputNodeID -> GetNodeInfo /
+    //  IterateNodeProperties) and maps clip time to media time through the
+    //  clip node's TransformNodeTime.  Nodes are created on first mention.
+
+    /// GetNodeInfo's type for a node (one of the kVideoSegment_NodeType_*
+    /// strings).  A node never given one reports the effect type.
+    void setNodeType(csSDK_int32 nodeId, std::string_view type);
+    /// The node AcquireOperatorOwnerNodeID returns for `operatorNodeId`
+    /// (0 removes it, and the call then fails like it does for a node with
+    /// no owner).
+    void setNodeOwner(csSDK_int32 operatorNodeId, csSDK_int32 ownerNodeId);
+    /// Append an input to a node; its AcquireInputNodeID index is the order
+    /// of the calls.  `offset` is what the call reports alongside it.
+    void addNodeInput(csSDK_int32 nodeId, csSDK_int32 inputNodeId, PrTime offset = 0);
+    /// The node's time transform: TransformNodeTime(node, t) answers
+    /// origin + t * rateNum / rateDen (integer ticks, truncated toward zero).
+    ///
+    ///   trimmed clip, in point I:        origin = I,        rate 1/1
+    ///   2x speed from in point I:        origin = I,        rate 2/1
+    ///   half speed:                      origin = I,        rate 1/2
+    ///   reversed, starting at media E:   origin = E,        rate -1/1
+    ///
+    /// A non-positive denominator is refused (the node keeps its transform).
+    void setNodeTimeTransform(csSDK_int32 nodeId, PrTime origin, std::int64_t rateNum, std::int64_t rateDen);
+    /// Make TransformNodeTime on the node fail with `error`
+    /// (suiteError_NoError restores the transform).
+    void setNodeTimeTransformError(csSDK_int32 nodeId, prSuiteError error);
+    /// Outstanding acquires of one node (0 for an unknown node).
+    [[nodiscard]] int nodeRefCount(csSDK_int32 nodeId) const;
+    /// Outstanding acquires of every node together - 0 after a plug-in that
+    /// releases everything it walked.
+    [[nodiscard]] int totalNodeRefs() const;
+    /// ReleaseVideoNodeID calls that had nothing to release.
+    [[nodiscard]] std::size_t invalidNodeReleases() const;
+
     // ---- GPU ---------------------------------------------------------------
+    /// Choose the kind of CUDA context the GPU Device Suite hands out.  Must
+    /// be called before anything touches the GPU; returns false (and changes
+    /// nothing) once the device has been initialised with the other kind.
+    bool setGpuContextKind(GpuContextKind kind);
+    /// The kind in force.
+    [[nodiscard]] GpuContextKind gpuContextKind() const;
     /// True when the CUDA driver initialised and a device exists.
     [[nodiscard]] bool gpuAvailable();
     [[nodiscard]] csSDK_uint32 gpuDeviceCount();

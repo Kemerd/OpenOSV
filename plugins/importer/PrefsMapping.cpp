@@ -14,6 +14,7 @@
 
 #include "ImporterPlugin.h"
 
+#include "CalibrationUi.h"
 #include "PrefsBlob.h"
 
 #include <cmath>
@@ -33,7 +34,9 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.stabilization = static_cast<int>(prefs.stabilization);
     c.seamSearch = prefs.seamSearch != 0;
     c.gainMatch = prefs.gainMatch != 0;
-    c.calibration = static_cast<int>(prefs.calibration);
+    // The combo lists the CHOICE (Auto, Native, Lens protectors, Underwater),
+    // which two stored bytes encode - see PrefsBlob::calibrationChoice().
+    c.calibration = static_cast<int>(prefs.calibrationChoice());
     c.dlogmFit = static_cast<int>(prefs.dlogmFit);
     c.exposureStops = static_cast<double>(prefs.exposureStops);
     c.renderDevice = static_cast<int>(prefs.renderDevice);
@@ -45,7 +48,20 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
 // ---------------------------------------------------------------------------
 
 PrefsBlob prefsFromControls(const DialogControls& controls) noexcept {
-    PrefsBlob blob = PrefsBlob::defaults();
+    return prefsFromControls(controls, PrefsBlob::defaults());
+}
+
+PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& base) noexcept {
+    // Start from the blob the dialog was opened with, NOT from defaults():
+    // the dialog shows only some of the fields, and every field it does not
+    // show (parallax, flow backend, and whatever later packages add) must
+    // come back exactly as it went in.  Starting from defaults() silently
+    // reset parallax to On and the flow backend to Auto on every OK.
+    //
+    // The base is sanitised first so a damaged incoming blob cannot smuggle
+    // an out-of-range hidden field through.
+    PrefsBlob blob = base;
+    blob.sanitise();
 
     // A control index outside its range must never produce an invalid blob.
     // A combo box with no selection reports CB_ERR (-1) and a corrupted
@@ -63,7 +79,11 @@ PrefsBlob prefsFromControls(const DialogControls& controls) noexcept {
     blob.stabilization = pick(controls.stabilization, static_cast<int>(PrefsStabilization::Count), 1);
     blob.seamSearch = controls.seamSearch ? 1u : 0u;
     blob.gainMatch = controls.gainMatch ? 1u : 0u;
-    blob.calibration = pick(controls.calibration, static_cast<int>(PrefsCalibration::Count), 0);
+    // An out-of-range calibration index lands on Auto, the default; the
+    // setter writes the canonical byte pattern for the choice.
+    blob.setCalibrationChoice(static_cast<PrefsCalibrationChoice>(
+        pick(controls.calibration, static_cast<int>(PrefsCalibrationChoice::Count),
+             static_cast<std::uint8_t>(PrefsCalibrationChoice::Auto))));
     blob.dlogmFit = pick(controls.dlogmFit, static_cast<int>(PrefsDlogmFit::Count), 0);
     blob.renderDevice = pick(controls.renderDevice, static_cast<int>(PrefsRenderDevice::Count), 0);
 
@@ -76,6 +96,98 @@ PrefsBlob prefsFromControls(const DialogControls& controls) noexcept {
 
     blob.sanitise();
     return blob;
+}
+
+// ---------------------------------------------------------------------------
+//  Which file to refresh after OK
+// ---------------------------------------------------------------------------
+
+std::wstring prefsRefreshTarget(const PrefsBlob& before, const PrefsBlob& after, const wchar_t* instancePath,
+                                const wchar_t* accessPath) noexcept {
+    // Unchanged settings: the frames already on screen are the right ones,
+    // and every PPix is keyed on the whole blob anyway.
+    if (before == after) {
+        return {};
+    }
+    try {
+        // The live instance knows its own file best; imGetPrefs8 has no
+        // instance, but the host names the clip's file in imFileAccessRec8.
+        if (instancePath && instancePath[0] != L'\0') {
+            return std::wstring(instancePath);
+        }
+        if (accessPath && accessPath[0] != L'\0') {
+            return std::wstring(accessPath);
+        }
+    } catch (...) {
+        // Allocation failure: no refresh is the safe answer (the user can
+        // still force one by reopening the project).
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------------------
+//  Calibration combo labels
+// ---------------------------------------------------------------------------
+
+std::array<std::wstring, static_cast<std::size_t>(PrefsCalibrationChoice::Count)>
+calibrationChoiceLabels(const CalibrationUiFacts& facts) {
+    // Index = PrefsCalibrationChoice.  DJI's own words where they exist: the
+    // camera's control centre calls the setting "Lens Protection Mode" and
+    // the accessory "Transparent Lens Protectors", and ND filters that sit on
+    // the lenses the same way are declared through that same mode (Freewell's
+    // instructions say exactly that), so the entry names both.
+    std::array<std::wstring, static_cast<std::size_t>(PrefsCalibrationChoice::Count)> labels = {
+        L"Auto (follow the camera)",
+        L"Native (bare lenses)",
+        L"Lens protectors / ND filters",
+        L"Underwater",
+    };
+    if (!facts.known) {
+        return labels;  // Nothing to say about a clip we could not read.
+    }
+
+    // ---- Auto: name what it follows, and whether that set is really there --
+    auto& autoLabel = labels[static_cast<std::size_t>(PrefsCalibrationChoice::Auto)];
+    switch (facts.recordedAccessory) {
+    case -1:
+        autoLabel = L"Auto (nothing recorded: Native)";
+        break;
+    case 0:
+        autoLabel = L"Auto (camera: no lens protectors)";
+        break;
+    case 1:
+        // Always backed: without a dedicated set the protector field-angle
+        // correction is applied to native.
+        autoLabel = L"Auto (camera: lens protectors)";
+        break;
+    case 2:
+        autoLabel = facts.underwater == CalibrationAvailability::Missing ? L"Auto (underwater recorded, no data)"
+                                                                          : L"Auto (camera: underwater)";
+        break;
+    default:
+        autoLabel = L"Auto (unknown accessory: Native)";
+        break;
+    }
+
+    // ---- the forced underwater set: say when it cannot change anything -----
+    // (Lens protectors are never marked: they always apply either their own
+    // set or the field-angle correction, so they always change the stitch.)
+    auto mark = [](std::wstring& label, CalibrationAvailability a, const wchar_t* name) {
+        switch (a) {
+        case CalibrationAvailability::Missing:
+            label = std::wstring(name) + L" (not in clip: Native)";
+            break;
+        case CalibrationAvailability::SameAsNative:
+            label = std::wstring(name) + L" (same as Native here)";
+            break;
+        case CalibrationAvailability::Unknown:
+        case CalibrationAvailability::Usable:
+        default:
+            break;  // The plain name is the truth.
+        }
+    };
+    mark(labels[static_cast<std::size_t>(PrefsCalibrationChoice::Underwater)], facts.underwater, L"Underwater");
+    return labels;
 }
 
 // ---------------------------------------------------------------------------

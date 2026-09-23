@@ -21,15 +21,18 @@
 // disagree about what the host was told.
 #include "ImporterPlugin.h"
 #include "PluginLog.h"
+#include "ProtectorGuard.h"
 
 #include "osv/color/AutoDetect.h"
 #include "osv/geom/ConventionProbe.h"
 #include "osv/geom/EquirectMap.h"
+#include "osv/geom/LensProtector.h"
 #include "osv/geom/StreamScaling.h"
 #include "osv/meta/CalibrationSelector.h"
 #include "osv/meta/FormatDetector.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
+#include "osv/video/ReaderPool.h"
 #if defined(OSV_HAVE_CUDA)
 #include "osv/render/CudaAnalysis.h"
 #include "osv/render/CudaRenderer.h"
@@ -39,6 +42,7 @@
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <format>
 #include <iterator>
 #include <mutex>
 #include <vector>
@@ -129,15 +133,18 @@ void trimAnalysisCache(MapT& cache, std::size_t limit, const typename MapT::key_
     return color::kDefaultDlogMFit;
 }
 
-/// Map the prefs enum onto the calibration selector's lens-mode override.
-/// Native means "use whatever the clip says", so it stays nullopt.
-[[nodiscard]] std::optional<meta::ExtriLensMode> toLensModeOverride(PrefsCalibration calib) noexcept {
-    switch (calib) {
-    case PrefsCalibration::LensGuards: return meta::ExtriLensMode::LensGuards;
-    case PrefsCalibration::Underwater: return meta::ExtriLensMode::Underwater;
-    case PrefsCalibration::Native:
-    case PrefsCalibration::Count:
-    default:                           return std::nullopt;
+/// Map the prefs choice onto the calibration selector's choice.  Auto - the
+/// default, and what every blob with calibration 0 written before the
+/// choice existed means - follows the accessory the camera recorded; the
+/// other three force their set.
+[[nodiscard]] meta::CalibrationChoice toCalibrationChoice(PrefsCalibrationChoice choice) noexcept {
+    switch (choice) {
+    case PrefsCalibrationChoice::Native:     return meta::CalibrationChoice::Native;
+    case PrefsCalibrationChoice::LensGuards: return meta::CalibrationChoice::LensGuards;
+    case PrefsCalibrationChoice::Underwater: return meta::CalibrationChoice::Underwater;
+    case PrefsCalibrationChoice::Auto:
+    case PrefsCalibrationChoice::Count:
+    default:                                 return meta::CalibrationChoice::Auto;
     }
 }
 
@@ -192,6 +199,76 @@ void ensureGpuAnalyses() noexcept {
         // a noexcept function honest on a path reached from a C boundary.
     }
 #endif
+}
+
+// ---------------------------------------------------------------------------
+//  Reader helpers (ensureReader / releaseHeavy)
+// ---------------------------------------------------------------------------
+
+/// True when every track the reader will decode carries the configuration
+/// record (hvcC for the native lenses, avcC for the LRF proxy) that the
+/// container-sample feed primes libavcodec with.  Every camera-written clip
+/// does; a remuxed file might not, and then libavformat demuxes it instead.
+[[nodiscard]] bool containerSamplesUsable(const OsvFile* file, const meta::FormatInfo& format) noexcept {
+    if (!file) {
+        return false;
+    }
+    // The same track selection DualStreamReader::open makes.
+    std::array<std::uint32_t, 2> tracks{format.videoTrackIds[0], format.videoTrackIds[1]};
+    if (format.sideBySideProxy) {
+        const std::uint32_t t = format.videoTrackIds[0] != 0 ? format.videoTrackIds[0] : 1u;
+        tracks = {t, t};
+    }
+    for (const std::uint32_t id : tracks) {
+        const TrackInfo* track = id != 0 ? file->track(id) : nullptr;
+        if (!track || !track->isVideo() || (!track->hevc() && !track->avc())) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The options the importer opens its reader with on one back-end.
+///
+/// Measured on the sample clip (osv_decoder_open_bench, D3D11VA, both lenses;
+/// the machine was shared with parallel builds, so ratios matter more than
+/// absolute numbers):
+///
+///   * useContainerSamples - frame index == sample index == djmd index by
+///     construction, and no libavformat probe of all seven streams (only
+///     ~3 ms here, but it grows with the metadata tracks).
+///   * shareHwDevice - creating a D3D11 device cost ~120 ms per lens, more
+///     than everything else in open() together.  Shared, a re-open with any
+///     reader of any clip alive costs ~2 ms instead of ~160-280 ms.
+///   * deferFirstFrame - open() used to decode frame 0 (~100 ms) only to
+///     learn a size the hvcC parameter sets already state; the first real
+///     request paid for its own decode on top.
+///   * 4 threads on hardware - libavcodec's automatic count (16 on this
+///     32-core machine) gives every hardware decoder one surface per thread
+///     (36 per lens, ~1 GB of VRAM each at 3072x3072 P010) and a 16-deep
+///     pipeline to fill before the first picture.  Twelve scattered landings,
+///     both lenses, in the calmer runs:
+///
+///         threads   surfaces/lens   first landing   landings   sequential
+///         auto (16)      36            ~162 ms        ~52-57      ~8.0 ms/pair
+///         4              24            ~130-137 ms    ~45         ~8.2-8.6
+///         1              20            ~112-117 ms    ~45         ~10.8-10.9
+///
+///     Four keeps sequential decode where it was, makes random access and
+///     the first landing faster, and a parked reader holds a third less VRAM.
+///     Software keeps libavcodec's own count: there, frame threads are the
+///     whole speed.
+[[nodiscard]] video::DecoderOptions importerReaderOptions(video::HwAccel hw, bool containerSamples) noexcept {
+    // Hardware decoder threads (see the table above).
+    constexpr int kHardwareDecoderThreads = 4;
+    video::DecoderOptions opt;
+    opt.hw = hw;
+    opt.threads = (hw == video::HwAccel::None) ? 0 : kHardwareDecoderThreads;
+    opt.keepOnDevice = false;
+    opt.useContainerSamples = containerSamples;
+    opt.shareHwDevice = true;
+    opt.deferFirstFrame = true;
+    return opt;
 }
 
 }  // namespace
@@ -301,6 +378,7 @@ void ImporterInstance::stopParallaxWorker() noexcept {
 void ImporterInstance::resetParallaxLocked() noexcept {
     std::lock_guard<std::mutex> lock(m_parallaxMutex);
     m_parallaxGrids.clear();
+    m_blendSeams.clear();  // [WP-SEAM] carved through the corrections just dropped
     m_parallaxPending.reset();
     ++m_parallaxGeneration;
 }
@@ -469,18 +547,18 @@ Status ImporterInstance::rebuildRig() {
     // The lens-guard / underwater slots change the intrinsics AND the
     // extrinsics, so the whole rig is rebuilt; the selector is cheap (it only
     // walks the protobuf records already parsed into StreamMeta).
-    meta::CalibrationSelector::Options selOpt;
-    selOpt.lensModeOverride = toLensModeOverride(m_prefs.calib());
-
+    //
+    // Everything is built into locals and committed together at the end, so
+    // a failure half way leaves the previous calibration, rig and notes
+    // intact and consistent with each other.
+    const PrefsCalibrationChoice choice = m_prefs.calibrationChoice();
     std::vector<std::string> selWarnings;
-    auto selected = meta::CalibrationSelector::select(m_track.stream(), selOpt, &selWarnings);
+    auto selected = meta::CalibrationSelector::choose(m_track.stream(), toCalibrationChoice(choice), {}, &selWarnings);
     if (!selected.ok()) {
         return selected.error();
     }
-    m_calibration = std::move(selected).value();
-    for (const std::string& w : selWarnings) {
-        m_notes.push_back("calibration: " + w);
-    }
+    const meta::CalibrationSelection selection = std::move(selected).value();
+    const meta::CalibrationSet& calibration = selection.set;
 
     // Sensor -> stream scaling: the calibration is expressed in 3840x3840
     // sensor pixels, the decoded frames are 3000x3000 (6K mode).  This is the
@@ -491,36 +569,119 @@ Status ImporterInstance::rebuildRig() {
     // reader splits apart before we ever see a frame.  The rig describes one
     // lens, so it must be derived from the half, not from the track.
     std::vector<std::string> scaleNotes;
-    const double calFxMean = 0.5 * (m_calibration.slave.fx + m_calibration.master.fx);
+    const double calFxMean = 0.5 * (calibration.slave.fx + calibration.master.fx);
     auto scaling = geom::StreamScaling::derive(
         static_cast<int>(m_format.lensW()), static_cast<int>(m_format.lensH()), static_cast<int>(m_format.sensorW),
         static_cast<int>(m_format.sensorH), m_format.digitalFocalLength, calFxMean, std::nullopt, &scaleNotes);
     if (!scaling.ok()) {
         return scaling.error();
     }
-    for (const std::string& n : scaleNotes) {
-        m_notes.push_back("scaling: " + n);
-    }
 
     // The verified conventions (docs, memory: wxyz order, body->lens sense,
     // focal from digital_focal_length, 195.18 deg usable FOV).
+    //
+    // Note what the focal source means for a calibration switch: with
+    // DigitalFocalLength both lenses take the clip's one digital focal length,
+    // so a set contributes its principal point, radial terms, extrinsic
+    // rotation and occlusion arc - but not its own fx/fy (unless those
+    // disagree with the digital focal length by more than 1.2x, see
+    // LensRig.cpp).  On the sample that is the verified-best choice: the
+    // per-lens calibration focal measured a lower overlap NCC (0.807 vs 0.824).
     const geom::ExtrinsicConvention conv;  // defaults are the verified values
-    auto rig = geom::LensRig::build(m_calibration, scaling.value(), geom::FocalSource::DigitalFocalLength,
+    auto rig = geom::LensRig::build(calibration, scaling.value(), geom::FocalSource::DigitalFocalLength,
                                     m_format.digitalFocalLength, conv, 195.18);
     if (!rig.ok()) {
         return rig.error();
     }
-    m_rig = std::move(rig).value();
+    geom::LensRig builtRig = std::move(rig).value();
+
+    // Blend defaults match osvtool's (4 degree feather, occlusion polygon on).
+    geom::BlendParams blend = m_blend;
+    blend.lensFovDeg = 195.18;
+    blend.featherDeg = 4.0;
+    blend.useOcclusionMask = true;
+
+    // ---- lens protectors: the field-angle correction ---------------------------
+    //
+    // When the choice resolved to lens guards and the clip has no dedicated
+    // lens-guard calibration (every clip seen so far), the protector's
+    // field-angle curve is folded into both lens models - see
+    // geom/LensProtector.h.  The direction is DJI's (forward), checked once
+    // per clip on frame 0 by the guard (ProtectorGuard.h), which switches the
+    // correction off if the footage plainly was not shot through a
+    // protector.  Native never gets here, and neither does Auto on a clip
+    // recorded without protectors - those rigs are exactly what they were.
+    std::string reason = selection.reason;
+    std::string protectorNote;
+    if (selection.protectorCorrection) {
+        const ProtectorGuardResult guard = resolveProtectorGuard(m_path, m_format, builtRig, blend);
+        auto fold = geom::applyLensProtector(builtRig, guard.direction, blend.lensFovDeg);
+        if (fold.ok()) {
+            blend.lensFovDeg = fold.value().lensFovDeg;
+            protectorNote = std::format("lens-protector correction {}: usable FOV {:.2f} deg, refit residual "
+                                        "{:.3f} px; check: {}",
+                                        geom::protectorDirectionName(guard.direction), blend.lensFovDeg,
+                                        fold.value().maxResidualPx, guard.summary);
+            if (guard.direction == geom::ProtectorDirection::None) {
+                // The selector's sentence promised the correction; say that
+                // the pixels overruled it, so the line is true as a whole.
+                reason += " - switched off: frame 0 does not look shot through a protector";
+            }
+        } else {
+            // The fold only fails on a lens it cannot refit; the bare lens is
+            // still a correct stitch of bare-lens geometry, so render that
+            // rather than nothing, and say so.
+            protectorNote = std::format("lens-protector correction could not be applied ({}); stitching without it",
+                                        fold.error().message);
+            reason += " - correction could not be applied, stitching without it";
+        }
+    }
+
+    // ---- commit ----------------------------------------------------------------
+    m_calibration = calibration;
+    m_rig = std::move(builtRig);
+    m_blend = blend;
+
+    // The notes feed the Properties panel.  A rebuild REPLACES the previous
+    // calibration / scaling / rig notes instead of piling another copy on
+    // top of them each time the user flips the setting.
+    std::erase_if(m_notes, [](const std::string& n) {
+        return n.starts_with("calibration: ") || n.starts_with("scaling: ") || n.starts_with("rig: ");
+    });
+    m_notes.push_back("calibration: " + reason);
+    if (!protectorNote.empty()) {
+        m_notes.push_back("calibration: " + protectorNote);
+    }
+    for (const std::string& w : selWarnings) {
+        m_notes.push_back("calibration: " + w);
+    }
+    for (const std::string& n : scaleNotes) {
+        m_notes.push_back("scaling: " + n);
+    }
     for (const std::string& n : m_rig.notes) {
         m_notes.push_back("rig: " + n);
     }
 
-    // Blend defaults match osvtool's (4 degree feather, occlusion polygon on).
-    m_blend.lensFovDeg = 195.18;
-    m_blend.featherDeg = 4.0;
-    m_blend.useOcclusionMask = true;
+    // ---- one line per (re)build: which set stitches this clip, and why ------
+    //
+    // The line to look for when "switching Calibration changes nothing": it
+    // names the choice, what the camera recorded, the set actually used and,
+    // when that set is native after all (the clip holds no lens-guard /
+    // underwater calibration, or holds a copy of native), says so in words.
+    // Info level, because it runs once on open and once per calibration
+    // change - never per frame.
+    PluginLog::info("calibration: '{}': {}/{} - {}", m_path.filename().string(), m_calibration.sourceSlave,
+                    m_calibration.sourceMaster, reason);
+    if (!protectorNote.empty()) {
+        // The three scores and the pick, so a protector clip's stitch can be
+        // explained from the log alone.
+        PluginLog::info("calibration: '{}': {}", m_path.filename().string(), protectorNote);
+    }
 
-    m_rigCalibration = m_prefs.calib();
+    // The CHOICE, not the calibration byte: Auto and a forced Native share
+    // calibration 0 but can stitch with different sets (on a clip recorded
+    // with lens protectors), so the rebuild trigger has to tell them apart.
+    m_rigCalibration = choice;
     m_rigBuilt = true;
     return okStatus();
 }
@@ -561,16 +722,44 @@ Status ImporterInstance::ensureReader() {
     }
     order.push_back(video::HwAccel::None);
 
+    // ---- how it is opened -------------------------------------------------
+    // The container-sample feed when the tracks allow it (every camera file
+    // does), libavformat otherwise; the rest of the choices and the numbers
+    // behind them are in importerReaderOptions().
+    const bool samples = containerSamplesUsable(m_file.get(), m_format);
+
+    // ---- where it comes from ------------------------------------------------
+    // Premiere quiets a clip it is not reading and wakes it seconds later, and
+    // opens a second instance of the clip on every Source Settings change.
+    // releaseHeavy() parks the reader in the process-wide pool instead of
+    // destroying it, so each back-end first asks the pool for a warm reader of
+    // this exact file version and options: no device, no surfaces, no codec
+    // set-up, and the decode position it had is kept.  Only a miss opens one.
+    // The pool is asked per back-end IN preference order, interleaved with
+    // the opens, so a parked software reader never displaces the hardware
+    // reader a fresh open would have produced.
+    video::ReaderPool& pool = video::ReaderPool::instance();
     Status lastError = okStatus();
     for (const video::HwAccel hw : order) {
-        video::DecoderOptions opt;
-        opt.hw = hw;
-        opt.threads = 0;  // software only: let libavcodec size its thread pool
-        opt.keepOnDevice = false;
+        const video::DecoderOptions opt = importerReaderOptions(hw, samples);
 
+        // ---- 1. a warm reader ------------------------------------------------
         const auto t0 = std::chrono::steady_clock::now();
+        std::unique_ptr<video::DualStreamReader> warm = pool.take(m_path, m_format, opt);
+        if (warm && warm->isOpen()) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            m_reader = std::move(warm);
+            const video::HevcStreamDecoder* d = m_reader->decoder(0);
+            const video::HwAccel active = d ? d->activeHw() : video::HwAccel::None;
+            PluginLog::info("video: '{}' decoding with {} (warm reader from the pool in {:.1f} ms)",
+                            m_path.filename().string(), video::hwAccelName(active), ms);
+            return okStatus();
+        }
+
+        // ---- 2. a new reader -------------------------------------------------
+        const auto t1 = std::chrono::steady_clock::now();
         auto reader = video::DualStreamReader::open(m_path, m_format, opt);
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
         if (!reader.ok()) {
             // Expected on a machine without that back-end; the next one is
             // tried, so this is informational rather than a warning.
@@ -581,13 +770,18 @@ Status ImporterInstance::ensureReader() {
         }
         m_reader = std::make_unique<video::DualStreamReader>(std::move(reader).value());
 
-        // The decoder may still have dropped to software inside open() (its
-        // get_format callback does when the GPU cannot decode this profile),
-        // so report what is really running, not what was asked for.
+        // The decoder may still drop to software on its first decode (its
+        // get_format callback does when the GPU cannot decode this profile);
+        // activeHw() reports that from then on.  Here it names what opened.
         const video::HevcStreamDecoder* d = m_reader->decoder(0);
         const video::HwAccel active = d ? d->activeHw() : video::HwAccel::None;
-        PluginLog::info("video: '{}' decoding with {} (opened in {:.0f} ms)", m_path.filename().string(),
-                        video::hwAccelName(active), ms);
+        const video::DecoderOpenTimings t = d ? d->openTimings() : video::DecoderOpenTimings{};
+        PluginLog::info("video: '{}' decoding with {} (opened in {:.0f} ms: device {:.0f} ms{}, codec {:.0f} ms, "
+                        "{}, first frame {})",
+                        m_path.filename().string(), video::hwAccelName(active), ms, t.hwDeviceMs,
+                        t.hwDeviceReused ? " shared" : "", t.codecOpenMs,
+                        opt.useContainerSamples ? "container samples" : "libavformat",
+                        t.firstFrameDeferred ? "deferred" : "probed");
         return okStatus();
     }
     // Software is always in the list, so reaching here means even it failed
@@ -621,6 +815,8 @@ Result<video::FramePair> ImporterInstance::readPair(std::uint32_t index) {
     PluginLog::warn("video: {} decoding failed on frame {} of '{}' ({}); switching this clip to software decoding",
                     video::hwAccelName(active), index, m_path.filename().string(), pair.error().message);
     m_hwDecodeFailed = true;
+    // Destroyed, NOT parked: a reader whose hardware just failed must never
+    // be handed to the next instance of this clip as a warm one.
     m_reader.reset();
     const Status reopened = ensureReader();
     if (!reopened.ok()) {
@@ -643,6 +839,19 @@ void ImporterInstance::releaseHeavy() noexcept {
     // they may reference.
     m_audio.reset();
     m_audioProbed = false;
+    // The reader is parked rather than destroyed: the next unquiet of this
+    // clip, or the next instance Premiere opens for it (every Source Settings
+    // change does), takes it back warm from the process-wide pool instead of
+    // paying for a new one.  The pool owns it from here - it decodes from its
+    // own shared mapping of the file, not from this instance's - and releases
+    // it after an idle minute, under memory pressure, or when a newer reader
+    // needs the room (video/ReaderPool.h).  A reader that is not open is
+    // simply destroyed by park().
+    if (m_reader) {
+        const bool parked = video::ReaderPool::instance().park(std::move(m_reader));
+        PluginLog::debug("video: '{}' reader {} on release", m_path.filename().string(),
+                         parked ? "parked in the pool" : "released");
+    }
     m_reader.reset();
     // The direct path's NVDEC decoders and their VRAM frame caches (up to
     // ~1.5 GB each): a quiet is exactly when that memory should go back.
@@ -780,11 +989,24 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
         if (!m_colorBuilt) {
             rebuildColor();
         }
+        // [WP-SETTINGS] Whatever is in force here (the defaults, when the
+        // host never gave this clip a blob) is what the equirect route
+        // renders, so the engine is told - as a statement that fills a blank
+        // but never overrides a blob another instance was actually given.
+        publishSettingsLocked(false);
         return;
     }
     const PrefsBlob incoming = PrefsBlob::fromBytes(bytes, length);
     if (m_colorBuilt && incoming == m_prefs) {
-        return;  // Nothing changed: the common case, keep every cache.
+        // Nothing changed: the common case, keep every cache.  [WP-SETTINGS]
+        // Unless the host's blob was never published from this instance -
+        // it first ran on its defaults and the blob equals them - in which
+        // case the engine must hear it now, or an older instance's different
+        // settings would stay in force.
+        if (!m_settingsPublishedFromHost) {
+            publishSettingsLocked(true);
+        }
+        return;
     }
 
     const PrefsBlob previous = m_prefs;
@@ -793,9 +1015,7 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
     // The engine renders this file for the direct GPU path with its OWN
     // instance; tell it what the user chose, so both paths agree.  The
     // engine's instance does not publish back (it would only echo).
-    if (!m_engineOwned) {
-        enginePublishPrefs(m_path, m_prefs);
-    }
+    publishSettingsLocked(true);
 
     // Colour depends on colorOutput, dlogmFit and exposureStops.
     if (!m_colorBuilt || previous.colorOutput != incoming.colorOutput || previous.dlogmFit != incoming.dlogmFit ||
@@ -803,8 +1023,8 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
         rebuildColor();
     }
 
-    // The rig only depends on the calibration slot.
-    if (m_parsed && (!m_rigBuilt || m_rigCalibration != incoming.calib())) {
+    // The rig only depends on the calibration choice.
+    if (m_parsed && (!m_rigBuilt || m_rigCalibration != incoming.calibrationChoice())) {
         const Status st = rebuildRig();
         if (!st.ok()) {
             PluginLog::warn("prefs: calibration slot {} could not be applied: {}",
@@ -832,6 +1052,29 @@ PrefsBlob ImporterInstance::prefs() const {
 }
 
 PrefsBlob ImporterInstance::prefsLocked() const noexcept { return m_prefs; }
+
+// [WP-SETTINGS]
+void ImporterInstance::publishSettingsLocked(bool fromHost) noexcept {
+    // The engine's own instance only ever APPLIES published settings;
+    // publishing them back would be an echo.
+    if (m_engineOwned) {
+        return;
+    }
+    // The token is taken at the first publication, which for a Premiere
+    // instance is imGetInfo8 right after imOpenFile8 - so token order is the
+    // order Premiere opened its instances in.
+    if (m_settingsPublisher == 0) {
+        m_settingsPublisher = engineNewPublisherToken();
+    }
+    SettingsPublisher who;
+    who.token = m_settingsPublisher;
+    who.fromHost = fromHost;
+    who.importerId = m_importerId.load(std::memory_order_relaxed);
+    enginePublishPrefs(m_path, m_prefs, who);
+    if (fromHost) {
+        m_settingsPublishedFromHost = true;
+    }
+}
 
 AudioDecoder* ImporterInstance::audioLocked() { return audioImpl(); }
 
@@ -1108,6 +1351,13 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
         }
     }
 
+    // ---- [WP-SEAM] carved blend seam ---------------------------------------
+    // Under the seam preference: "seam search" now means both halves of the
+    // seam - the disparity correction above and WHERE the two lenses meet.
+    if (wantSeam) {
+        applyCarvedSeam(index, pair, wantParallax, purpose, pool, builder, frameExact);
+    }
+
     if (m_prefs.gainMatch != 0) {
         auto cached = m_gains.find(bucket);
         if (cached == m_gains.end()) {
@@ -1129,6 +1379,124 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     }
 
     return AnalysisOutcome{parallaxApplied, frameExact};
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-SEAM] carved blend seam
+// ---------------------------------------------------------------------------
+void ImporterInstance::applyCarvedSeam(std::uint32_t index, const video::FramePair& pair, bool wantParallax,
+                                       RenderPurpose purpose, ThreadPool& pool, render::RenderParamsBuilder& builder,
+                                       bool& frameExact) {
+    const std::uint32_t bucket = render::parallaxBucket(index);
+
+    // ---- what is known: this bucket's seam, its neighbours', its correction --
+    std::shared_ptr<const render::BlendSeam> own;
+    std::shared_ptr<const render::BlendSeam> previous;
+    std::shared_ptr<const render::BlendSeam> next;
+    std::shared_ptr<const render::ParallaxWarpGrid> ownGrid;
+    // Without the parallax correction the bucket's correction is its seam
+    // table (or nothing), which the caller has already settled.  With it,
+    // the grid must have been measured (or refused) before the seam can be
+    // carved through it.
+    bool correctionKnown = !wantParallax;
+    {
+        std::lock_guard<std::mutex> lock(m_parallaxMutex);
+        if (const auto it = m_blendSeams.find(bucket); it != m_blendSeams.end()) {
+            own = it->second;
+        }
+        if (bucket > 0) {
+            if (const auto it = m_blendSeams.find(bucket - 1); it != m_blendSeams.end()) {
+                previous = it->second;
+            }
+        }
+        if (const auto it = m_blendSeams.find(bucket + 1); it != m_blendSeams.end()) {
+            next = it->second;
+        }
+        if (wantParallax) {
+            if (const auto it = m_parallaxGrids.find(bucket); it != m_parallaxGrids.end()) {
+                correctionKnown = true;
+                ownGrid = it->second;  // nullptr = refused: the seam table is the correction
+            }
+        }
+    }
+
+    // ---- carve this bucket now when its correction is settled --------------
+    // Cheap enough for the render thread (two band renders' worth of shading
+    // plus a DP over 1024 x ~70 cells), so there is no background path: an
+    // Interactive frame whose grid is still being measured borrows below,
+    // and the first frame of the bucket after the grid lands carves it.
+    if (!own && correctionKnown) {
+        render::WarpGridView warpView;
+        render::SeamCorrection correction;
+        if (ownGrid && ownGrid->valid()) {
+            warpView.uv = ownGrid->uv.data();
+            warpView.w = ownGrid->w;
+            warpView.h = ownGrid->h;
+            warpView.latMinRad = ownGrid->latMinRad;
+            warpView.latMaxRad = ownGrid->latMaxRad;
+            correction.warp = &warpView;
+        } else if (const auto table = m_seamTables.find(bucket);
+                   table != m_seamTables.end() && !table->second.empty()) {
+            correction.seamShiftDeg = &table->second;
+        }
+        // Steered by the neighbour that is already on screen: the previous
+        // bucket when playing forward, the next one when stepping back.
+        const render::BlendSeam* prior = previous ? previous.get() : next.get();
+        const render::SeamCarveParams params;
+        const render::BandParams band = render::ParallaxWarpParams{}.band;
+        auto carved = render::carveSeam(m_rig, pair, m_blend, band, correction, params, prior, pool);
+        if (carved.ok()) {
+            const render::BlendSeam& s = carved.value();
+            PluginLog::debug("frame {} (bucket {}): seam carved in {:.1f} ms through {}, latitude mean {:+.2f} / max "
+                             "{:.2f} deg, feather {:.2f} deg mean, {} narrow / {} forced columns{}",
+                             index, bucket, s.carveMs,
+                             correction.warp ? "the parallax grid"
+                                             : (correction.seamShiftDeg ? "the seam table" : "no correction"),
+                             s.meanLatDeg, s.maxAbsLatDeg, s.meanHalfWidthDeg, s.narrowColumns, s.forcedColumns,
+                             s.usedPrior ? ", held to its neighbour" : "");
+            own = std::make_shared<const render::BlendSeam>(std::move(carved).value());
+            std::lock_guard<std::mutex> lock(m_parallaxMutex);
+            m_blendSeams[bucket] = own;
+            trimAnalysisCache(m_blendSeams, kMaxAnalysisCache, bucket);
+        } else {
+            PluginLog::debug("frame {} (bucket {}): seam carve failed ({}); keeping the feather blend", index, bucket,
+                             carved.error().message);
+        }
+    }
+
+    // ---- choose what to apply ------------------------------------------------
+    std::shared_ptr<const render::BlendSeam> apply;
+    if (own) {
+        apply = own;
+        // Glide from the previous bucket's seam instead of stepping to this
+        // one at the bucket edge - the same schedule as the parallax grid, so
+        // the two move together.
+        if (previous) {
+            auto blended = render::blendSeams(*previous, *own, render::parallaxCrossfadeWeight(index));
+            if (blended.ok()) {
+                apply = std::make_shared<const render::BlendSeam>(std::move(blended).value());
+            }
+        }
+    } else if (purpose == RenderPurpose::Interactive) {
+        // Stand-in: the nearest carved neighbour within the parallax borrow
+        // range, earlier first.  The frame is then not final.
+        frameExact = false;
+        std::lock_guard<std::mutex> lock(m_parallaxMutex);
+        for (std::uint32_t d = 1; d <= kParallaxBorrowBuckets && !apply; ++d) {
+            if (bucket >= d) {
+                if (const auto it = m_blendSeams.find(bucket - d); it != m_blendSeams.end() && it->second) {
+                    apply = it->second;
+                    break;
+                }
+            }
+            if (const auto it = m_blendSeams.find(bucket + d); it != m_blendSeams.end() && it->second) {
+                apply = it->second;
+            }
+        }
+    }
+    if (apply) {
+        render::applyBlendSeam(builder, *apply);
+    }
 }
 
 Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_t index, void* cuContext,

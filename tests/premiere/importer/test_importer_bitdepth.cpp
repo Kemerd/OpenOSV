@@ -872,9 +872,25 @@ TEST_CASE("the host's Rec.709 connection space overrides one request, never the 
     REQUIRE(clip.open());
     constexpr std::uint32_t kFrame = 4;
 
+    // The settings the engine holds for the file (no decode, no GPU):
+    // their generation moves whenever a publication changes them.
+    const auto query =
+        reinterpret_cast<OsvEngineQuerySettingsFn>(GetProcAddress(module, OSV_ENGINE_SYM_QUERY_SETTINGS));
+    REQUIRE(query != nullptr);
+    auto settings = [&]() {
+        OsvEngineClipSettings s{};
+        s.structSize = sizeof(OsvEngineClipSettings);
+        char error[512] = {};
+        REQUIRE(query(path.c_str(), &s, error, sizeof(error)) == OSV_ENGINE_OK);
+        return s;
+    };
+
     // An ordinary PQ frame, and the clip's PQ reaches the engine.
     const Delivered ordinary = renderOne(harness, clip, ppix.suite, kFrame, PrPixelFormat_BGRA_4444_32f, 1920, 960, pq);
     CHECK(engineTransfer() == OSV_TRANSFER_PQ);
+    const OsvEngineClipSettings before = settings();
+    CHECK(before.generation != 0);
+    CHECK(before.clipTransfer == OSV_TRANSFER_PQ);
 
     // The host falls back to the connection space for one request: that
     // frame is Rec.709 - exactly the clip rendered with Rec.709 chosen ...
@@ -883,9 +899,14 @@ TEST_CASE("the host's Rec.709 connection space overrides one request, never the 
         renderOne(harness, clip, ppix.suite, kFrame, PrPixelFormat_BGRA_4444_32f, 1920, 960, pq, kPrOverranged709);
     CHECK(maxDiff(fallback, ordinary) > 0.02f);
 
-    // ... but the clip's settings did not change: the engine still renders
-    // PQ.  (The override used to go through applyPrefsLocked and publish
-    // "Rec.709" here, so every direct view of the clip turned SDR.)
+    // ... but the clip's settings did not change: nothing was published (the
+    // generation stands still) and the engine still renders PQ.  (The
+    // override used to go through applyPrefsLocked and publish "Rec.709"
+    // here, so every direct view of the clip turned SDR.)
+    const OsvEngineClipSettings after = settings();
+    CHECK(after.generation == before.generation);
+    CHECK(after.clipTransfer == OSV_TRANSFER_PQ);
+    CHECK(after.colorOutput == before.colorOutput);
     CHECK(engineTransfer() == OSV_TRANSFER_PQ);
 
     // The next ordinary request of the same frame is PQ again, bit for bit -

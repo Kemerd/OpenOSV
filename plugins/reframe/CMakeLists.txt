@@ -139,6 +139,11 @@ osv_add_premiere_plugin(Open360Reframe
     # the importer's OsvEngine_* exports (DirectPath.h).
     DirectPath.cpp
     DirectPath.h
+    # [WP-SETTINGS] Which clips the direct path may render given their
+    # Source Settings and the working colour space; pure, so the tests
+    # compile the same source.
+    DirectPathSettings.cpp
+    DirectPathSettings.h
     # The interactive Program Monitor overlay.  Two translation units on
     # purpose: ReframeUi.cpp is the pure interaction maths and names no Adobe
     # type, so the tests compile the very same source the .aex contains and

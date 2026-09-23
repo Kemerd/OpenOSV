@@ -25,6 +25,8 @@ osv_add_premiere_plugin(OpenOSVImporter
     ImporterAudioSelectors.cpp
     ImporterPlugin.h
     PrefsMapping.cpp
+    ProtectorGuard.cpp
+    ProtectorGuard.h
     Engine.cpp
     Engine.h
     ImporterGpuFrame.cpp

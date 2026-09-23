@@ -80,6 +80,69 @@ extern "C" {
 #define OSV_ENGINE_ERR_GPU 5         /**< A CUDA call failed (context, memory, copy). */
 #define OSV_ENGINE_ERR_INTERNAL 6    /**< Anything else; the message says what. */
 
+/* ==== [WP-SETTINGS] the Source Settings a clip is rendered with ============
+ *
+ * WHY.  The direct path does not render from the frame Premiere hands the
+ * effect; it renders from the fisheyes with the engine's OWN instance of the
+ * file.  That instance learns the user's Source Settings from Premiere's
+ * importer instances (they publish every change), so the effect needs to
+ * know WHICH settings a frame was rendered with - to prove in the log that a
+ * change reached the Program monitor, and to decide whether the direct path
+ * can reproduce the colour the importer's equirect route would produce (see
+ * docs/DIRECT_GPU.md, "WP-SETTINGS").
+ *
+ * The block is filled by OsvEngine_QuerySettings (cheap: no decode, no GPU)
+ * and, for the frame actually served, by OsvEngine_AcquireFrame in
+ * OsvEngineFrame::settings.
+ * ------------------------------------------------------------------------- */
+
+/** One file's Source Settings as the engine will render them. */
+typedef struct OsvEngineClipSettings {
+    uint32_t structSize;   /**< sizeof(OsvEngineClipSettings); set by the caller of the query, by the engine in a frame. */
+    /** Bumped every time the settings in force for the file change.  0 means
+     *  no Premiere importer instance of this file has published any in this
+     *  process: the engine would render its defaults, which may not be what
+     *  the clip is set to. */
+    uint32_t generation;
+    /** OSV_TRANSFER_* the clip's "colour output" encodes the importer's own
+     *  frames in: what Premiere converts into the working space on the
+     *  equirect route (OSV_TRANSFER_PASSTHROUGH for D-Log M passthrough). */
+    int32_t clipTransfer;
+    float exposureStops;   /**< Source Settings exposure offset, stops. */
+    uint8_t colorOutput;   /**< The raw PrefsColorOutput value. */
+    uint8_t calibration;   /**< The raw PrefsCalibration value. */
+    uint8_t dlogmFit;      /**< The raw PrefsDlogmFit value. */
+    uint8_t stabilization; /**< The raw PrefsStabilization value. */
+    /** The raw PrefsDirectColour value ("Program Monitor Colour"): 0 =
+     *  render every graded colour output straight into the working space
+     *  (the default), 1 = hand a clip whose colour output is not the working
+     *  space to the equirect route (match the Source monitor). */
+    uint8_t directColour;
+    uint8_t reservedSettings[3]; /**< Zero; keeps the 64-bit fields below naturally aligned. */
+    /** Identity of the file the settings belong to (volume serial and file
+     *  index, GetFileInformationByHandle); both 0 when the file could not be
+     *  opened for its identity and the normalised path was used instead. */
+    uint64_t fileVolume;
+    uint64_t fileIndex;
+} OsvEngineClipSettings;
+
+/** Read the Source Settings the engine would render `path` with, without
+ *  opening a decoder or touching the GPU.
+ *  @param path   source media file, NUL-terminated UTF-16.
+ *  @param out    receives the settings; out->structSize must be set.
+ *  @param error  UTF-8 buffer for a one-line reason on failure (may be NULL).
+ *  @param errorCapacity  bytes available in `error`.
+ *  @return OSV_ENGINE_OK (also when nothing was published: generation 0) or
+ *          OSV_ENGINE_ERR_ARGUMENT / OSV_ENGINE_ERR_VERSION / OSV_ENGINE_ERR_INTERNAL. */
+typedef int32_t (*OsvEngineQuerySettingsFn)(const wchar_t* path, OsvEngineClipSettings* out, char* error,
+                                            int32_t errorCapacity);
+
+/** Exported name of the query (optional: a caller that cannot resolve it
+ *  falls back to the settings reported with each frame). */
+#define OSV_ENGINE_SYM_QUERY_SETTINGS "OsvEngine_QuerySettings"
+
+/* ==== [/WP-SETTINGS] ====================================================== */
+
 /** What the effect asks for. */
 typedef struct OsvEngineFrameRequest {
     uint32_t structSize;    /**< sizeof(OsvEngineFrameRequest), set by the caller. */
@@ -107,6 +170,18 @@ typedef struct OsvEngineFrame {
     uint32_t frameIndex;          /**< The media frame that was decoded. */
     int32_t exact;                /**< 0 when an interactive request got a stand-in analysis. */
     void* lease;                  /**< Opaque; hand to OsvEngine_ReleaseFrame exactly once. */
+    /* ---- [WP-SEAM] ---------------------------------------------------------- */
+    /** Device copy of the carved blend-seam table (stitch.blendSeamColumns
+     *  interleaved (latitude, half width) radian pairs, see osv_kernel.h) or
+     *  NULL when stitch.blendSeamEnabled is 0.  Freed with the lease. */
+    const float* blendSeamDevice;
+    /* ---- [/WP-SEAM] --------------------------------------------------------- */
+    /* ---- [WP-SETTINGS] ------------------------------------------------------ */
+    /** The Source Settings THIS frame was rendered with (the engine sets
+     *  settings.structSize).  generation 0: none were published for the file
+     *  and the engine used its defaults. */
+    OsvEngineClipSettings settings;
+    /* ---- [/WP-SETTINGS] ----------------------------------------------------- */
 } OsvEngineFrame;
 
 /** ABI version of the loaded engine (compare with OSV_ENGINE_ABI_VERSION). */

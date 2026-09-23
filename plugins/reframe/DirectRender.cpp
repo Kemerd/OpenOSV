@@ -11,7 +11,7 @@
 //     equirect path uses, so both paths frame the picture identically;
 //   * the stitch comes from the importer's own equirect parameter block,
 //     copied field for field;
-//   * every pixel comes from osvShadePixelW() in osv_kernel.h, the function
+//   * every pixel comes from osvShadePixelWS() in osv_kernel.h, the function
 //     the GPU kernel runs too.
 //
 // What IS here: composing the stabilisation with the camera rotation, and
@@ -176,6 +176,7 @@ const char* directRejectName(DirectReject reason) noexcept {
     case DirectReject::SeamTable:    return "seam shift is enabled without a usable seam table";
     case DirectReject::WarpGrid:     return "the warp grid is enabled without a usable grid";
     case DirectReject::Composed:     return "the composed view block came out non-finite";
+    case DirectReject::BlendSeam:    return "the blend seam is enabled without a usable table";
     }
     // Unreachable for any enumerator above; a corrupt value lands here
     // rather than off the end of a table.
@@ -255,6 +256,19 @@ DirectSetup buildDirectParams(const Settings& settings, const StitchState& stitc
         }
     }
 
+    // ---- [WP-SEAM] the carved blend seam ---------------------------------
+    // Same rule as the seam table: on means the importer stitched with it, so
+    // the direct render must too.  The kernel reads two floats per column
+    // and divides by the edge ramp, so it must be finite and non-negative.
+    const bool blendSeamOn = eq.blendSeamEnabled != 0;
+    if (blendSeamOn) {
+        const bool shapeOk = eq.blendSeamColumns > 0 && eq.blendSeamColumns <= kMaxSeamColumns;
+        const bool rampOk = std::isfinite(eq.blendSeamEdgeRad) && eq.blendSeamEdgeRad >= 0.0f;
+        if (!shapeOk || !rampOk || stitch.blendSeam == nullptr) {
+            return refuse(DirectReject::BlendSeam);
+        }
+    }
+
     // ---- the camera --------------------------------------------------------
     // Built by the equirect path's own function.  Non-finite controls are
     // replaced by their defaults inside it, exactly as the equirect path
@@ -309,13 +323,22 @@ DirectSetup buildDirectParams(const Settings& settings, const StitchState& stitc
     // hands the kernel an address it has no business reading.
     setup.seamTable = seamOn ? stitch.seamTable : nullptr;
     setup.warpGrid = warpOn ? stitch.warpGrid : nullptr;
+    setup.blendSeam = blendSeamOn ? stitch.blendSeam : nullptr;  // [WP-SEAM]
 
     // ---- final backstop ----------------------------------------------------
     // buildView() already guarantees a finite camera; this repeats the check
     // on the COMPOSED block, the thing a kernel will actually read.
+    // The eye's distance behind the sphere centre is capped per projection:
+    // the Classic lens's eye offset lives in [0, 1], while DJI's Correction
+    // Angle legitimately goes past the sphere (Crystal Ball is 1.8).  Capping
+    // both at 1 would refuse every Crystal Ball frame and quietly hand it to
+    // the slower equirect path.
+    const float eyeOffsetMax = (p.projection == OSV_PROJ_DJI_SPHERE)
+                                   ? static_cast<float>(OSV_REFRAME_CORRECTION_VALID_MAX)
+                                   : 1.0f;
     const bool cameraFinite = std::isfinite(p.focalPx) && p.focalPx > 0.0f && std::isfinite(p.tanHalfH) &&
                               std::isfinite(p.tanHalfV) && std::isfinite(p.eyeOffset) && p.eyeOffset >= 0.0f &&
-                              p.eyeOffset <= 1.0f;
+                              p.eyeOffset <= eyeOffsetMax;
     if (!cameraFinite || !isRotation(p.Rout)) {
         return refuse(DirectReject::Composed);
     }
@@ -395,7 +418,7 @@ bool renderDirectPixel(const DirectSetup& setup, const OsvPlane* planes, int x, 
     if (x < 0 || y < 0 || x >= setup.params.outW || y >= setup.params.outH) {
         return false;
     }
-    osvShadePixelW(&setup.params, planes, setup.seamTable, setup.warpGrid, x, y, out);
+    osvShadePixelWS(&setup.params, planes, setup.seamTable, setup.warpGrid, setup.blendSeam, x, y, out);
     return true;
 }
 
@@ -426,7 +449,7 @@ bool renderDirectCpu(const DirectSetup& setup, const OsvPlane* planes, const Fra
         char* dstRow = static_cast<char*>(dst.rowTopDown(y));
         for (int x = 0; x < dst.width; ++x) {
             float rgba[4];
-            osvShadePixelW(&setup.params, planes, setup.seamTable, setup.warpGrid, x, y, rgba);
+            osvShadePixelWS(&setup.params, planes, setup.seamTable, setup.warpGrid, setup.blendSeam, x, y, rgba);
             storePixel(dstRow + static_cast<std::ptrdiff_t>(x) * static_cast<std::ptrdiff_t>(bpp), dst.layout, rgba);
         }
     };

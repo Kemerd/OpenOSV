@@ -6,6 +6,7 @@
 #include "osv/geom/Presets.h"
 
 #include <cctype>
+#include <cmath>
 #include <string>
 
 namespace osv::geom {
@@ -37,6 +38,35 @@ const Preset* findPreset(std::string_view id) noexcept {
     const std::string wanted = canonical(id);
     // Match either the CLI id or the display name.
     for (const Preset& preset : kPresets) {
+        if (!preset.id || !preset.name) {
+            continue;
+        }
+        if (canonical(preset.id) == wanted || canonical(preset.name) == wanted) {
+            return &preset;
+        }
+    }
+    return nullptr;
+}
+
+double djiPresetVfovDeg(const DjiPreset& preset, double aspect) noexcept {
+    // Landscape (and square) is DJI's default column and the only safe answer
+    // for a shape we cannot read.
+    if (!std::isfinite(aspect) || !(aspect > 0.0) || aspect >= 1.0) {
+        return preset.vfovLandscapeDeg;
+    }
+    // Portrait: the nearer of DJI's two portrait shapes, measured as a RATIO
+    // (the geometric mean of 9/16 and 3/4 is the point equally far from both
+    // in log terms), so a 2:3 frame lands on 3:4 and a 1:2 frame on 9:16.
+    constexpr double kPortraitSplit = 0.649519052838329;  // sqrt(0.5625 * 0.75)
+    return (aspect <= kPortraitSplit) ? preset.vfovPortrait916Deg : preset.vfovPortrait34Deg;
+}
+
+const DjiPreset* findDjiPreset(std::string_view id) noexcept {
+    if (id.empty()) {
+        return nullptr;
+    }
+    const std::string wanted = canonical(id);
+    for (const DjiPreset& preset : kDjiPresets) {
         if (!preset.id || !preset.name) {
             continue;
         }

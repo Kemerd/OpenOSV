@@ -2331,7 +2331,11 @@ TEST_CASE("matchHostParams tolerates entries Premiere cannot type", "[reframe][p
         HostParamKind::Unknown,  // [9]  Source Tilt
         HostParamKind::Unknown,  // [10] Source Roll
     };
-    REQUIRE(logged.size() == static_cast<std::size_t>(kValueParamCount));
+    // The log was recorded when the effect had eleven value controls; the
+    // [WP-CAMERA] block appended five more, so a list of this length is now a
+    // host that stops before them (which the matcher accepts) rather than the
+    // whole signature.
+    REQUIRE(logged.size() <= static_cast<std::size_t>(kValueParamCount));
 
     HostParamMap map{};
     REQUIRE(matchKinds(logged, &map));

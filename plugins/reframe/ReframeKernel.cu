@@ -197,6 +197,7 @@ extern "C" __global__ void osvReframeEquirectKernel(OsvReframeParams params, Osv
 extern "C" __global__ void osvReframeDirectKernel(OSV_GRID_CONST const OsvRenderParams params,
                                                   OSV_GRID_CONST const OsvDirectPlanes planes,
                                                   const float* __restrict__ seam, const float* __restrict__ warp,
+                                                  const float* __restrict__ blendSeam,
                                                   unsigned char* __restrict__ dstBase, int dstRowBytes,
                                                   int dstIsHalf) {
     const int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
@@ -211,7 +212,8 @@ extern "C" __global__ void osvReframeDirectKernel(OSV_GRID_CONST const OsvRender
      * blend, seam shift, warp grid, colour pipeline.  Pixels no lens sees
      * come back transparent black, so no clear pass is needed. */
     float rgba[4];
-    osvShadePixelW(&params, planes.lens, seam, warp, x, y, rgba);
+    /* [WP-SEAM] blendSeam is the carved seam table, or NULL without one. */
+    osvShadePixelWS(&params, planes.lens, seam, warp, blendSeam, x, y, rgba);
 
     /* Premiere GPU frame: top-left origin, positive pitch. */
     unsigned char* row = dstBase + (size_t)y * (size_t)dstRowBytes;

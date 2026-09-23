@@ -38,6 +38,8 @@ Status CpuRenderer::renderInto(const RenderJob& job, ImageRGBAf& image) {
     // checked that its size matches warpW * warpH, so the kernel's indexing
     // is bounded by construction rather than by trust.
     const float* warp = (params.warpEnabled && !job.warpGrid.empty()) ? job.warpGrid.data() : nullptr;
+    // [WP-SEAM] The carved blend-seam table, size-checked by job.valid().
+    const float* blendSeam = (params.blendSeamEnabled && !job.blendSeam.empty()) ? job.blendSeam.data() : nullptr;
     const int width = params.outW;
     float* pixels = image.data.data();
 
@@ -47,7 +49,8 @@ Status CpuRenderer::renderInto(const RenderJob& job, ImageRGBAf& image) {
                                        for (std::size_t y = rowBegin; y < rowEnd; ++y) {
                                            float* row = pixels + y * static_cast<std::size_t>(width) * 4u;
                                            for (int x = 0; x < width; ++x) {
-                                               osvShadePixelW(&params, planes, seam, warp, x, static_cast<int>(y), row + x * 4);
+                                               osvShadePixelWS(&params, planes, seam, warp, blendSeam, x,
+                                                               static_cast<int>(y), row + x * 4);
                                            }
                                        }
                                    });

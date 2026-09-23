@@ -210,3 +210,56 @@ TEST_CASE("osvtool probe/render/seam/selfcheck on the sample clip", "[cli][sampl
         REQUIRE(r.output.find("ALL CHECKS PASSED") != std::string::npos);
     }
 }
+
+TEST_CASE("osvtool probe lists the calibration sets, the accessory and every choice", "[cli][calibration][sample]") {
+    OSV_REQUIRE_SAMPLE();
+    if (std::string(kToolPath).empty() || !std::filesystem::exists(kToolPath)) {
+        SKIP("osvtool not built");
+    }
+    const auto path = osvtest::tempDir() / "cli_probe_calibration.json";
+    const RunResult r = runTool("probe " + quoted(osvtest::sampleOsv()) + " --json " + quoted(path));
+    INFO(r.output);
+    REQUIRE(r.exitCode == 0);
+    REQUIRE(asciiOnly(r.output));
+
+    // ---- console: the table and the verdict a user needs ----------------------
+    REQUIRE(r.output.find("calibration sets (differences vs native_refine") != std::string::npos);
+    REQUIRE(r.output.find("lens_guards        empty    zero-filled placeholder") != std::string::npos);
+    REQUIRE(r.output.find("lens accessory: Native (StreamMeta.extri_lens_mode)") != std::string::npos);
+    // Lens guards without a dedicated set: native plus the protector correction.
+    REQUIRE(r.output.find("lens-guards  -> native_refine  + protector") != std::string::npos);
+    REQUIRE(r.output.find("underwater   -> native_refine  (= native)") != std::string::npos);
+
+    // ---- JSON ---------------------------------------------------------------------
+    std::ifstream in(path);
+    REQUIRE(in.good());
+    nlohmann::json j;
+    in >> j;
+    const nlohmann::json& cal = j["calibration"];
+    REQUIRE(cal["sets"].is_array());
+    REQUIRE(cal["sets"].size() == 12);
+    REQUIRE(cal["sets"][0]["name"] == "native_refine");
+    REQUIRE(cal["sets"][0]["state"] == "usable");
+    REQUIRE(cal["sets"][0]["vsNative"]["identical"] == true);
+    REQUIRE(cal["sets"][2]["name"] == "lens_guards");
+    REQUIRE(cal["sets"][2]["state"] == "empty");
+    REQUIRE(cal["sets"][2]["vsNative"].is_null());
+    REQUIRE(cal["sets"][5]["name"] == "native");
+    REQUIRE(cal["sets"][5]["vsNative"]["focalPx"].get<double>() > 5.0);
+
+    REQUIRE(cal["accessory"]["recordedModeName"] == "Native");
+    REQUIRE(cal["accessory"]["recordedModePresent"] == true);
+    REQUIRE(cal["accessory"]["ndFilterField"] == false);
+
+    for (const char* choice : {"auto", "native", "lens-guards", "underwater"}) {
+        INFO(choice);
+        REQUIRE(cal["choices"][choice]["set"] == "native_refine");
+        REQUIRE(cal["choices"][choice]["reason"].is_string());
+    }
+    REQUIRE(cal["choices"]["auto"]["fellBack"] == false);
+    REQUIRE(cal["choices"]["lens-guards"]["fellBack"] == true);
+    REQUIRE(cal["choices"]["underwater"]["fellBack"] == true);
+    REQUIRE(cal["choices"]["lens-guards"]["protectorCorrection"] == true);
+    REQUIRE(cal["choices"]["auto"]["protectorCorrection"] == false);
+    REQUIRE(cal["choices"]["underwater"]["protectorCorrection"] == false);
+}
