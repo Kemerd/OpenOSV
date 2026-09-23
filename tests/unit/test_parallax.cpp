@@ -718,6 +718,66 @@ TEST_CASE("the benefit gate keeps a correction that helps and drops one that doe
     }
 }
 
+TEST_CASE("gridFromFlow is bit-identical with and without a pool", "[render][parallax]") {
+    // The importer builds grids on its render thread WITH a pool and in its
+    // background worker WITHOUT one, and an export must not depend on which
+    // got there first - the same guarantee DisFlow.cpp gives for the flow.
+    // So this compares with ==, on input chosen to exercise every branch of
+    // both per-pixel passes: spatially varying flow, pixels that failed the
+    // consistency check, pixels only one lens covers, a band height that
+    // does not divide evenly into grid rows, and a gate that keeps some
+    // cells and drops others.
+    constexpr std::uint32_t W = 700, H = 53, mapH = 400;
+    const auto a = [](std::uint32_t x, std::uint32_t y) { return bandTexture(x, y, W); };
+    const auto b = [](std::uint32_t x, std::uint32_t y) {
+        // The right half matches a shifted copy; the left half is unrelated.
+        if (x >= W / 2) {
+            return bandTexture(static_cast<double>(x) - 1.5, static_cast<double>(y) + 0.5, W);
+        }
+        return bandTexture(static_cast<double>(x) * 1.7 + 11.0, static_cast<double>(y) * 0.6, W);
+    };
+    render::LensBands bands = makeBands(W, H, mapH, a, b);
+    render::BidirFlow flow = uniformFlow(W, H, 1.5f, -0.5f);
+    for (std::uint32_t y = 0; y < H; ++y) {
+        for (std::uint32_t x = 0; x < W; ++x) {
+            const std::size_t i = static_cast<std::size_t>(y) * W + x;
+            // Motion that varies across the band so cells disagree.
+            flow.forward.u[i] += 0.8f * static_cast<float>(std::sin(0.02 * x + 0.1 * y));
+            flow.backward.u[i] -= 0.8f * static_cast<float>(std::sin(0.02 * x + 0.1 * y));
+            // Every 7th pixel inconsistent, every 11th covered by one lens.
+            if (i % 7 == 0) {
+                flow.ok[i] = 0u;
+            }
+            if (i % 11 == 0) {
+                bands.alpha[1][i] = 0.0f;
+            }
+        }
+    }
+    render::ParallaxWarpParams p;
+    p.gridW = 96;
+    p.gridRows = 12;
+    p.decayRows = 3;
+
+    const auto sequential = render::gridFromFlow(bands, flow, p, nullptr);
+    REQUIRE(sequential.ok());
+    REQUIRE(sequential.value().measuredCells > 0);
+    for (const unsigned threads : {2u, 5u, 32u}) {
+        ThreadPool pool(threads);
+        const auto pooled = render::gridFromFlow(bands, flow, p, &pool);
+        REQUIRE(pooled.ok());
+        INFO("pool of " << threads << " threads");
+        const render::ParallaxWarpGrid& s = sequential.value();
+        const render::ParallaxWarpGrid& q = pooled.value();
+        CHECK(q.uv == s.uv);
+        CHECK(q.consistentPixels == s.consistentPixels);
+        CHECK(q.totalPixels == s.totalPixels);
+        CHECK(q.measuredCells == s.measuredCells);
+        CHECK(q.gatedCells == s.gatedCells);
+        CHECK(q.meanAbsCorrectionDeg == s.meanAbsCorrectionDeg);
+        CHECK(q.maxAbsCorrectionDeg == s.maxAbsCorrectionDeg);
+    }
+}
+
 // ===========================================================================
 //  End to end: a known 2-D parallax through the real rig geometry
 // ===========================================================================
