@@ -1448,6 +1448,32 @@ std::vector<double> seamMotion(const osv::render::BlendSeam& a, const osv::rende
     return out;
 }
 
+/// How far the carved seam's feather EDGES move per column in the wing
+/// columns, 6K px: the feather half width follows the lenses' agreement
+/// (wide where they agree, narrow where they do not), so a column that flips
+/// between the two moves the edges of the blend even where the line itself
+/// holds still.  The larger of the two edges' moves.
+std::vector<double> seamEdgeMotion(const osv::render::BlendSeam& a, const osv::render::BlendSeam& b) {
+    std::vector<double> out;
+    if (!a.valid() || !b.valid() || a.columns != b.columns) {
+        return out;
+    }
+    for (std::uint32_t c = 0; c < a.columns; ++c) {
+        const double lon = columnLonDeg(c, a.columns);
+        if (lon < kWingLon0Deg || lon > kWingLon1Deg) {
+            continue;
+        }
+        const double latA = a.table[c * 2u];
+        const double hwA = a.table[c * 2u + 1u];
+        const double latB = b.table[c * 2u];
+        const double hwB = b.table[c * 2u + 1u];
+        const double upper = std::fabs((latB + hwB) - (latA + hwA));
+        const double lower = std::fabs((latB - hwB) - (latA - hwA));
+        out.push_back(osv::rad2deg(std::max(upper, lower)) * kPxPerDeg);
+    }
+    return out;
+}
+
 /// The seam-shift table's per-column change in the wing columns, 6K px (each
 /// lens moves by half the full disparity the table stores).
 std::vector<double> tableMotion(const std::vector<float>& a, const std::vector<float>& b) {
@@ -1484,59 +1510,20 @@ double gridMeanDeg(const osv::render::ParallaxWarpGrid& g, std::uint32_t decayRo
     return n ? sum / static_cast<double>(n) : 0.0;
 }
 
-/// Replay the importer's per-bucket schedule for one rig and gate.
-void replaySchedule(osvtool::Pipeline& P, const osv::geom::LensRig& rig, double gate, const char* title) {
-    namespace r = osv::render;
-    const std::uint32_t frames = std::min<std::uint32_t>(P.frameCount(), 65u);
-    const std::uint32_t buckets = r::parallaxBucket(frames - 1u) + 1u;
-    r::ParallaxWarpParams pw;
-    pw.backend = r::FlowBackendKind::Classical;
-    pw.requiredImprovement = gate;
-    const r::SeamCarveParams carveParams;
-    r::SeamSearchParams sp;
-    std::vector<std::shared_ptr<r::ParallaxWarpGrid>> grids(buckets);
-    std::vector<std::shared_ptr<r::BlendSeam>> seams(buckets);
-    std::vector<std::vector<float>> tables(buckets);
-    double wingMean = 0.0;
-    double groundMean = 0.0;
-    std::uint32_t measured = 0;
-    for (std::uint32_t b = 0; b < buckets; ++b) {
-        auto pair = P.reader->read(b * r::kParallaxBucketFrames);
-        if (!pair.ok()) {
-            std::printf("      decode of frame %u failed\n", b * r::kParallaxBucketFrames);
-            return;
-        }
-        auto grid = r::buildParallaxWarp(rig, pair.value(), P.blendParams, pw, nullptr, *P.pool);
-        r::WarpGridView view;
-        r::SeamCorrection correction;
-        if (grid.ok()) {
-            grids[b] = std::make_shared<r::ParallaxWarpGrid>(std::move(grid).value());
-            view.uv = grids[b]->uv.data();
-            view.w = grids[b]->w;
-            view.h = grids[b]->h;
-            view.latMinRad = grids[b]->latMinRad;
-            view.latMaxRad = grids[b]->latMaxRad;
-            correction.warp = &view;
-            wingMean += gridMeanDeg(*grids[b], pw.decayRows, kWingLon0Deg, kWingLon1Deg);
-            groundMean += gridMeanDeg(*grids[b], pw.decayRows, 15.0, 118.0);  // the ground, 1110-1700 of 2048
-            ++measured;
-        }
-        auto table = r::searchSeam(rig, pair.value(), P.blendParams, sp, *P.pool);
-        if (table.ok()) {
-            tables[b] = table.value().shiftDeg;
-        }
-        // Steered by the previous bucket's seam, as the importer's playback is.
-        auto carved = r::carveSeam(rig, pair.value(), P.blendParams, pw.band, correction, carveParams,
-                                   b > 0 && seams[b - 1] ? seams[b - 1].get() : nullptr, *P.pool);
-        if (carved.ok()) {
-            seams[b] = std::make_shared<r::BlendSeam>(std::move(carved).value());
-        }
-    }
-    // ---- the glide, frame by frame --------------------------------------------
-    MotionSeries gridSeries, seamSeries, tableSeries;
-    const auto gridAt = [&](std::uint32_t f) -> std::shared_ptr<r::ParallaxWarpGrid> {
+/// The importer's per-bucket seam analyses of one rig, bucket by bucket.
+struct Schedule {
+    std::uint32_t frames = 0;                                        ///< Frames replayed.
+    std::uint32_t decayRows = 0;                                     ///< The grid's decay rings (not judged).
+    std::vector<std::shared_ptr<osv::render::ParallaxWarpGrid>> grids;  ///< Per bucket; null = refused.
+    std::vector<std::shared_ptr<osv::render::BlendSeam>> seams;         ///< Per bucket; null = failed.
+    std::vector<std::vector<float>> tables;                             ///< Per bucket; empty = failed.
+
+    /// The grid the importer renders frame `f` with: glided from the
+    /// previous bucket's, as ImporterInstance::applyAnalyses does.
+    [[nodiscard]] std::shared_ptr<osv::render::ParallaxWarpGrid> gridAt(std::uint32_t f) const {
+        namespace r = osv::render;
         const std::uint32_t b = r::parallaxBucket(f);
-        if (!grids[b]) {
+        if (b >= grids.size() || !grids[b]) {
             return nullptr;
         }
         if (b == 0 || !grids[b - 1]) {
@@ -1544,10 +1531,13 @@ void replaySchedule(osvtool::Pipeline& P, const osv::geom::LensRig& rig, double 
         }
         auto g = r::blendParallaxGrids(*grids[b - 1], *grids[b], r::parallaxCrossfadeWeight(f));
         return g.ok() ? std::make_shared<r::ParallaxWarpGrid>(std::move(g).value()) : grids[b];
-    };
-    const auto seamAt = [&](std::uint32_t f) -> std::shared_ptr<r::BlendSeam> {
+    }
+
+    /// The carved seam frame `f` renders with, glided the same way.
+    [[nodiscard]] std::shared_ptr<osv::render::BlendSeam> seamAt(std::uint32_t f) const {
+        namespace r = osv::render;
         const std::uint32_t b = r::parallaxBucket(f);
-        if (!seams[b]) {
+        if (b >= seams.size() || !seams[b]) {
             return nullptr;
         }
         if (b == 0 || !seams[b - 1]) {
@@ -1555,24 +1545,247 @@ void replaySchedule(osvtool::Pipeline& P, const osv::geom::LensRig& rig, double 
         }
         auto s = r::blendSeams(*seams[b - 1], *seams[b], r::parallaxCrossfadeWeight(f));
         return s.ok() ? std::make_shared<r::BlendSeam>(std::move(s).value()) : seams[b];
-    };
-    for (std::uint32_t f = 0; f + 1 < frames; ++f) {
-        const auto g0 = gridAt(f);
-        const auto g1 = gridAt(f + 1);
+    }
+
+    /// The seam-shift table of frame `f`: NOT glided, it steps at every
+    /// bucket edge.
+    [[nodiscard]] const std::vector<float>& tableAt(std::uint32_t f) const {
+        static const std::vector<float> kNone;
+        const std::uint32_t b = osv::render::parallaxBucket(f);
+        return b < tables.size() ? tables[b] : kNone;
+    }
+};
+
+/// Replay the importer's per-bucket schedule for one rig and gate, print
+/// how far each analysis moves per frame, and hand the schedule back for the
+/// frozen-scene renders.
+Schedule replaySchedule(osvtool::Pipeline& P, const osv::geom::LensRig& rig, double gate, const char* title) {
+    namespace r = osv::render;
+    Schedule s;
+    s.frames = std::min<std::uint32_t>(P.frameCount(), 65u);
+    if (s.frames < 2) {
+        std::printf("      the clip is too short to replay\n");
+        return s;
+    }
+    const std::uint32_t buckets = r::parallaxBucket(s.frames - 1u) + 1u;
+    r::ParallaxWarpParams pw;
+    pw.backend = r::FlowBackendKind::Classical;
+    pw.requiredImprovement = gate;
+    s.decayRows = pw.decayRows;
+    const r::SeamCarveParams carveParams;
+    r::SeamSearchParams sp;
+    s.grids.assign(buckets, nullptr);
+    s.seams.assign(buckets, nullptr);
+    s.tables.assign(buckets, {});
+    double wingMean = 0.0;
+    double groundMean = 0.0;
+    std::uint32_t measured = 0;
+    for (std::uint32_t b = 0; b < buckets; ++b) {
+        auto pair = P.reader->read(b * r::kParallaxBucketFrames);
+        if (!pair.ok()) {
+            std::printf("      decode of frame %u failed\n", b * r::kParallaxBucketFrames);
+            s.frames = 0;
+            return s;
+        }
+        auto grid = r::buildParallaxWarp(rig, pair.value(), P.blendParams, pw, nullptr, *P.pool);
+        r::WarpGridView view;
+        r::SeamCorrection correction;
+        if (grid.ok()) {
+            s.grids[b] = std::make_shared<r::ParallaxWarpGrid>(std::move(grid).value());
+            view.uv = s.grids[b]->uv.data();
+            view.w = s.grids[b]->w;
+            view.h = s.grids[b]->h;
+            view.latMinRad = s.grids[b]->latMinRad;
+            view.latMaxRad = s.grids[b]->latMaxRad;
+            correction.warp = &view;
+            wingMean += gridMeanDeg(*s.grids[b], pw.decayRows, kWingLon0Deg, kWingLon1Deg);
+            groundMean += gridMeanDeg(*s.grids[b], pw.decayRows, 15.0, 118.0);  // the ground, 1110-1700 of 2048
+            ++measured;
+        }
+        auto table = r::searchSeam(rig, pair.value(), P.blendParams, sp, *P.pool);
+        if (table.ok()) {
+            s.tables[b] = table.value().shiftDeg;
+        }
+        // Steered by the previous bucket's seam, as the importer's playback is.
+        auto carved = r::carveSeam(rig, pair.value(), P.blendParams, pw.band, correction, carveParams,
+                                   b > 0 && s.seams[b - 1] ? s.seams[b - 1].get() : nullptr, *P.pool);
+        if (carved.ok()) {
+            s.seams[b] = std::make_shared<r::BlendSeam>(std::move(carved).value());
+        }
+    }
+    // ---- the glide, frame by frame --------------------------------------------
+    MotionSeries gridSeries, seamSeries, edgeSeries, tableSeries;
+    for (std::uint32_t f = 0; f + 1 < s.frames; ++f) {
+        const auto g0 = s.gridAt(f);
+        const auto g1 = s.gridAt(f + 1);
         gridSeries.perFrame.push_back(g0 && g1 ? gridMotion(*g0, *g1, pw.decayRows) : std::vector<double>{});
-        const auto s0 = seamAt(f);
-        const auto s1 = seamAt(f + 1);
+        const auto s0 = s.seamAt(f);
+        const auto s1 = s.seamAt(f + 1);
         seamSeries.perFrame.push_back(s0 && s1 ? seamMotion(*s0, *s1) : std::vector<double>{});
-        // The table is NOT glided: it steps at every bucket edge.
-        tableSeries.perFrame.push_back(
-            tableMotion(tables[r::parallaxBucket(f)], tables[r::parallaxBucket(f + 1)]));
+        edgeSeries.perFrame.push_back(s0 && s1 ? seamEdgeMotion(*s0, *s1) : std::vector<double>{});
+        tableSeries.perFrame.push_back(tableMotion(s.tableAt(f), s.tableAt(f + 1)));
     }
     std::printf("    %s (gate %.2f): %u of %u bucket grids accepted; mean correction wing %.3f deg, ground %.3f deg\n",
                 title, gate, measured, buckets, measured ? wingMean / measured : 0.0,
                 measured ? groundMean / measured : 0.0);
     gridSeries.print("parallax grid (per bucket, glided)");
     seamSeries.print("carved seam line (per bucket, glided)");
-    tableSeries.print("seam-shift table (per bucket, stepped; unused here");
+    edgeSeries.print("carved seam feather edges (per bucket, glided)");
+    tableSeries.print("seam-shift table (stepped; used without a grid)");
+    return s;
+}
+
+/// Luma of a top-down RGBA float image at continuous pixel (x, y), bilinear;
+/// longitude wraps, latitude clamps.  Rec.709 weights on the encoded values,
+/// as hostLuma below.
+float rgbaLuma(const osv::render::ImageRGBAf& img, double x, double y) {
+    const int w = static_cast<int>(img.w);
+    const int h = static_cast<int>(img.h);
+    const auto at = [&](int xx, int yy) {
+        xx = ((xx % w) + w) % w;
+        yy = std::clamp(yy, 0, h - 1);
+        const float* px = img.data.data() + (static_cast<std::size_t>(yy) * img.w + static_cast<std::size_t>(xx)) * 4u;
+        return 0.2126f * px[0] + 0.7152f * px[1] + 0.0722f * px[2];
+    };
+    const double fx = x - 0.5;
+    const double fy = y - 0.5;
+    const int x0 = static_cast<int>(std::floor(fx));
+    const int y0 = static_cast<int>(std::floor(fy));
+    const float tx = static_cast<float>(fx - x0);
+    const float ty = static_cast<float>(fy - y0);
+    const float top = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * tx;
+    const float bot = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * tx;
+    return top + (bot - top) * ty;
+}
+
+/// The nacelle patch of a rendered standard equirect (top-down RGBA), on the
+/// same polar-axis grid as nacellePatch.
+osv::render::GrayImage nacellePatchRgba(const osv::render::ImageRGBAf& rendered) {
+    osv::render::GrayImage img;
+    if (rendered.w == 0 || rendered.h == 0 || rendered.data.size() < static_cast<std::size_t>(rendered.w) * rendered.h * 4u) {
+        return img;
+    }
+    const double step = 1.0 / kPxPerDeg;
+    img.w = static_cast<std::uint32_t>((kPatchLon1Deg - kPatchLon0Deg) / step);
+    img.h = static_cast<std::uint32_t>(2.0 * kPatchLatDeg / step);
+    img.data.assign(static_cast<std::size_t>(img.w) * img.h, 0.0f);
+    osv::geom::EquirectMap map;
+    map.layout = osv::geom::EquirectLayout::Standard;
+    map.w = static_cast<int>(rendered.w);
+    map.h = static_cast<int>(rendered.h);
+    for (std::uint32_t j = 0; j < img.h; ++j) {
+        const double lat = osv::deg2rad(kPatchLatDeg - (static_cast<double>(j) + 0.5) * step);
+        for (std::uint32_t i = 0; i < img.w; ++i) {
+            const double lon = osv::deg2rad(kPatchLon0Deg + (static_cast<double>(i) + 0.5) * step);
+            const osv::Vec3d d{std::cos(lat) * std::sin(lon), std::sin(lat), std::cos(lat) * std::cos(lon)};
+            osv::Vec2d px;
+            if (map.dirToPixel(d, px)) {
+                img.data[static_cast<std::size_t>(j) * img.w + i] = rgbaLuma(rendered, px.x, px.y);
+            }
+        }
+    }
+    return img;
+}
+
+/// Which of a schedule's analyses follow it frame by frame in a frozen-scene
+/// series; the others hold the value of the frozen frame's bucket.
+struct FrozenSeries {
+    const char* name;
+    bool glideGrid;   ///< The grid follows the schedule (else: the frozen frame's).
+    bool glideSeam;   ///< The carved seam follows it (else: the frozen frame's).
+    bool tableOnly;   ///< No grid and no carve: the stepped seam-shift table alone.
+};
+
+/// Render ONE decoded frame with the corrections of every frame of the
+/// schedule in turn and measure the frame-to-frame motion at the nacelle.
+/// The scene cannot move - the pixels are the same decoded frame every time
+/// - so every pixel of motion measured is the corrections' own.
+void frozenScene(osvtool::Pipeline& P, osv::render::IRenderer& renderer, const osv::geom::LensRig& rig,
+                 const Schedule& s, std::uint32_t frozenFrame, const FrozenSeries& series) {
+    namespace r = osv::render;
+    if (s.frames < 2 || frozenFrame >= s.frames) {
+        return;
+    }
+    auto pair = P.reader->read(frozenFrame);
+    if (!pair.ok()) {
+        std::printf("      decode of frame %u failed\n", frozenFrame);
+        return;
+    }
+    r::RenderParamsBuilder builder;
+    builder.rig(rig).color(P.color).blend(P.blendParams, true);
+    osv::geom::EquirectMap map;
+    map.layout = osv::geom::EquirectLayout::Standard;
+    map.w = 6000;
+    map.h = 3000;
+    builder.equirect(map);
+    const auto frozenGrid = s.gridAt(frozenFrame);
+    const auto frozenSeam = s.seamAt(frozenFrame);
+    std::vector<r::GrayImage> patches;
+    for (std::uint32_t f = 0; f < s.frames; ++f) {
+        // ---- this frame's corrections -----------------------------------------
+        if (series.tableOnly) {
+            builder.clearWarp();
+            builder.seam(s.tableAt(f));
+            builder.clearBlendSeam();
+        } else {
+            const auto grid = series.glideGrid ? s.gridAt(f) : frozenGrid;
+            if (grid) {
+                builder.warp(grid->uv, grid->w, grid->h, grid->latMinRad, grid->latMaxRad);
+                builder.seam(std::vector<float>{});
+            } else {
+                builder.clearWarp();
+                builder.seam(s.tableAt(series.glideGrid ? f : frozenFrame));
+            }
+            const auto seam = series.glideSeam ? s.seamAt(f) : frozenSeam;
+            if (seam) {
+                r::applyBlendSeam(builder, *seam);
+            } else {
+                builder.clearBlendSeam();
+            }
+        }
+        auto job = builder.build(pair.value());
+        if (!job.ok()) {
+            std::printf("      frame %u: %s\n", f, job.error().message.c_str());
+            return;
+        }
+        auto img = renderer.render(job.value());
+        if (!img.ok()) {
+            std::printf("      frame %u: %s\n", f, img.error().message.c_str());
+            return;
+        }
+        patches.push_back(nacellePatchRgba(img.value()));
+    }
+    // ---- consecutive renders ----------------------------------------------------
+    std::vector<double> all, perPairMax, perPairP99;
+    std::size_t moving = 0;
+    for (std::size_t k = 0; k + 1 < patches.size(); ++k) {
+        auto flow = r::computeFlow(r::FlowBackendKind::Classical, patches[k], patches[k + 1], r::FlowBackendParams{},
+                                   P.pool.get(), nullptr);
+        if (!flow.ok()) {
+            continue;
+        }
+        const r::BidirFlow& bf = flow.value();
+        std::vector<double> mags;
+        for (std::size_t i = 0; i < bf.ok.size(); ++i) {
+            if (bf.ok[i]) {
+                mags.push_back(std::hypot(static_cast<double>(bf.forward.u[i]), static_cast<double>(bf.forward.v[i])));
+            }
+        }
+        perPairP99.push_back(percentile(mags, 99.0));
+        perPairMax.push_back(mags.empty() ? 0.0 : *std::max_element(mags.begin(), mags.end()));
+        moving += perPairP99.back() > 0.25 ? 1u : 0u;
+        all.insert(all.end(), mags.begin(), mags.end());
+    }
+    double mean = 0.0;
+    for (const double x : all) {
+        mean += x;
+    }
+    mean = all.empty() ? 0.0 : mean / static_cast<double>(all.size());
+    std::printf("      %-46s mean %6.3f  p99 %6.3f  max p99 %6.3f  max %6.3f px/frame; pairs with p99 > 0.25 px: %zu/%zu\n",
+                series.name, mean, percentile(all, 99.0),
+                perPairP99.empty() ? 0.0 : *std::max_element(perPairP99.begin(), perPairP99.end()),
+                perPairMax.empty() ? 0.0 : *std::max_element(perPairMax.begin(), perPairMax.end()), moving,
+                perPairP99.size());
 }
 
 /// Luma of a BGRA_4444_32f host frame (bottom-left rows) at continuous
@@ -1631,6 +1844,9 @@ struct SteadyConfig {
     bool seamSearch;
     osv::premiere::PrefsParallaxGrid grid;
     osv::premiere::PrefsLensAlign align;
+    /// Parallax Blend override (degrees), 0 = the default.  Widening it to
+    /// the Seam Blend tells a sharp seam's look apart from a seam's motion.
+    double parallaxBlendDeg = 0.0;
 };
 
 }  // namespace steadybench
@@ -1654,7 +1870,8 @@ void partS(const Options& o) {
         return;
     }
     osvtool::Pipeline& P = *opened.value();
-    replaySchedule(P, P.rig, r::ParallaxWarpParams{}.requiredImprovement, "calibration rig (today)");
+    const Schedule today = replaySchedule(P, P.rig, r::ParallaxWarpParams{}.requiredImprovement,
+                                          "calibration rig (today)");
     // The lens rotation, fitted as the importer fits it, then the same replay.
     const std::vector<std::uint32_t> rotFrames =
         r::clipSampleFrames(P.frameCount(), P.syncFrames(), r::kLensRotationSamples, 0.1, 0.9);
@@ -1666,16 +1883,51 @@ void partS(const Options& o) {
         r::LensRotationParams{}, *P.pool);
     const double rotMs = msSince(tRot);
     osv::geom::LensRig aligned = P.rig;
+    Schedule alignedSchedule;
     if (rotation.ok() && rotation.value().accepted && r::applyLensRotation(aligned, rotation.value().fit.wRad).ok()) {
         std::printf("    lens rotation: %s (measured in %.0f ms, decode %.0f)\n",
                     r::describeLensRotation(rotation.value().fit).c_str(), rotMs, rotation.value().decodeMs);
-        replaySchedule(P, aligned, r::kAlignedRequiredImprovement, "rotation folded in");
+        alignedSchedule = replaySchedule(P, aligned, r::kAlignedRequiredImprovement, "rotation folded in");
     } else {
         std::printf("    lens rotation: none (%s)\n",
                     rotation.ok() ? rotation.value().reason.c_str() : rotation.error().message.c_str());
     }
     std::printf("    clip correction (Parallax Grid Steady): one grid, one table and one seam for every frame -\n"
                 "      every row above is 0.000 px/frame by construction.\n");
+
+    // ---- 1b. what each analysis does to the PICTURE, the scene frozen -----------------
+    // One decoded frame rendered with the corrections of every frame in turn:
+    // nothing in the scene can move, so every pixel of motion is the
+    // corrections' own.  Each analysis alone, then all three; "held" renders
+    // the frozen frame's own value every time, which is what Steady does
+    // with the clip's value.
+    constexpr std::uint32_t kFrozenFrame = 32;
+    std::printf("\n  1b. The same schedules applied to ONE decoded frame (%u), rendered 6000x3000 and measured on the\n"
+                "      nacelle patch: the scene is frozen, so every pixel of motion is the corrections' own.\n",
+                kFrozenFrame);
+    std::string rendererName;
+    auto made = r::makeRenderer("auto", *P.pool, &rendererName);
+    if (!made.ok()) {
+        std::printf("    no renderer: %s\n", made.error().message.c_str());
+    } else {
+        std::unique_ptr<r::IRenderer> renderer = std::move(made).value();
+        std::printf("    renderer: %s\n", rendererName.c_str());
+        const FrozenSeries all{"all three, as the importer glides them", true, true, false};
+        const FrozenSeries gridOnly{"parallax grid alone (seam held)", true, false, false};
+        const FrozenSeries seamOnly{"carved seam alone (grid held)", false, true, false};
+        const FrozenSeries tableOnly{"seam-shift table alone (used without a grid)", false, false, true};
+        const FrozenSeries held{"held (what Steady renders every frame)", false, false, false};
+        std::printf("    calibration rig (today):\n");
+        for (const FrozenSeries& s : {all, gridOnly, seamOnly, tableOnly, held}) {
+            frozenScene(P, *renderer, P.rig, today, kFrozenFrame, s);
+        }
+        if (alignedSchedule.frames > 0) {
+            std::printf("    rotation folded in:\n");
+            for (const FrozenSeries& s : {all, gridOnly, seamOnly, held}) {
+                frozenScene(P, *renderer, aligned, alignedSchedule, kFrozenFrame, s);
+            }
+        }
+    }
 
     // ---- 2. what the viewer sees ---------------------------------------------------
     std::printf("\n  2. Rendered by the importer (Exact, 6000x3000, stabilisation off); DIS between consecutive frames\n"
@@ -1704,9 +1956,20 @@ void partS(const Options& o) {
         {"per moment + lens alignment", true, true, PrefsParallaxGrid::FollowsScene, PrefsLensAlign::Auto},
         {"steady, calibration only", true, true, PrefsParallaxGrid::Steady, PrefsLensAlign::Off},
         {"new defaults: Auto + lens alignment", true, true, PrefsParallaxGrid::Auto, PrefsLensAlign::Auto},
+        {"steady + lens alignment, Seam Search off", true, false, PrefsParallaxGrid::Steady, PrefsLensAlign::Auto},
+        {"new defaults, Parallax Blend 1.5 deg", true, true, PrefsParallaxGrid::Auto, PrefsLensAlign::Auto, 1.5},
     };
-    std::printf("    %-46s %8s %8s %8s %8s %9s %9s\n", "config", "mean px", "p95 px", "p99 px", "max p99",
-                "|dI| x1e3", "1st frame");
+    // The first configuration renders no correction at all, so its flow IS
+    // the scene's own motion.  Every other configuration's "excess" is its
+    // flow minus that one at the same pixel: what the corrections add on top
+    // of the scene.  A correction that glides adds its own motion directly;
+    // one that holds still adds only where it shows the scene differently -
+    // a different lens across a sharp seam, or content moved by a constant
+    // amount across a motion boundary (so compare it between configurations
+    // of the same rig).
+    std::vector<r::BidirFlow> sceneFlows;
+    std::printf("    %-46s %8s %8s %8s %8s %9s | %8s %8s %8s %9s\n", "config", "mean px", "p95 px", "p99 px",
+                "max p99", "|dI| x1e3", "excess", "ex p99", "ex max99", "1st frame");
     csSDK_int32 importerId = 1500;
     for (const SteadyConfig& c : configs) {
         harness.host().clearCache();
@@ -1723,6 +1986,9 @@ void partS(const Options& o) {
         prefs.seamSearch = c.seamSearch ? 1u : 0u;
         prefs.parallaxGrid = static_cast<std::uint8_t>(c.grid);
         prefs.lensAlign = static_cast<std::uint8_t>(c.align);
+        if (c.parallaxBlendDeg > 0.0) {
+            prefs.setParallaxBlendDeg(c.parallaxBlendDeg);
+        }
         imFileInfoRec8 info{};
         if (harness.getInfo8(clip, info, &prefs) != imNoErr || info.vidScale <= 0 || info.vidSampleSize <= 0) {
             std::printf("    %-46s imGetInfo8 failed\n", c.name);
@@ -1757,14 +2023,35 @@ void partS(const Options& o) {
         }
         clip.close();
         // ---- consecutive-frame motion ----------------------------------------------
+        // The first configuration (no corrections) is the scene's own motion.
+        const bool isScene = &c == &configs[0];
         std::vector<double> means, p95s, p99s, diffs;
+        std::vector<double> excessAll, excessP99s;
         for (std::size_t k = 0; k + 1 < patches.size(); ++k) {
             auto flow = r::computeFlow(r::FlowBackendKind::Classical, patches[k], patches[k + 1],
                                        r::FlowBackendParams{}, P.pool.get(), nullptr);
             if (!flow.ok()) {
+                if (isScene) {
+                    sceneFlows.emplace_back();  // keep the frame pairs aligned
+                }
                 continue;
             }
             const r::BidirFlow& bf = flow.value();
+            // ---- the excess over the scene's own motion, pixel by pixel -------------
+            if (!isScene && k < sceneFlows.size() && sceneFlows[k].valid() && bf.valid() &&
+                sceneFlows[k].ok.size() == bf.ok.size()) {
+                const r::BidirFlow& s = sceneFlows[k];
+                std::vector<double> ex;
+                ex.reserve(bf.ok.size());
+                for (std::size_t i = 0; i < bf.ok.size(); ++i) {
+                    if (bf.ok[i] && s.ok[i]) {
+                        ex.push_back(std::hypot(static_cast<double>(bf.forward.u[i]) - s.forward.u[i],
+                                                static_cast<double>(bf.forward.v[i]) - s.forward.v[i]));
+                    }
+                }
+                excessP99s.push_back(percentile(ex, 99.0));
+                excessAll.insert(excessAll.end(), ex.begin(), ex.end());
+            }
             std::vector<double> mags;
             for (std::size_t i = 0; i < bf.ok.size(); ++i) {
                 if (bf.ok[i]) {
@@ -1784,6 +2071,9 @@ void partS(const Options& o) {
                 d += std::fabs(static_cast<double>(patches[k + 1].data[i]) - static_cast<double>(patches[k].data[i]));
             }
             diffs.push_back(1e3 * d / static_cast<double>(std::max<std::size_t>(1, patches[k].data.size())));
+            if (isScene) {
+                sceneFlows.push_back(std::move(flow).value());
+            }
         }
         const auto avg = [](const std::vector<double>& v) {
             double s = 0.0;
@@ -1792,8 +2082,22 @@ void partS(const Options& o) {
             }
             return v.empty() ? 0.0 : s / static_cast<double>(v.size());
         };
-        std::printf("    %-46s %8.3f %8.3f %8.3f %8.3f %9.3f %7.0f ms\n", c.name, avg(means), avg(p95s), avg(p99s),
-                    p99s.empty() ? 0.0 : *std::max_element(p99s.begin(), p99s.end()), avg(diffs), firstMs);
+        const double maxP99 = p99s.empty() ? 0.0 : *std::max_element(p99s.begin(), p99s.end());
+        if (isScene) {
+            std::printf("    %-46s %8.3f %8.3f %8.3f %8.3f %9.3f | %8s %8s %8s %6.0f ms\n", c.name, avg(means),
+                        avg(p95s), avg(p99s), maxP99, avg(diffs), "-", "-", "-", firstMs);
+        } else {
+            // Mean over every judged pixel of every frame pair, the p99 of
+            // that set, and the worst frame pair's own p99.
+            double exMean = 0.0;
+            for (const double x : excessAll) {
+                exMean += x;
+            }
+            exMean = excessAll.empty() ? 0.0 : exMean / static_cast<double>(excessAll.size());
+            std::printf("    %-46s %8.3f %8.3f %8.3f %8.3f %9.3f | %8.3f %8.3f %8.3f %6.0f ms\n", c.name, avg(means),
+                        avg(p95s), avg(p99s), maxP99, avg(diffs), exMean, percentile(excessAll, 99.0),
+                        excessP99s.empty() ? 0.0 : *std::max_element(excessP99s.begin(), excessP99s.end()), firstMs);
+        }
     }
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }
