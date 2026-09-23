@@ -33,6 +33,21 @@ using Clock = std::chrono::steady_clock;
     return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
 }
 
+/// False while OPENOSV_STEADY_NO_SHARED_CACHE is set to anything but "0": every
+/// instance then measures its own rotation and clip correction and nothing is
+/// read from or written to the process-wide caches (the disk cache included).
+/// A diagnostics switch - it proves a clip's result does not depend on what
+/// another instance happened to measure - read on every use, so a test can
+/// toggle it.  The same CRT getenv the importer's other switches use.
+[[nodiscard]] bool sharedCacheEnabled() noexcept {
+    char value[8] = {};
+    std::size_t length = 0;
+    if (::getenv_s(&length, value, sizeof(value), "OPENOSV_STEADY_NO_SHARED_CACHE") != 0 || length == 0) {
+        return true;
+    }
+    return value[0] == '0';
+}
+
 // =============================================================================
 //  Identities
 // =============================================================================
@@ -485,6 +500,9 @@ void clipRigAndParams(const SteadyRequest& r, const std::optional<LensAlignVerdi
 std::optional<LensAlignVerdict> cachedLensAlign(const std::filesystem::path& path,
                                                 const geom::LensRig& baseRig) noexcept {
     try {
+        if (!sharedCacheEnabled()) {
+            return std::nullopt;  // every instance measures its own (diagnostics)
+        }
         const std::optional<FileIdentity> id = identityOf(path);
         if (!id) {
             return std::nullopt;
@@ -552,7 +570,7 @@ void SteadyStage::request(const SteadyRequest& req, const std::string& clipName)
         rotationKnown = rotation.has_value();
     }
     std::shared_ptr<const render::ClipSteady> clip;
-    if (req.wantClip && rotationKnown) {
+    if (req.wantClip && rotationKnown && sharedCacheEnabled()) {
         if (const std::optional<FileIdentity> id = identityOf(req.path)) {
             geom::LensRig rig;
             render::ClipSteadyParams params;
@@ -733,7 +751,9 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
     (void)key;
     const auto tJob = Clock::now();
     const auto cancelled = [this, gen] { return stale(gen); };
-    const std::optional<FileIdentity> id = identityOf(job.path);
+    // No identity (the file cannot be inspected) or the shared caches
+    // switched off: measure, and share nothing (the empty keys below).
+    const std::optional<FileIdentity> id = sharedCacheEnabled() ? identityOf(job.path) : std::nullopt;
     Global& g = global();
 
     // Opened on the first frame a measurement actually needs, never for a

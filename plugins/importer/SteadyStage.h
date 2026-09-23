@@ -43,7 +43,9 @@
 //
 // Two instances asking for the same result at once measure it once: the
 // second waits for the first (and measures itself if the first is
-// cancelled).
+// cancelled).  OPENOSV_STEADY_NO_SHARED_CACHE=1 switches all of this off for
+// diagnostics: every instance then measures its own, and the disk cache is
+// neither read nor written.
 //
 // LOCKS
 // -----

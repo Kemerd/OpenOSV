@@ -1397,6 +1397,70 @@ TEST_CASE("PrefsBlob lens shading: Auto for new clips, Off for old blobs, streng
 }
 
 // ---------------------------------------------------------------------------
+//  [WP-STEADY] Parallax Grid and Lens Alignment
+// ---------------------------------------------------------------------------
+
+TEST_CASE("PrefsBlob steady seam and lens alignment: Auto for new clips, today's behaviour for old blobs",
+          "[common][prefs][steady]") {
+    // A fresh blob holds the corrections still when the clip allows it and
+    // fits the lens rotation.
+    const PrefsBlob fresh = PrefsBlob::defaults();
+    CHECK(fresh.parallaxGridChoice() == PrefsParallaxGrid::Auto);
+    CHECK(fresh.lensAlignChoice() == PrefsLensAlign::Auto);
+
+    // An older blob's zero bytes read as the per-moment corrections and the
+    // calibration alone - exactly how it rendered - and are clean values.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.parallaxGrid = 0;
+    old.lensAlign = 0;
+    REQUIRE(old.sanitise());
+    CHECK(old.parallaxGridChoice() == PrefsParallaxGrid::FollowsScene);
+    CHECK(old.lensAlignChoice() == PrefsLensAlign::Off);
+
+    // Every value round-trips through sanitise.
+    for (std::uint8_t v = 0; v < static_cast<std::uint8_t>(PrefsParallaxGrid::Count); ++v) {
+        PrefsBlob q = PrefsBlob::defaults();
+        q.parallaxGrid = v;
+        REQUIRE(q.sanitise());
+        CHECK(q.parallaxGrid == v);
+    }
+    for (std::uint8_t v = 0; v < static_cast<std::uint8_t>(PrefsLensAlign::Count); ++v) {
+        PrefsBlob q = PrefsBlob::defaults();
+        q.lensAlign = v;
+        REQUIRE(q.sanitise());
+        CHECK(q.lensAlign == v);
+    }
+
+    // A corrupt byte lands on the default (like parallax and the sky seam
+    // fix), but an unsanitised blob READS it as today's behaviour.
+    PrefsBlob bad = PrefsBlob::defaults();
+    bad.parallaxGrid = 7;
+    bad.lensAlign = 9;
+    CHECK(bad.parallaxGridChoice() == PrefsParallaxGrid::FollowsScene);
+    CHECK(bad.lensAlignChoice() == PrefsLensAlign::Off);
+    REQUIRE_FALSE(bad.sanitise());
+    CHECK(bad.parallaxGridChoice() == PrefsParallaxGrid::Auto);
+    CHECK(bad.lensAlignChoice() == PrefsLensAlign::Auto);
+
+    // The padding before the range and the rest of it stay zero.
+    PrefsBlob pad = PrefsBlob::defaults();
+    pad.padBeforeSteady[1] = 3;
+    pad.steadyReserved[0] = 4;
+    REQUIRE_FALSE(pad.sanitise());
+    CHECK(pad.padBeforeSteady[1] == 0);
+    CHECK(pad.steadyReserved[0] == 0);
+    CHECK(pad == PrefsBlob::defaults());
+
+    // Both are part of the cache key: a changed choice is a different frame.
+    PrefsBlob other = PrefsBlob::defaults();
+    other.parallaxGrid = static_cast<std::uint8_t>(PrefsParallaxGrid::Steady);
+    CHECK_FALSE(other == fresh);
+    other = PrefsBlob::defaults();
+    other.lensAlign = static_cast<std::uint8_t>(PrefsLensAlign::Off);
+    CHECK_FALSE(other == fresh);
+}
+
+// ---------------------------------------------------------------------------
 //  [WP-SEAMTOOLS] the carved seam's tweaks
 // ---------------------------------------------------------------------------
 

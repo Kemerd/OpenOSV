@@ -306,6 +306,29 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
         fixture.setPopup(kIndexLensShading, 1);
         CHECK(translate(fixture, off).lensShadingMode() == PrefsLensShading::Off);
     }
+    SECTION("Parallax Grid") {  // [WP-STEADY]
+        // "Auto" -> Auto, "Steady (per clip)" -> Steady, "Follows scene (per moment)" -> FollowsScene.
+        for (int item = 1; item <= OSV_SS_PARALLAX_GRID_COUNT; ++item) {
+            PrefsBuffer buffer;
+            fixture.setPopup(kIndexParallaxGrid, item);
+            INFO("popup value " << item);
+            CHECK(translate(fixture, buffer).parallaxGridChoice() == kParallaxGridByPopup[item - 1]);
+        }
+        PrefsBuffer perMoment;
+        fixture.setPopup(kIndexParallaxGrid, 3);
+        CHECK(translate(fixture, perMoment).parallaxGridChoice() == PrefsParallaxGrid::FollowsScene);
+    }
+    SECTION("Lens Alignment") {  // [WP-STEADY]
+        for (int item = 1; item <= OSV_SS_LENS_ALIGN_COUNT; ++item) {
+            PrefsBuffer buffer;
+            fixture.setPopup(kIndexLensAlign, item);
+            INFO("popup value " << item);
+            CHECK(translate(fixture, buffer).lensAlignChoice() == kLensAlignByPopup[item - 1]);
+        }
+        PrefsBuffer off;
+        fixture.setPopup(kIndexLensAlign, 2);
+        CHECK(translate(fixture, off).lensAlignChoice() == PrefsLensAlign::Off);
+    }
     SECTION("Shading Strength") {  // [WP-VIGNETTE]
         for (const double percent : {0.0, 1.0, 42.0, 99.0, 100.0}) {
             PrefsBuffer buffer;
@@ -961,6 +984,54 @@ TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesetting
     // [WP-VIGNETTE] the lens shading correction: Auto at full strength.
     CHECK(c.lensShading == OSV_SS_LENS_SHADING_DEFAULT);
     CHECK(c.shadingStrengthPercent == Catch::Approx(OSV_SS_SHADING_STRENGTH_DEFAULT));
+    // [WP-STEADY] both popups on their first item, Auto.
+    CHECK(c.parallaxGrid == OSV_SS_PARALLAX_GRID_DEFAULT);
+    CHECK(c.lensAlign == OSV_SS_LENS_ALIGN_DEFAULT);
+}
+
+TEST_CASE("the pure mapping round-trips Parallax Grid and Lens Alignment", "[sourcesettings][mapping][steady]") {
+    // [WP-STEADY] Every item of both popups, both ways, through the tables
+    // (the popups list the default first; the enums keep the older behaviour
+    // at 0).
+    for (int grid = 1; grid <= OSV_SS_PARALLAX_GRID_COUNT; ++grid) {
+        for (int align = 1; align <= OSV_SS_LENS_ALIGN_COUNT; ++align) {
+            ControlValues c;
+            c.parallaxGrid = grid;
+            c.lensAlign = align;
+            const PrefsBlob blob = prefsFromControls(c);
+            INFO("grid item " << grid << ", alignment item " << align);
+            REQUIRE(blob.isValid());
+            CHECK(blob.parallaxGridChoice() == kParallaxGridByPopup[grid - 1]);
+            CHECK(blob.lensAlignChoice() == kLensAlignByPopup[align - 1]);
+            const ControlValues back = controlsFromPrefs(blob);
+            CHECK(back.parallaxGrid == grid);
+            CHECK(back.lensAlign == align);
+        }
+    }
+    // The popup items say what they select.
+    CHECK(kParallaxGridByPopup[0] == PrefsParallaxGrid::Auto);
+    CHECK(kParallaxGridByPopup[1] == PrefsParallaxGrid::Steady);
+    CHECK(kParallaxGridByPopup[2] == PrefsParallaxGrid::FollowsScene);
+    CHECK(kLensAlignByPopup[0] == PrefsLensAlign::Auto);
+    CHECK(kLensAlignByPopup[1] == PrefsLensAlign::Off);
+    // Hostile popup values: the defaults, never a blob needing repair.
+    for (const int hostile : {std::numeric_limits<int>::min(), -1, 0, 4, 77}) {
+        ControlValues c;
+        c.parallaxGrid = hostile;
+        c.lensAlign = hostile;
+        PrefsBlob blob = prefsFromControls(c);
+        CHECK(blob.parallaxGridChoice() == PrefsParallaxGrid::Auto);
+        CHECK(blob.lensAlignChoice() == PrefsLensAlign::Auto);
+        CHECK(blob.sanitise());
+    }
+    // An older project's blob (zero bytes) shows what it renders with:
+    // Follows scene and Off.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.parallaxGrid = 0;
+    old.lensAlign = 0;
+    const ControlValues shown = controlsFromPrefs(old);
+    CHECK(shown.parallaxGrid == 3);
+    CHECK(shown.lensAlign == 2);
 }
 
 TEST_CASE("the pure mapping round-trips the seam tools", "[sourcesettings][mapping][seamtools]") {

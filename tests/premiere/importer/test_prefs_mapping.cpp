@@ -663,3 +663,48 @@ TEST_CASE("the lens shading controls round trip and refuse garbage", "[importer]
     REQUIRE(blob.shadingStrengthPercent() == 100.0);
     REQUIRE(blob.sanitise());
 }
+
+TEST_CASE("the Parallax Grid and Lens Alignment combos round trip and refuse garbage",
+          "[importer][prefs][mapping][steady]") {
+    // [WP-STEADY] Defaults: both on their first entry, Auto.
+    const DialogControls shown = controlsFromPrefs(PrefsBlob::defaults());
+    REQUIRE(shown.parallaxGrid == 0);
+    REQUIRE(shown.lensAlign == 0);
+    REQUIRE(kDialogParallaxGrid[0] == PrefsParallaxGrid::Auto);
+    REQUIRE(kDialogLensAlign[0] == PrefsLensAlign::Auto);
+
+    // Every choice of both survives the round trip.
+    for (int grid = 0; grid < static_cast<int>(PrefsParallaxGrid::Count); ++grid) {
+        for (int align = 0; align < static_cast<int>(PrefsLensAlign::Count); ++align) {
+            PrefsBlob original = PrefsBlob::defaults();
+            original.parallaxGrid = static_cast<std::uint8_t>(grid);
+            original.lensAlign = static_cast<std::uint8_t>(align);
+            const DialogControls controls = controlsFromPrefs(original);
+            INFO("grid " << grid << " alignment " << align);
+            REQUIRE(kDialogParallaxGrid[static_cast<std::size_t>(controls.parallaxGrid)] ==
+                    original.parallaxGridChoice());
+            REQUIRE(kDialogLensAlign[static_cast<std::size_t>(controls.lensAlign)] == original.lensAlignChoice());
+            REQUIRE(prefsFromControls(controls) == original);
+        }
+    }
+
+    // An old project (both bytes zero): Follows scene and Off, and OK keeps them.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.parallaxGrid = 0;
+    old.lensAlign = 0;
+    const DialogControls oldShown = controlsFromPrefs(old);
+    REQUIRE(kDialogParallaxGrid[static_cast<std::size_t>(oldShown.parallaxGrid)] == PrefsParallaxGrid::FollowsScene);
+    REQUIRE(kDialogLensAlign[static_cast<std::size_t>(oldShown.lensAlign)] == PrefsLensAlign::Off);
+    REQUIRE(prefsFromControls(oldShown, old) == old);
+
+    // A combo with no selection (-1) or a corrupt index lands on Auto.
+    for (const int hostile : {-1, 3, 99}) {
+        DialogControls bad = controlsFromPrefs(PrefsBlob::defaults());
+        bad.parallaxGrid = hostile;
+        bad.lensAlign = hostile;
+        PrefsBlob blob = prefsFromControls(bad);
+        REQUIRE(blob.parallaxGridChoice() == PrefsParallaxGrid::Auto);
+        REQUIRE(blob.lensAlignChoice() == PrefsLensAlign::Auto);
+        REQUIRE(blob.sanitise());
+    }
+}

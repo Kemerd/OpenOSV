@@ -98,6 +98,9 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
     // [WP-VIGNETTE] the lens shading correction
     p.lensShading = static_cast<std::uint8_t>(PrefsLensShading::Off);
     p.setShadingStrengthPercent(63.0);
+    // [WP-STEADY] steady seam and lens alignment, both away from Auto
+    p.parallaxGrid = static_cast<std::uint8_t>(PrefsParallaxGrid::Steady);
+    p.lensAlign = static_cast<std::uint8_t>(PrefsLensAlign::Off);
     p.parallax = static_cast<std::uint8_t>(PrefsParallax::Off);
     p.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Classical);
     p.dlogmFit = static_cast<std::uint8_t>(PrefsDlogmFit::Pocket3);
@@ -189,6 +192,10 @@ TEST_CASE("the defaults file round-trips every value of every setting bit for bi
         each([](PrefsBlob& p, std::uint8_t v) { p.photoSeam = v; }, static_cast<int>(PrefsPhotoSeam::Count));
         each([](PrefsBlob& p, std::uint8_t v) { p.lensShading = v; },
              static_cast<int>(PrefsLensShading::Count));  // [WP-VIGNETTE]
+        each([](PrefsBlob& p, std::uint8_t v) { p.parallaxGrid = v; },
+             static_cast<int>(PrefsParallaxGrid::Count));  // [WP-STEADY]
+        each([](PrefsBlob& p, std::uint8_t v) { p.lensAlign = v; },
+             static_cast<int>(PrefsLensAlign::Count));  // [WP-STEADY]
         each([](PrefsBlob& p, std::uint8_t v) { p.directColour = v; }, static_cast<int>(PrefsDirectColour::Count));
         each([](PrefsBlob& p, std::uint8_t v) { p.seamSearch = v; }, 2);
         each([](PrefsBlob& p, std::uint8_t v) { p.gainMatch = v; }, 2);
