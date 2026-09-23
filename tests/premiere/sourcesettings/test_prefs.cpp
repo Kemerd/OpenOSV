@@ -156,6 +156,22 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
             CHECK(translate(fixture, buffer).colorOutput == static_cast<std::uint8_t>(item - 1));
         }
     }
+    SECTION("Look (Rec. 709 only)") {
+        // [WP-LOOK] "DJI (default)" -> 0 (DjiStudio, what an older blob's
+        // zero byte means), "OpenOSV standard" -> 1 (Standard).
+        for (int item = 1; item <= OSV_SS_LOOK_COUNT; ++item) {
+            PrefsBuffer buffer;
+            fixture.setPopup(kIndexRec709Look, item);
+            INFO("popup value " << item);
+            CHECK(translate(fixture, buffer).look == static_cast<std::uint8_t>(item - 1));
+        }
+        PrefsBuffer first;
+        fixture.setPopup(kIndexRec709Look, 1);
+        CHECK(translate(fixture, first).lookChoice() == PrefsLook::DjiStudio);
+        PrefsBuffer second;
+        fixture.setPopup(kIndexRec709Look, 2);
+        CHECK(translate(fixture, second).lookChoice() == PrefsLook::Standard);
+    }
     SECTION("Output Size") {
         for (int item = 1; item <= OSV_SS_SIZE_COUNT; ++item) {
             PrefsBuffer buffer;
@@ -615,6 +631,30 @@ TEST_CASE("the pure mapping round-trips the Program Monitor Colour choice", "[so
     }
 }
 
+TEST_CASE("the pure mapping round-trips the Rec.709 look choice", "[sourcesettings][mapping][look]") {
+    // [WP-LOOK] Every item, both directions; hostile popup values fall back
+    // to the default look rather than producing a blob that needs repair.
+    for (int item = 1; item <= OSV_SS_LOOK_COUNT; ++item) {
+        ControlValues c;
+        c.rec709Look = item;
+        const PrefsBlob blob = prefsFromControls(c);
+        REQUIRE(blob.isValid());
+        CHECK(blob.look == static_cast<std::uint8_t>(item - 1));
+        CHECK(controlsFromPrefs(blob).rec709Look == item);
+    }
+    for (const int hostile : {std::numeric_limits<int>::min(), -1, 0, OSV_SS_LOOK_COUNT + 1, 99}) {
+        ControlValues c;
+        c.rec709Look = hostile;
+        PrefsBlob blob = prefsFromControls(c);
+        CHECK(blob.lookChoice() == PrefsLook::DjiStudio);
+        CHECK(blob.sanitise());
+    }
+    // An older project's blob (zero byte) shows as "DJI (default)".
+    PrefsBlob old = PrefsBlob::defaults();
+    old.look = 0;
+    CHECK(controlsFromPrefs(old).rec709Look == OSV_SS_LOOK_DEFAULT);
+}
+
 TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesettings][mapping]") {
     // A default-constructed ControlValues is what the header's defaults say;
     // translating it must give exactly PrefsBlob::defaults().
@@ -629,6 +669,7 @@ TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesetting
     CHECK(c.dlogmFit == OSV_SS_FIT_DEFAULT);
     CHECK(c.renderDevice == OSV_SS_DEVICE_DEFAULT);
     CHECK(c.directColour == OSV_SS_DIRECT_COLOUR_DEFAULT);
+    CHECK(c.rec709Look == OSV_SS_LOOK_DEFAULT);  // [WP-LOOK]
     CHECK(c.seamSearch == (OSV_SS_SEAM_SEARCH_DEFAULT != 0));
     CHECK(c.gainMatch == (OSV_SS_GAIN_MATCH_DEFAULT != 0));
     CHECK(c.exposureStops == Catch::Approx(OSV_SS_EXPOSURE_DEFAULT));

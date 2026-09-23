@@ -61,6 +61,8 @@ PrefsBlob prefsFromControls(const ControlValues& controls) noexcept {
     blob.renderDevice = fromPopup(controls.renderDevice, OSV_SS_DEVICE_COUNT, blob.renderDevice);
     // [WP-SETTINGS] The direct path's colour rule for this clip.
     blob.directColour = fromPopup(controls.directColour, OSV_SS_DIRECT_COLOUR_COUNT, blob.directColour);
+    // [WP-LOOK] The Rec.709 output's display look (ignored by the other outputs).
+    blob.look = fromPopup(controls.rec709Look, OSV_SS_LOOK_COUNT, blob.look);
 
     // Checkboxes are already booleans; the blob stores them as 0 / 1 so the
     // bytes can be memcmp'd as part of the PPix cache key.
@@ -103,6 +105,7 @@ ControlValues controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.dlogmFit = toPopup(clean.dlogmFit, OSV_SS_FIT_COUNT);
     c.renderDevice = toPopup(clean.renderDevice, OSV_SS_DEVICE_COUNT);
     c.directColour = toPopup(clean.directColour, OSV_SS_DIRECT_COLOUR_COUNT);  // [WP-SETTINGS]
+    c.rec709Look = toPopup(clean.look, OSV_SS_LOOK_COUNT);                      // [WP-LOOK]
     c.seamSearch = clean.seamSearch != 0;
     c.gainMatch = clean.gainMatch != 0;
     c.exposureStops = static_cast<double>(clean.exposureStops);

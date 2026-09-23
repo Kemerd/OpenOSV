@@ -58,6 +58,7 @@ struct PipelineOptions {
     std::string fit = "osmo360";                  ///< osmo360 | dji | pocket3
     std::string inputEncoding = "auto";           ///< auto | dlogm | hlg | normal
     double exposureStops = 0.0;
+    std::string look = "dji";                     ///< dji | standard (Rec.709 output only)
 
     // Decode / render backends
     std::string hw = "none";                      ///< none | d3d11va | cuda | auto

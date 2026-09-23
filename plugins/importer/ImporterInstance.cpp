@@ -133,6 +133,20 @@ void trimAnalysisCache(MapT& cache, std::size_t limit, const typename MapT::key_
     return color::kDefaultDlogMFit;
 }
 
+/// [WP-LOOK] Map the prefs look onto the library's display look.  Zero - every
+/// blob written before the byte existed, and every fresh one - is the DJI
+/// Studio look, the library default; a byte outside the enum lands there too.
+/// Only the Rec.709 output has a look; makeColorParams ignores it otherwise.
+[[nodiscard]] color::Look toLook(PrefsLook look) noexcept {
+    switch (look) {
+    case PrefsLook::Standard: return color::Look::Standard;
+    case PrefsLook::DjiStudio:
+    case PrefsLook::Count:
+    default:                  break;
+    }
+    return color::kDefaultLook;
+}
+
 /// Map the prefs choice onto the calibration selector's choice.  Auto - the
 /// default, and what every blob with calibration 0 written before the
 /// choice existed means - follows the accessory the camera recorded; the
@@ -534,11 +548,11 @@ Status ImporterInstance::parseOnce() {
     // output is the "auto PQ for log footage" case the default already gives.
     {
         const color::InputEncoding in = inputEncodingFor(m_format.colorMode);
-        PluginLog::info("colour: '{}': source {} ({}) -> input encoding {}, output {} ({})",
+        PluginLog::info("colour: '{}': source {} ({}) -> input encoding {}, output {} ({}), Rec.709 look {}",
                         m_path.filename().string(), meta::colorModeName(m_format.colorMode),
                         m_format.colorModeFromMetadata ? "from metadata" : "inferred from luma statistics",
                         color::inputEncodingName(in), color::outputTransferName(toOutputTransfer(m_prefs.color())),
-                        colorSpaceTokenFor(m_prefs));
+                        colorSpaceTokenFor(m_prefs), color::lookName(toLook(m_prefs.lookChoice())));
     }
     return okStatus();
 }
@@ -1017,9 +1031,10 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
     // engine's instance does not publish back (it would only echo).
     publishSettingsLocked(true);
 
-    // Colour depends on colorOutput, dlogmFit and exposureStops.
+    // Colour depends on colorOutput, dlogmFit, exposureStops and [WP-LOOK] the
+    // Rec.709 look.
     if (!m_colorBuilt || previous.colorOutput != incoming.colorOutput || previous.dlogmFit != incoming.dlogmFit ||
-        previous.exposureStops != incoming.exposureStops) {
+        previous.exposureStops != incoming.exposureStops || previous.look != incoming.look) {
         rebuildColor();
     }
 
@@ -1082,9 +1097,12 @@ void ImporterInstance::rebuildColor() {
     const color::InputEncoding input = inputEncodingFor(m_format.colorMode);
     // The camera always writes narrow-range YCbCr; bit depth comes from the
     // stream (10 for the Osmo 360, 8 for the LRF proxy).
+    // The look is passed for every output; makeColorParams applies it only to
+    // Rec.709 (the one output with a fitted look) and ignores it otherwise.
     m_color = color::makeColorParams(toDlogMFit(m_prefs.fit()), toOutputTransfer(m_prefs.color()),
                                      m_prefs.exposureStops, input, true,
-                                     m_format.bitDepth ? m_format.bitDepth : 10u);
+                                     m_format.bitDepth ? m_format.bitDepth : 10u, nullptr, color::kBt2408SceneScale,
+                                     toLook(m_prefs.lookChoice()));
     m_colorBuilt = true;
 }
 
@@ -1558,9 +1576,12 @@ Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_
     // like rebuildColor() so the two can only ever differ by the transfer.
     OsvColorParams color = m_color;
     if (outputTransfer >= 0 && outputTransfer != m_color.transfer) {
+        // [WP-LOOK] the clip's look travels with it: a PQ clip rendered into
+        // a Rec.709 working space gets the look the user chose for Rec.709.
         color = color::makeColorParams(toDlogMFit(m_prefs.fit()), static_cast<color::OutputTransfer>(outputTransfer),
                                        m_prefs.exposureStops, inputEncodingFor(m_format.colorMode), true,
-                                       m_format.bitDepth ? m_format.bitDepth : 10u);
+                                       m_format.bitDepth ? m_format.bitDepth : 10u, nullptr,
+                                       color::kBt2408SceneScale, toLook(m_prefs.lookChoice()));
     }
 
     // ---- the stitch block ------------------------------------------------------
@@ -1727,9 +1748,12 @@ OsvColorParams ImporterInstance::colorForTransfer(int outputTransfer) const {
     if (outputTransfer < 0 || outputTransfer > OSV_TRANSFER_PASSTHROUGH || outputTransfer == m_color.transfer) {
         return m_color;
     }
+    // [WP-LOOK] the same look as the clip's own block, so a Rec.709
+    // connection-space override renders the look the user chose.
     return color::makeColorParams(toDlogMFit(m_prefs.fit()), static_cast<color::OutputTransfer>(outputTransfer),
                                   m_prefs.exposureStops, inputEncodingFor(m_format.colorMode), true,
-                                  m_format.bitDepth ? m_format.bitDepth : 10u);
+                                  m_format.bitDepth ? m_format.bitDepth : 10u, nullptr, color::kBt2408SceneScale,
+                                  toLook(m_prefs.lookChoice()));
 }
 
 Result<render::RenderJob> ImporterInstance::buildEquirectJob(std::uint32_t index, const video::FramePair& pair,
@@ -2086,7 +2110,11 @@ std::string ImporterInstance::analysisText() const {
     const char* outName = "BT.2100 PQ";
     switch (m_prefs.color()) {
     case PrefsColorOutput::HLG:    outName = "BT.2100 HLG"; break;
-    case PrefsColorOutput::Rec709: outName = "BT.709"; break;
+    // [WP-LOOK] Rec.709 names its display look: the two render visibly apart.
+    case PrefsColorOutput::Rec709:
+        outName = (m_prefs.lookChoice() == PrefsLook::Standard) ? "BT.709 (OpenOSV standard look)"
+                                                                : "BT.709 (DJI Studio look)";
+        break;
     case PrefsColorOutput::DLogM:  outName = "D-Log M passthrough (camera gamut, no transform)"; break;
     default:                       break;
     }
