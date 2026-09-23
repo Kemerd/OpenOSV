@@ -17,8 +17,9 @@ see the timeline, so this is a small Premiere panel called **OpenOSV**:
   selected clip at the playhead.
 * **Keyframe Animation**: DJI Studio's seven easing presets, for the selected
   clips or every OSV clip of the sequence.
-* **Stabilisation**: RockSteady, Horizon Leveling or Off, set on the master
-  clips' OpenOSV Source Settings.
+* **Stabilisation**: DJI Studio's two independent switches, RockSteady and
+  Horizon Leveling, both on by default, set on the master clips' OpenOSV
+  Source Settings.
 * A status line with the last action, how many clips it touched, and when.
 
 It ships in two builds, **UXP** and **CEP**, that share everything except the
@@ -268,15 +269,33 @@ Easing (id 22)".
 
 ### Stabilisation
 
-A segmented control with DJI Studio's names, applied to the **master clips**
-of the selected OSV clips, because stabilisation lives in the importer's
-Source Settings, not on the timeline:
+Two independent switches, exactly as DJI Studio has them: **RockSteady** and
+**Horizon Leveling**, both on by default, each on its own row with a line of
+what it does. They are applied to the **master clips** of the selected OSV
+clips, because stabilisation lives in the importer's Source Settings, not on
+the timeline. Together the pair picks one entry of the Source Settings
+"Stabilisation" popup, and the caption under the switches names it
+("Apply sets Stabilisation to Smooth + Horizon Lock on each selected clip's
+master clip"):
 
-| DJI Studio | OpenOSV Source Settings | Why |
-|---|---|---|
-| Off | Off | |
-| RockSteady | Smooth | RockSteady on a 360 clip removes the shake but keeps turning with the camera's heading. Full would lock the view to the first frame's direction. |
-| Horizon Leveling | Horizon Lock | Heading follows, pitch and roll level. |
+| RockSteady | Horizon Leveling | Source Settings entry | What the view does |
+|---|---|---|---|
+| off | off | 1 Off | follows the camera |
+| off | on | 2 Horizon Lock | heading follows the camera, pitch and roll level |
+| on | off | 4 Smooth | the shake is gone, the view keeps turning with the camera's heading (as RockSteady does on a 360 clip; Full would lock it to the first frame's direction) |
+| on | on | 5 Smooth + Horizon Lock | the smoothed heading with a level horizon (the Source Settings default) |
+
+**Full (entry 3)** is the one entry no pair of switches spells. The card
+never reads a clip's current entry - the switches are the choice Apply
+writes, remembered between sessions - so a master clip set to Full in Source
+Settings keeps it until Apply is pressed on it. Apply then writes the
+switches' entry like any other, and the status line says so: "RockSteady +
+Horizon Leveling on 2 master clips. Full replaced on 1 master clip."
+
+**Remembered.** The switches are stored as two booleans. A panel that
+remembered the older single choice starts from its switches: Off as both off,
+RockSteady as RockSteady alone, and Horizon Leveling - the old default, which
+every untouched card had stored - as the new default, both on.
 
 **How it reaches Source Settings.** The Source Settings effect is a master
 clip's effect, so the panel looks for `OpenOSV.SourceSettings` in the master
@@ -401,7 +420,8 @@ panel/
 `checkEffect()`, plus `capabilities()` (`{undoGroups, stabilization}`),
 `setEasing(seq, items, {entry, popupBase})`, `readFraming(seq, {popupBase})`,
 `writeFraming(seq, request)` and `setStabilization(seq, items, {entry,
-popupBase})` for the four cards. The controller is the only caller, and it
+popupBase})` (which also reports `replacedFull`, the master clips it took off
+Full) for the four cards. The controller is the only caller, and it
 runs everything on one promise chain, so passes never overlap each other or a
 button press. An adapter without one of the newer calls turns a press into a
 status line, never an exception.
@@ -456,7 +476,7 @@ build instead of shipping a panel that never finds its effect.
 
 ## Tests
 
-`node panel/tests/run.js` (Node 18+, no npm packages) runs 162 tests. ctest
+`node panel/tests/run.js` (Node 18+, no npm packages) runs 169 tests. ctest
 registers them as `panel.js` only when Node 18+ is found, so a machine without
 Node still passes the suite.
 
@@ -468,8 +488,8 @@ Node still passes the suite.
 | `uxpAdapter.test.js` | the UXP route against a mock of the documented UXP DOM that enforces the `lockedAccess` rule; never doubles, refused transactions, the race check, track listeners following new tracks, and a full drop-to-effect run through the real controller |
 | `hostjsx.test.js` | host.jsx in a mock ExtendScript + QE world: ES3-only source, QE items across gaps, the DOM double-check, name-checked writes, JSON escaping, never throwing |
 | `cepAdapter.test.js` | the CEP route end to end: adapter, evalScript bridge, the real host.jsx and the mock DOM, including a drop-to-effect run |
-| `easing.test.js` | the four cards: the tile curves against the effect's polynomials, popup numbering learned only from settling readings, the two FOVs told apart by their neighbours, DJI Studio's zoom path and preset values, component time; on UXP one undo step per press, keyframes at the playhead, a fresh effect asked for the numbering, Stabilisation through the master clip's chain; on CEP `addKey` + `setValueAtKey` and `videoComponents()`; the controller's read-out poll, selection event and remembered choices |
-| `view.test.js` | the interface in a fake DOM: every control reaches the controller, busy and error states, the status stamp, themes, springs landing on exact pixels, the controls card open for a new user, the preset grid, the framing read-outs and their reasons, the CEP undo note |
+| `easing.test.js` | the four cards: the tile curves against the effect's polynomials, popup numbering learned only from settling readings, the two FOVs told apart by their neighbours, DJI Studio's zoom path and preset values, component time; on UXP one undo step per press, keyframes at the playhead, a fresh effect asked for the numbering, Stabilisation through the master clip's chain (entry 5 for both switches, a clip on Full reported when Apply replaces it); on CEP `addKey` + `setValueAtKey` and `videoComponents()`; the controller's read-out poll, selection event and remembered choices, all four pairs of Stabilisation switches and the older single choice carried over |
+| `view.test.js` | the interface in a fake DOM: every control reaches the controller, busy and error states, the status stamp, themes, springs landing on exact pixels, the controls card open for a new user, the preset grid, the framing read-outs and their reasons, the CEP undo note, the two Stabilisation switches and the entry their caption names |
 | `identity.test.js` / `lint.test.js` | constants against the C++ sources and both manifests (the easing popup's entries, DJI Studio's preset table, the zoom path, the Source Settings popups); no `?.` / `??` (CEP 10 is Chromium 74), no CSS UXP lacks, no raw U+2028 |
 
 **Verified without launching Premiere:**

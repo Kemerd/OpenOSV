@@ -58,7 +58,7 @@ struct PipelineOptions {
     bool blend = true;
 
     // Stabilisation
-    std::string stab = "off";                     ///< off | horizon | full | smooth
+    std::string stab = "off";                     ///< off | horizon | full | smooth | smooth-horizon
     std::string attitudeConvention = "auto";      ///< auto | xyzw-b2w-ny | wxyz-w2b-z | ...
     double smoothSigmaFrames = 15.0;
 
@@ -100,7 +100,7 @@ struct Pipeline {
     OsvColorParams color{};
     std::optional<osv::geom::AttitudeTrack> attitude;
     osv::geom::StabilizationParams stabParams;
-    std::vector<osv::Quatd> smoothedAttitude;    ///< Per-frame smoothed quaternions (Smooth mode).
+    std::vector<osv::Quatd> smoothedAttitude;    ///< Per-frame smoothed quaternions (Smooth / SmoothLevel).
     osv::Quatd referenceAttitude;
     std::unique_ptr<osv::ThreadPool> pool;
     std::unique_ptr<osv::video::DualStreamReader> reader;

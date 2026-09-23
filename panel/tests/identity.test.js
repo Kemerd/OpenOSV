@@ -134,22 +134,33 @@ test('the framing controls the panel names are registered under exactly those na
     assert.equal(core.REFRAME_POPUP_COUNTS['Keyframe Easing'], define(params, 'OSV_REFRAME_EASING_COUNT'));
 });
 
-test('the Stabilisation choices land on the Source Settings entries they name', () => {
+test('the Stabilisation switches land on the Source Settings entries they name', () => {
     const ss = read('plugins/sourcesettings/SourceSettingsParams.h');
     const ssMain = read('plugins/sourcesettings/SourceSettingsMain.cpp');
     const identity = read('plugins/common/SourceSettingsIdentity.h');
     assert.equal(define(identity, 'OSV_SOURCE_SETTINGS_MATCH_NAME'), core.SOURCE_SETTINGS_MATCH_NAME);
     const items = define(ss, 'OSV_SS_STAB_ITEMS').split('|');
-    assert.deepEqual(items, ['Off', 'Horizon Lock', 'Full', 'Smooth']);
-    assert.equal(items[core.stabilizationById('off').entry - 1], 'Off');
-    assert.equal(items[core.stabilizationById('rocksteady').entry - 1], 'Smooth');
-    assert.equal(items[core.stabilizationById('horizon').entry - 1], 'Horizon Lock');
-    // The default choice is the Source Settings default.
-    assert.equal(core.sanitizeSettings(null).stabilization, 'horizon');
+    // Append-only: a saved project's entries 1..4 keep naming the same modes.
+    assert.deepEqual(items, ['Off', 'Horizon Lock', 'Full', 'Smooth', 'Smooth + Horizon Lock']);
+    // All four pairs of switches, each on the entry whose name it carries.
+    const pairs = [
+        [false, false, 'Off'], [false, true, 'Horizon Lock'], [true, false, 'Smooth'], [true, true, 'Smooth + Horizon Lock']
+    ];
+    for (const [rockSteady, horizon, name] of pairs) {
+        const choice = core.stabilizationChoice(rockSteady, horizon);
+        assert.equal(choice.name, name);
+        assert.equal(items[choice.entry - 1], name, rockSteady + ' / ' + horizon);
+    }
+    // Full is the one entry no pair spells.
+    assert.equal(items[core.STABILIZATION_ENTRIES.full - 1], 'Full');
+    // The default pair, both on, is the Source Settings default.
+    const s = core.sanitizeSettings(null);
+    assert.equal(s.rockSteady, true);
+    assert.equal(s.horizonLeveling, true);
     // (That define carries a trailing comment, so it is read as a leading integer.)
     const stabDefault = /#define\s+OSV_SS_STAB_DEFAULT\s+(\d+)/.exec(ss);
     assert.ok(stabDefault);
-    assert.equal(Number(stabDefault[1]), core.stabilizationById('horizon').entry);
+    assert.equal(Number(stabDefault[1]), core.stabilizationChoice(s.rockSteady, s.horizonLeveling).entry);
     // Every popup the numbering is learned from, by name and entry count.
     const counts = {
         'Colour Output': 'OSV_SS_COLOR_COUNT', 'Output Size': 'OSV_SS_SIZE_COUNT', 'Stabilisation': 'OSV_SS_STAB_COUNT',

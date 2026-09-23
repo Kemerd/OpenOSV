@@ -101,6 +101,7 @@ void trimAnalysisCache(MapT& cache, std::size_t limit, const typename MapT::key_
     case PrefsStabilization::HorizonLock: return geom::StabilizationMode::HorizonLock;
     case PrefsStabilization::Full:        return geom::StabilizationMode::Full;
     case PrefsStabilization::Smooth:      return geom::StabilizationMode::Smooth;
+    case PrefsStabilization::SmoothLevel: return geom::StabilizationMode::SmoothLevel;
     case PrefsStabilization::Off:
     case PrefsStabilization::Count:
     default:                              return geom::StabilizationMode::Off;
@@ -1292,7 +1293,9 @@ void ImporterInstance::rebuildStabilization() {
     m_attitude = std::move(built).value();
     m_referenceAttitude = m_attitude->worldFromBody(m_attitude->beginUs());
 
-    if (m_stabParams.mode == geom::StabilizationMode::Smooth) {
+    // Smooth and Smooth + horizon lock both read the smoothed orientation;
+    // the smoothing is one pass over the track, done once per mode change.
+    if (geom::stabilizationUsesSmoothing(m_stabParams.mode)) {
         std::vector<Quatd> perFrame;
         perFrame.reserve(m_attitude->samples().size());
         for (const auto& s : m_attitude->samples()) {
@@ -1319,8 +1322,11 @@ Mat3d ImporterInstance::stabilizationFor(std::uint32_t frameIndex) const {
         }
     }
     const Quatd wfb = m_attitude->worldFromBody(tUs);
+    // The smoothed pose for the modes that read it; a frame past the end of
+    // the smoothed track passes none (Smooth: no correction, Smooth +
+    // horizon lock: the horizon lock of the raw pose).
     std::optional<Quatd> smoothed;
-    if (m_stabParams.mode == geom::StabilizationMode::Smooth && frameIndex < m_smoothedAttitude.size()) {
+    if (geom::stabilizationUsesSmoothing(m_stabParams.mode) && frameIndex < m_smoothedAttitude.size()) {
         smoothed = m_smoothedAttitude[frameIndex];
     }
     return geom::stabilizationBodyFromWorld(wfb, m_stabParams, m_referenceAttitude, m_attitude->worldUp(), smoothed);
@@ -2984,6 +2990,7 @@ std::string ImporterInstance::analysisText() const {
     case PrefsStabilization::HorizonLock: stabName = "horizon lock"; break;
     case PrefsStabilization::Full:        stabName = "full"; break;
     case PrefsStabilization::Smooth:      stabName = "smooth"; break;
+    case PrefsStabilization::SmoothLevel: stabName = "smooth + horizon lock"; break;
     default:                              break;
     }
     line(std::string("Stabilisation: ") + stabName);

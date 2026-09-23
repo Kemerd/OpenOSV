@@ -200,6 +200,17 @@ test('the status lines for the new actions', () => {
     assert.equal(core.summarizeFraming({ ok: false, reason: 'failed', error: 'nope' }).tone, 'error');
     assert.match(core.summarizeStabilization({ unsupported: true }, 'Off', 0).text, /Source Settings/);
     assert.equal(core.summarizeStabilization({ updated: 2 }, 'RockSteady', 0).text, 'RockSteady on 2 master clips.');
+    // A master clip taken off Full is named: no pair of switches shows Full,
+    // so it never disappears without a word.
+    assert.equal(core.summarizeStabilization({ updated: 2, replacedFull: 1 }, 'RockSteady + Horizon Leveling', 0).text,
+                 'RockSteady + Horizon Leveling on 2 master clips. Full replaced on 1 master clip.');
+    // Never more than were changed; garbage counts as none.
+    assert.equal(core.summarizeStabilization({ updated: 1, replacedFull: 9 }, 'RockSteady', 0).text,
+                 'RockSteady on 1 master clip. Full replaced on 1 master clip.');
+    assert.equal(core.summarizeStabilization({ updated: 1, replacedFull: 'x' }, 'RockSteady', 0).text,
+                 'RockSteady on 1 master clip.');
+    assert.equal(core.summarizeStabilization({ unchanged: 1, replacedFull: 1 }, 'RockSteady', 0).text,
+                 '1 master clip had it already.');
 });
 
 // ===========================================================================
@@ -337,8 +348,42 @@ test('UXP: Stabilisation reaches each master clip\'s Source Settings once, in on
     const r = await w.adapter.setStabilization(active, items, { entry: 4, popupBase: null });
     assert.equal(r.updated, 1, 'one master clip, two timeline clips');
     assert.equal(r.missing, 1);
+    assert.equal(r.replacedFull, 0);
     assert.equal(w.m.paramValue(pi.components[0], 'Stabilisation'), 3, 'Smooth, entry 4, 0-based');
     assert.deepEqual(w.m.world.undo, [UNDO_STABILIZATION]);
+});
+
+test('UXP: both switches on write entry 5; a clip on Full is left alone until Apply, then reported', async () => {
+    for (const base of [0, 1]) {
+        const w = uxpWorld({ popupBase: base });
+        const fresh = { id: 'fresh', path: 'C:\\DCIM\\A.OSV', isSequence: false, components: [w.m.sourceSettingsComponent()] };
+        const full = { id: 'full', path: 'C:\\DCIM\\B.OSV', isSequence: false, components: [w.m.sourceSettingsComponent()] };
+        const off = { id: 'off', path: 'C:\\DCIM\\C.OSV', isSequence: false, components: [w.m.sourceSettingsComponent()] };
+        const setStab = (component, value) => {
+            component.params.filter((p) => p.displayName === 'Stabilisation')[0].value = value;
+        };
+        setStab(full.components[0], base + 2);   // Full, entry 3
+        setStab(off.components[0], base + 0);    // Off, entry 1
+        w.clip(0, 0, { selected: true, projectItem: fresh });
+        w.clip(0, 3000, { selected: true, projectItem: full });
+        w.clip(1, 0, { selected: true, projectItem: off });
+        // Nothing is read or written before Apply: Full stays Full.
+        assert.equal(w.m.paramValue(full.components[0], 'Stabilisation'), base + 2);
+        const { active, items } = await selectedItems(w.adapter);
+        const both = core.stabilizationChoice(true, true);
+        const r = await w.adapter.setStabilization(active, items, { entry: both.entry, popupBase: null });
+        assert.equal(r.learnedBase, base, 'learned from the fresh effect');
+        assert.equal(r.unchanged, 1, 'the fresh effect is already on the default');
+        assert.equal(r.updated, 2);
+        assert.equal(r.replacedFull, 1);
+        for (const pi of [fresh, full, off]) {
+            assert.equal(w.m.paramValue(pi.components[0], 'Stabilisation'), base + 4, 'Smooth + Horizon Lock, entry 5');
+        }
+        assert.deepEqual(w.m.world.undo, [UNDO_STABILIZATION], 'one undo step');
+        // Past the popup's last entry is refused without touching anything.
+        const beyond = await w.adapter.setStabilization(active, items, { entry: 6, popupBase: base });
+        assert.equal(beyond.updated + beyond.unchanged, 0);
+    }
 });
 
 test('UXP: a host whose project items have no component chain cannot set Stabilisation', async () => {
@@ -434,6 +479,32 @@ test('CEP: Stabilisation through ProjectItem.videoComponents(), and a DOM withou
     const active2 = await d.adapter.getActiveSequence();
     const scanned = await d.adapter.scan(active2, { selectedOnly: true });
     assert.equal((await d.adapter.setStabilization(active2, scanned.items, { entry: 1 })).unsupported, true);
+});
+
+test('CEP: both switches on write entry 5, and a master clip taken off Full is counted', async () => {
+    const c = cepWorld();
+    const fresh = c.osv(0, 0, { selected: true });
+    const full = c.osv(1, 0, { selected: true });
+    const stabOf = (clip) => {
+        const props = clip.projectItem._components[0].properties;
+        for (let i = 0; i < props.numItems; i += 1) {
+            if (props[i].displayName === 'Stabilisation') {
+                return props[i];
+            }
+        }
+        return null;
+    };
+    stabOf(full)._value = 2;   // Full, entry 3, on this 0-based host
+    const active = await c.adapter.getActiveSequence();
+    const { items } = await c.adapter.scan(active, { selectedOnly: true });
+    const r = await c.adapter.setStabilization(active, items, { entry: core.stabilizationChoice(true, true).entry,
+                                                                 popupBase: null });
+    assert.equal(r.learnedBase, 0);
+    assert.equal(r.unchanged, 1, 'the fresh effect is already on the default');
+    assert.equal(r.updated, 1);
+    assert.equal(r.replacedFull, 1);
+    assert.equal(c.w.paramValue(fresh.projectItem._components[0], 'Stabilisation'), 4, 'Smooth + Horizon Lock, 0-based');
+    assert.equal(c.w.paramValue(full.projectItem._components[0], 'Stabilisation'), 4);
 });
 
 // ===========================================================================
@@ -537,18 +608,22 @@ test('controller: the framing read-outs follow a poll and the selection event, a
     assert.equal(t.timers.pendingCount(), 0, 'every timer stopped');
 });
 
-test('controller: Stabilisation and the controls card are remembered', async () => {
+test('controller: the two Stabilisation switches and the controls card are remembered', async () => {
     const t = controllerWith();
     t.ctl.start();
     await t.step(0);
-    t.ctl.setStabilization('rocksteady');
+    // Both on out of the box, like DJI Studio.
+    assert.equal(t.last().settings.rockSteady, true);
+    assert.equal(t.last().settings.horizonLeveling, true);
+    t.ctl.setHorizonLeveling(false);
     t.ctl.setHintOpen(false);
     await t.ctl.applyStabilization();
     await t.step(300);
     assert.deepEqual(t.calls.filter((c) => c[0] === 'setStabilization')[0], ['setStabilization', ['a', 'b'], { entry: 4, popupBase: null }]);
     assert.equal(t.last().status.text, 'RockSteady on 1 master clip.');
     const stored = JSON.parse(t.map.get(STORAGE_KEY));
-    assert.equal(stored.stabilization, 'rocksteady');
+    assert.equal(stored.rockSteady, true);
+    assert.equal(stored.horizonLeveling, false);
     assert.equal(stored.hintOpen, false);
     t.ctl.stop();
 
@@ -556,7 +631,70 @@ test('controller: Stabilisation and the controls card are remembered', async () 
     t2.ctl.start();
     await t2.step(0);
     assert.equal(t2.last().settings.hintOpen, false);
+    assert.equal(t2.last().settings.rockSteady, true);
+    assert.equal(t2.last().settings.horizonLeveling, false);
     t2.ctl.stop();
+});
+
+test('controller: every pair of switches applies its own entry, in one call per press', async () => {
+    const t = controllerWith();
+    t.ctl.start();
+    await t.step(0);
+    const pairs = [
+        [true, true, 5, 'RockSteady + Horizon Leveling on 1 master clip.'],
+        [true, false, 4, 'RockSteady on 1 master clip.'],
+        [false, true, 2, 'Horizon Leveling on 1 master clip.'],
+        [false, false, 1, 'No stabilisation on 1 master clip.']
+    ];
+    for (const [rockSteady, horizon, entry, text] of pairs) {
+        t.ctl.setRockSteady(rockSteady);
+        t.ctl.setHorizonLeveling(horizon);
+        const before = t.calls.filter((c) => c[0] === 'setStabilization').length;
+        await t.ctl.applyStabilization();
+        await t.step(0);
+        const calls = t.calls.filter((c) => c[0] === 'setStabilization');
+        assert.equal(calls.length, before + 1);
+        assert.deepEqual(calls[calls.length - 1][2], { entry: entry, popupBase: null }, rockSteady + ' / ' + horizon);
+        assert.equal(t.last().status.text, text);
+    }
+    // A switch only ever stores a boolean.
+    t.ctl.setRockSteady('yes');
+    assert.equal(t.last().settings.rockSteady, false);
+    t.ctl.stop();
+});
+
+test('controller: a panel that remembered the older single choice starts from the matching switches', async () => {
+    const old = (id) => JSON.stringify({ autoApply: true, lens: 'dji', dragEnabled: false, dragSensitivity: 2,
+                                         easing: 'none', stabilization: id, hintOpen: true, popupBase: 1 });
+    for (const [id, rockSteady, horizon] of [['rocksteady', true, false], ['off', false, false], ['horizon', true, true]]) {
+        const t = controllerWith({}, { [STORAGE_KEY]: old(id) });
+        t.ctl.start();
+        await t.step(0);
+        assert.equal(t.last().settings.rockSteady, rockSteady, id);
+        assert.equal(t.last().settings.horizonLeveling, horizon, id);
+        assert.equal(t.last().settings.popupBase, 1, 'the rest of the settings survive');
+        // The next save writes the switches, not the old id.
+        t.ctl.setHintOpen(false);
+        await t.step(300);
+        const stored = JSON.parse(t.map.get(STORAGE_KEY));
+        assert.equal(stored.stabilization, undefined);
+        assert.equal(stored.rockSteady, rockSteady);
+        assert.equal(stored.horizonLeveling, horizon);
+        t.ctl.stop();
+    }
+});
+
+test('controller: Apply that takes a master clip off Full says so', async () => {
+    const t = controllerWith({
+        setStabilization: async () => ({ updated: 2, replacedFull: 1, learnedBase: 0 })
+    });
+    t.ctl.start();
+    await t.step(0);
+    await t.ctl.applyStabilization();
+    await t.step(0);
+    assert.equal(t.last().status.text, 'RockSteady + Horizon Leveling on 2 master clips. Full replaced on 1 master clip.');
+    assert.equal(t.last().settings.popupBase, 0, 'learned');
+    t.ctl.stop();
 });
 
 test('controller: an adapter without the new calls fails into the status line, never throws', async () => {

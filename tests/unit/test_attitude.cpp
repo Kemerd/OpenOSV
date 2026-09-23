@@ -332,6 +332,181 @@ TEST_CASE("Stabilization corrections: Off, Full, HorizonLock, Smooth", "[attitud
     REQUIRE(std::string(stabilizationModeName(StabilizationMode::HorizonLock)) == "HorizonLock");
 }
 
+// -----------------------------------------------------------------------------
+//  SmoothLevel: RockSteady and Horizon Leveling at the same time
+// -----------------------------------------------------------------------------
+namespace {
+
+/// The view's world heading in degrees (the angle of its forward axis about
+/// world +Z, measured from +Y towards -X, as VirtualCamera's yaw).
+double viewHeadingDeg(const Quatd& worldFromBody, const Mat3d& correction) {
+    const Vec3d fwd = worldFromBody.toMatrix() * (correction * Vec3d{0.0, 1.0, 0.0});
+    return rad2deg(std::atan2(-fwd.x, fwd.y));
+}
+
+/// Angle in degrees between the view's up axis in the world and world up:
+/// zero for a level horizon.
+double viewTiltDeg(const Quatd& worldFromBody, const Mat3d& correction, const Vec3d& worldUp) {
+    const Vec3d up = worldFromBody.toMatrix() * (correction * Vec3d{0.0, 0.0, 1.0});
+    return rad2deg(up.angleTo(worldUp));
+}
+
+/// Body pose from a heading, pitch and roll in degrees (VirtualCamera order).
+Quatd poseDeg(double headingDeg, double pitchDeg, double rollDeg) {
+    return Quatd::fromAxisAngle(Vec3d{0.0, 0.0, 1.0}, deg2rad(headingDeg)) *
+           Quatd::fromAxisAngle(Vec3d{1.0, 0.0, 0.0}, deg2rad(pitchDeg)) *
+           Quatd::fromAxisAngle(Vec3d{0.0, 1.0, 0.0}, deg2rad(rollDeg));
+}
+
+}  // namespace
+
+TEST_CASE("Stabilization SmoothLevel levels pitch and roll and follows the smoothed heading", "[attitude][stab]") {
+    const Vec3d worldUp{0.0, 0.0, 1.0};
+    StabilizationParams level;
+    level.mode = StabilizationMode::SmoothLevel;
+    StabilizationParams horizon;
+    horizon.mode = StabilizationMode::HorizonLock;
+
+    // Only the two smoothing modes read the smoothed sequence.
+    REQUIRE(stabilizationUsesSmoothing(StabilizationMode::Smooth));
+    REQUIRE(stabilizationUsesSmoothing(StabilizationMode::SmoothLevel));
+    REQUIRE_FALSE(stabilizationUsesSmoothing(StabilizationMode::Off));
+    REQUIRE_FALSE(stabilizationUsesSmoothing(StabilizationMode::HorizonLock));
+    REQUIRE_FALSE(stabilizationUsesSmoothing(StabilizationMode::Full));
+    REQUIRE(std::string(stabilizationModeName(StabilizationMode::SmoothLevel)) == "SmoothLevel");
+
+    SECTION("one frame: the heading is the smoothed one, pitch and roll are level") {
+        // A shaken body (heading 40, pitched and rolled) whose smoothed pose
+        // heads 30 deg with a different tilt.  The reference heading (25 deg)
+        // only sets the levelled basis and must not leak into the result.
+        const Quatd body = poseDeg(40.0, 15.0, -8.0);
+        const Quatd smoothed = poseDeg(30.0, 5.0, 3.0);
+        const Quatd reference = poseDeg(25.0, 0.0, 0.0);
+        const Mat3d c = stabilizationBodyFromWorld(body, level, reference, worldUp, smoothed);
+        // A proper rotation.
+        REQUIRE((c * c.transposed()).distance(Mat3d::identity()) < 1e-12);
+        // Level: the view's up is world up, its forward is horizontal.
+        REQUIRE(viewTiltDeg(body, c, worldUp) < 1e-9);
+        const Vec3d fwd = body.toMatrix() * (c * Vec3d{0.0, 1.0, 0.0});
+        REQUIRE_THAT(fwd.z, Catch::Matchers::WithinAbs(0.0, 1e-12));
+        // The smoothed heading, not the body's 40 deg.
+        REQUIRE_THAT(viewHeadingDeg(body, c), Catch::Matchers::WithinAbs(30.0, 1e-9));
+        // HorizonLock on the same body keeps the body's own heading.
+        const Mat3d h = stabilizationBodyFromWorld(body, horizon, reference, worldUp);
+        REQUIRE_THAT(viewHeadingDeg(body, h), Catch::Matchers::WithinAbs(40.0, 1e-9));
+        // Smooth on the same pair keeps the smoothed tilt: not level.
+        StabilizationParams smooth;
+        smooth.mode = StabilizationMode::Smooth;
+        const Mat3d s = stabilizationBodyFromWorld(body, smooth, reference, worldUp, smoothed);
+        REQUIRE(viewTiltDeg(body, s, worldUp) > 4.0);
+    }
+
+    SECTION("equals HorizonLock when the orientation is already smooth or no smoothed pose is given") {
+        std::mt19937_64 rng(17u);
+        for (int n = 0; n < 50; ++n) {
+            const Quatd body = randomQuat(rng);
+            const Quatd reference = randomQuat(rng);
+            const Mat3d h = stabilizationBodyFromWorld(body, horizon, reference, worldUp);
+            // Smoothed == body (a still camera, or smoothing that changed nothing).
+            REQUIRE(stabilizationBodyFromWorld(body, level, reference, worldUp, body).distance(h) < 1e-12);
+            // No smoothed pose, or one that is not finite: the horizon lock of the body.
+            REQUIRE(stabilizationBodyFromWorld(body, level, reference, worldUp).distance(h) < 1e-12);
+            const Quatd nanQ{std::nan(""), 0.0, 0.0, 0.0};
+            REQUIRE(stabilizationBodyFromWorld(body, level, reference, worldUp, nanQ).distance(h) < 1e-12);
+        }
+        // A non-finite body is identity, as for every mode.
+        const Quatd nanQ{std::nan(""), 0.0, 0.0, 0.0};
+        REQUIRE(stabilizationBodyFromWorld(nanQ, level, Quatd::identity(), worldUp, Quatd::identity())
+                    .distance(Mat3d::identity()) == 0.0);
+    }
+
+    SECTION("the axis locks mean what they mean for HorizonLock") {
+        // Yaw locked too: the smoothed heading no longer matters, the view
+        // holds the reference heading exactly as HorizonLock does.
+        StabilizationParams levelYaw = level;
+        levelYaw.lockYaw = true;
+        StabilizationParams horizonYaw = horizon;
+        horizonYaw.lockYaw = true;
+        const Quatd body = poseDeg(40.0, 15.0, -8.0);
+        const Quatd smoothed = poseDeg(30.0, 5.0, 3.0);
+        const Quatd reference = poseDeg(25.0, 0.0, 0.0);
+        const Mat3d a = stabilizationBodyFromWorld(body, levelYaw, reference, worldUp, smoothed);
+        const Mat3d b = stabilizationBodyFromWorld(body, horizonYaw, reference, worldUp);
+        REQUIRE(a.distance(b) < 1e-12);
+        REQUIRE_THAT(viewHeadingDeg(body, a), Catch::Matchers::WithinAbs(25.0, 1e-9));
+        // Nothing locked: the view is the smoothed pose itself, as Smooth.
+        StabilizationParams free = level;
+        free.lockPitch = false;
+        free.lockRoll = false;
+        StabilizationParams smooth;
+        smooth.mode = StabilizationMode::Smooth;
+        REQUIRE(stabilizationBodyFromWorld(body, free, reference, worldUp, smoothed)
+                    .distance(stabilizationBodyFromWorld(body, smooth, reference, worldUp, smoothed)) < 1e-12);
+    }
+
+    SECTION("a shaky pan: the shake leaves the heading, the horizon stays level") {
+        // A steady 0.5 deg / frame pan with +-3 deg of heading shake, a
+        // camera held 10 deg nose-up with +-2 deg of pitch shake and +-1.5
+        // deg of roll shake, alternating every frame.
+        constexpr int kFrames = 121;
+        std::vector<Quatd> bodies;
+        bodies.reserve(kFrames);
+        for (int k = 0; k < kFrames; ++k) {
+            const double shake = (k % 2 == 0) ? 1.0 : -1.0;
+            bodies.push_back(poseDeg(0.5 * k + 3.0 * shake, 10.0 + 2.0 * shake, -1.5 * shake));
+        }
+        const std::vector<Quatd> smoothed = Smoother(15.0).smooth(bodies);
+        REQUIRE(smoothed.size() == bodies.size());
+        const Quatd reference = bodies.front();
+        double worstLevelDeg = 0.0;
+        double worstHeadingErrLevel = 0.0;
+        double worstHeadingErrHorizon = 0.0;
+        double leastSmoothTiltDeg = 180.0;
+        StabilizationParams smooth;
+        smooth.mode = StabilizationMode::Smooth;
+        for (int k = 0; k < kFrames; ++k) {
+            const Quatd& body = bodies[static_cast<std::size_t>(k)];
+            const Quatd& sm = smoothed[static_cast<std::size_t>(k)];
+            const Mat3d c = stabilizationBodyFromWorld(body, level, reference, worldUp, sm);
+            worstLevelDeg = std::max(worstLevelDeg, viewTiltDeg(body, c, worldUp));
+            // Away from the ends, where the window is whole, the heading is
+            // the pan itself: the Gaussian mean of the shake is ~0.
+            if (k >= 45 && k <= kFrames - 46) {
+                const double pan = 0.5 * k;
+                worstHeadingErrLevel = std::max(worstHeadingErrLevel, std::fabs(viewHeadingDeg(body, c) - pan));
+                const Mat3d h = stabilizationBodyFromWorld(body, horizon, reference, worldUp);
+                worstHeadingErrHorizon = std::max(worstHeadingErrHorizon, std::fabs(viewHeadingDeg(body, h) - pan));
+                const Mat3d s = stabilizationBodyFromWorld(body, smooth, reference, worldUp, sm);
+                leastSmoothTiltDeg = std::min(leastSmoothTiltDeg, viewTiltDeg(body, s, worldUp));
+            }
+        }
+        // Level on every frame, the ends included.
+        REQUIRE(worstLevelDeg < 1e-9);
+        // The shake is gone from the heading ...
+        REQUIRE(worstHeadingErrLevel < 0.25);
+        // ... where HorizonLock carries all 3 deg of it ...
+        REQUIRE(worstHeadingErrHorizon > 2.9);
+        // ... and Smooth alone keeps the 10 deg nose-up tilt.
+        REQUIRE(leastSmoothTiltDeg > 9.0);
+    }
+
+    SECTION("smoothing disabled: every frame is HorizonLock") {
+        std::mt19937_64 rng(23u);
+        std::vector<Quatd> bodies;
+        for (int k = 0; k < 20; ++k) {
+            bodies.push_back(randomQuat(rng));
+        }
+        // sigma <= 0 hands the input straight back.
+        const std::vector<Quatd> smoothed = Smoother(0.0).smooth(bodies);
+        REQUIRE(smoothed.size() == bodies.size());
+        for (std::size_t k = 0; k < bodies.size(); ++k) {
+            const Mat3d c = stabilizationBodyFromWorld(bodies[k], level, bodies.front(), worldUp, smoothed[k]);
+            const Mat3d h = stabilizationBodyFromWorld(bodies[k], horizon, bodies.front(), worldUp);
+            REQUIRE(c.distance(h) < 1e-12);
+        }
+    }
+}
+
 TEST_CASE("Quaternion log/exp and ZXY Euler round trips", "[attitude][stab]") {
     std::mt19937_64 rng(9u);
     for (int n = 0; n < 200; ++n) {
@@ -565,4 +740,59 @@ TEST_CASE("Stabilization Full on the sample clip is identity at the reference fr
     const Mat3d h = stabilizationBodyFromWorld(last, params, reference, track.worldUp());
     const Vec3d viewUpWorld = last.toMatrix() * (h * Vec3d{0.0, 0.0, 1.0});
     REQUIRE(rad2deg(viewUpWorld.angleTo(track.worldUp())) < 1e-6);
+}
+
+TEST_CASE("Stabilization SmoothLevel on the sample clip is level on every frame and steadier in heading",
+          "[attitude][sample]") {
+    OSV_REQUIRE_SAMPLE();
+    const std::unique_ptr<SampleMeta> sample = openSample();
+    auto built = AttitudeTrack::build(sample->track, AttitudeTrack::Options{});
+    REQUIRE(built.ok());
+    const AttitudeTrack& track = built.value();
+    REQUIRE(track.sampleCount() > 2);
+    // The per-sample sequence and its smoothing, exactly as the importer
+    // builds them (ImporterInstance::rebuildStabilization).
+    std::vector<Quatd> bodies;
+    for (const auto& s : track.samples()) {
+        bodies.push_back(s.worldFromBody);
+    }
+    StabilizationParams level;
+    level.mode = StabilizationMode::SmoothLevel;
+    StabilizationParams horizon;
+    horizon.mode = StabilizationMode::HorizonLock;
+    const std::vector<Quatd> smoothed = Smoother(level.smoothSigmaFrames).smooth(bodies);
+    REQUIRE(smoothed.size() == bodies.size());
+    const Quatd reference = track.worldFromBody(track.beginUs());
+    const Vec3d up = track.worldUp();
+
+    // The view's forward axis in the world, on the horizontal plane.
+    const auto forward = [](const Quatd& body, const Mat3d& c) {
+        return body.toMatrix() * (c * Vec3d{0.0, 1.0, 0.0});
+    };
+    double worstTiltDeg = 0.0;
+    double levelTravelDeg = 0.0;
+    double horizonTravelDeg = 0.0;
+    Vec3d prevLevel;
+    Vec3d prevHorizon;
+    for (std::size_t k = 0; k < bodies.size(); ++k) {
+        const Mat3d c = stabilizationBodyFromWorld(bodies[k], level, reference, up, smoothed[k]);
+        const Mat3d hz = stabilizationBodyFromWorld(bodies[k], horizon, reference, up);
+        worstTiltDeg = std::max(worstTiltDeg, viewTiltDeg(bodies[k], c, up));
+        // Frame-to-frame heading change: how much the view swings.
+        const Vec3d fl = forward(bodies[k], c);
+        const Vec3d fh = forward(bodies[k], hz);
+        if (k > 0) {
+            levelTravelDeg += rad2deg(fl.angleTo(prevLevel));
+            horizonTravelDeg += rad2deg(fh.angleTo(prevHorizon));
+        }
+        prevLevel = fl;
+        prevHorizon = fh;
+    }
+    INFO("heading travel: smooth + horizon lock " << levelTravelDeg << " deg, horizon lock " << horizonTravelDeg
+                                                  << " deg");
+    // Level on every sample, like HorizonLock ...
+    REQUIRE(worstTiltDeg < 1e-6);
+    // ... and the view swings no more than HorizonLock's, which carries the
+    // body's heading shake.
+    REQUIRE(levelTravelDeg <= horizonTravelDeg + 1e-9);
 }

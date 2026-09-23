@@ -35,7 +35,9 @@ TEST_CASE("the defaults round trip through the control mapping", "[importer][pre
     SECTION("the controls show the documented defaults") {
         REQUIRE(controls.colorOutput == 0);     // PQ
         REQUIRE(controls.outputSize == static_cast<int>(PrefsOutputSize::Native));  // full sensor
-        REQUIRE(controls.stabilization == 1);   // Horizon lock
+        REQUIRE(controls.stabilization == 4);   // Smooth + horizon lock
+        // The dialog's own default-constructed state agrees with the blob.
+        REQUIRE(DialogControls{}.stabilization == controls.stabilization);
         REQUIRE(controls.seamSearch == true);
         REQUIRE(controls.gainMatch == true);
         REQUIRE(controls.calibration == 0);     // Auto (follow the recorded accessory)
@@ -151,7 +153,7 @@ TEST_CASE("out-of-range control values cannot produce an invalid blob",
     // Each out-of-range value fell back to its documented default.
     REQUIRE(blob.colorOutput == 0);
     REQUIRE(blob.outputSize == 0);
-    REQUIRE(blob.stabilization == 1);
+    REQUIRE(blob.stabilization == static_cast<std::uint8_t>(PrefsStabilization::SmoothLevel));
     REQUIRE(blob.calibration == 0);
     REQUIRE(blob.dlogmFit == 0);
     REQUIRE(blob.renderDevice == 0);

@@ -692,25 +692,26 @@ body {
 
 /* ---- [WP-EASING] Stabilisation ------------------------------------------------------------------ */
 
-.osv-segmented.osv-segmented-full {
-    display: flex;
-    margin-bottom: 10px;
+/* DJI Studio's two switches, one row each, like the defaults card's rows:
+   label and a line of what it does on the left, the switch on the right.
+   The padded card already gives the outer breathing room, so the rows sit a
+   little tighter and the first one starts flush with the card's padding. */
+.osv-stab-row {
+    min-height: 40px;
+    padding: 8px 0;
 }
 
-/* A block (not a flex box) so a label too long for a narrow panel ends in an
-   ellipsis instead of being clipped on both sides; the full text is its
-   tooltip. */
-.osv-segmented-full .osv-seg {
-    display: block;
-    flex: 1 1 0;
-    min-width: 0;
-    padding: 0 4px;
-    font-size: 11px;
-    line-height: 24px;
-    text-align: center;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+/* A class rather than :first-child, which UXP's selector support is not
+   guaranteed to cover. */
+.osv-stab-row.osv-stab-row-top {
+    padding-top: 0;
+}
+
+/* What Apply writes, under the switches: separated from them by the same
+   rhythm as the rows, and directly above the Apply button. */
+.osv-card-caption.osv-stab-caption {
+    margin-top: 10px;
+    margin-bottom: 0;
 }
 
 /* ---- focus (keyboard users) ------------------------------------------------------------------ */

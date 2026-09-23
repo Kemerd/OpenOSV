@@ -26,8 +26,8 @@
 //      composed in the wrong order) shows the measurement is sensitive.
 //
 //   3. THE PICTURE, on the sample clip.  Both paths rendered on the CPU from
-//      the same decoded frame with the importer's default stitch (horizon
-//      lock, seam table, exposure match): normalised cross-correlation must
+//      the same decoded frame with the importer's default stitch (smooth +
+//      horizon lock, seam table, exposure match): normalised cross-correlation must
 //      peak at zero offset (sub-pixel peak within 0.5 px) and be high, and at
 //      a narrow field of view - where the 6000-wide equirect undersamples -
 //      the direct render must carry at least as much high-frequency energy.
@@ -681,7 +681,7 @@ Sharpness sharpnessOf(const Luma& img, const Luma& other) {
 // ---------------------------------------------------------------------------
 
 /// Everything ImporterInstance derives once per clip: rig, blend, colour and
-/// the attitude track the horizon lock reads.
+/// the attitude track (and its smoothing) the default stabilisation reads.
 struct SampleClip {
     std::unique_ptr<OsvFile> file;
     meta::MetadataTrack track;
@@ -690,14 +690,16 @@ struct SampleClip {
     geom::BlendParams blend;
     OsvColorParams color{};
     std::optional<geom::AttitudeTrack> attitude;
+    std::vector<Quatd> smoothed;  ///< Per-sample smoothed attitude (smooth + horizon lock).
     Quatd reference;
     geom::StabilizationParams stab;
 };
 
 /// Open the clip with the importer's DEFAULT prefs: native calibration slot,
 /// 195.18 degree lens FOV, 4 degree feather with the occlusion polygon, the
-/// Osmo 360 D-Log M fit to PQ with the clip's own input encoding, and horizon
-/// lock (ImporterInstance::rebuildRig / rebuildColor / rebuildStabilization).
+/// Osmo 360 D-Log M fit to PQ with the clip's own input encoding, and smooth
+/// + horizon lock (ImporterInstance::rebuildRig / rebuildColor /
+/// rebuildStabilization).
 std::unique_ptr<SampleClip> openSampleClip() {
     auto clip = std::make_unique<SampleClip>();
     auto file = OsvFile::open(sampleClipPath());
@@ -733,8 +735,8 @@ std::unique_ptr<SampleClip> openSampleClip() {
                                          color::inputEncodingForColorMode(clip->format.colorMode), true,
                                          clip->format.bitDepth ? clip->format.bitDepth : 10u);
 
-    // ---- horizon lock (rebuildStabilization) --------------------------------
-    clip->stab.mode = geom::StabilizationMode::HorizonLock;
+    // ---- smooth + horizon lock (rebuildStabilization) -----------------------
+    clip->stab.mode = geom::StabilizationMode::SmoothLevel;
     geom::AttitudeTrack::Options attOpt;
     const geom::ConventionScore best = geom::ConventionProbe::best(clip->track);
     if (best.framesUsed > 0 && best.meanGravityAngleDeg < 15.0) {
@@ -744,6 +746,13 @@ std::unique_ptr<SampleClip> openSampleClip() {
     if (att.ok() && att.value().sampleCount() > 0) {
         clip->attitude = std::move(att).value();
         clip->reference = clip->attitude->worldFromBody(clip->attitude->beginUs());
+        // The smoothed orientation the heading follows, one per sample.
+        std::vector<Quatd> perSample;
+        perSample.reserve(clip->attitude->samples().size());
+        for (const auto& s : clip->attitude->samples()) {
+            perSample.push_back(s.worldFromBody);
+        }
+        clip->smoothed = geom::Smoother(clip->stab.smoothSigmaFrames).smooth(perSample);
     }
     return clip;
 }
@@ -759,7 +768,11 @@ Mat3d stabilisationFor(const SampleClip& clip, std::uint32_t frameIndex) {
         tUs = static_cast<double>(fm.value().timestampUs);
     }
     const Quatd wfb = clip.attitude->worldFromBody(tUs);
-    return geom::stabilizationBodyFromWorld(wfb, clip.stab, clip.reference, clip.attitude->worldUp(), std::nullopt);
+    std::optional<Quatd> smoothed;
+    if (frameIndex < clip.smoothed.size()) {
+        smoothed = clip.smoothed[frameIndex];
+    }
+    return geom::stabilizationBodyFromWorld(wfb, clip.stab, clip.reference, clip.attitude->worldUp(), smoothed);
 }
 
 /// One decoded frame with the importer's default per-frame analyses.

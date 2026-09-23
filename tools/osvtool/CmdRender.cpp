@@ -111,7 +111,7 @@ struct RenderOptions {
 /// The osvtool spelling of each Source Settings enum, in enum order (the
 /// same order as PrefsBlob.h, so the value indexes the list).
 constexpr const char* kCliColor[] = {"pq", "hlg", "709", "dlogm"};
-constexpr const char* kCliStab[] = {"off", "horizon", "full", "smooth"};
+constexpr const char* kCliStab[] = {"off", "horizon", "full", "smooth", "smooth-horizon"};
 constexpr const char* kCliCalib[] = {"auto", "native", "lens-guards", "underwater"};  // PrefsCalibrationChoice
 constexpr const char* kCliFit[] = {"dji", "pocket3", "osmo360"};
 constexpr const char* kCliDevice[] = {"auto", "cpu", "cuda", "opencl"};

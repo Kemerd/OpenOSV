@@ -64,11 +64,17 @@ enum class PrefsOutputSize : std::uint8_t {
 };
 
 /// Stabilisation mode applied from the IMU track.
+///
+/// The values are persisted in project files, so the list is append-only:
+/// a blob saved with 0..3 keeps rendering exactly as it did.  SmoothLevel is
+/// the pair DJI Studio offers as two independent switches, RockSteady and
+/// Horizon Leveling, both on - and the default for new clips.
 enum class PrefsStabilization : std::uint8_t {
     Off = 0,
-    HorizonLock = 1,
-    Full = 2,
-    Smooth = 3,
+    HorizonLock = 1,  ///< Horizon Leveling alone: the heading follows the body.
+    Full = 2,         ///< Locked to the first frame's orientation.
+    Smooth = 3,       ///< RockSteady alone: the smoothed orientation, not levelled.
+    SmoothLevel = 4,  ///< RockSteady + Horizon Leveling: smoothed heading, level horizon.
     Count
 };
 
@@ -297,7 +303,7 @@ struct PrefsBlob {
     /// is the single source of truth for what a fresh blob contains.  Two
     /// places stating a default is how they drift apart.
     std::uint8_t outputSize = 0;
-    std::uint8_t stabilization = 1;    ///< PrefsStabilization (default horizon lock).
+    std::uint8_t stabilization = 4;    ///< PrefsStabilization (default smooth + horizon lock).
     std::uint8_t seamSearch = 1;       ///< 0 / 1.
     std::uint8_t gainMatch = 1;        ///< 0 / 1.
     std::uint8_t calibration = 0;      ///< PrefsCalibration.
@@ -455,7 +461,11 @@ struct PrefsBlob {
         // and let the sequence decide the delivery size; Source Settings still
         // offers the smaller sizes for a machine that cannot keep up.
         p.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::Native);
-        p.stabilization = static_cast<std::uint8_t>(PrefsStabilization::HorizonLock);
+        // RockSteady and Horizon Leveling together, as DJI Studio can run
+        // them: the shake is smoothed out of the heading and the horizon is
+        // level.  A blob saved before the value existed holds 0..3 and keeps
+        // its own mode.
+        p.stabilization = static_cast<std::uint8_t>(PrefsStabilization::SmoothLevel);
         p.seamSearch = 1;
         p.gainMatch = 1;
         // Auto: follow the lens accessory the camera recorded.  It is the
@@ -536,7 +546,9 @@ struct PrefsBlob {
         // "garbage in Source Settings" silently means "full 6000 x 3000".
         clampEnum(outputSize, static_cast<std::uint8_t>(PrefsOutputSize::Count),
                   static_cast<std::uint8_t>(PrefsOutputSize::Native));
-        clampEnum(stabilization, static_cast<std::uint8_t>(PrefsStabilization::Count), 1);
+        // A garbage mode lands on the default, like outputSize above.
+        clampEnum(stabilization, static_cast<std::uint8_t>(PrefsStabilization::Count),
+                  static_cast<std::uint8_t>(PrefsStabilization::SmoothLevel));
         clampEnum(seamSearch, 2, 1);
         clampEnum(gainMatch, 2, 1);
         // Remembered for calibrationForceNative below: a garbage calibration

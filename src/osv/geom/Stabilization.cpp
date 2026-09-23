@@ -16,6 +16,7 @@ const char* stabilizationModeName(StabilizationMode mode) noexcept {
     case StabilizationMode::HorizonLock: return "HorizonLock";
     case StabilizationMode::Full: return "Full";
     case StabilizationMode::Smooth: return "Smooth";
+    case StabilizationMode::SmoothLevel: return "SmoothLevel";
     }
     return "Unknown";
 }
@@ -105,6 +106,43 @@ bool horizonBasis(const Vec3d& upIn, const Vec3d& forwardHint, Mat3d& basis) noe
     return true;
 }
 
+/// The levelled world basis HorizonLock and SmoothLevel work in: true up as
+/// up, the reference pose's heading as forward.  A reference that looks
+/// straight up or down has no heading, so its up axis stands in for it.
+/// Returns false when neither gives a basis (a degenerate reference).
+bool referenceHorizonBasis(const Vec3d& worldUp, const Mat3d& rRef, Mat3d& basis) noexcept {
+    // The reference body's forward axis (+Y) is the heading hint.
+    if (horizonBasis(worldUp, rRef * Vec3d{0.0, 1.0, 0.0}, basis)) {
+        return true;
+    }
+    // Reference looks straight up/down: use its up axis as heading hint.
+    return horizonBasis(worldUp, rRef * Vec3d{0.0, 0.0, 1.0}, basis);
+}
+
+/// The levelling itself: the orientation `rWorldFromSource` expressed in the
+/// levelled `basis`, with the locked axes of `params` zeroed.  The result is
+/// levelled-from-view - the pose the view keeps.  HorizonLock passes the body
+/// itself, SmoothLevel the smoothed body; that is the only difference
+/// between the two modes.
+Mat3d levelledFromView(const Mat3d& basis, const Mat3d& rWorldFromSource,
+                       const StabilizationParams& params) noexcept {
+    // Source orientation expressed in the levelled basis
+    // (basis^T maps world -> levelled world, columns are unit axes).
+    const Mat3d rLevelledFromSource = basis.transposed() * rWorldFromSource;
+    EulerZXY e = eulerZXY(rLevelledFromSource);
+    // Zero the locked axes; whatever is not locked follows the source.
+    if (params.lockYaw) {
+        e.yaw = 0.0;
+    }
+    if (params.lockPitch) {
+        e.pitch = 0.0;
+    }
+    if (params.lockRoll) {
+        e.roll = 0.0;
+    }
+    return fromEulerZXY(e);
+}
+
 }  // namespace
 
 Mat3d stabilizationBodyFromWorld(const Quatd& worldFromBody, const StabilizationParams& params,
@@ -134,32 +172,26 @@ Mat3d stabilizationBodyFromWorld(const Quatd& worldFromBody, const Stabilization
         return rBw * smoothed->normalized().toMatrix();
     }
 
-    case StabilizationMode::HorizonLock: {
+    case StabilizationMode::HorizonLock:
+    case StabilizationMode::SmoothLevel: {
         // World basis with the reference heading as forward and true up as up.
         Mat3d basis;
-        Vec3d hint = rRef * Vec3d{0.0, 1.0, 0.0};
-        if (!horizonBasis(worldUp, hint, basis)) {
-            // Reference looks straight up/down: use its up axis as heading hint.
-            hint = rRef * Vec3d{0.0, 0.0, 1.0};
-            if (!horizonBasis(worldUp, hint, basis)) {
-                return Mat3d::identity();
-            }
+        if (!referenceHorizonBasis(worldUp, rRef, basis)) {
+            return Mat3d::identity();
         }
-        // Current body orientation expressed in that levelled basis
-        // (basis^T maps world -> levelled world, columns are unit axes).
+        // The pose whose level part the view keeps.  HorizonLock levels the
+        // body itself, so the heading carries the body's yaw shake.
+        // SmoothLevel levels the smoothed body instead: the heading is the
+        // smoothed heading (RockSteady) and pitch / roll are level (Horizon
+        // Leveling).  Without a usable smoothed pose it levels the body -
+        // the horizon stays level even when the smoothing is unavailable.
+        Mat3d rWorldFromSource = rWb;
+        if (params.mode == StabilizationMode::SmoothLevel && smoothed.has_value() && smoothed->isFinite()) {
+            rWorldFromSource = smoothed->normalized().toMatrix();
+        }
+        const Mat3d rLevelledFromView = levelledFromView(basis, rWorldFromSource, params);
+        // Current body orientation expressed in the same levelled basis.
         const Mat3d rLevelledFromBody = basis.transposed() * rWb;
-        EulerZXY e = eulerZXY(rLevelledFromBody);
-        // Zero the locked axes; whatever is not locked follows the body.
-        if (params.lockYaw) {
-            e.yaw = 0.0;
-        }
-        if (params.lockPitch) {
-            e.pitch = 0.0;
-        }
-        if (params.lockRoll) {
-            e.roll = 0.0;
-        }
-        const Mat3d rLevelledFromView = fromEulerZXY(e);
         // body <- levelled <- view.
         return rLevelledFromBody.transposed() * rLevelledFromView;
     }

@@ -22,6 +22,9 @@
 
 #include "OsvEngineAbi.h"
 
+#include "osv/geom/AttitudeTrack.h"
+#include "osv/geom/ConventionProbe.h"
+#include "osv/geom/Stabilization.h"
 #include "osv/meta/FormatDetector.h"
 #include "osv/meta/MetadataTrack.h"
 #include "osv/container/OsvFile.h"
@@ -37,6 +40,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -414,6 +418,130 @@ TEST_CASE("Source Settings changed in Premiere reach the engine's next frame", "
     prefs.exposureStops = 0.5f;
     REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
     CHECK(gainOf(4) == Catch::Approx(1.41421356f));
+}
+
+// =============================================================================
+//  Stabilisation: every mode reaches the engine's frame
+// =============================================================================
+
+TEST_CASE("every stabilisation mode reaches the engine's frame, Smooth + Horizon Lock with its smoothed attitude",
+          "[importer][engine][stab][cuda][sample]") {
+    // The frame's bodyFromWorld is ImporterInstance::stabilizationFor(frame).
+    // It is compared with the same correction computed here from the library
+    // alone - the attitude track, its Gaussian smoothing, the mode's formula -
+    // so a mode the importer forgot to build the smoothed attitude for shows
+    // up as a mismatch (Smooth + Horizon Lock would quietly fall back to the
+    // plain horizon lock).
+    if (!sampleClipAvailable()) {
+        SKIP("the sample clip is not present at " << sampleClipPath().string());
+    }
+    TestContext cuda;  // before the harness: outlives imShutdown
+    if (!cuda.context) {
+        SKIP("CUDA unavailable: " << cuda.reason);
+    }
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const EngineApi api = resolveEngine();
+    REQUIRE(api.ok());
+    const std::wstring path = sampleClipPath().wstring();
+    char error[512] = {};
+
+    // ---- the reference: the attitude exactly as rebuildStabilization builds it ----
+    auto file = osv::OsvFile::open(sampleClipPath());
+    REQUIRE(file.ok());
+    auto track = osv::meta::MetadataTrack::load(file.value());
+    REQUIRE(track.ok());
+    osv::geom::AttitudeTrack::Options attOpt;
+    const osv::geom::ConventionScore best = osv::geom::ConventionProbe::best(track.value());
+    if (best.framesUsed > 0 && best.meanGravityAngleDeg < 15.0) {
+        attOpt.conv = best.conv;
+    }
+    auto built = osv::geom::AttitudeTrack::build(track.value(), attOpt);
+    REQUIRE(built.ok());
+    const osv::geom::AttitudeTrack& attitude = built.value();
+    REQUIRE(attitude.sampleCount() > 0);
+    const osv::Quatd reference = attitude.worldFromBody(attitude.beginUs());
+    std::vector<osv::Quatd> perSample;
+    for (const auto& s : attitude.samples()) {
+        perSample.push_back(s.worldFromBody);
+    }
+    const std::vector<osv::Quatd> smoothed =
+        osv::geom::Smoother(osv::geom::StabilizationParams{}.smoothSigmaFrames).smooth(perSample);
+
+    /// The correction a mode gives a frame, from the library alone.
+    const auto expected = [&](osv::geom::StabilizationMode mode, std::uint32_t frameIndex) {
+        osv::geom::StabilizationParams params;
+        params.mode = mode;
+        double tUs = attitude.beginUs();
+        auto fm = track.value().frame(frameIndex);
+        if (fm.ok()) {
+            tUs = static_cast<double>(fm.value().timestampUs);
+        }
+        std::optional<osv::Quatd> sm;
+        if (osv::geom::stabilizationUsesSmoothing(mode) && frameIndex < smoothed.size()) {
+            sm = smoothed[frameIndex];
+        }
+        return osv::geom::stabilizationBodyFromWorld(attitude.worldFromBody(tUs), params, reference,
+                                                     attitude.worldUp(), sm);
+    };
+    /// Largest element difference between a float row-major block and a matrix.
+    const auto maxDiff = [](const float (&a)[9], const osv::Mat3d& b) {
+        double worst = 0.0;
+        for (int i = 0; i < 9; ++i) {
+            worst = std::max(worst, std::fabs(static_cast<double>(a[i]) - b.m[i]));
+        }
+        return worst;
+    };
+
+    // ---- each mode, set in Source Settings the way Premiere hands it over -----
+    struct ModeCase {
+        osv::premiere::PrefsStabilization prefs;
+        osv::geom::StabilizationMode mode;
+    };
+    const ModeCase kModes[] = {
+        {osv::premiere::PrefsStabilization::Off, osv::geom::StabilizationMode::Off},
+        {osv::premiere::PrefsStabilization::HorizonLock, osv::geom::StabilizationMode::HorizonLock},
+        {osv::premiere::PrefsStabilization::Full, osv::geom::StabilizationMode::Full},
+        {osv::premiere::PrefsStabilization::Smooth, osv::geom::StabilizationMode::Smooth},
+        {osv::premiere::PrefsStabilization::SmoothLevel, osv::geom::StabilizationMode::SmoothLevel},
+    };
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+    osv::premiere::PrefsBlob prefs = osv::premiere::PrefsBlob::defaults();
+    std::uint32_t offset = 0;
+    for (const ModeCase& mc : kModes) {
+        prefs.stabilization = static_cast<std::uint8_t>(mc.prefs);
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+        // Fresh frames for every mode (start, middle and end of the clip), so
+        // nothing a cache kept from the previous mode can answer.
+        for (const std::uint32_t base : {2u, 30u, 56u}) {
+            const std::uint32_t frameIndex = base + offset;
+            OsvEngineFrameRequest request = requestFor(path, frameIndex, cuda.context);
+            OsvEngineFrame frame = emptyFrame();
+            const std::int32_t rc = api.acquire(&request, &frame, error, sizeof(error));
+            INFO(osv::geom::stabilizationModeName(mc.mode) << " frame " << frameIndex << ": " << error);
+            REQUIRE(rc == OSV_ENGINE_OK);
+            CHECK(maxDiff(frame.bodyFromWorld, expected(mc.mode, frameIndex)) < 1e-5);
+            api.release(frame.lease, nullptr);
+        }
+        ++offset;
+    }
+
+    // ---- the comparison discriminates: on these frames the combined mode is
+    // neither the plain horizon lock nor the unlevelled smoothing ---------------
+    double fromHorizon = 0.0;
+    double fromSmooth = 0.0;
+    for (const std::uint32_t base : {2u, 30u, 56u}) {
+        const std::uint32_t frameIndex = base + offset - 1u;  // the SmoothLevel frames
+        const osv::Mat3d level = expected(osv::geom::StabilizationMode::SmoothLevel, frameIndex);
+        fromHorizon = std::max(fromHorizon,
+                               level.distance(expected(osv::geom::StabilizationMode::HorizonLock, frameIndex)));
+        fromSmooth = std::max(fromSmooth, level.distance(expected(osv::geom::StabilizationMode::Smooth, frameIndex)));
+    }
+    INFO("smooth + horizon lock differs from horizon lock by " << fromHorizon << " and from smooth by " << fromSmooth);
+    CHECK(fromHorizon > 1e-4);
+    CHECK(fromSmooth > 1e-4);
 }
 
 // =============================================================================

@@ -177,22 +177,42 @@
     ]);
 
     /**
-     * Stabilisation choices, as DJI Studio names them, and the OpenOSV
-     * Source Settings "Stabilisation" entry each one sets
-     * (SourceSettingsParams.h, OSV_SS_STAB_ITEMS "Off|Horizon Lock|Full|Smooth"):
+     * Stabilisation as DJI Studio shows it: two independent switches,
+     * RockSteady and Horizon Leveling, both on by default.  Each pair is one
+     * entry of the OpenOSV Source Settings "Stabilisation" popup
+     * (SourceSettingsParams.h, OSV_SS_STAB_ITEMS
+     * "Off|Horizon Lock|Full|Smooth|Smooth + Horizon Lock"):
      *
-     *   Off               -> Off
-     *   RockSteady        -> Smooth: the view follows the camera's heading and
-     *                        removes the shake - DJI's RockSteady on a 360 clip
-     *                        keeps turning with the rider; Full would lock the
-     *                        view to the first frame's direction instead
-     *   Horizon Leveling  -> Horizon Lock: yaw follows, pitch and roll level
+     *   RockSteady  Horizon Leveling   entry
+     *   off         off                1  Off
+     *   off         on                 2  Horizon Lock: the heading follows the
+     *                                     camera, pitch and roll are level
+     *   on          off                4  Smooth: the shake is gone and the view
+     *                                     keeps turning with the rider, as
+     *                                     RockSteady does on a 360 clip (Full
+     *                                     would lock it to the first frame)
+     *   on          on                 5  Smooth + Horizon Lock: both at once
+     *
+     * Entry 3, Full, is no pair of switches.  It is set in Source Settings
+     * itself, and the panel replaces it only when Apply is pressed (and then
+     * says so).
      */
-    var STABILIZATIONS = Object.freeze([
-        Object.freeze({ id: 'off', label: 'Off', entry: 1 }),
-        Object.freeze({ id: 'rocksteady', label: 'RockSteady', entry: 4 }),
-        Object.freeze({ id: 'horizon', label: 'Horizon Leveling', entry: 2 })
-    ]);
+    var STABILIZATION_ENTRIES = Object.freeze({ off: 1, horizon: 2, full: 3, smooth: 4, smoothHorizon: 5 });
+
+    /** Both switches on: the Source Settings default (OSV_SS_STAB_DEFAULT). */
+    var STABILIZATION_DEFAULT = Object.freeze({ rockSteady: true, horizonLeveling: true });
+
+    /**
+     * The single choice older panels remembered ('off' | 'rocksteady' |
+     * 'horizon'), as the two switches.  'horizon' was the default and every
+     * save writes every field, so it is what an untouched card stored: it
+     * becomes the new default, both on.  The other two keep their meaning.
+     */
+    var LEGACY_STABILIZATIONS = Object.freeze({
+        off: Object.freeze({ rockSteady: false, horizonLeveling: false }),
+        rocksteady: Object.freeze({ rockSteady: true, horizonLeveling: false }),
+        horizon: STABILIZATION_DEFAULT
+    });
 
     /** The Source Settings effect (plugins/common/SourceSettingsIdentity.h). */
     var SOURCE_SETTINGS_MATCH_NAME = 'OpenOSV.SourceSettings';
@@ -210,13 +230,14 @@
     /**
      * Entry counts of the Source Settings popups whose readings can settle
      * how the host numbers popups (learnPopupBase): a 0 anywhere, or a
-     * popup's own count, is unambiguous.  D-Log M Curve's default is its LAST
-     * entry, so an untouched effect settles a host that counts from 1.
+     * popup's own count, is unambiguous.  D-Log M Curve's and Stabilisation's
+     * defaults are their LAST entries, so an untouched effect settles a host
+     * that counts from 1.
      */
     var SOURCE_POPUP_COUNTS = Object.freeze({
         'Colour Output': 4,
         'Output Size': 4,
-        'Stabilisation': 4,
+        'Stabilisation': 5,
         'Calibration': 4,
         'D-Log M Curve': 3,
         'Render Device': 4
@@ -380,8 +401,10 @@
      *   dragSensitivity  - the value to write, clamped to the effect's range
      *   easing           - the Keyframe Animation preset picked in the grid
      *                      (an EASINGS id; 'none' until the user picks one)
-     *   stabilization    - the Stabilisation choice (a STABILIZATIONS id;
-     *                      Horizon Leveling, the Source Settings default)
+     *   rockSteady       - the Stabilisation card's RockSteady switch
+     *   horizonLeveling  - its Horizon Leveling switch (both on by default,
+     *                      the Source Settings default; an older panel's
+     *                      single `stabilization` choice is carried over)
      *   hintOpen         - the Program Monitor controls card is expanded
      *                      (open for a new user, then as they left it)
      *   popupBase        - how this Premiere numbers effect popups through
@@ -389,15 +412,34 @@
      */
     function sanitizeSettings(raw) {
         var s = (raw !== null && typeof raw === 'object') ? raw : {};
+        var stab = storedStabilization(s);
         return {
             autoApply: typeof s.autoApply === 'boolean' ? s.autoApply : true,
             lens: s.lens === LENS.classic ? LENS.classic : LENS.dji,
             dragEnabled: s.dragEnabled === true,
             dragSensitivity: clampDragSensitivity(s.dragSensitivity),
             easing: easingById(s.easing).id,
-            stabilization: stabilizationById(s.stabilization).id,
+            rockSteady: stab.rockSteady,
+            horizonLeveling: stab.horizonLeveling,
             hintOpen: typeof s.hintOpen === 'boolean' ? s.hintOpen : true,
             popupBase: (s.popupBase === 0 || s.popupBase === 1) ? s.popupBase : null
+        };
+    }
+
+    /**
+     * The two Stabilisation switches from stored settings.  Booleans stored
+     * by this panel win; without them, an older panel's single choice is
+     * carried over through LEGACY_STABILIZATIONS; anything else (nothing
+     * stored, garbage) is the default, both on.
+     */
+    function storedStabilization(s) {
+        var legacyId = s.stabilization;
+        var fallback = (typeof legacyId === 'string' &&
+                        Object.prototype.hasOwnProperty.call(LEGACY_STABILIZATIONS, legacyId))
+            ? LEGACY_STABILIZATIONS[legacyId] : STABILIZATION_DEFAULT;
+        return {
+            rockSteady: typeof s.rockSteady === 'boolean' ? s.rockSteady : fallback.rockSteady,
+            horizonLeveling: typeof s.horizonLeveling === 'boolean' ? s.horizonLeveling : fallback.horizonLeveling
         };
     }
 
@@ -899,14 +941,40 @@
         return EASINGS[0];
     }
 
-    /** The STABILIZATIONS entry for an id; Horizon Leveling for anything unknown. */
-    function stabilizationById(id) {
-        for (var i = 0; i < STABILIZATIONS.length; i += 1) {
-            if (STABILIZATIONS[i].id === id) {
-                return STABILIZATIONS[i];
-            }
+    /**
+     * What a pair of Stabilisation switches sets: the Source Settings entry
+     * (STABILIZATION_ENTRIES), that entry's name as the popup shows it, and
+     * the words the status line uses.  Anything but `true` is off, so a
+     * missing or garbled switch never turns a mode on.
+     *
+     * @param {*} rockSteady
+     * @param {*} horizonLeveling
+     * @returns {{rockSteady:boolean, horizonLeveling:boolean, entry:number, name:string, label:string}}
+     */
+    function stabilizationChoice(rockSteady, horizonLeveling) {
+        var rs = rockSteady === true;
+        var hl = horizonLeveling === true;
+        var entry;
+        var name;
+        var label;
+        if (rs && hl) {
+            entry = STABILIZATION_ENTRIES.smoothHorizon;
+            name = 'Smooth + Horizon Lock';
+            label = 'RockSteady + Horizon Leveling';
+        } else if (rs) {
+            entry = STABILIZATION_ENTRIES.smooth;
+            name = 'Smooth';
+            label = 'RockSteady';
+        } else if (hl) {
+            entry = STABILIZATION_ENTRIES.horizon;
+            name = 'Horizon Lock';
+            label = 'Horizon Leveling';
+        } else {
+            entry = STABILIZATION_ENTRIES.off;
+            name = 'Off';
+            label = 'No stabilisation';
         }
-        return STABILIZATIONS[2];
+        return { rockSteady: rs, horizonLeveling: hl, entry: entry, name: name, label: label };
     }
 
     /** The FRAMING_PRESETS entry for an id, or null. */
@@ -1463,8 +1531,14 @@
     }
 
     /**
-     * After the Stabilisation choice was applied.
-     * @param {object} r { unsupported, updated, unchanged, missing, failed, errors[], notes[] }
+     * After the Stabilisation switches were applied.  `replacedFull` counts
+     * the master clips that were on Full - which no pair of switches shows -
+     * before this Apply changed them; the line says so, so Full never
+     * disappears without a word.
+     *
+     * @param {object} r { unsupported, updated, unchanged, missing, failed, replacedFull, errors[], notes[] }
+     * @param {string} label   stabilizationChoice(...).label
+     * @param {number} notOsv  selected clips that are not OSV
      */
     function summarizeStabilization(r, label, notOsv) {
         var res = (r !== null && typeof r === 'object') ? r : {};
@@ -1482,11 +1556,16 @@
         var unchanged = Math.max(0, Math.floor(finiteOr(res.unchanged, 0)));
         var missing = Math.max(0, Math.floor(finiteOr(res.missing, 0)));
         var failed = Math.max(0, Math.floor(finiteOr(res.failed, 0)));
+        // Never more than were actually changed.
+        var replacedFull = Math.min(updated, Math.max(0, Math.floor(finiteOr(res.replacedFull, 0))));
         var errors = Array.isArray(res.errors) ? res.errors : [];
         var parts = [];
         var tone = 'ok';
         if (updated > 0) {
             parts.push(label + ' on ' + plural(updated, 'master clip') + '.');
+        }
+        if (replacedFull > 0) {
+            parts.push('Full replaced on ' + plural(replacedFull, 'master clip') + '.');
         }
         if (unchanged > 0) {
             parts.push(plural(unchanged, 'master clip') + ' had it already.');
@@ -1580,13 +1659,14 @@
         PRESET_CUSTOM_ENTRY: PRESET_CUSTOM_ENTRY,
         DJI_ZOOM: DJI_ZOOM,
         CLASSIC_FOV: CLASSIC_FOV,
-        STABILIZATIONS: STABILIZATIONS,
+        STABILIZATION_ENTRIES: STABILIZATION_ENTRIES,
+        STABILIZATION_DEFAULT: STABILIZATION_DEFAULT,
         SOURCE_SETTINGS_MATCH_NAME: SOURCE_SETTINGS_MATCH_NAME,
         SOURCE_PARAM_NAMES: SOURCE_PARAM_NAMES,
         SOURCE_POPUP_COUNTS: SOURCE_POPUP_COUNTS,
         REFRAME_POPUP_COUNTS: REFRAME_POPUP_COUNTS,
         easingById: easingById,
-        stabilizationById: stabilizationById,
+        stabilizationChoice: stabilizationChoice,
         framingPresetById: framingPresetById,
         easeSpeed: easeSpeed,
         easingIconPoints: easingIconPoints,

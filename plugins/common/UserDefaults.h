@@ -8,9 +8,9 @@
 // ===========================================================================
 //
 // PrefsBlob::defaults() is the built-in answer to "what does a clip look like
-// before anybody touched it" - PQ, horizon lock, seam search on, the sky seam
-// fix on, and so on.  It is compiled in, it is what every test pins, and it
-// never changes behind anybody's back.
+// before anybody touched it" - PQ, smooth + horizon lock, seam search on, the
+// sky seam fix on, and so on.  It is compiled in, it is what every test pins,
+// and it never changes behind anybody's back.
 //
 // Users have opinions, though: a Rec.709 editor wants Rec.709, somebody who
 // grades in log wants the D-Log M passthrough, a laptop user wants 2560 x 1280.

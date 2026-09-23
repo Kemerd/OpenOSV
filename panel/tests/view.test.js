@@ -134,7 +134,8 @@ function stubController(state) {
         setEasing(v) { calls.push(['setEasing', v]); },
         applyEasingSelected() { calls.push(['applyEasingSelected']); },
         applyEasingAll() { calls.push(['applyEasingAll']); },
-        setStabilization(v) { calls.push(['setStabilization', v]); },
+        setRockSteady(v) { calls.push(['setRockSteady', v]); },
+        setHorizonLeveling(v) { calls.push(['setHorizonLeveling', v]); },
         applyStabilization() { calls.push(['applyStabilization']); },
         framingPreset(v) { calls.push(['framingPreset', v]); },
         zoomStep(v) { calls.push(['zoomStep', v]); }
@@ -448,19 +449,58 @@ test('Manual Framing with nothing to frame: the reason, dashes, and inert button
     assert.deepEqual(t.ctl.calls, []);
 });
 
-test('Stabilisation: DJI Studio\'s three choices, and a route that cannot reach Source Settings says so', () => {
+test('Stabilisation: DJI Studio\'s two switches, both on, the entry they spell, and an unreachable route says so',
+     () => {
     const t = mount();
-    const segs = t.shell.findAll('osv-seg');
-    const stabSegs = segs.slice(2);
-    assert.deepEqual(stabSegs.map((s) => s.textContent), ['Off', 'RockSteady', 'Horizon Leveling']);
-    assert.ok(stabSegs[2].classList.contains('is-selected'), 'Horizon Leveling, the Source Settings default');
-    stabSegs[1].fire('click');
-    assert.deepEqual(t.ctl.calls, [['setStabilization', 'rocksteady']]);
+    // The card's switches follow the auto-apply and drag switches.
+    const switches = t.shell.findAll('osv-switch');
+    assert.equal(switches.length, 4);
+    const [rockSteady, horizon] = switches.slice(2);
+    assert.equal(rockSteady.attributes['aria-label'], 'RockSteady');
+    assert.equal(horizon.attributes['aria-label'], 'Horizon Leveling');
+    assert.equal(rockSteady.attributes.role, 'switch');
+    assert.equal(rockSteady.attributes.tabindex, '0', 'reachable from the keyboard');
+    // Both on out of the box, drawn without animation.
+    assert.equal(rockSteady.attributes['aria-checked'], 'true');
+    assert.equal(horizon.attributes['aria-checked'], 'true');
+    assert.equal(rockSteady.find('osv-switch-knob').style.left, '16px', 'on: 36 - 2 - 18');
+    // The labels and what each one does sit beside them.
+    const rows = t.shell.findAll('osv-stab-row');
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].find('osv-label').textContent, 'RockSteady');
+    assert.equal(rows[1].find('osv-label').textContent, 'Horizon Leveling');
+    assert.ok(rows[0].classList.contains('osv-stab-row-top'));
+    assert.equal(rows[1].classList.contains('osv-stab-row-top'), false);
+    // The caption names the Source Settings entry Apply writes.
+    const caption = t.shell.find('osv-stab-caption');
+    assert.equal(caption.textContent,
+                 'Apply sets Stabilisation to Smooth + Horizon Lock on each selected clip\'s master clip.');
+    // Each switch toggles on its own: click and the keyboard.
+    rockSteady.fire('click');
+    horizon.fire('keydown', { key: ' ' });
+    assert.deepEqual(t.ctl.calls, [['setRockSteady', false], ['setHorizonLeveling', false]]);
+    // All four pairs: the switches and the caption follow the state.
+    const names = [[true, true, 'Smooth + Horizon Lock'], [true, false, 'Smooth'], [false, true, 'Horizon Lock'],
+                   [false, false, 'Off']];
+    for (const [rs, hl, name] of names) {
+        t.view.render(baseState({ settings: core.sanitizeSettings({ rockSteady: rs, horizonLeveling: hl }) }));
+        t.sched.runAll();
+        assert.equal(rockSteady.attributes['aria-checked'], String(rs));
+        assert.equal(horizon.attributes['aria-checked'], String(hl));
+        assert.equal(horizon.find('osv-switch-knob').style.left, hl ? '16px' : '2px', 'the knob springs to its end');
+        assert.ok(caption.textContent.indexOf(' ' + name + ' on ') !== -1, name);
+    }
+    // Apply.
     const apply = t.shell.findAll('osv-button')[11];
     apply.fire('click');
-    assert.deepEqual(t.ctl.calls[1], ['applyStabilization']);
+    assert.deepEqual(t.ctl.calls[2], ['applyStabilization']);
+    // A route that cannot reach Source Settings says so, and Apply is inert.
     t.view.render(baseState({ capabilities: { undoGroups: true, stabilization: false } }));
     assert.match(t.shell.findAll('osv-card-caption')[1].textContent, /can't reach Source Settings/);
     apply.fire('click');
-    assert.equal(t.ctl.calls.length, 2, 'unreachable: the button is inert');
+    assert.equal(t.ctl.calls.length, 3, 'unreachable: the button is inert');
+    // The theme reaches the card's switches too (both back on by now).
+    t.sched.runAll();
+    t.view.setTheme('light');
+    assert.equal(rockSteady.style.backgroundColor, 'rgb(52,199,89)', 'the light theme green');
 });

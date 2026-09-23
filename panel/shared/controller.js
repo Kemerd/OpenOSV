@@ -525,9 +525,12 @@
             });
         }
 
-        /** Set the chosen Stabilisation on the selected clips' master clips. */
+        /**
+         * Set the Stabilisation the two switches spell (RockSteady, Horizon
+         * Leveling) on the selected clips' master clips.
+         */
         function applyStabilization() {
-            var choice = core.stabilizationById(state.settings.stabilization);
+            var choice = core.stabilizationChoice(state.settings.rockSteady, state.settings.horizonLeveling);
             return runAction('stabilization', 'Setting stabilisation...', function () {
                 var seq = null;
                 return Promise.resolve(adapter.getActiveSequence())
@@ -776,9 +779,16 @@
             applyEasingSelected: function () { return applyEasing(true); },
             applyEasingAll: function () { return applyEasing(false); },
 
-            /** Pick a Stabilisation choice (remembered). */
-            setStabilization: function (id) {
-                state.settings = core.sanitizeSettings(Object.assign({}, state.settings, { stabilization: id }));
+            /** The Stabilisation card's RockSteady switch (remembered). */
+            setRockSteady: function (on) {
+                state.settings = core.sanitizeSettings(Object.assign({}, state.settings, { rockSteady: on === true }));
+                persistSoon();
+                emit();
+            },
+            /** The Stabilisation card's Horizon Leveling switch (remembered). */
+            setHorizonLeveling: function (on) {
+                state.settings = core.sanitizeSettings(Object.assign({}, state.settings,
+                                                                     { horizonLeveling: on === true }));
                 persistSoon();
                 emit();
             },

@@ -197,7 +197,9 @@ PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& bas
 
     blob.colorOutput = pick(controls.colorOutput, static_cast<int>(PrefsColorOutput::Count), 0);
     blob.outputSize = pick(controls.outputSize, static_cast<int>(PrefsOutputSize::Count), 0);
-    blob.stabilization = pick(controls.stabilization, static_cast<int>(PrefsStabilization::Count), 1);
+    // An out-of-range index lands on the default, Smooth + horizon lock.
+    blob.stabilization = pick(controls.stabilization, static_cast<int>(PrefsStabilization::Count),
+                              static_cast<std::uint8_t>(PrefsStabilization::SmoothLevel));
     blob.seamSearch = controls.seamSearch ? 1u : 0u;
     blob.gainMatch = controls.gainMatch ? 1u : 0u;
     // An out-of-range calibration index lands on Auto, the default; the

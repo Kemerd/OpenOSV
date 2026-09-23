@@ -1090,6 +1090,10 @@ static_assert(OSV_SS_SIZE_COUNT == static_cast<int>(osv::premiere::PrefsOutputSi
               "the Output Size popup does not list every PrefsOutputSize value");
 static_assert(OSV_SS_STAB_COUNT == static_cast<int>(osv::premiere::PrefsStabilization::Count),
               "the Stabilisation popup does not list every PrefsStabilization value");
+// The popup lists the enum in order (item = value + 1), so the default item is
+// PrefsBlob::defaults()' SmoothLevel, the last one.
+static_assert(OSV_SS_STAB_DEFAULT == static_cast<int>(osv::premiere::PrefsStabilization::SmoothLevel) + 1,
+              "the Stabilisation popup's default is not PrefsBlob::defaults()' SmoothLevel");
 static_assert(OSV_SS_CALIB_COUNT == static_cast<int>(osv::premiere::PrefsCalibrationChoice::Count),
               "the Calibration popup does not list every PrefsCalibrationChoice value");
 static_assert(OSV_SS_FIT_COUNT == static_cast<int>(osv::premiere::PrefsDlogmFit::Count),

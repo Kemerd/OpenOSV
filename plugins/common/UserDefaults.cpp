@@ -130,7 +130,9 @@ void queue(std::vector<PendingLog>& pending, UserDefaultsLogLevel level, std::st
 constexpr const char* kColourTokens[] = {"pq", "hlg", "rec709", "dlogm"};
 constexpr const char* kLookTokens[] = {"dji", "standard"};
 constexpr const char* kSizeTokens[] = {"native", "3840x1920", "2560x1280", "1920x960"};
-constexpr const char* kStabTokens[] = {"off", "horizon-lock", "full", "smooth"};
+// "smooth-horizon-lock" is the combined mode (and the built-in default):
+// the smoothed heading with a level horizon.
+constexpr const char* kStabTokens[] = {"off", "horizon-lock", "full", "smooth", "smooth-horizon-lock"};
 // Indexed by PrefsCalibrationChoice (the user's choice), NOT by the stored
 // PrefsCalibration byte: "native" means the FORCED bare-lens set, and "auto"
 // follows the accessory the camera recorded, exactly as the UIs say.

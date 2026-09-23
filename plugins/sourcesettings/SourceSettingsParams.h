@@ -240,10 +240,14 @@
  * which is where that decision belongs. */
 #define OSV_SS_SIZE_DEFAULT 1
 
-/* PrefsStabilization: Off, HorizonLock, Full, Smooth. */
-#define OSV_SS_STAB_ITEMS "Off|Horizon Lock|Full|Smooth"
-#define OSV_SS_STAB_COUNT 4
-#define OSV_SS_STAB_DEFAULT 2 /* HorizonLock */
+/* PrefsStabilization: Off, HorizonLock, Full, Smooth, SmoothLevel.  The popup
+ * value is the enum value + 1, and a project stores the popup value, so the
+ * list is append-only: "Smooth + Horizon Lock" (DJI Studio's RockSteady and
+ * Horizon Leveling, both on) is the fifth item even though it is the default,
+ * and every saved project keeps the entry it chose. */
+#define OSV_SS_STAB_ITEMS "Off|Horizon Lock|Full|Smooth|Smooth + Horizon Lock"
+#define OSV_SS_STAB_COUNT 5
+#define OSV_SS_STAB_DEFAULT 5 /* SmoothLevel */
 
 /* PrefsCalibrationChoice, in POPUP order (kCalibrationChoiceByPopup in
  * SourceSettingsMapping.h): Auto, Lens Protectors / ND Filters, Underwater,
