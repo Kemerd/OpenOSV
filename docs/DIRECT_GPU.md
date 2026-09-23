@@ -53,7 +53,7 @@ equirect does not.
 
 ## Work packages
 
-### WP-A  GPU clip decoder (`osv::video::GpuClipDecoder`)
+### WP-A  GPU clip decoder (`osv::video::GpuClipDecoder`) - implemented
 
 New files: `include/osv/video/GpuClipDecoder.h`, `src/osv/video/GpuClipDecoder.cpp`,
 tests `tests/unit/test_gpu_decoder.cpp`.
@@ -78,26 +78,97 @@ tests `tests/unit/test_gpu_decoder.cpp`.
 * Decode-ahead: a worker thread that, after sequential access is detected,
   decodes up to N frames ahead (default 8) into the cache; cancellable;
   pushes/pops the context itself.
-* API sketch (final names are WP-A's call, recorded here when settled):
+* API (settled; `include/osv/video/GpuClipDecoder.h` is the reference):
 
   ```cpp
   struct GpuDecoderOptions {
-      void* cuContext = nullptr;       // CUcontext; nullptr = primary context of cudaDevice
-      void* cuStream = nullptr;        // CUstream the copies are ordered on; nullptr = own stream
+      void* cuContext = nullptr;       // CUcontext; nullptr = primary context of cudaDevice (retained)
+      void* cuStream = nullptr;        // CUstream for NVDEC post-processing and every copy;
+                                       // nullptr = one owned non-blocking stream per lens
       int cudaDevice = 0;
-      std::size_t vramBudgetBytes = 0; // 0 = automatic
-      std::uint32_t decodeAhead = 8;
+      std::size_t vramBudgetBytes = 0; // 0 = min(1.5 GiB, 20 % of free VRAM)
+      std::uint32_t decodeAhead = 8;   // 0 = no worker thread
+      int decoderThreads = 3;          // libavcodec frame threads per lens decoder
   };
-  class GpuFrameLease;                 // pins one cached pair; RAII release
+  enum class LeaseSource { CacheHit, WaitedForDecode, Decoded };
+  class GpuFrameLease {                // move-only; pins one cached pair
+  public:
+      bool valid() const;
+      std::uint32_t frameIndex() const;
+      const FramePair& pair() const;   // device[] filled, lens[] sized, no host planes;
+                                       // every owner field shares the pin
+      LeaseSource source() const;
+      Status releaseAfter(void* cuStream); // event on the caller's stream; the slot's
+                                           // next overwrite waits for it on the GPU
+      void release();                  // caller asserts no pending GPU reads (= destructor)
+  };
   class GpuClipDecoder {
   public:
       static Result<std::unique_ptr<GpuClipDecoder>> open(const std::filesystem::path&,
                                                           const meta::FormatInfo&,
-                                                          const GpuDecoderOptions&);
+                                                          const GpuDecoderOptions& = {});
+      static bool available(std::string* reason = nullptr);
       Result<GpuFrameLease> acquire(std::uint32_t frameIndex);  // thread-safe
-      // lease.pair() -> video::FramePair with device[] filled, lens[] sized, no host planes
+      bool isCached(std::uint32_t frameIndex) const;
+      std::uint32_t dropCachedFrames();
+      GpuDecoderStats stats() const;
+      // frameCount(), fps(), lensWidth(), lensHeight(), cuContext(), deviceIndex()
   };
   ```
+
+* Decisions made while building it:
+  * No context supplied: the primary context is taken with
+    `cuDevicePrimaryCtxRetain` and handed to FFmpeg as an external context.
+    FFmpeg's own `AV_CUDA_USE_PRIMARY_CONTEXT` path insists on
+    `CU_CTX_SCHED_BLOCKING_SYNC` and fails ("Primary context already active
+    with incompatible flags") as soon as cudart or a renderer activated the
+    primary context with the default flags; retaining it leaves the flags
+    alone.
+  * FFmpeg's CUDA device context always gets a stream - the caller's, or a
+    non-blocking stream per lens owned by the decoder.  With FFmpeg's default
+    (the legacy NULL stream) its surface copies would serialise against every
+    blocking stream of a shared context, i.e. against Premiere's rendering.
+    NVDEC post-processing, FFmpeg's copy and ours are then ordered on one
+    stream per lens without any host wait.
+  * `HevcStreamDecoder` gained `DecoderOptions::cudaContext` / `cudaStream`
+    and `previousSyncIndex()`; `GpuClipDecoder` drives two of them (container
+    sample feed, `keepOnDevice`) instead of growing a second FFmpeg front end.
+    With no context supplied `HevcStreamDecoder` behaves exactly as before.
+  * `acquire()` returns complete data: the first acquire of a freshly filled
+    slot waits on the host for that slot's two copy events (the two
+    device-to-device copies of one frame pair, recorded right behind the
+    decode), so consumers need no ready-event protocol and may read on any
+    stream of the context.
+  * A `FramePair` copied out of a lease keeps the slot pinned (its owner
+    fields share the pin), so a `RenderJob` holding the pair is safe on its
+    own; releasing the lease alone does not unpin such a copy.
+  * `open()` decodes frame 0 once more after the lens decoders' probe and
+    keeps it: frame 0 is cached and the decoder sits on frame 1, so the first
+    landing in the first GOP continues instead of paying a flush and a
+    re-decode of frame 0 (~6 ms of every cold park there).
+  * The decode-ahead window is clamped to `capacity - 2` slots, and the
+    worker never evicts a frame inside its own window (it would chase its
+    own tail); the foreground may evict anything that is not pinned.  A
+    request more than 4 frames away from the running window cancels it.
+  * NVDEC's own decode surfaces are outside the cache budget: 790 MiB for
+    both 3000 x 3000 lenses at 3 frame threads right after open, ~880 MiB
+    once FFmpeg's output pool has grown during playback (each frame thread
+    adds one ~26 MiB surface per lens).  One thread saves 156 MiB but misses
+    the cold-park target (66 ms median); 3 threads is the knee.
+  * `nvcuda.dll`: the importer will import it directly once it links
+    `GpuClipDecoder` (WP-D).  Add it to `OSV_IMPORTER_DELAYLOAD_DLLS` then, as
+    the effect already does, so a machine without an NVIDIA driver still
+    loads the importer.
+* Measured (RTX 5090, driver 616.56, sample clip, `osv_gpu_decode_bench`,
+  three runs): open 50 ms; park median 46-48 ms cold-GOP (a fresh decoder
+  per landing) and 40-42 ms in-session (one decoder, cache dropped before
+  each landing, decoder position carried over); 0.001 ms on a cache hit;
+  sequential with decode-ahead 514-524 frame pairs/s (520-532/s when the
+  host itself drives the decoder flat out); cache 1529 MiB of a 1536 MiB
+  budget (29 slots of 52.7 MiB); destruction mid decode-ahead 43-47 ms
+  with no VRAM left behind (unit test).  The GOP catch-up runs at
+  ~1.9 ms per pair (landing on 45 from frame 1: 84.5 ms), a little under
+  the 2.1 ms per pair of the ffmpeg measurement above.
 * Thread safety: several Premiere render threads call `acquire` concurrently.
 * Acceptance: frames bit-exact with software decode (after the P010 shift) at
   scattered indices; park (12 scattered frames) median < 60 ms cold-GOP and

@@ -28,6 +28,12 @@
 
 #if defined(OSV_VIDEO_HAVE_CUDA)
 #include <cuda_runtime.h>
+// AVCUDADeviceContext, for decoding into a caller-supplied CUcontext.  The
+// header declares types only (it pulls in cuda.h for CUcontext / CUstream),
+// so nothing in this file links against the driver API because of it.
+extern "C" {
+#include <libavutil/hwcontext_cuda.h>
+}
 #endif
 
 #include <algorithm>
@@ -196,6 +202,8 @@ struct HevcStreamDecoder::Impl {
     HwAccel activeHw = HwAccel::None;
     bool keepOnDevice = false;
     int cudaDeviceIndex = 0;
+    void* cudaContext = nullptr;                         ///< Caller's CUcontext (nullptr = FFmpeg creates one).
+    void* cudaStream = nullptr;                          ///< Caller's CUstream for FFmpeg's copies (with cudaContext).
 
     // ---- stream properties --------------------------------------------------
     std::uint32_t trackId = 0;
@@ -334,6 +342,13 @@ struct HevcStreamDecoder::Impl {
             return failStatus(ErrorCode::Unsupported, std::string("decoder ") + codec->name +
                                                           " has no " + hwAccelName(want) + " hardware path");
         }
+        // A caller-supplied CUDA context takes its own route: FFmpeg must
+        // wrap that context rather than create one, and the runtime-API
+        // device check below would bind this thread to the primary context,
+        // which is exactly what a host with its own context must not see.
+        if (want == HwAccel::Cuda && cudaContext != nullptr) {
+            return setupExternalCuda(surface);
+        }
 #if defined(OSV_VIDEO_HAVE_CUDA)
         // With the CUDA runtime linked we can validate the device ordinal up
         // front and give a clearer message than FFmpeg's generic failure.
@@ -367,6 +382,48 @@ struct HevcStreamDecoder::Impl {
         hwDevice.reset(device);
         hwPixFmt = surface;
         return okStatus();
+    }
+
+    /// Build the CUDA device context around the caller's CUcontext (and
+    /// stream).  av_hwdevice_ctx_alloc leaves AVCUDADeviceContext zeroed;
+    /// filling cuda_ctx before av_hwdevice_ctx_init makes FFmpeg adopt the
+    /// context without creating, retaining or destroying anything (its
+    /// uninit only tears down contexts it allocated itself).
+    Status setupExternalCuda(AVPixelFormat surface) {
+#if defined(OSV_VIDEO_HAVE_CUDA)
+        if (cudaContext == nullptr) {
+            return failStatus(ErrorCode::InvalidArgument, "no external CUDA context supplied");
+        }
+        AVBufferRef* device = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_CUDA);
+        if (!device || !device->data) {
+            av_buffer_unref(&device);
+            return failStatus(ErrorCode::Unsupported, "cannot allocate a CUDA device context");
+        }
+        // The two fields FFmpeg reads from a user-built CUDA device context.
+        auto* deviceCtx = reinterpret_cast<AVHWDeviceContext*>(device->data);
+        auto* cudaCtx = static_cast<AVCUDADeviceContext*>(deviceCtx->hwctx);
+        if (!cudaCtx) {
+            av_buffer_unref(&device);
+            return failStatus(ErrorCode::Internal, "CUDA device context has no hwctx");
+        }
+        cudaCtx->cuda_ctx = static_cast<CUcontext>(cudaContext);
+        cudaCtx->stream = static_cast<CUstream>(cudaStream);
+        // init loads the driver entry points; it fails cleanly (and we free
+        // the half-built context) on a machine without nvcuda.dll.
+        const int ret = av_hwdevice_ctx_init(device);
+        if (ret < 0) {
+            av_buffer_unref(&device);
+            return failStatus(ErrorCode::Unsupported, "cannot adopt the external CUDA context: " + ff::errorString(ret));
+        }
+        hwDevice.reset(device);
+        hwPixFmt = surface;
+        log::debug("video: track {} decodes into an external CUDA context{}", trackId,
+                   cudaStream ? " on a caller stream" : "");
+        return okStatus();
+#else
+        (void)surface;
+        return failStatus(ErrorCode::Unsupported, "an external CUDA context needs a build with the CUDA toolkit");
+#endif
     }
 
     // -------------------------------------------------------------------------
@@ -1149,6 +1206,8 @@ Result<HevcStreamDecoder> HevcStreamDecoder::open(const std::filesystem::path& p
     impl.requestedHw = options.hw;
     impl.keepOnDevice = options.keepOnDevice;
     impl.cudaDeviceIndex = options.cudaDeviceIndex;
+    impl.cudaContext = options.cudaContext;
+    impl.cudaStream = options.cudaStream;
     impl.threadsRequested = options.threads;
     impl.samplesMode = options.useContainerSamples;
 
@@ -1246,6 +1305,15 @@ std::optional<std::int64_t> HevcStreamDecoder::lastPts() const noexcept {
 
 std::optional<DeviceFrameRef> HevcStreamDecoder::lastDeviceFrame() const {
     return m_impl ? m_impl->lastDevice : std::nullopt;
+}
+
+std::optional<std::uint32_t> HevcStreamDecoder::previousSyncIndex(std::uint32_t index) const noexcept {
+    // Only our own sample table knows the GOP layout; libavformat's index
+    // is not consulted here because it is not guaranteed to be complete.
+    if (!m_impl || !m_impl->container) {
+        return std::nullopt;
+    }
+    return m_impl->container->previousSync(index);
 }
 
 // -----------------------------------------------------------------------------

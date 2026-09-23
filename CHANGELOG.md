@@ -8,6 +8,35 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ### Added
 
+* **`video::GpuClipDecoder`: both lenses decoded by NVDEC straight into the
+  VRAM of the caller's CUDA context, with a GOP-aware frame cache and
+  decode-ahead** (work package A of docs/DIRECT_GPU.md).  A park that used to
+  cost 50-60 ms (NVDEC plus a host copy) or ~950 ms (software) is now a
+  0.001 ms cache hit inside any GOP already walked, and a cold park decodes
+  from the sync sample at ~1.9 ms per frame pair (median 46-48 ms over 12
+  scattered landings); forward playback runs at ~520 pairs/s.
+  * Frames live in pooled, pitched P010 slots the decoder owns (both lenses
+    in one 52.7 MiB allocation for 3000 x 3000); each NVDEC surface is copied
+    device-to-device and handed straight back, so FFmpeg's surface pool is
+    never pinned by the cache.  Capacity comes from a VRAM budget (default
+    min(1.5 GiB, 20 % of free VRAM)), eviction is LRU and never touches a
+    leased slot.
+  * A random access keeps every frame decoded on the way from the sync
+    sample; a decode-ahead worker takes over once the host plays forward and
+    yields to any waiting foreground request within one frame pair.
+  * `GpuFrameLease::releaseAfter(stream)` records an event on the caller's
+    stream and the slot's next overwrite waits for it on the GPU, so a render
+    thread never has to synchronise the host.
+  * CUDA driver API only; the context is pushed and popped around every call
+    and a private context is never created.  With no context supplied the
+    primary context is retained without touching its flags.
+  * `HevcStreamDecoder` can decode into a caller-supplied CUDA context and
+    stream (`DecoderOptions::cudaContext` / `cudaStream`) and reports the GOP
+    layout (`previousSyncIndex()`); without a context it behaves as before.
+  * `osv_gpu_decode_bench` prints the timings; tests cover bit-exactness with
+    the software decoder, the caller's context, LRU/leases/budget,
+    stream-ordered release, decode-ahead, destruction mid-run, four
+    concurrent threads and a zero-copy render.
 * **`kDlogMOsmo360`, a D-Log M curve fitted to a genuine Osmo 360 reference,
   and it is now the default.** The previous default, `kDlogMDjiRefit`, was
   fitted before any Osmo 360 reference existed, against Pocket-3-era

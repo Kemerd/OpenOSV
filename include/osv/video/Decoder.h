@@ -129,6 +129,15 @@ public:
     /// std::nullopt on the software / D3D11VA paths or before any decode.
     [[nodiscard]] std::optional<DeviceFrameRef> lastDeviceFrame() const;
 
+    /// Index of the nearest sync sample (random access point) at or before
+    /// `index`, read from the OpenOSV sample table.  This is where a
+    /// frame-accurate decode of `index` starts, so a caller that wants to keep
+    /// every frame of the GOP knows which frames the decoder will produce on
+    /// the way.  An index past the end resolves to the last GOP.
+    /// std::nullopt when the decoder is not open or our container parser
+    /// declined the file (avformat mode on a plain MP4 it cannot read).
+    [[nodiscard]] std::optional<std::uint32_t> previousSyncIndex(std::uint32_t index) const noexcept;
+
     /// Runtime FFmpeg library versions, e.g. "avcodec 63.1.100 / avformat 63.0.100 / avutil 61.0.100".
     [[nodiscard]] static std::string ffmpegVersion();
 

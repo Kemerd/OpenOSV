@@ -45,6 +45,25 @@ endif()
 
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/test-output")
 
+# The GPU decoder tests drive the CUDA driver API directly (contexts,
+# pointer attributes, device-to-host downloads of the cached frames).
+if(OSV_ENABLE_CUDA AND TARGET CUDA::cuda_driver)
+  target_link_libraries(osv_tests PRIVATE CUDA::cuda_driver)
+endif()
+
+# -----------------------------------------------------------------------------
+#  osv_gpu_decode_bench: GpuClipDecoder timings (open, park cold / session /
+#  hit, sequential with and without decode-ahead, VRAM).  Run by hand; it is
+#  deliberately NOT registered with ctest because timings on a shared machine
+#  are not pass/fail material.
+# -----------------------------------------------------------------------------
+if(OSV_ENABLE_CUDA AND TARGET CUDA::cuda_driver)
+  add_executable(osv_gpu_decode_bench bench/GpuDecodeBench.cpp)
+  target_link_libraries(osv_gpu_decode_bench PRIVATE osv_video osv_meta osv_container osv_core CUDA::cuda_driver)
+  target_compile_definitions(osv_gpu_decode_bench PRIVATE OSV_SAMPLE_FILE="${OSV_SAMPLE_FILE}")
+  set_target_properties(osv_gpu_decode_bench PROPERTIES FOLDER "osv/bench")
+endif()
+
 catch_discover_tests(osv_tests
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   PROPERTIES SKIP_RETURN_CODE 4
