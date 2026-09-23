@@ -22,6 +22,7 @@ add_executable(osv_importer_tests
   ImporterHarness.cpp
   ImporterHarness.h
   test_importer.cpp
+  test_engine.cpp
   test_prefs_mapping.cpp
   "${CMAKE_SOURCE_DIR}/plugins/importer/PrefsMapping.cpp"
 )
@@ -36,6 +37,7 @@ target_link_libraries(osv_importer_tests PRIVATE
   osv_premiere_mockhost     # the fake host: piSuites + every suite the importer acquires
   osv_premiere_common       # PrefsBlob, HostSuites types used by ImporterPlugin.h
   Catch2::Catch2
+  CUDA::cuda_driver         # test_engine.cpp: a private context, like Premiere's
 )
 
 # /MD, like the module it loads: the .prm and the test share one CRT, which is

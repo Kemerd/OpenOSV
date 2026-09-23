@@ -134,6 +134,11 @@ osv_add_premiere_plugin(Open360Reframe
     DirectLaunch.cpp
     DirectLaunch.h
     DirectKernelAbi.h
+    # ...and the effect's side of the engine: source binding through the
+    # segment graph, the working colour space, and the per-frame call into
+    # the importer's OsvEngine_* exports (DirectPath.h).
+    DirectPath.cpp
+    DirectPath.h
     # The interactive Program Monitor overlay.  Two translation units on
     # purpose: ReframeUi.cpp is the pure interaction maths and names no Adobe
     # type, so the tests compile the very same source the .aex contains and

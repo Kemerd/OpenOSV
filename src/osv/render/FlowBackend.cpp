@@ -178,6 +178,19 @@ std::unique_ptr<FlowBackend> makeFlowBackend(FlowBackendKind kind, const FlowBac
                 return neural;
             }
 #endif
+            // Next the CUDA port of the classical solver, but only in a
+            // process whose host opted in with installCudaAnalyses() (the
+            // Premiere importer does; the CLI and the tests do not unless
+            // they ask).  It is the SAME algorithm and produces the SAME
+            // field bit for bit (tests/unit/test_disflow_cuda.cpp compares
+            // them with ==), ~20x faster, so choosing it changes timing and
+            // nothing else.  An explicit "Classical" stays on the CPU.
+            if (const FlowBackendFactory factory = cudaFlowBackendFactory()) {
+                std::unique_ptr<FlowBackend> gpu = factory(params);
+                if (gpu && gpu->isAvailable()) {
+                    return gpu;
+                }
+            }
             return std::make_unique<ClassicalFlowBackend>();
         }
 

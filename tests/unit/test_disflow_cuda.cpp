@@ -571,11 +571,21 @@ TEST_CASE("the ClassicalCuda backend is reached through the factory and falls ba
         REQUIRE(direct.ok());
         CHECK(compareFlows(direct.value(), viaFactory.value()).identical);
 
-        // Auto is untouched by the install: it never picks the GPU solver.
+        // Auto, once a host has installed the GPU analyses (the Premiere
+        // importer does), prefers the GPU port of the classical solver when
+        // no neural model can run - and gets exactly the classical CPU field,
+        // which is what makes that choice invisible in the picture.
         used = FlowBackendKind::Count;
         const auto automatic = render::computeFlow(FlowBackendKind::Auto, a, b, params, nullptr, &used);
         REQUIRE(automatic.ok());
-        CHECK(used != FlowBackendKind::ClassicalCuda);
+        if (used != FlowBackendKind::Neural) {
+            CHECK(used == FlowBackendKind::ClassicalCuda);
+            FlowBackendKind cpuUsed = FlowBackendKind::Count;
+            const auto cpu = render::computeFlow(FlowBackendKind::Classical, a, b, params, nullptr, &cpuUsed);
+            REQUIRE(cpu.ok());
+            CHECK(cpuUsed == FlowBackendKind::Classical);
+            CHECK(compareFlows(cpu.value(), automatic.value()).identical);
+        }
     }
 
     // Whatever happened above, nothing stays installed for later tests.

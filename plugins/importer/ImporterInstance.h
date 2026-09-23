@@ -53,6 +53,7 @@
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/video/DualStreamReader.h"
+#include "osv/video/GpuClipDecoder.h"
 
 #include <array>
 #include <atomic>
@@ -283,6 +284,38 @@ public:
     /// empty before the first frame).
     [[nodiscard]] std::string rendererName() const;
 
+    // ---- the direct GPU path (docs/DIRECT_GPU.md) --------------------------
+    /// One frame for the direct renderer: both lenses decoded on NVDEC into a
+    /// caller's CUDA context and the stitch state that goes with them.
+    struct DirectFrame {
+        /// Pins the decoded pair in the decoder's VRAM cache.  The planes in
+        /// `job` point into it; they stay valid until the lease is released.
+        video::GpuFrameLease lease;
+        /// The stitch block exactly as the equirect path builds it for this
+        /// frame (rig, colour, blend, gains, seam table or warp grid,
+        /// stabilisation folded into Rout, equirect mode), the lens planes as
+        /// DEVICE pointers (planesOnDevice), and the seam table / warp grid
+        /// as host vectors for the caller to upload.
+        render::RenderJob job;
+        /// False when an Interactive request was served a stand-in analysis.
+        bool exact = true;
+    };
+
+    /// Decode frame `index` into `cuContext` and build its stitch state.
+    ///
+    /// `cuContext` must be current on the calling thread (the engine pushes
+    /// it): the analyses shade their bands from the device frames in that
+    /// context.  `outputTransfer` is an OSV_TRANSFER_* id for the colour
+    /// block, or a negative value for the clip's own Source Settings choice.
+    /// Shares every analysis cache with renderFrame().  The caller MUST hold
+    /// lock().
+    [[nodiscard]] Result<DirectFrame> directFrame(std::uint32_t index, void* cuContext, RenderPurpose purpose,
+                                                  int outputTransfer);
+
+    /// Mark this instance as the engine's own (not one Premiere opened), so
+    /// its prefs changes are not published back to the engine registry.
+    void setEngineOwned(bool owned) noexcept { m_engineOwned = owned; }
+
     /// The per-instance lock.  Every entry point that decodes, renders or
     /// touches the reader takes it.
     [[nodiscard]] std::mutex& lock() noexcept { return m_mutex; }
@@ -424,6 +457,12 @@ private:
 
     // ---- heavy, dropped by releaseHeavy() ---------------------------------
     std::unique_ptr<video::DualStreamReader> m_reader;
+    /// NVDEC decoders for the direct path, one per CUDA context that asked
+    /// (Premiere uses one).  Frames decoded in one context are unusable in
+    /// another, which is why this is keyed rather than shared.
+    std::map<void*, std::unique_ptr<video::GpuClipDecoder>> m_gpuDecoders;
+    /// True for the engine registry's own instance (see setEngineOwned).
+    bool m_engineOwned = false;
     std::unique_ptr<AudioDecoder> m_audio;
     bool m_audioProbed = false;
 

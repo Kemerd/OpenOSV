@@ -5,10 +5,12 @@
 #  "lib" prefix, /MD, /SUBSYSTEM:WINDOWS, the stage directory as its output
 #  and a post-build step that copies every runtime DLL it imports next to it.
 #
-#  The module exports exactly one symbol, xImportEntry; everything else is
-#  internal.  There is no .def file (the Adobe samples use __declspec(dllexport)
-#  and so do we), and no PiPL: standard importers need only the IMPT resource
-#  in OpenOSVImporter.rc.
+#  The module exports xImportEntry for Premiere and the three OsvEngine_*
+#  entry points of the direct-GPU engine for the reframe effect
+#  (plugins/common/OsvEngineAbi.h, Engine.cpp); everything else is internal.
+#  There is no .def file (the Adobe samples use __declspec(dllexport) and so
+#  do we), and no PiPL: standard importers need only the IMPT resource in
+#  OpenOSVImporter.rc.
 # =============================================================================
 
 osv_add_premiere_plugin(OpenOSVImporter
@@ -23,6 +25,8 @@ osv_add_premiere_plugin(OpenOSVImporter
     ImporterAudioSelectors.cpp
     ImporterPlugin.h
     PrefsMapping.cpp
+    Engine.cpp
+    Engine.h
     SourceSettingsDialog.cpp
     OpenOSVImporter.rc
     resource.h
@@ -37,6 +41,12 @@ target_link_libraries(OpenOSVImporter PRIVATE
 # The Source Settings dialog needs the common-controls and the shell/user
 # libraries; the rest of the module links only what osv_render drags in.
 target_link_libraries(OpenOSVImporter PRIVATE comctl32 user32 gdi32)
+
+# The direct-GPU engine (Engine.cpp) drives NVDEC and uploads its tables
+# through the CUDA driver API in Premiere's own context.  nvcuda.dll is
+# delay-loaded below, so a machine without an NVIDIA driver still loads the
+# importer and simply never serves the direct path.
+target_link_libraries(OpenOSVImporter PRIVATE CUDA::cuda_driver)
 
 # -----------------------------------------------------------------------------
 #  Delay loading
@@ -65,6 +75,10 @@ set(OSV_IMPORTER_DELAYLOAD_DLLS
   OpenCL.dll
   fmt.dll
   spdlog.dll
+  # The CUDA driver: resolved by the system (the hook finds no copy in the
+  # plug-in folder and falls back), delay-loaded so a driver-less machine
+  # still loads the importer.
+  nvcuda.dll
 )
 osv_add_delayload(OpenOSVImporter DLL_NAMES ${OSV_IMPORTER_DELAYLOAD_DLLS})
 

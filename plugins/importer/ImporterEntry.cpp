@@ -25,6 +25,7 @@
 #include "ImporterInstance.h"
 
 #include "DelayLoad.h"
+#include "Engine.h"
 #include "HostContext.h"
 #include "PluginLog.h"
 
@@ -341,8 +342,11 @@ csSDK_int32 doCloseFile(imStdParms* stdParms, imFileRef* fileRef, void* privateD
 
 csSDK_int32 doShutdown() {
     PluginLog::info("imShutdown: releasing the renderer pool and the host suites");
-    // Destroy the renderers (and with them any CUDA / OpenCL context) here,
-    // where the runtimes are still loaded.  Never from DllMain.
+    // The direct-GPU engine first: its NVDEC decoders live in Premiere's CUDA
+    // context and must be released while that context and the driver are
+    // still alive.  Then the renderers (and with them any CUDA / OpenCL
+    // context of our own), also here and never from DllMain.
+    engineShutdown();
     HostContext::shutdown();
 
     // Same lock the acquisition uses.  imShutdown arrives on one thread while

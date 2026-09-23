@@ -10,6 +10,8 @@
 
 #include "ImporterAudio.h"
 
+#include "Engine.h"
+
 #include "HostContext.h"
 // colorSpaceTokenFor(): the per-clip colour log line names the exact token the
 // importer will hand Premiere, so the log and imGetIndColorSpace can never
@@ -25,12 +27,16 @@
 #include "osv/meta/FormatDetector.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
+#if defined(OSV_HAVE_CUDA)
+#include "osv/render/CudaAnalysis.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <exception>
 #include <iterator>
+#include <mutex>
 #include <vector>
 
 namespace osv::premiere {
@@ -153,6 +159,35 @@ void trimAnalysisCache(MapT& cache, std::size_t limit, const typename MapT::key_
 /// frame, and this runs before the reader exists.
 [[nodiscard]] color::InputEncoding inputEncodingFor(meta::ColorMode mode) noexcept {
     return color::inputEncodingForColorMode(mode);
+}
+
+/// Switch the GPU analyses on for this process, once.
+///
+/// installCudaAnalyses() plugs two things into the library: GPU band shading
+/// for frames that live on the device (the direct path's frames - without it
+/// the seam search, gain match and parallax measurement refuse them), and the
+/// CUDA port of the classical flow solver behind "Auto".  The port produces
+/// the SAME field as the CPU solver bit for bit (tests/unit/
+/// test_disflow_cuda.cpp compares them with ==) in ~0.8 ms instead of ~16 ms,
+/// so the equirect path gets faster and not different.  A machine without a
+/// usable CUDA device simply stays on the CPU, which is logged once.
+void ensureGpuAnalyses() noexcept {
+#if defined(OSV_HAVE_CUDA)
+    try {
+        static std::once_flag once;
+        std::call_once(once, [] {
+            const Status installed = render::installCudaAnalyses();
+            if (installed.ok()) {
+                PluginLog::info("analyses: GPU band shading and GPU flow installed (bit-identical to the CPU solver)");
+            } else {
+                PluginLog::info("analyses: staying on the CPU ({})", installed.error().message);
+            }
+        });
+    } catch (...) {
+        // std::call_once only rethrows what the callable throws; this keeps
+        // a noexcept function honest on a path reached from a C boundary.
+    }
+#endif
 }
 
 }  // namespace
@@ -605,6 +640,9 @@ void ImporterInstance::releaseHeavy() noexcept {
     m_audio.reset();
     m_audioProbed = false;
     m_reader.reset();
+    // The direct path's NVDEC decoders and their VRAM frame caches (up to
+    // ~1.5 GB each): a quiet is exactly when that memory should go back.
+    m_gpuDecoders.clear();
 
     // Drop the frame and analysis caches: they are pure caches, and holding
     // a 6000x3000 float image (288 MB) across a quiet would defeat the point
@@ -747,6 +785,13 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
 
     const PrefsBlob previous = m_prefs;
     m_prefs = incoming;
+
+    // The engine renders this file for the direct GPU path with its OWN
+    // instance; tell it what the user chose, so both paths agree.  The
+    // engine's instance does not publish back (it would only echo).
+    if (!m_engineOwned) {
+        enginePublishPrefs(m_path, m_prefs);
+    }
 
     // Colour depends on colorOutput, dlogmFit and exposureStops.
     if (!m_colorBuilt || previous.colorOutput != incoming.colorOutput || previous.dlogmFit != incoming.dlogmFit ||
@@ -1082,6 +1127,105 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     return AnalysisOutcome{parallaxApplied, frameExact};
 }
 
+Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_t index, void* cuContext,
+                                                                   RenderPurpose purpose, int outputTransfer) {
+    // The caller holds m_mutex (the header contract) and has cuContext
+    // current on this thread (the engine export pushes it).
+    if (!m_parsed) {
+        return Error{ErrorCode::InvalidArgument, "directFrame before the clip was opened"};
+    }
+    if (index >= m_frameCount) {
+        return Error{ErrorCode::InvalidArgument, "frame index " + std::to_string(index) + " beyond the clip"};
+    }
+    if (!cuContext) {
+        return Error{ErrorCode::InvalidArgument, "directFrame without a CUDA context"};
+    }
+    if (outputTransfer > OSV_TRANSFER_PASSTHROUGH) {
+        return Error{ErrorCode::InvalidArgument,
+                     "directFrame: unknown output transfer " + std::to_string(outputTransfer)};
+    }
+    ensureGpuAnalyses();
+    if (!m_colorBuilt) {
+        rebuildColor();
+    }
+    if (!m_stabBuilt) {
+        rebuildStabilization();
+    }
+
+    // ---- the decoder for this context ---------------------------------------
+    // Opened on first use and kept: its VRAM cache is what makes stepping
+    // around inside a GOP free.  One per context, because a frame decoded in
+    // one CUDA context cannot be read by kernels in another.
+    auto decoder = m_gpuDecoders.find(cuContext);
+    if (decoder == m_gpuDecoders.end()) {
+        video::GpuDecoderOptions options;
+        options.cuContext = cuContext;
+        const auto t0 = std::chrono::steady_clock::now();
+        auto opened = video::GpuClipDecoder::open(m_path, m_format, options);
+        if (!opened.ok()) {
+            return opened.error();
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        PluginLog::info("direct: '{}' NVDEC decoder opened in the host's CUDA context in {:.0f} ms",
+                        m_path.filename().string(), ms);
+        decoder = m_gpuDecoders.emplace(cuContext, std::move(opened).value()).first;
+    }
+    if (!decoder->second) {
+        m_gpuDecoders.erase(decoder);
+        return Error{ErrorCode::Internal, "directFrame: an empty decoder slot"};
+    }
+
+    OSV_TRY_ASSIGN(video::GpuFrameLease lease, decoder->second->acquire(index));
+    if (!lease.valid() || !lease.pair().onDevice()) {
+        return Error{ErrorCode::Decoder, "directFrame: the decoder returned no device frame"};
+    }
+
+    // ---- colour ---------------------------------------------------------------
+    // The clip's Source Settings choice unless the caller asked for the space
+    // its frames must end up in (the sequence's working space).  Built exactly
+    // like rebuildColor() so the two can only ever differ by the transfer.
+    OsvColorParams color = m_color;
+    if (outputTransfer >= 0 && outputTransfer != m_color.transfer) {
+        color = color::makeColorParams(toDlogMFit(m_prefs.fit()), static_cast<color::OutputTransfer>(outputTransfer),
+                                       m_prefs.exposureStops, inputEncodingFor(m_format.colorMode), true,
+                                       m_format.bitDepth ? m_format.bitDepth : 10u);
+    }
+
+    // ---- the stitch block ------------------------------------------------------
+    // Assembled exactly as renderFrame assembles the equirect's, from the same
+    // analysis caches, so a direct view and the importer's equirect of the
+    // same frame are stitched identically.
+    render::RenderParamsBuilder builder;
+    builder.rig(m_rig).color(color).blend(m_blend, true);
+    builder.alphaCoverage(true);
+    std::shared_ptr<ThreadPool> pool = HostContext::instance().threadPoolShared();
+    if (!pool) {
+        return Error{ErrorCode::Internal, "directFrame: no thread pool"};
+    }
+    const AnalysisOutcome analyses = applyAnalyses(index, lease.pair(), /*draft=*/false, purpose, *pool, builder);
+    builder.stabilization(stabilizationFor(index));
+
+    // The equirect's SIZE is irrelevant to the direct renderer (it replaces
+    // every view field); the mode and the stabilised Rout are what it takes.
+    geom::EquirectMap map;
+    map.layout = geom::EquirectLayout::Standard;
+    const OutputGeometry g = geometryForLocked(m_prefs);
+    map.w = g.valid() ? g.width : 2048;
+    map.h = g.valid() ? g.height : 1024;
+    builder.equirect(map);
+
+    OSV_TRY_ASSIGN(render::RenderJob job, builder.build(lease.pair()));
+    if (!job.planesOnDevice[0] || !job.planesOnDevice[1]) {
+        return Error{ErrorCode::Internal, "directFrame: the stitch job does not reference the device frames"};
+    }
+
+    DirectFrame out;
+    out.lease = std::move(lease);
+    out.job = std::move(job);
+    out.exact = analyses.exact;
+    return out;
+}
+
 Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t index, const OutputGeometry& geometry,
                                                                 bool draft, RenderPurpose purpose) {
     // The caller holds m_mutex (see the header contract); nothing here locks
@@ -1134,6 +1278,10 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
         return Error{ErrorCode::Internal, "HostContext returned an empty renderer lease"};
     }
     m_rendererName = renderer.backend;
+    // A CUDA renderer means a usable device: let the analyses use it too.
+    if (renderer.backend == "cuda") {
+        ensureGpuAnalyses();
+    }
 
     // ---- decode ------------------------------------------------------------
     auto pair = readPair(index);

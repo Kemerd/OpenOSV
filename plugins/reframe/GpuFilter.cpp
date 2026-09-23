@@ -39,6 +39,7 @@
 // Premiere's C call stack is undefined behaviour and would take the host
 // down with it.
 
+#include "DirectPath.h"
 #include "ReframeCpu.h"
 #include "ReframeParams.h"
 
@@ -163,6 +164,10 @@ struct DeviceModule {
     CUcontext context = nullptr;
     CUmodule module = nullptr;
     CUfunction kernel = nullptr;
+    /// The direct path's fused fisheye -> view kernel, from the same fatbin.
+    /// Null only if this build's fatbin lacks it; the equirect path is then
+    /// the only one, exactly as before the direct path existed.
+    CUfunction direct = nullptr;
     bool valid = false;
 };
 
@@ -216,13 +221,36 @@ CUfunction acquireKernel(csSDK_uint32 deviceIndex, CUcontext context) noexcept {
         return nullptr;
     }
 
+    // The fused kernel is optional: failing to find it only switches the
+    // direct path off, never the effect.
+    CUfunction direct = nullptr;
+    r = cuModuleGetFunction(&direct, module, kDirectKernelName);
+    if (r != CUDA_SUCCESS || !direct) {
+        PluginLog::warn("reframe/gpu: the fused direct kernel is missing from the fatbin ({}); rendering from the "
+                        "equirect only",
+                        cudaMessage("cuModuleGetFunction", r));
+        direct = nullptr;
+    }
+
     slot.context = context;
     slot.module = module;
     slot.kernel = kernel;
+    slot.direct = direct;
     slot.valid = true;
     PluginLog::info("reframe/gpu: loaded the reframe kernel on device {} ({} bytes of fatbin)", deviceIndex,
                     kOsvReframeFatbin_size);
     return kernel;
+}
+
+/// The fused direct kernel for a device and context, or null when the module
+/// is not loaded for that context (acquireKernel() loads it) or lacks it.
+CUfunction directKernelFor(csSDK_uint32 deviceIndex, CUcontext context) noexcept {
+    if (deviceIndex >= kMaxDevices || !context) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(g_moduleMutex);
+    const DeviceModule& slot = g_modules[deviceIndex];
+    return (slot.valid && slot.context == context) ? slot.direct : nullptr;
 }
 
 /// Unload every cached module.  Called from the entry point's shutdown
@@ -284,6 +312,21 @@ struct Instance {
     /// for its whole life: Render retries while this is false.  Rendering a
     /// frame proves the node is ready, which is exactly when a retry works.
     bool paramMapProbed = false;
+
+    // ---- the direct path (DirectPath.h) ---------------------------------
+    /// The media file and owning clip node this instance renders; the node
+    /// is acquired and released in DisposeInstance.
+    osv::reframe::direct::SourceBinding source;
+    /// OSV_TRANSFER_* of the sequence's working colour space, -1 when the
+    /// direct path cannot produce it.
+    int directTransfer = -1;
+    /// Set after a failure that will not go away by itself (the file is not
+    /// one the engine can open, the view cannot be expressed): the instance
+    /// then stays on the equirect path instead of paying for the attempt on
+    /// every frame.  A transient failure (a decode hiccup) does not set it.
+    bool directDisabled = false;
+    /// Failures logged so far for this instance (bounded, see render()).
+    int directFailures = 0;
 
     Instance() noexcept { paramMap.setStatic(); }
 
@@ -1030,6 +1073,24 @@ prSuiteError createInstance(PrGPUFilterInstance* io) noexcept {
         probeParams(*inst);
         probeSourceGraph(*inst);
 
+        // ---- the direct path ---------------------------------------------
+        // Bind this instance to its source file and learn the working
+        // colour space once, here, rather than per frame.  Everything is
+        // best effort: an instance that cannot bind simply keeps rendering
+        // from the equirect it is handed.
+        if (osv::reframe::direct::engine().ok()) {
+            inst->source = osv::reframe::direct::resolveSource(inst->segment, inst->segmentVersion, basic,
+                                                              inst->nodeId);
+            std::string colourReason;
+            inst->directTransfer = osv::reframe::direct::workingTransfer(inst->sequence, inst->sequenceVersion, basic,
+                                                                         inst->timelineId, colourReason);
+            PluginLog::oncef("reframe/direct/bind", PluginLog::Level::Info,
+                             "reframe/direct: source {} ({}); {} -> transfer {}",
+                             inst->source.ok ? "bound" : "NOT bound",
+                             inst->source.ok ? std::string("OSV clip") : inst->source.reason, colourReason,
+                             inst->directTransfer);
+        }
+
         io->ioPrivatePluginData = inst;
         // Reframing a 6K equirect into an HD frame is a couple of samples
         // per output pixel on the GPU; it plays back in real time.
@@ -1066,6 +1127,9 @@ prSuiteError disposeInstance(PrGPUFilterInstance* io) noexcept {
         if (inst->sequence) {
             releaseSuite(basic, kPrSDKSequenceInfoSuite, inst->sequenceVersion);
         }
+        // The owner node the direct path holds must go back BEFORE the suite
+        // it was acquired through.
+        osv::reframe::direct::releaseSource(inst->segment, inst->source);
         if (inst->segment) {
             releaseSuite(basic, kPrSDKVideoSegmentSuite, inst->segmentVersion);
         }
@@ -1172,6 +1236,55 @@ prSuiteError render(PrGPUFilterInstance* instanceData, const PrGPUFilterRenderPa
         if (!scope.ok()) {
             PluginLog::error("reframe/gpu: cuCtxPushCurrent failed at render time");
             return suiteError_Fail;
+        }
+
+        // ---- the direct path: straight from the fisheyes ----------------------
+        // Sharper than sampling the equirect (one resampling instead of two,
+        // at the fisheyes' own resolution) and independent of the equirect
+        // size the importer was asked for.  Any failure falls through to the
+        // equirect kernel below, which overwrites the whole output.
+        if (!inst->directDisabled && inst->source.ok && inst->directTransfer >= 0 &&
+            osv::reframe::direct::engine().ok()) {
+            osv::reframe::direct::DirectRequest request;
+            request.source = &inst->source;
+            request.segment = inst->segment;
+            request.clipTime = renderParams->inClipTime;
+            request.transfer = inst->directTransfer;
+            request.context = inst->context;
+            request.kernel = directKernelFor(inst->deviceIndex, inst->context);
+            request.settings = settings;
+            request.output.data = dst.data;
+            request.output.rowBytes = dst.rowBytes;
+            request.output.width = dst.width;
+            request.output.height = dst.height;
+            request.output.isHalf = dst.isHalf;
+            request.sequenceSize = sequenceSize(*inst);
+            std::string reason;
+            if (request.kernel && osv::reframe::direct::renderDirect(request, reason)) {
+                PluginLog::oncef("reframe/direct/first", PluginLog::Level::Info,
+                                 "reframe/direct: rendering straight from the fisheyes ({}x{} {})", dst.width,
+                                 dst.height, dst.isHalf ? "16f" : "32f");
+                instanceData->outIsRealtime = kPrTrue;
+                return suiteError_NoError;
+            }
+            if (!request.kernel) {
+                reason = "the fused kernel is not loaded";
+            }
+            // Structural failures (the setup cannot express the view, the
+            // engine cannot open the file, the ABI changed) will fail again on
+            // every frame; stop trying for this instance.  Everything else -
+            // a decode hiccup - may pass, so the next frame retries.
+            const bool structural = reason.rfind("setup:", 0) == 0 || reason.find("cannot open") != std::string::npos ||
+                                    reason.find("layout") != std::string::npos ||
+                                    reason.find("not loaded") != std::string::npos;
+            if (structural) {
+                inst->directDisabled = true;
+            }
+            if (inst->directFailures < 5) {
+                ++inst->directFailures;
+                PluginLog::warn("reframe/direct: falling back to the equirect path for this frame{} - {}",
+                                structural ? " and this instance" : "", reason);
+            }
         }
 
         // buildParams() computed sourceRow0 as a HOST pointer arithmetic on
