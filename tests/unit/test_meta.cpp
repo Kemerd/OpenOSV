@@ -35,6 +35,23 @@ using Catch::Matchers::WithinRel;
 
 namespace {
 
+/// True for a DJI-style serial number: exactly 14 characters, each an
+/// upper-case ASCII letter or a digit.  Used instead of the sample's real
+/// serial, which identifies its owner's camera and is kept out of the repo.
+[[nodiscard]] bool looksLikeDjiSerial(const std::string& s) {
+    if (s.size() != 14) {
+        return false;
+    }
+    for (const char ch : s) {
+        const bool upper = ch >= 'A' && ch <= 'Z';
+        const bool digit = ch >= '0' && ch <= '9';
+        if (!upper && !digit) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Recursive comparison of a library JSON document against a golden one.
 /// Every key of the golden must exist in `actual` with an equal value:
 /// strings, bools and integers exactly, floating point numbers to a
@@ -148,7 +165,10 @@ TEST_CASE("ClipMeta of sample 0 equals the golden", "[meta][sample]") {
     REQUIRE(c.header.protoFileName == "dvtm_oq101.proto");
     REQUIRE(c.header.libVersion == "02.01.15");
     REQUIRE(c.header.productProtoVersion == "2.0.8");
-    REQUIRE(c.header.serialNumber == "XXXXXXXXXXXXXX");
+    // The camera's serial number is decoded, but not pinned: it identifies the
+    // owner's camera, so the repository records only its shape (DJI serials
+    // are 14 upper-case letters and digits).
+    REQUIRE(looksLikeDjiSerial(c.header.serialNumber));
     REQUIRE(c.header.firmware == "10.00.25.29");
     REQUIRE(c.header.clipTimestampUs == 30669420766ull);
     REQUIRE(c.header.productName == "Osmo 360");
@@ -168,8 +188,14 @@ TEST_CASE("ClipMeta of sample 0 equals the golden", "[meta][sample]") {
     REQUIRE(c.sensorW == 3840);
     REQUIRE(c.sensorH == 3840);
     REQUIRE(c.fNumber == std::vector<std::uint32_t>{19, 10});
-    // ...then the whole document against the independent decoder.
-    requireJsonMatches(toJson(c), golden.at("clip"), "clip");
+    // ...then the whole document against the independent decoder.  The
+    // golden stores a placeholder serial (the real one identifies the owner's
+    // camera), so the decoded serial - already checked for shape above - is
+    // swapped for the placeholder before the documents are compared.
+    json clipJson = toJson(c);
+    REQUIRE(clipJson.contains("header"));
+    clipJson["header"]["serialNumber"] = golden.at("clip").at("header").at("serialNumber");
+    requireJsonMatches(clipJson, golden.at("clip"), "clip");
 }
 
 TEST_CASE("StreamMeta of sample 0 equals the golden including all calibration slots", "[meta][sample]") {
@@ -420,7 +446,7 @@ TEST_CASE("The secondary djmd track loads but carries no calibration or IMU", "[
     // Same headers as track 4...
     REQUIRE(track.hasClip());
     REQUIRE(track.hasStream());
-    REQUIRE(track.clip().header.serialNumber == "XXXXXXXXXXXXXX");
+    REQUIRE(looksLikeDjiSerial(track.clip().header.serialNumber));
     REQUIRE(track.stream().colorMode == ColorMode::DLogM);
     // ...but no calibration at all, so the selector has nothing to pick.
     REQUIRE_FALSE(track.hasCalibration());
