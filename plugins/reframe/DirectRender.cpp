@@ -328,9 +328,17 @@ DirectSetup buildDirectParams(const Settings& settings, const StitchState& stitc
     // ---- final backstop ----------------------------------------------------
     // buildView() already guarantees a finite camera; this repeats the check
     // on the COMPOSED block, the thing a kernel will actually read.
+    // The eye's distance behind the sphere centre is capped per projection:
+    // the Classic lens's eye offset lives in [0, 1], while DJI's Correction
+    // Angle legitimately goes past the sphere (Crystal Ball is 1.8).  Capping
+    // both at 1 would refuse every Crystal Ball frame and quietly hand it to
+    // the slower equirect path.
+    const float eyeOffsetMax = (p.projection == OSV_PROJ_DJI_SPHERE)
+                                   ? static_cast<float>(OSV_REFRAME_CORRECTION_VALID_MAX)
+                                   : 1.0f;
     const bool cameraFinite = std::isfinite(p.focalPx) && p.focalPx > 0.0f && std::isfinite(p.tanHalfH) &&
                               std::isfinite(p.tanHalfV) && std::isfinite(p.eyeOffset) && p.eyeOffset >= 0.0f &&
-                              p.eyeOffset <= 1.0f;
+                              p.eyeOffset <= eyeOffsetMax;
     if (!cameraFinite || !isRotation(p.Rout)) {
         return refuse(DirectReject::Composed);
     }
