@@ -8,6 +8,25 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ### Added
 
+* **Companion panel "OpenOSV" (WP-PANEL): Open 360 Reframe goes on every
+  OSV clip you drop.** A small Premiere panel watches the timeline and
+  applies the effect to every `.OSV` / `.LRF` clip added to a sequence, once,
+  with the Lens (DJI or Classic) and Drag Sensitivity you set. It never
+  retro-fits an existing edit, and an effect you remove stays removed.
+  "Apply to selected clips" and "Apply to all OSV clips in this sequence"
+  handle what was there already. It comes in two builds:
+  * UXP for Premiere 25.6+, all official API.
+  * CEP for Premiere 22-26, which uses the unofficial QE DOM only to add the
+    effect and verifies every result through the official DOM.
+
+  `scripts\install_plugins.ps1` installs whichever needs no clicks:
+  * UXP through Adobe's UPIA when it is present;
+  * otherwise CEP, with a per-user `PlayerDebugMode` that `-Uninstall`
+    restores exactly.
+
+  New switches: `-NoPanel`, `-PanelOnly`, `-PanelFlavor`, `-PanelDestination`.
+  125 Node tests; ctest runs them when Node 18+ is found. See
+  `docs/PANEL.md`.
 * **Carved stitch seam (WP-SEAM).** Inside the overlap each lens now shows
   only on its own side of a seam carved where the lenses agree (dynamic
   programming over a closed longitude ring, stick mask and flare / rim costs

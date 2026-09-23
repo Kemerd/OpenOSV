@@ -39,8 +39,31 @@ says where to put them.
 cmake --preset windows-msvc-premiere-release
 cmake --build --preset windows-msvc-premiere-release
 ctest --preset premiere
-scripts\install_plugins.ps1        # plug-ins -> MediaCore, presets -> your Premiere profile
+scripts\install_plugins.ps1        # plug-ins -> MediaCore, presets + OpenOSV panel -> your profile
 ```
+
+## Companion panel: the reframe goes on by itself
+
+Drop an `.OSV` on the timeline and **Open 360 Reframe is already on it.** The
+**OpenOSV** panel watches your sequences and applies the effect to every OSV or
+LRF clip you add, once. It uses the Lens (DJI or Classic) and the Drag
+Sensitivity you pick in the panel.
+
+* It never touches clips that were already there. **Apply to all OSV clips in
+  this sequence** does that on purpose.
+* If you remove the effect from a clip, it stays removed.
+* One switch turns it off.
+
+`scripts\install_plugins.ps1` installs it along with the plug-ins
+(`-PanelOnly` for just the panel, no admin rights; `-NoPanel` to skip it). It
+picks whichever build installs without a click:
+
+* **UXP** (Premiere 25.6+) when Adobe's plug-in installer is present;
+* **CEP** (Premiere 22 and later) otherwise.
+
+Find it under **Window > UXP Plugins** or **Window > Extensions**, and dock it
+once. How it decides what's new, which APIs it uses and why, and what's left to
+check live: `docs/PANEL.md`.
 
 ## Sequence presets
 
