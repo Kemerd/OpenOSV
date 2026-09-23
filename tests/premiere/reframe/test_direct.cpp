@@ -2,7 +2,8 @@
 // Copyright 2026 The OpenOSV Contributors
 //
 // test_direct.cpp - the direct fisheye -> view path (docs/DIRECT_GPU.md, WP-C):
-// buildDirectParams() and its CPU twin.
+// buildDirectParams(), its CPU twin, launchDirect() and the fused kernel
+// osvReframeDirectKernel in the effect's fatbin.
 //
 // What is being proven, and how:
 //
@@ -30,9 +31,16 @@
 //      peak at zero offset (sub-pixel peak within 0.5 px) and be high, and at
 //      a narrow field of view - where the 6000-wide equirect undersamples -
 //      the direct render must carry at least as much high-frequency energy.
+//
+//   4. GPU vs CPU TWIN.  The kernel from the embedded fatbin, fed device P010
+//      frames (NVDEC zero-copy where available), against renderDirectCpu()
+//      on the very same samples: PSNR >= 60 dB after 16-bit quantisation, for
+//      32f and 16f output, with the seam table and with the warp grid.  The
+//      kernel is also timed at 2560 x 1440 and 3840 x 2160.
 
 #include "ReframeTestSupport.h"
 
+#include "DirectLaunch.h"
 #include "DirectRender.h"
 #include "ReframeCpu.h"
 #include "ReframeParams.h"
@@ -63,6 +71,8 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <cuda.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -76,6 +86,14 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+// ===========================================================================
+//  The embedded fatbin - the same generated translation unit the .aex links
+//  (see tests/premiere/reframe/CMakeLists.txt).  Global scope, ordinary C++
+//  linkage, exactly as GpuFilter.cpp declares it.
+// ===========================================================================
+extern const unsigned char kOsvReframeFatbin[];
+extern const std::size_t kOsvReframeFatbin_size;
 
 using namespace osv;
 using namespace osv::reframe;
@@ -833,6 +851,9 @@ TEST_CASE("buildDirectParams takes the camera from buildView and the stitch from
     CHECK(d.params.warpSinLatHi == stitch.equirect.warpSinLatHi);
     CHECK(d.seamTable == seam.data());
     CHECK(d.warpGrid == warp.data());
+
+    // ---- and it fits the kernel's parameter space ----------------------------
+    CHECK(sizeof(OsvRenderParams) + sizeof(OsvDirectPlanes) + 3 * sizeof(void*) + 2 * sizeof(int) <= 4096);
 }
 
 TEST_CASE("buildDirectParams forwards seam and warp pointers only with their feature", "[reframe][direct]") {
@@ -1091,6 +1112,51 @@ TEST_CASE("renderDirectCpu refuses a mismatched destination without writing anyt
     CHECK(c[3] == Approx(1.0f));
 }
 
+TEST_CASE("launchDirect refuses bad inputs before touching the driver", "[reframe][direct]") {
+    // Every refusal below fires before cuPointerGetAttribute / cuLaunchKernel,
+    // so these run without a GPU.  The non-null kernel handle is a sentinel
+    // that is never dereferenced because an earlier check always fails.
+    auto rig = syntheticRig(600);
+    REQUIRE(rig.ok());
+    const OsvColorParams cp = color::makeColorParams(color::kDefaultDlogMFit, color::OutputTransfer::PQ, 0.0f);
+    StitchState stitch;
+    stitch.equirect = equirectBlock(rig.value(), cp, Mat3d::identity(), 1200, 600);
+    const DirectSetup setup =
+        buildDirectParams(makeSettings(Resolution::MatchSequence, 0, 0, 0, 90, 0), stitch, 64, 36, SizePx{});
+    REQUIRE(setup.valid);
+    std::vector<osv_u16> y(600u * 600u, 0u);
+    std::vector<osv_u16> uv(600u * 300u, 0u);
+    OsvPlane p{};
+    p.y = y.data();
+    p.u = uv.data();
+    p.v = uv.data() + 1;
+    p.w = p.h = 600;
+    p.cw = p.ch = 300;
+    p.strideY = p.strideC = 600;
+    p.bitShift = 6;
+    p.chromaInterleaved = 1;
+    const OsvPlane planes[2] = {p, p};
+    std::vector<float> frame(64u * 36u * 4u);
+    DirectOutput out{frame.data(), 64 * 16, 64, 36, false};
+    const CUfunction sentinel = reinterpret_cast<CUfunction>(static_cast<std::uintptr_t>(0x10));
+
+    CHECK(launchDirect(nullptr, nullptr, setup, planes, out).reject == DirectLaunchReject::Kernel);
+    CHECK(launchDirect(sentinel, nullptr, DirectSetup{}, planes, out).reject == DirectLaunchReject::Setup);
+    CHECK(launchDirect(sentinel, nullptr, setup, nullptr, out).reject == DirectLaunchReject::Planes);
+    DirectOutput wrongSize = out;
+    wrongSize.height = 35;
+    CHECK(launchDirect(sentinel, nullptr, setup, planes, wrongSize).reject == DirectLaunchReject::Output);
+    DirectOutput shortPitch = out;
+    shortPitch.rowBytes = 64 * 16 - 4;
+    CHECK(launchDirect(sentinel, nullptr, setup, planes, shortPitch).reject == DirectLaunchReject::Output);
+    DirectOutput misaligned = out;
+    misaligned.rowBytes = 64 * 16 + 2;
+    CHECK(launchDirect(sentinel, nullptr, setup, planes, misaligned).reject == DirectLaunchReject::Alignment);
+    const DirectLaunchResult none = launchDirect(nullptr, nullptr, setup, planes, out);
+    CHECK_FALSE(none.ok());
+    CHECK(none.result == CUDA_ERROR_INVALID_VALUE);
+}
+
 // ===========================================================================
 //  2. Framing parity, deterministically
 // ===========================================================================
@@ -1268,4 +1334,542 @@ TEST_CASE("direct and two-step renders of the sample clip align, and the direct 
             CHECK(sDirect.laplacianVariance >= sTwo.laplacianVariance);
         }
     }
+}
+
+// ===========================================================================
+//  4. The GPU kernel against its CPU twin
+// ===========================================================================
+
+namespace {
+
+/// Everything one GPU test needs, torn down in the only safe order: our
+/// module and allocations first, then the frames (and with them, on the
+/// NVDEC route, the context they were decoded in).
+///
+/// The kernel is loaded into the context the FRAMES live in - FFmpeg's CUDA
+/// context on the NVDEC route, the primary context on the upload route -
+/// which is exactly the production arrangement: the GPU clip decoder
+/// (WP-A) decodes into Premiere's context, where the effect's module lives.
+struct GpuRig {
+    // ---- where the frames came from ------------------------------------------
+    std::optional<video::DualStreamReader> nvdecReader;  ///< Keeps FFmpeg's device context alive.
+    video::FramePair nvdecPair;                         ///< Keeps the NVDEC surfaces alive.
+    std::string route;                                  ///< "NVDEC zero-copy" or "host upload".
+
+    // ---- the context and our objects in it -----------------------------------
+    CUcontext context = nullptr;
+    CUdevice cuDevice = 0;
+    bool retainedPrimary = false;
+    CUmodule module = nullptr;
+    CUfunction kernel = nullptr;
+    CUstream stream = nullptr;
+    std::vector<CUdeviceptr> allocations;
+
+    // ---- the two lens frames, device and host views of the SAME samples -------
+    OsvPlane devicePlanes[2]{};
+    std::vector<osv_u16> hostY[2];
+    std::vector<osv_u16> hostUV[2];
+    OsvPlane hostPlanes[2]{};
+
+    GpuRig() = default;
+    GpuRig(const GpuRig&) = delete;
+    GpuRig& operator=(const GpuRig&) = delete;
+
+    ~GpuRig() {
+        if (context && cuCtxPushCurrent(context) == CUDA_SUCCESS) {
+            if (stream) {
+                cuStreamSynchronize(stream);
+                cuStreamDestroy(stream);
+            }
+            for (const CUdeviceptr p : allocations) {
+                cuMemFree(p);
+            }
+            if (module) {
+                cuModuleUnload(module);
+            }
+            CUcontext popped = nullptr;
+            cuCtxPopCurrent(&popped);
+        }
+        if (retainedPrimary) {
+            cuDevicePrimaryCtxRelease(cuDevice);
+        }
+        // nvdecPair and nvdecReader are destroyed after this body, i.e. after
+        // everything of ours in their context is gone.
+    }
+
+    /// Allocate `bytes` of device memory tracked for release.
+    CUdeviceptr alloc(std::size_t bytes) {
+        CUdeviceptr p = 0;
+        REQUIRE(cuMemAlloc(&p, bytes) == CUDA_SUCCESS);
+        allocations.push_back(p);
+        return p;
+    }
+    /// Allocate a pitched 2-D region tracked for release.
+    CUdeviceptr allocPitch(std::size_t widthBytes, std::size_t rows, std::size_t& pitch) {
+        CUdeviceptr p = 0;
+        REQUIRE(cuMemAllocPitch(&p, &pitch, widthBytes, rows, 16) == CUDA_SUCCESS);
+        allocations.push_back(p);
+        return p;
+    }
+};
+
+/// RAII push / pop of the rig's context around the test's own driver calls.
+class RigContext {
+public:
+    explicit RigContext(CUcontext c) noexcept : m_ok(c && cuCtxPushCurrent(c) == CUDA_SUCCESS) {}
+    ~RigContext() {
+        if (m_ok) {
+            CUcontext popped = nullptr;
+            cuCtxPopCurrent(&popped);
+        }
+    }
+    RigContext(const RigContext&) = delete;
+    RigContext& operator=(const RigContext&) = delete;
+    [[nodiscard]] bool ok() const noexcept { return m_ok; }
+
+private:
+    bool m_ok = false;
+};
+
+/// A host OsvPlane over tight P010 buffers (luma pitch w, CbCr pitch 2 cw).
+OsvPlane hostP010Plane(const std::vector<osv_u16>& y, const std::vector<osv_u16>& uv, int w, int h) {
+    OsvPlane p{};
+    p.y = y.data();
+    p.u = uv.data();
+    p.v = uv.data() + 1;
+    p.w = w;
+    p.h = h;
+    p.cw = (w + 1) / 2;
+    p.ch = (h + 1) / 2;
+    p.strideY = w;
+    p.strideC = 2 * p.cw;
+    p.bitShift = 6;
+    p.chromaInterleaved = 1;
+    return p;
+}
+
+/// Is there a CUDA device at all?  Empty string when yes, the reason when no.
+std::string cudaUnavailableReason() {
+    const CUresult init = cuInit(0);
+    if (init != CUDA_SUCCESS) {
+        return "cuInit failed (" + std::to_string(static_cast<int>(init)) + ")";
+    }
+    int count = 0;
+    if (cuDeviceGetCount(&count) != CUDA_SUCCESS || count <= 0) {
+        return "no CUDA device";
+    }
+    return {};
+}
+
+/// Build the rig for frame `frameIndex`: NVDEC keepOnDevice frames when the
+/// hardware decoder is available (their context found from the pointer), a
+/// host upload of the software-decoded frame into the primary context
+/// otherwise.  Either way `host` holds the very samples `device` holds.
+void prepareGpuRig(GpuRig& g, const SampleClip& clip, const SampleFrame& soft, std::uint32_t frameIndex) {
+    // ---- route 1: NVDEC, frames already in VRAM ------------------------------
+    video::DecoderOptions opt;
+    opt.hw = video::HwAccel::Cuda;
+    opt.keepOnDevice = true;
+    auto reader = video::DualStreamReader::open(sampleClipPath(), clip.format, opt);
+    if (reader.ok()) {
+        g.nvdecReader.emplace(std::move(reader).value());
+        auto pair = g.nvdecReader->read(frameIndex);
+        if (pair.ok() && pair.value().onDevice()) {
+            g.nvdecPair = std::move(pair).value();
+            CUcontext ctx = nullptr;
+            const CUdeviceptr y0 = static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(g.nvdecPair.device[0].yDevice));
+            if (cuPointerGetAttribute(&ctx, CU_POINTER_ATTRIBUTE_CONTEXT, y0) == CUDA_SUCCESS && ctx) {
+                g.context = ctx;
+                g.route = "NVDEC zero-copy";
+            }
+        }
+    }
+
+    if (g.context) {
+        RigContext scope(g.context);
+        REQUIRE(scope.ok());
+        REQUIRE(cuCtxGetDevice(&g.cuDevice) == CUDA_SUCCESS);
+        for (int i = 0; i < 2; ++i) {
+            const video::DeviceFrameRef& ref = g.nvdecPair.device[static_cast<std::size_t>(i)];
+            REQUIRE(render::fillDevicePlane(ref, g.devicePlanes[i]));
+            // Download the same P010 samples for the CPU twin.
+            const int w = static_cast<int>(ref.width);
+            const int h = static_cast<int>(ref.height);
+            const int cw = (w + 1) / 2;
+            const int ch = (h + 1) / 2;
+            g.hostY[i].assign(static_cast<std::size_t>(w) * h, 0u);
+            g.hostUV[i].assign(static_cast<std::size_t>(2 * cw) * ch, 0u);
+            CUDA_MEMCPY2D c{};
+            c.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+            c.srcDevice = static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(ref.yDevice));
+            c.srcPitch = ref.pitchBytes;
+            c.dstMemoryType = CU_MEMORYTYPE_HOST;
+            c.dstHost = g.hostY[i].data();
+            c.dstPitch = static_cast<std::size_t>(w) * 2u;
+            c.WidthInBytes = static_cast<std::size_t>(w) * 2u;
+            c.Height = static_cast<std::size_t>(h);
+            REQUIRE(cuMemcpy2D(&c) == CUDA_SUCCESS);
+            c.srcDevice = static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(ref.uvDevice));
+            c.dstHost = g.hostUV[i].data();
+            c.dstPitch = static_cast<std::size_t>(2 * cw) * 2u;
+            c.WidthInBytes = static_cast<std::size_t>(2 * cw) * 2u;
+            c.Height = static_cast<std::size_t>(ch);
+            REQUIRE(cuMemcpy2D(&c) == CUDA_SUCCESS);
+            g.hostPlanes[i] = hostP010Plane(g.hostY[i], g.hostUV[i], w, h);
+        }
+    } else {
+        // ---- route 2: upload the software-decoded frame as P010 -------------
+        REQUIRE(cuDeviceGet(&g.cuDevice, 0) == CUDA_SUCCESS);
+        REQUIRE(cuDevicePrimaryCtxRetain(&g.context, g.cuDevice) == CUDA_SUCCESS);
+        g.retainedPrimary = true;
+        g.route = "host upload";
+        RigContext scope(g.context);
+        REQUIRE(scope.ok());
+        for (int i = 0; i < 2; ++i) {
+            const video::PlanarFrame16& f = soft.pair.lens[static_cast<std::size_t>(i)];
+            const int w = static_cast<int>(f.width);
+            const int h = static_cast<int>(f.height);
+            const int cw = (w + 1) / 2;
+            const int ch = (h + 1) / 2;
+            // Repack into P010: 10-bit values in the top bits, CbCr interleaved.
+            g.hostY[i].assign(static_cast<std::size_t>(w) * h, 0u);
+            g.hostUV[i].assign(static_cast<std::size_t>(2 * cw) * ch, 0u);
+            for (int y = 0; y < h; ++y) {
+                for (int x = 0; x < w; ++x) {
+                    g.hostY[i][static_cast<std::size_t>(y) * w + x] =
+                        static_cast<osv_u16>(f.luma(static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y)) << 6);
+                }
+            }
+            for (int y = 0; y < ch; ++y) {
+                for (int x = 0; x < cw; ++x) {
+                    const std::size_t o = static_cast<std::size_t>(y) * (2 * cw) + 2 * x;
+                    g.hostUV[i][o + 0] = static_cast<osv_u16>(
+                        f.chroma(1, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y)) << 6);
+                    g.hostUV[i][o + 1] = static_cast<osv_u16>(
+                        f.chroma(2, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y)) << 6);
+                }
+            }
+            g.hostPlanes[i] = hostP010Plane(g.hostY[i], g.hostUV[i], w, h);
+            // One pitched allocation per plane, like a decoder surface.
+            std::size_t pitchY = 0;
+            std::size_t pitchC = 0;
+            const CUdeviceptr dy = g.allocPitch(static_cast<std::size_t>(w) * 2u, static_cast<std::size_t>(h), pitchY);
+            const CUdeviceptr duv =
+                g.allocPitch(static_cast<std::size_t>(2 * cw) * 2u, static_cast<std::size_t>(ch), pitchC);
+            CUDA_MEMCPY2D c{};
+            c.srcMemoryType = CU_MEMORYTYPE_HOST;
+            c.srcHost = g.hostY[i].data();
+            c.srcPitch = static_cast<std::size_t>(w) * 2u;
+            c.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+            c.dstDevice = dy;
+            c.dstPitch = pitchY;
+            c.WidthInBytes = static_cast<std::size_t>(w) * 2u;
+            c.Height = static_cast<std::size_t>(h);
+            REQUIRE(cuMemcpy2D(&c) == CUDA_SUCCESS);
+            c.srcHost = g.hostUV[i].data();
+            c.srcPitch = static_cast<std::size_t>(2 * cw) * 2u;
+            c.dstDevice = duv;
+            c.dstPitch = pitchC;
+            c.WidthInBytes = static_cast<std::size_t>(2 * cw) * 2u;
+            c.Height = static_cast<std::size_t>(ch);
+            REQUIRE(cuMemcpy2D(&c) == CUDA_SUCCESS);
+            OsvPlane d = g.hostPlanes[i];
+            d.y = reinterpret_cast<const osv_u16*>(static_cast<std::uintptr_t>(dy));
+            d.u = reinterpret_cast<const osv_u16*>(static_cast<std::uintptr_t>(duv));
+            d.v = d.u + 1;
+            d.strideY = static_cast<int>(pitchY / 2u);
+            d.strideC = static_cast<int>(pitchC / 2u);
+            g.devicePlanes[i] = d;
+        }
+    }
+
+    // ---- the kernel, from the fatbin the .aex embeds ---------------------------
+    RigContext scope(g.context);
+    REQUIRE(scope.ok());
+    REQUIRE(kOsvReframeFatbin_size > 0);
+    REQUIRE(cuModuleLoadFatBinary(&g.module, kOsvReframeFatbin) == CUDA_SUCCESS);
+    REQUIRE(cuModuleGetFunction(&g.kernel, g.module, kDirectKernelName) == CUDA_SUCCESS);
+    REQUIRE(cuStreamCreate(&g.stream, CU_STREAM_NON_BLOCKING) == CUDA_SUCCESS);
+}
+
+/// Upload a float table and return its device address (tracked by the rig).
+const float* uploadTable(GpuRig& g, const std::vector<float>& table) {
+    RigContext scope(g.context);
+    REQUIRE(scope.ok());
+    const CUdeviceptr p = g.alloc(table.size() * sizeof(float));
+    REQUIRE(cuMemcpyHtoD(p, table.data(), table.size() * sizeof(float)) == CUDA_SUCCESS);
+    return reinterpret_cast<const float*>(static_cast<std::uintptr_t>(p));
+}
+
+/// Render one view on the GPU into a pitched device frame and download it.
+HostFrame renderOnGpu(GpuRig& g, const DirectSetup& setup, bool isHalf) {
+    RigContext scope(g.context);
+    REQUIRE(scope.ok());
+    const int w = setup.params.outW;
+    const int h = setup.params.outH;
+    const PixelLayout layout = isHalf ? PixelLayout::Bgra16f : PixelLayout::Bgra32f;
+    const std::size_t bpp = bytesPerPixel(layout);
+    std::size_t pitch = 0;
+    const CUdeviceptr out = g.allocPitch(static_cast<std::size_t>(w) * bpp, static_cast<std::size_t>(h), pitch);
+    DirectOutput o;
+    o.data = reinterpret_cast<void*>(static_cast<std::uintptr_t>(out));
+    o.rowBytes = static_cast<std::int32_t>(pitch);
+    o.width = w;
+    o.height = h;
+    o.isHalf = isHalf;
+    const DirectLaunchResult r = launchDirect(g.kernel, g.stream, setup, g.devicePlanes, o);
+    INFO("launch: " << directLaunchRejectName(r.reject) << " (CUresult " << static_cast<int>(r.result) << ")");
+    REQUIRE(r.ok());
+    REQUIRE(cuStreamSynchronize(g.stream) == CUDA_SUCCESS);
+    HostFrame frame(w, h, layout);
+    CUDA_MEMCPY2D c{};
+    c.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+    c.srcDevice = out;
+    c.srcPitch = pitch;
+    c.dstMemoryType = CU_MEMORYTYPE_HOST;
+    c.dstHost = frame.bytes.data();
+    c.dstPitch = static_cast<std::size_t>(w) * bpp;
+    c.WidthInBytes = static_cast<std::size_t>(w) * bpp;
+    c.Height = static_cast<std::size_t>(h);
+    REQUIRE(cuMemcpy2D(&c) == CUDA_SUCCESS);
+    return frame;
+}
+
+/// Mean time of one kernel launch at the setup's size, from CUDA events
+/// around `iterations` back-to-back launches (after a warm-up).
+double kernelMs(GpuRig& g, const DirectSetup& setup, int iterations) {
+    RigContext scope(g.context);
+    REQUIRE(scope.ok());
+    const int w = setup.params.outW;
+    const int h = setup.params.outH;
+    std::size_t pitch = 0;
+    const CUdeviceptr out = g.allocPitch(static_cast<std::size_t>(w) * 16u, static_cast<std::size_t>(h), pitch);
+    DirectOutput o{reinterpret_cast<void*>(static_cast<std::uintptr_t>(out)), static_cast<std::int32_t>(pitch), w, h,
+                   false};
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(launchDirect(g.kernel, g.stream, setup, g.devicePlanes, o).ok());
+    }
+    CUevent start = nullptr;
+    CUevent stop = nullptr;
+    REQUIRE(cuEventCreate(&start, CU_EVENT_DEFAULT) == CUDA_SUCCESS);
+    REQUIRE(cuEventCreate(&stop, CU_EVENT_DEFAULT) == CUDA_SUCCESS);
+    REQUIRE(cuEventRecord(start, g.stream) == CUDA_SUCCESS);
+    for (int i = 0; i < iterations; ++i) {
+        REQUIRE(launchDirect(g.kernel, g.stream, setup, g.devicePlanes, o).ok());
+    }
+    REQUIRE(cuEventRecord(stop, g.stream) == CUDA_SUCCESS);
+    REQUIRE(cuEventSynchronize(stop) == CUDA_SUCCESS);
+    float ms = 0.0f;
+    REQUIRE(cuEventElapsedTime(&ms, start, stop) == CUDA_SUCCESS);
+    cuEventDestroy(start);
+    cuEventDestroy(stop);
+    return static_cast<double>(ms) / static_cast<double>(iterations);
+}
+
+}  // namespace
+
+TEST_CASE("the direct kernel matches its CPU twin on the sample clip", "[reframe][direct][cuda][sample]") {
+    const std::string noCuda = cudaUnavailableReason();
+    if (!noCuda.empty()) {
+        SKIP("no CUDA device: " << noCuda);
+    }
+    REQUIRE_SAMPLE_CLIP();
+    const auto clip = openSampleClip();
+    constexpr std::uint32_t kFrame = 32;
+    const SampleFrame soft = decodeSampleFrame(*clip, kFrame);
+
+    GpuRig g;
+    prepareGpuRig(g, *clip, soft, kFrame);
+    WARN("direct kernel test: device frames via " << g.route);
+
+    // The importer's native panorama: only its layout matters to the direct
+    // path (the size is overwritten by the view), but the builder needs one.
+    geom::EquirectMap map;
+    map.layout = geom::EquirectLayout::Standard;
+    map.w = 6000;
+    map.h = 3000;
+
+    // ---- stitch A: the importer default (seam table) ---------------------------
+    render::RenderParamsBuilder seamBuilder = importerBuilder(*clip, soft);
+    auto seamBlock = seamBuilder.equirect(map).buildParams();
+    REQUIRE(seamBlock.ok());
+    REQUIRE(seamBlock.value().seamShiftEnabled == 1);
+    StitchState seamHost;
+    seamHost.equirect = seamBlock.value();
+    seamHost.seamTable = soft.seamTable.data();
+    StitchState seamDevice = seamHost;
+    seamDevice.seamTable = uploadTable(g, soft.seamTable);
+
+    // ---- stitch B: the 2-D parallax warp grid (replaces the seam table) --------
+    render::ParallaxWarpParams pw;
+    pw.backend = render::FlowBackendKind::Classical;
+    auto grid = render::buildParallaxWarp(clip->rig, soft.pair, clip->blend, pw, nullptr, pool());
+    INFO("parallax grid: " << (grid.ok() ? std::string("accepted") : grid.error().message));
+    REQUIRE(grid.ok());
+    render::RenderParamsBuilder warpBuilder;
+    warpBuilder.rig(clip->rig).color(clip->color).blend(clip->blend, true).alphaCoverage(true);
+    warpBuilder.warp(grid.value().uv, grid.value().w, grid.value().h, grid.value().latMinRad, grid.value().latMaxRad);
+    warpBuilder.gain(soft.gains[0], soft.gains[1]).stabilization(soft.stab);
+    auto warpBlock = warpBuilder.equirect(map).buildParams();
+    REQUIRE(warpBlock.ok());
+    REQUIRE(warpBlock.value().warpEnabled == 1);
+    StitchState warpHost;
+    warpHost.equirect = warpBlock.value();
+    warpHost.warpGrid = grid.value().uv.data();
+    StitchState warpDevice = warpHost;
+    warpDevice.warpGrid = uploadTable(g, grid.value().uv);
+
+    struct GpuCase {
+        const char* name;
+        Settings settings;
+        const StitchState* host;
+        const StitchState* device;
+    };
+    const GpuCase cases[] = {
+        {"across the seam, seam table", makeSettings(Resolution::MatchSequence, 90.0, 0.0, 0.0, 100.0, 0.0), &seamHost,
+         &seamDevice},
+        {"narrow 40, warp grid", makeSettings(Resolution::MatchSequence, 95.0, 5.0, 0.0, 40.0, 0.0), &warpHost,
+         &warpDevice},
+        {"tiny planet, seam table", asteroidSettings(Resolution::MatchSequence), &seamHost, &seamDevice},
+        {"rolled + source-rotated eye-offset, warp grid",
+         makeSettings(Resolution::MatchSequence, -40.0, 15.0, 25.0, 150.0, 40.0, 30.0, -12.0, 8.0), &warpHost,
+         &warpDevice},
+    };
+
+    for (const GpuCase& c : cases) {
+        for (const bool isHalf : {false, true}) {
+            INFO(c.name << (isHalf ? " (16f)" : " (32f)"));
+            const DirectSetup cpuSetup = buildDirectParams(c.settings, *c.host, 1920, 1080, SizePx{});
+            const DirectSetup gpuSetup = buildDirectParams(c.settings, *c.device, 1920, 1080, SizePx{});
+            REQUIRE(cpuSetup.valid);
+            REQUIRE(gpuSetup.valid);
+
+            const HostFrame gpu = renderOnGpu(g, gpuSetup, isHalf);
+            HostFrame cpuFrame(1920, 1080, isHalf ? PixelLayout::Bgra16f : PixelLayout::Bgra32f);
+            REQUIRE(renderDirectCpu(cpuSetup, g.hostPlanes, cpuFrame.view(), &pool()));
+
+            const render::ImageDiffStats stats = render::compareImages16(gpu.toImage(), cpuFrame.toImage());
+            WARN("GPU vs CPU twin [" << c.name << (isHalf ? ", 16f" : ", 32f") << "]: PSNR " << stats.psnrDb
+                                     << " dB, max " << stats.maxAbsCode << " codes, "
+                                     << (100.0 * stats.fractionWithin2) << "% within 2 codes");
+            CHECK(stats.psnrDb >= 60.0);
+        }
+    }
+
+    // ---- timing -------------------------------------------------------------------
+    for (const auto& size : {std::pair<int, int>{2560, 1440}, std::pair<int, int>{3840, 2160}}) {
+        const Settings s = makeSettings(Resolution::MatchSequence, 90.0, 0.0, 0.0, 100.0, 0.0);
+        const DirectSetup seamSetup = buildDirectParams(s, seamDevice, size.first, size.second, SizePx{});
+        const DirectSetup warpSetup = buildDirectParams(s, warpDevice, size.first, size.second, SizePx{});
+        REQUIRE(seamSetup.valid);
+        REQUIRE(warpSetup.valid);
+        const double seamMs = kernelMs(g, seamSetup, 50);
+        const double warpMs = kernelMs(g, warpSetup, 50);
+        // Host-side cost of the launch itself (validation + pointer queries).
+        RigContext scope(g.context);
+        REQUIRE(scope.ok());
+        std::size_t pitch = 0;
+        const CUdeviceptr out =
+            g.allocPitch(static_cast<std::size_t>(size.first) * 16u, static_cast<std::size_t>(size.second), pitch);
+        const DirectOutput o{reinterpret_cast<void*>(static_cast<std::uintptr_t>(out)),
+                             static_cast<std::int32_t>(pitch), size.first, size.second, false};
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 50; ++i) {
+            REQUIRE(launchDirect(g.kernel, g.stream, seamSetup, g.devicePlanes, o).ok());
+        }
+        const double hostUs =
+            std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 50.0;
+        REQUIRE(cuStreamSynchronize(g.stream) == CUDA_SUCCESS);
+        WARN("direct kernel " << size.first << "x" << size.second << " (32f, view across the seam): " << seamMs
+                              << " ms with the seam table, " << warpMs << " ms with the warp grid; launchDirect host "
+                              << "cost " << hostUs << " us per call");
+        CHECK(seamMs > 0.0);
+    }
+}
+
+TEST_CASE("launchDirect refuses host memory and a too-small output before launching", "[reframe][direct][cuda]") {
+    const std::string noCuda = cudaUnavailableReason();
+    if (!noCuda.empty()) {
+        SKIP("no CUDA device: " << noCuda);
+    }
+    // A real module and context, synthetic frames: this is about the
+    // refusals, which must hold whatever the pixels are.
+    CUdevice dev = 0;
+    REQUIRE(cuDeviceGet(&dev, 0) == CUDA_SUCCESS);
+    CUcontext ctx = nullptr;
+    REQUIRE(cuDevicePrimaryCtxRetain(&ctx, dev) == CUDA_SUCCESS);
+    {
+        RigContext scope(ctx);
+        REQUIRE(scope.ok());
+        CUmodule module = nullptr;
+        REQUIRE(cuModuleLoadFatBinary(&module, kOsvReframeFatbin) == CUDA_SUCCESS);
+        CUfunction fn = nullptr;
+        REQUIRE(cuModuleGetFunction(&fn, module, kDirectKernelName) == CUDA_SUCCESS);
+
+        auto rig = syntheticRig(600);
+        REQUIRE(rig.ok());
+        const OsvColorParams cp = color::makeColorParams(color::kDefaultDlogMFit, color::OutputTransfer::PQ, 0.0f);
+        StitchState stitch;
+        stitch.equirect = equirectBlock(rig.value(), cp, Mat3d::identity(), 1200, 600);
+        const DirectSetup setup =
+            buildDirectParams(makeSettings(Resolution::MatchSequence, 0, 0, 0, 90, 0), stitch, 64, 36, SizePx{});
+        REQUIRE(setup.valid);
+
+        // Device P010 planes of the right shape.
+        std::vector<osv_u16> hy(600u * 600u, 512u << 6);
+        std::vector<osv_u16> huv(600u * 300u, 512u << 6);
+        CUdeviceptr dy = 0;
+        CUdeviceptr duv = 0;
+        REQUIRE(cuMemAlloc(&dy, hy.size() * 2u) == CUDA_SUCCESS);
+        REQUIRE(cuMemAlloc(&duv, huv.size() * 2u) == CUDA_SUCCESS);
+        REQUIRE(cuMemcpyHtoD(dy, hy.data(), hy.size() * 2u) == CUDA_SUCCESS);
+        REQUIRE(cuMemcpyHtoD(duv, huv.data(), huv.size() * 2u) == CUDA_SUCCESS);
+        const OsvPlane hostPlane = hostP010Plane(hy, huv, 600, 600);
+        OsvPlane devPlane = hostPlane;
+        devPlane.y = reinterpret_cast<const osv_u16*>(static_cast<std::uintptr_t>(dy));
+        devPlane.u = reinterpret_cast<const osv_u16*>(static_cast<std::uintptr_t>(duv));
+        devPlane.v = devPlane.u + 1;
+        const OsvPlane devPlanes[2] = {devPlane, devPlane};
+        const OsvPlane hostPlanes[2] = {hostPlane, hostPlane};
+
+        // An output one row short of the frame it claims to be.
+        CUdeviceptr shortOut = 0;
+        REQUIRE(cuMemAlloc(&shortOut, 64u * 16u * 35u) == CUDA_SUCCESS);
+        CUdeviceptr fullOut = 0;
+        REQUIRE(cuMemAlloc(&fullOut, 64u * 16u * 36u) == CUDA_SUCCESS);
+        const DirectOutput shortFrame{reinterpret_cast<void*>(static_cast<std::uintptr_t>(shortOut)), 64 * 16, 64, 36,
+                                      false};
+        const DirectOutput fullFrame{reinterpret_cast<void*>(static_cast<std::uintptr_t>(fullOut)), 64 * 16, 64, 36,
+                                     false};
+        std::vector<float> hostOut(64u * 36u * 4u);
+        const DirectOutput hostFrame{hostOut.data(), 64 * 16, 64, 36, false};
+
+        CHECK(launchDirect(fn, nullptr, setup, hostPlanes, fullFrame).reject == DirectLaunchReject::Memory);
+        CHECK(launchDirect(fn, nullptr, setup, devPlanes, shortFrame).reject == DirectLaunchReject::Memory);
+        CHECK(launchDirect(fn, nullptr, setup, devPlanes, hostFrame).reject == DirectLaunchReject::Memory);
+        // A seam table claimed longer than its allocation.
+        StitchState seamStitch = stitch;
+        CUdeviceptr seam = 0;
+        REQUIRE(cuMemAlloc(&seam, 100u * sizeof(float)) == CUDA_SUCCESS);
+        seamStitch.equirect.seamShiftEnabled = 1;
+        seamStitch.equirect.seamColumns = 360;
+        seamStitch.seamTable = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(seam));
+        const DirectSetup seamSetup =
+            buildDirectParams(makeSettings(Resolution::MatchSequence, 0, 0, 0, 90, 0), seamStitch, 64, 36, SizePx{});
+        REQUIRE(seamSetup.valid);
+        CHECK(launchDirect(fn, nullptr, seamSetup, devPlanes, fullFrame).reject == DirectLaunchReject::Memory);
+
+        // And the well-formed call launches and completes cleanly.
+        const DirectLaunchResult ok = launchDirect(fn, nullptr, setup, devPlanes, fullFrame);
+        CHECK(ok.ok());
+        CHECK(cuCtxSynchronize() == CUDA_SUCCESS);
+
+        cuMemFree(seam);
+        cuMemFree(fullOut);
+        cuMemFree(shortOut);
+        cuMemFree(duv);
+        cuMemFree(dy);
+        cuModuleUnload(module);
+    }
+    cuDevicePrimaryCtxRelease(dev);
 }

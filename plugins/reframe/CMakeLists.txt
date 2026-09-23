@@ -99,8 +99,10 @@ add_custom_command(
           -fatbin -O3 -fmad=false -Wno-deprecated-gpu-targets
           ${_osv_reframe_gencode_args}
           "-I${CMAKE_SOURCE_DIR}/include"
+          "-I${CMAKE_CURRENT_SOURCE_DIR}"
           -o "${_osv_reframe_fatbin}" "${_osv_reframe_kernel_src}"
   DEPENDS "${_osv_reframe_kernel_src}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/DirectKernelAbi.h"
           "${CMAKE_SOURCE_DIR}/include/osv/render/osv_kernel.h"
           "${CMAKE_SOURCE_DIR}/include/osv/color/ColorMath.h"
   COMMENT "nvcc ReframeKernel.cu -> fatbin (${_osv_reframe_arch_report})"
@@ -125,9 +127,13 @@ osv_add_premiere_plugin(Open360Reframe
     ReframeCpu.h
     ReframeParams.h
     # The direct fisheye -> view path (docs/DIRECT_GPU.md, WP-C): the
-    # parameter builder and its CPU twin.
+    # parameter builder and CPU twin, and the driver-API launcher of the
+    # fused kernel that ReframeKernel.cu adds to the same fatbin.
     DirectRender.cpp
     DirectRender.h
+    DirectLaunch.cpp
+    DirectLaunch.h
+    DirectKernelAbi.h
     # The interactive Program Monitor overlay.  Two translation units on
     # purpose: ReframeUi.cpp is the pure interaction maths and names no Adobe
     # type, so the tests compile the very same source the .aex contains and
@@ -144,6 +150,11 @@ osv_add_premiere_plugin(Open360Reframe
 # The generated sources are produced by the custom commands above.
 set_source_files_properties("${_osv_reframe_fatbin_cpp}" PROPERTIES GENERATED TRUE)
 
+# The reframe tests compile the SAME embedded fatbin into their executable, so
+# they can load the kernels the .aex carries without reaching into the module
+# (kOsvReframeFatbin is not exported, and must not be).  Publishing the path
+# on the target keeps the tests from hard-coding this directory's layout.
+set_target_properties(Open360Reframe PROPERTIES OSV_REFRAME_FATBIN_CPP "${_osv_reframe_fatbin_cpp}")
 
 target_include_directories(Open360Reframe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 

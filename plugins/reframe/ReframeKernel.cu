@@ -26,8 +26,45 @@
 // Compiled with -fmad=false and without fast math, exactly like the library's
 // own CUDA renderer, so the GPU result stays inside the parity budget the
 // tests assert (PSNR >= 60 dB for 32f, >= 45 dB for 16f).
+//
+// The fatbin carries TWO kernels:
+//
+//   osvReframeEquirectKernel  the classic path: sample the view out of the
+//                             importer's stitched equirect (above);
+//   osvReframeDirectKernel    the direct path: run the stitch shader
+//                             osvShadePixelW() in OSV_MODE_REFRAME straight
+//                             from the two fisheye frames (P010 in VRAM),
+//                             writing Premiere's output frame in one pass.
+//                             Parameters come from buildDirectParams()
+//                             (DirectRender.h) and the launch from
+//                             launchDirect() (DirectLaunch.h).
 
 #include "osv/render/osv_kernel.h"
+
+#include "DirectKernelAbi.h"
+
+// ---------------------------------------------------------------------------
+//  Parameter-space access
+//
+//  osvShadePixelW() takes its parameter block by POINTER and indexes into it
+//  with run-time indices (the occlusion polygon loop, the lens loop).  Taking
+//  the address of an ordinary by-value kernel parameter makes the compiler
+//  copy the whole ~1 KB block into per-thread local memory first - millions of
+//  threads times a kilobyte of traffic, several times the cost of the shading
+//  itself.  __grid_constant__ (compute capability 7.0+) lets the address point
+//  straight into the read-only parameter space instead, which is what the
+//  library's own CUDA renderer does.
+//
+//  The fatbin also carries PTX for compute_50 and cubins for sm_60/61, where
+//  the qualifier does not exist; there the parameter keeps the (correct,
+//  slower) local copy.  The qualifier changes code generation only, never the
+//  parameter's size or layout, so the host launch is identical either way.
+// ---------------------------------------------------------------------------
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+#define OSV_GRID_CONST __grid_constant__
+#else
+#define OSV_GRID_CONST
+#endif
 
 // ---------------------------------------------------------------------------
 //  Output store
@@ -83,6 +120,26 @@ __device__ __forceinline__ unsigned short osvFloatToHalfDevice(float value) {
     return (unsigned short)(sign | half);
 }
 
+/// Store one straight-RGBA float quadruple as the BGRA texel at column `x`
+/// of the output row `row`, in 16f or 32f.  Shared by both kernels so the
+/// two paths quantise a 16f frame identically - and identically to the CPU
+/// path's storePixel(), whose float -> half conversion is the same algorithm.
+__device__ __forceinline__ void osvStoreBgraDevice(unsigned char* row, int x, int isHalf, const float* rgba) {
+    if (isHalf) {
+        unsigned short* texel = (unsigned short*)row + (size_t)x * 4u;
+        texel[0] = osvFloatToHalfDevice(rgba[2]); /* B */
+        texel[1] = osvFloatToHalfDevice(rgba[1]); /* G */
+        texel[2] = osvFloatToHalfDevice(rgba[0]); /* R */
+        texel[3] = osvFloatToHalfDevice(rgba[3]); /* A */
+    } else {
+        float* texel = (float*)row + (size_t)x * 4u;
+        texel[0] = rgba[2];
+        texel[1] = rgba[1];
+        texel[2] = rgba[0];
+        texel[3] = rgba[3];
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  The kernel
 //
@@ -115,17 +172,48 @@ extern "C" __global__ void osvReframeEquirectKernel(OsvReframeParams params, Osv
      * "GPU Frames always have origin top left"), so row y is simply
      * y * rowBytes from the base. */
     unsigned char* row = dstBase + (size_t)y * (size_t)dstRowBytes;
-    if (dstIsHalf) {
-        unsigned short* texel = (unsigned short*)row + (size_t)x * 4u;
-        texel[0] = osvFloatToHalfDevice(rgba[2]); /* B */
-        texel[1] = osvFloatToHalfDevice(rgba[1]); /* G */
-        texel[2] = osvFloatToHalfDevice(rgba[0]); /* R */
-        texel[3] = osvFloatToHalfDevice(rgba[3]); /* A */
-    } else {
-        float* texel = (float*)row + (size_t)x * 4u;
-        texel[0] = rgba[2];
-        texel[1] = rgba[1];
-        texel[2] = rgba[0];
-        texel[3] = rgba[3];
+    osvStoreBgraDevice(row, x, dstIsHalf, rgba);
+}
+
+// ---------------------------------------------------------------------------
+//  The direct kernel: fisheyes -> view, in one pass
+//
+//  extern "C" for the same unmangled-name reason as the kernel above; the
+//  name and the parameter list are pinned in DirectKernelAbi.h, which the
+//  host launcher compiles too.
+//
+//  Everything that can be validated has been, on the host, before the launch
+//  (launchDirect): the parameter block is finite and composed, the planes
+//  match the lens blocks, the output is device memory of the right size and
+//  alignment.  The kernel therefore only guards the grid tail and runs the
+//  shared shader - the same osvShadePixelW() the CPU twin, the library's CPU
+//  renderer and its CUDA renderer all run, which is what makes the GPU/CPU
+//  parity test meaningful.
+//
+//  The parameter block is ~1 KB, well inside the 4 KB kernel-parameter limit
+//  every architecture in the fatbin supports (OsvRenderParams is asserted
+//  <= 4 KB by the library tests; the planes add 112 bytes).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void osvReframeDirectKernel(OSV_GRID_CONST const OsvRenderParams params,
+                                                  OSV_GRID_CONST const OsvDirectPlanes planes,
+                                                  const float* __restrict__ seam, const float* __restrict__ warp,
+                                                  unsigned char* __restrict__ dstBase, int dstRowBytes,
+                                                  int dstIsHalf) {
+    const int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    /* Grids are rounded up to whole blocks; the tail threads do nothing. */
+    if (x >= params.outW || y >= params.outH) {
+        return;
     }
+
+    /* The stitch shader in reframe mode: view ray -> body ray (Rout already
+     * holds stabilisation * camera) -> both lenses, feather / occlusion
+     * blend, seam shift, warp grid, colour pipeline.  Pixels no lens sees
+     * come back transparent black, so no clear pass is needed. */
+    float rgba[4];
+    osvShadePixelW(&params, planes.lens, seam, warp, x, y, rgba);
+
+    /* Premiere GPU frame: top-left origin, positive pitch. */
+    unsigned char* row = dstBase + (size_t)y * (size_t)dstRowBytes;
+    osvStoreBgraDevice(row, x, dstIsHalf, rgba);
 }

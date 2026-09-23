@@ -37,9 +37,10 @@ add_executable(osv_reframe_tests
   # renderer directly; the .aex contains the identical object.
   "${_osv_reframe_src}/ReframeCpu.cpp"
   # The direct fisheye -> view path, for the same reason: test_direct.cpp
-  # drives the builder and the CPU twin the .aex contains, against the
-  # equirect path it must frame identically.
+  # drives the builder, the CPU twin and the driver-API launcher the .aex
+  # contains, against the equirect path it must frame identically.
   "${_osv_reframe_src}/DirectRender.cpp"
+  "${_osv_reframe_src}/DirectLaunch.cpp"
   # The overlay's interaction core, for the same reason: test_ui.cpp pins the
   # drag-to-degrees mapping AND ITS SIGNS as pure arithmetic, with no host and
   # no window, against the very source the .aex contains.  ReframeUiEvent.cpp
@@ -51,6 +52,17 @@ add_executable(osv_reframe_tests
 
 target_include_directories(osv_reframe_tests PRIVATE "${_osv_reframe_src}")
 
+# The embedded fatbin the .aex carries, compiled into the tests as well so the
+# [cuda] direct-kernel tests load exactly the kernels Premiere would.  The
+# path is published by plugins/reframe on its target; the source is GENERATED
+# there and (CMP0118, cmake_minimum_required >= 3.20) visible here, and
+# add_dependencies() below orders the generating target first.
+get_target_property(_osv_reframe_fatbin_cpp Open360Reframe OSV_REFRAME_FATBIN_CPP)
+if(NOT _osv_reframe_fatbin_cpp)
+  message(FATAL_ERROR "Open360Reframe does not publish OSV_REFRAME_FATBIN_CPP; plugins/reframe/CMakeLists.txt must set it")
+endif()
+target_sources(osv_reframe_tests PRIVATE "${_osv_reframe_fatbin_cpp}")
+set_source_files_properties("${_osv_reframe_fatbin_cpp}" PROPERTIES GENERATED TRUE)
 
 # The [sample] direct-path tests need the 6K clip.  OSV_SAMPLE_FILE in the
 # environment wins at run time; this compile-time default is only used when it
