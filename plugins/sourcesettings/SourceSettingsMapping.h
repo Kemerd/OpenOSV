@@ -6,7 +6,7 @@
 //
 // It is a separate, Adobe-free translation unit for the same reason
 // plugins/importer/PrefsMapping.cpp is: the effect itself can only be driven
-// through the loaded module, but the arithmetic that turns nine control
+// through the loaded module, but the arithmetic that turns ten control
 // values into a blob (and back) is where a mistake is both easy to make and
 // invisible - an off-by-one between AE's 1-based popup values and PrefsBlob's
 // 0-based enums would silently give every user the wrong stabilisation mode.
@@ -46,6 +46,7 @@ struct ControlValues {
     int dlogmFit = OSV_SS_FIT_DEFAULT;           ///< 1-based popup value.
     double exposureStops = OSV_SS_EXPOSURE_DEFAULT;
     int renderDevice = OSV_SS_DEVICE_DEFAULT;    ///< 1-based popup value.
+    int directColour = OSV_SS_DIRECT_COLOUR_DEFAULT;  ///< [WP-SETTINGS] 1-based popup value.
 };
 
 /// Control values -> PrefsBlob.

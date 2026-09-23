@@ -985,11 +985,24 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
         if (!m_colorBuilt) {
             rebuildColor();
         }
+        // [WP-SETTINGS] Whatever is in force here (the defaults, when the
+        // host never gave this clip a blob) is what the equirect route
+        // renders, so the engine is told - as a statement that fills a blank
+        // but never overrides a blob another instance was actually given.
+        publishSettingsLocked(false);
         return;
     }
     const PrefsBlob incoming = PrefsBlob::fromBytes(bytes, length);
     if (m_colorBuilt && incoming == m_prefs) {
-        return;  // Nothing changed: the common case, keep every cache.
+        // Nothing changed: the common case, keep every cache.  [WP-SETTINGS]
+        // Unless the host's blob was never published from this instance -
+        // it first ran on its defaults and the blob equals them - in which
+        // case the engine must hear it now, or an older instance's different
+        // settings would stay in force.
+        if (!m_settingsPublishedFromHost) {
+            publishSettingsLocked(true);
+        }
+        return;
     }
 
     const PrefsBlob previous = m_prefs;
@@ -998,9 +1011,7 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
     // The engine renders this file for the direct GPU path with its OWN
     // instance; tell it what the user chose, so both paths agree.  The
     // engine's instance does not publish back (it would only echo).
-    if (!m_engineOwned) {
-        enginePublishPrefs(m_path, m_prefs);
-    }
+    publishSettingsLocked(true);
 
     // Colour depends on colorOutput, dlogmFit and exposureStops.
     if (!m_colorBuilt || previous.colorOutput != incoming.colorOutput || previous.dlogmFit != incoming.dlogmFit ||
@@ -1037,6 +1048,29 @@ PrefsBlob ImporterInstance::prefs() const {
 }
 
 PrefsBlob ImporterInstance::prefsLocked() const noexcept { return m_prefs; }
+
+// [WP-SETTINGS]
+void ImporterInstance::publishSettingsLocked(bool fromHost) noexcept {
+    // The engine's own instance only ever APPLIES published settings;
+    // publishing them back would be an echo.
+    if (m_engineOwned) {
+        return;
+    }
+    // The token is taken at the first publication, which for a Premiere
+    // instance is imGetInfo8 right after imOpenFile8 - so token order is the
+    // order Premiere opened its instances in.
+    if (m_settingsPublisher == 0) {
+        m_settingsPublisher = engineNewPublisherToken();
+    }
+    SettingsPublisher who;
+    who.token = m_settingsPublisher;
+    who.fromHost = fromHost;
+    who.importerId = m_importerId.load(std::memory_order_relaxed);
+    enginePublishPrefs(m_path, m_prefs, who);
+    if (fromHost) {
+        m_settingsPublishedFromHost = true;
+    }
+}
 
 AudioDecoder* ImporterInstance::audioLocked() { return audioImpl(); }
 

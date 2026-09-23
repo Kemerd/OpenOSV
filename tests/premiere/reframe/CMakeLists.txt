@@ -33,6 +33,7 @@ add_executable(osv_reframe_tests
   test_pipl.cpp
   test_ui.cpp
   test_direct.cpp
+  test_direct_settings.cpp  # [WP-SETTINGS] which clips the direct path renders
   # The GPU filter driven the way Premiere drives it (frames through the GPU
   # Device Suite, instances through the PrGPUFilter table), shared by the
   # parameter-probe tests and the direct path's end-to-end tests below.
@@ -50,6 +51,9 @@ add_executable(osv_reframe_tests
   # contains, against the equirect path it must frame identically.
   "${_osv_reframe_src}/DirectRender.cpp"
   "${_osv_reframe_src}/DirectLaunch.cpp"
+  # [WP-SETTINGS] The direct path's Source Settings rule, pure, pinned by
+  # test_direct_settings.cpp against the source the .aex contains.
+  "${_osv_reframe_src}/DirectPathSettings.cpp"
   # The overlay's interaction core, for the same reason: test_ui.cpp pins the
   # drag-to-degrees mapping AND ITS SIGNS as pure arithmetic, with no host and
   # no window, against the very source the .aex contains.  ReframeUiEvent.cpp

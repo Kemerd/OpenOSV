@@ -144,6 +144,31 @@ enum class PrefsParallax : std::uint8_t {
     Count
 };
 
+/// [WP-SETTINGS] "Program Monitor Colour": how the reframe effect's direct
+/// path (docs/DIRECT_GPU.md) treats a clip whose colour output is not the
+/// sequence's working space.
+///
+/// The direct path renders straight from the fisheyes into the working
+/// space, so Premiere's conversion of the importer's frame never runs.  When
+/// the colour output IS the working space the two routes agree exactly.
+/// When it is not, PQ, HLG and Rec.709 are still three encodings of the same
+/// scene, and rendering that scene straight into the working space with
+/// OpenOSV's own tone mapping is the colour-managed answer - it just is not
+/// Premiere's generic conversion, which is what the Source monitor shows.
+/// Persisted, so append-only.
+enum class PrefsDirectColour : std::uint8_t {
+    /// Render straight into the sequence's working space with OpenOSV's own
+    /// conversion: the direct path's speed and sharpness for every graded
+    /// colour output.  The default - and what the zero byte of an older
+    /// project reads as.
+    SequenceSpace = 0,
+    /// Hand a clip whose colour output is not the working space to the
+    /// equirect route, so the Program monitor shows exactly what Premiere's
+    /// own conversion makes of it (the Source monitor route).
+    MatchSource = 1,
+    Count
+};
+
 /// Renderer selection; the numeric values are the ones stored in the blob
 /// and match HostContext's RenderDevicePreference.
 enum class PrefsRenderDevice : std::uint8_t {
@@ -192,7 +217,13 @@ struct PrefsBlob {
     /// blob written before this byte existed, and every fresh one - keeps
     /// calibration 0 meaning Auto.  Read it through calibrationChoice().
     std::uint8_t calibrationForceNative = 0;
-    std::uint8_t reserved[105] = {};   ///< Zero; future fields.
+    /// Offset 23: the rest of WP-CALIB's byte range, unused.  Zero, and
+    /// zeroed by sanitise(), so it is free for a future calibration field.
+    std::uint8_t padAfterCalibration = 0;
+    /// PrefsDirectColour: how the effect's direct path treats this clip's
+    /// colour output (0 = SequenceSpace, the default; see DIRECT_GPU.md).
+    std::uint8_t directColour = 0;
+    std::uint8_t reserved[103] = {};   ///< Zero; future fields.
 
     /// A blob with every field at its documented default.
     [[nodiscard]] static PrefsBlob defaults() noexcept {
@@ -298,6 +329,13 @@ struct PrefsBlob {
             calibrationForceNative = 0;
             clean = false;
         }
+        // Zero is the default, so a corrupt byte lands there too.
+        clampEnum(directColour, static_cast<std::uint8_t>(PrefsDirectColour::Count),
+                  static_cast<std::uint8_t>(PrefsDirectColour::SequenceSpace));
+        if (padAfterCalibration != 0) {
+            padAfterCalibration = 0;
+            clean = false;
+        }
 
         // NaN compares false with everything, so test the valid range and
         // reset anything else (NaN, infinities, out of range).
@@ -344,6 +382,10 @@ struct PrefsBlob {
     [[nodiscard]] PrefsRenderDevice device() const noexcept { return static_cast<PrefsRenderDevice>(renderDevice); }
     [[nodiscard]] PrefsParallax parallaxMode() const noexcept { return static_cast<PrefsParallax>(parallax); }
     [[nodiscard]] PrefsFlowBackend flow() const noexcept { return static_cast<PrefsFlowBackend>(flowBackend); }
+    /// [WP-SETTINGS]
+    [[nodiscard]] PrefsDirectColour directColourMode() const noexcept {
+        return static_cast<PrefsDirectColour>(directColour);
+    }
     /// True when the flow-based parallax correction should run.
     [[nodiscard]] bool parallaxEnabled() const noexcept { return parallaxMode() == PrefsParallax::On; }
 
@@ -418,6 +460,12 @@ static_assert(offsetof(PrefsBlob, flowBackend) == 21, "PrefsBlob layout drifted"
 // has a choice that says so.
 static_assert(offsetof(PrefsBlob, calibration) == 13, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, calibrationForceNative) == 22, "PrefsBlob layout drifted");
-static_assert(offsetof(PrefsBlob, reserved) == 23, "PrefsBlob layout drifted");
+// directColour was taken from the reserved block the same way, at offset 24
+// (offset 23 stays unused so each field keeps the offset it was built and
+// tested against).  An older blob's zero byte reads as
+// PrefsDirectColour::SequenceSpace, the default.
+static_assert(offsetof(PrefsBlob, padAfterCalibration) == 23, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, directColour) == 24, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, reserved) == 25, "PrefsBlob layout drifted");
 
 }  // namespace osv::premiere

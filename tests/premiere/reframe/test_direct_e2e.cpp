@@ -71,6 +71,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -204,6 +205,41 @@ void configureSequence(MockHost& host, int w, int h, PrTime ticksPerFrame, const
     seq.ticksPerFrame = ticksPerFrame;
     seq.workingColorSpace = host.colorSpaceId(workingSpace);
     host.setSequence(kTimeline, seq);
+}
+
+/// Publish `prefs` as the sample clip's Source Settings the way Premiere does:
+/// open an importer instance of the file and describe it (imGetInfo8 carries
+/// the clip's blob, and the instance publishes it to the engine).  Premiere
+/// always does this before it can hand the effect a frame of the clip, and
+/// the direct path refuses to render settings nobody published [WP-SETTINGS],
+/// so every direct-path case starts here.  The handle must outlive the
+/// renders only as far as the test wants the instance alive; what it
+/// published stays in force either way.
+[[nodiscard]] ImporterHarness::ClipHandle publishSourceSettings(ImporterHarness& harness,
+                                                                const std::filesystem::path& clip,
+                                                                const PrefsBlob& prefs, csSDK_int32 importerId = 7) {
+    ImporterHarness::ClipHandle handle = harness.openClip(clip, importerId);
+    if (handle.open()) {
+        imFileInfoRec8 info{};
+        if (harness.getInfo8(handle, info, &prefs) != imNoErr) {
+            handle.close();
+        }
+    }
+    return handle;
+}
+
+/// Mean of the RGB channels over the covered (alpha > 0) pixels of an RGBA
+/// image: a brightness measure for "did the exposure change reach it".
+[[nodiscard]] double meanRgb(const std::vector<float>& rgba) {
+    double sum = 0.0;
+    std::size_t n = 0;
+    for (std::size_t i = 0; i + 3 < rgba.size(); i += 4) {
+        if (rgba[i + 3] > 0.0f) {
+            sum += static_cast<double>(rgba[i]) + static_cast<double>(rgba[i + 1]) + static_cast<double>(rgba[i + 2]);
+            n += 3;
+        }
+    }
+    return n ? sum / static_cast<double>(n) : 0.0;
 }
 
 /// A rectilinear view that stays well inside the master lens: a comfortable
@@ -659,6 +695,10 @@ TEST_CASE("clip time reaches the right media frame on trimmed, sped-up, slowed a
     constexpr int kW = 480;
     constexpr int kH = 270;
     configureSequence(host, kW, kH, kTicksPerFrame5994, kPrRec2100PQ);
+    // [WP-SETTINGS] The clip's Source Settings, published as Premiere's
+    // importer instance of it does before any render.
+    auto published = publishSourceSettings(harness, sample, PrefsBlob::defaults());
+    REQUIRE(published.open());
 
     const std::uintmax_t logStart = reframeLogSize();
     GpuEntryScope scope(host);
@@ -779,6 +819,9 @@ TEST_CASE("a TransformNodeTime failure or a media time before the clip falls bac
     constexpr int kW = 320;
     constexpr int kH = 180;
     configureSequence(host, kW, kH, kTicksPerFrame5994, kPrRec2100PQ);
+    // [WP-SETTINGS] Published as Premiere's importer instance does first.
+    auto published = publishSourceSettings(harness, e2eSampleClipPath(), PrefsBlob::defaults());
+    REQUIRE(published.open());
     const ClipNodes n{120, 220, 320};
     bindMedia(host, n, utf8Of(e2eSampleClipPath()));
     writeVerbatimControls(host, n.effect, plainView());
@@ -881,12 +924,16 @@ TEST_CASE("every source the direct path cannot serve renders through the equirec
          nullptr},
         {"an effect with no owning clip", {135, 235, 335},
          [](MockHost& h, const ClipNodes& n) { h.setNodeType(n.effect, kVideoSegment_NodeType_Effect); }, nullptr},
+        // [WP-SETTINGS] No importer instance can open either file, so no
+        // Source Settings are ever published for it, and the direct path's
+        // settings rule hands it to the equirect route before the engine is
+        // even asked to open it (it used to be the engine's "cannot open").
         {"an OSV file that does not exist", {136, 236, 336},
          [missing](MockHost& h, const ClipNodes& n) { bindMedia(h, n, utf8Of(missing)); },
-         "for this frame and this instance - engine: cannot open"},
+         "'missing_clip.OSV' Source Settings unknown -> equirect route"},
         {"an OSV file the engine cannot parse", {137, 237, 337},
          [garbage](MockHost& h, const ClipNodes& n) { bindMedia(h, n, utf8Of(garbage)); },
-         "for this frame and this instance - engine: cannot open"},
+         "'not_a_clip.OSV' Source Settings unknown -> equirect route"},
     };
 
     GpuEntryScope scope(host);
@@ -961,6 +1008,12 @@ TEST_CASE("the direct path serves exactly the working spaces it can produce", "[
     };
 
     // ---- produced: PQ and HLG on BT.2020, BT.709 ------------------------------------
+    // [WP-SETTINGS] The clip's default Source Settings - PQ output, Program
+    // Monitor Colour "Sequence space (fast)" - so every space the path can
+    // produce is served straight from the fisheyes, the user's everyday
+    // PQ-clip-in-a-Rec.709-sequence included.
+    auto publishedDefaults = publishSourceSettings(harness, e2eSampleClipPath(), PrefsBlob::defaults(), 40);
+    REQUIRE(publishedDefaults.open());
     const std::vector<float> pq = renderUnder(kPrRec2100PQ);
     const std::vector<float> hlg = renderUnder(kPrRec2100HLG);
     const std::vector<float> rec709 = renderUnder(kPrRec709);
@@ -970,6 +1023,39 @@ TEST_CASE("the direct path serves exactly the working spaces it can produce", "[
     // The working space really reached the engine: the three encodings differ.
     CHECK(maxAbsDifference(pq, hlg) > 0.01);
     CHECK(maxAbsDifference(pq, rec709) > 0.01);
+
+    // ---- [WP-SETTINGS] the opt-in: Match Source monitor --------------------------------
+    // A PQ clip is then served directly only in a PQ sequence; in HLG and
+    // Rec.709 sequences Premiere's own conversion of the importer's PQ frame
+    // is what the user asked for, so the equirect route keeps it.  (A newer
+    // importer instance publishes, as Premiere's does after a Source
+    // Settings change.)
+    PrefsBlob matchSource = PrefsBlob::defaults();
+    matchSource.directColour = static_cast<std::uint8_t>(osv::premiere::PrefsDirectColour::MatchSource);
+    auto publishedMatch = publishSourceSettings(harness, e2eSampleClipPath(), matchSource, 41);
+    REQUIRE(publishedMatch.open());
+    const std::vector<float> pqMatch = renderUnder(kPrRec2100PQ);
+    CHECK(drawnBy(pqMatch) == DrawnBy::Direct);
+    CHECK(maxAbsDifference(pqMatch, pq) == 0.0);  // the same picture either way when the spaces agree
+    CHECK(drawnBy(renderUnder(kPrRec2100HLG)) == DrawnBy::Equirect);
+    CHECK(drawnBy(renderUnder(kPrRec709)) == DrawnBy::Equirect);
+
+    // ---- [WP-SETTINGS] the D-Log M passthrough: never the direct path -----------------
+    // Declared as BT.2020 RGB Full (Scene), which none of these spaces is.
+    PrefsBlob passthrough = PrefsBlob::defaults();
+    passthrough.colorOutput = static_cast<std::uint8_t>(osv::premiere::PrefsColorOutput::DLogM);
+    auto publishedLog = publishSourceSettings(harness, e2eSampleClipPath(), passthrough, 42);
+    REQUIRE(publishedLog.open());
+    for (const char* space : {kPrRec2100PQ, kPrRec2100HLG, kPrRec709}) {
+        INFO("passthrough in " << space);
+        CHECK(drawnBy(renderUnder(space)) == DrawnBy::Equirect);
+    }
+
+    // Back to the defaults (a yet newer instance), so every refusal below is
+    // down to the working space alone.
+    auto publishedAgain = publishSourceSettings(harness, e2eSampleClipPath(), PrefsBlob::defaults(), 43);
+    REQUIRE(publishedAgain.open());
+    CHECK(drawnBy(renderUnder(kPrRec709)) == DrawnBy::Direct);
 
     // ---- not produced: the equirect path, where Premiere's own conversion of
     // the importer's frame stays in charge -------------------------------------
@@ -1034,4 +1120,150 @@ TEST_CASE("without the importer in the process the effect renders through the eq
     CHECK(reframeLogContains("reframe/direct: the OpenOSV importer is not loaded"));
     // An unbound instance acquires nothing to begin with.
     CHECK(host.totalNodeRefs() == 0);
+}
+
+// ===========================================================================
+//  5. [WP-SETTINGS] Source Settings changes reach the direct path
+// ===========================================================================
+
+TEST_CASE("a Source Settings change reaches the very next direct frame of the same GPU instance",
+          "[reframe][direct][e2e][cuda][sample][settings]") {
+    // Field report: Exposure -1 in a clip's Source Settings darkened the
+    // Source monitor but not the Program monitor's direct render.  Premiere's
+    // answer to a Source Settings change is to open a NEW importer instance
+    // with the new blob (and to keep the old one around); the effect renders
+    // the same clip time again.  This drives exactly that sequence through
+    // both built modules and checks the pixels, not just a parameter block -
+    // and deliberately keeps ONE GPU filter instance throughout, so the change
+    // is proven to need nothing from Premiere beyond calling Render again.
+    E2E_REQUIRE_SAMPLE();
+    ImporterHarness harness;
+    INFO("importer: " << harness.loadError());
+    REQUIRE(harness.loaded());
+    MockHost& host = harness.host();
+    E2E_REQUIRE_GPU_AND_ENGINE(host);
+
+    const std::filesystem::path sample = e2eSampleClipPath();
+    constexpr int kW = 480;
+    constexpr int kH = 270;
+    configureSequence(host, kW, kH, kTicksPerFrame5994, kPrRec2100PQ);
+    const PrTime t = 16 * kTicksPerFrame5994;
+
+    // ---- the clip as imported: default Source Settings ---------------------------
+    auto original = publishSourceSettings(harness, sample, PrefsBlob::defaults(), 51);
+    REQUIRE(original.open());
+
+    // The effect's media node spells the file differently from the importer's
+    // instances - long-path prefix, upper case, backslashes.  The engine keys
+    // Source Settings by file identity, so they must still meet; the unique
+    // spelling also gives this case its own entries in the effect's
+    // once-per-change log memory, whatever ran earlier in the process.
+    std::wstring wide = L"\\\\?\\" + std::filesystem::absolute(sample).lexically_normal().wstring();
+    for (wchar_t& c : wide) {
+        c = static_cast<wchar_t>(std::towupper(static_cast<wint_t>(c)));
+    }
+    const std::string spelled = utf8Of(std::filesystem::path(wide));
+
+    const ClipNodes n{160, 260, 360};
+    bindMedia(host, n, spelled);
+    writeVerbatimControls(host, n.effect, plainView());
+    const std::uintmax_t logStart = reframeLogSize();
+    GpuEntryScope scope(host);
+    REQUIRE(scope.result() == suiteError_NoError);
+    GpuFrame marker(host, 512, 256, false);
+    REQUIRE(marker.fill(kMarker));
+    GpuFrame out(host, kW, kH, false);
+    FilterInstance instance(scope, host, n.effect, kTimeline);
+    REQUIRE(instance.created() == suiteError_NoError);
+
+    const std::vector<float> before = renderAndRead(instance, marker, out, t, kTicksPerFrame5994);
+    REQUIRE(!before.empty());
+    REQUIRE(drawnBy(before) == DrawnBy::Direct);
+
+    // ---- the user sets Exposure -1: Premiere opens a newer instance ---------------
+    PrefsBlob darker = PrefsBlob::defaults();
+    darker.exposureStops = -1.0f;
+    auto changed = publishSourceSettings(harness, sample, darker, 52);
+    REQUIRE(changed.open());
+    const std::vector<float> after = renderAndRead(instance, marker, out, t, kTicksPerFrame5994);
+    REQUIRE(!after.empty());
+    CHECK(drawnBy(after) == DrawnBy::Direct);
+    const double meanBefore = meanRgb(before);
+    const double meanAfter = meanRgb(after);
+    WARN("mean PQ code before " << meanBefore << ", after Exposure -1 " << meanAfter);
+    // One stop down in linear light is a clear drop in PQ code values; the
+    // bound is loose on purpose (PQ is not linear) but far above noise - the
+    // same render repeated is bit-identical (checked below).
+    CHECK(meanAfter < meanBefore - 0.01);
+
+    // A FRESH instance of the same clip and time renders the same picture:
+    // the long-lived instance kept nothing stale.
+    {
+        const ClipNodes fresh{161, 261, 361};
+        bindMedia(host, fresh, spelled);
+        writeVerbatimControls(host, fresh.effect, plainView());
+        FilterInstance second(scope, host, fresh.effect, kTimeline);
+        REQUIRE(second.created() == suiteError_NoError);
+        GpuFrame out2(host, kW, kH, false);
+        const std::vector<float> again = renderAndRead(second, marker, out2, t, kTicksPerFrame5994);
+        REQUIRE(!again.empty());
+        CHECK(maxAbsDifference(again, after) == 0.0);
+        CHECK(second.dispose() == suiteError_NoError);
+    }
+
+    // ---- the OLD importer instance is handed its old blob again: ignored -------------
+    {
+        imFileInfoRec8 info{};
+        const PrefsBlob stale = PrefsBlob::defaults();
+        REQUIRE(harness.getInfo8(original, info, &stale) == imNoErr);
+    }
+    const std::vector<float> stillDarker = renderAndRead(instance, marker, out, t, kTicksPerFrame5994);
+    CHECK(maxAbsDifference(stillDarker, after) == 0.0);
+
+    // ---- Colour Output Rec.709 in this PQ sequence: still direct (the default) --------
+    // "Sequence space (fast)": the scene is rendered straight into the PQ
+    // working space, exactly as it was with the PQ output - the colour output
+    // only decides what the IMPORTER's own frame is encoded in.
+    PrefsBlob rec709 = darker;
+    rec709.colorOutput = static_cast<std::uint8_t>(osv::premiere::PrefsColorOutput::Rec709);
+    auto colourChanged = publishSourceSettings(harness, sample, rec709, 53);
+    REQUIRE(colourChanged.open());
+    const std::vector<float> sequenceSpace = renderAndRead(instance, marker, out, t, kTicksPerFrame5994);
+    CHECK(drawnBy(sequenceSpace) == DrawnBy::Direct);
+    CHECK(maxAbsDifference(sequenceSpace, after) == 0.0);
+
+    // ---- ...and "Match Source monitor" hands it to Premiere's conversion ---------------
+    PrefsBlob matchSource = rec709;
+    matchSource.directColour = static_cast<std::uint8_t>(osv::premiere::PrefsDirectColour::MatchSource);
+    auto matchInstance = publishSourceSettings(harness, sample, matchSource, 54);
+    REQUIRE(matchInstance.open());
+    CHECK(drawnBy(renderAndRead(instance, marker, out, t, kTicksPerFrame5994)) == DrawnBy::Equirect);
+
+    // ---- the log tells the story, one line per change -----------------------------------
+    // The effect logs one decision line per (file, generation, working space,
+    // rule, verdict); the fresh instance above shares the file's line.  Four
+    // states were rendered: the defaults, exposure -1, Rec.709 through the
+    // sequence space, and Rec.709 handed over.
+    std::vector<std::string> decisions;
+    for (const std::string& line : reframeLogLinesSince(logStart)) {
+        if (line.find("reframe/direct: 'EXAMPLE_FOOTAGE_DLOGM.OSV' Source Settings generation") != std::string::npos) {
+            decisions.push_back(line);
+        }
+    }
+    for (const std::string& d : decisions) {
+        WARN(d);
+    }
+    REQUIRE(decisions.size() == 4u);
+    CHECK(decisions[0].find("exposure +0.00") != std::string::npos);
+    CHECK(decisions[0].find("-> straight from the fisheyes (rule: same space)") != std::string::npos);
+    CHECK(decisions[1].find("exposure -1.00") != std::string::npos);
+    CHECK(decisions[1].find("-> straight from the fisheyes (rule: same space)") != std::string::npos);
+    CHECK(decisions[2].find("colour Rec.709") != std::string::npos);
+    CHECK(decisions[2].find("-> straight from the fisheyes (rule: Sequence space (fast))") != std::string::npos);
+    CHECK(decisions[3].find("Program Monitor Colour Match Source monitor") != std::string::npos);
+    CHECK(decisions[3].find("-> equirect route (rule: Match Source monitor)") != std::string::npos);
+
+    CHECK(instance.dispose() == suiteError_NoError);
+    CHECK(host.totalNodeRefs() == 0);
+    CHECK(host.invalidNodeReleases() == 0);
 }

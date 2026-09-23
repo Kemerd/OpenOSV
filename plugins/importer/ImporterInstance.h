@@ -468,6 +468,23 @@ private:
     std::map<void*, std::unique_ptr<video::GpuClipDecoder>> m_gpuDecoders;
     /// True for the engine registry's own instance (see setEngineOwned).
     bool m_engineOwned = false;
+
+    // ---- [WP-SETTINGS] Source Settings publication (Engine.h) -------------
+    /// This instance's publisher token, taken at its first publication
+    /// (right after imOpenFile8); 0 until then.  Larger means opened later,
+    /// which is how the engine lets the newest instance of a file win.
+    std::uint64_t m_settingsPublisher = 0;
+    /// True once a blob the HOST handed over has been published from here.
+    /// Until then the instance may have run on its defaults (a selector
+    /// without prefs) and must publish the host's blob even when it happens
+    /// to equal them, or an older instance's settings would stay in force.
+    bool m_settingsPublishedFromHost = false;
+    /// Publish m_prefs to the engine registry.  `fromHost`: the blob came
+    /// from the host (false: the host gave none and the defaults are in
+    /// force).  Never publishes from the engine's own instance.  The caller
+    /// holds m_mutex.
+    void publishSettingsLocked(bool fromHost) noexcept;
+    // ---- [/WP-SETTINGS] ----------------------------------------------------
     std::unique_ptr<AudioDecoder> m_audio;
     bool m_audioProbed = false;
 
