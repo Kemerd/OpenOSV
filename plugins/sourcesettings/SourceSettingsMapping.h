@@ -47,6 +47,7 @@ struct ControlValues {
     double exposureStops = OSV_SS_EXPOSURE_DEFAULT;
     int renderDevice = OSV_SS_DEVICE_DEFAULT;    ///< 1-based popup value.
     int directColour = OSV_SS_DIRECT_COLOUR_DEFAULT;  ///< [WP-SETTINGS] 1-based popup value.
+    bool flareRemoval = OSV_SS_FLARE_REMOVAL_DEFAULT != 0;  ///< [WP-FLARE] Sun Ghost Removal.
 };
 
 /// Control values -> PrefsBlob.

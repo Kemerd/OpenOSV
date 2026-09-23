@@ -66,6 +66,7 @@ PrefsBlob prefsFromControls(const ControlValues& controls) noexcept {
     // bytes can be memcmp'd as part of the PPix cache key.
     blob.seamSearch = controls.seamSearch ? std::uint8_t{1} : std::uint8_t{0};
     blob.gainMatch = controls.gainMatch ? std::uint8_t{1} : std::uint8_t{0};
+    blob.flareRemoval = controls.flareRemoval ? std::uint8_t{1} : std::uint8_t{0};  // [WP-FLARE]
 
     // A float slider cannot normally produce NaN, but an expression or a
     // corrupt project can, and NaN compares false with every bound - so
@@ -105,6 +106,7 @@ ControlValues controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.directColour = toPopup(clean.directColour, OSV_SS_DIRECT_COLOUR_COUNT);  // [WP-SETTINGS]
     c.seamSearch = clean.seamSearch != 0;
     c.gainMatch = clean.gainMatch != 0;
+    c.flareRemoval = clean.flareRemoval != 0;  // [WP-FLARE]
     c.exposureStops = static_cast<double>(clean.exposureStops);
     return c;
 }

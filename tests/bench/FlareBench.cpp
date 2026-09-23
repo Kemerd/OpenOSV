@@ -494,6 +494,17 @@ int main(int argc, char** argv) {
             OSV_TRY_ASSIGN(render::FlareImage im, render::flareDownsample(hostPair.value().lens[1], linear, 4, pool));
             return okStatus();
         });
+        // The same on a two-thread pool: what a background worker with no
+        // share of the render pool pays.
+        {
+            ThreadPool small(1);
+            const double smallMs = medianMs(std::max(1, reps / 3), [&]() -> Status {
+                OSV_TRY_ASSIGN(render::FlareImage im,
+                               render::flareDownsample(hostPair.value().lens[1], linear, 4, small));
+                return okStatus();
+            });
+            std::printf("  frame %u: downsample one lens on a 2-thread pool %.1f ms\n", frame, smallMs);
+        }
         // The detection + fit alone on a ready working image, with and without
         // the pool spreading the fits.
         double fitPoolMs = -1.0, fitSerialMs = -1.0;

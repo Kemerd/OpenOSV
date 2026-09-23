@@ -40,6 +40,7 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.dlogmFit = static_cast<int>(prefs.dlogmFit);
     c.exposureStops = static_cast<double>(prefs.exposureStops);
     c.renderDevice = static_cast<int>(prefs.renderDevice);
+    c.flareRemoval = prefs.flareRemoval != 0;  // [WP-FLARE]
     return c;
 }
 
@@ -86,6 +87,7 @@ PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& bas
              static_cast<std::uint8_t>(PrefsCalibrationChoice::Auto))));
     blob.dlogmFit = pick(controls.dlogmFit, static_cast<int>(PrefsDlogmFit::Count), 0);
     blob.renderDevice = pick(controls.renderDevice, static_cast<int>(PrefsRenderDevice::Count), 0);
+    blob.flareRemoval = controls.flareRemoval ? 1u : 0u;  // [WP-FLARE]
 
     // The exposure edit box is free text: "1e999" parses to infinity and a
     // cleared field can yield NaN.  Non-finite values become 0 here (NaN

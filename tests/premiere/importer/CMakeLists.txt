@@ -24,6 +24,7 @@ add_executable(osv_importer_tests
   test_importer.cpp
   test_engine.cpp
   test_engine_settings.cpp  # [WP-SETTINGS] file identity, instance precedence, per-frame settings
+  test_flare_importer.cpp   # [WP-FLARE] sun ghost removal end to end
   test_prefs_mapping.cpp
   test_reopen.cpp
   "${CMAKE_SOURCE_DIR}/plugins/importer/PrefsMapping.cpp"

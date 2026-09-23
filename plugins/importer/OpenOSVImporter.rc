@@ -35,7 +35,7 @@ END
 // ---------------------------------------------------------------------------
 // DIALOGEX so the controls get a real font; the geometry is in dialog units,
 // which scale with the system font and therefore with the DPI setting.
-IDD_SOURCE_SETTINGS DIALOGEX 0, 0, 268, 232
+IDD_SOURCE_SETTINGS DIALOGEX 0, 0, 268, 246
 STYLE DS_SETFONT | DS_MODALFRAME | DS_FIXEDSYS | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "OpenOSV Source Settings"
 FONT 8, "MS Shell Dlg", 400, 0, 0x1
@@ -82,9 +82,13 @@ BEGIN
     COMBOBOX        IDC_RENDER_DEVICE, 82, 185, 179, 80,
                     CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
 
+    // ---- [WP-FLARE] sun ghost removal (one appended row) -----------------
+    CONTROL         "Sun &ghost removal (subtracts the sun's lens reflections)",
+                    IDC_FLARE_REMOVAL, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 7, 206, 254, 10
+
     // ---- Buttons ----------------------------------------------------------
-    DEFPUSHBUTTON   "OK", IDOK, 156, 209, 50, 16
-    PUSHBUTTON      "Cancel", IDCANCEL, 211, 209, 50, 16
+    DEFPUSHBUTTON   "OK", IDOK, 156, 223, 50, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 211, 223, 50, 16
 END
 
 // ---------------------------------------------------------------------------

@@ -409,3 +409,74 @@ TEST_CASE("Source Settings changed in Premiere reach the engine's next frame", "
     REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
     CHECK(gainOf(4) == Catch::Approx(1.41421356f));
 }
+
+// =============================================================================
+//  [WP-FLARE] the sun ghost removal reaches the direct path in the stitch block
+// =============================================================================
+
+TEST_CASE("a device frame carries the fitted sun ghosts in its stitch block, and none when switched off",
+          "[importer][engine][flare][cuda][sample]") {
+    if (!sampleClipAvailable()) {
+        SKIP("the sample clip is not present at " << sampleClipPath().string());
+    }
+    TestContext cuda;  // before the harness: outlives imShutdown
+    if (!cuda.context) {
+        SKIP("CUDA unavailable: " << cuda.reason);
+    }
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const EngineApi api = resolveEngine();
+    REQUIRE(api.ok());
+    const std::wstring path = sampleClipPath().wstring();
+    char error[512] = {};
+
+    // ---- default settings: removal on, analysed from the frames in VRAM -------
+    // An EXACT request measures its bucket now (the GPU sampler reduces both
+    // lenses on the device), so the block must already carry the model.
+    {
+        OsvEngineFrameRequest request = requestFor(path, 5, cuda.context);
+        OsvEngineFrame frame = emptyFrame();
+        const std::int32_t rc = api.acquire(&request, &frame, error, sizeof(error));
+        INFO("engine error: " << error);
+        REQUIRE(rc == OSV_ENGINE_OK);
+        CHECK(frame.exact == 1);
+        CHECK(frame.stitch.flareEnabled == 1);
+        // The sun and its ghosts are in the master lens (stream 1) only.
+        CHECK(frame.stitch.flare[0].ghostCount == 0);
+        REQUIRE(frame.stitch.flare[1].ghostCount >= 1);
+        REQUIRE(frame.stitch.flare[1].ghostCount <= OSV_FLARE_MAX_GHOSTS);
+        // The bright pill ghost, where the library finds it on the host frame
+        // (tests/unit/test_flare.cpp), with a sane shape and positive light.
+        bool pill = false;
+        for (int k = 0; k < frame.stitch.flare[1].ghostCount; ++k) {
+            const OsvFlareGhost& g = frame.stitch.flare[1].ghost[k];
+            CHECK(std::isfinite(g.cx));
+            CHECK(g.hx > 0.0f);
+            CHECK(g.hy > 0.0f);
+            CHECK(g.soft > 0.0f);
+            CHECK(g.reach2 > g.hx * g.hx);
+            CHECK(g.amp[1] > 0.0f);
+            pill = pill || std::hypot(g.cx - 1182.0f, g.cy - 1547.0f) < 12.0f;
+        }
+        CHECK(pill);
+        api.release(frame.lease, nullptr);
+    }
+
+    // ---- switched off in Source Settings: the block carries nothing -------------
+    osv::premiere::PrefsBlob prefs = osv::premiere::PrefsBlob::defaults();
+    prefs.flareRemoval = 0;
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+    imFileInfoRec8 info{};
+    REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+    {
+        OsvEngineFrameRequest request = requestFor(path, 6, cuda.context);
+        OsvEngineFrame frame = emptyFrame();
+        const std::int32_t rc = api.acquire(&request, &frame, error, sizeof(error));
+        INFO("engine error: " << error);
+        REQUIRE(rc == OSV_ENGINE_OK);
+        CHECK(frame.stitch.flareEnabled == 0);
+        CHECK(frame.stitch.flare[1].ghostCount == 0);
+        api.release(frame.lease, nullptr);
+    }
+}

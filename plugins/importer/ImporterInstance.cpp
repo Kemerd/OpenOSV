@@ -32,6 +32,7 @@
 #include "osv/video/ReaderPool.h"
 #if defined(OSV_HAVE_CUDA)
 #include "osv/render/CudaAnalysis.h"
+#include "osv/render/FlareCuda.h"  // [WP-FLARE]
 #endif
 
 #include <algorithm>
@@ -188,6 +189,12 @@ void ensureGpuAnalyses() noexcept {
                 PluginLog::info("analyses: GPU band shading and GPU flow installed (bit-identical to the CPU solver)");
             } else {
                 PluginLog::info("analyses: staying on the CPU ({})", installed.error().message);
+            }
+            // [WP-FLARE] the ghost analysis's working images from frames in VRAM
+            const Status flare = render::installCudaFlareSampler();
+            if (!flare.ok()) {
+                PluginLog::info("flare: no GPU sampler ({}); direct-path frames render without ghost removal",
+                                flare.error().message);
             }
         });
     } catch (...) {
@@ -377,6 +384,7 @@ void ImporterInstance::resetParallaxLocked() noexcept {
     m_blendSeams.clear();  // [WP-SEAM] carved through the corrections just dropped
     m_parallaxPending.reset();
     ++m_parallaxGeneration;
+    m_flare.reset();  // [WP-FLARE] its own lock; nothing here is held by it
 }
 
 // ---------------------------------------------------------------------------
@@ -829,6 +837,7 @@ void ImporterInstance::releaseHeavy() noexcept {
     // about to lose its decoders.  (Joining with m_mutex held is safe - the
     // worker never takes m_mutex; see the LOCK ORDER note in the header.)
     stopParallaxWorker();
+    m_flare.stop();  // [WP-FLARE] the same rule: its worker never takes m_mutex
 
     // Order matters: the audio decoder owns its own AVFormatContext and OS
     // handle, the reader owns two decoders; both must go before the mapping
@@ -1347,6 +1356,12 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
         }
     }
 
+    // ---- [WP-FLARE] sun ghost removal (FlareStage.h) --------------------------
+    // Before the carve, which reads this frame's model through the penalty.
+    const FlareStage::Outcome flare = m_flare.apply(index, pair, m_rig, m_color, m_prefs.flareRemoval != 0, draft,
+                                                    exactWanted, pool, builder, m_path.filename().string());
+    frameExact = frameExact && flare.exact;
+
     // ---- [WP-SEAM] carved blend seam ---------------------------------------
     // Under the seam preference: "seam search" now means both halves of the
     // seam - the disparity correction above and WHERE the two lenses meet.
@@ -1438,7 +1453,8 @@ void ImporterInstance::applyCarvedSeam(std::uint32_t index, const video::FramePa
         // Steered by the neighbour that is already on screen: the previous
         // bucket when playing forward, the next one when stepping back.
         const render::BlendSeam* prior = previous ? previous.get() : next.get();
-        const render::SeamCarveParams params;
+        render::SeamCarveParams params;
+        params.penalty = m_flare.seamPenalty();  // [WP-FLARE] steer away from this frame's ghosts
         const render::BandParams band = render::ParallaxWarpParams{}.band;
         auto carved = render::carveSeam(m_rig, pair, m_blend, band, correction, params, prior, pool);
         if (carved.ok()) {
@@ -1615,12 +1631,13 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     // measurement per bucket of frames, off the render thread for an
     // Interactive request (see RenderPurpose and the block below).
     const bool wantParallax = m_prefs.parallaxEnabled() && !draft;
+    const bool wantFlare = m_prefs.flareRemoval != 0 && !draft;  // [WP-FLARE]
     const bool exactWanted = purpose == RenderPurpose::Exact;
 
     // Cache hit: the host asked for the same frame twice (it does, once per
     // requested pixel format while scrubbing).  An Exact request is never
     // served a frame an Interactive render built with a stand-in analysis.
-    if (m_lastFrame.matches(index, geometry, m_prefs, wantSeam, wantParallax, exactWanted)) {
+    if (m_lastFrame.matches(index, geometry, m_prefs, wantSeam, wantParallax, wantFlare, exactWanted)) {
         return &m_lastFrame.image;
     }
 
@@ -1717,6 +1734,7 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     m_lastFrame.prefs = m_prefs;
     m_lastFrame.seamApplied = wantSeam;
     m_lastFrame.parallaxWanted = wantParallax;
+    m_lastFrame.flareWanted = wantFlare;  // [WP-FLARE]
     m_lastFrame.exact = frameExact;
     return &m_lastFrame.image;
 }
@@ -1796,6 +1814,7 @@ std::string ImporterInstance::analysisText() const {
     line(std::string("Stabilisation: ") + stabName);
     line(std::string("Seam search: ") + (m_prefs.seamSearch ? "on" : "off") + ", exposure match: " +
          (m_prefs.gainMatch ? "on" : "off"));
+    line(std::string("Sun ghost removal: ") + (m_prefs.flareRemoval ? "on" : "off"));  // [WP-FLARE]
 
     if (m_audioChannels > 0) {
         char buf[64] = {};

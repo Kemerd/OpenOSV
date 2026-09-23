@@ -250,7 +250,8 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
             {kIndexColorOutput, PF_Param_POPUP},     {kIndexOutputSize, PF_Param_POPUP},
             {kIndexStabilization, PF_Param_POPUP},   {kIndexStitchTopic, PF_Param_GROUP_START},
             {kIndexSeamSearch, PF_Param_CHECKBOX},   {kIndexGainMatch, PF_Param_CHECKBOX},
-            {kIndexCalibration, PF_Param_POPUP},     {kIndexStitchTopicEnd, PF_Param_GROUP_END},
+            {kIndexCalibration, PF_Param_POPUP},     {kIndexFlareRemoval, PF_Param_CHECKBOX},
+            {kIndexStitchTopicEnd, PF_Param_GROUP_END},
             {kIndexAdvancedTopic, PF_Param_GROUP_START}, {kIndexDlogmFit, PF_Param_POPUP},
             {kIndexExposure, PF_Param_FLOAT_SLIDER}, {kIndexRenderDevice, PF_Param_POPUP},
             {kIndexDirectColour, PF_Param_POPUP},    {kIndexAdvancedTopicEnd, PF_Param_GROUP_END},
@@ -276,6 +277,7 @@ TEST_CASE("every value-carrying control refuses to vary over time", "[sourcesett
     const int valueIndices[kValueParamCount] = {
         kIndexColorOutput, kIndexOutputSize, kIndexStabilization, kIndexSeamSearch, kIndexGainMatch,
         kIndexCalibration, kIndexDlogmFit,   kIndexExposure,      kIndexRenderDevice, kIndexDirectColour,
+        kIndexFlareRemoval,
     };
     for (const int index : valueIndices) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");
@@ -334,8 +336,8 @@ TEST_CASE("the two groups are balanced and every control is inside the intended 
         INFO("top-level index " << index);
         CHECK(depthAt[static_cast<std::size_t>(index)] == 0);
     }
-    for (const int index : {kIndexSeamSearch, kIndexGainMatch, kIndexCalibration, kIndexDlogmFit, kIndexExposure,
-                            kIndexRenderDevice, kIndexDirectColour}) {
+    for (const int index : {kIndexSeamSearch, kIndexGainMatch, kIndexCalibration, kIndexFlareRemoval, kIndexDlogmFit,
+                            kIndexExposure, kIndexRenderDevice, kIndexDirectColour}) {
         INFO("grouped index " << index);
         CHECK(depthAt[static_cast<std::size_t>(index)] == 1);
     }
@@ -409,6 +411,7 @@ TEST_CASE("every control's default is PrefsBlob::defaults()", "[sourcesettings][
 
     CHECK(params[kIndexSeamSearch - 1].u.bd.dephault == static_cast<A_long>(defaults.seamSearch));
     CHECK(params[kIndexGainMatch - 1].u.bd.dephault == static_cast<A_long>(defaults.gainMatch));
+    CHECK(params[kIndexFlareRemoval - 1].u.bd.dephault == static_cast<A_long>(defaults.flareRemoval));  // [WP-FLARE]
     CHECK(static_cast<double>(params[kIndexExposure - 1].u.fs_d.dephault) ==
           Catch::Approx(static_cast<double>(defaults.exposureStops)));
 

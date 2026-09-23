@@ -1061,12 +1061,20 @@ OSV_HD void osvFlareRemove(const OsvFlareLens* F, float px, float py, float* rgb
     rgb[2] = osvFlareSoftSubtract(rgb[2], add[2]);
 }
 
-/* Analysis sampler: mean native-linear RGB of the factor x factor block of
- * lens pixels behind analysis pixel (ox, oy) - the working image the host
- * detects the sun and fits the ghosts on.  Each lens pixel is decoded on its
- * own (luma at the pixel, the co-sited 4:2:0 chroma sample) and the linear
- * values are averaged, because light adds in linear space, not in code.
- * Pixels of the block beyond the frame edge are left out of the mean. */
+/* Analysis sampler: mean native-linear RGB of a 2 x 2 grid of lens pixels
+ * inside the factor x factor block behind analysis pixel (ox, oy) - the
+ * working image the host detects the sun and fits the ghosts on.  Each lens
+ * pixel is decoded on its own (luma at the pixel, the co-sited 4:2:0 chroma
+ * sample) and the linear values are averaged, because light adds in linear
+ * space, not in code.
+ *
+ * The samples sit at offsets a = factor / 4 and b = factor - 1 - a in both
+ * directions, so their mean centre is exactly the block centre (the central
+ * 2 x 2 at factor 4, the whole block at factor 2, one pixel at factor 1).
+ * Four decodes instead of factor^2: the per-pixel log decode is the whole
+ * cost of the analysis on a CPU, and the features it looks for - a sun disc
+ * and ghosts tens of pixels across on smooth sky - lose nothing to the
+ * sparser sampling. */
 OSV_HD void osvFlareDownsamplePixel(const OsvPlane* P, const OsvColorParams* color, int factor, int ox, int oy,
                                     float* rgb) {
     rgb[0] = rgb[1] = rgb[2] = 0.0f;
@@ -1076,16 +1084,25 @@ OSV_HD void osvFlareDownsamplePixel(const OsvPlane* P, const OsvColorParams* col
     const int step = P->chromaInterleaved ? 2 : 1;
     const int x0 = ox * factor;
     const int y0 = oy * factor;
+    /* The two offsets per axis; one when they coincide (factor 1). */
+    const int offA = factor / 4;
+    const int offB = factor - 1 - offA;
+    const int taps = (offB > offA) ? 2 : 1;
     float acc[3] = {0.0f, 0.0f, 0.0f};
     int count = 0;
-    for (int j = 0; j < factor; ++j) {
-        const int y = y0 + j;
-        if (y < 0 || y >= P->h) {
+    for (int j = 0; j < taps; ++j) {
+        /* A partial block at the bottom / right edge: clamp the sample into
+         * the frame (its in-frame part always holds at least one row and
+         * column), so an edge pixel is a real mean and never an empty one. */
+        int y = y0 + (j == 0 ? offA : offB);
+        y = y >= P->h ? P->h - 1 : y;
+        if (y < 0) {
             continue;
         }
-        for (int i = 0; i < factor; ++i) {
-            const int x = x0 + i;
-            if (x < 0 || x >= P->w) {
+        for (int i = 0; i < taps; ++i) {
+            int x = x0 + (i == 0 ? offA : offB);
+            x = x >= P->w ? P->w - 1 : x;
+            if (x < 0) {
                 continue;
             }
             /* 4:2:0: chroma sample (x/2, y/2) covers this luma pixel. */

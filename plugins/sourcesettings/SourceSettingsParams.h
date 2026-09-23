@@ -141,10 +141,14 @@
  * reused one, placed inside the Advanced group (so its index is 13 and the
  * group terminator moved to 14 - indices are not persisted, ids are). */
 #define OSV_SS_ID_DIRECT_COLOUR 14
+/* [WP-FLARE] "Sun Ghost Removal", a NEW id placed inside the Stitching group
+ * after Calibration: its index is 8 and everything after it moved up by one
+ * (indices are not persisted, ids are). */
+#define OSV_SS_ID_FLARE_REMOVAL 15
 
-/* Total parameters excluding the input layer: 10 controls + 4 group markers.
+/* Total parameters excluding the input layer: 11 controls + 4 group markers.
  * out_data->num_params is this + 1. */
-#define OSV_SOURCE_SETTINGS_PARAM_COUNT 14
+#define OSV_SOURCE_SETTINGS_PARAM_COUNT 15
 
 /* ==========================================================================
  *  Popup item strings
@@ -229,6 +233,8 @@
  * ========================================================================== */
 #define OSV_SS_SEAM_SEARCH_DEFAULT 1
 #define OSV_SS_GAIN_MATCH_DEFAULT 1
+/* [WP-FLARE] on, as PrefsBlob::defaults().flareRemoval (a test pins it). */
+#define OSV_SS_FLARE_REMOVAL_DEFAULT 1
 
 /* Exposure, in stops.  The valid range is PrefsBlob::kMinExposureStops ..
  * kMaxExposureStops; a static_assert checks these literals against the blob's
@@ -264,13 +270,14 @@ namespace osv::premiere::sourcesettings {
 ///   5    Seam Search
 ///   6    Exposure Match
 ///   7    Calibration
-///   8  (GROUP_END, Stitching)
-///   9  Advanced           (GROUP_START, starts collapsed)
-///  10    D-Log M Curve
-///  11    Exposure
-///  12    Render Device
-///  13    Program Monitor Colour   [WP-SETTINGS]
-///  14  (GROUP_END, Advanced)
+///   8    Sun Ghost Removal        [WP-FLARE]
+///   9  (GROUP_END, Stitching)
+///  10  Advanced           (GROUP_START, starts collapsed)
+///  11    D-Log M Curve
+///  12    Exposure
+///  13    Render Device
+///  14    Program Monitor Colour   [WP-SETTINGS]
+///  15  (GROUP_END, Advanced)
 enum ParamIndex : int {
     kIndexColorOutput = 1,
     kIndexOutputSize = 2,
@@ -279,13 +286,14 @@ enum ParamIndex : int {
     kIndexSeamSearch = 5,
     kIndexGainMatch = 6,
     kIndexCalibration = 7,
-    kIndexStitchTopicEnd = 8,
-    kIndexAdvancedTopic = 9,
-    kIndexDlogmFit = 10,
-    kIndexExposure = 11,
-    kIndexRenderDevice = 12,
-    kIndexDirectColour = 13,
-    kIndexAdvancedTopicEnd = 14,
+    kIndexFlareRemoval = 8,  // [WP-FLARE]
+    kIndexStitchTopicEnd = 9,
+    kIndexAdvancedTopic = 10,
+    kIndexDlogmFit = 11,
+    kIndexExposure = 12,
+    kIndexRenderDevice = 13,
+    kIndexDirectColour = 14,
+    kIndexAdvancedTopicEnd = 15,
 };
 
 /// The permanent id stored at each index, in index order (index 1 first).
@@ -294,9 +302,9 @@ enum ParamIndex : int {
 inline constexpr int kParamIdByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
     OSV_SS_ID_COLOR_OUTPUT,     OSV_SS_ID_OUTPUT_SIZE,   OSV_SS_ID_STABILIZATION,
     OSV_SS_ID_STITCH_TOPIC,     OSV_SS_ID_SEAM_SEARCH,   OSV_SS_ID_GAIN_MATCH,
-    OSV_SS_ID_CALIBRATION,      OSV_SS_ID_STITCH_TOPIC_END, OSV_SS_ID_ADVANCED_TOPIC,
-    OSV_SS_ID_DLOGM_FIT,        OSV_SS_ID_EXPOSURE,      OSV_SS_ID_RENDER_DEVICE,
-    OSV_SS_ID_DIRECT_COLOUR,    OSV_SS_ID_ADVANCED_TOPIC_END,
+    OSV_SS_ID_CALIBRATION,      OSV_SS_ID_FLARE_REMOVAL, OSV_SS_ID_STITCH_TOPIC_END,
+    OSV_SS_ID_ADVANCED_TOPIC,   OSV_SS_ID_DLOGM_FIT,     OSV_SS_ID_EXPOSURE,
+    OSV_SS_ID_RENDER_DEVICE,    OSV_SS_ID_DIRECT_COLOUR, OSV_SS_ID_ADVANCED_TOPIC_END,
 };
 
 /// Number of user-visible parameters (excludes the input layer).
@@ -305,7 +313,7 @@ inline constexpr int kParamCount = OSV_SOURCE_SETTINGS_PARAM_COUNT;
 /// Number of controls that actually carry a value, i.e. everything except the
 /// four GROUP_START / GROUP_END markers.  This is the count that has to round
 /// trip through a PrefsBlob.
-inline constexpr int kValueParamCount = 10;
+inline constexpr int kValueParamCount = 11;
 
 /// The parameter names, in index order, so a test can compare the built
 /// module's list without repeating the strings.
@@ -316,9 +324,9 @@ inline constexpr int kValueParamCount = 10;
 /// rather than a labelled control.  Writing "Stitching" here would have
 /// described a field the SDK never fills.
 inline constexpr const char* kParamNameByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
-    "Colour Output", "Output Size",   "Stabilisation",      "Stitching", "Seam Search",
-    "Exposure Match", "Calibration",  "",                   "Advanced",  "D-Log M Curve",
-    "Exposure",       "Render Device", "Program Monitor Colour", "",
+    "Colour Output",  "Output Size",   "Stabilisation", "Stitching",     "Seam Search",
+    "Exposure Match", "Calibration",   "Sun Ghost Removal", "",          "Advanced",
+    "D-Log M Curve",  "Exposure",      "Render Device", "Program Monitor Colour", "",
 };
 
 }  // namespace osv::premiere::sourcesettings

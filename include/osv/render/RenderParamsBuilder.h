@@ -26,6 +26,8 @@
 
 namespace osv::render {
 
+struct FlareModel;  // [WP-FLARE] osv/render/Flare.h
+
 class RenderParamsBuilder {
 public:
     RenderParamsBuilder();
@@ -76,6 +78,14 @@ public:
     /// [WP-SEAM] Remove any previously set blend-seam table (A/B comparison).
     RenderParamsBuilder& clearBlendSeam();
 
+    /// [WP-FLARE] Sun ghost / veil removal for this frame (Flare.h): the
+    /// model is converted exactly as applyFlare() converts it and travels in
+    /// the parameter block, so every backend and the direct path get it.
+    RenderParamsBuilder& flare(const FlareModel& model);
+
+    /// [WP-FLARE] No removal (the default): the block's flare fields stay 0.
+    RenderParamsBuilder& clearFlare();
+
     /// Colour pipeline block from osv::color::makeColorParams (required).
     RenderParamsBuilder& color(const OsvColorParams& params);
 
@@ -111,6 +121,9 @@ private:
     std::vector<float> m_blendSeam;
     std::uint32_t m_blendSeamColumns = 0;
     float m_blendSeamEdgeRad = 0.0f;
+    // [WP-FLARE] the kernel's flare block, ready to copy (all zero = off)
+    int m_flareEnabled = 0;
+    std::array<OsvFlareLens, 2> m_flareLens{};
     std::optional<OsvColorParams> m_color;
     bool m_alphaCoverage = true;
     std::array<bool, 2> m_lensEnabled{true, true};

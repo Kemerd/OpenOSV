@@ -36,6 +36,7 @@
 // invalidated (colour parameters, output size, seam cache).
 #pragma once
 
+#include "FlareStage.h"  // [WP-FLARE]
 #include "PrefsBlob.h"
 
 #include "osv/color/ColorParams.h"
@@ -129,6 +130,9 @@ struct RenderedFrame {
     /// seamApplied is: the prefs blob alone does not distinguish a draft
     /// render from a full one, and a draft must never be served in its place.
     bool parallaxWanted = false;
+    /// [WP-FLARE] Whether sun ghost removal was WANTED (prefs on and not a
+    /// draft) - keyed for the same reason as parallaxWanted.
+    bool flareWanted = false;
     /// False when an Interactive render made do with a stand-in analysis -
     /// a neighbouring bucket's grid, or none while its own was still being
     /// measured.  An Exact request must never be served such a frame, or a
@@ -138,9 +142,9 @@ struct RenderedFrame {
     render::ImageRGBAf image;
 
     [[nodiscard]] bool matches(std::uint32_t index, const OutputGeometry& geom, const PrefsBlob& blob, bool wantSeam,
-                               bool wantParallax, bool needExact) const noexcept {
+                               bool wantParallax, bool wantFlare, bool needExact) const noexcept {
         return image.valid() && frameIndex == index && geometry == geom && prefs == blob && seamApplied == wantSeam &&
-               parallaxWanted == wantParallax && (exact || !needExact);
+               parallaxWanted == wantParallax && flareWanted == wantFlare && (exact || !needExact);
     }
 };
 
@@ -589,6 +593,13 @@ private:
     void applyCarvedSeam(std::uint32_t index, const video::FramePair& pair, bool wantParallax, RenderPurpose purpose,
                          ThreadPool& pool, render::RenderParamsBuilder& builder, bool& frameExact);
     // ---- [/WP-SEAM] ----------------------------------------------------------
+
+    // ---- [WP-FLARE] sun ghost removal (FlareStage.h) --------------------------
+    /// Per-bucket ghost models, their background worker and the seam penalty.
+    /// applyAnalyses feeds it every frame; resetParallaxLocked() resets it
+    /// with the other analyses and releaseHeavy() stops its worker.
+    FlareStage m_flare;
+    // ---- [/WP-FLARE] ---------------------------------------------------------
 
     RenderedFrame m_lastFrame;
     std::string m_rendererName;
