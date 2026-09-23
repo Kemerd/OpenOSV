@@ -51,6 +51,7 @@
 #include "osv/meta/Types.h"
 #include "osv/render/ImageRGBAf.h"
 #include "osv/render/ParallaxWarp.h"
+#include "osv/render/SeamCarve.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/video/DualStreamReader.h"
 #include "osv/video/GpuClipDecoder.h"
@@ -547,6 +548,26 @@ private:
     /// Invalidate every measurement: clear the cache, drop the pending job
     /// and bump the generation.  Takes m_parallaxMutex.
     void resetParallaxLocked() noexcept;
+
+    // ---- [WP-SEAM] carved blend seam, keyed by bucket ------------------------
+    /// Carved seams per bucket (SeamCarve.h), each measured through its own
+    /// bucket's correction (its parallax grid, else its seam table).  Guarded
+    /// by m_parallaxMutex and cleared with the parallax state in
+    /// resetParallaxLocked(), because a seam is only as current as the
+    /// correction it was carved through.  ~8 KB each.
+    std::map<std::uint32_t, std::shared_ptr<const render::BlendSeam>> m_blendSeams;
+
+    /// Carve (or fetch) the blend seam for frame `index` and hand it to
+    /// `builder`: glided from the previous bucket's seam like the parallax
+    /// grid, steered by a neighbouring bucket's seam when one is cached.  An
+    /// Interactive request whose bucket cannot be carved yet (its parallax
+    /// grid is still being measured) borrows a nearby bucket's seam and
+    /// clears `frameExact`.  Called by applyAnalyses with m_mutex held;
+    /// takes m_parallaxMutex itself.  Failures are logged and leave the frame
+    /// on the ordinary feather.
+    void applyCarvedSeam(std::uint32_t index, const video::FramePair& pair, bool wantParallax, RenderPurpose purpose,
+                         ThreadPool& pool, render::RenderParamsBuilder& builder, bool& frameExact);
+    // ---- [/WP-SEAM] ----------------------------------------------------------
 
     RenderedFrame m_lastFrame;
     std::string m_rendererName;
