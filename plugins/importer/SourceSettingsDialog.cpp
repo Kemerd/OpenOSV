@@ -161,7 +161,6 @@ void fillComboStrings(HWND dialog, int control, const std::wstring* items, int c
         }
         return inv.choiceChangesStitch(choice) ? CalibrationAvailability::Usable : CalibrationAvailability::SameAsNative;
     };
-    facts.lensGuards = availability(meta::CalibrationChoice::LensGuards);
     facts.underwater = availability(meta::CalibrationChoice::Underwater);
     return facts;
 }
@@ -367,7 +366,9 @@ bool showDialogWithFacts(void* ownerWindow, PrefsBlob& prefs, const CalibrationU
     if (result != IDOK || !state.accepted) {
         return false;  // The caller returns imCancel.
     }
-    prefs = prefsFromControls(state.controls);
+    // From the incoming blob, so the fields this dialog does not show
+    // (parallax, flow backend, ...) survive an OK untouched.
+    prefs = prefsFromControls(state.controls, prefs);
     return true;
 }
 
@@ -409,6 +410,9 @@ namespace {
     // first-time call, a blob from another importer, garbage) becomes the
     // documented defaults.
     PrefsBlob blob = PrefsBlob::fromBytes(rec->prefs, static_cast<std::size_t>(rec->prefsLength));
+    // What the clip was using before the dialog, to tell whether OK changed
+    // anything the frames depend on (see the refresh below).
+    const PrefsBlob before = blob;
 
     // The host main window owns the modal so the dialog is not lost behind
     // the application and the host's message loop is properly blocked.
@@ -438,10 +442,27 @@ namespace {
     // Tell the host the media changed so it re-asks for info and frames with
     // the new settings.  Without this the timeline keeps the old frames until
     // something else invalidates them.
-    ImporterGlobals& g = globals();
-    if (g.suites.fileManager && g.suites.fileManager->RefreshFileAsync && instance) {
-        const std::wstring path = instance->path().wstring();
-        g.suites.fileManager->RefreshFileAsync(reinterpret_cast<const prUTF16Char*>(path.c_str()));
+    //
+    // The SDK guide asks for exactly this whenever the settings changed in a
+    // way that needs the frames reimported - through imGetPrefs8 too, which
+    // has no instance and used to skip the refresh entirely.  There the clip
+    // is named by the imFileAccessRec8 the host passed in.
+    try {
+        ImporterGlobals& g = globals();
+        const std::wstring instancePath = instance ? instance->path().wstring() : std::wstring();
+        const wchar_t* accessPath =
+            (fileAccess && fileAccess->filepath) ? reinterpret_cast<const wchar_t*>(fileAccess->filepath) : nullptr;
+        const std::wstring target = prefsRefreshTarget(before, blob, instancePath.c_str(), accessPath);
+        if (!target.empty() && g.suites.fileManager && g.suites.fileManager->RefreshFileAsync) {
+            const prSuiteError err =
+                g.suites.fileManager->RefreshFileAsync(reinterpret_cast<const prUTF16Char*>(target.c_str()));
+            PluginLog::info("source settings: asked the host to refresh '{}' ({})",
+                            std::filesystem::path(target).filename().string(),
+                            err == suiteError_NoError ? "ok" : "refused");
+        }
+    } catch (...) {
+        // Path conversion only; the settings themselves are already stored.
+        PluginLog::warn("source settings: could not request a refresh of the clip");
     }
 
     PluginLog::info("source settings accepted: colour {}, size {}, stab {}, seam {}, gain {}, calib {} ({}), fit {}, "
@@ -456,7 +477,8 @@ namespace {
 
 csSDK_int32 handleGetPrefs8(imStdParms* stdParms, imFileAccessRec8* fileAccess, imGetPrefsRec* rec) {
     // The static prefs call has no instance to reach; the file it names is
-    // only read to label the calibration choices.
+    // read to label the calibration choices and is the one refreshed after
+    // a changed OK.
     return handlePrefsCommon(stdParms, rec, nullptr, fileAccess);
 }
 

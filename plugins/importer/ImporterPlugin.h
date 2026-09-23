@@ -254,6 +254,26 @@ struct DialogControls {
 /// than producing an invalid blob; the result is always sanitised.
 [[nodiscard]] PrefsBlob prefsFromControls(const DialogControls& controls) noexcept;
 
+/// Control state -> PrefsBlob, starting from `base` (the blob the dialog was
+/// opened with): every field the dialog does not show - parallax, flow
+/// backend and any field appended later - is carried over unchanged, and
+/// only the shown fields are replaced.  The one-argument form is this with
+/// base = PrefsBlob::defaults().  The result is always sanitised.
+[[nodiscard]] PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& base) noexcept;
+
+/// The file the importer must hand to RefreshFileAsync after the Source
+/// Settings dialog returned OK, or an empty string when no refresh is due.
+///
+/// The SDK guide (7.3, imGetPrefs8): "If the user changes the Clip Source
+/// Settings in a way such that the frames should be reimported, then the
+/// importer should use the Importer File Manager Suite to call
+/// RefreshFileAsync() on the main file."  So: nothing when the blob did not
+/// change; otherwise the live instance's path, else the path the host passed
+/// in imFileAccessRec8 (imGetPrefs8 has no instance, which is exactly the
+/// case the old code missed).  Either path may be null or empty.
+[[nodiscard]] std::wstring prefsRefreshTarget(const PrefsBlob& before, const PrefsBlob& after,
+                                              const wchar_t* instancePath, const wchar_t* accessPath) noexcept;
+
 /// Show the modal Source Settings dialog.  `owner` may be null.  Returns
 /// true when the user pressed OK (and `prefs` was updated), false on Cancel
 /// or when the dialog could not be created.  Honours

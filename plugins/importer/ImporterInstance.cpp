@@ -18,10 +18,12 @@
 // disagree about what the host was told.
 #include "ImporterPlugin.h"
 #include "PluginLog.h"
+#include "ProtectorGuard.h"
 
 #include "osv/color/AutoDetect.h"
 #include "osv/geom/ConventionProbe.h"
 #include "osv/geom/EquirectMap.h"
+#include "osv/geom/LensProtector.h"
 #include "osv/geom/StreamScaling.h"
 #include "osv/meta/CalibrationSelector.h"
 #include "osv/meta/FormatDetector.h"
@@ -35,6 +37,7 @@
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <format>
 #include <iterator>
 #include <mutex>
 #include <vector>
@@ -514,10 +517,54 @@ Status ImporterInstance::rebuildRig() {
     if (!rig.ok()) {
         return rig.error();
     }
+    geom::LensRig builtRig = std::move(rig).value();
+
+    // Blend defaults match osvtool's (4 degree feather, occlusion polygon on).
+    geom::BlendParams blend = m_blend;
+    blend.lensFovDeg = 195.18;
+    blend.featherDeg = 4.0;
+    blend.useOcclusionMask = true;
+
+    // ---- lens protectors: the field-angle correction ---------------------------
+    //
+    // When the choice resolved to lens guards and the clip has no dedicated
+    // lens-guard calibration (every clip seen so far), the protector's
+    // field-angle curve is folded into both lens models - see
+    // geom/LensProtector.h.  The direction is DJI's (forward), checked once
+    // per clip on frame 0 by the guard (ProtectorGuard.h), which switches the
+    // correction off if the footage plainly was not shot through a
+    // protector.  Native never gets here, and neither does Auto on a clip
+    // recorded without protectors - those rigs are exactly what they were.
+    std::string reason = selection.reason;
+    std::string protectorNote;
+    if (selection.protectorCorrection) {
+        const ProtectorGuardResult guard = resolveProtectorGuard(m_path, m_format, builtRig, blend);
+        auto fold = geom::applyLensProtector(builtRig, guard.direction, blend.lensFovDeg);
+        if (fold.ok()) {
+            blend.lensFovDeg = fold.value().lensFovDeg;
+            protectorNote = std::format("lens-protector correction {}: usable FOV {:.2f} deg, refit residual "
+                                        "{:.3f} px; check: {}",
+                                        geom::protectorDirectionName(guard.direction), blend.lensFovDeg,
+                                        fold.value().maxResidualPx, guard.summary);
+            if (guard.direction == geom::ProtectorDirection::None) {
+                // The selector's sentence promised the correction; say that
+                // the pixels overruled it, so the line is true as a whole.
+                reason += " - switched off: frame 0 does not look shot through a protector";
+            }
+        } else {
+            // The fold only fails on a lens it cannot refit; the bare lens is
+            // still a correct stitch of bare-lens geometry, so render that
+            // rather than nothing, and say so.
+            protectorNote = std::format("lens-protector correction could not be applied ({}); stitching without it",
+                                        fold.error().message);
+            reason += " - correction could not be applied, stitching without it";
+        }
+    }
 
     // ---- commit ----------------------------------------------------------------
     m_calibration = calibration;
-    m_rig = std::move(rig).value();
+    m_rig = std::move(builtRig);
+    m_blend = blend;
 
     // The notes feed the Properties panel.  A rebuild REPLACES the previous
     // calibration / scaling / rig notes instead of piling another copy on
@@ -525,7 +572,10 @@ Status ImporterInstance::rebuildRig() {
     std::erase_if(m_notes, [](const std::string& n) {
         return n.starts_with("calibration: ") || n.starts_with("scaling: ") || n.starts_with("rig: ");
     });
-    m_notes.push_back("calibration: " + selection.reason);
+    m_notes.push_back("calibration: " + reason);
+    if (!protectorNote.empty()) {
+        m_notes.push_back("calibration: " + protectorNote);
+    }
     for (const std::string& w : selWarnings) {
         m_notes.push_back("calibration: " + w);
     }
@@ -545,12 +595,12 @@ Status ImporterInstance::rebuildRig() {
     // Info level, because it runs once on open and once per calibration
     // change - never per frame.
     PluginLog::info("calibration: '{}': {}/{} - {}", m_path.filename().string(), m_calibration.sourceSlave,
-                    m_calibration.sourceMaster, selection.reason);
-
-    // Blend defaults match osvtool's (4 degree feather, occlusion polygon on).
-    m_blend.lensFovDeg = 195.18;
-    m_blend.featherDeg = 4.0;
-    m_blend.useOcclusionMask = true;
+                    m_calibration.sourceMaster, reason);
+    if (!protectorNote.empty()) {
+        // The three scores and the pick, so a protector clip's stitch can be
+        // explained from the log alone.
+        PluginLog::info("calibration: '{}': {}", m_path.filename().string(), protectorNote);
+    }
 
     // The CHOICE, not the calibration byte: Auto and a forced Native share
     // calibration 0 but can stitch with different sets (on a clip recorded

@@ -283,15 +283,20 @@ void describeCalibrationSets(const osv::meta::StreamMeta& s, json& calibration) 
             continue;
         }
         const CalibrationSelection& sel = picked.value();
-        const bool sameAsNative = sel.fellBack || sel.identicalToNative;
+        // "= native" only when nothing at all changes the geometry: a
+        // lens-guard choice without its own set is native PLUS the
+        // protector field-angle correction, which is not native.
+        const bool sameAsNative = (sel.fellBack || sel.identicalToNative) && !sel.protectorCorrection;
         choices[calibrationChoiceName(choice)] = json{{"slave", sel.set.sourceSlave},
                                                       {"master", sel.set.sourceMaster},
                                                       {"set", calibrationSetName(sel.used)},
                                                       {"fellBack", sel.fellBack},
                                                       {"identicalToNative", sel.identicalToNative},
+                                                      {"protectorCorrection", sel.protectorCorrection},
                                                       {"reason", safe(sel.reason)}};
         std::printf("  %-12s -> %-14s%s  %s\n", calibrationChoiceName(choice), calibrationSetName(sel.used),
-                    sameAsNative ? " (= native)" : "", safe(sel.reason).c_str());
+                    sel.protectorCorrection ? " + protector" : (sameAsNative ? " (= native)" : ""),
+                    safe(sel.reason).c_str());
     }
     calibration["choices"] = choices;
 }

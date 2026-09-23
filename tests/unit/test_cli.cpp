@@ -226,7 +226,9 @@ TEST_CASE("osvtool probe lists the calibration sets, the accessory and every cho
     REQUIRE(r.output.find("calibration sets (differences vs native_refine") != std::string::npos);
     REQUIRE(r.output.find("lens_guards        empty    zero-filled placeholder") != std::string::npos);
     REQUIRE(r.output.find("lens accessory: Native (StreamMeta.extri_lens_mode)") != std::string::npos);
-    REQUIRE(r.output.find("lens-guards  -> native_refine  (= native)") != std::string::npos);
+    // Lens guards without a dedicated set: native plus the protector correction.
+    REQUIRE(r.output.find("lens-guards  -> native_refine  + protector") != std::string::npos);
+    REQUIRE(r.output.find("underwater   -> native_refine  (= native)") != std::string::npos);
 
     // ---- JSON ---------------------------------------------------------------------
     std::ifstream in(path);
@@ -257,4 +259,7 @@ TEST_CASE("osvtool probe lists the calibration sets, the accessory and every cho
     REQUIRE(cal["choices"]["auto"]["fellBack"] == false);
     REQUIRE(cal["choices"]["lens-guards"]["fellBack"] == true);
     REQUIRE(cal["choices"]["underwater"]["fellBack"] == true);
+    REQUIRE(cal["choices"]["lens-guards"]["protectorCorrection"] == true);
+    REQUIRE(cal["choices"]["auto"]["protectorCorrection"] == false);
+    REQUIRE(cal["choices"]["underwater"]["protectorCorrection"] == false);
 }

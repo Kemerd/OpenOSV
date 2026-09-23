@@ -162,7 +162,9 @@ TEST_CASE("inventory tells absent, placeholder, partial and usable sets apart", 
     // Forced accessory choices on this clip cannot change the stitch.
     CHECK(inv.choiceSetState(CalibrationChoice::LensGuards) == CalibrationSetState::Empty);
     CHECK(inv.choiceSetState(CalibrationChoice::Underwater) == CalibrationSetState::Empty);
-    CHECK_FALSE(inv.choiceChangesStitch(CalibrationChoice::LensGuards));
+    // Lens guards still change it: without a set they apply the protector
+    // field-angle correction to native.  Underwater has no such fallback.
+    CHECK(inv.choiceChangesStitch(CalibrationChoice::LensGuards));
     CHECK_FALSE(inv.choiceChangesStitch(CalibrationChoice::Underwater));
     CHECK(inv.choiceChangesStitch(CalibrationChoice::Auto));
     CHECK(inv.choiceChangesStitch(CalibrationChoice::Native));
@@ -233,13 +235,19 @@ TEST_CASE("Auto follows the recorded accessory and forced choices explain themse
         CHECK(guards.value().used == CalibrationSetId::NativeRefine);
         CHECK(guards.value().fellBack);
         CHECK(guards.value().wanted == ExtriLensMode::LensGuards);
-        CHECK(guards.value().reason.find("no usable lens-guard calibration (slots 5/6 empty)") != std::string::npos);
-        CHECK(guards.value().reason.find("identical to Native") != std::string::npos);
+        // No dedicated set: native plus the protector correction, not "native".
+        CHECK(guards.value().protectorCorrection);
+        CHECK(guards.value().reason.find("no dedicated lens-guard calibration in this clip (slots 5/6 empty)") !=
+              std::string::npos);
+        CHECK(guards.value().reason.find("plus the lens-protector field-angle correction") != std::string::npos);
         CHECK(warnings.size() == 2);  // override note + fallback note, as select() always gave
+        CHECK_FALSE(autoSel.value().protectorCorrection);
+        CHECK_FALSE(native.value().protectorCorrection);
 
         Result<CalibrationSelection> water = CalibrationSelector::choose(s, CalibrationChoice::Underwater);
         REQUIRE(water.ok());
         CHECK(water.value().fellBack);
+        CHECK_FALSE(water.value().protectorCorrection);
         CHECK(water.value().reason.find("no usable underwater calibration") != std::string::npos);
     }
 
@@ -255,6 +263,8 @@ TEST_CASE("Auto follows the recorded accessory and forced choices explain themse
         CHECK(autoSel.value().set.sourceMaster == "lens_guards_master");
         CHECK_FALSE(autoSel.value().fellBack);
         CHECK_FALSE(autoSel.value().identicalToNative);
+        // A genuine dedicated set is trusted as is: no correction on top.
+        CHECK_FALSE(autoSel.value().protectorCorrection);
         CHECK(autoSel.value().reason.find("recorded lens guards") != std::string::npos);
 
         Result<CalibrationSelection> native = CalibrationSelector::choose(s, CalibrationChoice::Native);
@@ -277,10 +287,25 @@ TEST_CASE("Auto follows the recorded accessory and forced choices explain themse
         CHECK(guards.value().used == CalibrationSetId::LensGuards);
         CHECK_FALSE(guards.value().fellBack);
         CHECK(guards.value().identicalToNative);
-        CHECK(guards.value().reason.find("identical to Native") != std::string::npos);
+        // A copy of native carries no protector information: the correction
+        // is applied on top of it, exactly as with no set at all.
+        CHECK(guards.value().protectorCorrection);
+        CHECK(guards.value().reason.find("copy of native") != std::string::npos);
+        CHECK(guards.value().reason.find("plus the lens-protector field-angle correction") != std::string::npos);
+        CHECK(CalibrationSelector::inventory(s).choiceChangesStitch(CalibrationChoice::LensGuards));
+
+        // A copy for UNDERWATER has no correction to fall back on and is
+        // called out as unable to change anything.
+        s.dewarp.byField[P::WaterUnderSlave] = s.dewarp.byField[P::NativeRefineSlave];
+        s.dewarp.byField[P::WaterUnderMaster] = s.dewarp.byField[P::NativeRefineMaster];
+        warnings.clear();
+        Result<CalibrationSelection> water = CalibrationSelector::choose(s, CalibrationChoice::Underwater, {}, &warnings);
+        REQUIRE(water.ok());
+        CHECK(water.value().identicalToNative);
+        CHECK(water.value().reason.find("identical to Native") != std::string::npos);
         REQUIRE_FALSE(warnings.empty());
         CHECK(warnings.back().find("numerically identical") != std::string::npos);
-        CHECK_FALSE(CalibrationSelector::inventory(s).choiceChangesStitch(CalibrationChoice::LensGuards));
+        CHECK_FALSE(CalibrationSelector::inventory(s).choiceChangesStitch(CalibrationChoice::Underwater));
     }
 
     SECTION("a clip that records no accessory is treated as bare lenses") {
@@ -374,7 +399,10 @@ TEST_CASE("the sample clip holds native and far sets only, recorded without lens
         CHECK(sel.value().set.sourceMaster == "native_refine_master");
         const bool forcedAccessory = choice == CalibrationChoice::LensGuards || choice == CalibrationChoice::Underwater;
         CHECK(sel.value().fellBack == forcedAccessory);
+        // Only the forced lens-guard choice brings the protector correction;
+        // Auto on this bare-lens recording does not.
+        CHECK(sel.value().protectorCorrection == (choice == CalibrationChoice::LensGuards));
     }
-    CHECK_FALSE(inv.choiceChangesStitch(CalibrationChoice::LensGuards));
+    CHECK(inv.choiceChangesStitch(CalibrationChoice::LensGuards));
     CHECK_FALSE(inv.choiceChangesStitch(CalibrationChoice::Underwater));
 }

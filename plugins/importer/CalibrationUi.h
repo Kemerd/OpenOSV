@@ -7,10 +7,13 @@
 // The dialog used to offer Native / Lens guards / Underwater as if every
 // clip carried all three.  The sample clip carries neither: its lens-guard
 // and underwater slots are zero-filled placeholders, and picking them
-// silently rendered native.  (DJI's own importer never reads those slots at
-// all - its "Lens Protector" option is a field-angle correction applied on
-// top of the native calibration - so a clip that does fill them has not
-// been seen yet.)  The labels built here say up front when a set is missing
+// silently rendered native.
+//
+// Lens protectors no longer depend on those slots: without a dedicated set
+// the choice applies the protector field-angle correction to native (the way
+// DJI's own importer handles protector footage - it never reads slots 5/6),
+// so that entry always does something and is never marked.  Underwater still
+// needs its set; the labels built here say up front when it is missing
 // ("not in clip: Native"), and name what Auto will follow ("camera: no lens
 // protectors").
 //
@@ -46,7 +49,6 @@ struct CalibrationUiFacts {
     /// 1 lens protectors, 2 underwater), or -1 when the clip does not record
     /// one.  Other values are an accessory this build does not know.
     int recordedAccessory = -1;
-    CalibrationAvailability lensGuards = CalibrationAvailability::Unknown;  ///< Slots 5/6.
     CalibrationAvailability underwater = CalibrationAvailability::Unknown;  ///< Slots 9/10, else 7/8.
 };
 

@@ -255,10 +255,10 @@ bool CalibrationInventory::choiceChangesStitch(CalibrationChoice choice) const n
     std::optional<CalibrationSetId> target;
     switch (choice) {
     case CalibrationChoice::LensGuards:
-        if (usable(CalibrationSetId::LensGuards)) {
-            target = CalibrationSetId::LensGuards;
-        }
-        break;
+        // With or without a dedicated set the picture changes: a missing or
+        // native-copy set is replaced by the protector field-angle
+        // correction on top of native (see CalibrationSelection).
+        return true;
     case CalibrationChoice::Underwater:
         if (usable(CalibrationSetId::WaterUnder)) {
             target = CalibrationSetId::WaterUnder;
@@ -526,11 +526,21 @@ Result<CalibrationSelection> CalibrationSelector::choose(const StreamMeta& strea
     if (!nativeUsed && !farPreset) {
         const std::optional<CalibrationDelta>& d = inv.at(sel.used).vsNative;
         sel.identicalToNative = d.has_value() && d->identical;
-        if (sel.identicalToNative) {
+        if (sel.identicalToNative && sel.wanted != ExtriLensMode::LensGuards) {
             note(warnings, std::format("the {} pair is numerically identical to {}; this choice cannot change the stitch",
                                        usedName, refName));
         }
     }
+
+    // ---- lens guards without their own numbers: the field-angle correction --
+    // A protector bends every ray by a known curve (geom/LensProtector.h); a
+    // clip that carries no dedicated lens-guard calibration - every clip seen
+    // so far - gets that correction on top of native, which is how DJI's own
+    // importer handles protector footage (it never reads slots 5/6).  A
+    // dedicated, genuinely different set is trusted as is: applying the curve
+    // on top of it could correct twice.
+    sel.protectorCorrection =
+        !farPreset && sel.wanted == ExtriLensMode::LensGuards && (sel.fellBack || sel.identicalToNative);
 
     // ---- the one sentence ---------------------------------------------------
     // Written for the person looking at the log or the Properties panel: what
@@ -555,6 +565,14 @@ Result<CalibrationSelection> CalibrationSelector::choose(const StreamMeta& strea
     if (farPreset) {
         sel.reason = std::format("{}; stitch distance {:.2f} m selects the {} preset", asked,
                                  options.stitchDistanceM.value_or(0.0), usedName);
+    } else if (sel.protectorCorrection) {
+        sel.reason = std::format("{}; no dedicated lens-guard calibration in this clip ({} {}), so it stitches with "
+                                 "{} plus the lens-protector field-angle correction",
+                                 asked, accessorySlots(ExtriLensMode::LensGuards),
+                                 sel.identicalToNative ? "copy of native"
+                                                       : calibrationSetStateName(inv.choiceSetState(
+                                                             CalibrationChoice::LensGuards)),
+                                 sel.identicalToNative ? refName : usedName.c_str());
     } else if (sel.fellBack) {
         const CalibrationChoice needed =
             sel.wanted == ExtriLensMode::LensGuards ? CalibrationChoice::LensGuards : CalibrationChoice::Underwater;

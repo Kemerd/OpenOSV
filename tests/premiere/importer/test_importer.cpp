@@ -32,9 +32,13 @@
 // match name.  The same header the effect's PiPL is generated from, which is
 // what makes the importer/effect binding provably one string.
 #include "SourceSettingsIdentity.h"
+#include "TestLogIsolation.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 #include <cmath>
 #include <cstddef>
@@ -2507,6 +2511,48 @@ TEST_CASE("every calibration choice reaches the instance; on the sample they all
         INFO(text);
         REQUIRE(text.find("Calibration slots: native_refine_slave / native_refine_master") != std::string::npos);
         REQUIRE(text.find("Lens accessory: Native") != std::string::npos);
+    }
+
+    // ---- the lens-protector guard ran once, and said "none" ----------------
+    //
+    // Forcing Lens protectors on this bare-lens clip brings the protector
+    // field-angle correction into play; the guard scores frame 0 with and
+    // without it, finds the correction clearly worse and switches it off -
+    // which is why the LensGuards render above is pixel-identical to Auto.
+    // Its verdict is cached on disk (next to the isolated plug-in log), one
+    // line per clip, and a second instance must not measure again.
+    const std::filesystem::path cacheFile =
+        std::filesystem::path(osv::premiere::testsupport::detail::readEnvironment(L"LOCALAPPDATA")) / L"OpenOSV" /
+        L"lens-protector-guard.tsv";
+    auto cacheLines = [&cacheFile]() {
+        std::vector<std::string> lines;
+        std::ifstream in(cacheFile, std::ios::binary);
+        std::string line;
+        while (std::getline(in, line)) {
+            std::string lower = line;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (lower.find("example_footage_dlogm.osv") != std::string::npos) {
+                lines.push_back(line);
+            }
+        }
+        return lines;
+    };
+    {
+        const std::vector<std::string> lines = cacheLines();
+        INFO("cache file " << cacheFile.string());
+        REQUIRE(lines.size() == 1);
+        CHECK(lines[0].rfind("1\t", 0) == 0);
+        CHECK(lines[0].find("\tnone\t") != std::string::npos);
+    }
+    {
+        auto again = harness.openClip(sampleClipPath());
+        REQUIRE(again.open());
+        PrefsBlob p = base;
+        p.setCalibrationChoice(PrefsCalibrationChoice::LensGuards);
+        harness.host().clearCache();
+        REQUIRE(maxChannelDiff(renderFrame(harness, again, ppix, request, p), frameAuto) == 0.0f);
+        CHECK(cacheLines().size() == 1);  // served from the cache, not re-measured
     }
 
     SECTION("a blob saved before the choice existed renders exactly as Auto") {

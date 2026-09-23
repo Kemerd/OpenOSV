@@ -153,7 +153,9 @@ struct CalibrationInventory {
     /// True when forcing `choice` would stitch with a DIFFERENT set than
     /// Native does and that set is not numerically identical to native -
     /// i.e. the choice can change the picture.  Auto and Native are always
-    /// "effective" (they are the reference).
+    /// "effective" (they are the reference), and so is LensGuards: without
+    /// a dedicated set it applies the lens-protector field-angle correction
+    /// to native, which changes the geometry on any clip.
     [[nodiscard]] bool choiceChangesStitch(CalibrationChoice choice) const noexcept;
 
     /// The state of the set a forced `choice` needs: lens_guards for
@@ -178,6 +180,13 @@ struct CalibrationSelection {
     /// True when the used set is an accessory set whose numbers equal the
     /// native reference: the render is again exactly what Native gives.
     bool identicalToNative = false;
+    /// True when the lens-protector field-angle correction must be applied
+    /// on top of `set` (geom/LensProtector.h): the choice resolved to lens
+    /// guards, but the clip holds no dedicated lens-guard calibration (or
+    /// only a copy of native).  That is the normal case - DJI's own tools
+    /// never read slots 5/6 and correct protector footage exactly this way -
+    /// and it replaces the old "falls back to native" outcome for lens guards.
+    bool protectorCorrection = false;
     /// One sentence naming the set and why it was chosen, e.g.
     /// "auto: the camera recorded bare lenses (extri_lens_mode native); stitching with native_refine".
     std::string reason;

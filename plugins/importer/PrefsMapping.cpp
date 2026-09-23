@@ -48,7 +48,20 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
 // ---------------------------------------------------------------------------
 
 PrefsBlob prefsFromControls(const DialogControls& controls) noexcept {
-    PrefsBlob blob = PrefsBlob::defaults();
+    return prefsFromControls(controls, PrefsBlob::defaults());
+}
+
+PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& base) noexcept {
+    // Start from the blob the dialog was opened with, NOT from defaults():
+    // the dialog shows only some of the fields, and every field it does not
+    // show (parallax, flow backend, and whatever later packages add) must
+    // come back exactly as it went in.  Starting from defaults() silently
+    // reset parallax to On and the flow backend to Auto on every OK.
+    //
+    // The base is sanitised first so a damaged incoming blob cannot smuggle
+    // an out-of-range hidden field through.
+    PrefsBlob blob = base;
+    blob.sanitise();
 
     // A control index outside its range must never produce an invalid blob.
     // A combo box with no selection reports CB_ERR (-1) and a corrupted
@@ -86,6 +99,33 @@ PrefsBlob prefsFromControls(const DialogControls& controls) noexcept {
 }
 
 // ---------------------------------------------------------------------------
+//  Which file to refresh after OK
+// ---------------------------------------------------------------------------
+
+std::wstring prefsRefreshTarget(const PrefsBlob& before, const PrefsBlob& after, const wchar_t* instancePath,
+                                const wchar_t* accessPath) noexcept {
+    // Unchanged settings: the frames already on screen are the right ones,
+    // and every PPix is keyed on the whole blob anyway.
+    if (before == after) {
+        return {};
+    }
+    try {
+        // The live instance knows its own file best; imGetPrefs8 has no
+        // instance, but the host names the clip's file in imFileAccessRec8.
+        if (instancePath && instancePath[0] != L'\0') {
+            return std::wstring(instancePath);
+        }
+        if (accessPath && accessPath[0] != L'\0') {
+            return std::wstring(accessPath);
+        }
+    } catch (...) {
+        // Allocation failure: no refresh is the safe answer (the user can
+        // still force one by reopening the project).
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------------------
 //  Calibration combo labels
 // ---------------------------------------------------------------------------
 
@@ -116,8 +156,9 @@ calibrationChoiceLabels(const CalibrationUiFacts& facts) {
         autoLabel = L"Auto (camera: no lens protectors)";
         break;
     case 1:
-        autoLabel = facts.lensGuards == CalibrationAvailability::Missing ? L"Auto (protectors recorded, no data)"
-                                                                          : L"Auto (camera: lens protectors)";
+        // Always backed: without a dedicated set the protector field-angle
+        // correction is applied to native.
+        autoLabel = L"Auto (camera: lens protectors)";
         break;
     case 2:
         autoLabel = facts.underwater == CalibrationAvailability::Missing ? L"Auto (underwater recorded, no data)"
@@ -128,7 +169,9 @@ calibrationChoiceLabels(const CalibrationUiFacts& facts) {
         break;
     }
 
-    // ---- the forced accessory sets: say when they cannot change anything --
+    // ---- the forced underwater set: say when it cannot change anything -----
+    // (Lens protectors are never marked: they always apply either their own
+    // set or the field-angle correction, so they always change the stitch.)
     auto mark = [](std::wstring& label, CalibrationAvailability a, const wchar_t* name) {
         switch (a) {
         case CalibrationAvailability::Missing:
@@ -143,7 +186,6 @@ calibrationChoiceLabels(const CalibrationUiFacts& facts) {
             break;  // The plain name is the truth.
         }
     };
-    mark(labels[static_cast<std::size_t>(PrefsCalibrationChoice::LensGuards)], facts.lensGuards, L"Lens protectors");
     mark(labels[static_cast<std::size_t>(PrefsCalibrationChoice::Underwater)], facts.underwater, L"Underwater");
     return labels;
 }
