@@ -22,13 +22,21 @@
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
 
+// [WP-DEFAULTS] The Premiere plug-ins' own (SDK-free) reader of the defaults
+// file, compiled into osvtool by tools/osvtool/CMakeLists.txt.
+#include "UserDefaults.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <exception>
+#include <iterator>
 #include <mutex>
+#include <string>
 #include <thread>
 
 namespace osvtool {
@@ -73,7 +81,138 @@ struct RenderOptions {
     std::string codec = "hevc_nvenc";
     int crf = 18;
     bool noAudio = false;
+    // ---- [WP-DEFAULTS] render --use-user-defaults ----------------------------
+    /// Start from the Source Settings defaults saved in Premiere (see
+    /// applyUserDefaults); off unless asked, so a plain render is the same
+    /// on every machine whatever anybody saved there.
+    bool useUserDefaults = false;
+    /// The render blend's seam edge inset in degrees (the importer's
+    /// PrefsBlob::seamInsetDeg); --blend-fov, when given, replaces it.
+    double seamInsetDeg = osv::render::kDefaultSeamInsetDeg;
+    /// Equirect modes only: take the output size from the defaults' Output
+    /// Size "Native" (2 x decoded lens height), known once the clip is open.
+    bool nativeEquirectSize = false;
 };
+
+// ---------------------------------------------------------------------------
+//  [WP-DEFAULTS] --use-user-defaults
+// ---------------------------------------------------------------------------
+
+/// The osvtool spelling of each Source Settings enum, in enum order (the
+/// same order as PrefsBlob.h, so the value indexes the list).
+constexpr const char* kCliColor[] = {"pq", "hlg", "709", "dlogm"};
+constexpr const char* kCliStab[] = {"off", "horizon", "full", "smooth"};
+constexpr const char* kCliCalib[] = {"auto", "native", "lens-guards", "underwater"};  // PrefsCalibrationChoice
+constexpr const char* kCliFit[] = {"dji", "pocket3", "osmo360"};
+constexpr const char* kCliDevice[] = {"auto", "cpu", "cuda", "opencl"};
+constexpr const char* kCliLook[] = {"dji", "standard"};
+constexpr const char* kCliFlow[] = {"auto", "classical", "neural"};
+constexpr const char* kCliPhoto[] = {"off", "rim", "full"};
+static_assert(std::size(kCliColor) == static_cast<std::size_t>(osv::premiere::PrefsColorOutput::Count));
+static_assert(std::size(kCliStab) == static_cast<std::size_t>(osv::premiere::PrefsStabilization::Count));
+static_assert(std::size(kCliCalib) == static_cast<std::size_t>(osv::premiere::PrefsCalibrationChoice::Count));
+static_assert(std::size(kCliFit) == static_cast<std::size_t>(osv::premiere::PrefsDlogmFit::Count));
+static_assert(std::size(kCliDevice) == static_cast<std::size_t>(osv::premiere::PrefsRenderDevice::Count));
+static_assert(std::size(kCliLook) == static_cast<std::size_t>(osv::premiere::PrefsLook::Count));
+static_assert(std::size(kCliFlow) == static_cast<std::size_t>(osv::premiere::PrefsFlowBackend::Count));
+static_assert(std::size(kCliPhoto) == static_cast<std::size_t>(osv::premiere::PrefsPhotoSeam::Count));
+
+/// The token for an enum byte; the list's first entry for a value past it
+/// (the blob is sanitised, so that is a guard, not a path).
+template <std::size_t N>
+[[nodiscard]] std::string cliToken(const char* const (&tokens)[N], std::uint8_t value) {
+    return tokens[value < N ? value : 0u];
+}
+
+/// Replace every Source Settings option the user did NOT give on the command
+/// line with the value saved as the default for new clips in Premiere
+/// (plugins/common/UserDefaults.h: OPENOSV_DEFAULTS_FILE, else
+/// %APPDATA%\OpenOSV\defaults.json).  The file is a complete set - a key it
+/// lacks is the importer's built-in value - so the result renders the clip
+/// the way Premiere renders a NEW clip, except for what the command line
+/// says.  Sun ghost removal and Program Monitor Colour have no osvtool
+/// equivalent and are reported, not applied.
+void applyUserDefaults(RenderOptions& o, const CLI::App& sub) {
+    namespace pr = osv::premiere;
+    const pr::UserDefaults user = pr::currentUserDefaults();
+    const pr::PrefsBlob& p = user.prefs;
+    // Given on the command line wins; everything else follows the file.
+    const auto given = [&sub](const char* name) { return sub.count(name) > 0; };
+
+    if (user.fromFile) {
+        log::info("--use-user-defaults: {} - {}", pr::userDefaultsPathForLog(user.path), pr::userDefaultsSummary(p));
+    } else {
+        log::info("--use-user-defaults: no usable defaults file ({}); using the built-in Source Settings defaults",
+                  user.path.empty() ? std::string("no location") : pr::userDefaultsPathForLog(user.path));
+    }
+
+    // ---- the pipeline's options -------------------------------------------------
+    if (!given("--color")) {
+        o.pipeline.color = cliToken(kCliColor, p.colorOutput);
+    }
+    if (!given("--look")) {
+        o.pipeline.look = cliToken(kCliLook, p.look);
+    }
+    if (!given("--stab")) {
+        o.pipeline.stab = cliToken(kCliStab, p.stabilization);
+    }
+    if (!given("--calib")) {
+        o.pipeline.calib = cliToken(kCliCalib, static_cast<std::uint8_t>(p.calibrationChoice()));
+    }
+    if (!given("--fit")) {
+        o.pipeline.fit = cliToken(kCliFit, p.dlogmFit);
+    }
+    if (!given("--exposure")) {
+        o.pipeline.exposureStops = static_cast<double>(p.exposureStops);
+    }
+    if (!given("--device")) {
+        o.pipeline.device = cliToken(kCliDevice, p.renderDevice);
+    }
+
+    // ---- the stitch -------------------------------------------------------------
+    // The negated spellings (--no-seam-search, ...) count as given, so a
+    // default can always be switched off for one render.
+    if (!given("--seam-search")) {
+        o.seamSearch = p.seamSearch != 0;
+    }
+    if (!given("--gain")) {
+        o.gain = p.gainMatch != 0;
+    }
+    if (!given("--parallax")) {
+        o.parallax = p.parallaxEnabled();
+    }
+    if (!given("--flow-backend")) {
+        o.flowBackend = cliToken(kCliFlow, p.flowBackend);
+    }
+    if (!given("--photo")) {
+        o.photo = cliToken(kCliPhoto, p.photoSeam);
+    }
+    if (!given("--photo-strength")) {
+        o.photoStrength = p.photoStrengthPercent() / 100.0;
+    }
+    if (!given("--blend-fov")) {
+        o.seamInsetDeg = p.seamInsetDeg();
+    }
+
+    // ---- the equirect size -------------------------------------------------------
+    // Output Size is the importer's EQUIRECT size; a reframe's --size is the
+    // virtual camera's and stays as given.
+    if ((o.mode == "equirect" || o.mode == "equirect-polar") && !given("--size")) {
+        switch (p.size()) {
+        case pr::PrefsOutputSize::UHD4K:   o.size = "3840x1920"; break;
+        case pr::PrefsOutputSize::QHD2560: o.size = "2560x1280"; break;
+        case pr::PrefsOutputSize::HD2K:    o.size = "1920x960"; break;
+        case pr::PrefsOutputSize::Native:
+        case pr::PrefsOutputSize::Count:
+        default:                           o.nativeEquirectSize = true; break;
+        }
+    }
+
+    // ---- what osvtool does not do ------------------------------------------------
+    if (p.flareRemoval != 0) {
+        log::info("--use-user-defaults: sun ghost removal is a Premiere importer stage; osvtool renders without it");
+    }
+}
 
 /// Expand an output pattern for a frame index: printf-style "%05d", or an
 /// "_00000" suffix inserted before the extension for multi-frame runs.
@@ -185,7 +324,13 @@ int runRender(const RenderOptions& o) {
 
     // ---- output geometry ------------------------------------------------------------
     int w = 0, h = 0;
-    if (!parseSize(o.size, w, h)) {
+    // [WP-DEFAULTS] --use-user-defaults with Output Size "Native": the
+    // importer's native equirect, 2 x the decoded lens height.
+    std::string sizeText = o.size;
+    if (o.nativeEquirectSize && P.format.lensH() > 0) {
+        sizeText = std::to_string(2u * P.format.lensH()) + "x" + std::to_string(P.format.lensH());
+    }
+    if (!parseSize(sizeText, w, h)) {
         std::fprintf(stderr, "error: --size must be WxH\n");
         return kExitUsage;
     }
@@ -197,8 +342,9 @@ int runRender(const RenderOptions& o) {
         std::fprintf(stderr, "error: --blend-feather must be within 0..30 degrees\n");
         return kExitUsage;
     }
-    geom::BlendParams renderBlend =
-        render::insetRenderBlend(P.blendParams, render::kDefaultSeamInsetDeg, o.blendFeather);
+    // The seam edge inset is the default one unless --use-user-defaults set
+    // the saved Seam Edge Inset ([WP-DEFAULTS]).
+    geom::BlendParams renderBlend = render::insetRenderBlend(P.blendParams, o.seamInsetDeg, o.blendFeather);
     if (o.blendFovSet) {
         if (!(o.blendFov > 90.0) || o.blendFov > P.blendParams.lensFovDeg) {
             std::fprintf(stderr, "error: --blend-fov must be above 90 and at most --lens-fov (%.2f)\n",
@@ -613,15 +759,17 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
     outGeom->add_option("--roll", opt->roll, "Roll angle (deg)")->default_val(0.0);
     outGeom->add_option("--correction", opt->correction, "Correction (horizon) angle (deg)")->default_val(0.0);
     outGeom->add_option("--size", opt->size, "Output size WxH")->default_str("1920x1080");
-    outGeom->add_flag("--seam-search", opt->seamSearch, "Per-column seam disparity correction");
-    outGeom->add_flag("--parallax", opt->parallax,
+    // The --no-* spellings exist for --use-user-defaults: they switch a saved
+    // default off for one render.  Without that flag they change nothing.
+    outGeom->add_flag("--seam-search,!--no-seam-search", opt->seamSearch, "Per-column seam disparity correction");
+    outGeom->add_flag("--parallax,!--no-parallax", opt->parallax,
                       "2-D optical-flow parallax correction at the seam; when accepted it replaces --seam-search, "
                       "which remains the fallback");
     outGeom->add_flag("--seam-carve", opt->seamCarve,
                       "Carve the seam through the overlap by dynamic programming and blend narrowly along it "
                       "(no doubled near objects); composes with --parallax / --seam-search");
     outGeom->add_option("--flow-backend", opt->flowBackend, "auto|classical|neural")->default_str("auto");
-    outGeom->add_flag("--gain", opt->gain, "Exposure matching between lenses");
+    outGeom->add_flag("--gain,!--no-gain", opt->gain, "Exposure matching between lenses");
     outGeom
         ->add_option("--blend-fov", opt->blendFov,
                      "Render-blend lens FOV in degrees; the analyses keep --lens-fov (default: --lens-fov minus "
@@ -644,7 +792,26 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
     outGeom->add_option("--crf", opt->crf, "Quality (crf / cq)")->default_val(18);
     outGeom->add_flag("--no-audio", opt->noAudio, "Do not copy the source audio into the .mp4");
 
-    sub->callback([opt, &ctx]() { ctx.exitCode = runRender(*opt); });
+    // [WP-DEFAULTS] Opt-in only, so osvtool stays deterministic: a render
+    // without this flag never reads the Premiere defaults file.
+    sub->add_flag("--use-user-defaults", opt->useUserDefaults,
+                  "Start from the Source Settings saved in Premiere as the default for new clips "
+                  "(OPENOSV_DEFAULTS_FILE, else %APPDATA%\\OpenOSV\\defaults.json); options given here still win");
+
+    sub->callback([opt, sub, &ctx]() {
+        if (opt->useUserDefaults) {
+            // A lookup or an allocation failing here must end the command
+            // with a message, not escape through CLI11's parse().
+            try {
+                applyUserDefaults(*opt, *sub);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "error: --use-user-defaults: %s\n", log::safe(e.what()).c_str());
+                ctx.exitCode = kExitRuntime;
+                return;
+            }
+        }
+        ctx.exitCode = runRender(*opt);
+    });
 }
 
 }  // namespace osvtool

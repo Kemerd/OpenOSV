@@ -342,3 +342,93 @@ TEST_CASE("osvtool render --look switches the Rec.709 look", "[cli][look][sample
     CHECK(bad.exitCode != 0);
     CHECK(bad.output.find("--look") != std::string::npos);
 }
+
+// [WP-DEFAULTS] osvtool render --use-user-defaults: the Source Settings saved
+// in Premiere as the default for new clips become the starting values of the
+// render options - only when asked, and never over an option given on the
+// command line.
+TEST_CASE("osvtool render --use-user-defaults follows the saved defaults only when asked",
+          "[cli][defaults][sample]") {
+    OSV_REQUIRE_SAMPLE();
+    if (std::string(kToolPath).empty() || !std::filesystem::exists(kToolPath)) {
+        SKIP("osvtool not built");
+    }
+#if defined(_WIN32)
+    // A defaults file as the plug-ins write it.  Keys a file does not carry
+    // are the importer's built-in values, so the ones that would make a CPU
+    // render slow - parallax, the sky seam fix - are written out as off.
+    const auto defaultsFile = osvtest::tempDir() / "cli_user_defaults" / "defaults.json";
+    std::filesystem::create_directories(defaultsFile.parent_path());
+    {
+        std::ofstream out(defaultsFile, std::ios::binary | std::ios::trunc);
+        out << R"({
+  "format": "openosv-source-settings-defaults",
+  "version": 1,
+  "settings": {
+    "colourOutput": "rec709",
+    "rec709Look": "standard",
+    "stabilisation": "off",
+    "seamSearch": false,
+    "exposureMatch": false,
+    "calibration": "auto",
+    "skySeamFix": "off",
+    "parallaxCorrection": false,
+    "dlogmCurve": "osmo360",
+    "exposureStops": 0.5,
+    "renderDevice": "cpu"
+  }
+})";
+    }
+
+    // The child inherits this process's environment, so the variable is set
+    // for the renders that should see it and removed for the references.
+    struct ScopedVariable {
+        explicit ScopedVariable(const std::string& value) {
+            ::SetEnvironmentVariableA("OPENOSV_DEFAULTS_FILE", value.empty() ? nullptr : value.c_str());
+        }
+        ~ScopedVariable() { ::SetEnvironmentVariableA("OPENOSV_DEFAULTS_FILE", nullptr); }
+        ScopedVariable(const ScopedVariable&) = delete;
+        ScopedVariable& operator=(const ScopedVariable&) = delete;
+    };
+
+    const std::string clip = quoted(osvtest::sampleOsv());
+    const std::string frame = " --frame 0 --size 320x180 --out ";
+    struct Rendered {
+        std::vector<float> pixels;
+        std::string output;
+    };
+    const auto render = [&](const std::string& name, const std::string& flags, bool withFile) {
+        const ScopedVariable variable(withFile ? defaultsFile.string() : std::string());
+        const auto path = osvtest::tempDir() / name;
+        const RunResult r = runTool("render " + clip + frame + quoted(path) + flags);
+        INFO(r.output);
+        REQUIRE(r.exitCode == 0);
+        auto img = osv::io::readImage(path);
+        REQUIRE(img.ok());
+        return Rendered{img.value().data, r.output};
+    };
+
+    // Asked: the saved Rec.709 / standard look / +0.5 stops on the CPU...
+    const Rendered fromDefaults = render("cli_ud_defaults.tif", " --use-user-defaults", true);
+    CHECK(fromDefaults.output.find("--use-user-defaults:") != std::string::npos);
+    // ...is exactly the render those options spell out by hand.
+    const Rendered byHand =
+        render("cli_ud_byhand.tif", " --device cpu --color 709 --look standard --exposure 0.5", false);
+    CHECK(fromDefaults.pixels == byHand.pixels);
+
+    // An option given on the command line wins over the saved default.
+    const Rendered overridden = render("cli_ud_override.tif", " --use-user-defaults --look dji", true);
+    const Rendered overriddenByHand =
+        render("cli_ud_override_byhand.tif", " --device cpu --color 709 --look dji --exposure 0.5", false);
+    CHECK(overridden.pixels == overriddenByHand.pixels);
+    CHECK(overridden.pixels != fromDefaults.pixels);
+
+    // Not asked: the file is ignored even though the variable names it, so a
+    // plain render is the same on every machine.
+    const Rendered notAsked = render("cli_ud_not_asked.tif", " --device cpu", true);
+    const Rendered reference = render("cli_ud_reference.tif", " --device cpu", false);
+    CHECK(notAsked.pixels == reference.pixels);
+    CHECK(notAsked.pixels != fromDefaults.pixels);
+    CHECK(notAsked.output.find("--use-user-defaults") == std::string::npos);
+#endif
+}
