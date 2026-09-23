@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  Copyright 2026 The OpenOSV Contributors
+
+  The OpenOSV panel, CEP flavour (Premiere Pro 22 and later, while Premiere
+  still runs CEP).  Unsigned, so Premiere loads it only with the per-user
+  PlayerDebugMode switch that scripts/install_plugins.ps1 sets (docs/PANEL.md).
+  ExtensionBundleVersion must equal OsvCore.PANEL_VERSION (a test checks).
+-->
+<ExtensionManifest Version="6.0"
+                   ExtensionBundleId="com.openosv.panel"
+                   ExtensionBundleVersion="1.0.0"
+                   ExtensionBundleName="OpenOSV"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <ExtensionList>
+    <Extension Id="com.openosv.panel.main" Version="1.0.0"/>
+  </ExtensionList>
+  <ExecutionEnvironment>
+    <HostList>
+      <Host Name="PPRO" Version="[22.0,99.9]"/>
+    </HostList>
+    <LocaleList>
+      <Locale Code="All"/>
+    </LocaleList>
+    <RequiredRuntimeList>
+      <RequiredRuntime Name="CSXS" Version="10.0"/>
+    </RequiredRuntimeList>
+  </ExecutionEnvironment>
+  <DispatchInfoList>
+    <Extension Id="com.openosv.panel.main">
+      <DispatchInfo>
+        <Resources>
+          <MainPath>./index.html</MainPath>
+          <ScriptPath>./host/host.jsx</ScriptPath>
+        </Resources>
+        <Lifecycle>
+          <AutoVisible>true</AutoVisible>
+        </Lifecycle>
+        <UI>
+          <Type>Panel</Type>
+          <Menu>OpenOSV</Menu>
+          <Geometry>
+            <Size>
+              <Width>320</Width>
+              <Height>460</Height>
+            </Size>
+            <MinSize>
+              <Width>220</Width>
+              <Height>260</Height>
+            </MinSize>
+            <MaxSize>
+              <Width>2000</Width>
+              <Height>2000</Height>
+            </MaxSize>
+          </Geometry>
+        </UI>
+      </DispatchInfo>
+    </Extension>
+  </DispatchInfoList>
+</ExtensionManifest>

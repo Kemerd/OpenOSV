@@ -132,3 +132,36 @@ if(TARGET osv_render_cuda)
             $<TARGET_FILE_DIR:osv_flare_bench>
     COMMAND_EXPAND_LISTS)
 endif()
+
+# -----------------------------------------------------------------------------
+#  [WP-PANEL] The companion panel's JavaScript (panel/, docs/PANEL.md).
+#
+#  Plain Node with its built-in runner (node:test) and no npm packages: the
+#  pure rules, the controller, both host adapters against mocks of Premiere's
+#  UXP and ExtendScript DOMs, the view in a fake DOM, and the identity checks
+#  against plugins/reframe.  Registered only when Node 18 or later is found,
+#  so a machine or CI runner without Node still passes the suite.
+# -----------------------------------------------------------------------------
+find_program(OSV_NODE_EXECUTABLE NAMES node DOC "Node.js, for the companion panel tests")
+if(OSV_NODE_EXECUTABLE)
+  execute_process(COMMAND "${OSV_NODE_EXECUTABLE}" --version
+                  OUTPUT_VARIABLE _osv_node_version
+                  OUTPUT_STRIP_TRAILING_WHITESPACE
+                  RESULT_VARIABLE _osv_node_result
+                  ERROR_QUIET)
+  set(_osv_node_major 0)
+  if(_osv_node_result EQUAL 0 AND _osv_node_version MATCHES "^v([0-9]+)\\.")
+    set(_osv_node_major "${CMAKE_MATCH_1}")
+  endif()
+  if(_osv_node_major GREATER_EQUAL 18)
+    add_test(NAME panel.js
+             COMMAND "${OSV_NODE_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/panel/tests/run.js"
+             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(panel.js PROPERTIES LABELS "panel" TIMEOUT 120)
+    message(STATUS "  Panel tests    : Node ${_osv_node_version}")
+  else()
+    message(STATUS "  Panel tests    : skipped (need Node 18+, found '${_osv_node_version}')")
+  endif()
+else()
+  message(STATUS "  Panel tests    : skipped (no Node.js on PATH)")
+endif()
