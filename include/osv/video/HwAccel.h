@@ -48,8 +48,33 @@ struct DecoderOptions {
     /// need host pixels must leave this false.
     bool keepOnDevice = false;
 
-    /// CUDA only: ordinal of the device to decode on.
+    /// CUDA only: ordinal of the device to decode on.  With `cudaContext`
+    /// set it must name that context's device; it is then only reported back
+    /// in DeviceFrameRef::deviceIndex.
     int cudaDeviceIndex = 0;
+
+    /// CUDA only: an existing CUcontext to decode into, passed as void* so
+    /// this header never needs cuda.h.  nullptr keeps the historical
+    /// behaviour, where FFmpeg creates a context of its own for
+    /// `cudaDeviceIndex`.  With a context supplied the FFmpeg device context
+    /// is built around it (av_hwdevice_ctx_alloc, AVCUDADeviceContext::cuda_ctx,
+    /// av_hwdevice_ctx_init): FFmpeg then never creates, retains or destroys
+    /// a context, and every NVDEC surface it allocates lives in the caller's
+    /// context, where the caller's kernels can read it.  Allocations made in
+    /// one CUDA context are not usable by kernels running in another, which
+    /// is why a host application that renders in its own context needs this.
+    /// The caller keeps the context alive for the decoder's whole lifetime.
+    /// Requires a build with the CUDA toolkit (OSV_VIDEO_HAVE_CUDA);
+    /// otherwise open() fails with Unsupported.
+    void* cudaContext = nullptr;
+
+    /// CUDA only, used together with `cudaContext`: the CUstream FFmpeg
+    /// orders its surface copies and the NVDEC post-processing on.  nullptr
+    /// is FFmpeg's default, the context's legacy default stream, which
+    /// serialises against every blocking stream of that context; callers
+    /// that share the context with a renderer should pass a non-blocking
+    /// stream of their own.
+    void* cudaStream = nullptr;
 
     /// Bypass libavformat: open the file with the OpenOSV container parser and
     /// hand every sample of the selected track straight to libavcodec.  The
