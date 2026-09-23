@@ -214,6 +214,15 @@ DirectLaunchResult launchDirect(CUfunction kernel, CUstream stream, const Direct
             return refused(DirectLaunchReject::Memory);
         }
     }
+    // [WP-SEAMTOOLS] The seam smoothing's low band: both lenses' RGBA texels.
+    if (setup.seamLow) {
+        const std::uint64_t lowFloats = 2u * static_cast<std::uint64_t>(setup.params.seamLowW) *
+                                        static_cast<std::uint64_t>(setup.params.seamLowH) * 4u;
+        if (setup.params.seamLowW <= 0 || setup.params.seamLowH <= 0 ||
+            !deviceRangeOk(setup.seamLow, lowFloats * sizeof(float), device)) {
+            return refused(DirectLaunchReject::Memory);
+        }
+    }
 
     // ---- the arguments, in the order DirectKernelAbi.h pins ----------------
     // cuLaunchKernel copies every argument before it returns, so locals are
@@ -226,10 +235,12 @@ DirectLaunchResult launchDirect(CUfunction kernel, CUstream stream, const Direct
     const float* warp = setup.warpGrid;
     const float* blendSeam = setup.blendSeam;  // [WP-SEAM]
     const float* photo = setup.photoField;     // [WP-PHOTO]
+    const float* seamLow = setup.seamLow;      // [WP-SEAMTOOLS]
     unsigned char* dst = static_cast<unsigned char*>(out.data);
     int dstRowBytes = static_cast<int>(out.rowBytes);
     int dstIsHalf = out.isHalf ? 1 : 0;
-    void* args[] = {&params, &planes, &seam, &warp, &blendSeam, &photo, &dst, &dstRowBytes, &dstIsHalf};
+    void* args[] = {&params, &planes, &seam,    &warp,        &blendSeam, &photo,
+                    &seamLow, &dst,   &dstRowBytes, &dstIsHalf};
 
     // One thread per output pixel, the grid rounded up to whole blocks (the
     // kernel guards the tail).  Heights up to 65536 need at most 4096 blocks

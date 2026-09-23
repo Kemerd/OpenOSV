@@ -65,8 +65,13 @@ extern "C" {
  *       photometric seam field (WP-PHOTO); OsvEngine_QuerySettings was added;
  *       OsvRenderParams grew by the flare (WP-FLARE), look (WP-LOOK) and
  *       photo (WP-PHOTO) blocks.  A version-1 effect meeting a version-2 importer (or the
- *       reverse) refuses the engine and renders through the equirect path. */
-#define OSV_ENGINE_ABI_VERSION 2u
+ *       reverse) refuses the engine and renders through the equirect path.
+ *    3  OsvEngineFrame gained the seam smoothing's low band (WP-SEAMTOOLS,
+ *       seamLowDevice) and OsvRenderParams its seam smoothing block; the
+ *       direct kernel takes the low band as a new argument after the photo
+ *       table.  A version-2 effect meeting a version-3 importer (or the
+ *       reverse) refuses the engine, as above. */
+#define OSV_ENGINE_ABI_VERSION 3u
 
 /** Module file name of the importer that exports the engine. */
 #define OSV_ENGINE_MODULE_NAME L"OpenOSVImporter.prm"
@@ -197,6 +202,13 @@ typedef struct OsvEngineFrame {
      *  NULL when stitch.photoEnabled is 0.  Freed with the lease. */
     const float* photoDevice;
     /* ---- [/WP-PHOTO] -------------------------------------------------------- */
+    /* ---- [WP-SEAMTOOLS] ----------------------------------------------------- */
+    /** Device copy of the seam smoothing's two-lens low band (2 x
+     *  stitch.seamLowW x stitch.seamLowH RGBA float texels, see osv_kernel.h),
+     *  built by the engine from THIS frame's planes on the request's stream,
+     *  or NULL when stitch.seamSmoothEnabled is 0.  Freed with the lease. */
+    const float* seamLowDevice;
+    /* ---- [/WP-SEAMTOOLS] ---------------------------------------------------- */
 } OsvEngineFrame;
 
 /** ABI version of the loaded engine (compare with OSV_ENGINE_ABI_VERSION). */

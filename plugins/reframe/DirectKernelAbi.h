@@ -22,6 +22,7 @@
  *   const float*         warp          warp grid (device) or NULL
  *   const float*         blendSeam     [WP-SEAM] carved blend-seam table (device) or NULL
  *   const float*         photo         [WP-PHOTO] photometric seam table (device) or NULL
+ *   const float*         seamLow       [WP-SEAMTOOLS] seam smoothing low band (device) or NULL
  *   unsigned char*       dst           top-left pixel of the output frame (device)
  *   int                  dstRowBytes   positive row pitch in bytes
  *   int                  dstIsHalf     1 = BGRA 16f, 0 = BGRA 32f
