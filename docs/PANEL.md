@@ -132,8 +132,10 @@ renders its fixed Motion / Opacity after the standard effects either way.
 
 **Failure never reaches Premiere.** Every host call is guarded. Anything that
 fails turns into one line in the status bar, for example "Couldn't apply: the
-active sequence changed. Try again." A clip that failed in an automatic pass
-isn't retried in a loop. The buttons retry.
+active sequence changed. Try again." (from a button). If you switch sequences
+in the middle of an automatic pass, the panel says nothing: the switch starts
+the next pass itself. A clip that failed in an automatic pass isn't retried in
+a loop. The buttons retry.
 
 ### The lens and drag sensitivity
 
@@ -296,7 +298,7 @@ build instead of shipping a panel that never finds its effect.
 
 ## Tests
 
-`node panel/tests/run.js` (Node 18+, no npm packages) runs 125 tests. ctest
+`node panel/tests/run.js` (Node 18+, no npm packages) runs 126 tests. ctest
 registers them as `panel.js` only when Node 18+ is found, so a machine without
 Node still passes the suite.
 

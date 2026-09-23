@@ -276,6 +276,20 @@ test('a failing scan becomes a status line, never an exception', async () => {
     assert.equal(t.last().busy, false, 'busy is cleared after a failure');
 });
 
+test('a sequence switch racing an automatic pass is not reported as an error', async () => {
+    const t = setup();
+    t.ctl.start();
+    await t.step(0);
+    t.s.scanError = 'the active sequence changed. Try again';
+    t.s.onEvent('track');
+    await t.step(1000);
+    assert.equal(t.last().status.text, 'Watching the timeline.', 'the automatic pass stays quiet');
+    t.s.scanError = 'Premiere\'s script engine refused the call';
+    t.s.onEvent('track');
+    await t.step(1000);
+    assert.equal(t.last().status.tone, 'error', 'a real failure is still reported');
+});
+
 test('a missing effect is reported at start', async () => {
     const t = setup({ configure: (s) => { s.effectAvailable = false; } });
     t.ctl.start();

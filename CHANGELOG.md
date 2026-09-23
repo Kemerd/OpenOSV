@@ -53,7 +53,7 @@ All notable changes to OpenOSV are documented here. The format follows
     restores exactly.
 
   New switches: `-NoPanel`, `-PanelOnly`, `-PanelFlavor`, `-PanelDestination`.
-  125 Node tests; ctest runs them when Node 18+ is found. See
+  126 Node tests; ctest runs them when Node 18+ is found. See
   `docs/PANEL.md`.
 * **Carved stitch seam (WP-SEAM).** Inside the overlap each lens now shows
   only on its own side of a seam carved where the lenses agree (dynamic

@@ -298,6 +298,15 @@
                             setStatus(summary.tone, summary.text, true);
                         }
                     });
+                })
+                .catch(function (err) {
+                    // The user switched sequence while this pass was looking:
+                    // harmless, and the switch itself triggers the next pass.
+                    // Only a button press reports it.  Anything else is real.
+                    if (/active sequence changed/i.test(messageOf(err))) {
+                        return undefined;
+                    }
+                    throw err;
                 });
         }
 
