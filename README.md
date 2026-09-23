@@ -70,7 +70,7 @@ clip, works out where the lenses disagree, and fixes it.
 | **Banding in the sky** | — | **Lens shading measured per lens and removed** |
 | **Sky seam colour and brightness** | — | **A per-seam brightness and colour field** so the two lenses meet cleanly |
 | **Sun reflections (lens ghosts)** | — | **Detected, fitted and subtracted** |
-| **Stabilisation from the gyro** | RockSteady, Horizon Leveling | RockSteady, Horizon Leveling, full lock |
+| **Stabilisation from the gyro** | RockSteady, Horizon Leveling | RockSteady and Horizon Leveling, together by default, plus full lock |
 | **Keyframes** | DJI Studio's own timeline | **Premiere's keyframes and graph editor**, plus DJI Studio's seven easing presets |
 | **Save your settings as defaults** | — | **Yes**, for every new clip |
 | **Source code** | Closed | **Open (Apache-2.0)** |
@@ -300,7 +300,7 @@ same settings are in the right-click **Source Settings** dialog.
 | | **Look** | Rec.709 only: DJI Studio's look (default) or OpenOSV standard. |
 | | **HDR Peak** | PQ only: 1000 (default), 600, 400 or 203 nits. |
 | | **Output Size** | Native, 4K, 2560 × 1280 or 2K sphere. |
-| Motion | **Stabilisation** | From the camera's gyro: Off, Horizon Lock, Full, Smooth (RockSteady). |
+| Motion | **Stabilisation** | From the camera's gyro: Off, Horizon Lock, Full, Smooth (RockSteady), or Smooth + Horizon Lock (both; default). |
 | Stitching | **Seam Search** | The parallax-aware carved seam. |
 | | **Exposure Match** | Evens out the two lenses' brightness. |
 | | **Calibration** | Auto (as recorded), Lens Protectors / ND Filters, Underwater, Native. |
@@ -329,7 +329,7 @@ same settings are in the right-click **Source Settings** dialog.
 | **Program Monitor controls** | Every gesture, one line each. |
 | **Manual Framing** | DJI Studio's looks, a Zoom stepper along its zoom path, and live FOV, Correction, Pan, Tilt and Roll at the playhead. |
 | **Keyframe Animation** | DJI Studio's seven easing presets, for selected clips or the whole sequence. One `Ctrl+Z` undoes it. |
-| **Stabilisation** | RockSteady and Horizon Leveling, set on the clips' Source Settings. |
+| **Stabilisation** | RockSteady and Horizon Leveling as two switches, both on by default, set on the clips' Source Settings. |
 
 It works in both panel systems Premiere has: **UXP** (Premiere 25.6+) and
 **CEP** (Premiere 22+). Details in [`docs/PANEL.md`](docs/PANEL.md).
