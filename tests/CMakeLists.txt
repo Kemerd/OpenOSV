@@ -89,3 +89,19 @@ if(TARGET osv_render_cuda)
             $<TARGET_FILE_DIR:osv_gpu_analysis_bench>
     COMMAND_EXPAND_LISTS)
 endif()
+
+# -----------------------------------------------------------------------------
+#  osv_flare_bench - what the sun ghost / veil removal finds, removes, damages
+#  and costs on a real clip (WP-FLARE, docs/research/FLARE.md).  A measurement
+#  tool like the one above: built with the suite, never registered with ctest.
+# -----------------------------------------------------------------------------
+if(TARGET osv_render_cuda)
+  add_executable(osv_flare_bench bench/FlareBench.cpp)
+  target_link_libraries(osv_flare_bench PRIVATE ${_osv_test_libs})
+  target_compile_definitions(osv_flare_bench PRIVATE OSV_SAMPLE_FILE="${OSV_SAMPLE_FILE}")
+  set_target_properties(osv_flare_bench PROPERTIES FOLDER "tests")
+  add_custom_command(TARGET osv_flare_bench POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:osv_flare_bench>
+            $<TARGET_FILE_DIR:osv_flare_bench>
+    COMMAND_EXPAND_LISTS)
+endif()
