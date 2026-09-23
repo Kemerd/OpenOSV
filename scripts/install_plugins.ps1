@@ -41,6 +41,27 @@
        the presets before handing the modules to the elevated child, and the
        child is told to skip them.  Pass -NoPresets to skip them entirely.
 
+    3. THE COMPANION PANEL "OpenOSV" (panel\, docs\PANEL.md).  It puts Open
+       360 Reframe on every .OSV / .LRF clip dropped on a timeline.  Per user,
+       and done by the unelevated parent for the same reason as the presets.
+       Two builds of one panel; -PanelFlavor picks (Auto by default):
+
+         Uxp - Premiere 25.6+.  Packed as a .ccx (a ZIP with manifest.json at
+               its root) and installed with Adobe's Unified Plugin Installer
+               Agent (UPIA), which ships with the Creative Cloud app.  Without
+               UPIA the .ccx is handed to whatever opens .ccx files (Creative
+               Cloud's installer asks for one confirmation).
+         Cep - Premiere 22 and later, while Premiere still runs CEP.  Copied
+               to %APPDATA%\Adobe\CEP\extensions\com.openosv.panel.  It is
+               unsigned, so the per-user switch PlayerDebugMode = "1" is set
+               under HKCU\Software\Adobe\CSXS.<n> for the CEP version of each
+               installed Premiere - only where it was not set already, and
+               -Uninstall puts back exactly what it changed.
+         Auto - Uxp when UPIA is present, Cep otherwise: whichever installs
+               with no clicks.
+
+       Pass -NoPanel to skip it, -PanelOnly to do nothing else.
+
 .PARAMETER StageDir
     The folder produced by the build (OSV_PLUGIN_STAGE_DIR, by default
     <build>\plugins\OpenOSV).  When omitted the script looks for the newest
@@ -65,6 +86,21 @@
     exactly there and does not go looking for a Premiere profile - useful for
     a dry run, for a second Premiere version, or when the profile discovery
     below cannot find a settings root.
+
+.PARAMETER NoPanel
+    Skips the companion panel.
+
+.PARAMETER PanelOnly
+    Installs (or, with -Uninstall, removes) only the companion panel.  Needs
+    no administrator rights and leaves the modules and presets alone.
+
+.PARAMETER PanelFlavor
+    Auto (default), Uxp or Cep.  See item 3 above.
+
+.PARAMETER PanelDestination
+    A dry run for the panel: stage it into this folder (the CEP extension
+    folder, or the .ccx for Uxp) without registering anything - no UPIA, no
+    registry change.
 
 .PARAMETER NoElevate
     Fails with an explanation instead of relaunching through UAC.  Use it from
@@ -93,6 +129,14 @@
     scripts\install_plugins.ps1 -PresetDestination C:\temp\presets
     Installs the modules normally and the presets into a scratch folder.
 
+.EXAMPLE
+    scripts\install_plugins.ps1 -PanelOnly
+    Installs just the companion panel, no administrator rights needed.
+
+.EXAMPLE
+    scripts\install_plugins.ps1 -PanelOnly -PanelFlavor Uxp
+    Installs the UXP build of the panel (Premiere 25.6+).
+
 .NOTES
     Output is deliberately plain ASCII: the Windows console still defaults to
     a legacy code page on many machines and a box-drawing character there is
@@ -107,7 +151,12 @@ param(
     [switch] $Force,
     [switch] $NoPresets,
     [string] $PresetDir,
-    [string] $PresetDestination
+    [string] $PresetDestination,
+    [switch] $NoPanel,
+    [switch] $PanelOnly,
+    [ValidateSet('Auto', 'Uxp', 'Cep')]
+    [string] $PanelFlavor = 'Auto',
+    [string] $PanelDestination
 )
 
 Set-StrictMode -Version Latest
@@ -180,6 +229,8 @@ function Invoke-Elevated {
     # child do it again would resolve %USERPROFILE% to whichever account
     # answered the UAC prompt and drop the presets in a profile nobody opens.
     $arguments += '-NoPresets'
+    # The companion panel is per-user too (%APPDATA%, HKCU): same reason.
+    $arguments += '-NoPanel'
 
     Write-Step 'Administrator rights are required'
     Write-Info "The plug-ins are installed into a folder under Program Files:"
@@ -486,9 +537,512 @@ function Uninstall-Presets {
 }
 
 # ===========================================================================
+#  [WP-PANEL] The companion panel "OpenOSV"                      (begin)
+#
+#  Everything the panel needs lives between this banner and its (end)
+#  banner; Main calls Install-Panel / Uninstall-Panel and nothing else.
+#  docs/PANEL.md explains the two flavours and the evidence behind them.
+#
+#  Like the presets, the panel is never fatal to the plug-in install: every
+#  failure prints what went wrong and what to do by hand, and the modules
+#  are still installed.  Only -PanelOnly reports a failure in the exit code.
+# ===========================================================================
+
+# The CEP bundle id and the UXP plug-in id (the same string on purpose).
+$script:PanelId = 'com.openosv.panel'
+
+# The UXP manifest's "name": what UPIA's /remove takes.
+$script:PanelUxpName = 'OpenOSV'
+
+# Where CEP reads PlayerDebugMode: HKCU\Software\Adobe\CSXS.<n>.
+$script:PanelCsxsRoot = 'HKCU:\Software\Adobe'
+
+# Where the .ccx and the record of what the install changed are kept.  A
+# -PanelDestination dry run keeps them inside that folder instead.
+function Get-PanelStateDir {
+    if ($PanelDestination) {
+        return (Join-Path $PanelDestination 'OpenOSV-panel-state')
+    }
+    $base = $env:LOCALAPPDATA
+    if (-not $base) {
+        $base = Join-Path $env:USERPROFILE 'AppData\Local'
+    }
+    return (Join-Path $base 'OpenOSV\panel')
+}
+
+function Get-PanelStateFile { Join-Path (Get-PanelStateDir) 'install-state.json' }
+
+function Get-PanelSourceDir { Join-Path (Split-Path -Parent $PSScriptRoot) 'panel' }
+
+# A property of a parsed JSON object, or $null - StrictMode forbids reading
+# a property that is not there.
+function Get-PanelProperty {
+    param($Object, [string] $Name)
+    if ($null -ne $Object -and $Object.PSObject.Properties[$Name]) {
+        return $Object.$Name
+    }
+    return $null
+}
+
+# The panel version, from the UXP manifest (a test keeps both manifests and
+# OsvCore.PANEL_VERSION equal).
+function Get-PanelVersion {
+    $manifest = Join-Path (Get-PanelSourceDir) 'uxp\manifest.json'
+    $parsed = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+    $version = Get-PanelProperty $parsed 'version'
+    if (-not $version) {
+        throw "No version in '$manifest'."
+    }
+    return [string]$version
+}
+
+# Adobe's Unified Plugin Installer Agent, at the path Adobe documents
+# (developer.adobe.com/premiere-pro/uxp/plugins/distribution/install), or $null.
+function Find-Upia {
+    $common = [Environment]::GetFolderPath('CommonProgramFiles')
+    if (-not $common) {
+        return $null
+    }
+    $exe = Join-Path $common 'Adobe\Adobe Desktop Common\RemoteComponents\UPI\UnifiedPluginInstallerAgent\UnifiedPluginInstallerAgent.exe'
+    if (Test-Path -LiteralPath $exe -PathType Leaf) {
+        return $exe
+    }
+    return $null
+}
+
+# The per-user CEP extension folder (or the dry-run folder).
+function Get-CepExtensionsDir {
+    if ($PanelDestination) {
+        return $PanelDestination
+    }
+    return (Join-Path $env:APPDATA 'Adobe\CEP\extensions')
+}
+
+# ---------------------------------------------------------------------------
+#  Stage one flavour of the panel into $Target:
+#      panel\shared\*     -> $Target\shared\
+#      panel\<flavour>\*  -> $Target\
+#  which is the layout both index.html files load from.
+# ---------------------------------------------------------------------------
+function New-PanelStage {
+    param(
+        [ValidateSet('Uxp', 'Cep')] [string] $Flavor,
+        [string] $Target
+    )
+    $source = Get-PanelSourceDir
+    $shared = Join-Path $source 'shared'
+    $own = Join-Path $source $Flavor.ToLowerInvariant()
+    foreach ($required in @((Join-Path $shared 'osvcore.js'), (Join-Path $own 'index.html'), (Join-Path $own 'main.js'))) {
+        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+            throw "The panel sources are incomplete: '$required' is missing."
+        }
+    }
+    if (Test-Path -LiteralPath $Target) {
+        Remove-Item -LiteralPath $Target -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $Target -Force | Out-Null
+    # The flavour's own files (manifest, page, adapter, host script)...
+    Get-ChildItem -LiteralPath $own | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $Target -Recurse -Force
+    }
+    # ...and the shared core, controller, view and styles beside them.
+    $sharedTarget = Join-Path $Target 'shared'
+    New-Item -ItemType Directory -Path $sharedTarget -Force | Out-Null
+    Get-ChildItem -LiteralPath $shared -File | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $sharedTarget -Force
+    }
+}
+
+# ---------------------------------------------------------------------------
+#  Pack a staged UXP folder as a .ccx.  Adobe: "A .ccx file is a regular ZIP
+#  file under the hood" with manifest.json at its root, and a .ccx needs no
+#  signature.
+#
+#  Entries are written one by one with forward-slash names.  Neither
+#  Compress-Archive nor ZipFile.CreateFromDirectory can be trusted with that:
+#  under Windows PowerShell 5.1 both store "shared\boot.js", which the ZIP
+#  specification does not allow and which unpacks as one oddly named file
+#  anywhere a backslash is not a separator.
+# ---------------------------------------------------------------------------
+function New-PanelCcx {
+    param([string] $StageDir, [string] $OutFile)
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    if (Test-Path -LiteralPath $OutFile) {
+        Remove-Item -LiteralPath $OutFile -Force
+    }
+    $root = (Resolve-Path -LiteralPath $StageDir).Path.TrimEnd('\')
+    $stream = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::CreateNew)
+    try {
+        $zip = New-Object System.IO.Compression.ZipArchive($stream, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            Get-ChildItem -LiteralPath $root -Recurse -File | Sort-Object FullName | ForEach-Object {
+                $entryName = $_.FullName.Substring($root.Length + 1).Replace('\', '/')
+                [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $zip, $_.FullName, $entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+            }
+        }
+        finally {
+            $zip.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+# ---------------------------------------------------------------------------
+#  The CSXS (CEP) versions of the installed Premiere Pro builds, read from
+#  each one's PlugPlug.dll: Premiere 2026 ships CEP 12 (PlugPlug 12.0.1), and
+#  the PlayerDebugMode key has to name that major version (Adobe's PProPanel
+#  guide: "you'll need to perform this step again, but for key CSXS.11").
+#  Falls back to 12, Premiere 24-26's version, when nothing is found.
+# ---------------------------------------------------------------------------
+function Get-PremiereCsxsVersions {
+    $root = Join-Path $env:ProgramFiles 'Adobe'
+    $versions = @()
+    if (Test-Path -LiteralPath $root) {
+        $versions = @(Get-ChildItem -LiteralPath $root -Directory -Filter 'Adobe Premiere Pro*' -ErrorAction SilentlyContinue |
+            ForEach-Object { Join-Path $_.FullName 'PlugPlug.dll' } |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            ForEach-Object { (Get-Item -LiteralPath $_).VersionInfo.FileMajorPart } |
+            Where-Object { $_ -ge 9 } |
+            Sort-Object -Unique)
+    }
+    if ($versions.Count -eq 0) {
+        Write-Info 'No installed Premiere Pro found to read its CEP version from; assuming CEP 12.'
+        $versions = @(12)
+    }
+    return $versions
+}
+
+# The record of what an install changed, or an empty one.
+function Read-PanelState {
+    $file = Get-PanelStateFile
+    $empty = [pscustomobject]@{ flavor = ''; version = ''; cepPath = ''; ccx = ''; csxs = @() }
+    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+        return $empty
+    }
+    try {
+        $parsed = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+        return [pscustomobject]@{
+            flavor  = [string](Get-PanelProperty $parsed 'flavor')
+            version = [string](Get-PanelProperty $parsed 'version')
+            cepPath = [string](Get-PanelProperty $parsed 'cepPath')
+            ccx     = [string](Get-PanelProperty $parsed 'ccx')
+            csxs    = @(Get-PanelProperty $parsed 'csxs' | Where-Object { $null -ne $_ })
+        }
+    }
+    catch {
+        Write-Warn "Could not read '$file' ($($_.Exception.Message)); treating it as empty."
+        return $empty
+    }
+}
+
+function Write-PanelState {
+    param($State)
+    $dir = Get-PanelStateDir
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $State | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Get-PanelStateFile) -Encoding UTF8
+}
+
+# ---------------------------------------------------------------------------
+#  Set HKCU\Software\Adobe\CSXS.<n>\PlayerDebugMode = "1" (a string, as
+#  Adobe's guide shows) for each version, where it is not "1" already.
+#  Returns one record per change, with the value it replaced, so -Uninstall
+#  can put back exactly that and nothing else.  Only the current user's
+#  hive: no administrator rights, nothing machine-wide.
+# ---------------------------------------------------------------------------
+function Enable-PlayerDebugMode {
+    param([int[]] $Versions)
+    $changes = @()
+    foreach ($v in $Versions) {
+        $key = Join-Path $script:PanelCsxsRoot "CSXS.$v"
+        $existed = Test-Path -LiteralPath $key
+        $previous = $null
+        if ($existed) {
+            $item = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+            $previous = Get-PanelProperty $item 'PlayerDebugMode'
+        }
+        if ("$previous" -eq '1') {
+            Write-Info "CSXS.$v PlayerDebugMode is already 1; left as it is."
+            continue
+        }
+        if (-not $existed) {
+            New-Item -Path $key -Force | Out-Null
+        }
+        New-ItemProperty -LiteralPath $key -Name 'PlayerDebugMode' -Value '1' -PropertyType String -Force | Out-Null
+        Write-Info "Set $key\PlayerDebugMode = 1."
+        $changes += [pscustomobject]@{ key = "CSXS.$v"; previous = $previous; createdKey = (-not $existed) }
+    }
+    return $changes
+}
+
+# Put back what Enable-PlayerDebugMode changed, per its records.
+function Restore-PlayerDebugMode {
+    param($Changes)
+    foreach ($c in @($Changes)) {
+        $name = [string](Get-PanelProperty $c 'key')
+        if ($name -notmatch '^CSXS\.\d+$') {
+            continue
+        }
+        $key = Join-Path $script:PanelCsxsRoot $name
+        if (-not (Test-Path -LiteralPath $key)) {
+            continue
+        }
+        try {
+            $previous = Get-PanelProperty $c 'previous'
+            if ($null -eq $previous) {
+                Remove-ItemProperty -LiteralPath $key -Name 'PlayerDebugMode' -ErrorAction SilentlyContinue
+                # A key this install created, now empty, goes too.
+                $leftover = @((Get-Item -LiteralPath $key).Property)
+                if ((Get-PanelProperty $c 'createdKey') -eq $true -and $leftover.Count -eq 0 -and
+                    @(Get-ChildItem -LiteralPath $key).Count -eq 0) {
+                    Remove-Item -LiteralPath $key -Force
+                }
+                Write-Info "Removed the PlayerDebugMode this install set under $name."
+            }
+            else {
+                New-ItemProperty -LiteralPath $key -Name 'PlayerDebugMode' -Value ([string]$previous) -PropertyType String -Force | Out-Null
+                Write-Info "Put $name PlayerDebugMode back to '$previous'."
+            }
+        }
+        catch {
+            Write-Warn "Could not restore $name PlayerDebugMode: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Remove this panel's CEP folder (only ours, never the extensions folder).
+function Remove-PanelCepCopy {
+    $dir = Join-Path (Get-CepExtensionsDir) $script:PanelId
+    if (Test-Path -LiteralPath $dir) {
+        Remove-Item -LiteralPath $dir -Recurse -Force
+        Write-Info "Removed the CEP panel from $dir"
+    }
+}
+
+# Premiere must be restarted to see a new or changed panel.
+function Write-PanelRestartNote {
+    param([string] $Where)
+    if (Get-Process -Name 'Adobe Premiere Pro' -ErrorAction SilentlyContinue) {
+        Write-Info 'Premiere Pro is running: restart it to load the panel.'
+    }
+    Write-Info "Open it from $Where."
+}
+
+# ---------------------------------------------------------------------------
+#  CEP: copy, unlock, record.
+# ---------------------------------------------------------------------------
+function Install-PanelCep {
+    param($State, [string] $Version)
+    $target = Join-Path (Get-CepExtensionsDir) $script:PanelId
+    New-PanelStage -Flavor Cep -Target $target
+    Write-Step "Installed the OpenOSV panel (CEP) $Version"
+    Write-Info "into $target"
+
+    if ($PanelDestination) {
+        Write-Info 'Dry run (-PanelDestination): the registry was not touched.'
+    }
+    else {
+        # Merge with earlier records: the FIRST recorded previous value is the
+        # user's own, and must survive a reinstall.
+        $changes = @(Enable-PlayerDebugMode -Versions (Get-PremiereCsxsVersions))
+        $known = @($State.csxs | ForEach-Object { [string](Get-PanelProperty $_ 'key') })
+        $State.csxs = @($State.csxs) + @($changes | Where-Object { $known -notcontains $_.key })
+        Write-Info 'PlayerDebugMode lets Premiere load a panel that is not signed.'
+        Write-Info 'It is per user and only affects CEP panels; -Uninstall undoes it.'
+    }
+
+    # The UXP build must not run beside this one: two panels, one timeline.
+    if ($State.flavor -eq 'Uxp' -and -not $PanelDestination) {
+        $upia = Find-Upia
+        if ($upia) {
+            & $upia /remove $script:PanelUxpName 2>&1 | ForEach-Object { Write-Info "UPIA: $_" }
+        }
+        else {
+            Write-Warn 'The UXP build of the panel is installed too. Remove it in the Creative Cloud app (Stock & Marketplace > Plugins > Manage plugins) so only one runs.'
+        }
+    }
+    $State.flavor = 'Cep'
+    $State.cepPath = $target
+    Write-PanelRestartNote -Where 'Window > Extensions > OpenOSV'
+    return $true
+}
+
+# ---------------------------------------------------------------------------
+#  UXP: install the .ccx with UPIA, or hand it to its file association.
+# ---------------------------------------------------------------------------
+function Install-PanelUxp {
+    param($State, [string] $Ccx, [string] $Upia)
+    if ($PanelDestination) {
+        Write-Step 'Built the OpenOSV panel (UXP) installer'
+        Write-Info "    $Ccx"
+        Write-Info 'Dry run (-PanelDestination): nothing was installed.'
+        return $true
+    }
+    if ($Upia) {
+        Write-Step 'Installing the OpenOSV panel (UXP) with Adobe''s plug-in installer'
+        $output = @(& $Upia /install $Ccx 2>&1)
+        $code = $LASTEXITCODE
+        foreach ($line in $output) {
+            Write-Info "UPIA: $line"
+        }
+        if ($code -ne 0) {
+            Write-Warn "UPIA exited with code $code."
+            return $false
+        }
+        # One panel at a time: drop a CEP copy left from an earlier install.
+        Remove-PanelCepCopy
+        $State.flavor = 'Uxp'
+        Write-PanelRestartNote -Where 'Window > UXP Plugins > OpenOSV'
+        return $true
+    }
+
+    # No UPIA: the documented alternative is opening the .ccx, which the
+    # Creative Cloud app (or whatever is registered for .ccx) installs after
+    # one confirmation.
+    $handler = $null
+    try {
+        $handler = (Get-ItemProperty -LiteralPath 'Registry::HKEY_CLASSES_ROOT\.ccx' -ErrorAction Stop).'(default)'
+    }
+    catch {
+        $handler = $null
+    }
+    if ($handler) {
+        Write-Step 'Opening the OpenOSV panel installer (UXP)'
+        Write-Info "    $Ccx"
+        Write-Info 'Confirm the install in the window that opens.'
+        Start-Process -FilePath $Ccx
+        Remove-PanelCepCopy
+        $State.flavor = 'Uxp'
+        Write-PanelRestartNote -Where 'Window > UXP Plugins > OpenOSV'
+        return $true
+    }
+    Write-Warn 'Neither Adobe''s plug-in installer (UPIA) nor a .ccx handler was found, so the UXP panel was NOT installed.'
+    Write-Warn 'Install or update the Creative Cloud app, then double-click:'
+    Write-Warn "    $Ccx"
+    Write-Warn 'or run this script with -PanelFlavor Cep.'
+    return $false
+}
+
+# ---------------------------------------------------------------------------
+#  Install the panel.  Returns $true on success; never throws.
+# ---------------------------------------------------------------------------
+function Install-Panel {
+    $work = $null
+    try {
+        $version = Get-PanelVersion
+        $state = Read-PanelState
+        $state.version = $version
+        $stateDir = Get-PanelStateDir
+        if (-not (Test-Path -LiteralPath $stateDir)) {
+            New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+        }
+
+        # The .ccx is always built: it IS the UXP install, and the file a
+        # user double-clicks later to move from CEP to UXP.
+        $work = Join-Path ([System.IO.Path]::GetTempPath()) ('OpenOSV-panel-' + [guid]::NewGuid().ToString('N'))
+        New-PanelStage -Flavor Uxp -Target (Join-Path $work 'uxp')
+        $ccx = Join-Path $stateDir ("OpenOSV-panel-$version.ccx")
+        New-PanelCcx -StageDir (Join-Path $work 'uxp') -OutFile $ccx
+        $state.ccx = $ccx
+
+        $upia = Find-Upia
+        $flavor = $PanelFlavor
+        if ($flavor -eq 'Auto') {
+            if ($upia -and -not $PanelDestination) {
+                $flavor = 'Uxp'
+                Write-Info 'Adobe''s plug-in installer is present: installing the UXP build.'
+            }
+            else {
+                $flavor = 'Cep'
+                if (-not $PanelDestination) {
+                    Write-Info 'Adobe''s plug-in installer (UPIA) is not on this machine: installing the'
+                    Write-Info 'CEP build, which needs no clicks. The UXP build is ready at'
+                    Write-Info "    $ccx"
+                    Write-Info 'for when Premiere drops CEP (docs/PANEL.md).'
+                }
+            }
+        }
+
+        $ok = $false
+        if ($flavor -eq 'Uxp') {
+            $ok = Install-PanelUxp -State $state -Ccx $ccx -Upia $upia
+            if (-not $ok -and $PanelFlavor -eq 'Auto') {
+                Write-Info 'Falling back to the CEP build.'
+                $ok = Install-PanelCep -State $state -Version $version
+            }
+        }
+        else {
+            $ok = Install-PanelCep -State $state -Version $version
+        }
+        Write-PanelState -State $state
+        return $ok
+    }
+    catch {
+        Write-Warn "Could not install the OpenOSV panel: $($_.Exception.Message)"
+        return $false
+    }
+    finally {
+        if ($work -and (Test-Path -LiteralPath $work)) {
+            Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+#  Remove the panel and undo what the install changed.  Never throws.
+# ---------------------------------------------------------------------------
+function Uninstall-Panel {
+    try {
+        $state = Read-PanelState
+        Write-Step 'Removing the OpenOSV panel'
+        Remove-PanelCepCopy
+        if (-not $PanelDestination) {
+            Restore-PlayerDebugMode -Changes $state.csxs
+            if ($state.flavor -eq 'Uxp') {
+                $upia = Find-Upia
+                if ($upia) {
+                    & $upia /remove $script:PanelUxpName 2>&1 | ForEach-Object { Write-Info "UPIA: $_" }
+                }
+                else {
+                    Write-Warn 'Remove the UXP panel in the Creative Cloud app: Stock & Marketplace > Plugins > Manage plugins > OpenOSV > Uninstall.'
+                }
+            }
+        }
+        $stateDir = Get-PanelStateDir
+        if (Test-Path -LiteralPath $stateDir) {
+            Remove-Item -LiteralPath $stateDir -Recurse -Force
+        }
+        Write-Info 'Done. Restart Premiere Pro if it is running.'
+        return $true
+    }
+    catch {
+        Write-Warn "Could not fully remove the OpenOSV panel: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# ===========================================================================
+#  [WP-PANEL] The companion panel "OpenOSV"                        (end)
+# ===========================================================================
+
+# ===========================================================================
 #  Main
 # ===========================================================================
 try {
+    # [WP-PANEL] -PanelOnly: the panel and nothing else, no elevation.
+    if ($PanelOnly) {
+        $panelOk = if ($Uninstall) { Uninstall-Panel } else { Install-Panel }
+        if ($panelOk) {
+            exit 0
+        }
+        exit 1
+    }
+
     # The presets go into THIS user's profile, so they are handled here,
     # before any elevation.  Doing it in the elevated child would resolve the
     # profile to whichever account answered the UAC prompt (see the header).
@@ -499,6 +1053,18 @@ try {
         }
         else {
             Install-Presets
+        }
+        Write-Host ''
+    }
+
+    # [WP-PANEL] The panel is per-user too, so it is handled here as well;
+    # the elevated child always gets -NoPanel.
+    if (-not $NoPanel) {
+        if ($Uninstall) {
+            [void](Uninstall-Panel)
+        }
+        else {
+            [void](Install-Panel)
         }
         Write-Host ''
     }
