@@ -24,6 +24,7 @@ project(openosv
 # -----------------------------------------------------------------------------
 option(OSV_ENABLE_CUDA     "Build the CUDA renderer backend"                    ON)
 option(OSV_ENABLE_OPENCL   "Build the OpenCL renderer backend"                  ON)
+option(OSV_ENABLE_METAL    "Build the Metal renderer backend (macOS only)"      ON)
 option(OSV_BUILD_TESTS     "Build the Catch2 test-suite"                        ON)
 option(OSV_BUILD_TOOLS     "Build the osvtool command line utility"             ON)
 option(OSV_WARNINGS_AS_ERRORS "Treat compiler warnings as errors"               OFF)
@@ -71,6 +72,10 @@ endif()
 if(OSV_ENABLE_OPENCL)
   include(OsvOpenCL)
 endif()
+# Metal exists on macOS only; elsewhere the option is inert.
+if(OSV_ENABLE_METAL AND APPLE)
+  include(OsvMetal)
+endif()
 
 # -----------------------------------------------------------------------------
 #  Third-party packages (all via vcpkg manifest; see vcpkg.json)
@@ -113,6 +118,9 @@ endif()
 message(STATUS "OpenOSV ${PROJECT_VERSION}")
 message(STATUS "  CUDA backend   : ${OSV_ENABLE_CUDA}")
 message(STATUS "  OpenCL backend : ${OSV_ENABLE_OPENCL}")
+if(APPLE)
+  message(STATUS "  Metal backend  : ${OSV_ENABLE_METAL}")
+endif()
 message(STATUS "  Tests          : ${OSV_BUILD_TESTS}")
 message(STATUS "  Tools          : ${OSV_BUILD_TOOLS}")
 message(STATUS "  Sample clip    : ${OSV_SAMPLE_FILE}")

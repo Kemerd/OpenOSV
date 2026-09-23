@@ -67,6 +67,42 @@ if(OSV_ENABLE_OPENCL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/opencl/OpenClRender
 endif()
 
 # ---------------------------------------------------------------------------
+#  Metal backend (macOS): the same four-part assembly as OpenCL,
+#     preamble.metal -> ColorMath.h -> osv_kernel.h -> kernel.metal
+#  concatenated into one source (cmake/OsvMetal.cmake), embedded, and - when
+#  the Metal compiler is installed - also compiled ahead of time into a
+#  metallib that is embedded next to it.
+# ---------------------------------------------------------------------------
+if(OSV_ENABLE_METAL AND APPLE AND TARGET osv_metal AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metal/MetalRenderer.mm")
+  set(_mtl_gen "${CMAKE_BINARY_DIR}/generated/osv/render/metal")
+  osv_metal_library("${_mtl_gen}" osv_kernels
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/metal/preamble.metal"
+            "${CMAKE_SOURCE_DIR}/include/osv/color/ColorMath.h"
+            "${CMAKE_SOURCE_DIR}/include/osv/render/osv_kernel.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/metal/kernel.metal"
+    OUT_SOURCE _mtl_source
+    OUT_METALLIB _mtl_metallib)
+  osv_embed_text_file("${_mtl_gen}/embedded_metal_source.cpp" "${_mtl_source}" osv_metal_source)
+  set(_mtl_embedded "${_mtl_gen}/embedded_metal_source.cpp")
+  if(_mtl_metallib)
+    osv_embed_text_file("${_mtl_gen}/embedded_metal_lib.cpp" "${_mtl_metallib}" osv_metal_lib)
+    list(APPEND _mtl_embedded "${_mtl_gen}/embedded_metal_lib.cpp")
+  endif()
+  add_library(osv_render_metal STATIC "${CMAKE_CURRENT_SOURCE_DIR}/metal/MetalRenderer.mm" ${_mtl_embedded})
+  add_library(osv::render_metal ALIAS osv_render_metal)
+  target_link_libraries(osv_render_metal PUBLIC osv_render_cpu osv_metal)
+  target_compile_definitions(osv_render_metal PUBLIC OSV_HAVE_METAL=1)
+  if(_mtl_metallib)
+    target_compile_definitions(osv_render_metal PRIVATE OSV_METAL_HAVE_METALLIB=1)
+  endif()
+  # ARC: every Metal object in the backend is reference counted by the
+  # compiler, so no path through the renderer can leak or over-release one.
+  set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/metal/MetalRenderer.mm" PROPERTIES
+    COMPILE_OPTIONS "-fobjc-arc")
+  set_target_properties(osv_render_metal PROPERTIES FOLDER "osv")
+endif()
+
+# ---------------------------------------------------------------------------
 #  Umbrella target: RendererFactory (makeRenderer) links every backend that
 #  was built.  Tools and tests link osv_render only.
 # ---------------------------------------------------------------------------
@@ -78,5 +114,8 @@ if(TARGET osv_render_cuda)
 endif()
 if(TARGET osv_render_opencl)
   target_link_libraries(osv_render PUBLIC osv_render_opencl)
+endif()
+if(TARGET osv_render_metal)
+  target_link_libraries(osv_render PUBLIC osv_render_metal)
 endif()
 set_target_properties(osv_render PROPERTIES FOLDER "osv")

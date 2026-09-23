@@ -13,6 +13,9 @@
 #if defined(OSV_HAVE_OPENCL)
 #include "osv/render/OpenClRenderer.h"
 #endif
+#if defined(OSV_HAVE_METAL)
+#include "osv/render/MetalRenderer.h"
+#endif
 
 #include "osv/core/Log.h"
 
@@ -60,6 +63,28 @@ Result<std::unique_ptr<IRenderer>> makeRenderer(const std::string& deviceIn, Thr
 #endif
     }
 
+    // Metal before OpenCL: on a Mac it is the native GPU API (OpenCL there is
+    // deprecated and itself implemented on top of Metal).
+    if (device == "metal" || device == "auto") {
+#if defined(OSV_HAVE_METAL)
+        auto r = MetalRenderer::create(0);
+        if (r.ok()) {
+            if (chosen) {
+                *chosen = "metal";
+            }
+            return std::unique_ptr<IRenderer>(std::move(r).value());
+        }
+        if (device == "metal") {
+            return Error(r.error());
+        }
+        log::debug("auto renderer: Metal unavailable ({})", r.error().message);
+#else
+        if (device == "metal") {
+            return Error{ErrorCode::Unsupported, "Metal backend not compiled in (macOS only, OSV_ENABLE_METAL)"};
+        }
+#endif
+    }
+
     if (device == "opencl" || device == "auto") {
 #if defined(OSV_HAVE_OPENCL)
         auto r = OpenClRenderer::create(0);
@@ -87,7 +112,11 @@ Result<std::unique_ptr<IRenderer>> makeRenderer(const std::string& deviceIn, Thr
         return std::unique_ptr<IRenderer>(std::make_unique<CpuRenderer>(pool));
     }
 
+#if defined(__APPLE__)
+    return Error{ErrorCode::InvalidArgument, "unknown renderer device '" + deviceIn + "' (cpu|metal|opencl|auto)"};
+#else
     return Error{ErrorCode::InvalidArgument, "unknown renderer device '" + deviceIn + "' (cpu|cuda|opencl|auto)"};
+#endif
 }
 
 }  // namespace osv::render

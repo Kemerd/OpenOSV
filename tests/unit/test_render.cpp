@@ -32,6 +32,9 @@
 #if defined(OSV_HAVE_OPENCL)
 #include "osv/render/OpenClRenderer.h"
 #endif
+#if defined(OSV_HAVE_METAL)
+#include "osv/render/MetalRenderer.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -646,6 +649,21 @@ TEST_CASE("OpenCL renderer matches the CPU reference", "[render][sample][opencl]
         FAIL("OpenCL renderer creation failed: " << r.error().message);
     }
     checkParity(*r.value(), "opencl");
+}
+#endif
+
+#if defined(OSV_HAVE_METAL)
+TEST_CASE("Metal renderer matches the CPU reference", "[render][sample][metal]") {
+    OSV_REQUIRE_SAMPLE();
+    std::string reason;
+    if (!render::MetalRenderer::available(&reason)) {
+        SKIP("Metal unavailable: " << reason);
+    }
+    auto r = render::MetalRenderer::create(0);
+    if (!r.ok()) {
+        FAIL("Metal renderer creation failed: " << r.error().message);
+    }
+    checkParity(*r.value(), "metal");
 }
 #endif
 

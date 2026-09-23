@@ -17,6 +17,9 @@
 #if defined(OSV_HAVE_OPENCL)
 #include "osv/render/OpenClRenderer.h"
 #endif
+#if defined(OSV_HAVE_METAL)
+#include "osv/render/MetalRenderer.h"
+#endif
 
 #include <cstdio>
 #include <string>
@@ -73,6 +76,9 @@ int printVersion(CommandContext& ctx) {
 #if defined(OSV_HAVE_OPENCL)
     std::printf(" render_opencl");
 #endif
+#if defined(OSV_HAVE_METAL)
+    std::printf(" render_metal");
+#endif
 #if defined(OSV_HAVE_IO)
     std::printf(" io");
 #endif
@@ -105,6 +111,16 @@ void printBackendDiagnostics() {
             std::printf("  opencl  : %s\n", osv::render::OpenClRenderer::deviceName(0).c_str());
         } else {
             std::printf("  opencl  : unavailable (%s)\n", reason.c_str());
+        }
+    }
+#endif
+#if defined(OSV_HAVE_METAL)
+    {
+        std::string reason;
+        if (osv::render::MetalRenderer::available(&reason)) {
+            std::printf("  metal   : %s\n", osv::render::MetalRenderer::deviceName(0).c_str());
+        } else {
+            std::printf("  metal   : unavailable (%s)\n", reason.c_str());
         }
     }
 #endif
