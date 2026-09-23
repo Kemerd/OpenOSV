@@ -387,9 +387,16 @@ metadata was missing and the histogram fallback decided.
 DJI's "Color Recovery" option only affects the live-view preview; recorded
 D-Log M files are unchanged and carry no flag for it.
 
-## Known limitation: lens shading
+## Lens shading
 
-The fisheye images carry strong vignetting towards the rim (DJI corrects it
-with a per-unit lens shading calibration we do not have). Near the seam the sky
-therefore renders darker than in DJI's own stitch. A radial gain model is on
-the roadmap; `--gain` only matches the overall exposure of the two lenses.
+The .OSV metadata carries no lens shading table (only a shading mode number),
+so whatever shading correction the camera applies has already happened when
+the frames are decoded.  What remains near the rim is measured from the
+footage: the photometric seam field evens the two lenses where both see the
+sky, and the lens shading correction (Source Settings "Lens Shading",
+`include/osv/render/LensShading.h`) measures each lens's own rim structure
+from its own sky and adds the missing light back in native linear light,
+before every gain.  On the sample that structure is an additive ring in the
+lens facing the sun - missing veiling glare rather than a vignette - so the
+correction is additive too.  See docs/research/NEURAL_STITCHING.md, section
+9.

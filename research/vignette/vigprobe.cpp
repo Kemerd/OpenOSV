@@ -2,8 +2,8 @@
 // Copyright 2026 The OpenOSV Contributors
 //
 // vigprobe - disposable research tool (research/vignette, not part of the
-// build).  Dumps what the lens-shading (common-mode vignetting) research
-// needs from a clip:
+// build).  Dumps what the lens shading research (NEURAL_STITCHING.md,
+// section 9) needs from a clip:
 //
 //   att   <clip> <outdir>
 //         per-frame camera attitude (worldFromBody), its rotation relative
@@ -20,12 +20,20 @@
 //         f<F>_theta.f32   : 2 float32 per pixel, theta0 / theta1 (deg)
 //         meta.json        : geometry
 //
+//   field <clip> <outdir> <mapW> <frame>
+//         the photometric seam field of the frame's bucket and the polar map
+//         rendered with it: blended and each lens alone (native linear).
+//
+//   seamview <clip> <out.pgm> <w> <h> <fov> <distortion> <yaw> <pitch> <stab> <frame>
+//         where the stitch seam runs in an eye-offset view (a PGM mask).
+//
 // Build: research\vignette\build_vigprobe.cmd (inside a VS dev shell).
 
 #include "../../tools/osvtool/Pipeline.h"
 
 #include "osv/color/ColorParams.h"
 #include "osv/geom/EquirectMap.h"
+#include "osv/geom/VirtualCamera.h"
 #include "osv/render/PhotoSeam.h"
 #include "osv/render/RenderParamsBuilder.h"
 
@@ -183,7 +191,9 @@ int runLens(const std::string& clip, const std::string& outDir, int mapW, bool s
         for (int y = 0; y < map.h; ++y) {
             for (int x = 0; x < map.w; ++x) {
                 osv::Vec3d d;
-                map.pixelToDir(x + 0.5, y + 0.5, d);
+                if (!map.pixelToDir(x + 0.5, y + 0.5, d)) {
+                    continue;  // a pixel outside the map: its angles stay 0
+                }
                 const float* Ro = params.Rout;
                 const float db[3] = {static_cast<float>(Ro[0] * d.x + Ro[1] * d.y + Ro[2] * d.z),
                                      static_cast<float>(Ro[3] * d.x + Ro[4] * d.y + Ro[5] * d.z),
@@ -275,7 +285,67 @@ int runField(const std::string& clip, const std::string& outDir, int mapW, int f
 
 }  // namespace
 
+/// seamview <clip> <out.pgm> <w> <h> <fov> <distortion> <yaw> <pitch> <stab 0|1> <frame>: where the stitch
+/// seam (polar latitude 0, the plane between the lens axes) runs in an
+/// eye-offset view: white within 0.25 deg of it, grey where polar |lat| <
+/// 7.6 deg (the overlap), black elsewhere.  Plain PGM for inspection.
+int runSeamView(int argc, char** argv) {
+    if (argc < 12) {
+        return 2;
+    }
+    osvtool::PipelineOptions po;
+    po.input = argv[2];
+    po.device = "cpu";
+    po.hw = "none";
+    po.color = "linear";
+    po.stab = std::atoi(argv[10]) != 0 ? "horizon" : "off";
+    auto pipe = osvtool::Pipeline::open(po, false);
+    if (!pipe.ok()) {
+        std::fprintf(stderr, "open failed: %s\n", pipe.error().toString().c_str());
+        return 1;
+    }
+    osvtool::Pipeline& P = *pipe.value();
+    osv::geom::VirtualCamera cam;
+    cam.w = std::atoi(argv[4]);
+    cam.h = std::atoi(argv[5]);
+    cam.projection = osv::geom::Projection::EyeOffset;
+    cam.hfovDeg = std::atof(argv[6]);
+    cam.eyeOffset = std::atof(argv[7]);
+    cam.yawDeg = std::atof(argv[8]);
+    cam.pitchDeg = std::atof(argv[9]);
+    osv::render::RenderParamsBuilder b;
+    b.rig(P.rig).camera(cam).color(P.color).stabilization(
+        P.stabilizationFor(static_cast<std::uint32_t>(std::atoi(argv[11]))));
+    auto params = b.buildParams();
+    if (!params.ok()) {
+        return 1;
+    }
+    const OsvRenderParams& p = params.value();
+    std::vector<unsigned char> img(static_cast<std::size_t>(cam.w) * cam.h, 0);
+    for (int y = 0; y < cam.h; ++y) {
+        for (int x = 0; x < cam.w; ++x) {
+            float dv[3];
+            if (!osvRayForPixel(&p, static_cast<float>(x), static_cast<float>(y), dv)) {
+                continue;
+            }
+            float db[3];
+            osvMat3MulVec(p.Rout, dv, db);
+            const double lat = std::asin(std::fmax(-1.0, std::fmin(1.0, static_cast<double>(db[1])))) * 57.29577951;
+            img[static_cast<std::size_t>(y) * cam.w + x] =
+                std::fabs(lat) < 0.25 ? 255 : (std::fabs(lat) < 7.6 ? 90 : 0);
+        }
+    }
+    std::ofstream f(argv[3], std::ios::binary);
+    f << "P5\n" << cam.w << " " << cam.h << "\n255\n";
+    f.write(reinterpret_cast<const char*>(img.data()), static_cast<std::streamsize>(img.size()));
+    std::printf("seam map written\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc >= 2 && std::string(argv[1]) == "seamview") {
+        return runSeamView(argc, argv);
+    }
     if (argc >= 6 && std::string(argv[1]) == "field") {
         return runField(argv[2], argv[3], std::atoi(argv[4]), std::atoi(argv[5]));
     }
