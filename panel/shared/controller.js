@@ -60,6 +60,13 @@
     /** How long a settings change waits before it is written to storage. */
     var PERSIST_DELAY_MS = 250;
 
+    /**
+     * [WP-EASING] How often the Manual Framing read-outs follow the selected
+     * clip and the playhead.  Neither API sends a playhead event, so this is
+     * a poll - of reads only, skipped while any action runs.
+     */
+    var FRAMING_POLL_MS = 1000;
+
     /** Text of an Error, a string, or anything else. */
     function messageOf(err) {
         if (err && typeof err.message === 'string' && err.message.length > 0) {
@@ -103,7 +110,16 @@
             status: { tone: 'info', text: 'Starting...', at: 0, stamped: false },
             busy: false,
             busyLabel: '',
-            host: 'starting'
+            // [WP-EASING] Which card's action is running ('' / 'apply' /
+            // 'easing' / 'framing' / 'stabilization'), so only its buttons
+            // show the progress.
+            busyAction: '',
+            host: 'starting',
+            // [WP-EASING] What this route can do (grouped undo, Source Settings).
+            capabilities: { undoGroups: true, stabilization: true },
+            // [WP-EASING] The Manual Framing read-outs: the selected clip's
+            // framing at the playhead, or why there is none.
+            framing: { ok: false, reason: 'no-selection' }
         };
 
         // ---- bookkeeping ---------------------------------------------------
@@ -114,6 +130,11 @@
         var polling = false;
         var lastSignature = null;
         var persistHandle = null;
+        // [WP-EASING] The framing poll, and how many queued tasks are running
+        // (the poll never reads while one is).
+        var framingHandle = null;
+        var framingReading = false;
+        var pending = 0;
 
         // Which sequences existed when the panel started looking at the
         // current project.  `ids === null` means the host could not say, and
@@ -132,7 +153,10 @@
                 status: Object.assign({}, state.status),
                 busy: state.busy,
                 busyLabel: state.busyLabel,
-                host: state.host
+                busyAction: state.busyAction,
+                host: state.host,
+                capabilities: Object.assign({}, state.capabilities),
+                framing: Object.assign({}, state.framing)
             };
         }
 
@@ -163,6 +187,7 @@
 
         /** Run `task` after everything already queued; failures become status. */
         function enqueue(task) {
+            pending += 1;
             queue = queue.then(function () {
                 if (stopped) {
                     return undefined;
@@ -170,6 +195,8 @@
                 return task();
             }).catch(function (err) {
                 setStatus('error', 'Something went wrong: ' + core.shortError(messageOf(err)) + '.', true);
+            }).then(function () {
+                pending = Math.max(0, pending - 1);
             });
             return queue;
         }
@@ -318,9 +345,20 @@
             onError: function (err) { setStatus('error', core.shortError(messageOf(err)), true); }
         }, { setTimeout: setT, clearTimeout: clearT, now: now });
 
-        /** A host event: something on the timeline may have changed. */
-        function onHostEvent() {
-            if (!stopped && state.settings.autoApply) {
+        /**
+         * A host event: something on the timeline may have changed.  A
+         * selection change only moves the Manual Framing read-outs to another
+         * clip, so it refreshes them and leaves auto-apply alone.
+         */
+        function onHostEvent(reason) {
+            if (stopped) {
+                return;
+            }
+            if (reason === 'selection') {
+                refreshFraming();
+                return;
+            }
+            if (state.settings.autoApply) {
                 debouncer.trigger();
             }
         }
@@ -370,6 +408,7 @@
                 return queue;
             }
             state.busy = true;
+            state.busyAction = 'apply';
             state.busyLabel = selectedOnly ? 'Applying to selection...' : 'Applying to sequence...';
             emit();
             return enqueue(function () {
@@ -402,9 +441,210 @@
                     });
             }).then(function () {
                 state.busy = false;
+                state.busyAction = '';
                 state.busyLabel = '';
                 emit();
             });
+        }
+
+        // ---- [WP-EASING] Keyframe Animation, Manual Framing, Stabilisation ------------------
+
+        /**
+         * Keep what an adapter learned about the host's popup numbering, so
+         * the next action (and the next session) does not have to learn it
+         * again.  Only a settled 0 or 1 is ever stored.
+         */
+        function rememberBase(result) {
+            var b = result && result.learnedBase;
+            if ((b === 0 || b === 1) && b !== state.settings.popupBase) {
+                state.settings = core.sanitizeSettings(Object.assign({}, state.settings, { popupBase: b }));
+                persistSoon();
+            }
+        }
+
+        /** An adapter method, or a stand-in that says the route cannot do it. */
+        function adapterCall(name) {
+            return typeof adapter[name] === 'function'
+                ? adapter[name].bind(adapter)
+                : function () { return Promise.reject(new Error('this panel build cannot do that')); };
+        }
+
+        /**
+         * One button press: busy while it runs (only `action`'s buttons show
+         * the label), queued behind everything else, never overlapping.
+         */
+        function runAction(action, label, task) {
+            if (state.busy) {
+                return queue;
+            }
+            state.busy = true;
+            state.busyAction = action;
+            state.busyLabel = label;
+            emit();
+            return enqueue(task).then(function () {
+                state.busy = false;
+                state.busyAction = '';
+                state.busyLabel = '';
+                emit();
+            });
+        }
+
+        /** Apply the Keyframe Animation preset picked in the grid. */
+        function applyEasing(selectedOnly) {
+            var easing = core.easingById(state.settings.easing);
+            return runAction('easing', selectedOnly ? 'Setting on selection...' : 'Setting on sequence...', function () {
+                var seq = null;
+                return Promise.resolve(adapter.getActiveSequence())
+                    .then(function (s) {
+                        seq = (s && typeof s === 'object' && s.id) ? s : null;
+                        if (!seq) {
+                            setStatus('info', 'Open a sequence first.', true);
+                            return null;
+                        }
+                        return syncProject(seq, false).then(function () { return scan(seq, selectedOnly); });
+                    })
+                    .then(function (scanned) {
+                        if (!seq || !scanned) {
+                            return undefined;
+                        }
+                        var context = selectedOnly ? 'selected' : 'all';
+                        if (scanned.items.length === 0) {
+                            var none = core.summarizeEasing({}, easing.label, context, scanned.otherCount);
+                            setStatus(none.tone, none.text, true);
+                            return undefined;
+                        }
+                        return Promise.resolve(adapterCall('setEasing')(seq, scanned.items, {
+                            entry: easing.entry,
+                            popupBase: state.settings.popupBase
+                        })).then(function (result) {
+                            rememberBase(result);
+                            var summary = core.summarizeEasing(result, easing.label, context, scanned.otherCount);
+                            setStatus(summary.tone, summary.text, true);
+                        });
+                    });
+            });
+        }
+
+        /** Set the chosen Stabilisation on the selected clips' master clips. */
+        function applyStabilization() {
+            var choice = core.stabilizationById(state.settings.stabilization);
+            return runAction('stabilization', 'Setting stabilisation...', function () {
+                var seq = null;
+                return Promise.resolve(adapter.getActiveSequence())
+                    .then(function (s) {
+                        seq = (s && typeof s === 'object' && s.id) ? s : null;
+                        if (!seq) {
+                            setStatus('info', 'Open a sequence first.', true);
+                            return null;
+                        }
+                        return syncProject(seq, false).then(function () { return scan(seq, true); });
+                    })
+                    .then(function (scanned) {
+                        if (!seq || !scanned) {
+                            return undefined;
+                        }
+                        if (scanned.items.length === 0) {
+                            var none = core.summarizeStabilization({}, choice.label, scanned.otherCount);
+                            setStatus(none.tone, none.text, true);
+                            return undefined;
+                        }
+                        return Promise.resolve(adapterCall('setStabilization')(seq, scanned.items, {
+                            entry: choice.entry,
+                            popupBase: state.settings.popupBase
+                        })).then(function (result) {
+                            rememberBase(result);
+                            var summary = core.summarizeStabilization(result, choice.label, scanned.otherCount);
+                            setStatus(summary.tone, summary.text, true);
+                        });
+                    });
+            });
+        }
+
+        /** A Manual Framing action on the selected clip, then fresh read-outs. */
+        function framingAction(request, label) {
+            return runAction('framing', label, function () {
+                return Promise.resolve(adapter.getActiveSequence()).then(function (s) {
+                    var seq = (s && typeof s === 'object' && s.id) ? s : null;
+                    if (!seq) {
+                        var none = core.summarizeFraming({ ok: false, reason: 'no-sequence' });
+                        setStatus(none.tone, none.text, true);
+                        return undefined;
+                    }
+                    var req = Object.assign({ popupBase: state.settings.popupBase }, request);
+                    return Promise.resolve(adapterCall('writeFraming')(seq, req)).then(function (result) {
+                        rememberBase(result);
+                        var summary = core.summarizeFraming(result);
+                        setStatus(summary.tone, summary.text, true);
+                        return readFramingNow(seq);
+                    });
+                });
+            });
+        }
+
+        /** Read the framing of `seq`'s selected clip into the state. */
+        function readFramingNow(seq) {
+            if (!seq) {
+                return Promise.resolve(setFraming({ ok: false, reason: 'no-sequence' }));
+            }
+            return Promise.resolve(adapterCall('readFraming')(seq, { popupBase: state.settings.popupBase }))
+                .then(function (r) {
+                    rememberBase(r);
+                    setFraming(r);
+                }, function (err) {
+                    // A sequence switch mid-read is not worth a status line.
+                    setFraming({ ok: false, reason: /active sequence changed/i.test(messageOf(err)) ? 'no-sequence' : 'unknown' });
+                });
+        }
+
+        /** Store new read-outs; the view is only told when they changed. */
+        function setFraming(r) {
+            var f = (r !== null && typeof r === 'object') ? r : { ok: false, reason: 'unknown' };
+            var next = f.ok === true ? {
+                ok: true,
+                name: String(f.name || ''),
+                lens: f.lens === core.LENS.classic ? core.LENS.classic : core.LENS.dji,
+                zoom: f.zoom,
+                fov: f.lens === core.LENS.classic ? f.fov : f.djiFov,
+                correction: f.correction,
+                distortion: f.distortion,
+                pan: f.pan,
+                tilt: f.tilt,
+                roll: f.roll
+            } : { ok: false, reason: String(f.reason || 'unknown') };
+            if (JSON.stringify(next) !== JSON.stringify(state.framing)) {
+                state.framing = next;
+                emit();
+            }
+        }
+
+        /**
+         * Refresh the read-outs now, unless something is running (a queued
+         * action refreshes them itself when it is done) or a read already is.
+         */
+        function refreshFraming() {
+            if (stopped || framingReading || pending > 0 || state.host !== 'ready') {
+                return Promise.resolve();
+            }
+            framingReading = true;
+            return Promise.resolve()
+                .then(function () { return adapter.getActiveSequence(); })
+                .then(function (s) {
+                    return readFramingNow((s && typeof s === 'object' && s.id) ? s : null);
+                })
+                .then(function () { framingReading = false; }, function () { framingReading = false; });
+        }
+
+        function startFramingPoll() {
+            if (framingHandle === null) {
+                framingHandle = setI(function () { refreshFraming(); }, FRAMING_POLL_MS);
+            }
+        }
+
+        function stopFramingPoll() {
+            if (framingHandle !== null) {
+                clearI(framingHandle);
+                framingHandle = null;
+            }
         }
 
         // ---- public API -------------------------------------------------------------
@@ -430,6 +670,19 @@
                     return queue;
                 }
                 state.host = 'ready';
+                // [WP-EASING] What this route can do decides the notes the
+                // cards show (grouped undo, a reachable Source Settings).
+                try {
+                    if (typeof adapter.capabilities === 'function') {
+                        var caps = adapter.capabilities() || {};
+                        state.capabilities = {
+                            undoGroups: caps.undoGroups !== false,
+                            stabilization: caps.stabilization !== false
+                        };
+                    }
+                } catch (err) {
+                    // The defaults stay.
+                }
                 idleStatus();
                 // Take the baseline first, then tell the user if the effect is missing.
                 enqueue(function () { return autoPass(true); });
@@ -446,6 +699,7 @@
                 if (state.settings.autoApply) {
                     startPolling();
                 }
+                startFramingPoll();
                 return queue;
             },
 
@@ -453,6 +707,7 @@
             stop: function () {
                 stopped = true;
                 stopPolling();
+                stopFramingPoll();
                 debouncer.cancel();
                 if (persistHandle !== null) {
                     clearT(persistHandle);
@@ -510,6 +765,44 @@
             applySelected: function () { return manualApply(true); },
             applyAll: function () { return manualApply(false); },
 
+            // ---- [WP-EASING] --------------------------------------------------------
+
+            /** Pick a Keyframe Animation preset in the grid (remembered). */
+            setEasing: function (id) {
+                state.settings = core.sanitizeSettings(Object.assign({}, state.settings, { easing: id }));
+                persistSoon();
+                emit();
+            },
+            applyEasingSelected: function () { return applyEasing(true); },
+            applyEasingAll: function () { return applyEasing(false); },
+
+            /** Pick a Stabilisation choice (remembered). */
+            setStabilization: function (id) {
+                state.settings = core.sanitizeSettings(Object.assign({}, state.settings, { stabilization: id }));
+                persistSoon();
+                emit();
+            },
+            applyStabilization: function () { return applyStabilization(); },
+
+            /** A Manual Framing preset button. */
+            framingPreset: function (id) {
+                var p = core.framingPresetById(id);
+                return p ? framingAction({ action: 'preset', preset: id }, p.label + '...') : queue;
+            },
+            /** A zoom button: +1 widens (Zoom up), -1 narrows. */
+            zoomStep: function (direction) {
+                return framingAction({ action: 'zoom', direction: direction > 0 ? 1 : -1 }, 'Zooming...');
+            },
+            /** Read the framing read-outs now. */
+            refreshFraming: function () { return refreshFraming(); },
+
+            /** The Program Monitor controls card was opened or closed (remembered). */
+            setHintOpen: function (open) {
+                state.settings = core.sanitizeSettings(Object.assign({}, state.settings, { hintOpen: open === true }));
+                persistSoon();
+                emit();
+            },
+
             /** For the tests and the view's first paint. */
             getState: snapshot,
             /** Resolves when everything queued so far has run. */
@@ -526,6 +819,7 @@
         STORAGE_KEY: STORAGE_KEY,
         DEBOUNCE_WAIT_MS: DEBOUNCE_WAIT_MS,
         DEBOUNCE_MAX_MS: DEBOUNCE_MAX_MS,
-        POLL_MS: POLL_MS
+        POLL_MS: POLL_MS,
+        FRAMING_POLL_MS: FRAMING_POLL_MS
     });
 }));

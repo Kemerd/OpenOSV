@@ -155,7 +155,10 @@ test('apply finds the right QE item across gaps and verifies through the DOM', (
     // The new instance's parameters come back for the panel to plan with.
     const lens = r.applied[0].params.filter((p) => p.name === 'Lens')[0];
     assert.deepEqual(lens, { index: 14, name: 'Lens', value: 0, timeVarying: false });
-    assert.deepEqual(r.applied[0].params.map((p) => p.name).sort(), ['Camera Model', 'Drag Sensitivity', 'Lens', 'Preset']);
+    // [WP-EASING] The panel now reads the camera controls too.
+    assert.deepEqual(r.applied[0].params.map((p) => p.name).sort(),
+                     ['Camera Model', 'Correction Angle', 'Distortion', 'Drag Sensitivity', 'FOV', 'FOV', 'Keyframe Easing',
+                      'Lens', 'Output Resolution', 'Pan', 'Preset', 'Roll', 'Tilt', 'Zoom']);
 });
 
 test('apply matches by position among clips when QE gives no start time', () => {
@@ -220,11 +223,13 @@ test('setParams writes by index only when the name agrees, never over keyframes'
     assert.match(r.errors[0], /keyframed/);
 });
 
-test('bindEvents binds the three timeline events once, and they reach the panel', () => {
+test('bindEvents binds the timeline events once, and they reach the panel', () => {
     const { w, call } = boot();
-    assert.deepEqual(call('bindEvents'), { ok: true, bound: true, count: 3 });
+    // [WP-EASING] The selection event moves the Manual Framing read-outs.
+    assert.deepEqual(call('bindEvents'), { ok: true, bound: true, count: 4 });
     assert.deepEqual(Object.keys(w.world.bound).sort(),
-                     ['onActiveSequenceChanged', 'onActiveSequenceStructureChanged', 'onActiveSequenceTrackItemAdded']);
+                     ['onActiveSequenceChanged', 'onActiveSequenceSelectionChanged', 'onActiveSequenceStructureChanged',
+                      'onActiveSequenceTrackItemAdded']);
     assert.equal(call('bindEvents').already, true, 'a reloaded panel does not bind twice');
     w.fire('onActiveSequenceTrackItemAdded', {}, {});
     assert.deepEqual(w.world.dispatched, [{ type: 'com.openosv.panel.hostchange', data: 'onActiveSequenceTrackItemAdded' }]);

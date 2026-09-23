@@ -72,13 +72,24 @@ test('pickHostMatchName prefers the registered name and returns null when it is 
 // ---------------------------------------------------------------------------
 
 test('settings default to auto-apply on, DJI lens, drag sensitivity untouched at 2.0', () => {
-    assert.deepEqual(core.sanitizeSettings(null), { autoApply: true, lens: 'dji', dragEnabled: false, dragSensitivity: 2 });
+    // [WP-EASING] The newer settings: no easing picked yet, Horizon Leveling
+    // (the Source Settings default), the controls card open for a new user,
+    // and the popup numbering not learned yet.
+    assert.deepEqual(core.sanitizeSettings(null), {
+        autoApply: true, lens: 'dji', dragEnabled: false, dragSensitivity: 2, easing: 'none', stabilization: 'horizon', hintOpen: true, popupBase: null
+    });
     assert.deepEqual(core.sanitizeSettings(undefined), core.sanitizeSettings({}));
 });
 
 test('settings are repaired field by field', () => {
-    const s = core.sanitizeSettings({ autoApply: 'yes', lens: 'CLASSIC', dragEnabled: 1, dragSensitivity: 'fast' });
-    assert.deepEqual(s, { autoApply: true, lens: 'dji', dragEnabled: false, dragSensitivity: 2 });
+    const s = core.sanitizeSettings({ autoApply: 'yes', lens: 'CLASSIC', dragEnabled: 1, dragSensitivity: 'fast',
+                                      easing: 'bounce', stabilization: 'gyro', hintOpen: 'no', popupBase: 2 });
+    assert.deepEqual(s, { autoApply: true, lens: 'dji', dragEnabled: false, dragSensitivity: 2, easing: 'none', stabilization: 'horizon', hintOpen: true, popupBase: null });
+    assert.equal(core.sanitizeSettings({ easing: 'slow-in-slow-out' }).easing, 'slow-in-slow-out');
+    assert.equal(core.sanitizeSettings({ stabilization: 'rocksteady' }).stabilization, 'rocksteady');
+    assert.equal(core.sanitizeSettings({ hintOpen: false }).hintOpen, false);
+    assert.equal(core.sanitizeSettings({ popupBase: 0 }).popupBase, 0);
+    assert.equal(core.sanitizeSettings({ popupBase: 1 }).popupBase, 1);
     assert.equal(core.sanitizeSettings({ autoApply: false }).autoApply, false);
     assert.equal(core.sanitizeSettings({ lens: 'classic' }).lens, 'classic');
     assert.equal(core.sanitizeSettings({ dragSensitivity: 99 }).dragSensitivity, 10);
@@ -91,7 +102,8 @@ test('settings are repaired field by field', () => {
 });
 
 test('stored settings round-trip, and garbage storage gives the defaults', () => {
-    const s = { autoApply: false, lens: 'classic', dragEnabled: true, dragSensitivity: 3.5 };
+    const s = { autoApply: false, lens: 'classic', dragEnabled: true, dragSensitivity: 3.5, easing: 'linear-smooth',
+                stabilization: 'off', hintOpen: false, popupBase: 0 };
     assert.deepEqual(core.parseSettings(core.serializeSettings(s)), s);
     for (const junk of [null, '', '{', 'null', '42', '"text"', '[]', 'x'.repeat(5000)]) {
         assert.deepEqual(core.parseSettings(junk), core.sanitizeSettings(null), String(junk).slice(0, 20));

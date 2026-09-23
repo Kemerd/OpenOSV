@@ -44,6 +44,12 @@ function createWorld(options) {
         dispatched: [],           // CSXS events host.jsx dispatched
         bound: {},                // app.bind registrations
         setValueCalls: [],
+        // [WP-EASING] Keyframe writes (addKey / setValueAtKey), the playhead
+        // and the sequence frame size, and a DOM without master clip access.
+        keyCalls: [],
+        playhead: 0,
+        frameSize: { width: 1920, height: 1080 },
+        noVideoComponents: false,
         project: null,
         sequences: [],
         activeIndex: 0,
@@ -55,9 +61,21 @@ function createWorld(options) {
         const params = [
             ['Output Resolution', b + 0], ['Camera', null], ['Preset', b + 3], ['Pan', 0], ['Tilt', 0], ['Roll', 0],
             ['FOV', 120], ['Distortion', 15], ['Smooth Keyframes', false], ['Camera Model', true], ['Zoom', 142.4],
-            ['FOV', 60], ['Correction Angle', 0.6], ['Drag Sensitivity', 2], ['Lens', b + 0]
+            ['FOV', 60], ['Correction Angle', 0.6], ['Drag Sensitivity', 2], ['Lens', b + 0],
+            // [WP-EASING] Appended after the Lens: None, entry 1.
+            ['Keyframe Easing', b + 0]
         ].map(([name, value]) => makeParam(name, value));
         return { matchName: 'AE.OpenOSV.Open360Reframe', displayName: 'Open 360 Reframe', properties: collection(params, 'numItems') };
+    }
+
+    /** [WP-EASING] The fresh OpenOSV Source Settings popups the panel reads. */
+    function sourceSettingsComponent() {
+        const b = popupBase;
+        const params = [
+            ['Colour Output', b + 0], ['Look (Rec. 709 only)', b + 0], ['Output Size', b + 0], ['Stabilisation', b + 1],
+            ['Stitching', null], ['Calibration', b + 0], ['D-Log M Curve', b + 2], ['Render Device', b + 0]
+        ].map(([name, value]) => makeParam(name, value));
+        return { matchName: 'AE.OpenOSV.SourceSettings', displayName: 'OpenOSV Source Settings', properties: collection(params, 'numItems') };
     }
 
     function makeParam(name, value) {
@@ -65,13 +83,54 @@ function createWorld(options) {
             displayName: name,
             _value: value,
             _timeVarying: false,
+            _keys: [],   // [{t, v}] when keyframed
             getValue() { return this._value; },
             setValue(v, updateUI) {
                 world.setValueCalls.push([name, v, updateUI]);
                 this._value = v;
                 return 0;
             },
-            isTimeVarying() { return this._timeVarying; }
+            isTimeVarying() { return this._timeVarying; },
+            // ---- [WP-EASING] keyframes -------------------------------------------
+            getValueAtTime(t) {
+                const keys = this._keys.slice().sort((a, b) => a.t - b.t);
+                if (!this._timeVarying || keys.length === 0) {
+                    return this._value;
+                }
+                const x = Number(t.ticks);
+                if (x <= keys[0].t) {
+                    return keys[0].v;
+                }
+                for (let i = 1; i < keys.length; i += 1) {
+                    if (x <= keys[i].t) {
+                        const a = keys[i - 1];
+                        const b = keys[i];
+                        return a.v + (b.v - a.v) * (x - a.t) / (b.t - a.t);
+                    }
+                }
+                return keys[keys.length - 1].v;
+            },
+            findNearestKey(t, threshold) {
+                const x = Number(t.ticks);
+                const hit = this._keys.filter((k) => Math.abs(k.t - x) <= Number(threshold || 0))[0];
+                return hit ? time(hit.t) : undefined;
+            },
+            addKey(t) {
+                world.keyCalls.push(['addKey', name, String(t.ticks)]);
+                if (!this._keys.some((k) => k.t === Number(t.ticks))) {
+                    this._keys.push({ t: Number(t.ticks), v: this.getValueAtTime(t) });
+                }
+                return 0;
+            },
+            setValueAtKey(t, v, updateUI) {
+                world.keyCalls.push(['setValueAtKey', name, String(t.ticks), v, updateUI]);
+                const k = this._keys.filter((x) => x.t === Number(t.ticks))[0];
+                if (!k) {
+                    throw new Error('no keyframe at that time');
+                }
+                k.v = v;
+                return 0;
+            }
         };
         return p;
     }
@@ -92,7 +151,15 @@ function createWorld(options) {
                 _path: spec.path || 'C:/media/clip.mp4',
                 _isSequence: spec.isSequence === true,
                 getMediaPath() { return this._isSequence ? '' : this._path; },
-                isSequence() { return this._isSequence; }
+                isSequence() { return this._isSequence; },
+                // [WP-EASING] The master clip's components (its Source Settings).
+                _components: collection(spec.sourceSettings === false ? [] : [sourceSettingsComponent()], 'numItems'),
+                videoComponents() {
+                    if (world.noVideoComponents) {
+                        throw new Error('videoComponents is not a function');
+                    }
+                    return this._components;
+                }
             },
             components: collection([
                 { matchName: 'AE.ADBE Opacity', displayName: 'Opacity', properties: collection([], 'numItems') },
@@ -108,7 +175,15 @@ function createWorld(options) {
         for (let i = 0; i < trackCount; i += 1) {
             tracks.push({ name: 'V' + (i + 1), clips: collection([], 'numItems') });
         }
-        const seq = { sequenceID: id, name: name, videoTracks: collection(tracks, 'numTracks') };
+        const seq = {
+            sequenceID: id,
+            name: name,
+            videoTracks: collection(tracks, 'numTracks'),
+            // [WP-EASING] The playhead and the frame size, for Manual Framing.
+            getPlayerPosition() { return time(world.playhead); },
+            get frameSizeHorizontal() { return world.frameSize.width; },
+            get frameSizeVertical() { return world.frameSize.height; }
+        };
         world.sequences.push(seq);
         return seq;
     }
@@ -206,11 +281,17 @@ function createWorld(options) {
         this.spec = spec;
     }
 
+    /** ExtendScript's Time: `new Time()`, then set `ticks` (a string). */
+    function Time() {
+        this.ticks = '0';
+    }
+
     const context = vm.createContext({
         app: app,
         Folder: { fs: 'Windows' },
         CSXSEvent: CSXSEvent,
-        ExternalObject: ExternalObject
+        ExternalObject: ExternalObject,
+        Time: Time
     });
     context.$ = { global: context };
 
@@ -236,6 +317,7 @@ function createWorld(options) {
         addSequence: addSequence,
         addClip: addClip,
         reframeComponent: reframeComponent,
+        sourceSettingsComponent: sourceSettingsComponent,
         load: load,
         evalScript: evalScript,
         /** Fire an app.bind() event the way Premiere would. */

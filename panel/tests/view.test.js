@@ -56,6 +56,8 @@ class FakeElement {
         return 2 + 64 * Math.max(0, segs.indexOf(this));
     }
     getBoundingClientRect() { return { left: 0, top: 0, width: this.offsetWidth, height: 22 }; }
+    // [WP-EASING] A folding card measures its body; 120 px of hints.
+    get scrollHeight() { return this.classList.contains('osv-disclosure-body') ? 120 : 0; }
     setPointerCapture() {}
     releasePointerCapture() {}
     /** Depth-first search by class. */
@@ -81,8 +83,17 @@ class FakeElement {
     }
 }
 
-function fakeDocument() {
+function fakeDocument(options) {
     const doc = { createElement: (tag) => new FakeElement(tag, doc) };
+    // [WP-EASING] SVG for the curve icons and the chevron, unless a test
+    // wants the text fallback.
+    if (!(options && options.noSvg)) {
+        doc.createElementNS = (ns, tag) => {
+            const el = new FakeElement(tag, doc);
+            el.namespaceURI = ns;
+            return el;
+        };
+    }
     doc.body = new FakeElement('body', doc);
     return doc;
 }
@@ -117,7 +128,16 @@ function stubController(state) {
         setDragEnabled(v) { calls.push(['setDragEnabled', v]); },
         setDragSensitivity(v) { calls.push(['setDragSensitivity', v]); },
         applySelected() { calls.push(['applySelected']); },
-        applyAll() { calls.push(['applyAll']); }
+        applyAll() { calls.push(['applyAll']); },
+        // [WP-EASING]
+        setHintOpen(v) { calls.push(['setHintOpen', v]); },
+        setEasing(v) { calls.push(['setEasing', v]); },
+        applyEasingSelected() { calls.push(['applyEasingSelected']); },
+        applyEasingAll() { calls.push(['applyEasingAll']); },
+        setStabilization(v) { calls.push(['setStabilization', v]); },
+        applyStabilization() { calls.push(['applyStabilization']); },
+        framingPreset(v) { calls.push(['framingPreset', v]); },
+        zoomStep(v) { calls.push(['zoomStep', v]); }
     };
 }
 
@@ -131,8 +151,8 @@ function baseState(overrides) {
     }, overrides || {});
 }
 
-function mount(state) {
-    const doc = fakeDocument();
+function mount(state, options) {
+    const doc = fakeDocument(options);
     const root = doc.createElement('div');
     root.appendChild(doc.createElement('div'));      // the "Loading" placeholder
     const ctl = stubController(state || baseState());
@@ -150,7 +170,15 @@ test('mount replaces the placeholder with the panel and renders the first state'
     assert.equal(shell.find('osv-status-text').textContent, 'Watching the timeline.');
     assert.equal(shell.find('osv-pill-text').textContent, 'Watching');
     const buttons = shell.findAll('osv-button');
-    assert.deepEqual(buttons.map((b) => b.textContent), ['Apply to selected clips', 'Apply to all OSV clips in this sequence']);
+    // The auto-apply buttons come first; [WP-EASING] then the Manual Framing
+    // presets and zoom stepper, the Keyframe Animation pair and the
+    // Stabilisation apply.
+    assert.deepEqual(buttons.map((b) => b.textContent), [
+        'Apply to selected clips', 'Apply to all OSV clips in this sequence',
+        'Crystal Ball', 'Asteroid', 'Wide', 'Ultra Wide', 'Dewarp', '−', '+',
+        'Apply to selected clips', 'Apply to all OSV clips in this sequence',
+        'Apply to selected clips'
+    ]);
 });
 
 test('the switch starts on, drawn without animation, and springs to off', () => {
@@ -267,4 +295,172 @@ test('mount refuses to start without its dependencies', () => {
     assert.throws(() => View.mount(null, {}), /needs a root element/);
     assert.equal(View.mixColor('#000000', '#ffffff', 2), 'rgb(255,255,255)', 'overshoot is clamped');
     assert.equal(View.mixColor('junk', '#ffffff', 0), 'rgb(0,0,0)');
+});
+
+// ===========================================================================
+//  [WP-EASING] The new cards
+// ===========================================================================
+
+/** A state with the framing read-outs of a selected clip. */
+function framedState(overrides) {
+    return baseState(Object.assign({
+        framing: { ok: true, name: 'CAM_0001.OSV', lens: 'dji', zoom: 142.397, fov: 60, correction: 0.6, pan: 12.345,
+                   tilt: -3, roll: 0 }
+    }, overrides || {}));
+}
+
+test('the Program Monitor controls card: open for a new user, one key-capped line per gesture', () => {
+    const t = mount();
+    const card = t.shell.find('osv-disclosure');
+    assert.ok(card.classList.contains('is-open'));
+    const head = card.find('osv-disclosure-head');
+    assert.equal(head.attributes['aria-expanded'], 'true');
+    const lines = card.findAll('osv-hint-line');
+    assert.equal(lines.length, 5);
+    assert.deepEqual(card.findAll('osv-key').map((k) => k.textContent), ['Drag', 'Shift', 'Ctrl', 'Alt', 'Corner']);
+    assert.match(card.find('osv-hint-note').textContent, /Effect Controls/);
+    // The chevron is an SVG path, turned to point down while open.
+    const chevron = card.find('osv-chevron').children[0];
+    assert.equal(chevron.namespaceURI, 'http://www.w3.org/2000/svg');
+    assert.ok(chevron.children[0].attributes.d.startsWith('M'));
+    head.fire('click');
+    assert.deepEqual(t.ctl.calls, [['setHintOpen', false]]);
+});
+
+test('closing the controls card folds its body on a spring, and a closed card starts closed', () => {
+    const t = mount();
+    const card = t.shell.find('osv-disclosure');
+    const body = card.find('osv-disclosure-body');
+    const chevronPath = card.find('osv-chevron').children[0].children[0];
+    const openPath = chevronPath.attributes.d;
+    t.view.render(baseState({ settings: core.sanitizeSettings({ hintOpen: false }) }));
+    assert.equal(card.classList.contains('is-open'), false);
+    t.sched.runAll();
+    assert.equal(body.style.height, '0px');
+    assert.equal(body.style.opacity, '0');
+    assert.notEqual(chevronPath.attributes.d, openPath, 'the chevron turned');
+    // And back open: the height is released once the spring lands.
+    t.view.render(baseState({ settings: core.sanitizeSettings({ hintOpen: true }) }));
+    t.sched.runAll();
+    assert.equal(body.style.height, '');
+    assert.equal(body.style.opacity, '1');
+    card.find('osv-disclosure-head').fire('keydown', { key: 'Enter' });
+    assert.deepEqual(t.ctl.calls, [['setHintOpen', false]]);
+    // A panel loaded closed starts closed, without animating.
+    const closed = mount(baseState({ settings: core.sanitizeSettings({ hintOpen: false }) }));
+    assert.equal(closed.shell.find('osv-disclosure-body').style.height, '0px');
+});
+
+test('the Keyframe Animation grid: seven tiles with curve icons, one picked, springing to a new pick', () => {
+    const t = mount();
+    const tiles = t.shell.findAll('osv-ease-tile');
+    assert.equal(tiles.length, 7);
+    assert.deepEqual(tiles.map((x) => x.attributes['aria-label']), core.EASINGS.map((e) => e.label));
+    assert.equal(tiles[0].attributes['aria-checked'], 'true', 'None, until a preset is picked');
+    // Every tile draws an SVG: a crossed circle for None, a curve and two
+    // keyframe dots for the others.
+    const none = tiles[0].find('osv-ease-icon').children[0];
+    assert.deepEqual(none.children.map((c) => c.tagName), ['CIRCLE', 'PATH']);
+    const siso = tiles[5].find('osv-ease-icon').children[0];
+    assert.deepEqual(siso.children.map((c) => c.tagName), ['PATH', 'CIRCLE', 'CIRCLE']);
+    assert.equal(siso.children[0].attributes.stroke, 'rgb(174,174,178)', 'unpicked grey');
+    tiles[5].fire('click');
+    tiles[2].fire('keydown', { key: ' ' });
+    assert.deepEqual(t.ctl.calls, [['setEasing', 'slow-in-slow-out'], ['setEasing', 'fast-in-slow-out']]);
+    t.view.render(baseState({ settings: core.sanitizeSettings({ easing: 'slow-in-slow-out' }) }));
+    t.sched.runAll();
+    assert.equal(tiles[5].attributes['aria-checked'], 'true');
+    assert.ok(tiles[5].classList.contains('is-selected'));
+    assert.equal(tiles[0].attributes['aria-checked'], 'false');
+    assert.equal(siso.children[0].attributes.stroke, 'rgb(10,132,255)', 'the accent once picked');
+    assert.equal(tiles[5].style.backgroundColor, 'rgb(23,49,79)', 'the tinted fill');
+    // A tile dims while pressed and springs back.
+    tiles[3].fire('pointerdown');
+    t.sched.runAll();
+    assert.equal(tiles[3].style.opacity, '0.7');
+    tiles[3].fire('pointerup');
+    t.sched.runAll();
+    assert.equal(tiles[3].style.opacity, '1');
+});
+
+test('without SVG the tiles and the chevron fall back to text glyphs', () => {
+    const t = mount(baseState(), { noSvg: true });
+    assert.equal(t.shell.findAll('osv-ease-glyph').length, 7);
+    assert.ok(t.shell.find('osv-chevron-glyph'));
+});
+
+test('the Keyframe Animation buttons, the busy label on its own card, and the undo note on CEP', () => {
+    const t = mount();
+    const buttons = t.shell.findAll('osv-button');
+    const easeSel = buttons[9];
+    const easeAll = buttons[10];
+    easeSel.fire('click');
+    easeAll.fire('click');
+    assert.deepEqual(t.ctl.calls, [['applyEasingSelected'], ['applyEasingAll']]);
+    const note = t.shell.find('osv-card-note');
+    assert.ok(note.classList.contains('is-empty'), 'UXP: one undo step, nothing to say');
+    t.view.render(baseState({ busy: true, busyAction: 'easing', busyLabel: 'Setting on selection...',
+                              capabilities: { undoGroups: false, stabilization: true } }));
+    assert.equal(easeSel.textContent, 'Setting on selection...');
+    assert.equal(buttons[0].textContent, 'Apply to selected clips', 'the auto-apply button keeps its label');
+    easeAll.fire('click');
+    assert.equal(t.ctl.calls.length, 2, 'inert while busy');
+    assert.equal(note.textContent, 'This Premiere undoes it one clip at a time.');
+    assert.equal(note.classList.contains('is-empty'), false);
+});
+
+test('Manual Framing: read-outs of the selected clip, preset chips and the zoom stepper', () => {
+    const t = mount(framedState());
+    const card = t.shell.find('osv-framing-clip').parentNode;
+    assert.equal(t.shell.find('osv-framing-clip').textContent, 'CAM_0001.OSV');
+    assert.equal(card.classList.contains('is-idle'), false);
+    assert.equal(t.shell.find('osv-zoom-value').textContent, '142.4°');
+    const values = t.shell.findAll('osv-readout-value').map((v) => v.textContent);
+    assert.deepEqual(values, ['60.0°', '0.60', '12.3°', '-3.0°', '0.0°']);
+    assert.equal(t.shell.findAll('osv-readout-label')[1].textContent, 'Correction');
+    const buttons = t.shell.findAll('osv-button');
+    buttons[2].fire('click');                      // Crystal Ball
+    buttons[6].fire('keydown', { key: 'Enter' });  // Dewarp
+    buttons[7].fire('click');                      // zoom in (narrower)
+    buttons[8].fire('click');                      // zoom out (wider)
+    assert.deepEqual(t.ctl.calls, [['framingPreset', 'crystal-ball'], ['framingPreset', 'dewarping'], ['zoomStep', -1],
+                                   ['zoomStep', 1]]);
+    // A new Zoom glides to its number on a spring.
+    t.view.render(framedState({ framing: Object.assign({}, framedState().framing, { zoom: 156.1 }) }));
+    t.sched.runAll();
+    assert.equal(t.shell.find('osv-zoom-value').textContent, '156.1°');
+    // The Classic lens shows its Distortion instead of Correction.
+    t.view.render(framedState({ framing: { ok: true, name: 'x', lens: 'classic', zoom: 120, fov: 120, distortion: 15,
+                                           pan: 0, tilt: 0, roll: 0 } }));
+    assert.equal(t.shell.findAll('osv-readout-label')[1].textContent, 'Distortion');
+    assert.equal(t.shell.findAll('osv-readout-value')[1].textContent, '15.0%');
+});
+
+test('Manual Framing with nothing to frame: the reason, dashes, and inert buttons', () => {
+    const t = mount(baseState({ framing: { ok: false, reason: 'outside' } }));
+    assert.equal(t.shell.find('osv-framing-clip').textContent, 'Move the playhead over the selected clip.');
+    assert.ok(t.shell.find('osv-framing-clip').parentNode.classList.contains('is-idle'));
+    assert.equal(t.shell.find('osv-zoom-value').textContent, '—');
+    assert.ok(t.shell.findAll('osv-readout-value').every((v) => v.textContent === '—'));
+    const buttons = t.shell.findAll('osv-button');
+    buttons[2].fire('click');
+    buttons[7].fire('click');
+    assert.deepEqual(t.ctl.calls, []);
+});
+
+test('Stabilisation: DJI Studio\'s three choices, and a route that cannot reach Source Settings says so', () => {
+    const t = mount();
+    const segs = t.shell.findAll('osv-seg');
+    const stabSegs = segs.slice(2);
+    assert.deepEqual(stabSegs.map((s) => s.textContent), ['Off', 'RockSteady', 'Horizon Leveling']);
+    assert.ok(stabSegs[2].classList.contains('is-selected'), 'Horizon Leveling, the Source Settings default');
+    stabSegs[1].fire('click');
+    assert.deepEqual(t.ctl.calls, [['setStabilization', 'rocksteady']]);
+    const apply = t.shell.findAll('osv-button')[11];
+    apply.fire('click');
+    assert.deepEqual(t.ctl.calls[1], ['applyStabilization']);
+    t.view.render(baseState({ capabilities: { undoGroups: true, stabilization: false } }));
+    assert.match(t.shell.findAll('osv-card-caption')[1].textContent, /can't reach Source Settings/);
+    apply.fire('click');
+    assert.equal(t.ctl.calls.length, 2, 'unreachable: the button is inert');
 });
