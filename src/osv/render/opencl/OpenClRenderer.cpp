@@ -126,6 +126,7 @@ struct OpenClRenderer::Impl {
     ClBuffer seam;
     ClBuffer warp;
     ClBuffer blendSeam;  // [WP-SEAM] carved blend-seam table
+    ClBuffer photo;      // [WP-PHOTO] photometric seam table
     ClBuffer out;
     std::mutex mutex;
 
@@ -141,6 +142,7 @@ struct OpenClRenderer::Impl {
         seam.release();
         warp.release();
         blendSeam.release();
+        photo.release();
         out.release();
         if (kernel) {
             clReleaseKernel(kernel);
@@ -376,6 +378,20 @@ Result<ImageRGBAf> OpenClRenderer::render(const RenderJob& job) {
         }
     }
     err |= clSetKernelArg(impl.kernel, arg++, sizeof(cl_mem), &impl.blendSeam.mem);
+
+    // [WP-PHOTO] Photometric seam table: bound always (a valid buffer object
+    // even when empty), read only when params.photoEnabled says so.
+    const std::size_t photoBytes = std::max<std::size_t>(job.photoField.size(), 1) * sizeof(float);
+    OSV_TRY(impl.photo.ensure(impl.context, photoBytes, CL_MEM_READ_ONLY));
+    if (!job.photoField.empty()) {
+        const cl_int perr = clEnqueueWriteBuffer(impl.queue, impl.photo.mem, CL_FALSE, 0,
+                                                 job.photoField.size() * sizeof(float), job.photoField.data(), 0,
+                                                 nullptr, nullptr);
+        if (perr != CL_SUCCESS) {
+            return Error{ErrorCode::Gpu, clMessage("upload photo table", perr)};
+        }
+    }
+    err |= clSetKernelArg(impl.kernel, arg++, sizeof(cl_mem), &impl.photo.mem);
 
     // Output buffer (tightly packed float4 rows).
     OSV_TRY_ASSIGN(ImageRGBAf image, ImageRGBAf::create(static_cast<std::uint32_t>(job.params.outW),

@@ -40,6 +40,22 @@ struct RenderJob {
     /// See osv_kernel.h and SeamCarve.h.
     std::vector<float> blendSeam;
 
+    /// [WP-PHOTO] Photometric seam table: the log2 gain grid (photoW *
+    /// photoH * 3 floats) followed by the per-column usable rim (photoW * 2
+    /// floats, radians).  Empty when params.photoEnabled is 0.  See
+    /// osv_kernel.h and PhotoSeam.h.
+    std::vector<float> photoField;
+
+    /// [WP-PHOTO] Number of floats the photo table must hold for the photo
+    /// fields of `p` (0 when the table is off or its shape is degenerate).
+    [[nodiscard]] static std::size_t photoTableSize(const OsvRenderParams& p) noexcept {
+        if (!p.photoEnabled || p.photoW <= 0 || p.photoH <= 1) {
+            return 0;
+        }
+        const std::size_t w = static_cast<std::size_t>(p.photoW);
+        return w * static_cast<std::size_t>(p.photoH) * 3u + w * 2u;
+    }
+
     /// True when both planes describe usable memory and the output size is sane.
     [[nodiscard]] bool valid() const noexcept {
         if (params.outW <= 0 || params.outH <= 0 || params.outW > 32768 || params.outH > 32768) {
@@ -70,6 +86,14 @@ struct RenderJob {
         if (params.blendSeamEnabled) {
             if (params.blendSeamColumns <= 0 ||
                 blendSeam.size() != static_cast<std::size_t>(params.blendSeamColumns) * 2u) {
+                return false;
+            }
+        }
+        // [WP-PHOTO] The kernel indexes the photo table by photoW / photoH;
+        // any other size would read past its end.
+        if (params.photoEnabled) {
+            const std::size_t need = photoTableSize(params);
+            if (need == 0 || photoField.size() != need) {
                 return false;
             }
         }

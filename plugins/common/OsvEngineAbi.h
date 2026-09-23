@@ -182,6 +182,12 @@ typedef struct OsvEngineFrame {
      *  and the engine used its defaults. */
     OsvEngineClipSettings settings;
     /* ---- [/WP-SETTINGS] ----------------------------------------------------- */
+    /* ---- [WP-PHOTO] --------------------------------------------------------- */
+    /** Device copy of the photometric seam table (stitch.photoW * photoH * 3
+     *  gain floats, then stitch.photoW * 2 rim floats, see osv_kernel.h) or
+     *  NULL when stitch.photoEnabled is 0.  Freed with the lease. */
+    const float* photoDevice;
+    /* ---- [/WP-PHOTO] -------------------------------------------------------- */
 } OsvEngineFrame;
 
 /** ABI version of the loaded engine (compare with OSV_ENGINE_ABI_VERSION). */

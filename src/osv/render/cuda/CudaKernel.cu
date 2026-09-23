@@ -19,15 +19,16 @@ namespace {
 __global__ void osvReframeKernel(const __grid_constant__ OsvRenderParams params,
                                  const __grid_constant__ OsvPlanePair planes, const float* __restrict__ seam,
                                  const float* __restrict__ warp, const float* __restrict__ blendSeam,
-                                 float* __restrict__ out, int outPitchFloats) {
+                                 const float* __restrict__ photo, float* __restrict__ out, int outPitchFloats) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= params.outW || y >= params.outH) {
         return;
     }
     float rgba[4];
-    // [WP-SEAM] blendSeam is null unless a carved seam was built.
-    osvShadePixelWS(&params, planes.p, seam, warp, blendSeam, x, y, rgba);
+    // [WP-SEAM] blendSeam is null unless a carved seam was built;
+    // [WP-PHOTO] photo is null unless a photometric seam field was built.
+    osvShadePixelWSP(&params, planes.p, seam, warp, blendSeam, photo, x, y, rgba);
     float* dst = out + static_cast<size_t>(y) * outPitchFloats + static_cast<size_t>(x) * 4;
     dst[0] = rgba[0];
     dst[1] = rgba[1];
@@ -58,13 +59,13 @@ __global__ void osvReframeEquirectKernel(const __grid_constant__ OsvReframeParam
 }  // namespace
 
 cudaError_t osvCudaLaunchReframe(const OsvRenderParams& params, const OsvPlanePair& planes, const float* seam,
-                                 const float* warp, const float* blendSeam, float* out, int outPitchFloats,
-                                 cudaStream_t stream) {
+                                 const float* warp, const float* blendSeam, const float* photo, float* out,
+                                 int outPitchFloats, cudaStream_t stream) {
     // 16x16 threads per block covers the image with edge guards in the kernel.
     const dim3 block(16, 16);
     const dim3 grid((static_cast<unsigned>(params.outW) + block.x - 1) / block.x,
                     (static_cast<unsigned>(params.outH) + block.y - 1) / block.y);
-    osvReframeKernel<<<grid, block, 0, stream>>>(params, planes, seam, warp, blendSeam, out, outPitchFloats);
+    osvReframeKernel<<<grid, block, 0, stream>>>(params, planes, seam, warp, blendSeam, photo, out, outPitchFloats);
     return cudaGetLastError();
 }
 

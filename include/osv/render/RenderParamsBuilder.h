@@ -26,6 +26,10 @@
 
 namespace osv::render {
 
+// [WP-PHOTO] Defined in PhotoSeam.h, which includes this header.
+struct PhotoSeamField;
+struct PhotoSeamParams;
+
 class RenderParamsBuilder {
 public:
     RenderParamsBuilder();
@@ -76,6 +80,16 @@ public:
     /// [WP-SEAM] Remove any previously set blend-seam table (A/B comparison).
     RenderParamsBuilder& clearBlendSeam();
 
+    /// [WP-PHOTO] Photometric seam field (PhotoSeam.h): the per-longitude
+    /// usable rim and the 2-D log gain, applied as `params.mode` says (Off
+    /// clears it, RimOnly drops the gain, RimAndGain applies both at
+    /// `params.strength`).  A field that is not valid() leaves the photo
+    /// table disabled rather than half-configured.
+    RenderParamsBuilder& photo(const PhotoSeamField& field, const PhotoSeamParams& params);
+
+    /// [WP-PHOTO] Remove any previously set photometric seam field.
+    RenderParamsBuilder& clearPhoto();
+
     /// Colour pipeline block from osv::color::makeColorParams (required).
     RenderParamsBuilder& color(const OsvColorParams& params);
 
@@ -111,6 +125,16 @@ private:
     std::vector<float> m_blendSeam;
     std::uint32_t m_blendSeamColumns = 0;
     float m_blendSeamEdgeRad = 0.0f;
+    // [WP-PHOTO] photometric seam field (empty table = disabled)
+    std::vector<float> m_photo;        ///< Kernel table (gain grid, then rim).
+    std::uint32_t m_photoW = 0;
+    std::uint32_t m_photoH = 0;
+    float m_photoLatMin = 0.0f;        ///< Radians.
+    float m_photoLatMax = 0.0f;
+    float m_photoDecay = 0.0f;         ///< Luma decay distance, radians.
+    float m_photoChromaDecay = 0.0f;   ///< Chroma decay distance, radians.
+    float m_photoRimFeather = 0.0f;    ///< Feather below the rim, radians; 0 = no rim.
+    float m_photoStrength = 0.0f;      ///< Gain strength 0..1; 0 = no gain.
     std::optional<OsvColorParams> m_color;
     bool m_alphaCoverage = true;
     std::array<bool, 2> m_lensEnabled{true, true};

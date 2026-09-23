@@ -109,6 +109,7 @@ struct CudaRenderer::Impl {
     DeviceBuffer seam;
     DeviceBuffer warp;
     DeviceBuffer blendSeam;  // [WP-SEAM] carved blend-seam table
+    DeviceBuffer photo;      // [WP-PHOTO] photometric seam table
     DeviceBuffer out;
     PinnedBuffer staging;
     std::mutex mutex;  // one render at a time per renderer
@@ -126,6 +127,7 @@ struct CudaRenderer::Impl {
         seam.release();
         warp.release();
         blendSeam.release();
+        photo.release();
         out.release();
         staging.release();
     }
@@ -274,6 +276,19 @@ struct CudaRenderer::Impl {
             blendSeamPtr = static_cast<const float*>(blendSeam.ptr);
         }
 
+        // [WP-PHOTO] Photometric seam table (optional): the gain grid plus the
+        // per-column rim, ~50 KB, uploaded per frame like the grid.
+        const float* photoPtr = nullptr;
+        if (job.params.photoEnabled && !job.photoField.empty()) {
+            const std::size_t bytes = job.photoField.size() * sizeof(float);
+            OSV_TRY(photo.ensure(bytes, 1));
+            err = cudaMemcpyAsync(photo.ptr, job.photoField.data(), bytes, cudaMemcpyHostToDevice, stream);
+            if (err != cudaSuccess) {
+                return failStatus(ErrorCode::Gpu, cudaMessage("upload photo table", err));
+            }
+            photoPtr = static_cast<const float*>(photo.ptr);
+        }
+
         // Output buffer.
         const std::size_t outWidthBytes = static_cast<std::size_t>(job.params.outW) * 4 * sizeof(float);
         OSV_TRY(out.ensure(outWidthBytes, static_cast<std::size_t>(job.params.outH)));
@@ -283,8 +298,8 @@ struct CudaRenderer::Impl {
         OsvPlanePair pair;
         pair.p[0] = devPlanes[0];
         pair.p[1] = devPlanes[1];
-        err = osvCudaLaunchReframe(job.params, pair, seamPtr, warpPtr, blendSeamPtr, static_cast<float*>(out.ptr),
-                                   outPitchFloats, stream);
+        err = osvCudaLaunchReframe(job.params, pair, seamPtr, warpPtr, blendSeamPtr, photoPtr,
+                                   static_cast<float*>(out.ptr), outPitchFloats, stream);
         if (err != cudaSuccess) {
             return failStatus(ErrorCode::Gpu, cudaMessage("kernel launch", err));
         }

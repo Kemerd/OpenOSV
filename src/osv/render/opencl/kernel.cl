@@ -2,7 +2,7 @@
  * Copyright 2026 The OpenOSV Contributors
  *
  * kernel.cl - last source string of the OpenCL program: the __kernel wrapper
- * around osvShadePixelWS.  OpenCL cannot pass structs containing pointers as
+ * around osvShadePixelWSP.  OpenCL cannot pass structs containing pointers as
  * kernel arguments, so the two planes arrive as separate buffers plus their
  * integer descriptors and are re-assembled into OsvPlane here.
  */
@@ -14,6 +14,7 @@ __kernel void osvReframe(const OsvRenderParams params,
                          __global const float* seam,
                          __global const float* warp,
                          __global const float* blendSeam,
+                         __global const float* photo,
                          __global float* out, int outPitchFloats) {
     const int x = (int)get_global_id(0);
     const int y = (int)get_global_id(1);
@@ -31,7 +32,9 @@ __kernel void osvReframe(const OsvRenderParams params,
     float rgba[4];
     /* [WP-SEAM] blendSeam is always a valid buffer; params.blendSeamEnabled
      * decides whether it is read (OpenCL rejects a null __global argument). */
-    osvShadePixelWS(&params, planes, seam, warp, blendSeam, x, y, rgba);
+    /* [WP-PHOTO] photo is always a valid buffer too; params.photoEnabled
+     * decides whether it is read. */
+    osvShadePixelWSP(&params, planes, seam, warp, blendSeam, photo, x, y, rgba);
     __global float* dst = out + (size_t)y * (size_t)outPitchFloats + (size_t)x * 4;
     dst[0] = rgba[0];
     dst[1] = rgba[1];
