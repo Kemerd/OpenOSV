@@ -159,6 +159,7 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     photoControlsFromPrefs(prefs, c);  // [WP-PHOTO]
     seamToolControlsFromPrefs(prefs, c);  // [WP-SEAMTOOLS]
     shadingControlsFromPrefs(prefs, c);  // [WP-VIGNETTE]
+    c.hdrPeak = static_cast<int>(prefs.hdrPeakChoice());  // [WP-HDRPEAK]
     steadyControlsFromPrefs(prefs, c);  // [WP-STEADY]
     return c;
 }
@@ -220,6 +221,9 @@ PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& bas
     applyPhotoControls(controls, blob);  // [WP-PHOTO]
     applySeamToolControls(controls, blob);  // [WP-SEAMTOOLS]
     applyShadingControls(controls, blob);  // [WP-VIGNETTE]
+    // [WP-HDRPEAK] An out-of-range index lands on 1000 nits, the default.
+    blob.hdrPeak = pick(controls.hdrPeak, static_cast<int>(PrefsHdrPeak::Count),
+                        static_cast<std::uint8_t>(PrefsHdrPeak::Nits1000));
     applySteadyControls(controls, blob);  // [WP-STEADY]
 
     blob.sanitise();

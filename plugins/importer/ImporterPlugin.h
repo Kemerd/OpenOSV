@@ -269,6 +269,9 @@ struct DialogControls {
     int lensShading = 1;                  ///< Combo index = PrefsLensShading: 0 Off, 1 Auto.
     double shadingStrengthPercent = 100;  ///< Correction strength, 0..100 %.
     // ---- [/WP-VIGNETTE] ------------------------------------------------------
+    /// [WP-HDRPEAK] Combo index = PrefsHdrPeak: 0 1000 nits (default), 1 600,
+    /// 2 400, 3 203 (SDR-safe).  Only the PQ output uses it.
+    int hdrPeak = 0;
     // ---- [WP-STEADY] listed default first, like the Source Settings effect ---
     int parallaxGrid = 0;  ///< Combo index: 0 Auto, 1 Steady (per clip), 2 Follows scene (per moment).
     int lensAlign = 0;     ///< Combo index: 0 Auto (fit per clip), 1 Off (calibration only).

@@ -74,6 +74,7 @@ PF_Err click(EffectFixture& fixture, int aeIndex, PF_OutData* out = nullptr) {
     PrefsBlob p = PrefsBlob::defaults();
     p.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::Rec709);
     p.look = static_cast<std::uint8_t>(PrefsLook::Standard);
+    p.hdrPeak = static_cast<std::uint8_t>(PrefsHdrPeak::Nits600);  // [WP-HDRPEAK]
     p.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::QHD2560);
     p.stabilization = static_cast<std::uint8_t>(PrefsStabilization::Full);
     p.gainMatch = 0;
@@ -91,6 +92,7 @@ PF_Err click(EffectFixture& fixture, int aeIndex, PF_OutData* out = nullptr) {
     ControlValues c;
     c.colorOutput = fixture.popup(kIndexColorOutput);
     c.rec709Look = fixture.popup(kIndexRec709Look);
+    c.hdrPeak = fixture.popup(kIndexHdrPeak);  // [WP-HDRPEAK]
     c.outputSize = fixture.popup(kIndexOutputSize);
     c.stabilization = fixture.popup(kIndexStabilization);
     c.seamSearch = fixture.checkbox(kIndexSeamSearch);

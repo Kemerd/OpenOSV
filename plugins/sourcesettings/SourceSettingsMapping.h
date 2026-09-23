@@ -94,6 +94,7 @@ struct ControlValues {
     // ---- [WP-VIGNETTE] the lens shading correction ----------------------------
     int lensShading = OSV_SS_LENS_SHADING_DEFAULT;                    ///< 1-based popup value.
     double shadingStrengthPercent = OSV_SS_SHADING_STRENGTH_DEFAULT;  ///< Shading Strength, percent.
+    int hdrPeak = OSV_SS_HDR_PEAK_DEFAULT;  ///< [WP-HDRPEAK] 1-based popup value (PrefsHdrPeak + 1).
     // ---- [WP-STEADY] ------------------------------------------------------------
     int parallaxGrid = OSV_SS_PARALLAX_GRID_DEFAULT;  ///< 1-based popup value (kParallaxGridByPopup).
     int lensAlign = OSV_SS_LENS_ALIGN_DEFAULT;        ///< 1-based popup value (kLensAlignByPopup).

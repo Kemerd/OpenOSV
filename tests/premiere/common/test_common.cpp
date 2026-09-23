@@ -201,14 +201,20 @@ TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     static_assert(offsetof(PrefsBlob, nearOffset) == 42, "nearOffset sits at 42");
     static_assert(offsetof(PrefsBlob, farOffset) == 44, "farOffset sits at 44");
     // [WP-VIGNETTE] lensShading and shadingStrength at 46-47, from the front
-    // of the reserved block, which now starts at 48.
+    // of the reserved block.
     static_assert(offsetof(PrefsBlob, lensShading) == 46, "lensShading sits at 46");
     static_assert(offsetof(PrefsBlob, shadingStrength) == 47, "shadingStrength sits at 47");
     // [WP-STEADY] Parallax Grid and Lens Alignment at 50-51 (its range is
-    // 50-53, 48-49 padded); the reserved block now starts at 54.
+    // 50-53, 48-49 padded).
+    static_assert(offsetof(PrefsBlob, padBeforeSteady) == 48, "48-49 are another package's padding");
     static_assert(offsetof(PrefsBlob, parallaxGrid) == 50, "parallaxGrid sits at 50");
     static_assert(offsetof(PrefsBlob, lensAlign) == 51, "lensAlign sits at 51");
-    static_assert(offsetof(PrefsBlob, reserved) == 54, "reserved fills the rest");
+    static_assert(offsetof(PrefsBlob, steadyReserved) == 52, "52-53 are WP-STEADY's spare bytes");
+    // [WP-HDRPEAK] hdrPeak at 54 (its range is 54-55); the reserved block
+    // now starts at 56.
+    static_assert(offsetof(PrefsBlob, hdrPeak) == 54, "hdrPeak sits at 54");
+    static_assert(offsetof(PrefsBlob, padAfterHdrPeak) == 55, "offset 55 is unused padding");
+    static_assert(offsetof(PrefsBlob, reserved) == 56, "reserved fills the rest");
     static_assert(std::is_trivially_copyable_v<PrefsBlob>, "the blob is memcpy'd to and from the host");
 
     REQUIRE(sizeof(PrefsBlob) == PrefsBlob::kSize);

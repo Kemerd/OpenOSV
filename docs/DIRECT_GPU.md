@@ -420,7 +420,8 @@ rule that chose it (`settings unknown`, `working space`, `same space`,
 * **Identical** (the diagonal, rule "same space"): the engine's colour block is
   byte-identical to the importer's (`makeColorParams` with the same fit,
   transfer, exposure, input, range and bit depth - pinned for PQ, HLG,
-  Rec.709 and the passthrough at exposure -1) and Premiere's source -> working
+  Rec.709 and the passthrough at exposure -1 - and the same Rec.709 look and
+  PQ HDR peak, see docs/COLOR.md) and Premiere's source -> working
   conversion is the identity, so the Program monitor matches the Source
   monitor route up to that route's second resampling (WP-C: NCC
   0.9995-0.9999, framing <= 0.0016 px); the direct render is the sharper one.

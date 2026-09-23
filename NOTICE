@@ -63,7 +63,8 @@ Colour science provenance
 * BT.2100 HLG / PQ transfer functions, BT.2020 and BT.709 primaries and the
   BT.2408 signal-level anchors are implemented from the public ITU-R
   Recommendations BT.2100-2, BT.2020-2 and BT.709-6 and the ITU-R Reports
-  BT.2408-5 and BT.2390-8.
+  BT.2408-5 and BT.2390-8.  The HDR peak roll-off is the reference EETF of
+  the public ITU-R Report BT.2408-7, Annex 5.
 * The "DJI-matched" D-Log M decoding curve (kDlogMDjiRefit, `--fit dji`) is an
   analytic 7-parameter fit produced by scripts/fit_dlogm.py from 64
   neutral-axis measurements of DJI's publicly distributed D-Log M to HLG

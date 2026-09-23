@@ -175,6 +175,18 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
         fixture.setPopup(kIndexRec709Look, 2);
         CHECK(translate(fixture, second).lookChoice() == PrefsLook::Standard);
     }
+    SECTION("HDR Peak (PQ only)") {
+        // [WP-HDRPEAK] "1000 nits (default)" -> 0 (what an older blob's zero
+        // byte means) through "203 nits (SDR-safe)" -> 3, in enum order.
+        for (int item = 1; item <= OSV_SS_HDR_PEAK_COUNT; ++item) {
+            PrefsBuffer buffer;
+            fixture.setPopup(kIndexHdrPeak, item);
+            INFO("popup value " << item);
+            const PrefsBlob blob = translate(fixture, buffer);
+            CHECK(blob.hdrPeak == static_cast<std::uint8_t>(item - 1));
+            CHECK(blob.hdrPeakNits() == kPrefsHdrPeakNits[static_cast<std::size_t>(item - 1)]);
+        }
+    }
     SECTION("Output Size") {
         for (int item = 1; item <= OSV_SS_SIZE_COUNT; ++item) {
             PrefsBuffer buffer;
@@ -953,6 +965,34 @@ TEST_CASE("the pure mapping round-trips the Rec.709 look choice", "[sourcesettin
     CHECK(controlsFromPrefs(old).rec709Look == OSV_SS_LOOK_DEFAULT);
 }
 
+TEST_CASE("the pure mapping round-trips the HDR peak choice", "[sourcesettings][mapping][hdrpeak]") {
+    // [WP-HDRPEAK] Every item, both directions; hostile popup values fall
+    // back to 1000 nits (no roll-off) rather than producing a blob that needs
+    // repair.
+    for (int item = 1; item <= OSV_SS_HDR_PEAK_COUNT; ++item) {
+        ControlValues c;
+        c.hdrPeak = item;
+        const PrefsBlob blob = prefsFromControls(c);
+        REQUIRE(blob.isValid());
+        CHECK(blob.hdrPeak == static_cast<std::uint8_t>(item - 1));
+        CHECK(controlsFromPrefs(blob).hdrPeak == item);
+    }
+    for (const int hostile : {std::numeric_limits<int>::min(), -1, 0, OSV_SS_HDR_PEAK_COUNT + 1, 99}) {
+        ControlValues c;
+        c.hdrPeak = hostile;
+        PrefsBlob blob = prefsFromControls(c);
+        CHECK(blob.hdrPeakChoice() == PrefsHdrPeak::Nits1000);
+        CHECK(blob.sanitise());
+    }
+    // An older project's blob (zero byte) shows as "1000 nits (default)",
+    // and a corrupt byte in a stored blob is shown as the default too.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.hdrPeak = 0;
+    CHECK(controlsFromPrefs(old).hdrPeak == OSV_SS_HDR_PEAK_DEFAULT);
+    old.hdrPeak = 0xEE;
+    CHECK(controlsFromPrefs(old).hdrPeak == OSV_SS_HDR_PEAK_DEFAULT);
+}
+
 TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesettings][mapping]") {
     // A default-constructed ControlValues is what the header's defaults say;
     // translating it must give exactly PrefsBlob::defaults().
@@ -968,6 +1008,7 @@ TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesetting
     CHECK(c.renderDevice == OSV_SS_DEVICE_DEFAULT);
     CHECK(c.directColour == OSV_SS_DIRECT_COLOUR_DEFAULT);
     CHECK(c.rec709Look == OSV_SS_LOOK_DEFAULT);  // [WP-LOOK]
+    CHECK(c.hdrPeak == OSV_SS_HDR_PEAK_DEFAULT);  // [WP-HDRPEAK]
     CHECK(c.seamSearch == (OSV_SS_SEAM_SEARCH_DEFAULT != 0));
     CHECK(c.gainMatch == (OSV_SS_GAIN_MATCH_DEFAULT != 0));
     CHECK(c.flareRemoval == (OSV_SS_FLARE_REMOVAL_DEFAULT != 0));  // [WP-FLARE]

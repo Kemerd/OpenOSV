@@ -123,6 +123,10 @@ void addPipelineOptions(CLI::App* sub, PipelineOptions& opt) {
     colorGroup->add_option("--exposure", opt.exposureStops, "Exposure offset in stops")->default_val(0.0);
     colorGroup->add_option("--look", opt.look, "Rec.709 look: dji (DJI Studio, default) | standard")
         ->default_str("dji");
+    // [WP-HDRPEAK] The Source Settings "HDR Peak" choices, nothing in between.
+    colorGroup->add_option("--hdr-peak", opt.hdrPeak,
+                           "PQ output's peak in nits: 1000 (default, no roll-off) | 600 | 400 | 203 (SDR-safe)")
+        ->default_str("1000");
 
     auto* backendGroup = sub->add_option_group("Backends");
     backendGroup->add_option("--hw", opt.hw, "Decoder acceleration: none|d3d11va|cuda|auto")->default_str("none");
@@ -305,9 +309,16 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     if (!color::parseLook(lower(options.look), look)) {
         return Error{ErrorCode::InvalidArgument, "unknown --look '" + options.look + "' (expected dji or standard)"};
     }
+    // [WP-HDRPEAK] The PQ output's peak (ignored by every other output): the
+    // same four choices as Source Settings, 1000 = no roll-off.
+    float hdrPeakNits = color::kDefaultHdrPeakNits;
+    if (!color::parseHdrPeak(options.hdrPeak, hdrPeakNits)) {
+        return Error{ErrorCode::InvalidArgument,
+                     "unknown --hdr-peak '" + options.hdrPeak + "' (expected 1000, 600, 400 or 203)"};
+    }
     p->color = color::makeColorParams(fit, p->outputTransfer, static_cast<float>(options.exposureStops),
                                       p->inputEncoding, true, p->format.bitDepth ? p->format.bitDepth : 10, nullptr,
-                                      color::kBt2408SceneScale, look);
+                                      color::kBt2408SceneScale, look, hdrPeakNits);
 
     // ---- stabilisation ----------------------------------------------------------------
     const std::string stab = lower(options.stab);

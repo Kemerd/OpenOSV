@@ -634,6 +634,10 @@ For the ITU-R documents, "used" is the revision the code was written from
   - Implemented: the signal-level anchors, 18 % grey at 38 % HLG and diffuse
     white at 75 % HLG, which set the scene scale 0.2674
     (`include/osv/color/ColorMath.h`, `docs/COLOR.md`).
+  - Implemented: the Annex 5 reference EETF ("Displaying PQ - calculating the
+    EETF", read in BT.2408-7, 2023), applied per R'G'B' component, behind the
+    PQ output's HDR Peak Brightness setting (`osvHdrPeakRolloff`,
+    `docs/COLOR.md` "HDR peak brightness").
 - ITU-R. **Report BT.2390: High dynamic range television for production and
   international programme exchange.** Used BT.2390-8 (02/2020); current
   BT.2390-12 (03/2025). <https://www.itu.int/pub/R-REP-BT.2390>
@@ -641,6 +645,10 @@ For the ITU-R documents, "used" is the revision the code was written from
     2021 that material lives in BT.2408 Annex 5), and the "HLG on an SDR
     display" rendering behind the standard Rec.709 output
     (`ColorMath.h`, `docs/COLOR.md`).
+  - Reference: the HLG system gamma for a display of peak Lw,
+    1.2 + 0.42 log10(Lw / 1000), and the 400-2000 nit range it is validated
+    over (section 6.2, read in BT.2390-11) - the reason the HDR peak setting
+    leaves the display-relative HLG output alone (`docs/COLOR.md`).
 - SMPTE. **ST 2084:2014, High Dynamic Range Electro-Optical Transfer Function
   of Mastering Reference Displays.** 2014.
   <https://doi.org/10.5594/SMPTE.ST2084.2014>

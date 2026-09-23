@@ -183,6 +183,30 @@ enum class PrefsLook : std::uint8_t {
     Count
 };
 
+/// [WP-HDRPEAK] "HDR Peak Brightness": the display peak the PQ colour output's
+/// highlights are rolled off into (the BT.2408 Annex 5 EETF, see
+/// osv::color::setHdrPeak).  Only PQ has an absolute peak; HLG, Rec.709 and
+/// the passthrough ignore this byte.  Persisted, so append-only.
+enum class PrefsHdrPeak : std::uint8_t {
+    /// 1000 nits: the master as rendered, no roll-off.  The default, and what
+    /// the zero byte of every older project reads as - bit for bit the PQ
+    /// output of every build before the setting existed.
+    Nits1000 = 0,
+    Nits600 = 1,  ///< Highlights above 464 nits roll off into 600.
+    Nits400 = 2,  ///< Highlights above 251 nits roll off into 400.
+    /// 203 nits, "SDR-safe": nothing above BT.2408's HDR reference white.
+    /// The knee drops to 88 nits, so diffuse white itself lands at 159.
+    Nits203 = 3,
+    Count
+};
+
+/// [WP-HDRPEAK] The target of each PrefsHdrPeak value in nits, indexed by the
+/// value (the same list as osv::color::kHdrPeakChoicesNits).
+inline constexpr float kPrefsHdrPeakNits[] = {1000.0f, 600.0f, 400.0f, 203.0f};
+static_assert(sizeof(kPrefsHdrPeakNits) / sizeof(kPrefsHdrPeakNits[0]) ==
+                  static_cast<std::size_t>(PrefsHdrPeak::Count),
+              "kPrefsHdrPeakNits does not list every PrefsHdrPeak value");
+
 /// Renderer selection; the numeric values are the ones stored in the blob
 /// and match HostContext's RenderDevicePreference.
 enum class PrefsRenderDevice : std::uint8_t {
@@ -372,7 +396,15 @@ struct PrefsBlob {
     /// sanitise().
     std::uint8_t steadyReserved[2] = {};
     // ---- [/WP-STEADY] ---------------------------------------------------------
-    std::uint8_t reserved[74] = {};    ///< Zero; future fields.
+    // ---- [WP-HDRPEAK] the PQ output's peak brightness -------------------------
+    /// PrefsHdrPeak: the display peak the PQ output's highlights roll off
+    /// into.  0 = 1000 nits (no roll-off), the default and every older blob.
+    std::uint8_t hdrPeak = 0;
+    /// Offset 55: the rest of this package's range.  Zero, and zeroed by
+    /// sanitise().
+    std::uint8_t padAfterHdrPeak = 0;
+    // ---- [/WP-HDRPEAK] --------------------------------------------------------
+    std::uint8_t reserved[72] = {};    ///< Zero; future fields.
 
     /// seamInset: the default inset in tenths of a degree (2.6 deg - the
     /// render weight then ends at 95.0 deg on the calibrated 97.59 deg lens;
@@ -627,6 +659,14 @@ struct PrefsBlob {
             shadingStrength = 0;
             clean = false;
         }
+        // [WP-HDRPEAK] zero is the default (1000 nits, no roll-off), so a
+        // corrupt byte lands there; its spare byte stays zero.
+        clampEnum(hdrPeak, static_cast<std::uint8_t>(PrefsHdrPeak::Count),
+                  static_cast<std::uint8_t>(PrefsHdrPeak::Nits1000));
+        if (padAfterHdrPeak != 0) {
+            padAfterHdrPeak = 0;
+            clean = false;
+        }
         // [WP-STEADY] Corrupt choices land on the DEFAULT (Auto), like
         // parallax and the sky seam fix: a fresh blob's setting.  The padding
         // and the rest of the range stay zero.
@@ -683,6 +723,16 @@ struct PrefsBlob {
     }
     /// [WP-LOOK]
     [[nodiscard]] PrefsLook lookChoice() const noexcept { return static_cast<PrefsLook>(look); }
+    /// [WP-HDRPEAK] The HDR peak choice; an out-of-range byte (an unsanitised
+    /// blob) reads as the default, 1000 nits.
+    [[nodiscard]] PrefsHdrPeak hdrPeakChoice() const noexcept {
+        return hdrPeak < static_cast<std::uint8_t>(PrefsHdrPeak::Count) ? static_cast<PrefsHdrPeak>(hdrPeak)
+                                                                        : PrefsHdrPeak::Nits1000;
+    }
+    /// [WP-HDRPEAK] The PQ output's target peak in nits (1000 = no roll-off).
+    [[nodiscard]] float hdrPeakNits() const noexcept {
+        return kPrefsHdrPeakNits[static_cast<std::size_t>(hdrPeakChoice())];
+    }
     /// True when the flow-based parallax correction should run.
     [[nodiscard]] bool parallaxEnabled() const noexcept { return parallaxMode() == PrefsParallax::On; }
 
@@ -972,7 +1022,13 @@ static_assert(offsetof(PrefsBlob, padBeforeSteady) == 48, "PrefsBlob layout drif
 static_assert(offsetof(PrefsBlob, parallaxGrid) == 50, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, lensAlign) == 51, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, steadyReserved) == 52, "PrefsBlob layout drifted");
-static_assert(offsetof(PrefsBlob, reserved) == 54, "PrefsBlob layout drifted");
+// [WP-HDRPEAK] hdrPeak takes offset 54 of its assigned range (54-55).  An
+// older blob's zero byte reads as PrefsHdrPeak::Nits1000 - no roll-off, the
+// PQ output it always had.
+static_assert(offsetof(PrefsBlob, hdrPeak) == 54, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, padAfterHdrPeak) == 55, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, reserved) == 56, "PrefsBlob layout drifted");
+static_assert(static_cast<int>(PrefsHdrPeak::Nits1000) == 0, "zero must stay the no-roll-off default");
 // The codes' upper bounds are the ranges the controls offer.
 static_assert(PrefsBlob::kMaxSeamBlendCode == 8 * PrefsBlob::kSeamToolStepsPerDeg + 1, "Seam Blend reaches 8 deg");
 static_assert(PrefsBlob::kMinSeamBlendCode == 4 + 1, "Seam Blend starts at 0.2 deg");

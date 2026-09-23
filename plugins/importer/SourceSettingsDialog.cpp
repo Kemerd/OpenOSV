@@ -456,16 +456,64 @@ void shadingWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
 // ---- [/WP-VIGNETTE] ----------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+//  [WP-HDRPEAK] the HDR peak row
+// ---------------------------------------------------------------------------
+// One combo row appended below the lens shading rows, the same way.  Its ids
+// are clear of resource.h (1000-1018, 1030, 1060, 1100-1107, 1130, 1160) and
+// of the rows above (1040-1049, 1140-1157).
+
+/// Control ids of the row: the combo and its label.
+constexpr int kIdcHdrPeak = 1070;
+constexpr int kIdcStaticHdrPeak = 1170;
+
+/// Grey the HDR peak row unless Colour output is PQ, the only output with an
+/// absolute peak to roll off into.  The selection itself is kept, so going
+/// back to PQ restores the user's choice (the same rule as the Rec.709 look).
+void enableHdrPeakForOutput(HWND dialog) noexcept {
+    const bool pq = comboSelection(dialog, IDC_COLOR_OUTPUT) == static_cast<int>(PrefsColorOutput::PQ);
+    for (const int id : {kIdcHdrPeak, kIdcStaticHdrPeak}) {
+        if (HWND control = ::GetDlgItem(dialog, id)) {
+            ::EnableWindow(control, pq ? TRUE : FALSE);
+        }
+    }
+}
+
+/// Append the HDR peak row and load `c` into it.  The combo index IS the
+/// PrefsHdrPeak value, so the list is in enum order.
+void addHdrPeakRow(HWND dialog, const DialogControls& c) noexcept {
+    const int row = growDialogForRows(dialog, 1);
+    addDialogChild(dialog, L"STATIC", L"&HDR peak (PQ):", SS_LEFT, kIdcStaticHdrPeak, 7, row + 3, 70, 8);
+    addDialogChild(dialog, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kIdcHdrPeak, 82, row, 179,
+                   80);
+    static const wchar_t* const kPeaks[] = {L"1000 nits (default)", L"600 nits", L"400 nits",
+                                            L"203 nits (SDR-safe)"};
+    static_assert(std::size(kPeaks) == static_cast<std::size_t>(PrefsHdrPeak::Count),
+                  "the HDR peak combo does not list every PrefsHdrPeak value");
+    fillCombo(dialog, kIdcHdrPeak, kPeaks, static_cast<int>(std::size(kPeaks)), c.hdrPeak);
+    enableHdrPeakForOutput(dialog);
+}
+
+/// Read the HDR peak row back.  A missing row keeps what the dialog opened
+/// with.
+void hdrPeakWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
+    if (::GetDlgItem(dialog, kIdcHdrPeak)) {
+        c.hdrPeak = comboSelection(dialog, kIdcHdrPeak);
+    }
+}
+// ---- [/WP-HDRPEAK] -----------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 //  [WP-STEADY] the Parallax Grid and Lens Alignment rows
 // ---------------------------------------------------------------------------
-// Two combo rows appended below the lens shading rows, the same way.  Ids
-// clear of resource.h, the sky seam rows (1040-1042, 1140-1144), the seam
-// tool rows (1043-1047, 1145-1154) and the lens shading rows (1048-1049,
-// 1155-1157).
-constexpr int kIdcParallaxGrid = 1060;
-constexpr int kIdcLensAlign = 1061;
-constexpr int kIdcStaticParallaxGrid = 1160;
-constexpr int kIdcStaticLensAlign = 1161;
+// Two combo rows appended below the HDR peak row, the same way.  Ids clear
+// of resource.h (1000-1018, 1030, 1060, 1100-1107, 1130, 1160), the sky seam
+// rows (1040-1042, 1140-1144), the seam tool rows (1043-1047, 1145-1154),
+// the lens shading rows (1048-1049, 1155-1157) and the HDR peak row (1070,
+// 1170).
+constexpr int kIdcParallaxGrid = 1080;
+constexpr int kIdcLensAlign = 1081;
+constexpr int kIdcStaticParallaxGrid = 1180;
+constexpr int kIdcStaticLensAlign = 1181;
 
 /// Append the two rows and load `c` into them.  The lists are in the order
 /// of kDialogParallaxGrid / kDialogLensAlign (the default first), and the
@@ -655,6 +703,7 @@ void widgetsToControls(HWND dialog, DialogControls& c) noexcept {
     photoWidgetsToControls(dialog, c);  // [WP-PHOTO]
     seamToolWidgetsToControls(dialog, c);  // [WP-SEAMTOOLS]
     shadingWidgetsToControls(dialog, c);  // [WP-VIGNETTE]
+    hdrPeakWidgetsToControls(dialog, c);  // [WP-HDRPEAK]
     steadyWidgetsToControls(dialog, c);    // [WP-STEADY]
 }
 
@@ -671,6 +720,7 @@ INT_PTR CALLBACK sourceSettingsProc(HWND dialog, UINT message, WPARAM wParam, LP
             addPhotoSeamRows(dialog, state->controls);  // [WP-PHOTO]
             addSeamToolRows(dialog, state->controls);   // [WP-SEAMTOOLS]
             addLensShadingRows(dialog, state->controls);  // [WP-VIGNETTE]
+            addHdrPeakRow(dialog, state->controls);       // [WP-HDRPEAK]
             addSteadyRows(dialog, state->controls);       // [WP-STEADY]
         }
         placeDefaultsRow(dialog);  // [WP-DEFAULTS] after every block that moves OK
@@ -698,9 +748,11 @@ INT_PTR CALLBACK sourceSettingsProc(HWND dialog, UINT message, WPARAM wParam, LP
             }
             return TRUE;
         }
-        // [WP-LOOK] A new Colour output re-evaluates whether the look applies.
+        // [WP-LOOK] A new Colour output re-evaluates whether the look applies
+        // - and [WP-HDRPEAK] whether the HDR peak does.
         if (id == IDC_COLOR_OUTPUT && HIWORD(wParam) == CBN_SELCHANGE) {
             enableLookForOutput(dialog);
+            enableHdrPeakForOutput(dialog);
             return TRUE;
         }
         return FALSE;
@@ -885,10 +937,11 @@ void logDialogStartsFromDefaults(ImporterInstance* instance, const imFileAccessR
         PluginLog::warn("source settings: could not request a refresh of the clip");
     }
 
-    PluginLog::info("source settings accepted: colour {}, look {}, size {}, stab {}, seam {}, gain {}, calib {} ({}), "
-                    "fit {}, exposure {:+.2f}, device {}, sun ghost removal {}",
-                    blob.colorOutput, blob.look, blob.outputSize, blob.stabilization, blob.seamSearch, blob.gainMatch,
-                    blob.calibration, calibrationChoiceToken(blob.calibrationChoice()), blob.dlogmFit,
+    PluginLog::info("source settings accepted: colour {}, look {}, HDR peak {:.0f} nits, size {}, stab {}, seam {}, "
+                    "gain {}, calib {} ({}), fit {}, exposure {:+.2f}, device {}, sun ghost removal {}",
+                    blob.colorOutput, blob.look, static_cast<double>(blob.hdrPeakNits()), blob.outputSize,
+                    blob.stabilization, blob.seamSearch, blob.gainMatch, blob.calibration,
+                    calibrationChoiceToken(blob.calibrationChoice()), blob.dlogmFit,
                     static_cast<double>(blob.exposureStops), blob.renderDevice, blob.flareRemoval);
     return imNoErr;
 }

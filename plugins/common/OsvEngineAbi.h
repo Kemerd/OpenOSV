@@ -75,8 +75,13 @@ extern "C" {
  *       shadeEnabled, the knot geometry, the strength and two OsvShadeLens,
  *       1064 bytes); no new table or entry point - the correction travels
  *       inside OsvEngineFrame::stitch.  A version-3 effect meeting a
- *       version-4 importer (or the reverse) refuses the engine, as above. */
-#define OSV_ENGINE_ABI_VERSION 4u
+ *       version-4 importer (or the reverse) refuses the engine, as above.
+ *    5  OsvColorParams (inside OsvRenderParams::color) grew by the HDR peak
+ *       group (WP-HDRPEAK: hdrPeakNits, hdrPeakSrcCode, hdrPeakMaxLum,
+ *       hdrPeakKnee - 16 bytes), so every field after the colour block
+ *       moved; no new table or entry point.  A version-4 effect meeting a
+ *       version-5 importer (or the reverse) refuses the engine, as above. */
+#define OSV_ENGINE_ABI_VERSION 5u
 
 /** Module file name of the importer that exports the engine. */
 #define OSV_ENGINE_MODULE_NAME L"OpenOSVImporter.prm"
