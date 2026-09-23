@@ -14,6 +14,7 @@
 #include "PrSDKVideoSegmentProperties.h"
 #include "SPBasic.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -250,6 +251,84 @@ void noteMediaEvidence(const SourceBinding& b) noexcept {
     const char* name = nullptr;
     (void)cuGetErrorName(r, &name);
     return std::string(what) + ": " + (name ? name : "CUDA_ERROR_UNKNOWN");
+}
+
+// ===========================================================================
+//  The clip time -> media time log
+//
+//  Premiere maps the time an effect renders at to a time in the MEDIA
+//  through the clip node's TransformNodeTime: in point, speed, reverse and
+//  time remapping all live there, and the engine then rounds that media time
+//  to a frame.  Nothing but a real host can confirm the whole chain on a
+//  trimmed, sped-up or reversed clip, so the first frames of every instance
+//  say exactly what happened.  CreateInstance runs again on every parameter
+//  change (a Program Monitor drag makes dozens a second), so the lines are
+//  also capped process-wide per time window: a drag costs at most
+//  kMappingLinesPerWindow lines per window, and a field check - trim, play,
+//  read the log - finds its lines unless such a burst spent the budget in
+//  the seconds just before.
+// ===========================================================================
+
+/// Frames logged per instance.
+constexpr int kMappingFramesPerInstance = 3;
+/// Lines allowed per window across every instance of the process.
+constexpr int kMappingLinesPerWindow = 24;
+/// The window.
+constexpr std::chrono::seconds kMappingWindow{10};
+/// Premiere's tick rate (PrSDKTypes.h), for the seconds in the line.
+constexpr double kTicksPerSecond = 254016000000.0;
+
+/// The file name of a UTF-16 path as UTF-8, for a log line.
+[[nodiscard]] std::string fileNameUtf8(const std::wstring& path) {
+    const std::size_t slash = path.find_last_of(L"\\/");
+    const std::wstring name = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+    if (name.empty()) {
+        return {};
+    }
+    const int n = WideCharToMultiByte(CP_UTF8, 0, name.data(), static_cast<int>(name.size()), nullptr, 0, nullptr,
+                                      nullptr);
+    if (n <= 0) {
+        return {};
+    }
+    std::string out(static_cast<std::size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, name.data(), static_cast<int>(name.size()), out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+/// Log one frame's clip time -> media time -> frame, if this instance and
+/// the process-wide budget both still allow it.
+void logMapping(const DirectRequest& request, PrTime media, std::uint32_t frameIndex) noexcept {
+    try {
+        if (!request.source) {
+            return;
+        }
+        static std::mutex mutex;
+        static std::chrono::steady_clock::time_point windowStart{};
+        static int linesInWindow = 0;
+        std::lock_guard<std::mutex> lock(mutex);
+        const SourceBinding& source = *request.source;
+        if (source.mappingFramesLogged >= kMappingFramesPerInstance) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (linesInWindow == 0 || now - windowStart >= kMappingWindow) {
+            windowStart = now;
+            linesInWindow = 0;
+        }
+        if (linesInWindow >= kMappingLinesPerWindow) {
+            return;  // over budget: this frame is not counted, a later one may be logged
+        }
+        ++linesInWindow;
+        const int ordinal = ++source.mappingFramesLogged;
+        PluginLog::info("reframe/direct: mapping {}/{} of this instance (clip node {}) - clip time {} ticks ({:.4f} s) "
+                        "-> media time {} ticks ({:.4f} s) -> frame {} of '{}'",
+                        ordinal, kMappingFramesPerInstance, source.ownerNode,
+                        static_cast<long long>(request.clipTime), static_cast<double>(request.clipTime) / kTicksPerSecond,
+                        static_cast<long long>(media), static_cast<double>(media) / kTicksPerSecond, frameIndex,
+                        fileNameUtf8(source.path));
+    } catch (...) {
+        // A diagnostic must never fail a render.
+    }
 }
 
 }  // namespace
@@ -493,6 +572,9 @@ bool renderDirect(const DirectRequest& request, std::string& reason) noexcept {
                 }
             }
         } guard{api, frame.lease};
+
+        // The first frames of each instance record the whole time chain.
+        logMapping(request, media, frame.frameIndex);
 
         if (frame.paramsSize != sizeof(OsvRenderParams)) {
             reason = "the engine's parameter block has a different layout";

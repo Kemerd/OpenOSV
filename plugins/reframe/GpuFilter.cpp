@@ -412,16 +412,166 @@ bool readParam(const Instance& inst, int aeIndex, PrTime time, PrParam* out) noe
 /// Discover the host's parameter index space, once per instance.
 ///
 /// Asks GetParamCount how many entries there are, reads each one's TYPE at
-/// time 0, and hands the resulting signature to matchHostParams().  On a
-/// positive identification the instance's map is replaced; otherwise the
-/// static map it was constructed with is kept.  Either way the function is
-/// non-fatal - it only ever improves the mapping, never breaks it - and it
+/// time 0, and identifies the list as one of the two layouts Premiere has
+/// been seen to use (matchVerbatimLayout() below, then matchHostParams()).
+/// On a positive identification the instance's map is replaced; otherwise
+/// the static map it was constructed with is kept.  Either way the function
+/// is non-fatal - it only ever improves the mapping, never breaks it - and it
 /// logs which of the two is in force so a log alone answers the question.
 ///
-/// Cost: one GetParamCount plus at most kValueParamCount GetParam calls, all
-/// at t = 0, on a code path Premiere runs when an effect is applied or a
-/// parameter changes - not per frame.
+/// Cost: one GetParamCount plus at most kParamCount GetParam calls (a few
+/// retries each for entries that do not answer), all at t = 0, on a code
+/// path Premiere runs when an effect is applied or a parameter changes - not
+/// per frame.
 void probeParams(Instance& inst) noexcept;
+
+// ---------------------------------------------------------------------------
+//  The VERBATIM host layout
+//
+//  Premiere Pro 26.2.2 was seen to hand a GPU filter this effect's parameter
+//  list exactly as After Effects built it, minus the input layer:
+//
+//      GetParamCount = 15 = OSV_REFRAME_PARAM_COUNT
+//      [0]i32:0 [1]bool:0 [2]i32:3 [3]f32:0 [4]f32:0 [5]f32:0 [6]f64:120
+//      [7]f64:15 [8]bool:0 [9]bool:0 [10]f32:0   (11..14 unreadable at t = 0)
+//
+//  i.e. host index = AE index - 1, and the four group markers (Camera start
+//  and end, Source start and end) PRESENT, answering as Bool.  An older
+//  session showed the same layout with the markers refusing to answer at
+//  all.  This is the layout the static "AE index - 1" rule assumes, so the
+//  static mapping was right - but the matcher only knew the COMPACT layout
+//  (markers dropped, a collapsed group missing) and logged a false "types do
+//  not match" error on every such host.  Worse, the old probe read only the
+//  first kValueParamCount entries of a 15-entry list, and when the markers
+//  refused to answer, the FOV/Distortion anchor "identified" that prefix at
+//  a constant offset that is wrong past the first group marker: Source Roll
+//  was read out of Source Pan's slot while Source Pan, Source Tilt, Smooth
+//  Keyframes and Output Resolution were not read at all.
+//
+//  The expected layout is built from ReframeParams.h alone - every AE index
+//  in kValueParamAeIndex carries kValueParamKind, every other index up to
+//  kParamCount is a group marker - so a control appended there (a new id,
+//  a new AE index, a new kind entry) is recognised here with no change to
+//  this code.
+// ---------------------------------------------------------------------------
+
+/// The smallest number of value-carrying entries that must answer with the
+/// expected type before a verbatim identification is believed.  Five is the
+/// same bar the compact matcher's anchor applies: a list that answers less
+/// than that is not identified but unreadable, so the static mapping (which
+/// IS the verbatim mapping) stays in force, the log says so, and Render
+/// retries the probe once the node answers.
+constexpr int kVerbatimMinTypedValues = 5;
+
+// The tables the verbatim layout is derived from must describe a list the
+// host map can hold.  Checked at compile time so a table edit that breaks
+// the invariant fails the build rather than the probe.
+static_assert(kValueParamCount > 0 && kValueParamCount <= kParamCount,
+              "ReframeParams.h: the value controls must be a subset of the AE parameter list");
+static_assert(
+    [] {
+        for (int i = 0; i < kValueParamCount; ++i) {
+            if (kValueParamAeIndex[i] < 1 || kValueParamAeIndex[i] > kParamCount) {
+                return false;
+            }
+            for (int j = 0; j < i; ++j) {
+                if (kValueParamAeIndex[j] == kValueParamAeIndex[i]) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }(),
+    "ReframeParams.h: kValueParamAeIndex must name distinct AE indices in 1..kParamCount");
+
+/// What the verbatim layout expects at host index `hostIndex`: the kind of
+/// the value control whose AE index is hostIndex + 1, or `isMarker` = true
+/// when that AE index belongs to no value control (a group start or end).
+/// Returns false for an index outside the list.
+[[nodiscard]] bool verbatimExpectation(int hostIndex, HostParamKind* kind, bool* isMarker) noexcept {
+    if (!kind || !isMarker || hostIndex < 0 || hostIndex >= kParamCount) {
+        return false;
+    }
+    const int aeIndex = hostIndex + 1;
+    for (int i = 0; i < kValueParamCount; ++i) {
+        if (kValueParamAeIndex[i] == aeIndex) {
+            *kind = kValueParamKind[i];
+            *isMarker = false;
+            return true;
+        }
+    }
+    *kind = HostParamKind::Unknown;
+    *isMarker = true;
+    return true;
+}
+
+/// Identify the host list as this effect's AE parameter list verbatim.
+///
+/// `kinds` holds what the host answered for indices 0 .. readCount-1
+/// (Unknown for an entry that refused or carried a type we do not use) and
+/// `hostCount` what GetParamCount said.  Rules, each one a guard against a
+/// plausible-looking wrong answer:
+///
+///   1. the host must report exactly kParamCount entries - the one number
+///      that separates this layout from the compact one (8 or 11 there);
+///   2. every entry that DID answer must agree with its position: a value
+///      control with its own kind, a group marker with Bool (Premiere's
+///      answer for a marker) - one contradiction and the list is not ours;
+///   3. an entry that did not answer contradicts nothing - Premiere 26.2.2
+///      refuses the trailing entries of a freshly built node at t = 0 - but
+///      it is not evidence either, so at least kVerbatimMinTypedValues value
+///      controls must have answered with the right kind.
+///
+/// On success every value control is mapped to its position, INCLUDING the
+/// ones that did not answer at t = 0: in this layout the index is known
+/// from the list itself, not inferred from the answers, and a read that
+/// fails at render time still falls back to the control's default in the
+/// readers.  Group markers stay at -1 (they carry no value and are never
+/// read).  On failure `outMap` is untouched.
+[[nodiscard]] bool matchVerbatimLayout(const HostParamKind* kinds, int readCount, int hostCount,
+                                       HostParamMap* outMap) noexcept {
+    if (!kinds || !outMap || hostCount != kParamCount || readCount < 0 || readCount > kParamCount) {
+        return false;
+    }
+    int typedValues = 0;
+    for (int host = 0; host < readCount; ++host) {
+        HostParamKind expected = HostParamKind::Unknown;
+        bool isMarker = false;
+        if (!verbatimExpectation(host, &expected, &isMarker)) {
+            return false;
+        }
+        const HostParamKind got = kinds[host];
+        if (got == HostParamKind::Unknown) {
+            continue;  // rule 3: no answer, no contradiction, no evidence
+        }
+        if (isMarker) {
+            if (got != HostParamKind::Bool) {
+                return false;  // rule 2: a marker answering as a value
+            }
+            continue;
+        }
+        if (got != expected) {
+            return false;  // rule 2: a value control of the wrong kind
+        }
+        ++typedValues;
+    }
+    if (typedValues < kVerbatimMinTypedValues) {
+        return false;
+    }
+
+    // ---- positional map ------------------------------------------------------
+    HostParamMap map{};
+    for (int i = 0; i <= OSV_REFRAME_PARAM_COUNT; ++i) {
+        map.hostIndex[i] = -1;
+    }
+    for (int i = 0; i < kValueParamCount; ++i) {
+        const int aeIndex = kValueParamAeIndex[i];
+        map.hostIndex[aeIndex] = gpuParamIndex(aeIndex);
+    }
+    map.probed = true;
+    *outMap = map;
+    return true;
+}
 
 // ===========================================================================
 //  Source-graph probe (diagnostic, once per process)
@@ -666,15 +816,24 @@ void probeParams(Instance& inst) noexcept {
                          "reframe/gpu: GetParamCount failed; using the static parameter mapping");
         return;
     }
+    // Host-supplied, therefore validated: a negative count is garbage, and a
+    // zero count is a node that exposes nothing to identify.
+    if (hostCount <= 0) {
+        PluginLog::oncef("reframe/gpu/probe-empty", PluginLog::Level::Warn,
+                         "reframe/gpu: the host reports {} parameters; using the static parameter mapping",
+                         hostCount);
+        return;
+    }
 
-    // Read every entry the host admits to, but never more than our own list
-    // can account for: a longer list is not ours and matchHostParams() would
-    // refuse it anyway, so there is no reason to pay for the extra calls.
-    // The array is sized by the same constant, so the bound is structural.
-    HostParamKind kinds[kValueParamCount] = {};
-    const int probeCount = (hostCount > kValueParamCount) ? kValueParamCount : static_cast<int>(hostCount);
+    // Read every entry the host admits to, but never more than our whole AE
+    // list (group markers included) can account for: that is the longest
+    // list either layout can be, so a longer one is not ours and there is no
+    // reason to pay for the extra calls.  The array is sized by the same
+    // constant, so the bound is structural.
+    HostParamKind kinds[kParamCount] = {};
+    const int probeCount = (hostCount > kParamCount) ? kParamCount : static_cast<int>(hostCount);
     std::string dump;
-    dump.reserve(256);
+    dump.reserve(384);
     for (int i = 0; i < probeCount; ++i) {
         PrParam p{};
         // GetParam on a freshly created node fails INTERMITTENTLY: observed
@@ -723,26 +882,42 @@ void probeParams(Instance& inst) noexcept {
                      "reframe/gpu: host parameter dump at t=0 ({} of {} entries, we added {}): {}", probeCount,
                      hostCount, OSV_REFRAME_PARAM_COUNT, dump);
 
+    // ---- identify the layout ---------------------------------------------------
+    // The two layouts cannot be confused: the verbatim one is exactly
+    // kParamCount entries long, the compact one at most kValueParamCount.
+    // Anything else is a list nobody has seen yet, and guessing at it would
+    // mean reading someone else's controls.
     HostParamMap probed{};
-    if (!matchHostParams(kinds, probeCount, &probed)) {
+    const char* layout = nullptr;
+    if (matchVerbatimLayout(kinds, probeCount, static_cast<int>(hostCount), &probed)) {
+        layout = "verbatim (host index = AE index - 1, group markers included)";
+    } else if (hostCount <= kValueParamCount && matchHostParams(kinds, probeCount, &probed)) {
+        layout = "compact (group markers dropped)";
+    }
+    if (!layout) {
         PluginLog::oncef("reframe/gpu/probe-nomatch", PluginLog::Level::Error,
                          "reframe/gpu: the host reports {} parameters and their types do not match this effect's "
-                         "signature; falling back to the static mapping (AE index - 1), which may read the wrong "
-                         "control",
-                         hostCount);
+                         "signature ({} entries including group markers, {} without); falling back to the static "
+                         "mapping (AE index - 1), which may read the wrong control",
+                         hostCount, kParamCount, kValueParamCount);
         return;
     }
 
     inst.paramMap = probed;
     inst.paramMapProbed = true;
+
+    // Which AE index reads which host entry, straight from the tables, so a
+    // control added to ReframeParams.h shows up here without an edit.
+    std::string pairs;
+    pairs.reserve(8 * kValueParamCount);
+    for (int i = 0; i < kValueParamCount; ++i) {
+        const int aeIndex = kValueParamAeIndex[i];
+        pairs += std::format("{}->{} ", aeIndex, probed[aeIndex]);
+    }
     PluginLog::oncef("reframe/gpu/probe-ok", PluginLog::Level::Info,
-                     "reframe/gpu: probed the host parameter mapping from {} entries - "
-                     "resolution={} preset={} pan={} tilt={} roll={} fov={} distortion={} "
-                     "srcPan={} srcTilt={} srcRoll={} smooth={} (-1 = not exposed by the host)",
-                     hostCount, probed[kIndexOutputResolution], probed[kIndexPreset], probed[kIndexPan],
-                     probed[kIndexTilt], probed[kIndexRoll], probed[kIndexFov], probed[kIndexDistortion],
-                     probed[kIndexSourcePan], probed[kIndexSourceTilt], probed[kIndexSourceRoll],
-                     probed[kIndexSmooth]);
+                     "reframe/gpu: probed the host parameter mapping from {} entries, {} layout - AE index -> host "
+                     "index: {}(-1 = not exposed by the host)",
+                     hostCount, layout, pairs);
 }
 
 /// An angle control: PF_ADD_ANGLE arrives as mFloat32 degrees.  Other types
