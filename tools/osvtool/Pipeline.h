@@ -37,7 +37,16 @@ struct PipelineOptions {
     std::filesystem::path input;
 
     // Calibration / geometry conventions (defaults = verified values)
-    std::string calib = "native";                 ///< native | lens-guards | underwater
+    /// auto | native | lens-guards | underwater - CalibrationSelector::choose().
+    /// "auto" follows the recorded accessory (what "native" used to do
+    /// implicitly); "native" now really forces the bare-lens set.
+    std::string calib = "auto";
+    /// auto | none | forward | inverse - the lens-protector field-angle
+    /// correction.  "auto" applies DJI's (forward) direction exactly when the
+    /// calibration choice resolves to lens protectors without a dedicated
+    /// set, as the importer does (which additionally verifies it on frame 0);
+    /// the others force a direction whatever the calibration says.
+    std::string protector = "auto";
     std::optional<double> stitchDistanceM;        ///< far_XX preset selection
     std::optional<double> cropScale;              ///< override StreamScaling
     std::string focalSource = "dfl";              ///< dfl | scaled
