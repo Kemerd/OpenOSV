@@ -20,9 +20,12 @@
 //     PF_EffectWorld of the world set with setInputWorld) and params[1..n]
 //     (the values set with setParamValue), plus an output world;
 //   * checkout_param at a neighbouring time returns exactly the stored value
-//     (the mock has no keyframes on the AE side - the GPU path reads
-//     keyframes through the Video Segment Suite instead, which does
-//     interpolate).
+//     (AE-side keyframes installed with setParamValueAtTime are returned at
+//     exactly their time and never interpolated - the GPU path reads
+//     keyframes through the Video Segment Suite instead, which does);
+//   * PF_FindKeyframeTime / PF_GetKeyframeCount / PF_KeyIndexToTime answer
+//     from those same installed keyframes, which is how the Keyframe Easing
+//     finds the interval around the render time on the CPU path.
 //
 // Effect worlds are top-left origin with positive row bytes rounded up to 64,
 // which is what Premiere hands an AE-API effect.  A world registers itself in
@@ -649,6 +652,12 @@ void MockHost::clearParamKeyframes(PF_ProgPtr ref) {
     r->keyframes.clear();
 }
 
+std::size_t MockHost::findKeyframeCalls(PF_ProgPtr ref) const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    const EffectRef* r = m_impl->effectRef(ref);
+    return r ? r->findKeyframeCalls : 0u;
+}
+
 void MockHost::setInputWorld(PF_ProgPtr ref, EffectWorld* world) {
     std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
     EffectRef* r = m_impl->effectRef(ref);
@@ -883,19 +892,93 @@ PF_Err pfParamUtilsIsIdenticalCheckout(PF_ProgPtr, PF_ParamIndex, A_long, A_long
     return PF_Err_BAD_CALLBACK_PARAM;
 }
 
-PF_Err pfParamUtilsFindKeyframeTime(PF_ProgPtr, PF_ParamIndex, A_long, A_u_long, PF_TimeDir, PF_Boolean* found,
-                                    PF_KeyIndex*, A_long*, A_u_long*) {
-    if (found) {
-        *found = FALSE;
+/// The AE-side keyframe times of one parameter, ascending: the times the
+/// test installed with MockHost::setParamValueAtTime.  They are in whatever
+/// time scale the test used - the mock has one scale per effect, the one its
+/// PF_InData reports - so the scale argument of the queries below is echoed
+/// back rather than converted.
+std::vector<A_long> keyframeTimesLocked(const EffectRef& ref, PF_ParamIndex index) {
+    std::vector<A_long> times;
+    for (const auto& entry : ref.keyframes) {
+        if (entry.first.first == static_cast<A_long>(index)) {
+            times.push_back(entry.first.second);  // the map is ordered, so ascending
+        }
     }
-    return PF_Err_BAD_CALLBACK_PARAM;
+    return times;
 }
 
-PF_Err pfParamUtilsGetKeyframeCount(PF_ProgPtr, PF_ParamIndex, PF_KeyIndex* count) {
-    if (count) {
-        *count = PF_KeyIndex_NONE;
+/// PF_FindKeyframeTime (the [WP-EASING] Keyframe Easing reads keyframes
+/// through it): the keyframe nearest `what_time` in the direction asked,
+/// from the installed keyframes.  A parameter with none is "not found",
+/// which is what a host answers for a constant control.
+PF_Err pfParamUtilsFindKeyframeTime(PF_ProgPtr effectRef, PF_ParamIndex index, A_long what_time, A_u_long time_scale,
+                                    PF_TimeDir dir, PF_Boolean* found, PF_KeyIndex* key_index, A_long* key_time,
+                                    A_u_long* key_timescale) {
+    MockHost::Impl* p = impl();
+    if (!p || !found) {
+        return PF_Err_BAD_CALLBACK_PARAM;
     }
-    return PF_Err_BAD_CALLBACK_PARAM;
+    *found = FALSE;
+    std::lock_guard<std::recursive_mutex> lock(p->mutex);
+    EffectRef* ref = p->effectRef(effectRef);
+    if (!ref || index < 1 || static_cast<std::size_t>(index) > ref->params.size()) {
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+    ++ref->findKeyframeCalls;
+    const std::vector<A_long> times = keyframeTimesLocked(*ref, index);
+    // Walk the ascending list for the one keyframe the direction names.
+    int pick = -1;
+    for (int i = 0; i < static_cast<int>(times.size()); ++i) {
+        const A_long k = times[static_cast<std::size_t>(i)];
+        switch (dir) {
+            case PF_TimeDir_LESS_THAN:
+                pick = (k < what_time) ? i : pick;
+                break;
+            case PF_TimeDir_LESS_THAN_OR_EQUAL:
+                pick = (k <= what_time) ? i : pick;
+                break;
+            case PF_TimeDir_GREATER_THAN:
+                pick = (pick < 0 && k > what_time) ? i : pick;
+                break;
+            case PF_TimeDir_GREATER_THAN_OR_EQUAL:
+                pick = (pick < 0 && k >= what_time) ? i : pick;
+                break;
+            default:
+                return PF_Err_BAD_CALLBACK_PARAM;
+        }
+    }
+    if (pick < 0) {
+        return PF_Err_NONE;  // not found is an answer, not an error
+    }
+    *found = TRUE;
+    if (key_index) {
+        *key_index = pick;
+    }
+    if (key_time) {
+        *key_time = times[static_cast<std::size_t>(pick)];
+    }
+    if (key_timescale) {
+        *key_timescale = time_scale;
+    }
+    return PF_Err_NONE;
+}
+
+/// PF_GetKeyframeCount: PF_KeyIndex_NONE for a constant parameter, as the
+/// header documents, otherwise the number installed.
+PF_Err pfParamUtilsGetKeyframeCount(PF_ProgPtr effectRef, PF_ParamIndex index, PF_KeyIndex* count) {
+    MockHost::Impl* p = impl();
+    if (!p || !count) {
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+    std::lock_guard<std::recursive_mutex> lock(p->mutex);
+    const EffectRef* ref = p->effectRef(effectRef);
+    if (!ref || index < 1 || static_cast<std::size_t>(index) > ref->params.size()) {
+        *count = PF_KeyIndex_NONE;
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+    const std::size_t n = keyframeTimesLocked(*ref, index).size();
+    *count = (n == 0) ? PF_KeyIndex_NONE : static_cast<PF_KeyIndex>(n);
+    return PF_Err_NONE;
 }
 
 PF_Err pfParamUtilsCheckoutKeyframe(PF_ProgPtr, PF_ParamIndex, PF_KeyIndex, A_long*, A_u_long*, PF_ParamDef*) {
@@ -904,8 +987,28 @@ PF_Err pfParamUtilsCheckoutKeyframe(PF_ProgPtr, PF_ParamIndex, PF_KeyIndex, A_lo
 
 PF_Err pfParamUtilsCheckinKeyframe(PF_ProgPtr, PF_ParamDef*) { return PF_Err_BAD_CALLBACK_PARAM; }
 
-PF_Err pfParamUtilsKeyIndexToTime(PF_ProgPtr, PF_ParamIndex, PF_KeyIndex, A_long*, A_u_long*) {
-    return PF_Err_BAD_CALLBACK_PARAM;
+/// PF_KeyIndexToTime: the n-th installed keyframe's time (0-based), in the
+/// mock's one time scale (reported as 0: the mock has no scale of its own).
+PF_Err pfParamUtilsKeyIndexToTime(PF_ProgPtr effectRef, PF_ParamIndex index, PF_KeyIndex key, A_long* time,
+                                  A_u_long* scale) {
+    MockHost::Impl* p = impl();
+    if (!p || !time) {
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+    std::lock_guard<std::recursive_mutex> lock(p->mutex);
+    const EffectRef* ref = p->effectRef(effectRef);
+    if (!ref || index < 1 || static_cast<std::size_t>(index) > ref->params.size()) {
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+    const std::vector<A_long> times = keyframeTimesLocked(*ref, index);
+    if (key < 0 || static_cast<std::size_t>(key) >= times.size()) {
+        return PF_Err_BAD_CALLBACK_PARAM;
+    }
+    *time = times[static_cast<std::size_t>(key)];
+    if (scale) {
+        *scale = 0;
+    }
+    return PF_Err_NONE;
 }
 
 }  // namespace

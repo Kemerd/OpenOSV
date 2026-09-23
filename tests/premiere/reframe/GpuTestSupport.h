@@ -197,6 +197,11 @@ struct Controls {
     /// DJI.  In 1-based numbering "Classic" is 2, the popup's entry count, so
     /// it also settles the host's numbering as 1-based.
     int lens = static_cast<int>(LensPopup::Classic);
+    /// [WP-EASING] The Keyframe Easing popup, raw like the others.  Negative
+    /// means "not written": the entry then reads nothing at all, which is how
+    /// every test written before the popup existed describes its host (the
+    /// effect reads the default, None).
+    int easing = -1;
 };
 
 /// Write `c` onto `node` at `time` the way Premiere 26.2.2 serves it: host

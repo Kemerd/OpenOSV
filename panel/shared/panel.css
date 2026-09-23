@@ -30,6 +30,8 @@
     --green: #30d158;
     --orange: #ff9f0a;
     --red: #ff453a;
+    --key-bg: #3a3a3c;
+    --key-edge: #1c1c1e;
 }
 
 .osv.theme-light {
@@ -48,6 +50,8 @@
     --green: #34c759;
     --orange: #ff9500;
     --red: #ff3b30;
+    --key-bg: #ffffff;
+    --key-edge: #c7c7cc;
 }
 
 /* ---- page ------------------------------------------------------------------- */
@@ -412,6 +416,303 @@ body {
     color: var(--text-3);
 }
 
+/* ---- [WP-EASING] cards with a body of their own ------------------------------------------------ */
+
+.osv-card-padded {
+    padding: 12px 12px 12px 12px;
+}
+
+.osv-section-spaced {
+    margin-top: 18px;
+}
+
+.osv-card-caption {
+    margin-top: 0;
+    margin-bottom: 10px;
+}
+
+.osv-card-actions {
+    margin-top: 12px;
+}
+
+.osv-card-note {
+    margin-top: 8px;
+}
+
+.osv-card-note.is-empty {
+    display: none;
+}
+
+/* ---- [WP-EASING] the Program Monitor controls card ------------------------------------------------ */
+
+.osv-disclosure {
+    padding: 0 12px;
+}
+
+.osv-disclosure-head {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 40px;
+    cursor: pointer;
+}
+
+.osv-chevron {
+    flex: 0 0 auto;
+    width: 12px;
+    height: 12px;
+    margin-left: 8px;
+}
+
+.osv-chevron-glyph {
+    font-size: 13px;
+    line-height: 12px;
+}
+
+.osv-disclosure-body {
+    overflow: hidden;
+}
+
+.osv-disclosure.is-open .osv-disclosure-body {
+    padding-bottom: 10px;
+}
+
+.osv-hint-line {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    padding: 5px 0;
+    border-top: 1px solid var(--separator);
+}
+
+.osv-hint-keys {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    flex: 0 0 auto;
+    width: 104px;
+    margin-right: 10px;
+}
+
+.osv-key {
+    display: inline-block;
+    min-width: 14px;
+    padding: 1px 6px;
+    border-radius: 5px;
+    border: 1px solid var(--key-edge);
+    border-bottom-width: 2px;
+    background-color: var(--key-bg);
+    color: var(--text);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 15px;
+    text-align: center;
+}
+
+.osv-key-plus {
+    margin: 0 4px;
+    color: var(--text-3);
+    font-size: 11px;
+}
+
+.osv-key-word {
+    color: var(--text-2);
+    font-size: 11px;
+}
+
+.osv-hint-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: 11px;
+    line-height: 17px;
+    color: var(--text-2);
+}
+
+.osv-hint-note {
+    margin-top: 6px;
+}
+
+/* ---- [WP-EASING] Manual Framing ------------------------------------------------------------------ */
+
+.osv-framing-clip {
+    margin-top: 0;
+    margin-bottom: 10px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.osv-chips {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    margin: 0 -6px -6px 0;
+}
+
+.osv-button.osv-chip {
+    flex: 0 0 auto;
+    min-height: 26px;
+    padding: 3px 10px;
+    margin: 0 6px 6px 0;
+    border-radius: 13px;
+    background-color: var(--seg-bg);
+    color: var(--text);
+    font-weight: 500;
+}
+
+.osv-button.osv-chip + .osv-button.osv-chip {
+    margin-top: 0;
+    margin-left: 0;
+}
+
+.osv-zoom-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 14px;
+}
+
+.osv-stepper {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+}
+
+.osv-button.osv-step {
+    flex: 0 0 auto;
+    width: 28px;
+    min-height: 28px;
+    height: 28px;
+    padding: 0;
+    border-radius: 14px;
+    background-color: var(--seg-bg);
+    color: var(--text);
+    font-size: 16px;
+    font-weight: 500;
+}
+
+.osv-button.osv-step + .osv-button.osv-step {
+    margin-top: 0;
+    margin-left: 0;
+}
+
+.osv-zoom-value {
+    min-width: 64px;
+    margin: 0 8px;
+    text-align: center;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+}
+
+.osv-readouts {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--separator);
+}
+
+.osv-readout {
+    flex: 1 1 0;
+    min-width: 46px;
+    margin-bottom: 2px;
+    padding-right: 4px;
+}
+
+.osv-readout-label {
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.3px;
+    color: var(--text-3);
+}
+
+.osv-readout-value {
+    margin-top: 2px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+}
+
+.osv-card.is-idle .osv-readout-value,
+.osv-card.is-idle .osv-zoom-value {
+    color: var(--text-3);
+}
+
+/* ---- [WP-EASING] Keyframe Animation --------------------------------------------------------------- */
+
+.osv-ease-grid {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    margin: 0 -6px -6px 0;
+}
+
+.osv-ease-tile {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    flex: 0 0 auto;
+    width: 62px;
+    padding: 8px 2px 6px 2px;
+    margin: 0 6px 6px 0;
+    border-radius: 9px;
+    background-color: var(--seg-bg);
+    cursor: pointer;
+}
+
+.osv-ease-icon {
+    width: 30px;
+    height: 18px;
+    margin-bottom: 5px;
+}
+
+.osv-ease-glyph {
+    font-size: 15px;
+    line-height: 18px;
+    text-align: center;
+}
+
+.osv-ease-line {
+    font-size: 10px;
+    line-height: 13px;
+    font-weight: 500;
+    color: var(--text-2);
+    text-align: center;
+    white-space: nowrap;
+}
+
+.osv-ease-tile.is-selected .osv-ease-line {
+    color: var(--text);
+    font-weight: 600;
+}
+
+/* ---- [WP-EASING] Stabilisation ------------------------------------------------------------------ */
+
+.osv-segmented.osv-segmented-full {
+    display: flex;
+    margin-bottom: 10px;
+}
+
+/* A block (not a flex box) so a label too long for a narrow panel ends in an
+   ellipsis instead of being clipped on both sides; the full text is its
+   tooltip. */
+.osv-segmented-full .osv-seg {
+    display: block;
+    flex: 1 1 0;
+    min-width: 0;
+    padding: 0 4px;
+    font-size: 11px;
+    line-height: 24px;
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 /* ---- focus (keyboard users) ------------------------------------------------------------------ */
 
 /* A click must never draw a ring: the browser's own focus outline is a
@@ -422,15 +723,25 @@ body {
 .osv-switch:focus,
 .osv-seg:focus,
 .osv-slider:focus,
-.osv-button:focus {
+.osv-button:focus,
+.osv-ease-tile:focus,
+.osv-disclosure-head:focus {
     outline: none;
 }
 
 .osv-switch:focus-visible,
 .osv-seg:focus-visible,
 .osv-slider:focus-visible,
-.osv-button:focus-visible {
+.osv-button:focus-visible,
+.osv-ease-tile:focus-visible,
+.osv-disclosure-head:focus-visible {
     box-shadow: 0 0 0 2px var(--accent);
+}
+
+/* [WP-EASING] The disclosure header spans the card's width; round its ring
+   like the card's own corners. */
+.osv-disclosure-head:focus-visible {
+    border-radius: 8px;
 }
 
 /* The segment and the slider row have no corners of their own; give the
@@ -489,5 +800,26 @@ body {
 
     .osv-subtitle {
         display: none;
+    }
+
+    /* [WP-EASING] The padded cards keep their breathing room on top and
+       bottom; the controls card stacks each key above its words; three
+       preset tiles to a row. */
+    .osv-card.osv-card-padded {
+        padding: 10px 10px 10px 10px;
+    }
+
+    .osv-hint-line {
+        flex-direction: column;
+    }
+
+    .osv-hint-keys {
+        width: auto;
+        margin-right: 0;
+        margin-bottom: 3px;
+    }
+
+    .osv-ease-tile {
+        width: 56px;
     }
 }

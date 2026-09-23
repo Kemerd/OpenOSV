@@ -166,7 +166,7 @@ test('track listeners follow the sequence, including a track created by a drop',
     const { m, seq, adapter } = world();
     let events = 0;
     adapter.init(() => { events += 1; });
-    assert.equal(m.globalCount(), 4, 'sequence activated, project activated / opened / dirty');
+    assert.equal(m.globalCount(), 5, 'sequence activated / selection changed, project activated / opened / dirty');
     await adapter.getActiveSequence();
     assert.equal(m.listenerCount(), 2);
     assert.equal(m.fireTrackChanged(seq, 1), 1);

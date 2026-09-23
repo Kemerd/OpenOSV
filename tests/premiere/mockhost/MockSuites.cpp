@@ -1092,8 +1092,41 @@ prSuiteError vsGetNodeOperatorCount(csSDK_int32, csSDK_int32* out) {
     return suiteError_NotImplemented;
 }
 prSuiteError vsAcquireOperatorNodeId(csSDK_int32, csSDK_int32, csSDK_int32*) { return suiteError_NotImplemented; }
-prSuiteError vsGetNextKeyframeTime(csSDK_int32, csSDK_int32, PrTime, PrTime*, csSDK_int32*) {
-    return suiteError_NotImplemented;
+/// GetNextKeyframeTime, from the node's keyframe table: the first keyframe
+/// STRICTLY after `time` (the header's own example: keyframes at 0 and 10,
+/// inTime 0 answers 10 and inTime 10 answers suiteError_NoKeyframeAfterInTime).
+/// Every key the mock holds interpolates linearly, so the mode is Linear.  An
+/// injected read failure on the (node, index) fails this query too - a host
+/// that cannot read a parameter cannot walk its keyframes either.
+prSuiteError vsGetNextKeyframeTime(csSDK_int32 nodeId, csSDK_int32 index, PrTime time, PrTime* outTime,
+                                   csSDK_int32* outMode) {
+    MockHost::Impl* p = impl();
+    if (!p || !outTime) {
+        return suiteError_InvalidParms;
+    }
+    std::lock_guard<std::recursive_mutex> lock(p->mutex);
+    ++p->nextKeyframeCalls;
+    auto nodeIt = p->nodes.find(nodeId);
+    if (nodeIt == p->nodes.end()) {
+        return suiteError_IDNotValid;
+    }
+    const auto failIt = nodeIt->second.readFailures.find(index);
+    if (failIt != nodeIt->second.readFailures.end() && !failIt->second.onlyAtTime) {
+        return failIt->second.error;
+    }
+    auto trackIt = nodeIt->second.params.find(index);
+    if (trackIt == nodeIt->second.params.end() || trackIt->second.keys.empty()) {
+        return suiteError_InvalidParms;
+    }
+    const auto next = trackIt->second.keys.upper_bound(time);
+    if (next == trackIt->second.keys.end()) {
+        return suiteError_NoKeyframeAfterInTime;
+    }
+    *outTime = next->first;
+    if (outMode) {
+        *outMode = kPrInterpolationModeFlag_Linear;
+    }
+    return suiteError_NoError;
 }
 prSuiteError vsGetSegmentsProperties(PrTimelineID, prRect*, csSDK_int32*, csSDK_int32*, PrTime*, prFieldType*) {
     return suiteError_NotImplemented;

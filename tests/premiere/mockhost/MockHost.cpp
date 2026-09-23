@@ -633,10 +633,16 @@ std::vector<ParamReadRecord> MockHost::paramReads() const {
     return m_impl->paramReads;
 }
 
+std::size_t MockHost::nextKeyframeCalls() const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    return m_impl->nextKeyframeCalls;
+}
+
 void MockHost::clearParamReads() {
     std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
     m_impl->paramReads.clear();
     m_impl->paramReadsDropped = 0;
+    m_impl->nextKeyframeCalls = 0;
 }
 
 // -----------------------------------------------------------------------------

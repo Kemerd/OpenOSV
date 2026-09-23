@@ -37,7 +37,29 @@ function reframeParams(popupBase) {
         { displayName: 'FOV', value: 60, timeVarying: false },
         { displayName: 'Correction Angle', value: 0.6, timeVarying: false },
         { displayName: 'Drag Sensitivity', value: 2.0, timeVarying: false },
-        { displayName: 'Lens', value: b + 0, timeVarying: false }
+        { displayName: 'Lens', value: b + 0, timeVarying: false },
+        // [WP-EASING] Appended after the Lens: None, entry 1.
+        { displayName: 'Keyframe Easing', value: b + 0, timeVarying: false }
+    ];
+}
+
+/**
+ * [WP-EASING] The parameter list of a fresh OpenOSV Source Settings (the
+ * popups the panel reads), as the host would list it: Colour Output PQ,
+ * Output Size Native, Stabilisation Horizon Lock, Calibration Auto, D-Log M
+ * Curve Osmo 360 (its LAST entry), Render Device Auto.
+ */
+function sourceSettingsParams(popupBase) {
+    const b = popupBase;
+    return [
+        { displayName: 'Colour Output', value: b + 0, timeVarying: false },
+        { displayName: 'Look (Rec. 709 only)', value: b + 0, timeVarying: false },
+        { displayName: 'Output Size', value: b + 0, timeVarying: false },
+        { displayName: 'Stabilisation', value: b + 1, timeVarying: false },
+        { displayName: 'Stitching', value: null, timeVarying: false },
+        { displayName: 'Calibration', value: b + 0, timeVarying: false },
+        { displayName: 'D-Log M Curve', value: b + 2, timeVarying: false },
+        { displayName: 'Render Device', value: b + 0, timeVarying: false }
     ];
 }
 
@@ -56,7 +78,12 @@ function createMockPremiere(options) {
         project: { guid: 'proj-1', name: 'Project', sequences: [], active: 0 },
         failTransaction: false,
         log: log,
-        undo: undo
+        undo: undo,
+        // [WP-EASING] The playhead and the sequence frame size.
+        playhead: 0,
+        frameSize: { width: 1920, height: 1080 },
+        // A ClipProjectItem without getComponentChain (an older host).
+        noMasterChains: false
     };
 
     // ---- value classes ------------------------------------------------------
@@ -67,12 +94,14 @@ function createMockPremiere(options) {
     }
     class TickTime {
         constructor(ticks) { this.ticksNumber = Number(ticks); this.ticks = String(ticks); this.seconds = Number(ticks) / 254016000000; }
+        static createWithTicks(ticks) { return new TickTime(ticks); }
     }
     const Constants = {
         TrackItemType: { EMPTY: 0, CLIP: 1, TRANSITION: 2, PREVIEW: 3, FEEDBACK: 4 },
         VideoTrackEvent: { TRACK_CHANGED: 'ppro.videotrack.trackchanged', INFO_CHANGED: 'ppro.videotrack.info', LOCK_CHANGED: 'ppro.videotrack.lock' },
         SequenceEvent: { ACTIVATED: 'ppro.sequence.activated', CLOSED: 'ppro.sequence.closed', SELECTION_CHANGED: 'ppro.sequence.selection' },
-        ProjectEvent: { OPENED: 'ppro.project.opened', CLOSED: 'ppro.project.closed', DIRTY: 'ppro.project.dirty', ACTIVATED: 'ppro.project.activated' }
+        ProjectEvent: { OPENED: 'ppro.project.opened', CLOSED: 'ppro.project.closed', DIRTY: 'ppro.project.dirty', ACTIVATED: 'ppro.project.activated' },
+        MediaType: { ANY: 0, DATA: 1, VIDEO: 2, AUDIO: 3 }
     };
 
     function requireLock(what) {
@@ -88,12 +117,45 @@ function createMockPremiere(options) {
         return { _apply: apply, _label: label };
     }
 
+    /** A keyframed param's value at `ticks`: the key there, else linear between keys. */
+    function valueAt(p, ticks) {
+        const keys = (p.keys || []).slice().sort((a, b) => a.t - b.t);
+        if (p.timeVarying !== true || keys.length === 0) {
+            return p.value;
+        }
+        const t = Number(ticks);
+        if (t <= keys[0].t) {
+            return keys[0].v;
+        }
+        for (let i = 1; i < keys.length; i += 1) {
+            if (t <= keys[i].t) {
+                const a = keys[i - 1];
+                const b = keys[i];
+                if (typeof a.v !== 'number') {
+                    return a.v;
+                }
+                return a.v + (b.v - a.v) * (t - a.t) / (b.t - a.t);
+            }
+        }
+        return keys[keys.length - 1].v;
+    }
+
     function paramWrap(component, index) {
         const p = component.params[index];
         return {
             displayName: p.displayName,
             getStartValue: async () => ({ value: { value: p.value }, position: new TickTime(0) }),
+            getValueAtTime: async (time) => valueAt(p, time && time.ticks),
             isTimeVarying: () => p.timeVarying === true,
+            createAddKeyframeAction: (keyframe) => {
+                requireLock('createAddKeyframeAction');
+                return action(() => {
+                    const t = Number(keyframe.position && keyframe.position.ticks);
+                    p.keys = (p.keys || []).filter((k) => k.t !== t);
+                    p.keys.push({ t: t, v: keyframe.value.value });
+                    log.push(['addKeyframe', p.displayName, t, keyframe.value.value]);
+                }, 'addKeyframe');
+            },
             createKeyframe: (value) => {
                 if (typeof value !== typeof p.value && !(p.value === null)) {
                     throw new Error('value type does not match the parameter');
@@ -188,7 +250,9 @@ function createMockPremiere(options) {
             guid: new Guid(seq.guid),
             name: seq.name,
             getVideoTrackCount: async () => seq.tracks.length,
-            getVideoTrack: async (i) => (i >= 0 && i < seq.tracks.length) ? trackWrap(seq, i) : null
+            getVideoTrack: async (i) => (i >= 0 && i < seq.tracks.length) ? trackWrap(seq, i) : null,
+            getPlayerPosition: async () => new TickTime(world.playhead),
+            getFrameSize: async () => ({ x: 0, y: 0, width: world.frameSize.width, height: world.frameSize.height })
         };
     }
 
@@ -241,11 +305,23 @@ function createMockPremiere(options) {
                     return null;
                 }
                 const m = pi._model;
-                return {
+                const clip = {
                     getId: () => m.id,
                     isSequence: async () => m.isSequence === true,
                     getMediaFilePath: async () => m.isSequence ? '' : m.path
                 };
+                // [WP-EASING] The master clip's effects: its OpenOSV Source
+                // Settings, when the test gave the project item one.
+                if (!world.noMasterChains) {
+                    clip.getComponentChain = async (mediaType) => {
+                        if (mediaType !== Constants.MediaType.VIDEO) {
+                            return null;
+                        }
+                        m.components = m.components || [];
+                        return chainWrap(m);
+                    };
+                }
+                return clip;
             }
         },
         VideoFilterFactory: {
@@ -281,6 +357,15 @@ function createMockPremiere(options) {
         world: world,
         ppro: ppro,
         reframeParams: reframeParams,
+        sourceSettingsParams: sourceSettingsParams,
+        /** A fresh Open 360 Reframe component model (for a clip's `components`). */
+        reframeComponent() {
+            return { matchName: 'AE.OpenOSV.Open360Reframe', params: reframeParams(popupBase) };
+        },
+        /** A fresh OpenOSV Source Settings component model (for a project item's `components`). */
+        sourceSettingsComponent() {
+            return { matchName: 'AE.OpenOSV.SourceSettings', params: sourceSettingsParams(popupBase) };
+        },
         /** Add a sequence and return its model. */
         addSequence(guid, name, trackCount) {
             const seq = { guid: guid, name: name, tracks: [] };

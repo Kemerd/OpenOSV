@@ -39,7 +39,13 @@
             signature: fail,
             scan: fail,
             apply: fail,
-            checkEffect: fail
+            checkEffect: fail,
+            // [WP-EASING] The newer actions fail the same way.
+            capabilities: function () { return { undoGroups: false, stabilization: false }; },
+            setEasing: fail,
+            readFraming: fail,
+            writeFraming: fail,
+            setStabilization: fail
         };
     }
 

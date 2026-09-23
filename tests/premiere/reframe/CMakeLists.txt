@@ -46,9 +46,15 @@ add_executable(osv_reframe_tests
   # [WP-LENSUI] The Effect Controls panel shows one lens at a time
   # (PF_Cmd_UPDATE_PARAMS_UI through the mock's recording Param Utils Suite).
   test_lens_ui.cpp
+  # [WP-EASING] Keyframe Easing: the curves, the keyframe walk, the popup
+  # through the parameter probe, and CPU / GPU parity with a preset on.
+  test_easing.cpp
   # Compiled here too so the tests can call the geometry and the CPU
   # renderer directly; the .aex contains the identical object.
   "${_osv_reframe_src}/ReframeCpu.cpp"
+  # [WP-EASING] The easing core, for the same reason: test_easing.cpp drives
+  # the curves and the keyframe walk against the source the .aex contains.
+  "${_osv_reframe_src}/ReframeEasing.cpp"
   # The direct fisheye -> view path, for the same reason: test_direct.cpp
   # drives the builder, the CPU twin and the driver-API launcher the .aex
   # contains, against the equirect path it must frame identically.

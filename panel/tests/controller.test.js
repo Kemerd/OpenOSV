@@ -308,7 +308,8 @@ test('settings persist after a short delay and load on the next start', async ()
     assert.equal(t.storage.map.has(STORAGE_KEY), false, 'not written on every keystroke');
     await t.step(300);
     assert.deepEqual(JSON.parse(t.storage.map.get(STORAGE_KEY)),
-                     { autoApply: true, lens: 'classic', dragEnabled: true, dragSensitivity: 3.3 });
+                     { autoApply: true, lens: 'classic', dragEnabled: true, dragSensitivity: 3.3, easing: 'none',
+                       stabilization: 'horizon', hintOpen: true, popupBase: null });
 
     const t2 = setup({ storage: { [STORAGE_KEY]: t.storage.map.get(STORAGE_KEY) } });
     t2.ctl.start();
