@@ -49,6 +49,10 @@ struct ControlValues {
     int directColour = OSV_SS_DIRECT_COLOUR_DEFAULT;  ///< [WP-SETTINGS] 1-based popup value.
     int rec709Look = OSV_SS_LOOK_DEFAULT;             ///< [WP-LOOK] 1-based popup value.
     bool flareRemoval = OSV_SS_FLARE_REMOVAL_DEFAULT != 0;  ///< [WP-FLARE] Sun Ghost Removal.
+    // ---- [WP-PHOTO] the sky seam fix ----------------------------------------
+    int photoSeam = OSV_SS_PHOTO_SEAM_DEFAULT;                     ///< 1-based popup value.
+    double photoStrengthPercent = OSV_SS_PHOTO_STRENGTH_DEFAULT;   ///< Sky Seam Strength, percent.
+    double seamInsetDeg = OSV_SS_SEAM_INSET_DEFAULT;               ///< Seam Edge Inset, degrees.
 };
 
 /// Control values -> PrefsBlob.

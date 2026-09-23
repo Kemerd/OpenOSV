@@ -220,7 +220,7 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
 
     const std::vector<PF_ParamDef> params = addedParams(fixture);
 
-    // Fifteen: eleven controls plus the four group markers.  PF_ADD_TOPIC and
+    // Nineteen: fifteen controls plus the four group markers.  PF_ADD_TOPIC and
     // PF_END_TOPIC each issue their own PF_ADD_PARAM, so a group occupies two
     // real slots - counting only the controls is the mistake that shifts
     // every index after the first group.
@@ -252,6 +252,8 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
             {kIndexStabilization, PF_Param_POPUP},   {kIndexStitchTopic, PF_Param_GROUP_START},
             {kIndexSeamSearch, PF_Param_CHECKBOX},   {kIndexGainMatch, PF_Param_CHECKBOX},
             {kIndexCalibration, PF_Param_POPUP},     {kIndexFlareRemoval, PF_Param_CHECKBOX},
+            {kIndexPhotoSeam, PF_Param_POPUP},       {kIndexPhotoStrength, PF_Param_FLOAT_SLIDER},  // [WP-PHOTO]
+            {kIndexSeamInset, PF_Param_FLOAT_SLIDER},
             {kIndexStitchTopicEnd, PF_Param_GROUP_END},
             {kIndexAdvancedTopic, PF_Param_GROUP_START}, {kIndexDlogmFit, PF_Param_POPUP},
             {kIndexExposure, PF_Param_FLOAT_SLIDER}, {kIndexRenderDevice, PF_Param_POPUP},
@@ -280,6 +282,7 @@ TEST_CASE("every value-carrying control refuses to vary over time", "[sourcesett
         kIndexCalibration, kIndexDlogmFit,   kIndexExposure,      kIndexRenderDevice, kIndexDirectColour,
         kIndexFlareRemoval,
         kIndexRec709Look,
+        kIndexPhotoSeam, kIndexPhotoStrength, kIndexSeamInset,  // [WP-PHOTO]
     };
     for (const int index : valueIndices) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");
@@ -338,8 +341,9 @@ TEST_CASE("the two groups are balanced and every control is inside the intended 
         INFO("top-level index " << index);
         CHECK(depthAt[static_cast<std::size_t>(index)] == 0);
     }
-    for (const int index : {kIndexSeamSearch, kIndexGainMatch, kIndexCalibration, kIndexFlareRemoval, kIndexDlogmFit,
-                            kIndexExposure, kIndexRenderDevice, kIndexDirectColour}) {
+    for (const int index : {kIndexSeamSearch, kIndexGainMatch, kIndexCalibration, kIndexFlareRemoval, kIndexPhotoSeam,
+                            kIndexPhotoStrength, kIndexSeamInset, kIndexDlogmFit, kIndexExposure, kIndexRenderDevice,
+                            kIndexDirectColour}) {
         INFO("grouped index " << index);
         CHECK(depthAt[static_cast<std::size_t>(index)] == 1);
     }
@@ -360,6 +364,7 @@ TEST_CASE("the popup item lists are the documented ones", "[sourcesettings][para
         {kIndexStabilization, OSV_SS_STAB_ITEMS},  {kIndexCalibration, OSV_SS_CALIB_ITEMS},
         {kIndexDlogmFit, OSV_SS_FIT_ITEMS},        {kIndexRenderDevice, OSV_SS_DEVICE_ITEMS},
         {kIndexDirectColour, OSV_SS_DIRECT_COLOUR_ITEMS},
+        {kIndexPhotoSeam, OSV_SS_PHOTO_SEAM_ITEMS},  // [WP-PHOTO]
     };
     for (const auto& [index, items] : expected) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");
@@ -416,6 +421,12 @@ TEST_CASE("every control's default is PrefsBlob::defaults()", "[sourcesettings][
     CHECK(params[kIndexSeamSearch - 1].u.bd.dephault == static_cast<A_long>(defaults.seamSearch));
     CHECK(params[kIndexGainMatch - 1].u.bd.dephault == static_cast<A_long>(defaults.gainMatch));
     CHECK(params[kIndexFlareRemoval - 1].u.bd.dephault == static_cast<A_long>(defaults.flareRemoval));  // [WP-FLARE]
+    // [WP-PHOTO] The sky seam fix: Rim and colour at 100 %, the 2.6 deg inset.
+    CHECK(params[kIndexPhotoSeam - 1].u.pd.dephault == static_cast<A_long>(defaults.photoSeam) + 1);
+    CHECK(static_cast<double>(params[kIndexPhotoStrength - 1].u.fs_d.dephault) ==
+          Catch::Approx(defaults.photoStrengthPercent()));
+    CHECK(static_cast<double>(params[kIndexSeamInset - 1].u.fs_d.dephault) ==
+          Catch::Approx(defaults.seamInsetDeg()));
     CHECK(static_cast<double>(params[kIndexExposure - 1].u.fs_d.dephault) ==
           Catch::Approx(static_cast<double>(defaults.exposureStops)));
 
@@ -444,6 +455,7 @@ TEST_CASE("the popups list every value of their prefs enum", "[sourcesettings][p
         {kIndexRenderDevice, static_cast<int>(PrefsRenderDevice::Count)},
         {kIndexDirectColour, static_cast<int>(PrefsDirectColour::Count)},
         {kIndexRec709Look, static_cast<int>(PrefsLook::Count)},
+        {kIndexPhotoSeam, static_cast<int>(PrefsPhotoSeam::Count)},  // [WP-PHOTO]
     };
     for (const auto& [index, count] : expected) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");
@@ -453,4 +465,32 @@ TEST_CASE("the popups list every value of their prefs enum", "[sourcesettings][p
         const std::ptrdiff_t separators = std::count(items.begin(), items.end(), '|');
         CHECK(separators == count - 1);
     }
+}
+
+TEST_CASE("the sky seam sliders offer exactly what the blob stores", "[sourcesettings][params][photoseam]") {
+    // [WP-PHOTO] Sky Seam Strength is whole percent 0..100 and Seam Edge
+    // Inset tenths of a degree 0.0..6.0 - PrefsBlob's photoStrength and
+    // seamInset codes.  A slider that reached further would offer a value the
+    // blob silently clamps; one that stopped short would hide a stored one.
+    EffectFixture fixture;
+    REQUIRE(LoadedPlugin::instance().ok());
+    const std::vector<PF_ParamDef> params = addedParams(fixture);
+    REQUIRE(params.size() == static_cast<std::size_t>(OSV_SOURCE_SETTINGS_PARAM_COUNT));
+
+    const PF_ParamDef& strength = params[kIndexPhotoStrength - 1];
+    CHECK(static_cast<double>(strength.u.fs_d.valid_min) == Catch::Approx(0.0));
+    CHECK(static_cast<double>(strength.u.fs_d.valid_max) ==
+          Catch::Approx(static_cast<double>(PrefsBlob::kMaxPhotoStrengthCode - 1)));
+    CHECK(static_cast<double>(strength.u.fs_d.slider_min) == Catch::Approx(0.0));
+    CHECK(static_cast<double>(strength.u.fs_d.slider_max) == Catch::Approx(100.0));
+    CHECK(strength.u.fs_d.precision == PF_Precision_INTEGER);
+    CHECK(strength.u.fs_d.display_flags == PF_ValueDisplayFlag_PERCENT);
+
+    const PF_ParamDef& inset = params[kIndexSeamInset - 1];
+    CHECK(static_cast<double>(inset.u.fs_d.valid_min) == Catch::Approx(0.0));
+    CHECK(static_cast<double>(inset.u.fs_d.valid_max) ==
+          Catch::Approx(static_cast<double>(PrefsBlob::kMaxSeamInsetCode - 1) / 10.0));
+    CHECK(static_cast<double>(inset.u.fs_d.slider_min) == Catch::Approx(0.0));
+    CHECK(static_cast<double>(inset.u.fs_d.slider_max) == Catch::Approx(6.0));
+    CHECK(inset.u.fs_d.precision == PF_Precision_TENTHS);
 }
