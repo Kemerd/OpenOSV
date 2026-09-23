@@ -1095,6 +1095,150 @@ matches unless masked).
 * **A long handheld walking clip:** multi-frame same-lens depth (section 4.3)
   becomes the metric depth source for item 4.
 
+### 5.6 As built: items 1 and 2 (WP-STEADY)
+
+Both are in the importer (Source Settings "Lens Alignment" and "Parallax
+Grid", docs/PREMIERE.md "Steady seam and lens alignment"). Where the build
+departs from 5.2 / 5.3, and what the kernel renders measured:
+
+**Item 1, the rotation** (`render::fitLensRotation`,
+`render::combineLensRotations`, `render::applyLensRotation` in
+`include/osv/render/LensAlign.h`; `render::measureLensRotation` in
+`ClipSteady.h`).
+
+* Fitted to the grid's RAW cells - the half flow and its pixel count per
+  cell, before the fill, blur and benefit gate (`ParallaxCellStats`, filled by
+  `gridFromFlow`) - with least squares, 2 Huber passes (k = 2 sigma) and 3
+  Tukey passes (c = 4.685 sigma, sigma = median |r| / 1.1774). Tukey rather
+  than Huber alone because the near-field cells are outliers that must get
+  zero weight, not a smaller one.
+* Refused when fewer than 48 cells, fewer than 20 % inliers, a residual
+  above 0.1 deg RMS, an angle above 2 deg, or a conditioning (smallest over
+  largest eigenvalue of the normal matrix) below 0.02 - a band that only
+  constrains two axes.
+* Frames: 3, at 10 / 50 / 90 % of the clip, snapped to sync frames on a
+  clip longer than 240 frames; the median of the accepted fits, which must
+  agree within 0.05 deg.
+* Folded AFTER the lens-protector correction (the rotation is measured
+  through the curve the fold made) and before everything else.
+* **The benefit gate had to move.** With the rotation folded the grid's
+  20 % bar refused most of the small residual that was left and the ground
+  FELL: 0.892-0.904 against 0.922-0.932 with no rotation. A rig with a
+  folded rotation uses 5 % (`kAlignedRequiredImprovement`; 10 %: ground
+  0.916-0.930, 3 %: the wing starts to lose, 0.303 on frame 32). Other rigs
+  keep 20 % and render exactly as before.
+
+| Sample, frames 0 / 32 / 64, kernel render | ground | wing | sky | whole band |
+|---|---|---|---|---|
+| no grid, calibration | 0.373 / 0.357 / 0.367 | 0.226 / 0.236 / 0.248 | 0.976 | - |
+| no grid, rotation folded | 0.882 / 0.880 / 0.890 | 0.223 / 0.232 / 0.243 | 0.974 | - |
+| grid, calibration (before) | 0.922 / 0.932 / 0.932 | 0.310 / 0.288 / 0.332 | 0.976 | 0.916 / 0.918 / 0.921 |
+| grid, rotation folded, gate 5 % | 0.932 / 0.942 / 0.946 | 0.324 / 0.323 / 0.339 | 0.974-0.975 | 0.923 / 0.924 / 0.925 |
+| clip grid, rotation folded (new defaults) | 0.934 / 0.942 / 0.944 | 0.322 / 0.334 / 0.346 | 0.975 | 0.922 / 0.924 / 0.925 |
+
+w = 0.356-0.360 deg about (+0.14..+0.26, +0.04..+0.07, -0.97..-0.99),
+residual 0.058-0.068 deg RMS over 5551 of 5834 (6378 of 7006 on osvtool's
+bands) cells, the three frames within 0.004-0.008 deg: the harness's
+0.353-0.377 deg (3.3). 160-330 ms once per clip, then remembered on disk.
+The sky moves by 0.002 NCC (0.976 -> 0.974-0.975), inside the 2 % the
+acceptance allowed.
+
+**Item 2, holding the corrections still** (`render::measureClipSteady`,
+`render::decideSteady` in `ClipSteady.h`; `plugins/importer/SteadyStage.h`).
+
+* It covers all THREE per-bucket seam analyses, not only the grid: the
+  parallax grid (per-cell median of the samples' grids), the 1-D seam-shift
+  table (per-column median, used where the grid is refused) and the carved
+  seam (each sample carved through the clip correction with no temporal
+  prior, then the per-column median of the carves, which is still a valid
+  seam: the median of paths that each move at most N rows per column moves
+  at most N rows per column). A field report had switching Seam Search off
+  remove the movement seen in the Program monitor; of what it removes, the
+  seam-shift table is what moves the picture (below).
+* Samples: 9 frames spread over the whole clip (the harness's nine
+  buckets), not 3, so the median has a majority to take.
+* Auto is judged by effect, not by grid statistics: each sample's own bands
+  are seen with no correction, with their own and with the clip correction,
+  and the overlap NCC compared in 32 sectors. A textured sector the own
+  correction really aligns (NCC >= 0.7, +0.05 over none) fails when the clip
+  correction loses more than 0.02 NCC AND keeps less than 40 % of the own
+  gain. An NCC-loss threshold alone chose "follows scene" on the sample,
+  because the nacelle's specular surface scores differently frame to frame
+  whatever the correction; the kept-gain rule separates a static near object
+  (the median carries its parallax: the worst sector on the sample keeps
+  71-86 %) from one that moved (the median has no parallax where it now is:
+  ~0 %), and a synthetic test covers both.
+* Per-bucket photometric analyses (exposure gain, sky seam field, lens
+  shading, sun ghosts) are unchanged; they change brightness, not geometry.
+
+**What each per-bucket analysis moved** (`osv_importer_bench --part S`, the
+production code on the importer's schedule, 6K px per frame, the nacelle's
+columns). In correction space - how far each analysis's own output moves:
+
+| Analysis, per-moment schedule | calibration rig: mean / p99 / max | rotation folded: mean / p99 / max |
+|---|---|---|
+| parallax grid, glided | 0.051 / 0.86 / 1.96 (24 of 64 frames > 1 px) | 0.061 / 0.78 / 1.53 (33 of 64) |
+| carved seam line, glided | 0.024 / 0.28 / 0.60 | 0.033 / 0.35 / 0.56 |
+| carved seam feather edges, glided | 0.042 / 0.58 / 0.91 | 0.040 / 0.36 / 0.56 |
+| seam-shift table, stepped (only where a grid is refused) | 0.19 / 5.6 / 13.5 | 0.19 / 4.5 / 14.8 |
+| any of them, Steady | 0 | 0 |
+
+In the picture - ONE decoded frame (32) rendered at 6000 x 3000 with the
+corrections of every frame in turn, so nothing but the corrections can move,
+DIS between consecutive renders on a 35 x 12 deg nacelle patch:
+
+| Moving | mean | p99 | worst pair's p99 | max |
+|---|---|---|---|---|
+| grid only | 0.039 | 0.63 | 1.29 | 3.3 |
+| carve only | 0.002 | 0.05 | 0.14 | 0.63 |
+| table only (where a grid is refused) | 0.18 | 5.5 | 12.3 | 19.1 |
+| all three, as the importer glides them | 0.040 | 0.64 | 1.29 | 3.3 |
+| none (Steady) | 0 | 0 | 0 | 0 |
+
+So the grid's glide is the "slight movement" on the sample; the carve's line
+moves (3.6) but barely changes the picture, because it runs where the lenses
+agree; and the seam-shift table, the one analysis that is NOT glided, steps
+by 12-19 px at a bucket edge wherever a bucket's grid is refused - on the
+sample at 6K no grid is, which is why the field report's "Seam Search off
+fixes it" did not reproduce here as table motion. Steady holds all three.
+
+The acceptance of 5.3 against what was measured:
+
+* grid motion p99 0.88 / max 2.0 px -> <= 0.1 px: **0** (by construction; the
+  direct path serves bit-identical tables to consecutive frames, a test
+  checks it through the engine);
+* NCC within 0.003 of today on frames 0 / 32 / 64, calibration rig: ground
+  0.925 / 0.932 / 0.930 vs 0.922 / 0.932 / 0.932 and whole band 0.916 /
+  0.919 / 0.919 vs 0.916 / 0.918 / 0.921 are; the wing (0.297 / 0.307 /
+  0.320 vs 0.310 / 0.288 / 0.332) moves by up to 0.019 either way - the
+  specular nacelle, whose score changes frame to frame whatever the
+  correction. With the rotation folded the clip correction is within 0.003
+  of each frame's own everywhere but the wing (-0.002 / +0.011 / +0.007 on the
+  wing, so no worse);
+* Exact frames identical regardless of request order, and Interactive equal
+  to Exact once the clip correction exists: tests, with the shared caches
+  disabled so each instance measures for itself.
+
+**Cost.** Rotation 160-330 ms once per clip (three decodes: 88-276 ms of it),
+then remembered on disk. Clip correction 0.74-0.95 s once per clip (decode
+0.29-0.33 s, measure 0.31-0.43 s, carve and decision 0.13-0.18 s); after
+that none of the three per-bucket analyses runs. The first Exact frame of a
+clip waits for both: 0.9-1.2 s instead of 0.15-0.19 s.
+
+**Left open.**
+
+* The 20 % benefit gate may be too strict on rigs WITHOUT a folded rotation
+  as well; only the aligned rig was changed, so every existing project
+  renders as before.
+* The photometric per-bucket analyses (exposure gain, sky seam field, lens
+  shading, sun ghosts) still follow the per-bucket schedule and its history;
+  they change brightness, not geometry.
+* The clip carve does not take the sun-ghost penalty (the per-bucket carve
+  does); the ghosts sit far from the seam on the sample.
+* A clip whose mount changes part-way (a camera moved between shots in one
+  recording) gets one verdict for the whole clip; Auto only sees the nine
+  samples.
+
 ---
 
 ## Reproducing

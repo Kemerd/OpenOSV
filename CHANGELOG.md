@@ -8,6 +8,39 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ### Added
 
+* **Steady seam and Lens Alignment (WP-STEADY).** The "slight movement at
+  the seam" was the seam corrections being re-measured every eight frames.
+  Rendered with the corrections of every frame on one frozen frame, the
+  picture around the sample's nacelle moved by up to 1.29 px per frame at
+  6K (p99 of the worst frame pair, 55 of 64 pairs above 0.25 px): the
+  parallax grid's glide. The carved seam barely changed the picture there
+  (0.14), and the seam-shift table - in force wherever a bucket's grid is
+  refused - stepped by up to 12.3 px at a bucket edge. "Parallax Grid" in
+  Source Settings (Stitching group) now offers Steady - all three measured
+  once per clip on nine fixed frames and their median used for every frame,
+  so nothing at the seam moves (0 px) - next to Follows scene (the
+  per-moment schedule) and Auto, which holds them still unless a near object
+  both lenses see moves past the seam. On the sample Auto holds them and the
+  alignment stays: ground 0.925 / 0.932 / 0.930 against each frame's own
+  0.922 / 0.932 / 0.932. "Lens Alignment" (Auto / Off) fits the 0.36 deg
+  rotation between the two lenses once per clip from three fixed frames
+  (they agree to 0.004-0.008 deg) and folds it into the rig before every
+  analysis: the ground's lens-to-lens NCC goes from 0.37 to 0.88 before any
+  flow, and to 0.932-0.946 with the grid (0.922-0.932 before); whole band
+  0.916-0.921 -> 0.923-0.925; the sky 0.976 -> 0.974-0.975. Both are
+  measured on a background worker from the clip's first real frame and
+  shared by every instance of the clip: Exact frames (export, the Program
+  monitor's direct path) wait for them once per clip, never per bucket;
+  Interactive frames never wait and render the same pixels as Exact once
+  the clip correction exists. Cost, once per clip: 0.16-0.33 s for the
+  rotation (remembered on disk, so a reopen is free) and 0.74-0.95 s for the
+  clip correction, after which none of the three per-bucket analyses runs.
+  Auto / Auto for new clips (and, like every control added to the Source
+  Settings effect, for an effect saved before them); a prefs blob written
+  before them reads as Follows scene / Off and renders exactly as before.
+  Also in the importer dialog, the user defaults file (`parallaxGrid`,
+  `lensAlignment`) and osvtool (`seam --lens-align --steady --regions`).
+  Engine ABI unchanged (5).
 * **HDR Peak Brightness for the PQ output (WP-HDRPEAK).** PQ is rendered for
   a 1000-nit display, so sunlit white is genuinely bright: the sample's white
   aircraft sits at 525 nits median, 98 % of it above diffuse white, and looks
