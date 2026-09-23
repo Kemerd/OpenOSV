@@ -17,9 +17,12 @@
 //                           want frames in.  That registration is RETRIED
 //                           from the first PF_Cmd_RENDER if the suite was not
 //                           available here; see registerPixelFormats().
-//   PF_Cmd_PARAMS_SETUP     the 13 controls, with their permanent ids.
-//   PF_Cmd_USER_CHANGED_PARAM  Preset writes FOV/Distortion/Tilt; editing
-//                           any of those three flips Preset to Custom.
+//   PF_Cmd_PARAMS_SETUP     the 18 controls, with their permanent ids (the
+//                           DJI camera block, ids 16..20, appended last).
+//   PF_Cmd_USER_CHANGED_PARAM  Preset writes the Classic and the DJI lens
+//                           and Tilt and selects DJI's lens; editing a lens
+//                           control flips Preset to Custom and selects that
+//                           control's lens, carrying the look across.
 //   PF_Cmd_UPDATE_PARAMS_UI reserved (nothing is greyed today).
 //   PF_Cmd_SEQUENCE_*       sequence_data stays null - see below.
 //   PF_Cmd_RENDER           the CPU path, through ReframeCpu.
@@ -109,8 +112,8 @@ static_assert(OSV_REFRAME_STAGE == PF_Stage_RELEASE, "the PiPL stage word is not
 // group terminators break the "index == id" shortcut.  These assertions pin
 // the three facts that make it correct, so a reordering of paramsSetup() has
 // to come here and think rather than silently shifting every GPU GetParam.
-static_assert(osv::reframe::kIndexSmooth == OSV_REFRAME_PARAM_COUNT,
-              "Smooth Keyframes must be the last parameter added");
+static_assert(osv::reframe::kIndexSmooth == 15,
+              "Smooth Keyframes must stay the 15th parameter: saved projects and host index maps depend on it");
 static_assert(osv::reframe::kIndexCameraTopicEnd == osv::reframe::kIndexDistortion + 1,
               "the Camera group must close immediately after Distortion");
 static_assert(osv::reframe::kIndexSourceTopicEnd == osv::reframe::kIndexSourceRoll + 1,
@@ -120,6 +123,46 @@ static_assert(osv::reframe::kParamIdByIndex[osv::reframe::kIndexSmooth - 1] == O
 static_assert(osv::reframe::kParamIdByIndex[osv::reframe::kIndexOutputResolution - 1] ==
                   OSV_REFRAME_ID_OUTPUT_RESOLUTION,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
+
+// [WP-CAMERA] The DJI block is APPENDED: it follows Smooth Keyframes, in this
+// order, and ends the list.  Inserting it anywhere else would shift the index
+// of an existing control and break every saved project.
+static_assert(osv::reframe::kIndexCameraModel == osv::reframe::kIndexSmooth + 1 &&
+                  osv::reframe::kIndexZoom == osv::reframe::kIndexCameraModel + 1 &&
+                  osv::reframe::kIndexDjiFov == osv::reframe::kIndexZoom + 1 &&
+                  osv::reframe::kIndexCorrection == osv::reframe::kIndexDjiFov + 1 &&
+                  osv::reframe::kIndexDragSensitivity == osv::reframe::kIndexCorrection + 1,
+              "the DJI camera block must follow Smooth Keyframes in its documented order");
+static_assert(osv::reframe::kIndexDragSensitivity == OSV_REFRAME_PARAM_COUNT,
+              "Drag Sensitivity must be the last parameter added");
+static_assert(osv::reframe::kParamIdByIndex[osv::reframe::kIndexDragSensitivity - 1] ==
+                  OSV_REFRAME_ID_DRAG_SENSITIVITY,
+              "kParamIdByIndex is not aligned with the ParamIndex enum");
+
+namespace {
+
+/// The three parameter-kind tables describe one list three ways; this proves
+/// they agree: every value control has the same kind in the full AE-order
+/// table as in the value signature, and every other entry is a group marker.
+[[nodiscard]] constexpr bool kindTablesAgree() noexcept {
+    int valueSeen = 0;
+    for (int aeIndex = 1; aeIndex <= OSV_REFRAME_PARAM_COUNT; ++aeIndex) {
+        const osv::reframe::HostParamKind kind = osv::reframe::kParamKindByIndex[aeIndex - 1];
+        if (valueSeen < osv::reframe::kValueParamCount && osv::reframe::kValueParamAeIndex[valueSeen] == aeIndex) {
+            if (kind != osv::reframe::kValueParamKind[valueSeen]) {
+                return false;
+            }
+            ++valueSeen;
+        } else if (kind != osv::reframe::HostParamKind::Group) {
+            return false;
+        }
+    }
+    return valueSeen == osv::reframe::kValueParamCount;
+}
+
+}  // namespace
+
+static_assert(kindTablesAgree(), "kParamKindByIndex, kValueParamAeIndex and kValueParamKind disagree");
 
 // ---------------------------------------------------------------------------
 //  The effect's presets really are the library's presets
@@ -162,7 +205,40 @@ namespace {
            mine->distortion == theirs->eyeOffset * 100.0;
 }
 
+/// [WP-CAMERA] The same contract for DJI's numbers: the effect's DJI columns
+/// must be exactly osv::geom::kDjiPresets (DJI's own table), all four values
+/// plus the tilt.
+[[nodiscard]] constexpr bool djiPresetsAgree(osv::reframe::Preset value, std::string_view id) noexcept {
+    const osv::reframe::PresetEntry* mine = osv::reframe::presetEntry(value);
+    const osv::geom::DjiPreset* theirs = nullptr;
+    for (const osv::geom::DjiPreset& p : osv::geom::kDjiPresets) {
+        if (std::string_view(p.id) == id) {
+            theirs = &p;
+        }
+    }
+    if (!mine || !theirs) {
+        return false;
+    }
+    return mine->djiFovLandscapeDeg == theirs->vfovLandscapeDeg &&
+           mine->djiFovPortrait916Deg == theirs->vfovPortrait916Deg &&
+           mine->djiFovPortrait34Deg == theirs->vfovPortrait34Deg && mine->correction == theirs->eyeDistance &&
+           mine->tiltDeg == theirs->pitchDeg;
+}
+
 }  // namespace
+
+static_assert(djiPresetsAgree(osv::reframe::Preset::CrystalBall, "crystal-ball"),
+              "the effect's Crystal Ball preset no longer matches osv::geom::kDjiPresets");
+static_assert(djiPresetsAgree(osv::reframe::Preset::Asteroid, "asteroid"),
+              "the effect's Asteroid preset no longer matches osv::geom::kDjiPresets");
+static_assert(djiPresetsAgree(osv::reframe::Preset::Wide, "wide"),
+              "the effect's Wide preset no longer matches osv::geom::kDjiPresets");
+static_assert(djiPresetsAgree(osv::reframe::Preset::UltraWide, "ultra-wide"),
+              "the effect's Ultra Wide preset no longer matches osv::geom::kDjiPresets");
+static_assert(djiPresetsAgree(osv::reframe::Preset::Dewarping, "dewarping"),
+              "the effect's Dewarping preset no longer matches osv::geom::kDjiPresets");
+static_assert(osv::geom::kDjiPresets.size() + 1u == static_cast<std::size_t>(OSV_REFRAME_PRESET_COUNT),
+              "a DJI preset was added to one table and not the other");
 
 static_assert(presetsAgree(osv::reframe::Preset::CrystalBall, "crystal-ball"),
               "the effect's Crystal Ball preset no longer matches osv::geom::kPresets");
@@ -591,6 +667,25 @@ Settings readSettings(PF_InData* in_data, PF_ParamDef* params[]) noexcept {
     s.distortion = static_cast<double>(params[kIndexDistortion]->u.fs_d.value);
     s.smoothKeyframes = params[kIndexSmooth]->u.bd.value != 0;
 
+    // [WP-CAMERA] The DJI block.  Each entry is null-checked: the host sizes
+    // the array from num_params, but a defensive read costs nothing and a
+    // missing entry must mean "the default" (Classic), never a crash.
+    if (params[kIndexCameraModel]) {
+        s.cameraModel = cameraModelFromCheckbox(params[kIndexCameraModel]->u.bd.value);
+    }
+    if (params[kIndexZoom]) {
+        s.zoomDeg = static_cast<double>(params[kIndexZoom]->u.fs_d.value);
+    }
+    if (params[kIndexDjiFov]) {
+        s.djiFovDeg = static_cast<double>(params[kIndexDjiFov]->u.fs_d.value);
+    }
+    if (params[kIndexCorrection]) {
+        s.correction = static_cast<double>(params[kIndexCorrection]->u.fs_d.value);
+    }
+    if (params[kIndexDragSensitivity]) {
+        s.dragSensitivity = static_cast<double>(params[kIndexDragSensitivity]->u.fs_d.value);
+    }
+
     const int angleIndices[6] = {kIndexPan,       kIndexTilt,       kIndexRoll,
                                  kIndexSourcePan, kIndexSourceTilt, kIndexSourceRoll};
     double angles[6] = {0, 0, 0, 0, 0, 0};
@@ -778,6 +873,54 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Smooth Keyframes", OSV_REFRAME_SMOOTH_DEFAULT, PF_ParamFlag_NONE, OSV_REFRAME_ID_SMOOTH);
 
+    // ---- [WP-CAMERA] 16..20. DJI's camera, appended ------------------------
+    // Appended after every existing control so no saved index moves (see
+    // ReframeParams.h).  Camera Model defaults to Classic, which is what
+    // keeps an old project rendering the lens it was made with.
+    //
+    // 16. Camera Model: a checkbox labelled "DJI" (a checkbox and not a
+    //     popup because Premiere's GPU reads number popups from 0 where AE
+    //     numbers them from 1 - see ReframeParams.h).  Supervised (switching
+    //     carries the look across) and not animatable - a lens model that
+    //     changes mid-shot is not a framing anybody keyframes, and a host-held
+    //     keyframe on it would make the conversion in USER_CHANGED_PARAM
+    //     ambiguous.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOX("Camera Model", "DJI", OSV_REFRAME_CAMERA_MODEL_DEFAULT,
+                    PF_ParamFlag_SUPERVISE | PF_ParamFlag_CANNOT_TIME_VARY, OSV_REFRAME_ID_CAMERA_MODEL);
+
+    // 17. Zoom: DJI's derived visible angle.  Supervised: editing it moves
+    //     DJI FOV and Correction Angle along DJI Studio's own zoom path, and
+    //     editing either of those refreshes it.  Not animatable, because it is
+    //     never rendered from - DJI keyframes FOV and Correction, not Zoom.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Zoom", OSV_REFRAME_ZOOM_VALID_MIN, OSV_REFRAME_ZOOM_VALID_MAX, OSV_REFRAME_ZOOM_SLIDER_MIN,
+                         OSV_REFRAME_ZOOM_SLIDER_MAX, OSV_REFRAME_ZOOM_DEFAULT, PF_Precision_TENTHS,
+                         PF_ValueDisplayFlag_NONE, PF_ParamFlag_SUPERVISE | PF_ParamFlag_CANNOT_TIME_VARY,
+                         OSV_REFRAME_ID_ZOOM);
+
+    // 18. DJI FOV: the vertical pinhole field of view, one decimal like DJI.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("DJI FOV", OSV_REFRAME_DJI_FOV_VALID_MIN, OSV_REFRAME_DJI_FOV_VALID_MAX,
+                         OSV_REFRAME_DJI_FOV_SLIDER_MIN, OSV_REFRAME_DJI_FOV_SLIDER_MAX, OSV_REFRAME_DJI_FOV_DEFAULT,
+                         PF_Precision_TENTHS, PF_ValueDisplayFlag_NONE, PF_ParamFlag_SUPERVISE, OSV_REFRAME_ID_DJI_FOV);
+
+    // 19. Correction Angle: the eye distance, two decimals like DJI.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Correction Angle", OSV_REFRAME_CORRECTION_VALID_MIN, OSV_REFRAME_CORRECTION_VALID_MAX,
+                         OSV_REFRAME_CORRECTION_SLIDER_MIN, OSV_REFRAME_CORRECTION_SLIDER_MAX,
+                         OSV_REFRAME_CORRECTION_DEFAULT, PF_Precision_HUNDREDTHS, PF_ValueDisplayFlag_NONE,
+                         PF_ParamFlag_SUPERVISE, OSV_REFRAME_ID_CORRECTION);
+
+    // 20. Drag Sensitivity: an overlay preference, never rendered from, so
+    //     not animatable and not supervised.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Drag Sensitivity", OSV_REFRAME_DRAG_SENSITIVITY_VALID_MIN,
+                         OSV_REFRAME_DRAG_SENSITIVITY_VALID_MAX, OSV_REFRAME_DRAG_SENSITIVITY_SLIDER_MIN,
+                         OSV_REFRAME_DRAG_SENSITIVITY_SLIDER_MAX, OSV_REFRAME_DRAG_SENSITIVITY_DEFAULT,
+                         PF_Precision_HUNDREDTHS, PF_ValueDisplayFlag_NONE, PF_ParamFlag_CANNOT_TIME_VARY,
+                         OSV_REFRAME_ID_DRAG_SENSITIVITY);
+
     out_data->num_params = OSV_REFRAME_PARAM_COUNT + 1;  // + the input layer
 
     // ---- The Program Monitor overlay --------------------------------------
@@ -793,22 +936,144 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     return PF_Err_NONE;
 }
 
+// ---------------------------------------------------------------------------
+//  [WP-CAMERA] Writing supervised values back
+// ---------------------------------------------------------------------------
+
+/// Write a float slider and mark it as an undoable edit.  A null entry (a
+/// host that handed a short array) is skipped, never dereferenced.
+void writeSlider(PF_ParamDef* def, double value) noexcept {
+    if (!def || !std::isfinite(value)) {
+        return;
+    }
+    def->u.fs_d.value = static_cast<PF_FpShort>(value);
+    def->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
+}
+
+/// Write a popup (1-based) and mark it changed - only when it actually
+/// changes, so an unchanged popup never gets a redundant undo step.
+void writePopup(PF_ParamDef* def, int value) noexcept {
+    if (!def || def->u.pd.value == static_cast<A_long>(value)) {
+        return;
+    }
+    def->u.pd.value = static_cast<A_long>(value);
+    def->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
+}
+
+/// Set the Camera Model checkbox and mark it changed - again only when it
+/// actually changes.
+void writeCameraModel(PF_ParamDef* params[], CameraModel model) noexcept {
+    if (!params || !params[kIndexCameraModel]) {
+        return;
+    }
+    PF_ParamDef* def = params[kIndexCameraModel];
+    if (cameraModelFromCheckbox(def->u.bd.value) == model) {
+        return;
+    }
+    def->u.bd.value = (model == CameraModel::Dji) ? 1 : 0;
+    def->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
+}
+
+/// Flip Preset to Custom after a manual edit: the look is no longer the
+/// preset, and a popup that still named it would be lying.
+void presetToCustom(PF_ParamDef* params[], PF_ParamIndex changed) noexcept {
+    if (!params || !params[kIndexPreset]) {
+        return;
+    }
+    if (sanitisePreset(params[kIndexPreset]->u.pd.value) != Preset::Custom) {
+        writePopup(params[kIndexPreset], static_cast<int>(Preset::Custom));
+        PluginLog::debug("reframe: manual edit of param {} -> preset Custom", static_cast<int>(changed));
+    }
+}
+
+/// The frame shape the DJI numbers are computed for: the named Output
+/// Resolution, else the sequence, else DJI's 16:9 (framingAspect()).
+[[nodiscard]] double framingAspectFor(PF_InData* in_data, PF_ParamDef* params[]) noexcept {
+    const Resolution resolution = (params && params[kIndexOutputResolution])
+                                      ? sanitiseResolution(params[kIndexOutputResolution]->u.pd.value)
+                                      : Resolution::MatchSequence;
+    return framingAspect(resolution, sequenceSize(in_data));
+}
+
+/// The Classic lens as the controls currently hold it.
+[[nodiscard]] ClassicLens classicLensOf(PF_ParamDef* params[]) noexcept {
+    ClassicLens lens;
+    if (params && params[kIndexFov]) {
+        lens.fovDeg = static_cast<double>(params[kIndexFov]->u.fs_d.value);
+    }
+    if (params && params[kIndexDistortion]) {
+        lens.distortion = static_cast<double>(params[kIndexDistortion]->u.fs_d.value);
+    }
+    return lens;
+}
+
+/// The DJI lens as the controls currently hold it, sanitised.
+[[nodiscard]] DjiLens djiLensOf(PF_ParamDef* params[]) noexcept {
+    DjiLens lens;
+    if (params && params[kIndexDjiFov]) {
+        lens.fovDeg = static_cast<double>(params[kIndexDjiFov]->u.fs_d.value);
+    }
+    if (params && params[kIndexCorrection]) {
+        lens.correction = static_cast<double>(params[kIndexCorrection]->u.fs_d.value);
+    }
+    return sanitiseDjiLens(lens);
+}
+
+/// Write a whole DJI lens back, with the Zoom read-out that belongs to it.
+void writeDjiLens(PF_ParamDef* params[], const DjiLens& lens, double aspect, bool writeFov,
+                  bool writeCorrection) noexcept {
+    if (!params) {
+        return;
+    }
+    if (writeFov) {
+        writeSlider(params[kIndexDjiFov], lens.fovDeg);
+    }
+    if (writeCorrection) {
+        writeSlider(params[kIndexCorrection], lens.correction);
+    }
+    writeSlider(params[kIndexZoom], djiZoomDeg(lens, aspect));
+}
+
+[[nodiscard]] bool isDjiModel(PF_ParamDef* params[]) noexcept {
+    return params && params[kIndexCameraModel] &&
+           cameraModelFromCheckbox(params[kIndexCameraModel]->u.bd.value) == CameraModel::Dji;
+}
+
 /// PF_Cmd_USER_CHANGED_PARAM: the supervised behaviour.
 ///
-/// Changing Preset writes FOV, Distortion and Tilt from the preset table and
-/// marks each with PF_ChangeFlag_CHANGED_VALUE so the host records an
-/// undoable edit.  Changing FOV, Distortion or Tilt by hand means the look
-/// is no longer the preset, so Preset flips to Custom - which is exactly how
-/// every other reframe UI behaves and stops the popup from lying.
+/// Changing Preset writes the preset's look - the Classic FOV / Distortion,
+/// DJI's FOV / Correction Angle / Zoom for the frame's shape, and Tilt - and
+/// switches Camera Model to DJI, marking each value with
+/// PF_ChangeFlag_CHANGED_VALUE so the host records one undoable edit.
+///
+/// Editing a lens control by hand means the look is no longer the preset, so
+/// Preset flips to Custom - which is exactly how every other reframe UI
+/// behaves and stops the popup from lying.  [WP-CAMERA] It also selects the
+/// model that control belongs to, carrying the current look across so the
+/// picture does not jump:
+///
+///   * DJI FOV / Correction Angle: Camera Model -> DJI; if it was Classic,
+///     the OTHER DJI control is set from the Classic look first; Zoom is
+///     refreshed.
+///   * Zoom: Camera Model -> DJI, and DJI FOV / Correction Angle move along
+///     DJI Studio's zoom path (fov += 130 d, correction += d) until the lens
+///     shows that Zoom; Zoom is then rewritten with what was reached (a
+///     request past DJI's limits stops at them, as DJI's own does).
+///   * Classic FOV / Distortion: Camera Model -> Classic.
+///   * Camera Model itself: the look is converted into the newly selected
+///     model's controls (djiFromClassic / classicFromDji).
 PF_Err userChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* params[],
                         const PF_UserChangedParamExtra* extra) noexcept {
     if (!params || !extra) {
         return PF_Err_NONE;
     }
-    (void)in_data;
     (void)out_data;
 
     const PF_ParamIndex changed = extra->param_index;
+    // A host index outside our list is not a control of ours to supervise.
+    if (changed < 1 || changed > OSV_REFRAME_PARAM_COUNT || !params[changed]) {
+        return PF_Err_NONE;
+    }
 
     if (changed == kIndexPreset) {
         const Preset preset = sanitisePreset(params[kIndexPreset]->u.pd.value);
@@ -816,24 +1081,87 @@ PF_Err userChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
         if (!entry || !entry->writesControls) {
             return PF_Err_NONE;  // "Custom" writes nothing
         }
-        params[kIndexFov]->u.fs_d.value = static_cast<PF_FpShort>(entry->fovDeg);
-        params[kIndexFov]->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
-        params[kIndexDistortion]->u.fs_d.value = static_cast<PF_FpShort>(entry->distortion);
-        params[kIndexDistortion]->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
+        writeSlider(params[kIndexFov], entry->fovDeg);
+        writeSlider(params[kIndexDistortion], entry->distortion);
         // The angle control stores fixed 16.16 degrees.
-        params[kIndexTilt]->u.ad.value = static_cast<PF_Fixed>(std::lround(entry->tiltDeg * 65536.0));
-        params[kIndexTilt]->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
-        PluginLog::debug("reframe: preset '{}' -> fov {} distortion {} tilt {}", entry->label, entry->fovDeg,
-                         entry->distortion, entry->tiltDeg);
+        if (params[kIndexTilt]) {
+            params[kIndexTilt]->u.ad.value = static_cast<PF_Fixed>(std::lround(entry->tiltDeg * 65536.0));
+            params[kIndexTilt]->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
+        }
+        // [WP-CAMERA] DJI's numbers for the same look, for this frame's shape
+        // (DJI keeps separate landscape / 9:16 / 3:4 columns), and the switch
+        // to the DJI model that makes them the picture.
+        const double aspect = framingAspectFor(in_data, params);
+        const DjiLens lens = sanitiseDjiLens(DjiLens{djiPresetFovDeg(*entry, aspect), entry->correction});
+        writeDjiLens(params, lens, aspect, /*writeFov=*/true, /*writeCorrection=*/true);
+        writeCameraModel(params, CameraModel::Dji);
+        PluginLog::debug("reframe: preset '{}' -> classic fov {} distortion {}, DJI fov {} correction {} "
+                         "(aspect {:.4f}), tilt {}",
+                         entry->label, entry->fovDeg, entry->distortion, lens.fovDeg, lens.correction, aspect,
+                         entry->tiltDeg);
         return PF_Err_NONE;
     }
 
-    if (changed == kIndexFov || changed == kIndexDistortion || changed == kIndexTilt) {
-        if (sanitisePreset(params[kIndexPreset]->u.pd.value) != Preset::Custom) {
-            params[kIndexPreset]->u.pd.value = static_cast<A_long>(Preset::Custom);
-            params[kIndexPreset]->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
-            PluginLog::debug("reframe: manual edit of param {} -> preset Custom", static_cast<int>(changed));
+    if (changed == kIndexFov || changed == kIndexDistortion) {
+        presetToCustom(params, changed);
+        // A Classic control was edited: the Classic lens is the picture now.
+        writeCameraModel(params, CameraModel::Classic);
+        return PF_Err_NONE;
+    }
+
+    if (changed == kIndexTilt) {
+        presetToCustom(params, changed);
+        return PF_Err_NONE;
+    }
+
+    // ---- [WP-CAMERA] the DJI controls --------------------------------------
+    if (changed == kIndexDjiFov || changed == kIndexCorrection) {
+        const double aspect = framingAspectFor(in_data, params);
+        DjiLens lens = djiLensOf(params);
+        if (!isDjiModel(params)) {
+            // Coming from Classic: the control the user did NOT touch takes
+            // its value from the current look, so only their edit shows.
+            const DjiLens carried = djiFromClassic(classicLensOf(params), aspect);
+            if (changed == kIndexDjiFov) {
+                lens.correction = carried.correction;
+            } else {
+                lens.fovDeg = carried.fovDeg;
+            }
         }
+        writeDjiLens(params, lens, aspect, /*writeFov=*/changed != kIndexDjiFov,
+                     /*writeCorrection=*/changed != kIndexCorrection);
+        writeCameraModel(params, CameraModel::Dji);
+        presetToCustom(params, changed);
+        return PF_Err_NONE;
+    }
+
+    if (changed == kIndexZoom) {
+        const double aspect = framingAspectFor(in_data, params);
+        const double target = static_cast<double>(params[kIndexZoom]->u.fs_d.value);
+        // Start from the lens that is on screen, whichever model draws it.
+        const DjiLens from = isDjiModel(params) ? djiLensOf(params) : djiFromClassic(classicLensOf(params), aspect);
+        const DjiLens to = djiZoomTo(target, from, aspect);
+        writeDjiLens(params, to, aspect, /*writeFov=*/true, /*writeCorrection=*/true);
+        writeCameraModel(params, CameraModel::Dji);
+        presetToCustom(params, changed);
+        PluginLog::debug("reframe: zoom {} -> DJI fov {} correction {} (aspect {:.4f})", target, to.fovDeg,
+                         to.correction, aspect);
+        return PF_Err_NONE;
+    }
+
+    if (changed == kIndexCameraModel) {
+        const double aspect = framingAspectFor(in_data, params);
+        if (isDjiModel(params)) {
+            // Classic -> DJI: DJI's controls take the Classic look.
+            writeDjiLens(params, djiFromClassic(classicLensOf(params), aspect), aspect, true, true);
+        } else {
+            // DJI -> Classic: the nearest Classic look (exact unless the
+            // Classic ramp or a correction above 1 makes it unrepresentable).
+            const ClassicLens classic = classicFromDji(djiLensOf(params), aspect);
+            writeSlider(params[kIndexFov], classic.fovDeg);
+            writeSlider(params[kIndexDistortion], classic.distortion);
+        }
+        presetToCustom(params, changed);
         return PF_Err_NONE;
     }
 

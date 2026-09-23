@@ -313,6 +313,15 @@ struct Instance {
     /// frame proves the node is ready, which is exactly when a retry works.
     bool paramMapProbed = false;
 
+    /// [WP-CAMERA] How this host numbers popup entries on the GPU side
+    /// (PopupBase in ReframeParams.h), learned from the values readSettings()
+    /// sees: Premiere 26.2.2 counts from 0, After Effects and the mock host
+    /// from 1.  Atomic because Render may run on several threads for one
+    /// instance; the value only ever moves from Unknown to a settled base.
+    /// Mutable because the readers take the instance const: learning the
+    /// numbering is a cache of what the host says, not a change of state.
+    mutable std::atomic<int> popupBase{static_cast<int>(PopupBase::Unknown)};
+
     // ---- the direct path (DirectPath.h) ---------------------------------
     /// The media file and owning clip node this instance renders; the node
     /// is acquired and released in DisposeInstance.
@@ -956,21 +965,31 @@ double readFloat(const Instance& inst, int aeIndex, PrTime time, double fallback
     }
 }
 
-/// A popup: mInt32, 1-based.
-int readPopup(const Instance& inst, int aeIndex, PrTime time, int fallback) noexcept {
+/// A popup: mInt32, as the host numbers it - which on the GPU side need not
+/// be 1-based; readSettings() decodes it with decodeHostPopup().  Returns
+/// false (and leaves `out` alone) when the host did not answer with an
+/// integer, so a caller can tell a real reading from its own fallback: only
+/// a real reading may be decoded or teach the instance anything.
+bool readPopupRaw(const Instance& inst, int aeIndex, PrTime time, int* out) noexcept {
+    if (!out) {
+        return false;
+    }
     PrParam p{};
     if (!readParam(inst, aeIndex, time, &p)) {
-        return fallback;
+        return false;
     }
     switch (p.mType) {
         case kPrParamType_Int32:
-            return p.mInt32;
+            *out = p.mInt32;
+            return true;
         case kPrParamType_Int16:
-            return static_cast<int>(p.mInt16);
+            *out = static_cast<int>(p.mInt16);
+            return true;
         case kPrParamType_Int8:
-            return static_cast<int>(p.mInt8);
+            *out = static_cast<int>(p.mInt8);
+            return true;
         default:
-            return fallback;
+            return false;
     }
 }
 
@@ -999,12 +1018,57 @@ bool readBool(const Instance& inst, int aeIndex, PrTime time, bool fallback) noe
 /// path, which does the same three-sample average through PF_CHECKOUT_PARAM.
 Settings readSettings(const Instance& inst, PrTime clipTime, PrTime ticksPerFrame) noexcept {
     Settings s;
-    s.resolution =
-        sanitiseResolution(readPopup(inst, kIndexOutputResolution, clipTime, OSV_REFRAME_RESOLUTION_DEFAULT));
-    s.preset = sanitisePreset(readPopup(inst, kIndexPreset, clipTime, OSV_REFRAME_PRESET_DEFAULT));
+
+    // ---- the popups, in the host's own numbering -------------------------------
+    // [WP-CAMERA] Premiere hands GPU filters popups numbered from 0 where the
+    // CPU path (and the mock host) number them from 1 (PopupBase in
+    // ReframeParams.h).  Both raw values are read FIRST and both are allowed
+    // to settle the base before either is decoded, so a Preset reading 0 on
+    // this very frame already corrects an ambiguous Output Resolution.  A
+    // control the host did not answer takes its documented (1-based) default
+    // directly: it was never in the host's numbering, so it is neither
+    // decoded nor allowed to teach the instance anything.
+    int rawResolution = 0;
+    int rawPreset = 0;
+    const bool haveResolution = readPopupRaw(inst, kIndexOutputResolution, clipTime, &rawResolution);
+    const bool havePreset = readPopupRaw(inst, kIndexPreset, clipTime, &rawPreset);
+    PopupBase base = static_cast<PopupBase>(inst.popupBase.load(std::memory_order_relaxed));
+    if (haveResolution) {
+        (void)decodeHostPopup(rawResolution, OSV_REFRAME_RESOLUTION_COUNT, &base);
+    }
+    if (havePreset) {
+        (void)decodeHostPopup(rawPreset, OSV_REFRAME_PRESET_COUNT, &base);
+    }
+    const PopupBase learned = base;
+    s.resolution = sanitiseResolution(haveResolution
+                                          ? decodeHostPopup(rawResolution, OSV_REFRAME_RESOLUTION_COUNT, &base)
+                                          : OSV_REFRAME_RESOLUTION_DEFAULT);
+    s.preset = sanitisePreset(havePreset ? decodeHostPopup(rawPreset, OSV_REFRAME_PRESET_COUNT, &base)
+                                         : OSV_REFRAME_PRESET_DEFAULT);
+    if (learned != PopupBase::Unknown) {
+        const int previous = inst.popupBase.exchange(static_cast<int>(learned), std::memory_order_relaxed);
+        if (previous != static_cast<int>(learned)) {
+            PluginLog::info("reframe/gpu: this host numbers popups from {} (Output Resolution read {}, Preset {})",
+                            learned == PopupBase::Zero ? 0 : 1, rawResolution, rawPreset);
+        }
+    }
+
     s.fovDeg = readFloat(inst, kIndexFov, clipTime, OSV_REFRAME_FOV_DEFAULT);
     s.distortion = readFloat(inst, kIndexDistortion, clipTime, OSV_REFRAME_DISTORTION_DEFAULT);
     s.smoothKeyframes = readBool(inst, kIndexSmooth, clipTime, false);
+
+    // ---- [WP-CAMERA] DJI's camera ----------------------------------------------
+    // Camera Model is a checkbox, so it reads the same on every host; a host
+    // that does not expose it (or a probe that mapped it to nothing) yields
+    // Classic, the lens every project had before the control existed.  Zoom
+    // and Drag Sensitivity are never rendered from but are read so the
+    // Settings block is complete for the log line on a rejected setup.
+    s.cameraModel = cameraModelFromCheckbox(
+        readBool(inst, kIndexCameraModel, clipTime, OSV_REFRAME_CAMERA_MODEL_DEFAULT != 0) ? 1 : 0);
+    s.zoomDeg = readFloat(inst, kIndexZoom, clipTime, OSV_REFRAME_ZOOM_DEFAULT);
+    s.djiFovDeg = readFloat(inst, kIndexDjiFov, clipTime, OSV_REFRAME_DJI_FOV_DEFAULT);
+    s.correction = readFloat(inst, kIndexCorrection, clipTime, OSV_REFRAME_CORRECTION_DEFAULT);
+    s.dragSensitivity = readFloat(inst, kIndexDragSensitivity, clipTime, OSV_REFRAME_DRAG_SENSITIVITY_DEFAULT);
 
     // The six angles, either sampled once or averaged over three frames.
     const int angleIndices[6] = {kIndexPan,       kIndexTilt,       kIndexRoll,

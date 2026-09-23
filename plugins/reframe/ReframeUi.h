@@ -203,7 +203,7 @@ inline constexpr double kRollDegPerPixelAltDrag = 0.35;
 /// and re-deciding every mouse move makes the picture jitter between them.
 inline constexpr double kAxisLockThresholdPx = 3.0;
 
-/// How much faster than the hand a pan/tilt drag turns the view.
+/// How much faster than the hand a pan/tilt drag turns the view, by DEFAULT.
 ///
 /// 1.0 is the exact grab: the point under the pointer stays under it.  The
 /// field report was that this feels sluggish next to DJI Studio - reframing
@@ -212,7 +212,11 @@ inline constexpr double kAxisLockThresholdPx = 3.0;
 /// this factor BEFORE the grab is solved, so the drag still moves the sphere
 /// as one rigid piece in both axes (a quicker grab, not a distorted one);
 /// the fixed-rate fallback is scaled by the same factor so the two agree.
-inline constexpr double kPanTiltSensitivity = 2.0;
+///
+/// [WP-CAMERA] The live value is the "Drag Sensitivity" control, captured
+/// into DragState::sensitivity when a gesture starts; this is its default
+/// and the value used whenever the control cannot be read.
+inline constexpr double kPanTiltSensitivity = OSV_REFRAME_DRAG_SENSITIVITY_DEFAULT;
 
 /// The FOV a pan/tilt drag is calibrated at.  At this FOV, dragging across
 /// the full width of the viewport turns the view by exactly this many
@@ -338,6 +342,12 @@ struct CameraValues {
     double tiltDeg = 0.0;
     double rollDeg = 0.0;
     double fovDeg = OSV_REFRAME_FOV_DEFAULT;
+    // [WP-CAMERA] DJI's lens.  `dji` says which lens the picture is rendered
+    // with (the Camera Model checkbox); the zoom gesture and the read-out
+    // follow it.  In Classic mode the two DJI numbers ride along untouched.
+    bool dji = false;
+    double djiFovDeg = OSV_REFRAME_DJI_FOV_DEFAULT;       ///< DJI FOV (vertical pinhole, deg).
+    double correction = OSV_REFRAME_CORRECTION_DEFAULT;   ///< Correction Angle (sphere radii).
 };
 
 /// The renderer's pixel -> ray model plus the grabbed point, captured when a
@@ -431,7 +441,18 @@ struct DragState {
     /// shim could not build the camera, in which case the fixed-rate drag
     /// is used exactly as before.
     SphereGrab grab;
+    /// [WP-CAMERA] How much faster than the hand a pan / tilt drag turns the
+    /// view: the "Drag Sensitivity" control at the click.  Captured once per
+    /// gesture, like `start`, so editing the control mid-drag cannot change
+    /// the rate under the hand.  A non-finite or out-of-range value falls
+    /// back to kPanTiltSensitivity (see effectiveSensitivity()).
+    double sensitivity = kPanTiltSensitivity;
 };
+
+/// [WP-CAMERA] The drag sensitivity actually used: `requested` clamped into
+/// the Drag Sensitivity control's valid range, or kPanTiltSensitivity when it
+/// is not a finite number.
+[[nodiscard]] double effectiveSensitivity(double requested) noexcept;
 
 /// Degrees of view rotation per pixel of drag, at a given FOV and viewport
 /// width.
@@ -482,10 +503,20 @@ enum ChangedField : std::uint32_t {
     kChangedTilt = 1u << 1,
     kChangedRoll = 1u << 2,
     kChangedFov = 1u << 3,
+    // [WP-CAMERA]
+    kChangedDjiFov = 1u << 4,      ///< DJI FOV.
+    kChangedCorrection = 1u << 5,  ///< Correction Angle.
 };
 
-/// The fields a drag mode writes.  Pure function of the mode.
+/// The fields a drag mode writes with the CLASSIC lens.  Pure function of
+/// the mode.
 [[nodiscard]] std::uint32_t changedFieldsFor(DragMode mode) noexcept;
+
+/// [WP-CAMERA] The fields a drag mode writes with the given lens: identical
+/// to changedFieldsFor(mode) for Classic; with DJI's lens a zoom (Fov mode)
+/// writes DJI FOV and Correction Angle - DJI's zoom gesture moves both -
+/// instead of the Classic FOV.
+[[nodiscard]] std::uint32_t changedFieldsFor(DragMode mode, bool dji) noexcept;
 
 /// Clamp a camera snapshot into the parameters' valid ranges, replacing any
 /// non-finite component with the corresponding default.

@@ -246,6 +246,17 @@ Settings asteroidSettings(Resolution res) {
     return s;
 }
 
+/// [WP-CAMERA] A Settings block on DJI's lens: Camera Model ticked, with the
+/// DJI FOV and Correction Angle given; the Classic lens controls stay at
+/// their defaults, which the DJI lens ignores.
+Settings djiSettings(Resolution res, double pan, double tilt, double roll, double djiFov, double correction) {
+    Settings s = makeSettings(res, pan, tilt, roll, OSV_REFRAME_FOV_DEFAULT, OSV_REFRAME_DISTORTION_DEFAULT);
+    s.cameraModel = CameraModel::Dji;
+    s.djiFovDeg = djiFov;
+    s.correction = correction;
+    return s;
+}
+
 /// One framing case: controls, output frame and sequence.
 struct ViewCase {
     const char* name;
@@ -284,6 +295,14 @@ std::vector<ViewCase> framingCases() {
     // Cover-fit that crops the other way: 16:9 into a 4:3 frame.
     v.push_back({"1920x1080 requested into a 4:3 1440x1080 frame",
                  makeSettings(Resolution::Fhd1920x1080, 170.0, 30.0, -15.0, 75.0, 0.0), 1440, 1080, SizePx{1440, 1080}});
+    // [WP-CAMERA] DJI's lens (OSV_PROJ_DJI_SPHERE): the two DJI Studio field
+    // observations, the second cover-fitted into a portrait frame.
+    v.push_back({"DJI FOV 103.3 / correction 0.67 (DJI Studio screenshot 1), 1920x1080",
+                 djiSettings(Resolution::MatchSequence, 144.8, -5.9, 0.0, 103.3, 0.67), 1920, 1080,
+                 SizePx{1920, 1080}});
+    v.push_back({"DJI FOV 150 / correction 0.34 (screenshot 2) requested 1920x1080 into a portrait 1080x1920 frame",
+                 djiSettings(Resolution::Fhd1920x1080, 144.8, -5.9, 0.0, 150.0, 0.34), 1080, 1920,
+                 SizePx{1080, 1920}});
     return v;
 }
 

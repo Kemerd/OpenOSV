@@ -39,6 +39,9 @@ add_executable(osv_reframe_tests
   GpuTestSupport.cpp
   GpuTestSupport.h
   test_gpu_probe.cpp
+  # DJI's lens (Camera Model: DJI): geometry, legacy invariance, the DJI
+  # Studio field observations, supervision and CPU / GPU parity.
+  test_dji_camera.cpp
   # Compiled here too so the tests can call the geometry and the CPU
   # renderer directly; the .aex contains the identical object.
   "${_osv_reframe_src}/ReframeCpu.cpp"
