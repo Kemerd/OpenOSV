@@ -1293,12 +1293,13 @@ TROUBLE
 DAVINCI RESOLVE (PREVIEW)
 -------------------------
 The same stitch and camera as OpenFX plug-ins, for DaVinci Resolve free
-or Studio. A preview: tested against a mock OpenFX host, not yet run
-inside Resolve. Please report what you see.
+or Studio. A preview: tested against a mock OpenFX host, and run in
+Resolve 21 (free) on Windows. Please report what you see.
 
 1. Close DaVinci Resolve and double-click Install-Resolve.cmd (admin
    rights, like Install.cmd).
-2. Start Resolve. In the Effects Library, under OpenFX, group OpenOSV:
+2. Start Resolve. In the Effects panel, select Open FX and search for
+   OpenOSV (the search looks only inside the selected category):
    * OpenOSV Source - a generator. Drop it on the timeline, click
      "Choose .OSV File...", trim it to the length its Clip line shows.
    * OpenOSV 360 Reframe - a filter for any 360 equirect clip. Set Project
@@ -2218,12 +2219,14 @@ The full list is in `CHANGELOG.md`, in the zip and in the repository.
 
 **Uninstall:** close Premiere, double-click `Uninstall.cmd`, then launch Premiere holding `Shift` once.
 
+**DaVinci Resolve (preview):** close Resolve and double-click **`Install-Resolve.cmd`**. In the Effects panel, select **Open FX** and search for **OpenOSV**: **OpenOSV Source** opens an `.OSV` (click **Choose .OSV File...**), **OpenOSV 360 Reframe** reframes any 360 clip. `Uninstall-Resolve.cmd` removes them. Guide: `docs/RESOLVE.md`.
+
 ## Known limits
 
 * **Unsigned binaries.** SmartScreen warns on first run; Windows 11's Smart App Control, when it is on, may block unsigned plug-ins like these.
 * **CUDA covers Turing and newer** (GTX 16 / RTX 20 and later). On an older NVIDIA card, set **Render Device** to OpenCL in Source Settings; that setup is untested.
 * **No neural optical flow in the download.** Its runtime is 1.4 GB, so Auto uses the classical flow, which is the one the stitch is tuned on. Building from source with ONNX Runtime adds it back.
-* **Windows x64 in this zip.** Premiere Pro, plus a DaVinci Resolve preview (`Install-Resolve.cmd`: OpenFX, tested against a mock host, not yet run inside Resolve). macOS (Apple Silicon) builds from source and on CI, but is untested in Premiere and Resolve: see `docs/BUILDING_MAC.md`. No Final Cut plug-in; `osvtool` renders for any other editor.
+* **Windows x64 in this zip.** Premiere Pro, plus a DaVinci Resolve preview (`Install-Resolve.cmd`: OpenFX, first run in Resolve 21 on Windows). macOS (Apple Silicon) builds from source and on CI, but is untested in Premiere and Resolve: see `docs/BUILDING_MAC.md`. No Final Cut plug-in; `osvtool` renders for any other editor.
 * Tested on Premiere Pro 2026 with Osmo 360 footage.
 
 ## Checksums

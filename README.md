@@ -21,11 +21,12 @@ converted to HDR and ready to reframe. No export step, no transcode.
 
 </div>
 
-> **macOS and DaVinci Resolve are untested.** Premiere Pro on Windows is
-> what OpenOSV is built and tested on. The macOS build and the DaVinci
-> Resolve plug-ins compile and pass their tests on CI, but nobody on the
-> project has run Premiere on a Mac or Resolve on either platform. If you
-> can, [build it](#build-from-source), try it, and
+> **macOS is untested, and DaVinci Resolve is a preview.** Premiere Pro on
+> Windows is what OpenOSV is built and tested on. The macOS build and the
+> DaVinci Resolve plug-ins compile and pass their tests on CI. Resolve has
+> had a first run on Windows (Resolve 21, free), but nobody on the project
+> has run Premiere or Resolve on a Mac. If you can,
+> [build it](#build-from-source), try it, and
 > [file a bug report or a pull request](https://github.com/Kemerd/OpenOSV/issues)
 > for anything that goes wrong.
 
@@ -423,7 +424,7 @@ the Premiere plug-ins come along when Adobe's SDKs are there:
 | | Windows | macOS, Apple Silicon (untested) |
 |---|---|---|
 | **Premiere Pro** | needs the Adobe SDKs | needs the Adobe SDKs (untested in Premiere) |
-| **DaVinci Resolve** (untested in Resolve) | no Adobe SDK needed | no Adobe SDK needed |
+| **DaVinci Resolve** (preview) | no Adobe SDK needed | no Adobe SDK needed |
 
 Adobe's SDKs may not be redistributed, so they are never committed:
 [`docs/BUILDING.md`](docs/BUILDING.md) (Windows) and

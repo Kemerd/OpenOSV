@@ -1,11 +1,13 @@
 # DaVinci Resolve (OpenFX)
 
-**Status: built and tested, but not yet run inside DaVinci Resolve**, on
-Windows or on macOS. The plug-ins pass their tests against a strict mock
-OpenFX host that loads the real `OpenOSV.ofx` and drives it the way a host
-does (`tests/ofx`). Nobody on the project has run them in Resolve yet. Treat
-this as a preview. If you try it, especially on a Mac, please report what you
-see, or send a fix: see [Reporting a problem](#reporting-a-problem).
+**Status: a preview, with one run inside DaVinci Resolve so far:** Resolve
+21 (free) on Windows, where both effects load and OpenOSV Source stitches and
+frames a clip. OpenOSV 360 Reframe hasn't been tried inside Resolve yet, and
+nobody has run either effect in Resolve on macOS. Both pass their tests
+against a strict mock OpenFX host that loads the real `OpenOSV.ofx` and
+drives it the way a host does (`tests/ofx`). If you try it, especially on a
+Mac, please report what you see, or send a fix: see
+[Reporting a problem](#reporting-a-problem).
 
 `OpenOSV.ofx.bundle` holds two OpenFX effects, both in the **OpenOSV**
 group: the generator under **Open FX > Generators**, the filter under
@@ -208,16 +210,24 @@ The macOS build of the bundle compiles and runs these tests on GitHub's
 Apple Silicon runners (`.github/workflows/macos.yml`), except the [cuda] and
 [sample] ones.
 
-The following can't be checked without Resolve:
+Seen in DaVinci Resolve 21 (free) on Windows:
 
-- **What time Resolve gives a generator.** The OpenFX standard doesn't say,
-  and Blackmagic doesn't document it. The generator counts from the start of
-  its output clip's frame range. It falls back to the raw time when that
-  range starts later than the time itself, and logs what it saw on its first
-  frame.
-- **How the Inspector draws the controls.** One lens's controls are shown at
-  a time, through `kOfxParamPropSecret`, with `kOfxParamPropEnabled` as a
-  fallback. Resolve is reported to honour both.
+- **The time Resolve gives a generator**, which neither the OpenFX standard
+  nor Blackmagic documents: timeline frames counted from the generator's own
+  first frame, with an output frame range of [0, length - 1] at the
+  timeline's rate. A 5-second generator on a 24 fps timeline logged
+  `time 35, output range known [0, 119], host fps 24`. The generator
+  converts through seconds, so any timeline rate works with any clip rate.
+  It still logs what it saw on its first frame.
+- **The output format.** Resolve labels a generator's output image
+  `OfxImageComponentNone` unless the generator states a format in its clip
+  preferences. OpenOSV Source states 32-bit float RGBA.
+- **The Inspector** shows one lens's controls at a time
+  (`kOfxParamPropSecret`, with `kOfxParamPropEnabled` as a fallback).
+
+Not checked inside Resolve yet:
+
+- **OpenOSV 360 Reframe**, on the CPU or on Resolve's CUDA images.
 - **Colour management.** How a colour-managed project interprets a
   generator's output. See [Colour](#colour).
 - **Playback speed inside Resolve.**

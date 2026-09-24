@@ -10,7 +10,7 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ### Added
 
-* **DaVinci Resolve (OpenFX), a preview not yet run inside Resolve.**
+* **DaVinci Resolve (OpenFX), a preview.**
   `OpenOSV.ofx.bundle` holds two OpenFX effects:
   * **OpenOSV Source** is a generator. It opens a `.OSV` or `.LRF` through
     the importer's own clip engine, compiled in unchanged, so the stitch,
@@ -35,7 +35,11 @@ All notable changes to OpenOSV are documented here. The format follows
   on by default): on Windows, and on macOS as `OpenOSV.ofx.bundle` with
   FFmpeg embedded, built and tested on GitHub's Apple Silicon runners. On a
   Mac the stitch runs on Metal, and OpenOSV 360 Reframe renders on the CPU.
-  Neither platform has been run inside Resolve yet. `scripts/install_ofx.ps1`
+  First run inside Resolve: Resolve 21 (free) on Windows, where OpenOSV
+  Source stitches and frames a clip; nobody has run it in Resolve on a Mac
+  yet. OpenOSV Source states float RGBA output in its clip preferences,
+  because Resolve otherwise labels a generator's image
+  `OfxImageComponentNone`. `scripts/install_ofx.ps1`
   and `scripts/install_ofx.sh` install it. The OpenFX 1.5.1 headers are
   vendored in `plugins/ofx/openfx` (BSD-3-Clause). See
   [docs/RESOLVE.md](docs/RESOLVE.md).
