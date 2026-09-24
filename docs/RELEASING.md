@@ -71,7 +71,11 @@ Inside the zip: `Install.cmd`, `Uninstall.cmd`, `README.txt`, `LICENSE`,
 `NOTICE`, `CHANGELOG.md`, `SHA256SUMS.txt`, `plugins\OpenOSV\` (the three
 modules and their DLLs), `luts\`, `presets\`, `panel\` (CEP and UXP sources
 plus the `.ccx`), `scripts\install_plugins.ps1`, `cli\` (`osvtool.exe` and its
-DLLs) and `licenses\`.
+DLLs) and `licenses\`. When the build made the DaVinci Resolve bundle
+(`OSV_BUILD_OFX`, on in the preset), the zip also carries
+`plugins\OpenOSV.ofx.bundle\` (`OpenOSV.ofx` and its own import closure),
+`scripts\install_ofx.ps1` and `Install-Resolve.cmd` / `Uninstall-Resolve.cmd`,
+and `licenses\` gains the OpenFX headers' licence.
 
 **Why it builds its own tree.** FFmpeg records its whole configure line in its
 DLLs (it is what `avutil_configuration()` returns), and vcpkg's port passes

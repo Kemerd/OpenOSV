@@ -157,6 +157,22 @@ fi
 # ---------------------------------------------------------------------------
 #  Data, scripts, documentation, licences.
 # ---------------------------------------------------------------------------
+# The OpenFX bundle for DaVinci Resolve (plugins/ofx) needs no Adobe SDK, so
+# every build makes it: ship it with its installer, its guide and the licence
+# of the OpenFX headers it is compiled against.
+OFX_BUNDLE="$BUILD_DIR/plugins/ofx/OpenOSV.ofx.bundle"
+if [ -f "$OFX_BUNDLE/Contents/MacOS/OpenOSV.ofx" ]; then
+    mkdir -p "$STAGE/plugins"
+    ditto "$OFX_BUNDLE" "$STAGE/plugins/OpenOSV.ofx.bundle"
+    cp "$ROOT_DIR/scripts/install_ofx.sh" "$STAGE/scripts/install_ofx.sh"
+    chmod +x "$STAGE/scripts/install_ofx.sh"
+    cp "$ROOT_DIR/docs/RESOLVE.md" "$STAGE/docs/RESOLVE.md"
+    cp "$ROOT_DIR/plugins/ofx/openfx/LICENSE.md" "$STAGE/licenses/OpenFX.txt"
+    step "DaVinci Resolve: OpenOSV.ofx.bundle (scripts/install_ofx.sh installs it)"
+else
+    step "DaVinci Resolve: no OpenOSV.ofx.bundle in $BUILD_DIR (configured with OSV_BUILD_OFX=OFF?)"
+fi
+
 step "data and documentation"
 cp -R "$ROOT_DIR/luts" "$STAGE/luts"
 cp -R "$ROOT_DIR/presets" "$STAGE/presets"

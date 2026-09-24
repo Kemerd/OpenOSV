@@ -20,7 +20,7 @@ name: macos
 
 on:
   push:
-    branches: [ mac ]
+    branches: [ main, mac ]
   workflow_dispatch:
 
 env:

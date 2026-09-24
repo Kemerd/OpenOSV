@@ -18,8 +18,13 @@
 #include "ImporterGpuFrame.h"
 // colorSpaceTokenFor(): the per-clip colour log line names the exact token the
 // importer will hand Premiere, so the log and imGetIndColorSpace can never
-// disagree about what the host was told.
+// disagree about what the host was told.  A build of this clip engine for a
+// host that is not Premiere (the OpenFX plug-in, plugins/ofx) has no token to
+// hand anyone and no Adobe SDK to spell one with: it defines
+// OSV_CLIP_ENGINE_WITHOUT_PREMIERE, and the log line says so instead.
+#if !defined(OSV_CLIP_ENGINE_WITHOUT_PREMIERE)
 #include "ImporterPlugin.h"
+#endif
 #include "PluginLog.h"
 #include "ProtectorGuard.h"
 
@@ -595,12 +600,17 @@ Status ImporterInstance::parseOnce() {
     // output is the "auto PQ for log footage" case the default already gives.
     {
         const color::InputEncoding in = inputEncodingFor(m_format.colorMode);
+#if defined(OSV_CLIP_ENGINE_WITHOUT_PREMIERE)
+        const char* declared = "none (not Premiere)";
+#else
+        const char* declared = colorSpaceTokenFor(m_prefs);
+#endif
         PluginLog::info("colour: '{}': source {} ({}) -> input encoding {}, output {} ({}), Rec.709 look {}, "
                         "HDR peak {:.0f} nits",
                         m_path.filename().string(), meta::colorModeName(m_format.colorMode),
                         m_format.colorModeFromMetadata ? "from metadata" : "inferred from luma statistics",
                         color::inputEncodingName(in), color::outputTransferName(toOutputTransfer(m_prefs.color())),
-                        colorSpaceTokenFor(m_prefs), color::lookName(toLook(m_prefs.lookChoice())),
+                        declared, color::lookName(toLook(m_prefs.lookChoice())),
                         static_cast<double>(m_prefs.hdrPeakNits()));
     }
     return okStatus();

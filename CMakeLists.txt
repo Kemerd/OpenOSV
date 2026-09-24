@@ -14,7 +14,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(openosv
-        VERSION 0.1.0
+        VERSION 0.2.0
         DESCRIPTION "Independent open-source DJI Osmo 360 .OSV parser, stitcher, reframer and HDR colour pipeline"
         HOMEPAGE_URL "https://github.com/Kemerd/OpenOSV"
         LANGUAGES C CXX)
@@ -29,6 +29,9 @@ option(OSV_BUILD_TESTS     "Build the Catch2 test-suite"                        
 option(OSV_BUILD_TOOLS     "Build the osvtool command line utility"             ON)
 option(OSV_WARNINGS_AS_ERRORS "Treat compiler warnings as errors"               OFF)
 option(OSV_BUILD_PREMIERE  "Build the Premiere Pro plug-ins (needs SDK paths)"  OFF)
+# The OpenFX plug-ins for DaVinci Resolve (plugins/ofx, docs/RESOLVE.md).  They
+# need no Adobe SDK, so they build in every configuration, CI included.
+option(OSV_BUILD_OFX       "Build the OpenFX plug-ins for DaVinci Resolve"     ON)
 
 # Out-of-tree SDK locations.  The Adobe SDK headers are NOT redistributable and
 # are therefore never committed; the user points these at a local download.
@@ -112,6 +115,16 @@ if(OSV_BUILD_PREMIERE)
   add_subdirectory(plugins)
 endif()
 
+# OpenFX plug-ins for DaVinci Resolve (OpenOSV.ofx.bundle), and the tests that
+# drive the built bundle through a mock OpenFX host.  After plugins/ because
+# the bundle reuses, when present, the importer's pack kernel library.
+if(OSV_BUILD_OFX)
+  add_subdirectory(plugins/ofx)
+  if(OSV_BUILD_TESTS)
+    add_subdirectory(tests/ofx)
+  endif()
+endif()
+
 # -----------------------------------------------------------------------------
 #  Summary
 # -----------------------------------------------------------------------------
@@ -125,3 +138,4 @@ message(STATUS "  Tests          : ${OSV_BUILD_TESTS}")
 message(STATUS "  Tools          : ${OSV_BUILD_TOOLS}")
 message(STATUS "  Sample clip    : ${OSV_SAMPLE_FILE}")
 message(STATUS "  Premiere plugs : ${OSV_BUILD_PREMIERE}")
+message(STATUS "  OpenFX plugs   : ${OSV_BUILD_OFX}")

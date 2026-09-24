@@ -426,6 +426,22 @@ has run it inside Premiere Pro on a Mac yet. Treat it as a preview.
 [`docs/BUILDING_MAC.md`](docs/BUILDING_MAC.md) has the build, the install
 script (`scripts/install_plugins.sh`) and exactly what has been checked.
 
+### DaVinci Resolve (preview, untested in Resolve)
+
+`OpenOSV.ofx.bundle` brings OpenOSV to DaVinci Resolve, free or Studio, as
+two OpenFX effects:
+
+- **OpenOSV Source**, a generator that opens an `.OSV` and stitches it with
+  the importer's own engine;
+- **Open 360 Reframe**, a filter for any 360 clip, with CUDA on NVIDIA.
+
+Same stitch, same camera, same controls. From the release zip, double-click
+`Install-Resolve.cmd`. From source, it builds with the Premiere plug-ins and
+`scripts\install_ofx.ps1` installs it. It passes its tests
+against a mock OpenFX host, but nobody has run it inside Resolve yet.
+[`docs/RESOLVE.md`](docs/RESOLVE.md) has the workflow and exactly what has
+been checked.
+
 ### Sequence presets
 
 An equirectangular sphere is always 2:1, so a sequence made from an `.OSV`
