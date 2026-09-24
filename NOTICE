@@ -4,9 +4,10 @@ Copyright 2026 The OpenOSV Contributors
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 OpenOSV is an independent project.  It is not affiliated with, endorsed by or
-sponsored by SZ DJI Technology Co., Ltd. ("DJI") or Adobe Inc.  DJI, Osmo and
-Osmo 360 are trademarks of DJI; Adobe, Premiere Pro and After Effects are
-trademarks of Adobe; NVIDIA and CUDA are trademarks of NVIDIA Corporation.
+sponsored by SZ DJI Technology Co., Ltd. ("DJI"), Adobe Inc. or Blackmagic
+Design.  DJI, Osmo and Osmo 360 are trademarks of DJI; Adobe, Premiere Pro and
+After Effects are trademarks of Adobe; DaVinci Resolve is a trademark of
+Blackmagic Design; NVIDIA and CUDA are trademarks of NVIDIA Corporation.
 They are used only to say what OpenOSV is compatible with.  See docs/LEGAL.md.
 
 ================================================================================
@@ -129,8 +130,12 @@ Third-party components
 * spdlog                            MIT                https://github.com/gabime/spdlog
 * fmt                               MIT                https://github.com/fmtlib/fmt
 * tinyexr                           BSD-3-Clause       https://github.com/syoyo/tinyexr
-* NVIDIA CUDA Runtime               NVIDIA EULA        (statically linked cudart in osvtool
-                                                        and the Premiere importer)
+* OpenFX API headers                BSD-3-Clause       https://github.com/AcademySoftwareFoundation/openfx
+  Copyright (c) OpenFX and contributors to the OpenFX project.  Vendored in
+  plugins/ofx/openfx (release 1.5.1, unmodified) for the DaVinci Resolve
+  plug-ins; the licence travels inside OpenOSV.ofx.bundle.
+* NVIDIA CUDA Runtime               NVIDIA EULA        (statically linked cudart in osvtool,
+                                                        the Premiere importer and OpenOSV.ofx)
 
 The Premiere Pro plug-ins are built against the Adobe Premiere Pro and After
 Effects SDKs, which are not redistributable and are not in this repository;

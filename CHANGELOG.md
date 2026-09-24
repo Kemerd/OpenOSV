@@ -6,6 +6,32 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+* **DaVinci Resolve (OpenFX), a preview not yet run inside Resolve.**
+  `OpenOSV.ofx.bundle` holds two OpenFX effects:
+  * **OpenOSV Source** is a generator. It opens a `.OSV` or `.LRF` through
+    the importer's own clip engine, compiled in unchanged, so the stitch,
+    stabilisation and colour are Premiere's. It outputs a reframed view
+    taken from the native sphere, or the 360 equirect at the timeline's
+    size. A **Choose .OSV File...** button stands in for the Browse button
+    Resolve doesn't draw, a **Clip** read-out shows the length to trim to,
+    and **Start Frame** slides the clip. Colour Output defaults to Rec. 709
+    here, because a generator can't tag a colour space.
+  * **Open 360 Reframe** is a filter for any equirectangular clip. It has
+    the Premiere effect's lenses, presets, supervision, Keyframe Easing and
+    Smooth Keyframes, and renders on the CPU or on Resolve's CUDA images and
+    stream.
+
+  `tests/ofx` loads the built bundle into a strict mock OpenFX host. It
+  compares every render with the Premiere effect's CPU render of the same
+  picture and controls. It checks the CUDA path against the CPU path, and on
+  the sample clip it checks the generator against Premiere's two-step path
+  frame for frame. Built with the Premiere plug-ins (`OSV_BUILD_OFX`) and
+  installed by `scripts/install_ofx.ps1`. The OpenFX 1.5.1 headers are
+  vendored in `plugins/ofx/openfx` (BSD-3-Clause). See
+  [docs/RESOLVE.md](docs/RESOLVE.md).
+
 ## [0.1.0] - 2026-09-23
 
 ### Added
