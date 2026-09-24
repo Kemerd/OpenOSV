@@ -8,6 +8,13 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [0.2.0] - 2026-09-24
 
+### Changed
+
+* **One download per editor.** `OpenOSV-0.2.0-premiere-windows-x64.zip`
+  holds the Premiere Pro plug-ins, and `OpenOSV-0.2.0-resolve-windows-x64.zip`
+  the DaVinci Resolve ones. Each has its own `Install.cmd`, `README.txt` and
+  licence list, and both carry `osvtool` and the LUTs.
+
 ### Added
 
 * **DaVinci Resolve (OpenFX), a preview.**

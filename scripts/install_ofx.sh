@@ -186,7 +186,7 @@ priv ditto "$BUNDLE" "$TARGET"
 priv xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
 sign_bundle "$TARGET"
 
-info "Installed. Start DaVinci Resolve and look in the Effects Library under"
-info "OpenFX, group OpenOSV: OpenOSV Source (a generator) and OpenOSV 360 Reframe"
+info "Installed. Start DaVinci Resolve. In the Edit page's Effects panel, select"
+info "Open FX and search for OpenOSV: OpenOSV Source (a generator) and OpenOSV 360 Reframe"
 info "(a filter). This build is UNTESTED on macOS: please report what you see at"
 info "https://github.com/Kemerd/OpenOSV/issues"

@@ -396,25 +396,34 @@ Measured on an RTX 5090 with the 6K test clip.
 
 ### Download
 
-1. Grab `OpenOSV-x.y.z-windows-x64.zip` from the
-   [latest release](https://github.com/Kemerd/OpenOSV/releases/latest) and
-   unzip it.
-2. Close Premiere and double-click **`Install.cmd`**. It asks for admin rights
-   once. The files aren't code-signed, so SmartScreen may step in:
-   **More info → Run anyway**.
-3. Launch Premiere **holding `Shift`**, so it rescans its plug-ins.
-4. Open **Window > Extensions > OpenOSV** (or **Window > UXP Plugins >
+One download per editor, on the
+[latest release](https://github.com/Kemerd/OpenOSV/releases/latest). Each has
+its own `Install.cmd`. The files aren't code-signed, so SmartScreen may step
+in: **More info → Run anyway**. Either installer asks for admin rights once.
+
+**Premiere Pro:** `OpenOSV-x.y.z-premiere-windows-x64.zip`
+
+1. Unzip it, close Premiere and double-click **`Install.cmd`**.
+2. Launch Premiere **holding `Shift`**, so it rescans its plug-ins.
+3. Open **Window > Extensions > OpenOSV** (or **Window > UXP Plugins >
    OpenOSV**; the installer says which).
 
-**Needs** Windows 10/11 x64 and Premiere Pro 2022 or later (tested on 2026).
+**DaVinci Resolve (preview):** `OpenOSV-x.y.z-resolve-windows-x64.zip`
+
+1. Unzip it, close Resolve and double-click **`Install.cmd`**.
+2. Start Resolve. In the Edit page's Effects panel, select **Open FX** and
+   search for **OpenOSV**.
+3. Drag **OpenOSV Source** onto the timeline and click **Choose .OSV File...**
+   in the Inspector. [`docs/RESOLVE.md`](docs/RESOLVE.md) has the rest.
+
+`Uninstall.cmd`, in the same zip, takes it all back out.
+
+**Needs** Windows 10/11 x64, and Premiere Pro 2022 or later (tested on 2026)
+or DaVinci Resolve, free or Studio (first run on 21).
 **GPU:** CUDA on NVIDIA GTX 16 / RTX 20 and newer (Turing, Ampere, Ada,
 Blackwell); OpenCL on AMD and Intel; the CPU when there's nothing else. On an
-older NVIDIA card, set **Render Device** to OpenCL in Source Settings.
-`Uninstall.cmd` takes it all back out.
-
-**DaVinci Resolve (preview):** from 0.2.0 the Windows zip also carries the
-Resolve plug-ins. Close Resolve and double-click **`Install-Resolve.cmd`**;
-`Uninstall-Resolve.cmd` removes them.
+older NVIDIA card, set **Render Device** to OpenCL (Source Settings in
+Premiere, OpenOSV Source > Advanced in Resolve).
 
 ### Build from source
 

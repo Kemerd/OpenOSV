@@ -5,8 +5,13 @@ uploaded to GitHub Releases by hand. There is no release workflow on purpose:
 the plug-ins compile against Adobe's Premiere Pro and After Effects SDKs,
 which nobody may redistribute, so a hosted runner cannot build them.
 
-What people download is one zip, `OpenOSV-x.y.z-windows-x64.zip`: unzip,
-double-click `Install.cmd`, launch Premiere holding Shift.
+What people download is one zip per editor: unzip, double-click
+`Install.cmd`.
+
+* `OpenOSV-x.y.z-premiere-windows-x64.zip`: the Premiere Pro plug-ins (then
+  launch Premiere holding Shift);
+* `OpenOSV-x.y.z-resolve-windows-x64.zip`: the DaVinci Resolve OpenFX
+  plug-ins.
 
 ## What you need
 
@@ -63,19 +68,23 @@ It prints every step. What it makes, in `dist\` (git-ignored):
 
 | File | What |
 |---|---|
-| `OpenOSV-x.y.z-windows-x64\` | the package, unzipped, for a look before upload |
-| `OpenOSV-x.y.z-windows-x64.zip` | the upload; its SHA-256 is printed |
+| `OpenOSV-x.y.z-premiere-windows-x64\` | the Premiere Pro package, unzipped, for a look before upload |
+| `OpenOSV-x.y.z-premiere-windows-x64.zip` | its upload; the SHA-256 is printed |
+| `OpenOSV-x.y.z-resolve-windows-x64\` | the DaVinci Resolve package, unzipped |
+| `OpenOSV-x.y.z-resolve-windows-x64.zip` | its upload; the SHA-256 is printed |
 | `RELEASE_NOTES.md` | a draft for the release page |
 
-Inside the zip: `Install.cmd`, `Uninstall.cmd`, `README.txt`, `LICENSE`,
-`NOTICE`, `CHANGELOG.md`, `SHA256SUMS.txt`, `plugins\OpenOSV\` (the three
-modules and their DLLs), `luts\`, `presets\`, `panel\` (CEP and UXP sources
-plus the `.ccx`), `scripts\install_plugins.ps1`, `cli\` (`osvtool.exe` and its
-DLLs) and `licenses\`. When the build made the DaVinci Resolve bundle
-(`OSV_BUILD_OFX`, on in the preset), the zip also carries
-`plugins\OpenOSV.ofx.bundle\` (`OpenOSV.ofx` and its own import closure),
-`scripts\install_ofx.ps1` and `Install-Resolve.cmd` / `Uninstall-Resolve.cmd`,
-and `licenses\` gains the OpenFX headers' licence.
+Both zips carry their own `Install.cmd`, `Uninstall.cmd`, `README.txt`,
+`LICENSE`, `NOTICE`, `CHANGELOG.md`, `SHA256SUMS.txt`, `luts\`, `cli\`
+(`osvtool.exe` and its DLLs) and `licenses\`, listing only the components
+inside that zip. On top of that:
+
+* **Premiere Pro:** `plugins\OpenOSV\` (the three modules and their DLLs),
+  `presets\`, `panel\` (CEP and UXP sources plus the `.ccx`) and
+  `scripts\install_plugins.ps1`;
+* **DaVinci Resolve:** `plugins\OpenOSV.ofx.bundle\` (`OpenOSV.ofx` and its
+  own import closure) and `scripts\install_ofx.ps1`. It is made whenever the
+  build made the bundle (`OSV_BUILD_OFX`, on in the preset).
 
 **Why it builds its own tree.** FFmpeg records its whole configure line in its
 DLLs (it is what `avutil_configuration()` returns), and vcpkg's port passes
@@ -145,8 +154,8 @@ elevated prompt (otherwise the script asks for administrator rights):
 
 ```powershell
 $test = "$env:TEMP\osv release test"
-Expand-Archive dist\OpenOSV-x.y.z-windows-x64.zip $test
-$pkg = "$test\OpenOSV-x.y.z-windows-x64"
+Expand-Archive dist\OpenOSV-x.y.z-premiere-windows-x64.zip $test
+$pkg = "$test\OpenOSV-x.y.z-premiere-windows-x64"
 powershell -NoProfile -ExecutionPolicy Bypass -File "$pkg\scripts\install_plugins.ps1" `
     -Destination "$test\MediaCore" -PresetDestination "$test\presets" -PanelDestination "$test\panel"
 & "$pkg\cli\osvtool.exe" probe <clip>.OSV
@@ -158,7 +167,7 @@ double-click `Install.cmd`, launch holding Shift, drop a clip.
 ## 7. Publish
 
 ```powershell
-gh release create vX.Y.Z dist/OpenOSV-X.Y.Z-windows-x64.zip --title "OpenOSV X.Y.Z" --notes-file dist/RELEASE_NOTES.md
+gh release create vX.Y.Z dist/OpenOSV-X.Y.Z-premiere-windows-x64.zip dist/OpenOSV-X.Y.Z-resolve-windows-x64.zip --title "OpenOSV X.Y.Z" --notes-file dist/RELEASE_NOTES.md
 ```
 
 `gh` creates the tag at the head of `main` when it does not exist yet, which

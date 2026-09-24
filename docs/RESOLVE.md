@@ -37,10 +37,11 @@ tests check this frame for frame.
 
 Resolve only looks for plug-ins when it starts, so close it first.
 
-**From the Windows release zip** (0.2.0 and later): unzip it and
-double-click **`Install-Resolve.cmd`**. It asks for admin rights once.
-**`Uninstall-Resolve.cmd`** takes the plug-ins out again. The zip's
-`Install.cmd` is the Premiere installer; the two are independent.
+**From the release** (0.2.0 and later): download
+`OpenOSV-x.y.z-resolve-windows-x64.zip`, unzip it and double-click
+**`Install.cmd`**. It asks for admin rights once. **`Uninstall.cmd`** takes
+the plug-ins out again. The Premiere Pro plug-ins are the other download;
+the two install independently.
 
 **From source.** The bundle needs **no Adobe SDK**: every build makes it
 (`OSV_BUILD_OFX`, on by default), with or without the Premiere plug-ins.

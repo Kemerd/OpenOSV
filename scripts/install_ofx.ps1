@@ -203,6 +203,7 @@ foreach ($file in $leftovers) {
 
 $files = @(Get-ChildItem -LiteralPath $target -Recurse -File)
 Write-Info ("Installed {0} files." -f $files.Count)
-Write-Info 'Start DaVinci Resolve and look in the Effects Library under OpenFX, group'
-Write-Info 'OpenOSV: OpenOSV Source (a generator) and OpenOSV 360 Reframe (a filter).'
+Write-Info 'Start DaVinci Resolve. In the Edit page''s Effects panel, select Open FX and'
+Write-Info 'search for OpenOSV: OpenOSV Source (a generator) and OpenOSV 360 Reframe (a'
+Write-Info 'filter). The search looks only inside the category selected on its left.'
 exit 0
