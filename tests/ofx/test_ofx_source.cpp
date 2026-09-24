@@ -144,6 +144,59 @@ TEST_CASE("a generator with no file renders transparent black and says nothing",
     CHECK(MockHost::instance().imagesOut == 0);
 }
 
+// ---------------------------------------------------------------------------
+//  The output format.  A generator has no input for the host to copy a
+//  format from; DaVinci Resolve labels its output OfxImageComponentNone until
+//  the generator states one in its clip preferences.
+// ---------------------------------------------------------------------------
+TEST_CASE("the generator states float RGBA output in its clip preferences", "[ofx][source]") {
+    REQUIRE(Fixture::get().ready);
+    SourceRig rig(320, 180);
+    // The out args as a host fills them before the plug-in speaks.
+    PropertySet out;
+    out.setString("OfxImageClipPropComponents_Output", kOfxImageComponentNone);
+    out.setString("OfxImageClipPropDepth_Output", kOfxBitDepthFloat);
+    out.setDouble("OfxImageClipPropPAR_Output", 1.0);
+    out.setString(kOfxImageEffectPropPreMultiplication, kOfxImagePreMultiplied);
+    out.setInt(kOfxImageEffectFrameVarying, 0);
+    REQUIRE(Fixture::get().source.action(kOfxImageEffectActionGetClipPreferences, rig.effect->handle(), nullptr,
+                                         &out) == kOfxStatOK);
+    CHECK(out.getString("OfxImageClipPropComponents_Output") == kOfxImageComponentRGBA);
+    CHECK(out.getString("OfxImageClipPropDepth_Output") == kOfxBitDepthFloat);
+    CHECK(out.getInt(kOfxImageEffectFrameVarying) == 1);
+    CHECK(out.getString(kOfxImageEffectPropPreMultiplication) == kOfxImageUnPreMultiplied);
+}
+
+TEST_CASE("an output labelled OfxImageComponentNone is used only with a host-reported pitch", "[ofx][source]") {
+    REQUIRE(Fixture::get().ready);
+    SourceRig rig(320, 180);
+    Clip* out = rig.effect->clip(kOfxImageEffectOutputClipName);
+    REQUIRE(out);
+    HostImage& image = rig.output;
+
+    // Resolve's label on its own float RGBA buffer, pitch reported: rendered
+    // (transparent black, as there is no file).
+    out->provide = [&image](double, PropertySet& props) {
+        image.describe(props);
+        props.setString(kOfxImageEffectPropComponents, kOfxImageComponentNone);
+        return true;
+    };
+    REQUIRE(rig.render() == kOfxStatOK);
+    CHECK(rig.allTransparent());
+
+    // The same label with no pitch proves nothing about the buffer: refused,
+    // and not one pixel written.
+    out->provide = [&image](double, PropertySet& props) {
+        image.describe(props);
+        props.setString(kOfxImageEffectPropComponents, kOfxImageComponentNone);
+        props.setInt(kOfxImagePropRowBytes, 0);
+        return true;
+    };
+    CHECK(rig.render() == kOfxStatErrImageFormat);
+    CHECK_FALSE(rig.allTransparent());
+    CHECK(MockHost::instance().imagesOut == 0);
+}
+
 TEST_CASE("a file that is not an Osmo 360 clip is reported once and renders nothing", "[ofx][source]") {
     REQUIRE(Fixture::get().ready);
     const std::filesystem::path junk = std::filesystem::temp_directory_path() / "openosv-ofx-not-a-clip.OSV";

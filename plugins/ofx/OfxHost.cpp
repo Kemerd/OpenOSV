@@ -599,6 +599,7 @@ ClipImage::ClipImage(OfxImageClipHandle clip, OfxTime time) noexcept {
         bounds = OfxRectI{b[0], b[1], b[2], b[3]};
     }
     rowBytes = getInt(image, kOfxImagePropRowBytes);
+    rowBytesFromHost = rowBytes != 0;
     depth = getString(image, kOfxImageEffectPropPixelDepth);
     components = getString(image, kOfxImageEffectPropComponents);
     // A host that reports no pitch at all hands out tightly packed rows (the
@@ -624,11 +625,21 @@ bool ClipImage::isFloatRgba(bool lenient) const noexcept {
     if (static_cast<long long>(rowBytes < 0 ? -rowBytes : rowBytes) < static_cast<long long>(width()) * 16) {
         return false;
     }
-    // An empty label is accepted only when the caller allows it: DaVinci
-    // Resolve has been seen to leave the components of a GENERATOR's output
-    // image unset, while the image itself is its usual float RGBA.
+    // Unlabelled images are accepted only when the caller allows it: DaVinci
+    // Resolve labels a GENERATOR's output OfxImageComponentNone unless the
+    // generator states its format in kOfxImageEffectActionGetClipPreferences
+    // (OfxSource.cpp does), while the image itself is its usual float RGBA.
+    // "None" is trusted only with a host-reported pitch, so every byte this
+    // plug-in writes is inside the host's own allocation.
     const bool depthOk = depth == kOfxBitDepthFloat || (lenient && depth.empty());
-    const bool componentsOk = components == kOfxImageComponentRGBA || (lenient && components.empty());
+    const bool unlabelled = components.empty() || (components == kOfxImageComponentNone && rowBytesFromHost);
+    const bool componentsOk = components == kOfxImageComponentRGBA || (lenient && unlabelled);
+    if (depthOk && componentsOk && components != kOfxImageComponentRGBA) {
+        PluginLog::oncef("ofx/image/unlabelled", PluginLog::Level::Warn,
+                         "ofx: the host labelled an image '{}' '{}' with {} bytes per row for {} pixels; treating it "
+                         "as float RGBA",
+                         depth, components, rowBytes, width());
+    }
     return depthOk && componentsOk;
 }
 

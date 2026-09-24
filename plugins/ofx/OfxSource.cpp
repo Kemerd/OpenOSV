@@ -461,9 +461,13 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
         return kOfxStatFailed;
     }
     if (!output.isFloatRgba(true)) {
+        // The pitch and bounds too: they tell a mislabelled float RGBA image
+        // apart from a genuinely different format.
         PluginLog::oncef("ofx/source/format", PluginLog::Level::Error,
-                         "ofx source: output image is '{}' '{}' - only 32-bit float RGBA is supported", output.depth,
-                         output.components);
+                         "ofx source: output image is '{}' '{}' ({}x{}, {} bytes per row{}) - only 32-bit float "
+                         "RGBA is supported",
+                         output.depth, output.components, output.width(), output.height(), output.rowBytes,
+                         output.rowBytesFromHost ? "" : ", pitch not reported");
         return kOfxStatErrImageFormat;
     }
     OfxPropertySetHandle effectPropSet = effectProps(effect);
@@ -621,6 +625,13 @@ OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySetHandle
             return describeInContext(effect);
         }
         if (isAction(action, kOfxImageEffectActionGetClipPreferences)) {
+            // A generator has no input for the host to copy a format from,
+            // so the output's components and depth are stated here.  Left
+            // unstated, DaVinci Resolve hands the generator an image
+            // labelled OfxImageComponentNone.  The property names are the
+            // specification's "<property>_<clip name>" form.
+            setString(outArgs, "OfxImageClipPropComponents_" kOfxImageEffectOutputClipName, kOfxImageComponentRGBA);
+            setString(outArgs, "OfxImageClipPropDepth_" kOfxImageEffectOutputClipName, kOfxBitDepthFloat);
             // Every frame differs (it is a movie), and the picture carries
             // straight coverage alpha - the importer's own declaration.
             setInt(outArgs, kOfxImageEffectFrameVarying, 1);

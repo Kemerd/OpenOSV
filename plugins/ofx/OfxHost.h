@@ -232,6 +232,7 @@ public:
     void* data = nullptr;           ///< kOfxImagePropData.
     OfxRectI bounds{0, 0, 0, 0};    ///< kOfxImagePropBounds (pixels).
     int rowBytes = 0;               ///< kOfxImagePropRowBytes (may be negative in principle).
+    bool rowBytesFromHost = false;  ///< True when the host reported the pitch (not the width * 16 fallback).
     std::string depth;              ///< kOfxImageEffectPropPixelDepth.
     std::string components;         ///< kOfxImageEffectPropComponents.
 
@@ -239,9 +240,12 @@ public:
     [[nodiscard]] int height() const noexcept { return bounds.y2 - bounds.y1; }
 
     /// True for a 32-bit float RGBA image, the only kind the effects accept.
-    /// `lenient` also accepts an image whose depth / components labels are
-    /// EMPTY (not wrong) as long as its pitch holds four floats per pixel -
-    /// what DaVinci Resolve hands a generator.
+    /// `lenient` (a generator's output) also accepts UNLABELLED images as
+    /// long as the pitch holds four floats per pixel:
+    ///   - an empty depth or components label;
+    ///   - components kOfxImageComponentNone, but only with a pitch the host
+    ///     reported itself, so the four floats per pixel are proven by the
+    ///     host's own allocation rather than assumed.
     [[nodiscard]] bool isFloatRgba(bool lenient = false) const noexcept;
 
 private:
