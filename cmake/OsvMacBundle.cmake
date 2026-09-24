@@ -48,8 +48,13 @@ if(NOT APPLE)
   return()
 endif()
 
-set(OSV_MAC_BUNDLE_DYLIBS_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/OsvMacBundleDylibs.cmake")
-set(OSV_MAC_PLUGIN_PLIST_TEMPLATE "${CMAKE_CURRENT_LIST_DIR}/macos/PluginInfo.plist.in")
+# The post-build script and the Info.plist template are located inside
+# osv_add_mac_bundle() itself, from CMAKE_CURRENT_FUNCTION_LIST_DIR - NOT set
+# here as plain variables.  include_guard(GLOBAL) makes every include after
+# the first a no-op, and a plain variable set by the first include lives only
+# in THAT directory's scope: tests/macos includes this file before
+# plugins/ofx does, so plugins/ofx saw both paths empty and configure_file()
+# was handed its own source folder.
 
 # Where the post-build step looks for the dylibs a bundle loads: vcpkg's lib
 # folder for the triplet (Debug first in a Debug build).
@@ -77,6 +82,16 @@ function(osv_add_mac_bundle TARGET)
   endif()
   file(MAKE_DIRECTORY "${ARG_OUTPUT_DIRECTORY}")
 
+  # This file's own folder, whichever directory scope calls the function (see
+  # the note above the search directories).
+  set(_dylibs_script "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/OsvMacBundleDylibs.cmake")
+  set(_plist_template "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/macos/PluginInfo.plist.in")
+  foreach(_helper IN ITEMS "${_dylibs_script}" "${_plist_template}")
+    if(NOT EXISTS "${_helper}")
+      message(FATAL_ERROR "osv_add_mac_bundle(${TARGET}): '${_helper}' is missing")
+    endif()
+  endforeach()
+
   add_library(${TARGET} MODULE ${ARG_SOURCES})
 
   # The name the bundle folder and its executable carry: the target's own
@@ -95,7 +110,7 @@ function(osv_add_mac_bundle TARGET)
   set(OSV_BUNDLE_PACKAGE_TYPE "${ARG_PACKAGE_TYPE}")
   set(OSV_BUNDLE_SIGNATURE "${ARG_SIGNATURE}")
   set(_plist "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}-Info.plist")
-  configure_file("${OSV_MAC_PLUGIN_PLIST_TEMPLATE}" "${_plist}" @ONLY)
+  configure_file("${_plist_template}" "${_plist}" @ONLY)
 
   set_target_properties(${TARGET} PROPERTIES
     BUNDLE TRUE
@@ -132,7 +147,7 @@ function(osv_add_mac_bundle TARGET)
             "-DBINARY=$<TARGET_FILE:${TARGET}>"
             "-DSEARCH_DIRS=${_search_dirs_joined}"
             "-DPREFIX=OpenOSV_"
-            -P "${OSV_MAC_BUNDLE_DYLIBS_SCRIPT}"
+            -P "${_dylibs_script}"
     COMMENT "Embedding the shared libraries of ${TARGET}.${ARG_EXTENSION} and signing it"
     VERBATIM)
 endfunction()

@@ -232,7 +232,7 @@ The following can't be checked without Resolve:
 | `plugins/ofx/OfxCamera.*` | The camera controls: describe, read (easing, smoothing), supervise |
 | `plugins/ofx/OfxReframe.*`, `OfxRender.*`, `OfxCuda.*`, `OfxReframeKernel.cu` | The filter, its CPU loop and its CUDA launch |
 | `plugins/ofx/OfxSource.*`, `OfxSourceParams.*`, `OfxFileDialog.*` | The generator, its stitch controls, the Choose File dialog |
-| `plugins/ofx/OfxEngineHooks.cpp` | The two settings hooks the clip engine links against (Premiere's direct-path engine has no counterpart here) |
+| `plugins/importer/EngineNoDirect.cpp` | The clip engine's answer when there is no direct GPU path, which an OpenFX host never has |
 | `plugins/ofx/openfx/` | OpenFX 1.5.1 headers, vendored (BSD-3-Clause) |
 | `tests/ofx/` | The mock OpenFX host and the tests |
 | `plugins/ofx/OfxFileDialogMac.mm` | The macOS Choose File panel |
