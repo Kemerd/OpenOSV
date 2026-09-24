@@ -6,6 +6,8 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-23
+
 ### Added
 
 * **DaVinci Resolve (OpenFX), a preview not yet run inside Resolve.**

@@ -427,8 +427,9 @@ two OpenFX effects:
   the importer's own engine;
 - **Open 360 Reframe**, a filter for any 360 clip, with CUDA on NVIDIA.
 
-Same stitch, same camera, same controls. It builds with the Premiere
-plug-ins, and `scripts\install_ofx.ps1` installs it. It passes its tests
+Same stitch, same camera, same controls. From the release zip, double-click
+`Install-Resolve.cmd`. From source, it builds with the Premiere plug-ins and
+`scripts\install_ofx.ps1` installs it. It passes its tests
 against a mock OpenFX host, but nobody has run it inside Resolve yet.
 [`docs/RESOLVE.md`](docs/RESOLVE.md) has the workflow and exactly what has
 been checked.

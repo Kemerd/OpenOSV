@@ -24,9 +24,10 @@
     same arguments.
 
 .PARAMETER StageDir
-    The bundle the build produced (OSV_OFX_STAGE_DIR\OpenOSV.ofx.bundle, by
-    default <build>\plugins\ofx\OpenOSV.ofx.bundle).  When omitted the script
-    takes the newest one under <repo>\build\*.
+    The bundle to install.  When omitted the script takes the release
+    package's plugins\OpenOSV.ofx.bundle when it runs from a package
+    (scripts\package_release.ps1), and otherwise the newest
+    <repo>\build\*\plugins\ofx\OpenOSV.ofx.bundle.
 
 .PARAMETER Destination
     Overrides the OFX plug-in folder (a dry run into a scratch directory, or
@@ -116,10 +117,16 @@ function Invoke-Elevated {
 }
 
 # ---------------------------------------------------------------------------
-#  The newest bundle under <repo>\build\* when the caller named none.
+#  The bundle to install when the caller named none: the release package's
+#  plugins\OpenOSV.ofx.bundle beside this script's folder, else the newest
+#  one under <repo>\build\*.
 # ---------------------------------------------------------------------------
 function Find-Bundle {
     $repo = Split-Path -Parent $PSScriptRoot
+    $packaged = Join-Path $repo "plugins\$BundleName"
+    if (Test-Path -LiteralPath (Join-Path $packaged $BinaryRelative)) {
+        return $packaged
+    }
     $build = Join-Path $repo 'build'
     if (-not (Test-Path -LiteralPath $build)) { return $null }
     $candidates = Get-ChildItem -LiteralPath $build -Directory | ForEach-Object {

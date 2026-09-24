@@ -37,7 +37,9 @@
      3. Assembles the package.  Everything install_plugins.ps1 needs sits
         where that script looks for it (plugins\OpenOSV, luts, presets,
         panel, all beside its own scripts\ folder), so the packaged script
-        installs from the package with no arguments.  cli\ holds osvtool.exe
+        installs from the package with no arguments.  The DaVinci Resolve
+        bundle goes to plugins\OpenOSV.ofx.bundle, where install_ofx.ps1
+        looks for it, with its own Install-Resolve.cmd.  cli\ holds osvtool.exe
         and exactly the DLLs it imports.  The module and CLI DLL sets are
         the import closure walked with dumpbin, so a stale DLL left in the
         build folder by an older FFmpeg is never shipped.
@@ -143,6 +145,12 @@ $script:DefaultBuildDir = Join-Path $script:RepoRoot 'build\release-package'
 
 # The three modules install_plugins.ps1 installs (the same list it keeps).
 $script:PluginModules = @('OpenOSVImporter.prm', 'Open360Reframe.aex', 'OpenOSVSourceSettings.aex')
+
+# The OpenFX bundle for DaVinci Resolve (plugins/ofx, docs/RESOLVE.md): the
+# folder install_ofx.ps1 installs and the binary inside it.  Shipped whenever
+# the build made it (OSV_BUILD_OFX, on in the release preset).
+$script:OfxBundleName = 'OpenOSV.ofx.bundle'
+$script:OfxBinary = 'Contents\Win64\OpenOSV.ofx'
 
 # ---------------------------------------------------------------------------
 #  The CUDA architectures README.txt, the release notes and README.md
@@ -567,6 +575,20 @@ function Get-BuildInfo {
         throw "The build has no '$osvtool'."
     }
 
+    # The OpenFX bundle: required when the build was configured with it, so
+    # a half-built bundle fails here rather than shipping without Resolve.
+    $ofxBundle = $null
+    if ((Get-CacheValue $cache 'OSV_BUILD_OFX') -match '^(ON|TRUE|1|YES)$') {
+        $ofxStage = Get-CacheValue $cache 'OSV_OFX_STAGE_DIR'
+        if (-not $ofxStage) {
+            $ofxStage = Join-Path $Dir 'plugins\ofx'
+        }
+        $ofxBundle = [System.IO.Path]::GetFullPath((Join-Path $ofxStage $script:OfxBundleName))
+        if (-not (Test-Path -LiteralPath (Join-Path $ofxBundle $script:OfxBinary) -PathType Leaf)) {
+            throw "The build has no '$($script:OfxBinary)' in '$ofxBundle'. Build the $($script:Preset) preset completely first."
+        }
+    }
+
     # dumpbin walks the import tables.  The plug-in build records the one
     # it used; the developer environment's is the fallback.
     $dumpbin = Get-CacheValue $cache 'OSV_DUMPBIN_EXE'
@@ -631,6 +653,7 @@ function Get-BuildInfo {
         Installed    = $installed
         Share        = $share
         Cuda         = $cuda
+        OfxBundle    = $ofxBundle
         FfmpegBanner = if ($ffmpegLine.Count -gt 0) { $ffmpegLine[0].Trim() } else { '' }
     }
 }
@@ -739,6 +762,42 @@ function Copy-PluginModules {
         Write-Info "left out of the package (not imported by any module): $($item.Name)"
     }
     Write-Info ("plugins\OpenOSV: {0} modules, {1} DLLs" -f $roots.Count, $dlls.Count)
+    return @($dlls | ForEach-Object { Split-Path -Leaf $_ })
+}
+
+# ---------------------------------------------------------------------------
+#  plugins\OpenOSV.ofx.bundle: the OpenFX binary plus its import closure,
+#  taken from the bundle's own Contents\Win64 (the folder its delay-load
+#  hook loads them from), and the OpenFX licence under Contents\Resources.
+#  Anything else in the built bundle - a PDB, a stale DLL - stays out.
+# ---------------------------------------------------------------------------
+function Copy-OfxBundle {
+    param($Build, [string] $Package)
+    $sourceBin = Join-Path $Build.OfxBundle 'Contents\Win64'
+    $target = Join-Path $Package "plugins\$($script:OfxBundleName)"
+    $targetBin = Join-Path $target 'Contents\Win64'
+    $targetRes = Join-Path $target 'Contents\Resources'
+    New-Directory $targetBin
+    New-Directory $targetRes
+
+    $root = Join-Path $Build.OfxBundle $script:OfxBinary
+    $dlls = Resolve-DllClosure -Roots @($root) -SearchDir $sourceBin -Dumpbin $Build.Dumpbin
+    foreach ($file in (@($root) + @($dlls))) {
+        Copy-Item -LiteralPath $file -Destination $targetBin -Force
+    }
+    $licence = Join-Path $Build.OfxBundle 'Contents\Resources\OpenFX-LICENSE.md'
+    if (-not (Test-Path -LiteralPath $licence -PathType Leaf)) {
+        throw "The built bundle has no '$licence'."
+    }
+    Copy-Item -LiteralPath $licence -Destination $targetRes -Force
+
+    $shipped = @((@($root) + @($dlls)) | ForEach-Object { (Split-Path -Leaf $_).ToLowerInvariant() })
+    $left = @(Get-ChildItem -LiteralPath $sourceBin -File |
+        Where-Object { $shipped -notcontains $_.Name.ToLowerInvariant() })
+    foreach ($item in $left) {
+        Write-Info "left out of the bundle (not imported by OpenOSV.ofx): $($item.Name)"
+    }
+    Write-Info ("plugins\{0}: OpenOSV.ofx, {1} DLLs" -f $script:OfxBundleName, $dlls.Count)
     return @($dlls | ForEach-Object { Split-Path -Leaf $_ })
 }
 
@@ -911,7 +970,7 @@ function Copy-Panel {
 #  name works; arguments are passed through to the script.
 # ---------------------------------------------------------------------------
 function Write-InstallCommands {
-    param([string] $Package)
+    param([string] $Package, [switch] $Resolve)
 
     $common = @'
 @echo off
@@ -1005,6 +1064,92 @@ echo ==============================================================
     # file with bare LF line endings.
     Write-AsciiFile -Path (Join-Path $Package 'Install.cmd') -Text $install -LineEnding CRLF
     Write-AsciiFile -Path (Join-Path $Package 'Uninstall.cmd') -Text $uninstall -LineEnding CRLF
+
+    if ($Resolve) {
+        Write-ResolveCommands -Package $Package
+    }
+}
+
+# ---------------------------------------------------------------------------
+#  Install-Resolve.cmd / Uninstall-Resolve.cmd: the same wrapper around
+#  scripts\install_ofx.ps1, which copies plugins\OpenOSV.ofx.bundle into
+#  Common Files\OFX\Plugins.  DaVinci Resolve holds its plug-ins open while
+#  it runs and only scans for them when it starts, so it must be closed.
+# ---------------------------------------------------------------------------
+function Write-ResolveCommands {
+    param([string] $Package)
+
+    $common = @'
+@echo off
+rem ===========================================================================
+rem  OpenOSV - @TITLE@
+rem
+rem  Double-click it.  It runs scripts\install_ofx.ps1 from this folder with
+rem  "-ExecutionPolicy Bypass" for that one PowerShell process, which is what
+rem  lets a script that came out of a downloaded zip run.  The machine's
+rem  policy is not changed.  OpenFX plug-ins live under Program Files, so the
+rem  script asks Windows for administrator rights (a UAC prompt).
+rem ===========================================================================
+setlocal EnableExtensions DisableDelayedExpansion
+
+set "OSV_SCRIPT=%~dp0scripts\install_ofx.ps1"
+if not exist "%OSV_SCRIPT%" goto :missing
+
+tasklist /NH /FI "IMAGENAME eq Resolve.exe" 2>nul | find /I "Resolve.exe" >nul && goto :hostopen
+
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%OSV_SCRIPT%" @SWITCH@%*
+set "OSV_EXIT=%ERRORLEVEL%"
+echo.
+if not "%OSV_EXIT%"=="0" goto :failed
+@DONE@
+goto :end
+
+:failed
+echo ==============================================================
+echo  That did not work (exit code %OSV_EXIT%). The lines above say why.
+echo ==============================================================
+goto :end
+
+:hostopen
+echo Close DaVinci Resolve first, then run @NAME@ again.
+echo It holds its plug-ins open while it runs.
+set "OSV_EXIT=1"
+goto :end
+
+:missing
+echo Cannot find "%OSV_SCRIPT%".
+echo Extract the WHOLE zip first, then run @NAME@ from the extracted folder.
+set "OSV_EXIT=1"
+goto :end
+
+:end
+echo.
+pause
+exit /b %OSV_EXIT%
+'@
+
+    $installDone = @'
+echo ==============================================================
+echo  OpenOSV for DaVinci Resolve is installed (a preview).
+echo.
+echo  Start Resolve. In the Effects Library, under OpenFX, group
+echo  OpenOSV: OpenOSV Source (a generator, for .OSV clips) and
+echo  Open 360 Reframe (a filter, for any 360 clip).
+echo ==============================================================
+'@
+
+    $uninstallDone = @'
+echo ==============================================================
+echo  OpenOSV for DaVinci Resolve is removed.
+echo ==============================================================
+'@
+
+    $install = $common.Replace('@TITLE@', 'Install-Resolve.cmd: install the DaVinci Resolve plug-ins from this folder.').
+        Replace('@NAME@', 'Install-Resolve.cmd').Replace('@SWITCH@', '').Replace('@DONE@', $installDone.TrimEnd())
+    $uninstall = $common.Replace('@TITLE@', 'Uninstall-Resolve.cmd: remove what Install-Resolve.cmd put in place.').
+        Replace('@NAME@', 'Uninstall-Resolve.cmd').Replace('@SWITCH@', '-Uninstall ').Replace('@DONE@', $uninstallDone.TrimEnd())
+    Write-AsciiFile -Path (Join-Path $Package 'Install-Resolve.cmd') -Text $install -LineEnding CRLF
+    Write-AsciiFile -Path (Join-Path $Package 'Uninstall-Resolve.cmd') -Text $uninstall -LineEnding CRLF
 }
 
 # ---------------------------------------------------------------------------
@@ -1050,7 +1195,7 @@ function Format-Wrapped {
 #  launch, where the OpenOSV window is.  Notepad-friendly (ASCII, CRLF).
 # ---------------------------------------------------------------------------
 function Write-PackageReadme {
-    param([string] $Package, [string] $Version, [string] $Commit, [string] $CcxName)
+    param([string] $Package, [string] $Version, [string] $Commit, [string] $CcxName, [switch] $Resolve)
 
     $requirements = (Get-RequirementLines | ForEach-Object { Format-Wrapped -Text $_ -First '* ' -Rest '  ' }) -join "`n"
 
@@ -1104,7 +1249,7 @@ Close Premiere Pro and double-click Uninstall.cmd. Then start Premiere
 once while holding Shift, so it forgets the plug-ins.
 
 
-COMMAND LINE
+@RESOLVE@COMMAND LINE
 ------------
 cli\osvtool.exe works without Premiere: inspect a clip, render stills or
 HDR video, write LUTs. "cli\osvtool.exe --help" lists the commands.
@@ -1125,7 +1270,7 @@ panel\                         the OpenOSV window, CEP and UXP builds;
                                @CCX@ is the UXP installer
 scripts\install_plugins.ps1    what Install.cmd and Uninstall.cmd run
 cli\                           osvtool.exe and its DLLs
-licenses\                      third-party licences (FFmpeg is LGPL-2.1)
+@RESOLVEFILES@licenses\                      third-party licences (FFmpeg is LGPL-2.1)
 LICENSE, NOTICE                OpenOSV is Apache-2.0
 CHANGELOG.md                   what changed
 SHA256SUMS.txt                 SHA-256 of every file here
@@ -1140,9 +1285,45 @@ TROUBLE
   policy centrally, and it wins. Ask whoever runs your IT.
 * Anything else: https://github.com/Kemerd/OpenOSV/issues
 '@
+    # The DaVinci Resolve preview, when this package carries it.
+    $resolveSection = ''
+    $resolveFiles = ''
+    if ($Resolve) {
+        $resolveSection = @'
+DAVINCI RESOLVE (PREVIEW)
+-------------------------
+The same stitch and camera as OpenFX plug-ins, for DaVinci Resolve free
+or Studio. A preview: tested against a mock OpenFX host, not yet run
+inside Resolve. Please report what you see.
+
+1. Close DaVinci Resolve and double-click Install-Resolve.cmd (admin
+   rights, like Install.cmd).
+2. Start Resolve. In the Effects Library, under OpenFX, group OpenOSV:
+   * OpenOSV Source - a generator. Drop it on the timeline, click
+     "Choose .OSV File...", trim it to the length its Clip line shows.
+   * Open 360 Reframe - a filter for any 360 equirect clip. Set Project
+     Settings > Image Scaling > Mismatched resolution to "Stretch frame
+     to all corners" so the sphere fills the frame.
+3. Audio: cli\osvtool.exe extract CAM_0001.OSV --audio CAM_0001.aac
+
+Uninstall-Resolve.cmd removes it. The full guide is docs/RESOLVE.md in
+the repository: https://github.com/Kemerd/OpenOSV/blob/main/docs/RESOLVE.md
+The log is %LOCALAPPDATA%\OpenOSV\OpenOSVOfx.log.
+
+
+'@
+        $resolveFiles = @'
+Install-Resolve.cmd,           the DaVinci Resolve preview (OpenFX)
+Uninstall-Resolve.cmd
+plugins\OpenOSV.ofx.bundle\    the OpenFX plug-ins and the DLLs they load
+scripts\install_ofx.ps1        what Install-Resolve.cmd runs
+
+'@
+    }
     $title = "OpenOSV $Version for Windows x64"
     $text = $text.Replace('@TITLE@', ($title + "`n" + ('=' * $title.Length))).Replace('@COMMIT@', $Commit).
-        Replace('@REQUIREMENTS@', $requirements).Replace('@CCX@', $CcxName)
+        Replace('@REQUIREMENTS@', $requirements).Replace('@CCX@', $CcxName).
+        Replace('@RESOLVE@', $resolveSection.Replace("`r`n", "`n")).Replace('@RESOLVEFILES@', $resolveFiles.Replace("`r`n", "`n"))
     Write-AsciiFile -Path (Join-Path $Package 'README.txt') -Text $text -LineEnding CRLF
 }
 
@@ -1333,7 +1514,7 @@ OpenOSV's own source: https://github.com/Kemerd/OpenOSV
 #  licence text, and README.txt saying which is where.
 # ---------------------------------------------------------------------------
 function Write-Licenses {
-    param($Build, [string] $Package, [string[]] $PluginDlls, [string[]] $CliDlls)
+    param($Build, [string] $Package, [string[]] $PluginDlls, [string[]] $CliDlls, [string[]] $OfxDlls = @())
 
     $target = Join-Path $Package 'licenses'
     New-Directory $target
@@ -1353,8 +1534,19 @@ function Write-Licenses {
         }
     }
 
+    foreach ($dll in @($OfxDlls)) {
+        $key = $dll.ToLowerInvariant()
+        $path = "plugins\$($script:OfxBundleName)\Contents\Win64\$dll"
+        if ($where.ContainsKey($key)) {
+            $where[$key] += $path
+        }
+        else {
+            $where[$key] = @($path)
+        }
+    }
+
     # Every shipped DLL must belong to a known component.
-    $allDlls = @(@($PluginDlls) + @($CliDlls) | Sort-Object -Unique)
+    $allDlls = @(@($PluginDlls) + @($CliDlls) + @($OfxDlls) | Sort-Object -Unique)
     foreach ($dll in $allDlls) {
         $owner = @($script:ThirdParty | Where-Object { $_.ContainsKey('Dll') -and $dll -match $_.Dll })
         if ($owner.Count -eq 0) {
@@ -1416,10 +1608,29 @@ function Write-Licenses {
                 $cudart = [string]$v.cuda_cudart.version
             }
         }
+        $cudaWhere = 'OpenOSVImporter.prm, Open360Reframe.aex, osvtool.exe'
+        if ($Build.OfxBundle) {
+            $cudaWhere += ', OpenOSV.ofx'
+        }
         $rows.Add("NVIDIA CUDA Runtime (cudart_static) $cudart")
         $rows.Add('    licence : NVIDIA CUDA Toolkit End User License Agreement, NVIDIA-CUDA-EULA.txt')
         $rows.Add('              (it lists the static runtime among the redistributable files)')
-        $rows.Add('    where   : compiled into OpenOSVImporter.prm, Open360Reframe.aex, osvtool.exe')
+        $rows.Add((Format-Wrapped -Text "compiled into $cudaWhere" -First '    where   : ' -Rest '              '))
+        $rows.Add('')
+    }
+
+    # The OpenFX API headers the Resolve plug-in is compiled against:
+    # vendored in the repository, not a vcpkg port, so the text comes from
+    # there.
+    if ($Build.OfxBundle) {
+        $ofxLicence = Join-Path $script:RepoRoot 'plugins\ofx\openfx\LICENSE.md'
+        if (-not (Test-Path -LiteralPath $ofxLicence -PathType Leaf)) {
+            throw "'$ofxLicence' is missing; the OpenFX headers' licence ships with the bundle."
+        }
+        Copy-Item -LiteralPath $ofxLicence -Destination (Join-Path $target 'OpenFX.txt') -Force
+        $rows.Add('OpenFX API headers 1.5.1')
+        $rows.Add('    licence : BSD-3-Clause, OpenFX.txt')
+        $rows.Add('    where   : compiled into OpenOSV.ofx')
         $rows.Add('')
     }
 
@@ -2012,7 +2223,7 @@ The full list is in `CHANGELOG.md`, in the zip and in the repository.
 * **Unsigned binaries.** SmartScreen warns on first run; Windows 11's Smart App Control, when it is on, may block unsigned plug-ins like these.
 * **CUDA covers Turing and newer** (GTX 16 / RTX 20 and later). On an older NVIDIA card, set **Render Device** to OpenCL in Source Settings; that setup is untested.
 * **No neural optical flow in the download.** Its runtime is 1.4 GB, so Auto uses the classical flow, which is the one the stitch is tuned on. Building from source with ONNX Runtime adds it back.
-* **Windows x64 and Premiere Pro only.** No macOS build, no Resolve or Final Cut plug-in; `osvtool` renders for any other editor.
+* **Windows x64.** Premiere Pro, plus a DaVinci Resolve preview (`Install-Resolve.cmd`: OpenFX, tested against a mock host, not yet run inside Resolve). No macOS build or Final Cut plug-in; `osvtool` renders for any other editor.
 * Tested on Premiere Pro 2026 with Osmo 360 footage.
 
 ## Checksums
@@ -2101,11 +2312,18 @@ try {
     Write-Step "Assembling $package"
 
     $pluginDlls = Copy-PluginModules -Build $build -Package $package
+    $ofxDlls = @()
+    if ($build.OfxBundle) {
+        $ofxDlls = Copy-OfxBundle -Build $build -Package $package
+    }
     $cliDlls = Copy-CommandLineTool -Build $build -Package $package
     Test-PackagedCli -Package $package -Version $version
 
     New-Directory (Join-Path $package 'scripts')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'install_plugins.ps1') -Destination (Join-Path $package 'scripts') -Force
+    if ($build.OfxBundle) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'install_ofx.ps1') -Destination (Join-Path $package 'scripts') -Force
+    }
 
     Write-Step 'Generating the LUTs with the packaged osvtool'
     New-PackageLuts -Package $package
@@ -2116,9 +2334,10 @@ try {
     # ---- 5. texts -----------------------------------------------------------
     Write-Step 'Writing the texts and licences'
     Copy-ProjectTexts -Package $package
-    Write-InstallCommands -Package $package
-    Write-PackageReadme -Package $package -Version $version -Commit $commit -CcxName $ccxName
-    Write-Licenses -Build $build -Package $package -PluginDlls $pluginDlls -CliDlls $cliDlls
+    $withResolve = [bool]$build.OfxBundle
+    Write-InstallCommands -Package $package -Resolve:$withResolve
+    Write-PackageReadme -Package $package -Version $version -Commit $commit -CcxName $ccxName -Resolve:$withResolve
+    Write-Licenses -Build $build -Package $package -PluginDlls $pluginDlls -CliDlls $cliDlls -OfxDlls $ofxDlls
     $ffmpegVersion = Get-PortVersion -Share $build.Share -Port 'ffmpeg'
     Write-Checksums -Package $package
 

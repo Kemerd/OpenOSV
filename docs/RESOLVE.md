@@ -30,6 +30,13 @@ tests check this frame for frame.
 
 Resolve only looks for plug-ins when it starts, so close it first.
 
+**From the release zip** (0.2.0 and later): unzip it and double-click
+**`Install-Resolve.cmd`**. It asks for admin rights once.
+**`Uninstall-Resolve.cmd`** takes the plug-ins out again. The zip's
+`Install.cmd` is the Premiere installer; the two are independent.
+
+**From source:**
+
 ```powershell
 # Build (the Premiere preset builds the OpenFX bundle too; OSV_BUILD_OFX=ON)
 $env:VCPKG_ROOT = "C:\vcpkg"
