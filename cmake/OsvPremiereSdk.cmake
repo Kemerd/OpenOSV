@@ -26,7 +26,7 @@
 #                       PrSDKAESupport.h / PrSDKPixelFormat.h shipped with the
 #                       Premiere SDK win over the older ones in the AE SDK.
 #
-#    osv_add_premiere_plugin(<target> KIND prm|aex|ofx SOURCES ...
+#    osv_add_premiere_plugin(<target> KIND prm|aex SOURCES ...
 #                            [OUTPUT_DIRECTORY <dir>])
 #    osv_add_pipl(<target> R_FILE <file.r> OUT_VAR <var>
 #                 [RC_FILE <file.rc>] [DEPENDS ...])
@@ -36,9 +36,28 @@
 #    OSV_PREMIERE_SDK_IMPORTMOD_VERSION   e.g. "24 (23.2)"
 #    OSV_AE_SDK_SPEC_VERSION              e.g. "13.29"
 #    OSV_PLUGIN_STAGE_DIR                 cache PATH, where plug-ins are staged
+#
+#  macOS.  The same three functions build Mac bundles instead (see the
+#  APPLE branches below, and docs/BUILDING_MAC.md):
+#    * osv_add_premiere_plugin makes a loadable bundle - KIND prm becomes
+#      <target>.bundle (package type BNDL, like Adobe's importer samples),
+#      KIND aex becomes <target>.plugin (eFKT / FXTC, like the AE samples) -
+#      compiled with hidden visibility, and a post-build step copies the
+#      FFmpeg dylibs the module loads into Contents/Frameworks under
+#      OpenOSV-prefixed install names and signs everything ad hoc
+#      (cmake/OsvMacBundleDylibs.cmake);
+#    * osv_add_pipl compiles the .r with Rez into Contents/Resources/<target>.rsrc
+#      (the After Effects Xcode samples' Rez phase), no PiPLtool involved;
+#    * osv_add_delayload has nothing to do: the unique install names are what
+#      keeps a bundle from binding to a host's copy of a library.
+#  The SDK needs no PiPLtool.exe there, only the headers and AE_General.r.
 # =============================================================================
 if(NOT OSV_BUILD_PREMIERE)
   return()
+endif()
+
+if(APPLE)
+  include(OsvMacBundle)
 endif()
 
 set(OSV_PREMIERE_SDK_DOWNLOAD_URL "https://developer.adobe.com/console/servicesandapis/pr")
@@ -87,8 +106,12 @@ _osv_require_sdk_file("${OSV_PREMIERE_SDK_HEADERS}/PrSDKImport.h"
   "the Premiere Pro SDK (Examples/Headers/PrSDKImport.h)" OSV_PREMIERE_SDK_DIR "${OSV_PREMIERE_SDK_DOWNLOAD_URL}")
 _osv_require_sdk_file("${OSV_AE_SDK_HEADERS}/AE_Effect.h"
   "the After Effects SDK (Examples/Headers/AE_Effect.h)" OSV_AE_SDK_DIR "${OSV_AE_SDK_DOWNLOAD_URL}")
-_osv_require_sdk_file("${OSV_AE_PIPLTOOL}"
-  "the After Effects PiPL tool (Examples/Resources/PiPLtool.exe)" OSV_AE_SDK_DIR "${OSV_AE_SDK_DOWNLOAD_URL}")
+# PiPLtool.exe is the Windows half of the PiPL pipeline; a Mac compiles the
+# same .r with Rez and never needs it.
+if(NOT APPLE)
+  _osv_require_sdk_file("${OSV_AE_PIPLTOOL}"
+    "the After Effects PiPL tool (Examples/Resources/PiPLtool.exe)" OSV_AE_SDK_DIR "${OSV_AE_SDK_DOWNLOAD_URL}")
+endif()
 _osv_require_sdk_file("${OSV_AE_SDK_RESOURCES}/AE_General.r"
   "the After Effects PiPL template (Examples/Resources/AE_General.r)" OSV_AE_SDK_DIR "${OSV_AE_SDK_DOWNLOAD_URL}")
 _osv_require_sdk_file("${OSV_AE_SDK_UTIL}/AEFX_SuiteHelper.c"
@@ -148,16 +171,35 @@ file(MAKE_DIRECTORY "${OSV_PLUGIN_STAGE_DIR}")
 #               can copy exactly the runtime DLLs the plug-in needs.
 #    cl       : the preprocessor for the PiPL pipeline (must be the MSVC cl).
 # -----------------------------------------------------------------------------
-get_filename_component(_osv_cl_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
-find_program(OSV_DUMPBIN_EXE NAMES dumpbin HINTS "${_osv_cl_dir}" DOC "MSVC dumpbin.exe (runtime DLL discovery)")
-find_program(OSV_MSVC_CL_EXE NAMES cl HINTS "${_osv_cl_dir}" DOC "MSVC cl.exe (PiPL preprocessing)")
-if(NOT OSV_DUMPBIN_EXE)
-  message(WARNING
-    "dumpbin.exe was not found; the plug-in post-build step will only copy DLLs known to CMake "
-    "(imported SHARED targets) and not the FFmpeg/OpenCL DLLs. Configure from a Visual Studio developer shell.")
-endif()
-if(NOT OSV_MSVC_CL_EXE)
-  message(FATAL_ERROR "cl.exe was not found next to the C++ compiler; the PiPL pipeline needs the MSVC preprocessor.")
+if(APPLE)
+  # macOS: Rez compiles the PiPL (osv_add_pipl), and the bundle post-build
+  # step uses otool / install_name_tool / codesign, which ship with the
+  # command line tools and are looked up on PATH by that script.
+  execute_process(COMMAND xcrun -f Rez OUTPUT_VARIABLE _osv_rez OUTPUT_STRIP_TRAILING_WHITESPACE
+                  ERROR_QUIET RESULT_VARIABLE _osv_rez_rc)
+  if(_osv_rez_rc EQUAL 0 AND EXISTS "${_osv_rez}")
+    set(OSV_REZ_EXE "${_osv_rez}" CACHE FILEPATH "Apple's Rez resource compiler (PiPL)")
+  else()
+    find_program(OSV_REZ_EXE NAMES Rez HINTS /usr/bin DOC "Apple's Rez resource compiler (PiPL)")
+  endif()
+  if(NOT OSV_REZ_EXE)
+    message(FATAL_ERROR "Rez was not found; the PiPL resources need it. Install the Xcode command line tools "
+                        "(xcode-select --install).")
+  endif()
+  execute_process(COMMAND xcrun --show-sdk-path OUTPUT_VARIABLE OSV_MACOS_SDK_PATH
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+else()
+  get_filename_component(_osv_cl_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  find_program(OSV_DUMPBIN_EXE NAMES dumpbin HINTS "${_osv_cl_dir}" DOC "MSVC dumpbin.exe (runtime DLL discovery)")
+  find_program(OSV_MSVC_CL_EXE NAMES cl HINTS "${_osv_cl_dir}" DOC "MSVC cl.exe (PiPL preprocessing)")
+  if(NOT OSV_DUMPBIN_EXE)
+    message(WARNING
+      "dumpbin.exe was not found; the plug-in post-build step will only copy DLLs known to CMake "
+      "(imported SHARED targets) and not the FFmpeg/OpenCL DLLs. Configure from a Visual Studio developer shell.")
+  endif()
+  if(NOT OSV_MSVC_CL_EXE)
+    message(FATAL_ERROR "cl.exe was not found next to the C++ compiler; the PiPL pipeline needs the MSVC preprocessor.")
+  endif()
 endif()
 
 set(OSV_COPY_RUNTIME_DLLS_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/OsvCopyRuntimeDlls.cmake")
@@ -167,7 +209,13 @@ set(OSV_PIPL_STEP_SCRIPT         "${CMAKE_CURRENT_LIST_DIR}/OsvPiplStep.cmake")
 # Directories searched for runtime DLLs by the post-build copy step.  The
 # vcpkg bin folder holds FFmpeg, OpenCL.dll, fmt, spdlog, zlib, miniz.
 set(_osv_dll_search_dirs "")
-if(VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET)
+if(APPLE AND VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET)
+  # macOS keeps shared libraries (the FFmpeg dylibs) in lib/, not bin/.
+  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    list(APPEND _osv_dll_search_dirs "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/debug/lib")
+  endif()
+  list(APPEND _osv_dll_search_dirs "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib")
+elseif(VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET)
   list(APPEND _osv_dll_search_dirs "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin")
   if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     list(APPEND _osv_dll_search_dirs "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/debug/bin")
@@ -189,12 +237,18 @@ target_include_directories(osv_premiere_sdk INTERFACE "${OSV_PREMIERE_SDK_HEADER
 #
 # NOMINMAX is deliberately NOT defined here: osv_warnings already puts it on
 # the command line for the whole project.
-target_compile_definitions(osv_premiere_sdk INTERFACE
-  PRWIN_ENV
-  MSWindows
-  _WINDOWS
-  _USE_MATH_DEFINES
-)
+#
+# macOS needs none of them: PrSDKTypes.h includes PrSDKSetEnv.h, which
+# defines PRMAC_ENV from the compiler's own __APPLE__, and AEConfig.h does
+# the same for AE_OS_MAC.
+if(NOT APPLE)
+  target_compile_definitions(osv_premiere_sdk INTERFACE
+    PRWIN_ENV
+    MSWindows
+    _WINDOWS
+    _USE_MATH_DEFINES
+  )
+endif()
 
 # PrSDKTypes.h line 41 does an unconditional `#define NOMINMAX` inside its
 # `#if defined(PRWIN_ENV)` branch.  Because osv_warnings defines the very same
@@ -233,14 +287,16 @@ message(STATUS "Plug-in stage: ${OSV_PLUGIN_STAGE_DIR}")
 
 # =============================================================================
 #  osv_add_premiere_plugin(<target> KIND prm|aex|ofx SOURCES <src>...
-#                          [OUTPUT_DIRECTORY <dir>])
+#                          [OUTPUT_DIRECTORY <dir>] [EXPORTS <c-symbol>...])
+#
+#  EXPORTS names the module's entry points.  Windows ignores it (the
+#  entry points carry __declspec(dllexport)); a macOS bundle exports exactly
+#  these and nothing else (cmake/OsvMacBundle.cmake).
 #
 #  Creates a MODULE library laid out the way Premiere Pro expects a plug-in:
 #
 #    * file name  <target>.prm (importer) or <target>.aex (AE-API effect),
 #      no "lib" prefix;
-#    * KIND ofx is the OpenFX module for DaVinci Resolve (plugins/ofx): the
-#      same /MD, staging and delay-load audit, suffix .ofx, and no AE SDK;
 #    * /MD (or /MDd in Debug) - Adobe's loader shares fiber-local storage
 #      slots between plug-ins and a static CRT exhausts them (SDK guide
 #      3.10.4), so the dynamic CRT is mandatory;
@@ -261,10 +317,38 @@ message(STATUS "Plug-in stage: ${OSV_PLUGIN_STAGE_DIR}")
 #  osv_render, ...) and delay-load entries afterwards with the usual
 #  target_* commands and osv_add_delayload().
 # =============================================================================
+# -----------------------------------------------------------------------------
+#  _osv_add_premiere_bundle(<target> <kind> <out_dir> <sources>...)   (macOS)
+#
+#  The Mac shape of a plug-in, following Adobe's Xcode samples, built by
+#  osv_add_mac_bundle() (cmake/OsvMacBundle.cmake, which explains the layout,
+#  the hidden visibility and the embedded, renamed FFmpeg):
+#
+#    <out_dir>/<target>.bundle/  KIND prm: package type BNDL, as SDK_File_Import
+#    <out_dir>/<target>.plugin/  KIND aex: eFKT / FXTC, as the AE effect samples
+#
+#  plus the Adobe SDK targets every plug-in compiles against.  The PiPL /
+#  IMPT resource is added by osv_add_pipl() into Contents/Resources.
+# -----------------------------------------------------------------------------
+function(_osv_add_premiere_bundle TARGET KIND OUT_DIR EXPORTS)
+  if(KIND STREQUAL "prm")
+    osv_add_mac_bundle(${TARGET} EXTENSION bundle PACKAGE_TYPE BNDL SIGNATURE "????"
+                       OUTPUT_DIRECTORY "${OUT_DIR}" EXPORTS ${EXPORTS} SOURCES ${ARGN})
+  else()
+    osv_add_mac_bundle(${TARGET} EXTENSION plugin PACKAGE_TYPE eFKT SIGNATURE FXTC
+                       OUTPUT_DIRECTORY "${OUT_DIR}" EXPORTS ${EXPORTS} SOURCES ${ARGN})
+  endif()
+  set_target_properties(${TARGET} PROPERTIES FOLDER "plugins")
+  target_link_libraries(${TARGET} PRIVATE osv_warnings osv_premiere_sdk)
+  if(KIND STREQUAL "aex")
+    target_link_libraries(${TARGET} PRIVATE osv_ae_sdk)
+  endif()
+endfunction()
+
 function(osv_add_premiere_plugin TARGET)
   set(_options)
   set(_one KIND OUTPUT_DIRECTORY)
-  set(_multi SOURCES)
+  set(_multi SOURCES EXPORTS)
   cmake_parse_arguments(ARG "${_options}" "${_one}" "${_multi}" ${ARGN})
 
   if(NOT ARG_KIND)
@@ -294,6 +378,15 @@ function(osv_add_premiere_plugin TARGET)
     set(_out_dir "${OSV_PLUGIN_STAGE_DIR}")
   endif()
   file(MAKE_DIRECTORY "${_out_dir}")
+
+  # macOS: a loadable bundle instead of a DLL (see the file header).
+  if(APPLE)
+    if(NOT ARG_EXPORTS)
+      message(FATAL_ERROR "osv_add_premiere_plugin(${TARGET}): a macOS bundle needs EXPORTS (its entry points)")
+    endif()
+    _osv_add_premiere_bundle(${TARGET} "${_kind}" "${_out_dir}" "${ARG_EXPORTS}" ${ARG_SOURCES})
+    return()
+  endif()
 
   # Turn vcpkg's own "applocal" deployment off for this module.
   #
@@ -426,6 +519,38 @@ function(osv_add_pipl TARGET)
     message(FATAL_ERROR "osv_add_pipl(${TARGET}): PiPL source '${_r_abs}' does not exist")
   endif()
 
+  # macOS: Rez, the way the After Effects Xcode samples' Rez phase runs it,
+  # straight to a data-fork resource file the bundle carries in
+  # Contents/Resources/<target>.rsrc.  The include order is the same as
+  # step 1 below (ours first, then the SDKs), -d __MACH__ is what those
+  # samples define for AEConfig.h, and -arch lets AEConfig.h recognise the
+  # processor inside Rez.  RC_FILE has no meaning here and is ignored.
+  if(APPLE)
+    set(_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/pipl/${TARGET}")
+    file(MAKE_DIRECTORY "${_gen_dir}")
+    set(_rsrc "${_gen_dir}/${TARGET}.rsrc")
+    set(_rez_includes "")
+    foreach(_inc IN ITEMS "${_r_dir}" ${ARG_INCLUDES} "${OSV_AE_SDK_HEADERS}" "${OSV_AE_SDK_RESOURCES}"
+                          "${OSV_PREMIERE_SDK_HEADERS}")
+      list(APPEND _rez_includes -i "${_inc}")
+    endforeach()
+    set(_rez_sysroot "")
+    if(OSV_MACOS_SDK_PATH)
+      set(_rez_sysroot -isysroot "${OSV_MACOS_SDK_PATH}")
+    endif()
+    add_custom_command(
+      OUTPUT  "${_rsrc}"
+      COMMAND "${OSV_REZ_EXE}" -o "${_rsrc}" -d SystemSevenOrLater=1 -useDF -script Roman -d __MACH__
+              -arch arm64 ${_rez_sysroot} ${_rez_includes} "${_r_abs}"
+      DEPENDS "${_r_abs}" ${ARG_DEPENDS}
+      COMMENT "Rez ${_r_name}.r -> ${TARGET}.rsrc"
+      VERBATIM)
+    target_sources(${TARGET} PRIVATE "${_rsrc}")
+    set_source_files_properties("${_rsrc}" PROPERTIES GENERATED TRUE MACOSX_PACKAGE_LOCATION Resources)
+    set(${ARG_OUT_VAR} "${_rsrc}" PARENT_SCOPE)
+    return()
+  endif()
+
   set(_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/pipl/${TARGET}")
   file(MAKE_DIRECTORY "${_gen_dir}")
   set(_rr      "${_gen_dir}/${_r_name}.rr")
@@ -520,6 +645,11 @@ function(osv_add_delayload TARGET)
   endif()
   if(NOT ARG_DLL_NAMES)
     message(FATAL_ERROR "osv_add_delayload(${TARGET}): DLL_NAMES is required")
+  endif()
+  # macOS bundles solve the same problem with their own, uniquely named
+  # copies of the libraries (OsvMacBundle.cmake); there is nothing to delay.
+  if(APPLE)
+    return()
   endif()
   if(NOT MSVC)
     message(WARNING "osv_add_delayload(${TARGET}): delay loading is only supported with MSVC")

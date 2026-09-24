@@ -81,7 +81,13 @@ endif()
 # Mock-host test harness for the plug-ins.  It lives under tests/premiere so
 # the test tree mirrors the plug-in tree; it is added from here because it
 # only makes sense together with the SDK targets.
-if(OSV_BUILD_TESTS)
+#
+# Windows only for now: the harness loads the modules with LoadLibraryW and
+# drives them with Win32 process and environment calls throughout.  On macOS
+# the SDK-free parts of the plug-ins (the log, the text and number helpers,
+# the Metal GPU path, the bundle packaging) are tested by tests/macos, which
+# needs no Adobe SDK at all.
+if(OSV_BUILD_TESTS AND WIN32)
   add_subdirectory("${CMAKE_SOURCE_DIR}/tests/premiere" "${CMAKE_BINARY_DIR}/tests/premiere")
   # The OpenFX module's tests drive the built bundle through a mock OpenFX
   # host (tests/ofx); they skip themselves when OSV_BUILD_OFX is OFF.

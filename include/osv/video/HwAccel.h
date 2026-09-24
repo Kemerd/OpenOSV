@@ -6,8 +6,9 @@
 // The video module always has a software (libavcodec hevc / h264) path; the
 // hardware paths are opt-in because they change the frame memory layout
 // (P010 instead of planar yuv420p10) and because a host application may
-// already own the GPU.  `HwAccel::Auto` tries CUDA, then D3D11VA, then falls
-// back to software and never fails just because no GPU is present.
+// already own the GPU.  `HwAccel::Auto` tries CUDA, then D3D11VA (on macOS:
+// VideoToolbox), then falls back to software and never fails just because no
+// GPU is present.
 #pragma once
 
 #include <cstdint>
@@ -22,14 +23,28 @@ enum class HwAccel : std::uint8_t {
     None = 0,     ///< libavcodec software decoding (always available).
     D3D11VA = 1,  ///< Direct3D 11 video acceleration (any Windows GPU vendor).
     Cuda = 2,     ///< NVDEC through FFmpeg's CUDA hwaccel (device pointers exposable).
-    Auto = 3      ///< Try Cuda, then D3D11VA, then None.
+    Auto = 3,     ///< Try Cuda, then D3D11VA (macOS: VideoToolbox), then None.
+    /// Apple's VideoToolbox through FFmpeg's hwaccel (macOS).  Frames come
+    /// back to host memory as P010, exactly like the D3D11VA path.
+    VideoToolbox = 4
 };
 
-/// Stable lower-case name of a back-end ("none", "d3d11va", "cuda", "auto").
+/// The hardware back-end of this platform whose frames come back to host
+/// memory: D3D11VA on Windows (any GPU vendor), VideoToolbox on macOS.  What
+/// the importer's host-frame path and its analyses try before software.
+#if defined(__APPLE__)
+inline constexpr HwAccel kHostFrameHwAccel = HwAccel::VideoToolbox;
+#else
+inline constexpr HwAccel kHostFrameHwAccel = HwAccel::D3D11VA;
+#endif
+
+/// Stable lower-case name of a back-end ("none", "d3d11va", "cuda", "auto",
+/// "videotoolbox").
 [[nodiscard]] const char* hwAccelName(HwAccel hw) noexcept;
 
 /// Parse a back-end name as typed on a command line (case-insensitive).
-/// Returns std::nullopt for anything that is not one of the four names.
+/// Returns std::nullopt for anything that is not one of the five names (or
+/// their aliases: sw / software, d3d11, nvdec, vt).
 [[nodiscard]] std::optional<HwAccel> parseHwAccel(std::string_view text) noexcept;
 
 /// Everything that influences how a stream decoder is opened.

@@ -24,4 +24,11 @@ target_compile_definitions(osv_opencl INTERFACE
   CL_HPP_MINIMUM_OPENCL_VERSION=120
 )
 
+# macOS: CMake finds Apple's OpenCL.framework (OpenCL 1.2, implemented on top
+# of Metal).  Apple marks every entry point deprecated; the backend is a
+# vendor-neutral fallback there, so the warnings carry no information.
+if(APPLE)
+  target_compile_definitions(osv_opencl INTERFACE CL_SILENCE_DEPRECATION)
+endif()
+
 message(STATUS "OpenCL: ${OpenCL_INCLUDE_DIRS} (${OpenCL_VERSION_STRING})")

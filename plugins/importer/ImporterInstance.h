@@ -77,6 +77,7 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -84,8 +85,26 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <cstdint>
+#endif
 
 namespace osv::premiere {
+
+/// The OS handle a clip holds open while it is not quiet, and hands the host
+/// as its imFileRef: a HANDLE on Windows; on macOS, where imFileRef is a
+/// void*, a POSIX file descriptor carried in that pointer (Adobe's own Mac
+/// importer sample carries its file reference number the same way).
+#if defined(_WIN32)
+using ClipFileHandle = HANDLE;
+[[nodiscard]] inline ClipFileHandle invalidClipFileHandle() noexcept { return INVALID_HANDLE_VALUE; }
+#else
+using ClipFileHandle = void*;
+/// (void*)-1, the SDK's imInvalidHandleValue on this platform.
+[[nodiscard]] inline ClipFileHandle invalidClipFileHandle() noexcept {
+    return reinterpret_cast<void*>(static_cast<std::intptr_t>(-1));
+}
+#endif
 
 // Forward declaration: the audio side lives in its own translation unit and
 // owns a second AVFormatContext on the same file.
@@ -193,11 +212,11 @@ public:
     void releaseHeavy() noexcept;
 
     /// True between a successful open() and releaseHeavy().
-    [[nodiscard]] bool isOpen() const noexcept { return m_fileHandle != INVALID_HANDLE_VALUE; }
+    [[nodiscard]] bool isOpen() const noexcept { return m_fileHandle != invalidClipFileHandle(); }
 
     /// The OS handle Premiere stores in imFileAccessRec8::fileref.  The
     /// instance keeps ownership; releaseHeavy() closes it.
-    [[nodiscard]] HANDLE fileHandle() const noexcept { return m_fileHandle; }
+    [[nodiscard]] ClipFileHandle fileHandle() const noexcept { return m_fileHandle; }
 
     // There is deliberately NO detachFileHandle(): this importer never hands
     // its OS handle to the host.  imQuietFile and imCloseFile both go through
@@ -554,7 +573,7 @@ private:
                                                 render::RenderParamsBuilder& builder);
 
     std::filesystem::path m_path;
-    HANDLE m_fileHandle = INVALID_HANDLE_VALUE;
+    ClipFileHandle m_fileHandle = invalidClipFileHandle();
 
     mutable std::mutex m_mutex;
 

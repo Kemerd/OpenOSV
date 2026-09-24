@@ -8,6 +8,7 @@
 
 #include "SteadyStage.h"
 
+#include "NumberParse.h"
 #include "PluginLog.h"
 
 #include "osv/core/ThreadPool.h"
@@ -15,6 +16,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <fstream>
@@ -40,12 +42,21 @@ using Clock = std::chrono::steady_clock;
 /// another instance happened to measure - read on every use, so a test can
 /// toggle it.  The same CRT getenv the importer's other switches use.
 [[nodiscard]] bool sharedCacheEnabled() noexcept {
+#if defined(_WIN32)
     char value[8] = {};
     std::size_t length = 0;
     if (::getenv_s(&length, value, sizeof(value), "OPENOSV_STEADY_NO_SHARED_CACHE") != 0 || length == 0) {
         return true;
     }
     return value[0] == '0';
+#else
+    // POSIX getenv: no getenv_s, and nothing here outlives the call.
+    const char* value = std::getenv("OPENOSV_STEADY_NO_SHARED_CACHE");
+    if (!value || value[0] == '\0') {
+        return true;
+    }
+    return value[0] == '0';
+#endif
 }
 
 // =============================================================================
@@ -273,8 +284,9 @@ template <class T>
     if (text.empty()) {
         return false;
     }
-    const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
-    return ec == std::errc{} && ptr == text.data() + text.size();
+    // std::from_chars, or its locale-free twin where the standard library
+    // has no floating-point from_chars (NumberParse.h).
+    return parseWholeNumber(text.data(), text.data() + text.size(), out);
 }
 
 /// A number for the cache file: fixed, locale independent.
@@ -410,7 +422,7 @@ public:
 private:
     [[nodiscard]] Status open(bool softwareOnly) {
         Error last{ErrorCode::Decoder, "no decoder could be opened"};
-        for (const video::HwAccel hw : {video::HwAccel::D3D11VA, video::HwAccel::None}) {
+        for (const video::HwAccel hw : {video::kHostFrameHwAccel, video::HwAccel::None}) {
             if (softwareOnly && hw != video::HwAccel::None) {
                 continue;
             }

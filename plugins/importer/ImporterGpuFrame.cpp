@@ -3,6 +3,12 @@
 //
 // ImporterGpuFrame.cpp - pinned banded readback, the renderer-output lock and
 // the context scope used by the importer's GPU frame path (see the header).
+//
+// The GPU frame path is CUDA through and through, so on a build without the
+// CUDA toolkit (macOS) only the two pieces the rest of the importer calls on
+// every platform are compiled: the renderer-output lock and the environment
+// switch.  ImporterInstance only reaches the readback and the context scope
+// under OSV_HAVE_CUDA.
 
 #include "ImporterGpuFrame.h"
 
@@ -11,16 +17,20 @@
 #endif
 #include "PluginLog.h"
 
+#if defined(OSV_HAVE_CUDA)
 #include <cuda.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <string>
 
 namespace osv::premiere {
 
+#if defined(OSV_HAVE_CUDA)
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -52,6 +62,7 @@ struct ReadbackRegistry {
 }
 
 }  // namespace
+#endif  // OSV_HAVE_CUDA
 
 // ===========================================================================
 //  The renderer-output lock
@@ -64,6 +75,7 @@ std::mutex& cudaRendererOutputMutex() noexcept {
     return mutex;
 }
 
+#if defined(OSV_HAVE_CUDA)
 // ===========================================================================
 //  CudaContextScope
 // ===========================================================================
@@ -421,12 +433,14 @@ Status GpuReadback::copyToHost(const void* deviceRgba, std::size_t devicePitchBy
     }
     return result;
 }
+#endif  // OSV_HAVE_CUDA
 
 // ===========================================================================
 //  Switches
 // ===========================================================================
 
 bool importerGpuDecodeDisabledByEnvironment() noexcept {
+#if defined(_WIN32)
     // getenv_s rather than getenv: the importer is /MD and shares the CRT's
     // environment with the host (and with a test that sets the variable).
     char value[8] = {};
@@ -434,6 +448,15 @@ bool importerGpuDecodeDisabledByEnvironment() noexcept {
     if (getenv_s(&length, value, sizeof(value), "OPENOSV_IMPORTER_NO_GPU_DECODE") != 0 || length == 0) {
         return false;
     }
+#else
+    // POSIX: one process-wide environment, read with plain getenv.
+    const char* env = std::getenv("OPENOSV_IMPORTER_NO_GPU_DECODE");
+    if (!env || env[0] == '\0') {
+        return false;
+    }
+    char value[8] = {};
+    std::strncpy(value, env, sizeof(value) - 1);
+#endif
     // Only an explicit yes switches the GPU path off: "1", "true", "yes",
     // "on" (any case).  Anything else - "0", "false", garbage - leaves the
     // fast path on, so a stray value can never silently slow a user down.

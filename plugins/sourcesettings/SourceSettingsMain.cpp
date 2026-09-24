@@ -75,6 +75,7 @@
 #include "SourceSettingsMapping.h"
 #include "SourceSettingsParams.h"
 
+#include "PluginExport.h"
 #include "PluginLog.h"
 #include "PrefsBlob.h"
 #include "UserDefaults.h"
@@ -1183,8 +1184,8 @@ static_assert(OSV_SS_SHADING_STRENGTH_DEFAULT == 100.0, "Shading Strength defaul
 //  wrapped in a try/catch: an exception unwinding into Premiere's C stack is
 //  undefined behaviour and in practice takes the host down.
 // ===========================================================================
-extern "C" __declspec(dllexport) PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data,
-                                                   PF_ParamDef* params[], PF_LayerDef* output, void* extra) {
+extern "C" OSV_PLUGIN_EXPORT PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutData* out_data,
+                                               PF_ParamDef* params[], PF_LayerDef* output, void* extra) {
     (void)output;  // never used: this effect is never sent PF_Cmd_RENDER
     try {
         switch (cmd) {

@@ -144,6 +144,7 @@ AVHWDeviceType hwDeviceType(HwAccel hw) noexcept {
     switch (hw) {
     case HwAccel::D3D11VA: return AV_HWDEVICE_TYPE_D3D11VA;
     case HwAccel::Cuda: return AV_HWDEVICE_TYPE_CUDA;
+    case HwAccel::VideoToolbox: return AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
     case HwAccel::None:
     case HwAccel::Auto:
     default: return AV_HWDEVICE_TYPE_NONE;
@@ -161,6 +162,7 @@ const char* hwAccelName(HwAccel hw) noexcept {
     case HwAccel::D3D11VA: return "d3d11va";
     case HwAccel::Cuda: return "cuda";
     case HwAccel::Auto: return "auto";
+    case HwAccel::VideoToolbox: return "videotoolbox";
     }
     return "none";
 }
@@ -183,6 +185,9 @@ std::optional<HwAccel> parseHwAccel(std::string_view text) noexcept {
     }
     if (lower == "auto") {
         return HwAccel::Auto;
+    }
+    if (lower == "videotoolbox" || lower == "vt") {
+        return HwAccel::VideoToolbox;
     }
     return std::nullopt;
 }
@@ -997,7 +1002,13 @@ struct HevcStreamDecoder::Impl {
         // Hardware: honour the request, or walk the Auto preference list.
         std::vector<HwAccel> attempts;
         if (requestedHw == HwAccel::Auto) {
+#if defined(__APPLE__)
+            // macOS has neither NVDEC nor Direct3D; VideoToolbox is the
+            // hardware HEVC decoder on every Apple Silicon and T2 Mac.
+            attempts = {HwAccel::VideoToolbox};
+#else
             attempts = {HwAccel::Cuda, HwAccel::D3D11VA};
+#endif
         } else if (requestedHw != HwAccel::None) {
             attempts = {requestedHw};
         }
@@ -1475,6 +1486,8 @@ std::vector<std::string> HevcStreamDecoder::availableHwAccels() {
             names.emplace_back(hwAccelName(HwAccel::D3D11VA));
         } else if (t == AV_HWDEVICE_TYPE_CUDA) {
             names.emplace_back(hwAccelName(HwAccel::Cuda));
+        } else if (t == AV_HWDEVICE_TYPE_VIDEOTOOLBOX) {
+            names.emplace_back(hwAccelName(HwAccel::VideoToolbox));
         }
     }
     return names;

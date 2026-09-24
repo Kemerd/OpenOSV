@@ -48,8 +48,14 @@
 #endif
 #include <windows.h>
 #else
+#include <clocale>
 #include <fstream>
+#include <locale.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <xlocale.h>  // strtod_l / newlocale
+#endif
 #endif
 
 namespace osv::premiere {
@@ -259,10 +265,26 @@ static_assert(std::size(kShadingTokens) == static_cast<std::size_t>(PrefsLensSha
         return Json(static_cast<double>(value));
     }
     double asDouble = 0.0;
+#if defined(__cpp_lib_to_chars)
     const std::from_chars_result parsed = std::from_chars(buffer, printed.ptr, asDouble);
     if (parsed.ec != std::errc()) {
         return Json(static_cast<double>(value));
     }
+#else
+    // A standard library without floating-point from_chars (Apple's libc++):
+    // strtod_l in the "C" locale reads the same shortest spelling back, and
+    // is immune to whatever locale the host process has set.  The buffer is
+    // NUL terminated (zero-initialised, one byte kept free above).
+    static const locale_t cLocale = ::newlocale(LC_ALL_MASK, "C", static_cast<locale_t>(nullptr));
+    if (!cLocale) {
+        return Json(static_cast<double>(value));
+    }
+    char* end = nullptr;
+    asDouble = ::strtod_l(buffer, &end, cLocale);
+    if (end != printed.ptr) {
+        return Json(static_cast<double>(value));
+    }
+#endif
     return Json(asDouble);
 }
 
@@ -810,16 +832,17 @@ std::atomic<std::uint32_t> g_tempCounter{0};
 // ===========================================================================
 
 /// What identifies one state of the file on disk: its modification time and
-/// size, plus - on Windows - the file's own identity (volume serial and file
-/// index).  Every save renames a NEW file over the old one, so the identity
+/// size, plus the file's own identity (volume serial and file index on
+/// Windows, device and inode elsewhere).  Every save renames a NEW file over
+/// the old one, so the identity
 /// changes on every save even when two saves land in the same timestamp tick
 /// with the same length (the file system's clock is coarser than a click).
 struct FileStamp {
     bool exists = false;
     std::uint64_t mtime = 0;       ///< Modification time, file-system units.
     std::uint64_t size = 0;        ///< Bytes.
-    std::uint64_t identity = 0;    ///< File index (Windows); 0 elsewhere.
-    std::uint32_t volume = 0;      ///< Volume serial (Windows); 0 elsewhere.
+    std::uint64_t identity = 0;    ///< File index (Windows) / inode (POSIX).
+    std::uint32_t volume = 0;      ///< Volume serial (Windows) / device (POSIX).
 
     [[nodiscard]] bool operator==(const FileStamp& o) const noexcept {
         return exists == o.exists &&
@@ -856,21 +879,24 @@ struct FileStamp {
     s.volume = info.dwVolumeSerialNumber;
     return s;
 #else
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(path, ec) || ec) {
-        return s;
-    }
-    const auto written = std::filesystem::last_write_time(path, ec);
-    if (ec) {
-        return FileStamp{};
-    }
-    const std::uintmax_t bytes = std::filesystem::file_size(path, ec);
-    if (ec) {
-        return FileStamp{};
+    // One stat() returns all four facts, as GetFileInformationByHandle does:
+    // the inode and device play the file index and volume serial, so a save
+    // (a new file renamed over the old one) always reads as a change.
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+        return s;  // missing, unreadable, or not a regular file
     }
     s.exists = true;
-    s.mtime = static_cast<std::uint64_t>(written.time_since_epoch().count());
-    s.size = static_cast<std::uint64_t>(bytes);
+#if defined(__APPLE__)
+    s.mtime = static_cast<std::uint64_t>(st.st_mtimespec.tv_sec) * 1000000000ull +
+              static_cast<std::uint64_t>(st.st_mtimespec.tv_nsec);
+#else
+    s.mtime = static_cast<std::uint64_t>(st.st_mtim.tv_sec) * 1000000000ull +
+              static_cast<std::uint64_t>(st.st_mtim.tv_nsec);
+#endif
+    s.size = static_cast<std::uint64_t>(st.st_size);
+    s.identity = static_cast<std::uint64_t>(st.st_ino);
+    s.volume = static_cast<std::uint32_t>(st.st_dev);
     return s;
 #endif
 }
@@ -1190,6 +1216,15 @@ std::filesystem::path userDefaultsPath() noexcept {
         if (!overridePath.empty()) {
             return std::filesystem::path(overridePath);
         }
+#if defined(__APPLE__)
+        // macOS keeps per-user application preferences under Application
+        // Support - the counterpart of %APPDATA% - so Premiere's plug-ins and
+        // osvtool share one file there.
+        const std::string macHome = environment("HOME");
+        if (!macHome.empty()) {
+            return std::filesystem::path(macHome) / "Library" / "Application Support" / "OpenOSV" / "defaults.json";
+        }
+#endif
         const std::string xdg = environment("XDG_CONFIG_HOME");
         if (!xdg.empty()) {
             return std::filesystem::path(xdg) / "openosv" / "defaults.json";
