@@ -1384,6 +1384,39 @@ function Get-FfmpegConfiguration {
 }
 
 # ---------------------------------------------------------------------------
+#  True when a vcpkg platform expression (a dependency or feature's
+#  "platform", e.g. "!osx") holds for x64-windows, the only triplet this
+#  script packages.  An empty expression holds everywhere.  Only what
+#  vcpkg.json can reasonably say is understood - identifiers, '!', and
+#  either '&' or '|' - and anything else throws: FFmpeg-BUILD.txt must
+#  never record a guessed feature list.
+# ---------------------------------------------------------------------------
+function Test-PlatformForX64Windows {
+    param([string] $Expression)
+    $text = ([string]$Expression).Trim().ToLowerInvariant()
+    if ($text.Length -eq 0) {
+        return $true
+    }
+    if ($text -notmatch '^[a-z0-9_!&| ]+$' -or ($text.Contains('&') -and $text.Contains('|'))) {
+        throw "vcpkg.json: the platform expression '$Expression' is beyond Test-PlatformForX64Windows; extend it before packaging."
+    }
+    # The identifiers true for this triplet; every other one is false.
+    $truths = @('windows', 'x64')
+    $values = foreach ($term in @($text -split '[&|]' | ForEach-Object { $_.Trim() })) {
+        $negated = $term.StartsWith('!')
+        $name = $term.TrimStart('!').Trim()
+        if ($name.Length -eq 0) {
+            throw "vcpkg.json: the platform expression '$Expression' has an empty term."
+        }
+        ($truths -contains $name) -xor $negated
+    }
+    if ($text.Contains('|')) {
+        return @($values | Where-Object { $_ }).Count -gt 0
+    }
+    return @($values | Where-Object { -not $_ }).Count -eq 0
+}
+
+# ---------------------------------------------------------------------------
 #  licenses\FFmpeg-BUILD.txt: what LGPL-2.1 asks of a binary distribution -
 #  which FFmpeg, built how (and that nothing GPL or nonfree is in it), and
 #  where the matching source is.
@@ -1430,11 +1463,22 @@ function Write-FfmpegRecord {
     }
     $manifest = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'vcpkg.json') -Raw | ConvertFrom-Json
     $baseline = [string]$manifest.'builtin-baseline'
+    # A feature is a plain name, or {name, platform} when it applies to some
+    # platforms only (nvcodec is "!osx"): kept when it applies to this build.
     $features = @()
     foreach ($dep in @($manifest.dependencies)) {
         if ($dep -isnot [string] -and $dep.name -eq 'ffmpeg') {
-            $features = @($dep.features)
+            foreach ($feature in @($dep.features)) {
+                if ($feature -is [string]) {
+                    $features += $feature
+                } elseif ($feature -and $feature.name -and (Test-PlatformForX64Windows ([string]$feature.platform))) {
+                    $features += [string]$feature.name
+                }
+            }
         }
+    }
+    if (@($features | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+        throw "vcpkg.json: an FFmpeg feature has no name; FFmpeg-BUILD.txt would record a broken install command."
     }
     $recipeUrl = "https://github.com/microsoft/vcpkg/tree/$baseline/ports/ffmpeg"
     $git = Get-Command git -ErrorAction SilentlyContinue
