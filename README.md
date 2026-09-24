@@ -1,17 +1,18 @@
 <div align="center">
 
-<img src="img/banner.png" alt="OpenOSV for Adobe Premiere: natively import .OSV files, automatically grade D-Log M to HDR, better stitching with lens correction and sky banding removal, native Windows support with CUDA GPU acceleration, completely customisable settings. Open source and completely free." width="100%">
+<img src="img/banner.png" alt="OpenOSV for Adobe Premiere and DaVinci Resolve: natively import .OSV files into Premiere or Resolve, automatically grade D-Log M to HDR formats, better stitching with lens correction and sky banding removal, native Windows and Mac support with CUDA or GPU acceleration, completely customisable settings including stitching. Your hardware, your choice. Open source and completely free." width="100%">
 
-### DJI Osmo 360 footage, straight into Premiere Pro on Windows, with a better stitch and real HDR.
+### DJI Osmo 360 footage, straight into Premiere Pro or DaVinci Resolve, with a better stitch and real HDR.
 
 Free and open source. Drop an `.OSV` on your timeline and it's stitched,
-converted to HDR and ready to reframe. No export step, no transcode, no Mac.
+converted to HDR and ready to reframe. No export step, no transcode.
 
 [![Licence: Apache-2.0](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
-![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)
+![Platform: Windows | macOS (preview)](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20%7C%20macOS%20%28preview%29-0078D6.svg)
 ![Premiere Pro 2022+](https://img.shields.io/badge/Premiere%20Pro-2022%2B-9999FF.svg)
+![DaVinci Resolve (preview)](https://img.shields.io/badge/DaVinci%20Resolve-preview-233A51.svg)
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg)
-![GPU: CUDA | OpenCL](https://img.shields.io/badge/GPU-CUDA%20%7C%20OpenCL-76B900.svg)
+![GPU: CUDA | OpenCL | Metal](https://img.shields.io/badge/GPU-CUDA%20%7C%20OpenCL%20%7C%20Metal-76B900.svg)
 ![HDR: Rec.2100 PQ / HLG](https://img.shields.io/badge/HDR-Rec.2100%20PQ%20%7C%20HLG-orange.svg)
 
 <img src="img/sequence_demo.png" alt="An Osmo 360 clip reframed live in Premiere Pro's Program Monitor, with OpenOSV's on-screen read-out of Pan, Tilt, Roll, Zoom, FOV and Correction" width="900">
@@ -19,6 +20,14 @@ converted to HDR and ready to reframe. No export step, no transcode, no Mac.
 <sub>An `.OSV` straight on a Premiere timeline, reframed by dragging the picture. Stitched, converted to HDR and rendered on the GPU as you drag.</sub>
 
 </div>
+
+> **macOS and DaVinci Resolve are untested.** Premiere Pro on Windows is
+> what OpenOSV is built and tested on. The macOS build and the DaVinci
+> Resolve plug-ins compile and pass their tests on CI, but nobody on the
+> project has run Premiere on a Mac or Resolve on either platform. If you
+> can, [build it](#build-from-source), try it, and
+> [file a bug report or a pull request](https://github.com/Kemerd/OpenOSV/issues)
+> for anything that goes wrong.
 
 ---
 
@@ -51,6 +60,11 @@ you edit:
 * **The OpenOSV window.** Keep it open and **every `.OSV` you drop on the
   timeline gets the effect automatically**. DJI Studio's framing presets,
   easing presets and stabilisation are one click away.
+* **DaVinci Resolve too (preview, free or Studio).** Same stitch, same
+  camera, same controls, as two OpenFX effects: **OpenOSV Source** opens an
+  `.OSV` and stitches it with the importer's own engine, and **Open 360
+  Reframe** reframes any 360 clip, with CUDA on NVIDIA. See
+  [`docs/RESOLVE.md`](docs/RESOLVE.md).
 
 Under all of that is a stitcher built to beat the stock one: it measures each
 clip, works out where the lenses disagree, and fixes it.
@@ -397,11 +411,26 @@ Blackwell); OpenCL on AMD and Intel; the CPU when there's nothing else. On an
 older NVIDIA card, set **Render Device** to OpenCL in Source Settings.
 `Uninstall.cmd` takes it all back out.
 
+**DaVinci Resolve (preview):** from 0.2.0 the Windows zip also carries the
+Resolve plug-ins. Close Resolve and double-click **`Install-Resolve.cmd`**;
+`Uninstall-Resolve.cmd` removes them.
+
 ### Build from source
 
-You need Windows 10/11, Visual Studio 2022, CMake 3.28+, vcpkg and, for the
-GPU paths, CUDA 12.9. Premiere's SDKs are not redistributable, so they are
-never committed. [`docs/BUILDING.md`](docs/BUILDING.md) says where to put them.
+One CMake project builds everything. You pick a preset for the platform, and
+the Premiere plug-ins come along when Adobe's SDKs are there:
+
+| | Windows | macOS, Apple Silicon (untested) |
+|---|---|---|
+| **Premiere Pro** | needs the Adobe SDKs | needs the Adobe SDKs (untested in Premiere) |
+| **DaVinci Resolve** (untested in Resolve) | no Adobe SDK needed | no Adobe SDK needed |
+
+Adobe's SDKs may not be redistributed, so they are never committed:
+[`docs/BUILDING.md`](docs/BUILDING.md) (Windows) and
+[`docs/BUILDING_MAC.md`](docs/BUILDING_MAC.md) (macOS) say where to put them.
+
+**Premiere Pro on Windows.** You need Windows 10/11, Visual Studio 2022,
+CMake 3.28+, vcpkg and, for the GPU paths, CUDA 12.9:
 
 ```powershell
 $env:VCPKG_ROOT = "C:\vcpkg"
@@ -418,29 +447,43 @@ Media Encoder and After Effects all see them. It asks for admin rights once.
 and `-Uninstall` removes everything it added. Cutting a release zip:
 [`docs/RELEASING.md`](docs/RELEASING.md).
 
-### macOS (untested)
+**DaVinci Resolve on Windows.** Same tools, no Adobe SDK. Every preset builds
+the Resolve bundle, the Premiere one above included:
 
-There is an Apple Silicon build: `osvtool`, the plug-ins as Mac bundles, and
-Metal in place of CUDA. It compiles and passes its tests on CI, but nobody
-has run it inside Premiere Pro on a Mac yet. Treat it as a preview.
-[`docs/BUILDING_MAC.md`](docs/BUILDING_MAC.md) has the build, the install
-script (`scripts/install_plugins.sh`) and exactly what has been checked.
+```powershell
+$env:VCPKG_ROOT = "C:\vcpkg"
+cmake --preset windows-msvc-cuda-release
+cmake --build --preset windows-msvc-cuda-release
+scripts\install_ofx.ps1            # into C:\Program Files\Common Files\OFX\Plugins
+```
 
-### DaVinci Resolve (preview, untested in Resolve)
+**Premiere Pro on macOS (untested).** You need macOS 13.3+ on Apple Silicon,
+the Xcode command line tools, CMake 3.28+, Ninja and vcpkg, plus the Adobe
+SDKs:
 
-`OpenOSV.ofx.bundle` brings OpenOSV to DaVinci Resolve, free or Studio, as
-two OpenFX effects:
+```sh
+export VCPKG_ROOT=~/vcpkg
+cmake --preset macos-premiere-release
+cmake --build --preset macos-premiere-release
+ctest --preset macos-premiere
+scripts/install_plugins.sh         # plug-ins, LUTs, sequence presets and the OpenOSV panel
+```
 
-- **OpenOSV Source**, a generator that opens an `.OSV` and stitches it with
-  the importer's own engine;
-- **Open 360 Reframe**, a filter for any 360 clip, with CUDA on NVIDIA.
+**DaVinci Resolve on macOS (untested).** Same tools, no Adobe SDK:
 
-Same stitch, same camera, same controls. From the release zip, double-click
-`Install-Resolve.cmd`. From source, it builds with the Premiere plug-ins and
-`scripts\install_ofx.ps1` installs it. It passes its tests
-against a mock OpenFX host, but nobody has run it inside Resolve yet.
-[`docs/RESOLVE.md`](docs/RESOLVE.md) has the workflow and exactly what has
-been checked.
+```sh
+export VCPKG_ROOT=~/vcpkg
+cmake --preset macos-release
+cmake --build --preset macos-release
+scripts/install_ofx.sh             # into /Library/OFX/Plugins
+```
+
+On a Mac, Metal replaces CUDA. How to use the Resolve plug-ins, and exactly
+what has been checked on each platform:
+[`docs/RESOLVE.md`](docs/RESOLVE.md) and
+[`docs/BUILDING_MAC.md`](docs/BUILDING_MAC.md). **If something breaks on a Mac
+or in Resolve, please
+[file a bug report or a pull request](https://github.com/Kemerd/OpenOSV/issues).**
 
 ### Sequence presets
 
