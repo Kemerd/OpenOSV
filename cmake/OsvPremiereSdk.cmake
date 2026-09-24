@@ -26,7 +26,7 @@
 #                       PrSDKAESupport.h / PrSDKPixelFormat.h shipped with the
 #                       Premiere SDK win over the older ones in the AE SDK.
 #
-#    osv_add_premiere_plugin(<target> KIND prm|aex SOURCES ...
+#    osv_add_premiere_plugin(<target> KIND prm|aex|ofx SOURCES ...
 #                            [OUTPUT_DIRECTORY <dir>])
 #    osv_add_pipl(<target> R_FILE <file.r> OUT_VAR <var>
 #                 [RC_FILE <file.rc>] [DEPENDS ...])
@@ -232,13 +232,15 @@ message(STATUS "AE SDK       : ${OSV_AE_SDK_DIR} (effect spec ${OSV_AE_SDK_SPEC_
 message(STATUS "Plug-in stage: ${OSV_PLUGIN_STAGE_DIR}")
 
 # =============================================================================
-#  osv_add_premiere_plugin(<target> KIND prm|aex SOURCES <src>...
+#  osv_add_premiere_plugin(<target> KIND prm|aex|ofx SOURCES <src>...
 #                          [OUTPUT_DIRECTORY <dir>])
 #
 #  Creates a MODULE library laid out the way Premiere Pro expects a plug-in:
 #
 #    * file name  <target>.prm (importer) or <target>.aex (AE-API effect),
 #      no "lib" prefix;
+#    * KIND ofx is the OpenFX module for DaVinci Resolve (plugins/ofx): the
+#      same /MD, staging and delay-load audit, suffix .ofx, and no AE SDK;
 #    * /MD (or /MDd in Debug) - Adobe's loader shares fiber-local storage
 #      slots between plug-ins and a static CRT exhausts them (SDK guide
 #      3.10.4), so the dynamic CRT is mandatory;
@@ -266,7 +268,7 @@ function(osv_add_premiere_plugin TARGET)
   cmake_parse_arguments(ARG "${_options}" "${_one}" "${_multi}" ${ARGN})
 
   if(NOT ARG_KIND)
-    message(FATAL_ERROR "osv_add_premiere_plugin(${TARGET}): KIND prm|aex is required")
+    message(FATAL_ERROR "osv_add_premiere_plugin(${TARGET}): KIND prm|aex|ofx is required")
   endif()
   if(NOT ARG_SOURCES)
     message(FATAL_ERROR "osv_add_premiere_plugin(${TARGET}): at least one SOURCES entry is required")
@@ -280,8 +282,10 @@ function(osv_add_premiere_plugin TARGET)
     set(_suffix ".prm")
   elseif(_kind STREQUAL "aex")
     set(_suffix ".aex")
+  elseif(_kind STREQUAL "ofx")
+    set(_suffix ".ofx")
   else()
-    message(FATAL_ERROR "osv_add_premiere_plugin(${TARGET}): KIND must be prm or aex, got '${ARG_KIND}'")
+    message(FATAL_ERROR "osv_add_premiere_plugin(${TARGET}): KIND must be prm, aex or ofx, got '${ARG_KIND}'")
   endif()
 
   if(ARG_OUTPUT_DIRECTORY)
