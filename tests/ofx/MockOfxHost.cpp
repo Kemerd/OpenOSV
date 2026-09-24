@@ -12,6 +12,18 @@
 #include <cstring>
 #include <stdexcept>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
 namespace osv::ofxtest {
 
 // ===========================================================================
@@ -671,16 +683,35 @@ MockHost::MockHost() {
 //  LoadedModule
 // ===========================================================================
 
-LoadedModule::LoadedModule(const std::wstring& path) {
+namespace {
+
+/// One exported symbol of the loaded module, or null.
+void* moduleSymbol(void* module, const char* name) {
+#if defined(_WIN32)
+    return reinterpret_cast<void*>(::GetProcAddress(static_cast<HMODULE>(module), name));
+#else
+    return ::dlsym(module, name);
+#endif
+}
+
+}  // namespace
+
+LoadedModule::LoadedModule(const std::filesystem::path& path) {
+#if defined(_WIN32)
     // LOAD_WITH_ALTERED_SEARCH_PATH: the module's own imports resolve from
     // its folder, the way a host that loads by full path behaves.
     m_module = ::LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+#else
+    // RTLD_LOCAL: the bundle's symbols stay its own, as in a host that loads
+    // many plug-ins into one process.
+    m_module = ::dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+#endif
     if (!m_module) {
         return;
     }
-    m_getCount = reinterpret_cast<int (*)()>(::GetProcAddress(m_module, "OfxGetNumberOfPlugins"));
-    m_getPlugin = reinterpret_cast<OfxPlugin* (*)(int)>(::GetProcAddress(m_module, "OfxGetPlugin"));
-    m_setHost = reinterpret_cast<OfxStatus (*)(const OfxHost*)>(::GetProcAddress(m_module, "OfxSetHost"));
+    m_getCount = reinterpret_cast<int (*)()>(moduleSymbol(m_module, "OfxGetNumberOfPlugins"));
+    m_getPlugin = reinterpret_cast<OfxPlugin* (*)(int)>(moduleSymbol(m_module, "OfxGetPlugin"));
+    m_setHost = reinterpret_cast<OfxStatus (*)(const OfxHost*)>(moduleSymbol(m_module, "OfxSetHost"));
     if (m_setHost) {
         m_setHost(MockHost::instance().ofxHost());
     }

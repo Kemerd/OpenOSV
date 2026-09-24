@@ -4,7 +4,8 @@
 #  osv_add_mac_bundle(<target> EXTENSION bundle|plugin
 #                     PACKAGE_TYPE <4cc> SIGNATURE <4cc>
 #                     OUTPUT_DIRECTORY <dir> SOURCES <src>...
-#                     EXPORTS <c-symbol>...)
+#                     EXPORTS <c-symbol>...
+#                     [OUTPUT_NAME <name>])
 #
 #  A loadable bundle laid out the way Adobe's Xcode samples lay out a
 #  Premiere Pro / After Effects plug-in, and made self-contained:
@@ -30,8 +31,14 @@
 #    install name and signs the result ad hoc - see that script for why the
 #    prefix matters inside a host process.
 #
-#  Used by the Premiere plug-ins (cmake/OsvPremiereSdk.cmake) and by the
-#  macOS test-suite, which builds an SDK-free probe bundle the same way and
+#  * OUTPUT_NAME, when given, replaces <target> in the bundle's folder and
+#    executable names (and in Info.plist): the OpenFX bundle is
+#    OUTPUT_NAME "OpenOSV.ofx" with EXTENSION bundle, which is exactly the
+#    OpenOSV.ofx.bundle/Contents/MacOS/OpenOSV.ofx the OpenFX packaging
+#    rules ask for.
+#
+#  Used by the Premiere plug-ins (cmake/OsvPremiereSdk.cmake), by the OpenFX
+#  plug-ins (plugins/ofx) and by the macOS test-suite, which builds an SDK-free probe bundle the same way and
 #  loads it, so this machinery is exercised on machines without the Adobe
 #  SDKs too.
 # =============================================================================
@@ -59,7 +66,7 @@ if(NOT DEFINED OSV_MAC_BUNDLE_SEARCH_DIRS)
 endif()
 
 function(osv_add_mac_bundle TARGET)
-  cmake_parse_arguments(ARG "" "EXTENSION;PACKAGE_TYPE;SIGNATURE;OUTPUT_DIRECTORY" "SOURCES;EXPORTS" ${ARGN})
+  cmake_parse_arguments(ARG "" "EXTENSION;PACKAGE_TYPE;SIGNATURE;OUTPUT_DIRECTORY;OUTPUT_NAME" "SOURCES;EXPORTS" ${ARGN})
   foreach(_required EXTENSION PACKAGE_TYPE SIGNATURE OUTPUT_DIRECTORY SOURCES EXPORTS)
     if(NOT ARG_${_required})
       message(FATAL_ERROR "osv_add_mac_bundle(${TARGET}): ${_required} is required")
@@ -72,10 +79,18 @@ function(osv_add_mac_bundle TARGET)
 
   add_library(${TARGET} MODULE ${ARG_SOURCES})
 
+  # The name the bundle folder and its executable carry: the target's own
+  # unless the caller needs another (see OUTPUT_NAME above).
+  set(_name "${TARGET}")
+  if(ARG_OUTPUT_NAME)
+    set(_name "${ARG_OUTPUT_NAME}")
+    set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME "${_name}")
+  endif()
+
   # The Info.plist, fully resolved here so nothing is left to the generator.
-  set(OSV_BUNDLE_EXECUTABLE "${TARGET}")
+  set(OSV_BUNDLE_EXECUTABLE "${_name}")
   set(OSV_BUNDLE_IDENTIFIER "com.openosv.${TARGET}")
-  set(OSV_BUNDLE_NAME "${TARGET}")
+  set(OSV_BUNDLE_NAME "${_name}")
   set(OSV_BUNDLE_VERSION "${PROJECT_VERSION}")
   set(OSV_BUNDLE_PACKAGE_TYPE "${ARG_PACKAGE_TYPE}")
   set(OSV_BUNDLE_SIGNATURE "${ARG_SIGNATURE}")

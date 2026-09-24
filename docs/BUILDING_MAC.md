@@ -2,8 +2,11 @@
 
 > **Status: untested on real hardware.** Everything below builds, and most
 > of it is tested, on GitHub's macOS runners (Apple Silicon virtual
-> machines). Nobody has yet run the plug-ins inside Premiere Pro on a Mac.
-> The table says exactly what has and has not been checked.
+> machines). Nobody has yet run the plug-ins inside Premiere Pro or DaVinci
+> Resolve on a Mac. The table says exactly what has and has not been
+> checked. If you have a Mac, please build it, try it, and
+> [file an issue or a pull request](https://github.com/Kemerd/OpenOSV/issues)
+> for anything that goes wrong.
 
 ## What is verified, and how
 
@@ -15,6 +18,7 @@
 | VideoToolbox hardware decode | yes | no (decode tests need the sample clip) | `--hw videotoolbox`, or `auto` |
 | Plug-in pieces that need no Adobe SDK | yes | yes (`tests/macos`) | The log, the text and number helpers, the Metal GPU path of the effect against its CPU path, the importer's engine hooks, and the bundle packaging (a probe bundle is built, loaded and inspected) |
 | Premiere plug-ins (importer, effect, Source Settings) | only when the SDK secret is set (below) | only the tests above | Never loaded into Premiere Pro on a Mac |
+| DaVinci Resolve bundle (`OpenOSV.ofx.bundle`) | yes, always (it needs no Adobe SDK) | yes (`tests/ofx`: loaded into a mock OpenFX host and compared with the Premiere effect's CPU render) | Never loaded into Resolve on a Mac. The stitch runs on Metal; Open 360 Reframe renders on the CPU |
 | Release zip | yes | the packaged `osvtool` is started once | |
 
 ## Toolchain
@@ -41,7 +45,7 @@ minutes on an M1). Presets:
 
 | Preset | What |
 |---|---|
-| `macos-release` / `macos-debug` | Library, `osvtool`, tests; Metal and OpenCL renderers |
+| `macos-release` / `macos-debug` | Library, `osvtool`, tests, the DaVinci Resolve bundle; Metal and OpenCL renderers |
 | `macos-premiere-release` | The same plus the Premiere Pro plug-ins (needs the SDKs) |
 | `ci-macos` | What GitHub Actions builds |
 
@@ -50,6 +54,21 @@ the small C++ libraries are static, FFmpeg is a shared library, as on
 Windows (OpenOSV links FFmpeg dynamically under the LGPL everywhere). No CUDA
 on a Mac: the Metal renderer takes its place, and `--device auto` picks
 Metal, then OpenCL, then the CPU.
+
+## The DaVinci Resolve plug-ins (OpenFX)
+
+Every preset above builds `build/<preset>/plugins/ofx/OpenOSV.ofx.bundle`: the
+OpenOSV Source generator and the Open 360 Reframe filter, with FFmpeg embedded
+in `Contents/Frameworks`. No Adobe SDK is involved. Install it into
+`/Library/OFX/Plugins` with
+
+```sh
+scripts/install_ofx.sh             # --uninstall removes it
+```
+
+(sudo asks for your password once; the quarantine flag is cleared and the
+bundle signed ad hoc). Quit Resolve first, and start it again afterwards. How
+to use it: [`RESOLVE.md`](RESOLVE.md).
 
 ## The Premiere Pro plug-ins
 
@@ -127,13 +146,14 @@ plug-ins.
 
 ## CI and the SDK secret
 
-`.github/workflows/macos.yml` runs on every push to the `mac` branch, on
-`macos-14` (Apple Silicon). It builds and tests everything above, caches
+`.github/workflows/macos.yml` runs on every push to `main` (and the `mac`
+branch), on `macos-14` (Apple Silicon). It builds and tests everything above, caches
 vcpkg's binary packages so FFmpeg is built once, and uploads
 `OpenOSV-<version>-macos-arm64.zip`: `osvtool` with its FFmpeg dylibs, the
 LUTs, the sequence presets, the panel, `scripts/install_plugins.sh`, this
-document and the licences - and the three plug-in bundles when they were
-built.
+document and the licences, the DaVinci Resolve bundle with
+`scripts/install_ofx.sh` - and the three Premiere plug-in bundles when they
+were built.
 
 The plug-ins are built only when the repository secret
 **`OSV_ADOBE_SDK_ARCHIVE_URL`** is set: a private URL of a zip or tar

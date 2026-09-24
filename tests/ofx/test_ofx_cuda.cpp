@@ -33,6 +33,10 @@ struct CudaHost {
     std::string failure;
 
     CudaHost() {
+        if (!cudaDriverLoadable()) {
+            failure = "no NVIDIA driver (nvcuda.dll)";
+            return;
+        }
         if (cuInit(0) != CUDA_SUCCESS) {
             failure = "cuInit failed";
             return;

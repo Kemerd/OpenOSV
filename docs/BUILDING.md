@@ -109,7 +109,7 @@ Cache variables:
 | `OSV_PREMIERE_IMPORTER` | `ON` | Build `OpenOSVImporter.prm` |
 | `OSV_PREMIERE_REFRAME` | `ON` | Build `Open360Reframe.aex` |
 | `OSV_PLUGIN_STAGE_DIR` | `<build>/plugins/OpenOSV` | Where the modules and their runtime DLLs are staged |
-| `OSV_BUILD_OFX` | `ON` | Build `OpenOSV.ofx.bundle`, the OpenFX plug-ins for DaVinci Resolve ([RESOLVE.md](RESOLVE.md)) |
+| `OSV_BUILD_OFX` | `ON` | Build `OpenOSV.ofx.bundle`, the OpenFX plug-ins for DaVinci Resolve ([RESOLVE.md](RESOLVE.md)). Needs no Adobe SDK, so it is built without `OSV_BUILD_PREMIERE` too |
 | `OSV_OFX_STAGE_DIR` | `<build>/plugins/ofx` | Where `OpenOSV.ofx.bundle` is assembled |
 
 Set both plug-in options to `OFF` to build and test only the shared layer and

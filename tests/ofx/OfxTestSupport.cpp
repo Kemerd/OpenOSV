@@ -10,6 +10,16 @@
 #include <cstring>
 #include <limits>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #ifndef OSV_OFX_MODULE_PATH
 #error "OSV_OFX_MODULE_PATH must name the built OpenOSV.ofx (tests/ofx/CMakeLists.txt)"
 #endif
@@ -230,6 +240,16 @@ reframe::Settings defaultSettings() {
     s.easing = reframe::KeyframeEasing::None;
     s.smoothKeyframes = false;
     return s;
+}
+
+bool cudaDriverLoadable() {
+#if defined(_WIN32)
+    // From System32 only, where the driver installs it.  Kept loaded: the
+    // delay-load stubs then bind to this very module.
+    return ::LoadLibraryExW(L"nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32) != nullptr;
+#else
+    return false;
+#endif
 }
 
 void provideImage(Clip& clip, HostImage& image) {

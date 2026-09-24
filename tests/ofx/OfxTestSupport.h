@@ -81,4 +81,9 @@ void paintPanorama(HostImage& image);
 /// Hand `image` to `clip` for every time.
 void provideImage(Clip& clip, HostImage& image);
 
+/// True when the NVIDIA driver's nvcuda.dll can be loaded, so a driver-API
+/// call cannot raise a delay-load exception (the test executable
+/// delay-loads it).  Always false off Windows.
+[[nodiscard]] bool cudaDriverLoadable();
+
 }  // namespace osv::ofxtest

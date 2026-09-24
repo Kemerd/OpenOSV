@@ -29,8 +29,14 @@ All notable changes to OpenOSV are documented here. The format follows
   compares every render with the Premiere effect's CPU render of the same
   picture and controls. It checks the CUDA path against the CPU path, and on
   the sample clip it checks the generator against Premiere's two-step path
-  frame for frame. Built with the Premiere plug-ins (`OSV_BUILD_OFX`) and
-  installed by `scripts/install_ofx.ps1`. The OpenFX 1.5.1 headers are
+  frame for frame.
+
+  The bundle needs no Adobe SDK, so every build makes it (`OSV_BUILD_OFX`,
+  on by default): on Windows, and on macOS as `OpenOSV.ofx.bundle` with
+  FFmpeg embedded, built and tested on GitHub's Apple Silicon runners. On a
+  Mac the stitch runs on Metal, and Open 360 Reframe renders on the CPU.
+  Neither platform has been run inside Resolve yet. `scripts/install_ofx.ps1`
+  and `scripts/install_ofx.sh` install it. The OpenFX 1.5.1 headers are
   vendored in `plugins/ofx/openfx` (BSD-3-Clause). See
   [docs/RESOLVE.md](docs/RESOLVE.md).
 * **macOS on Apple Silicon (untested in Premiere Pro).** The library,

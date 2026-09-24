@@ -286,7 +286,7 @@ message(STATUS "AE SDK       : ${OSV_AE_SDK_DIR} (effect spec ${OSV_AE_SDK_SPEC_
 message(STATUS "Plug-in stage: ${OSV_PLUGIN_STAGE_DIR}")
 
 # =============================================================================
-#  osv_add_premiere_plugin(<target> KIND prm|aex|ofx SOURCES <src>...
+#  osv_add_premiere_plugin(<target> KIND prm|aex SOURCES <src>...
 #                          [OUTPUT_DIRECTORY <dir>] [EXPORTS <c-symbol>...])
 #
 #  EXPORTS names the module's entry points.  Windows ignores it (the
@@ -352,7 +352,7 @@ function(osv_add_premiere_plugin TARGET)
   cmake_parse_arguments(ARG "${_options}" "${_one}" "${_multi}" ${ARGN})
 
   if(NOT ARG_KIND)
-    message(FATAL_ERROR "osv_add_premiere_plugin(${TARGET}): KIND prm|aex|ofx is required")
+    message(FATAL_ERROR "osv_add_premiere_plugin(${TARGET}): KIND prm|aex is required")
   endif()
   if(NOT ARG_SOURCES)
     message(FATAL_ERROR "osv_add_premiere_plugin(${TARGET}): at least one SOURCES entry is required")
@@ -366,10 +366,8 @@ function(osv_add_premiere_plugin TARGET)
     set(_suffix ".prm")
   elseif(_kind STREQUAL "aex")
     set(_suffix ".aex")
-  elseif(_kind STREQUAL "ofx")
-    set(_suffix ".ofx")
   else()
-    message(FATAL_ERROR "osv_add_premiere_plugin(${TARGET}): KIND must be prm, aex or ofx, got '${ARG_KIND}'")
+    message(FATAL_ERROR "osv_add_premiere_plugin(${TARGET}): KIND must be prm or aex, got '${ARG_KIND}'")
   endif()
 
   if(ARG_OUTPUT_DIRECTORY)

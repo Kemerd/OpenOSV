@@ -77,8 +77,10 @@ struct ClipKey {
 std::mutex g_cacheMutex;
 std::map<ClipKey, std::weak_ptr<ImporterInstance>> g_cache;
 
-/// A path spelled the way two spellings of the same file agree on: absolute,
-/// lexically normalised, lower-case (NTFS is case-insensitive).
+/// A path spelled the way two spellings of the same file agree on: absolute
+/// and lexically normalised - and lower-case on Windows, where NTFS ignores
+/// case.  Not on macOS: an APFS volume may be case-SENSITIVE, and folding
+/// case there would give two different clips one engine.
 [[nodiscard]] std::wstring normalisedPath(const std::filesystem::path& path) {
     std::error_code ec;
     std::filesystem::path abs = std::filesystem::absolute(path, ec);
@@ -86,9 +88,11 @@ std::map<ClipKey, std::weak_ptr<ImporterInstance>> g_cache;
         abs = path;
     }
     std::wstring s = abs.lexically_normal().wstring();
+#if defined(_WIN32)
     for (wchar_t& c : s) {
         c = static_cast<wchar_t>(std::towlower(c));
     }
+#endif
     return s;
 }
 

@@ -7,7 +7,7 @@
 //  What it is for
 // ===========================================================================
 // Nobody on the project runs DaVinci Resolve, so the OpenFX module is proven
-// the way the Premiere plug-ins are: the tests LoadLibraryW the bundle this
+// the way the Premiere plug-ins are: the tests load the bundle this
 // build produced and drive it through the C API exactly as a host does -
 // OfxSetHost, OfxGetPlugin, Load, Describe, DescribeInContext, CreateInstance,
 // InstanceChanged, GetRegionsOfInterest, Render, DestroyInstance, Unload -
@@ -31,19 +31,12 @@
 #include "ofxParam.h"
 #include "ofxProperty.h"
 
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
 
 namespace osv::ofxtest {
 
@@ -183,8 +176,9 @@ private:
 
 class LoadedModule {
 public:
-    /// Load the module at `path` (UTF-16) and hand it the mock host.
-    explicit LoadedModule(const std::wstring& path);
+    /// Load the module at `path` (LoadLibraryExW on Windows, dlopen on
+    /// macOS - the bundle's Contents/MacOS binary) and hand it the mock host.
+    explicit LoadedModule(const std::filesystem::path& path);
     ~LoadedModule();
     LoadedModule(const LoadedModule&) = delete;
     LoadedModule& operator=(const LoadedModule&) = delete;
@@ -196,7 +190,7 @@ public:
     [[nodiscard]] bool hasSetHostExport() const noexcept { return m_setHost != nullptr; }
 
 private:
-    HMODULE m_module = nullptr;
+    void* m_module = nullptr;  ///< HMODULE on Windows, a dlopen handle elsewhere.
     int (*m_getCount)() = nullptr;
     OfxPlugin* (*m_getPlugin)(int) = nullptr;
     OfxStatus (*m_setHost)(const OfxHost*) = nullptr;

@@ -1,10 +1,11 @@
 # DaVinci Resolve (OpenFX)
 
-**Status: built and tested, but not yet run inside DaVinci Resolve.** The
-plug-ins pass their tests against a strict mock OpenFX host that loads the
-real `OpenOSV.ofx` and drives it the way a host does (`tests/ofx`). Nobody on
-the project has run them in Resolve yet. Treat this as a preview, and please
-report what you see (see [Reporting a problem](#reporting-a-problem)).
+**Status: built and tested, but not yet run inside DaVinci Resolve**, on
+Windows or on macOS. The plug-ins pass their tests against a strict mock
+OpenFX host that loads the real `OpenOSV.ofx` and drives it the way a host
+does (`tests/ofx`). Nobody on the project has run them in Resolve yet. Treat
+this as a preview. If you try it, especially on a Mac, please report what you
+see, or send a fix: see [Reporting a problem](#reporting-a-problem).
 
 `OpenOSV.ofx.bundle` holds two OpenFX effects. Both show up in Resolve's
 Effects Library under **OpenFX**, in the **OpenOSV** group:
@@ -12,7 +13,7 @@ Effects Library under **OpenFX**, in the **OpenOSV** group:
 | Effect | Kind | What it does |
 |---|---|---|
 | **OpenOSV Source** | Generator | Opens a DJI Osmo 360 `.OSV` (or its `.LRF` proxy) and stitches it with the Premiere importer's engine. It outputs either a reframed view or the whole 360 sphere. |
-| **Open 360 Reframe** | Filter | Points the Premiere effect's virtual camera into any equirectangular clip. It renders on the GPU (CUDA) when Resolve hands over CUDA images. |
+| **Open 360 Reframe** | Filter | Points the Premiere effect's virtual camera into any equirectangular clip. On Windows it renders on the GPU (CUDA) when Resolve hands over CUDA images; otherwise, and on a Mac, on all CPU cores. |
 
 Both effects compile the Premiere plug-ins' own source files, not a port of
 them:
@@ -30,28 +31,41 @@ tests check this frame for frame.
 
 Resolve only looks for plug-ins when it starts, so close it first.
 
-**From the release zip** (0.2.0 and later): unzip it and double-click
-**`Install-Resolve.cmd`**. It asks for admin rights once.
+**From the Windows release zip** (0.2.0 and later): unzip it and
+double-click **`Install-Resolve.cmd`**. It asks for admin rights once.
 **`Uninstall-Resolve.cmd`** takes the plug-ins out again. The zip's
 `Install.cmd` is the Premiere installer; the two are independent.
 
-**From source:**
+**From source.** The bundle needs **no Adobe SDK**: every build makes it
+(`OSV_BUILD_OFX`, on by default), with or without the Premiere plug-ins.
+
+Windows (Visual Studio 2022, CMake, vcpkg; CUDA for the GPU path):
 
 ```powershell
-# Build (the Premiere preset builds the OpenFX bundle too; OSV_BUILD_OFX=ON)
 $env:VCPKG_ROOT = "C:\vcpkg"
-cmake --preset windows-msvc-premiere-release
-cmake --build --preset windows-msvc-premiere-release
-
-# Install into C:\Program Files\Common Files\OFX\Plugins (asks for admin once)
-scripts\install_ofx.ps1
+cmake --preset windows-msvc-cuda-release
+cmake --build --preset windows-msvc-cuda-release
+scripts\install_ofx.ps1            # into C:\Program Files\Common Files\OFX\Plugins
 ```
 
-`scripts\install_ofx.ps1 -Uninstall` removes it again. The bundle is
-self-contained: its FFmpeg, OpenCL, fmt and spdlog DLLs sit next to
+macOS on Apple Silicon (Xcode command line tools, CMake, Ninja, vcpkg; see
+[`BUILDING_MAC.md`](BUILDING_MAC.md)):
+
+```sh
+export VCPKG_ROOT=~/vcpkg
+cmake --preset macos-release
+cmake --build --preset macos-release
+scripts/install_ofx.sh             # into /Library/OFX/Plugins
+```
+
+`-Uninstall` / `--uninstall` removes it again. The bundle is self-contained.
+On Windows, its FFmpeg, OpenCL, fmt and spdlog DLLs sit next to
 `OpenOSV.ofx`, and the module loads them from there, never from Resolve's own
-folder. To install by hand, copy the whole `OpenOSV.ofx.bundle` folder from
-`<build>\plugins\ofx\` into `C:\Program Files\Common Files\OFX\Plugins\`.
+folder. On a Mac, FFmpeg is embedded in `Contents/Frameworks` under
+OpenOSV-prefixed names, and the installer clears the download quarantine and
+signs the bundle ad hoc. To install by hand, copy the whole
+`OpenOSV.ofx.bundle` folder from `<build>/plugins/ofx/` into the OpenFX
+folder.
 
 Third-party OpenFX plug-ins run in the free version of Resolve as well as in
 Studio.
@@ -149,6 +163,10 @@ on all CPU cores.
 
 ## Reporting a problem
 
+Please open an issue, or better, a pull request, at
+<https://github.com/Kemerd/OpenOSV/issues>. That goes double for a Mac:
+nobody on the project has one to test on.
+
 Everything the plug-ins do is logged to
 `%LOCALAPPDATA%\OpenOSV\OpenOSVOfx.log`. Set `OSV_PLUGIN_LOG_LEVEL=debug`
 before starting Resolve for more detail. The first frame of every OpenOSV
@@ -182,6 +200,10 @@ The following is checked by `tests/ofx` on every build:
 - A missing file or a non-OSV file: transparent output and one message, not
   one per frame.
 
+The macOS build of the bundle compiles and runs these tests on GitHub's
+Apple Silicon runners (`.github/workflows/macos.yml`), except the [cuda] and
+[sample] ones.
+
 The following can't be checked without Resolve:
 
 - **What time Resolve gives a generator.** The OpenFX standard doesn't say,
@@ -195,6 +217,11 @@ The following can't be checked without Resolve:
 - **Colour management.** How a colour-managed project interprets a
   generator's output. See [Colour](#colour).
 - **Playback speed inside Resolve.**
+- **macOS inside Resolve at all.** The bundle builds and passes its tests on
+  a Mac, but nobody has loaded it into Resolve on one. On a Mac the stitch
+  runs on the GPU (Metal, through the clip engine). Open 360 Reframe renders
+  on the CPU: Resolve hands a Mac plug-in Metal buffers, and a Metal path for
+  the filter isn't written yet.
 
 ## Where the code is
 
@@ -208,9 +235,11 @@ The following can't be checked without Resolve:
 | `plugins/ofx/OfxEngineHooks.cpp` | The two settings hooks the clip engine links against (Premiere's direct-path engine has no counterpart here) |
 | `plugins/ofx/openfx/` | OpenFX 1.5.1 headers, vendored (BSD-3-Clause) |
 | `tests/ofx/` | The mock OpenFX host and the tests |
-| `scripts/install_ofx.ps1` | Install / uninstall |
+| `plugins/ofx/OfxFileDialogMac.mm` | The macOS Choose File panel |
+| `scripts/install_ofx.ps1`, `scripts/install_ofx.sh` | Install / uninstall (Windows / macOS) |
 
-The module is built with the Premiere plug-ins (`OSV_BUILD_PREMIERE=ON`,
-option `OSV_BUILD_OFX`), because it compiles their sources. One of them,
-`ImporterInstance.cpp`, includes a Premiere SDK header for the name in a log
-line. No Adobe code ends up in `OpenOSV.ofx`.
+The module compiles the Premiere plug-ins' host-independent sources, but no
+Adobe header: the clip engine is built with
+`OSV_CLIP_ENGINE_WITHOUT_PREMIERE`, which leaves out its one Premiere-only
+log detail. Premiere's direct GPU path (`Engine.cpp`) is replaced by
+`EngineNoDirect.cpp`, which answers that there is none.

@@ -7,6 +7,7 @@
 
 #include "PluginLog.h"
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -14,6 +15,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 
 #if defined(OSV_OFX_HAVE_CUDA)
 #include <cuda.h>
@@ -40,6 +42,10 @@ namespace osv::ofx::cuda {
 using osv::premiere::PluginLog;
 
 bool driverPresent() noexcept {
+#if !defined(_WIN32)
+    // CUDA render is an NVIDIA-on-Windows path here; a Mac has no driver.
+    return false;
+#else
     // Already in the process: the host (Resolve on an NVIDIA machine) loaded
     // it, which is the case that matters - a CUDA render cannot happen
     // without it.
@@ -56,6 +62,7 @@ bool driverPresent() noexcept {
     // the first driver call, and unloading it now would only make that call
     // load it again.
     return true;
+#endif
 }
 
 #if defined(OSV_OFX_HAVE_CUDA)

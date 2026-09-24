@@ -20,12 +20,17 @@
 // Every entry point is noexcept and catches everything: an exception
 // unwinding into the host's C call stack takes the host down with it, and a
 // host that crashes while loading a plug-in blacklists it.
+//
+// Windows and macOS build the same file.  Windows adds DllMain (the
+// delay-load hook that resolves the bundle's own DLLs); a Mac bundle needs
+// neither, because its libraries are embedded under unique install names
+// (cmake/OsvMacBundle.cmake), and it marks the three exports visible,
+// since everything else in the bundle is compiled hidden.
 #include "OfxCuda.h"
 #include "OfxHost.h"
 #include "OfxReframe.h"
 #include "OfxSource.h"
 
-#include "DelayLoad.h"
 #include "HostContext.h"
 #include "PluginLog.h"
 
@@ -155,13 +160,23 @@ OfxPlugin g_sourcePlugin = {
 
 // ===========================================================================
 //  The OpenFX exports
+//
+//  OfxExport is __declspec(dllexport) on Windows and a plain `extern`
+//  elsewhere; a Mac bundle is compiled with -fvisibility=hidden, so the three
+//  entry points are made visible explicitly (and are the only symbols its
+//  exported-symbols list names).
 // ===========================================================================
+#if defined(_WIN32)
+#define OSV_OFX_EXPORT OfxExport
+#else
+#define OSV_OFX_EXPORT OfxExport __attribute__((visibility("default")))
+#endif
 
 /// Number of plug-ins in this module.
-OfxExport int OfxGetNumberOfPlugins(void) { return 2; }
+OSV_OFX_EXPORT int OfxGetNumberOfPlugins(void) { return 2; }
 
 /// The nth plug-in; null for an index out of range.
-OfxExport OfxPlugin* OfxGetPlugin(int nth) {
+OSV_OFX_EXPORT OfxPlugin* OfxGetPlugin(int nth) {
     switch (nth) {
     case 0:
         return &g_reframePlugin;
@@ -175,13 +190,14 @@ OfxExport OfxPlugin* OfxGetPlugin(int nth) {
 /// OpenFX 1.5's optional module-level host hand-off, called (by hosts that
 /// know it) before OfxGetNumberOfPlugins.  Equivalent to the per-plug-in
 /// setHost above; a host that calls both simply sets the same pointer twice.
-OfxExport OfxStatus OfxSetHost(const OfxHost* host) {
+OSV_OFX_EXPORT OfxStatus OfxSetHost(const OfxHost* host) {
     osv::ofx::setHost(const_cast<OfxHost*>(host));
     return kOfxStatOK;
 }
 
+#if defined(_WIN32)
 // ===========================================================================
-//  DllMain
+//  DllMain (Windows)
 //
 //  Only what is safe under the loader lock, exactly like the Premiere
 //  plug-ins: point the delay-load hook at this module's own folder (the
@@ -189,6 +205,8 @@ OfxExport OfxStatus OfxSetHost(const OfxHost* host) {
 //  sit), and turn off thread notifications.  No logging, no CUDA, no
 //  allocation.
 // ===========================================================================
+
+#include "DelayLoad.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -205,3 +223,4 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID /*reserved*/) {
     }
     return TRUE;
 }
+#endif  // _WIN32

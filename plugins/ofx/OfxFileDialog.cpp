@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// OfxFileDialog.cpp - the Windows Open dialog behind "Choose .OSV File...".
+// OfxFileDialog.cpp - the Windows Open dialog behind "Choose .OSV File...",
+// and the path clean-up both platforms share.  The macOS panel is in
+// OfxFileDialogMac.mm.
 
 #include "OfxFileDialog.h"
 
 #include "PluginLog.h"
 
+#include <string>
+
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -17,12 +22,13 @@
 
 #include <commdlg.h>
 
-#include <array>
 #include <filesystem>
 #include <vector>
+#endif  // _WIN32
 
 namespace osv::ofx {
 
+#if defined(_WIN32)
 using osv::premiere::PluginLog;
 
 namespace {
@@ -59,6 +65,7 @@ namespace {
 }
 
 }  // namespace
+#endif  // _WIN32
 
 std::string cleanPath(std::string text) {
     // Whitespace first, then one level of matching quotes, then whitespace
@@ -81,6 +88,7 @@ std::string cleanPath(std::string text) {
     return text;
 }
 
+#if defined(_WIN32)
 std::optional<std::string> chooseOsvFile(const std::string& startPath) noexcept {
     try {
         // Room for any path Windows can hand back (long paths included).
@@ -133,5 +141,6 @@ std::optional<std::string> chooseOsvFile(const std::string& startPath) noexcept 
         return std::nullopt;
     }
 }
+#endif  // _WIN32
 
 }  // namespace osv::ofx

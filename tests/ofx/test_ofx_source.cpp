@@ -19,7 +19,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#if defined(OSV_OFX_TEST_HAVE_CUDA)
 #include <cuda.h>
+#endif
 
 #include <cmath>
 #include <cstdlib>
@@ -278,13 +280,14 @@ TEST_CASE("the reframed view is the Premiere effect's view of the importer's sph
     CHECK(maxDifference(view.output, ref, view.frame) == 0.0);
 }
 
+#if defined(OSV_OFX_TEST_HAVE_CUDA)
 TEST_CASE("a generator render leaves the host's CUDA context current", "[ofx][source][sample][cuda]") {
     REQUIRE(Fixture::get().ready);
     const std::string clip = sampleClip();
     if (clip.empty()) {
         SKIP("no sample clip");
     }
-    if (cuInit(0) != CUDA_SUCCESS) {
+    if (!cudaDriverLoadable() || cuInit(0) != CUDA_SUCCESS) {
         SKIP("no CUDA driver");
     }
     CUdevice device = 0;
@@ -304,3 +307,4 @@ TEST_CASE("a generator render leaves the host's CUDA context current", "[ofx][so
     CHECK(current == hostContext);
     cuCtxDestroy(hostContext);
 }
+#endif  // OSV_OFX_TEST_HAVE_CUDA
