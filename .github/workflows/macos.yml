@@ -1,0 +1,226 @@
+# =============================================================================
+#  OpenOSV continuous integration (macOS, Apple Silicon)
+#
+#  One job on macos-14 (arm64):
+#    * vcpkg installs the manifest for the arm64-osx-openosv overlay triplet
+#      (cmake/triplets): static C++ libraries, FFmpeg as shared libraries
+#      (LGPL).  Built packages go to a GitHub Actions cache through vcpkg's
+#      "files" binary provider, so FFmpeg is compiled once, not on every run.
+#    * the library, osvtool and the whole test-suite are built and run.  The
+#      sample clip is never downloaded here, so every [sample] test SKIPs.
+#    * the Premiere Pro plug-ins are built ONLY when the repository secret
+#      OSV_ADOBE_SDK_ARCHIVE_URL is set (a private URL to an archive holding
+#      the Premiere Pro and After Effects C++ SDKs, see docs/BUILDING_MAC.md).
+#      Adobe's SDKs may not be redistributed: the archive is downloaded into
+#      the runner's temp folder, used, and deleted; nothing from it is ever
+#      uploaded.  Without the secret those steps are skipped.
+#    * a zip with everything that was built is uploaded as an artifact.
+# =============================================================================
+name: macos
+
+on:
+  push:
+    branches: [ mac ]
+  workflow_dispatch:
+
+env:
+  VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+  VCPKG_BINARY_CACHE_DIR: ${{ github.workspace }}/.vcpkg-binary-cache
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.vcpkg-binary-cache,readwrite"
+  VCPKG_TRIPLET: arm64-osx-openosv
+
+jobs:
+  build-arm64:
+    runs-on: macos-14
+    timeout-minutes: 240
+    env:
+      # Secrets cannot be tested in a step's `if:` directly; an env copy can.
+      OSV_ADOBE_SDK_ARCHIVE_URL: ${{ secrets.OSV_ADOBE_SDK_ARCHIVE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      #  Toolchain: the newest Xcode on the image (its libc++ has the C++20
+      #  pieces the library uses), Ninja from Homebrew.
+      # -----------------------------------------------------------------------
+      - name: Select Xcode and install Ninja
+        run: |
+          set -euo pipefail
+          newest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -n "$newest" ]; then
+            sudo xcode-select -s "$newest/Contents/Developer"
+          fi
+          xcodebuild -version
+          clang++ --version
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          brew list pkg-config >/dev/null 2>&1 || brew list pkgconf >/dev/null 2>&1 || brew install pkgconf
+          cmake --version
+          ninja --version
+
+      # -----------------------------------------------------------------------
+      #  vcpkg at exactly the manifest's builtin-baseline.
+      # -----------------------------------------------------------------------
+      - name: Set up vcpkg at the manifest baseline
+        run: |
+          set -euo pipefail
+          baseline="$(python3 -c 'import json;print(json.load(open("vcpkg.json"))["builtin-baseline"])')"
+          git clone --quiet https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
+          git -C "$VCPKG_ROOT" checkout --quiet "$baseline"
+          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          mkdir -p "$VCPKG_BINARY_CACHE_DIR"
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE_DIR }}
+          key: vcpkg-bin-macos14-arm64-${{ hashFiles('vcpkg.json', 'cmake/triplets/*.cmake') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-bin-macos14-arm64-${{ hashFiles('vcpkg.json', 'cmake/triplets/*.cmake') }}-
+            vcpkg-bin-macos14-arm64-
+
+      # A listing of the cache before the install, so the save step below only
+      # uploads a new cache entry when vcpkg actually built something.
+      - name: Fingerprint the binary cache
+        run: |
+          set -euo pipefail
+          echo "VCPKG_CACHE_BEFORE=$(find "$VCPKG_BINARY_CACHE_DIR" -type f | sort | shasum | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Install dependencies (vcpkg manifest)
+        run: |
+          set -euo pipefail
+          "$VCPKG_ROOT/vcpkg" install \
+            --triplet "$VCPKG_TRIPLET" \
+            --host-triplet arm64-osx \
+            --overlay-triplets "${{ github.workspace }}/cmake/triplets" \
+            --x-install-root "${{ github.workspace }}/vcpkg_installed" \
+            --clean-after-build
+
+      - name: Decide whether the binary cache changed
+        if: always()
+        id: vcpkg-cache-diff
+        run: |
+          set -euo pipefail
+          after="$(find "$VCPKG_BINARY_CACHE_DIR" -type f | sort | shasum | cut -d' ' -f1)"
+          if [ "$after" != "${VCPKG_CACHE_BEFORE:-}" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Saved even when the install failed half way: every package that did
+      # build is worth keeping for the next attempt.
+      - name: Save vcpkg binary cache
+        if: always() && steps.vcpkg-cache-diff.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE_DIR }}
+          key: vcpkg-bin-macos14-arm64-${{ hashFiles('vcpkg.json', 'cmake/triplets/*.cmake') }}-${{ github.run_id }}
+
+      - name: Upload vcpkg logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcpkg-logs-macos-arm64
+          path: |
+            ${{ env.VCPKG_ROOT }}/buildtrees/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # -----------------------------------------------------------------------
+      #  Library, osvtool, tests.
+      # -----------------------------------------------------------------------
+      - name: Configure
+        run: cmake --preset ci-macos -DVCPKG_MANIFEST_INSTALL=OFF
+
+      # -k 0: keep going past the first failing file, so one run reports
+      # every compile error instead of one.
+      - name: Build
+        run: cmake --build --preset ci-macos -- -k 0
+
+      - name: Test
+        run: ctest --preset ci-macos
+
+      - name: Backend report
+        run: build/ci-macos/bin/osvtool --version
+
+      # -----------------------------------------------------------------------
+      #  The Premiere Pro plug-ins - only with the private SDK archive.
+      #
+      #  The archive (zip or tar) must hold the Premiere Pro C++ SDK and the
+      #  After Effects C++ SDK folders anywhere inside it; they are found by
+      #  their headers.  It lives in the runner's temp folder only, and is
+      #  deleted by the last step whatever happened.  Never uploaded.
+      # -----------------------------------------------------------------------
+      - name: Fetch the Adobe SDKs (private)
+        id: sdk
+        if: env.OSV_ADOBE_SDK_ARCHIVE_URL != ''
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/adobe-sdk"
+          archive="$RUNNER_TEMP/adobe-sdk.archive"
+          rm -rf "$dest" && mkdir -p "$dest"
+          curl -fsSL --retry 3 -o "$archive" "$OSV_ADOBE_SDK_ARCHIVE_URL"
+          if unzip -tq "$archive" >/dev/null 2>&1; then
+            unzip -q "$archive" -d "$dest"
+          else
+            tar -xf "$archive" -C "$dest"
+          fi
+          rm -f "$archive"
+          pr_header="$(find "$dest" -path '*/Examples/Headers/PrSDKImport.h' -print -quit)"
+          ae_header="$(find "$dest" -path '*/Examples/Resources/AE_General.r' -print -quit)"
+          if [ -z "$pr_header" ] || [ -z "$ae_header" ]; then
+            echo "The SDK archive must contain the Premiere Pro SDK (Examples/Headers/PrSDKImport.h) and the After Effects SDK (Examples/Resources/AE_General.r)." >&2
+            exit 1
+          fi
+          echo "premiere=$(cd "$(dirname "$pr_header")/../.." && pwd)" >> "$GITHUB_OUTPUT"
+          echo "ae=$(cd "$(dirname "$ae_header")/../.." && pwd)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure the plug-ins
+        if: steps.sdk.outcome == 'success'
+        run: >
+          cmake --preset macos-premiere-release -DVCPKG_MANIFEST_INSTALL=OFF
+          "-DOSV_PREMIERE_SDK_DIR=${{ steps.sdk.outputs.premiere }}"
+          "-DOSV_AE_SDK_DIR=${{ steps.sdk.outputs.ae }}"
+
+      - name: Build the plug-ins
+        if: steps.sdk.outcome == 'success'
+        run: cmake --build --preset macos-premiere-release -- -k 0
+
+      - name: Test the plug-in build
+        if: steps.sdk.outcome == 'success'
+        run: ctest --preset macos-premiere
+
+      - name: Skip the plug-ins (no SDK archive configured)
+        if: env.OSV_ADOBE_SDK_ARCHIVE_URL == ''
+        run: |
+          echo "OSV_ADOBE_SDK_ARCHIVE_URL is not set, so the Premiere Pro plug-ins are not built here."
+          echo "The library, osvtool and the SDK-free plug-in tests above ran; see docs/BUILDING_MAC.md."
+
+      - name: Remove the Adobe SDKs
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/adobe-sdk" "$RUNNER_TEMP/adobe-sdk.archive"
+
+      # -----------------------------------------------------------------------
+      #  The release zip.
+      # -----------------------------------------------------------------------
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^ *VERSION \([0-9][0-9.]*\)$/\1/p' CMakeLists.txt | head -1)"
+          name="OpenOSV-${version}-macos-arm64"
+          stage=""
+          if [ -d build/macos-premiere-release/plugins/OpenOSV ]; then
+            stage="--plugin-stage build/macos-premiere-release/plugins/OpenOSV"
+          fi
+          scripts/package_macos.sh --build-dir build/ci-macos --out "dist/${name}.zip" $stage
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the release zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.name }}.zip
+          if-no-files-found: error
+          retention-days: 30

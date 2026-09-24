@@ -51,9 +51,30 @@
 #include <mutex>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace osv::premiere {
 
 namespace {
+
+/// Close a clip's OS handle and mark it closed; a closed handle is left
+/// alone.  CloseHandle on Windows, close() of the descriptor elsewhere.
+void closeClipFile(ClipFileHandle& handle) noexcept {
+    if (handle == invalidClipFileHandle()) {
+        return;
+    }
+#if defined(_WIN32)
+    ::CloseHandle(handle);
+#else
+    ::close(static_cast<int>(reinterpret_cast<std::intptr_t>(handle)));
+#endif
+    handle = invalidClipFileHandle();
+}
 
 /// Keep a bounded analysis cache: once it grows past `limit` the lowest keys
 /// (bucket indices - every analysis cache is keyed by bucket) are dropped.  Scrubbing walks forward and backward, so
@@ -419,6 +440,7 @@ Status ImporterInstance::open() {
     // The OS handle is what Premiere stores in imFileAccessRec8::fileref and
     // what keeps a second application from deleting the clip under us.  Share
     // read so Media Encoder can open the same file at the same time.
+#if defined(_WIN32)
     if (m_fileHandle == INVALID_HANDLE_VALUE) {
         const std::wstring wide = m_path.wstring();
         m_fileHandle = ::CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -428,6 +450,22 @@ Status ImporterInstance::open() {
             return Error{ErrorCode::Io, "CreateFileW failed with " + std::to_string(err)};
         }
     }
+#else
+    // POSIX has no share modes (nothing stops a delete anyway); the open
+    // descriptor is what the host is handed and what proves the file is
+    // readable before anything is parsed.
+    if (m_fileHandle == invalidClipFileHandle()) {
+        int fd = -1;
+        do {
+            fd = ::open(m_path.c_str(), O_RDONLY | O_CLOEXEC);
+        } while (fd < 0 && errno == EINTR);
+        if (fd < 0) {
+            const int err = errno;
+            return Error{ErrorCode::Io, std::string("open failed: ") + std::strerror(err)};
+        }
+        m_fileHandle = reinterpret_cast<ClipFileHandle>(static_cast<std::intptr_t>(fd));
+    }
+#endif
 
     // The container work only happens once; after a quiet/unquiet cycle the
     // parsed state is still there and only the decoders have to come back.
@@ -435,10 +473,7 @@ Status ImporterInstance::open() {
     if (!st.ok()) {
         // Close the handle here: the dispatcher returns imBadFile and a
         // lower-priority importer must be able to open the file.
-        if (m_fileHandle != INVALID_HANDLE_VALUE) {
-            ::CloseHandle(m_fileHandle);
-            m_fileHandle = INVALID_HANDLE_VALUE;
-        }
+        closeClipFile(m_fileHandle);
         return st;
     }
     return okStatus();
@@ -781,10 +816,17 @@ Status ImporterInstance::ensureReader() {
     // renderer comes from a shared pool whose device is not known here.
     // Software is the last resort, and the only choice once hardware has
     // failed on this clip (m_hwDecodeFailed, see readPair()).
+    //
+    // macOS: VideoToolbox takes D3D11VA's place - Apple's hardware HEVC
+    // decoder, on every Apple Silicon Mac - with the same host copy.
     std::vector<video::HwAccel> order;
     if (!m_hwDecodeFailed) {
+#if defined(__APPLE__)
+        order.push_back(video::HwAccel::VideoToolbox);
+#else
         order.push_back(video::HwAccel::D3D11VA);
         order.push_back(video::HwAccel::Cuda);
+#endif
     }
     order.push_back(video::HwAccel::None);
 
@@ -952,10 +994,7 @@ void ImporterInstance::releaseHeavy() noexcept {
     m_gains.clear();
     resetParallaxLocked();
 
-    if (m_fileHandle != INVALID_HANDLE_VALUE) {
-        ::CloseHandle(m_fileHandle);
-        m_fileHandle = INVALID_HANDLE_VALUE;
-    }
+    closeClipFile(m_fileHandle);
 }
 
 Result<std::unique_ptr<video::GpuClipDecoder>> ImporterInstance::takeOrOpenGpuDecoder(

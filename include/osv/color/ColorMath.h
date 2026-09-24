@@ -25,14 +25,22 @@
 #define OSV_COLOR_COLORMATH_H
 
 // Host build: pull the C math intrinsics.  nvcc provides them as builtins and
-// the OpenCL wrapper maps them onto the OpenCL C equivalents with macros.
-#if !defined(__CUDACC__) && !defined(__OPENCL_VERSION__)
+// the OpenCL / Metal wrappers map them onto their own functions with macros.
+#if !defined(__CUDACC__) && !defined(__OPENCL_VERSION__) && !defined(__METAL_VERSION__)
 #include <math.h>
 #endif
 
 // The render module defines OSV_HD as `__host__ __device__ inline` for CUDA.
 #ifndef OSV_HD
 #define OSV_HD inline
+#endif
+
+// Pointers to per-pixel private data (parameter blocks, small arrays).  The
+// Metal Shading Language wants an address space on every pointer, so its
+// preamble defines this as `thread`; everywhere else such pointers are
+// private by default and the macro is empty.
+#ifndef OSV_PRIVATE
+#define OSV_PRIVATE
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -217,7 +225,7 @@ OSV_HD float osvExpf(float x) {
 }
 
 /** @brief Apply a row-major 3x3 matrix to (r, g, b); out may alias nothing. */
-OSV_HD void osvMat3Apply(const OsvMat3f* mat, float r, float g, float b, float out[3]) {
+OSV_HD void osvMat3Apply(OSV_PRIVATE const OsvMat3f* mat, float r, float g, float b, OSV_PRIVATE float out[3]) {
     /* Defensive: a null matrix is treated as identity so callers never crash. */
     if (mat == 0) {
         out[0] = r;
@@ -241,7 +249,7 @@ OSV_HD void osvMat3Apply(const OsvMat3f* mat, float r, float g, float b, float o
  * value of tmp where both branches agree.  When the slopes are equal (no
  * intersection) the stored cut is returned instead.
  */
-OSV_HD float osvDlogmCut(const OsvDlogMCurve* curve) {
+OSV_HD float osvDlogmCut(OSV_PRIVATE const OsvDlogMCurve* curve) {
     if (curve == 0) {
         return 0.0f;
     }
@@ -262,7 +270,7 @@ OSV_HD float osvDlogmCut(const OsvDlogMCurve* curve) {
  * mis-configured curve can go negative.  Callers that need positive light
  * clamp afterwards.
  */
-OSV_HD float osvDlogmToLinear(const OsvDlogMCurve* curve, float code) {
+OSV_HD float osvDlogmToLinear(OSV_PRIVATE const OsvDlogMCurve* curve, float code) {
     if (curve == 0) {
         return code;
     }
@@ -422,7 +430,7 @@ OSV_HD float osvBt2390Eetf(float pqCode, float srcPeakNits, float dstPeakNits) {
  * there instead of calling this.  A degenerate curve (zero slopes, scale or
  * mid-grey scaling) returns 0 rather than dividing by zero.
  */
-OSV_HD float osvDlogmToCode(const OsvDlogMCurve* curve, float lin) {
+OSV_HD float osvDlogmToCode(OSV_PRIVATE const OsvDlogMCurve* curve, float lin) {
     if (curve == 0) {
         return lin;
     }
@@ -453,7 +461,7 @@ OSV_HD float osvDlogmToCode(const OsvDlogMCurve* curve, float lin) {
  * input, including the negative values a wide-gamut matrix produces for
  * colours outside the output gamut.
  */
-OSV_HD float osvLookShaper(const OsvLookParams* look, float x) {
+OSV_HD float osvLookShaper(OSV_PRIVATE const OsvLookParams* look, float x) {
     if (look == 0) {
         return x;
     }
@@ -472,7 +480,7 @@ OSV_HD float osvLookShaper(const OsvLookParams* look, float x) {
  * the knots.  Outside [0, 1] the curve continues along its end tangents, so
  * T is C1 everywhere and nothing is clipped here.
  */
-OSV_HD float osvLookTone(const OsvLookParams* look, float u) {
+OSV_HD float osvLookTone(OSV_PRIVATE const OsvLookParams* look, float u) {
     if (look == 0) {
         return u;
     }
@@ -533,7 +541,8 @@ OSV_HD float osvLookTone(const OsvLookParams* look, float u) {
  * Both matrices have unit row sums and stages 2 and 4 leave neutrals alone,
  * so for a neutral input the whole look is exactly T(shaper(x)).
  */
-OSV_HD void osvLookApply(const OsvLookParams* look, const float in[3], float out[3]) {
+OSV_HD void osvLookApply(OSV_PRIVATE const OsvLookParams* look, OSV_PRIVATE const float in[3],
+                         OSV_PRIVATE float out[3]) {
     float x[3];
     float y[3];
     int i;
@@ -645,7 +654,7 @@ OSV_HD void osvLookApply(const OsvLookParams* look, const float in[3], float out
  * than dividing by zero or bending the curve backwards.  Input at or above
  * the source peak lands exactly on the target peak.
  */
-OSV_HD float osvHdrPeakRolloff(const OsvColorParams* params, float pqCode) {
+OSV_HD float osvHdrPeakRolloff(OSV_PRIVATE const OsvColorParams* params, float pqCode) {
     /* Off: no block, or no target (the zeroed default). */
     if (params == 0 || !(params->hdrPeakNits > 0.0f)) {
         return pqCode;
@@ -687,7 +696,8 @@ OSV_HD float osvHdrPeakRolloff(const OsvColorParams* params, float pqCode) {
  * the result clamped to [0,1].  For D-Log M input the result is the log code;
  * for HLG / Rec.709 input it is that transfer's signal.
  */
-OSV_HD void osvYuvToCode(const OsvColorParams* params, float y, float u, float v, float out[3]) {
+OSV_HD void osvYuvToCode(OSV_PRIVATE const OsvColorParams* params, float y, float u, float v,
+                         OSV_PRIVATE float out[3]) {
     if (params == 0) {
         out[0] = out[1] = out[2] = 0.0f;
         return;
@@ -706,7 +716,7 @@ OSV_HD void osvYuvToCode(const OsvColorParams* params, float y, float u, float v
     const float un = (u - chromaMid) * params->yuvScaleC;
     const float vn = (v - chromaMid) * params->yuvScaleC;
     /* Y'CbCr -> R'G'B'. */
-    const float* k = params->yuvToRgb;
+    OSV_PRIVATE const float* k = params->yuvToRgb;
     out[0] = osvSaturatef(k[0] * yn + k[1] * un + k[2] * vn);
     out[1] = osvSaturatef(k[3] * yn + k[4] * un + k[5] * vn);
     out[2] = osvSaturatef(k[6] * yn + k[7] * un + k[8] * vn);
@@ -721,7 +731,8 @@ OSV_HD void osvYuvToCode(const OsvColorParams* params, float y, float u, float v
  *  - Rec709Normal:  BT.709 inverse OETF per channel (display-referred SDR is
  *                   treated as scene-linear with grey ~0.18).
  */
-OSV_HD void osvCodeToLinear(const OsvColorParams* params, const float code[3], float out[3]) {
+OSV_HD void osvCodeToLinear(OSV_PRIVATE const OsvColorParams* params, OSV_PRIVATE const float code[3],
+                            OSV_PRIVATE float out[3]) {
     int i;
     if (params == 0 || params->enabled == 0) {
         out[0] = code[0];
@@ -767,7 +778,8 @@ OSV_HD void osvCodeToLinear(const OsvColorParams* params, const float code[3], f
  *  - Passthrough: input copied unchanged (see osvCodeToOutput).
  * Outputs of the encoded transfers are clamped to [0,1].
  */
-OSV_HD void osvLinearToOutput(const OsvColorParams* params, const float lin[3], float out[3]) {
+OSV_HD void osvLinearToOutput(OSV_PRIVATE const OsvColorParams* params, OSV_PRIVATE const float lin[3],
+                              OSV_PRIVATE float out[3]) {
     float working[3];
     float tmp[3];
     int i;
@@ -862,7 +874,8 @@ OSV_HD void osvLinearToOutput(const OsvColorParams* params, const float lin[3], 
  * (and enabled == 0) copy the code unchanged; every other transfer runs
  * osvCodeToLinear followed by osvLinearToOutput.
  */
-OSV_HD void osvCodeToOutput(const OsvColorParams* params, const float code[3], float out[3]) {
+OSV_HD void osvCodeToOutput(OSV_PRIVATE const OsvColorParams* params, OSV_PRIVATE const float code[3],
+                            OSV_PRIVATE float out[3]) {
     float lin[3];
     if (params == 0 || params->enabled == 0 || params->transfer == OSV_TRANSFER_PASSTHROUGH) {
         out[0] = code[0];

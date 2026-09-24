@@ -418,6 +418,14 @@ Media Encoder and After Effects all see them. It asks for admin rights once.
 and `-Uninstall` removes everything it added. Cutting a release zip:
 [`docs/RELEASING.md`](docs/RELEASING.md).
 
+### macOS (untested)
+
+There is an Apple Silicon build: `osvtool`, the plug-ins as Mac bundles, and
+Metal in place of CUDA. It compiles and passes its tests on CI, but nobody
+has run it inside Premiere Pro on a Mac yet. Treat it as a preview.
+[`docs/BUILDING_MAC.md`](docs/BUILDING_MAC.md) has the build, the install
+script (`scripts/install_plugins.sh`) and exactly what has been checked.
+
 ### Sequence presets
 
 An equirectangular sphere is always 2:1, so a sequence made from an `.OSV`

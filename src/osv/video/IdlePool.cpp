@@ -31,6 +31,13 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
 #endif
 
 namespace osv::video::detail {
@@ -75,6 +82,36 @@ bool systemMemoryUnderPressure(std::uint64_t minAvailableMiB) noexcept {
         // Compare in MiB so a huge floor cannot overflow the byte count.
         if (::GlobalMemoryStatusEx(&status) && (status.ullAvailPhys >> 20) < minAvailableMiB) {
             return true;
+        }
+    }
+    return false;
+#elif defined(__APPLE__)
+    // The kernel's own verdict first: the memorystatus pressure level is
+    // 1 (normal), 2 (warning) or 4 (critical).  Warning is where a Mac lives
+    // whenever it swaps a little, so only critical counts - the same "the OS
+    // is about to start hurting" point Windows' low-memory notification marks.
+    int level = 0;
+    std::size_t levelSize = sizeof(level);
+    if (::sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &levelSize, nullptr, 0) == 0 && level >= 4) {
+        return true;
+    }
+    if (minAvailableMiB > 0) {
+        // Available = free + inactive (file cache the kernel reclaims first)
+        // + purgeable pages.  The host port is looked up once: every
+        // mach_host_self() call adds a send right to it.
+        static const mach_port_t host = ::mach_host_self();
+        vm_statistics64_data_t vm{};
+        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+        vm_size_t pageSize = 0;
+        if (::host_statistics64(host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm), &count) == KERN_SUCCESS &&
+            ::host_page_size(host, &pageSize) == KERN_SUCCESS && pageSize > 0) {
+            const std::uint64_t pages = static_cast<std::uint64_t>(vm.free_count) +
+                                        static_cast<std::uint64_t>(vm.inactive_count) +
+                                        static_cast<std::uint64_t>(vm.purgeable_count);
+            // Compare in MiB so a huge floor cannot overflow the byte count.
+            if (((pages * static_cast<std::uint64_t>(pageSize)) >> 20) < minAvailableMiB) {
+                return true;
+            }
         }
     }
     return false;
@@ -302,6 +339,24 @@ void startReaperLocked(const std::shared_ptr<IdlePool::State>& s) noexcept {
     }
     s->reaperThread = thread;
 #else
+    // The reaper is detached, so the image holding its code must never be
+    // unmapped under it.  POSIX has no FreeLibraryAndExitThread to hand a
+    // reference back from the last instruction of a thread, so the image
+    // (a plug-in bundle, or the executable itself) is marked never-unload
+    // once instead: RTLD_NOLOAD finds it without loading anything and
+    // RTLD_NODELETE makes a later dlclose() leave it mapped.  Best effort:
+    // a main executable (osvtool, the tests) is never unloaded anyway, and
+    // some loaders refuse to hand out a handle to it by path.
+    static const bool pinned = []() noexcept {
+        Dl_info info{};
+        if (::dladdr(reinterpret_cast<const void*>(&reaperLoop), &info) == 0 || !info.dli_fname) {
+            return false;
+        }
+        return ::dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD | RTLD_NODELETE) != nullptr;
+    }();
+    if (!pinned) {
+        log::debug("video: {} could not mark its module never-unload", s->name);
+    }
     try {
         std::thread([state = s]() noexcept { reaperLoop(state); }).detach();
     } catch (...) {

@@ -3,9 +3,10 @@
  *
  * osv_kernel.h - the ONE per-pixel shader shared by every renderer backend.
  *
- * This header is written in the common subset of C99, C++20, CUDA C++ and
- * OpenCL C so that exactly the same arithmetic runs on the CPU reference
- * renderer, inside a CUDA kernel and inside an OpenCL kernel.  The parity tests
+ * This header is written in the common subset of C99, C++20, CUDA C++,
+ * OpenCL C and the Metal Shading Language so that exactly the same arithmetic
+ * runs on the CPU reference renderer and inside a CUDA, OpenCL or Metal
+ * kernel.  The parity tests
  * (tests/unit/test_render_*.cpp) demand PSNR >= 60 dB between backends after
  * 16-bit quantisation, which is only achievable when the code is literally the
  * same.  Therefore:
@@ -17,7 +18,11 @@
  *     functions;
  *   * every function is marked OSV_HD (host+device inline);
  *   * pointers into image memory are qualified with OSV_GLOBAL (expands to
- *     __global under OpenCL, to nothing elsewhere).
+ *     __global under OpenCL, device under Metal, to nothing elsewhere);
+ *   * every other pointer - parameters, array parameters, locals pointing at
+ *     a parameter block or a stack array - is qualified with OSV_PRIVATE
+ *     (thread under Metal, which demands an address space on every pointer;
+ *     nothing elsewhere, where such pointers are private by default).
  *
  * Coordinate conventions (see docs/GEOMETRY.md):
  *   view frame   : X right, Y forward, Z up (right-handed)
@@ -43,6 +48,20 @@
 #ifndef OSV_GLOBAL
 #define OSV_GLOBAL __global
 #endif
+#elif defined(__METAL_VERSION__)
+/* Metal Shading Language (C++14 based).  Like OpenCL, ColorMath.h arrives as
+ * a preceding source string, and the Metal preamble maps the C99 float math
+ * names onto the metal:: functions. */
+#define OSV_KERNEL_METAL 1
+#ifndef OSV_HD
+#define OSV_HD static inline
+#endif
+#ifndef OSV_GLOBAL
+#define OSV_GLOBAL device
+#endif
+#ifndef OSV_PRIVATE
+#define OSV_PRIVATE thread
+#endif
 #elif defined(__CUDACC__)
 #define OSV_KERNEL_CUDA 1
 #ifndef OSV_HD
@@ -63,7 +82,12 @@
 #include <stddef.h>
 #endif
 
-#if !defined(OSV_KERNEL_OPENCL)
+/* Pointers into private (per work-item) memory: explicit under Metal only. */
+#ifndef OSV_PRIVATE
+#define OSV_PRIVATE
+#endif
+
+#if !defined(OSV_KERNEL_OPENCL) && !defined(OSV_KERNEL_METAL)
 #include "osv/color/ColorMath.h"
 #endif
 
@@ -463,11 +487,14 @@ typedef struct OsvReframeParams {
 } OsvReframeParams;
 
 /* Reinterpretation helper for the half-float decoder below.  A union is the
- * one type pun every dialect (C99, C++, CUDA C++, OpenCL C) accepts. */
+ * one type pun every dialect (C99, C++, CUDA C++, OpenCL C) accepts; Metal
+ * has as_type<> for it instead. */
+#if !defined(OSV_KERNEL_METAL)
 typedef union OsvFloatBits {
     unsigned int u;
     float f;
 } OsvFloatBits;
+#endif
 
 /* ------------------------------------------------------------------------- */
 /*  Small vector helpers                                                      */
@@ -479,19 +506,19 @@ OSV_HD float osvSmoothstep(float t) {
     return t * t * (3.0f - 2.0f * t);
 }
 
-OSV_HD void osvMat3MulVec(const float* m, const float* v, float* out) {
+OSV_HD void osvMat3MulVec(OSV_PRIVATE const float* m, OSV_PRIVATE const float* v, OSV_PRIVATE float* out) {
     out[0] = m[0] * v[0] + m[1] * v[1] + m[2] * v[2];
     out[1] = m[3] * v[0] + m[4] * v[1] + m[5] * v[2];
     out[2] = m[6] * v[0] + m[7] * v[1] + m[8] * v[2];
 }
 
-OSV_HD void osvMat3TMulVec(const float* m, const float* v, float* out) {
+OSV_HD void osvMat3TMulVec(OSV_PRIVATE const float* m, OSV_PRIVATE const float* v, OSV_PRIVATE float* out) {
     out[0] = m[0] * v[0] + m[3] * v[1] + m[6] * v[2];
     out[1] = m[1] * v[0] + m[4] * v[1] + m[7] * v[2];
     out[2] = m[2] * v[0] + m[5] * v[1] + m[8] * v[2];
 }
 
-OSV_HD void osvNormalize3(float* v) {
+OSV_HD void osvNormalize3(OSV_PRIVATE float* v) {
     const float n = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
     if (n > 0.0f) {
         v[0] /= n;
@@ -500,14 +527,15 @@ OSV_HD void osvNormalize3(float* v) {
     }
 }
 
-OSV_HD void osvCross3(const float* a, const float* b, float* out) {
+OSV_HD void osvCross3(OSV_PRIVATE const float* a, OSV_PRIVATE const float* b, OSV_PRIVATE float* out) {
     out[0] = a[1] * b[2] - a[2] * b[1];
     out[1] = a[2] * b[0] - a[0] * b[2];
     out[2] = a[0] * b[1] - a[1] * b[0];
 }
 
 /* Rotate v about the unit axis n by angle a (Rodrigues). */
-OSV_HD void osvRotateAboutAxis(const float* v, const float* n, float a, float* out) {
+OSV_HD void osvRotateAboutAxis(OSV_PRIVATE const float* v, OSV_PRIVATE const float* n, float a,
+                               OSV_PRIVATE float* out) {
     const float c = cosf(a);
     const float s = sinf(a);
     float nxv[3];
@@ -535,6 +563,17 @@ OSV_HD float osvEyeOffsetTheta(float r, float focalPx, float d) {
         return -1.0f;
     }
     const float k = r / (focalPx * (1.0f + d));
+    /* Past k = 2^26, atan(k) lies within 1/k < 1.5e-8 of pi/2 - a quarter of
+     * the float spacing there - so the ray sits on the asymptote to float
+     * precision.  A correctly rounded atanf then returns pi/2's own float and
+     * the comparison below reports it uncovered, but math libraries that are
+     * only faithfully rounded (Apple's, some GPU ones) may return the float
+     * just below and call it covered.  The verdict is made here instead, the
+     * same on every platform and backend.  No real frame comes near: k is a
+     * radius in units of the focal length, a few at most. */
+    if (!(k < 67108864.0f)) {
+        return -1.0f;
+    }
     /* k d / sqrt(1 + k^2), written so that k^2 overflowing to infinity for
      * absurd radii still gives the correct limit d instead of 0. */
     const float s = (k > 1.0f) ? osvClampf(d / sqrtf(1.0f + 1.0f / (k * k)), -1.0f, 1.0f)
@@ -559,7 +598,7 @@ OSV_HD float osvEyeOffsetTheta(float r, float focalPx, float d) {
  * function itself lives in the [WP-CAMERA] region at the end of this file.
  * See docs/research/DJI_CAMERA.md for the recovery of the model. */
 #define OSV_PROJ_DJI_SPHERE 4
-OSV_HD int osvDjiSphereRay(float focalPx, float eyeZ, float nx, float ny, float* d);
+OSV_HD int osvDjiSphereRay(float focalPx, float eyeZ, float nx, float ny, OSV_PRIVATE float* d);
 /* ---- end [WP-CAMERA] ------------------------------------------------------ */
 
 /* Unit view ray for a centred pixel offset (nx right, ny up, in pixels) of a
@@ -568,7 +607,7 @@ OSV_HD int osvDjiSphereRay(float focalPx, float eyeZ, float nx, float ny, float*
  * produce the same framing for the same parameters.  Returns 0 when the
  * pixel maps to no direction (outside the image circle / valid radius). */
 OSV_HD int osvViewRay(int projection, float focalPx, float eyeOffset, float tanHalfH, float tanHalfV, float W,
-                      float H, float nx, float ny, float* d) {
+                      float H, float nx, float ny, OSV_PRIVATE float* d) {
     /* [WP-CAMERA] DJI's pinhole-behind-the-sphere camera has its own ray
      * construction (a ray / sphere intersection, not a radial angle map). */
     if (projection == OSV_PROJ_DJI_SPHERE) {
@@ -615,7 +654,7 @@ OSV_HD int osvViewRay(int projection, float focalPx, float eyeOffset, float tanH
 
 /* Direction (unit vector, view frame) seen through output pixel (px, py).
  * Returns 0 when the pixel maps to no direction (outside a fisheye circle). */
-OSV_HD int osvRayForPixel(const OsvRenderParams* p, float px, float py, float* d) {
+OSV_HD int osvRayForPixel(OSV_PRIVATE const OsvRenderParams* p, float px, float py, OSV_PRIVATE float* d) {
     const float W = (float)p->outW;
     const float H = (float)p->outH;
     const float sx = px + 0.5f;
@@ -651,7 +690,7 @@ OSV_HD int osvRayForPixel(const OsvRenderParams* p, float px, float py, float* d
 /* ------------------------------------------------------------------------- */
 
 /* Kannala-Brandt radial polynomial: r/f as a function of theta. */
-OSV_HD float osvThetaD(const OsvLens* L, float theta) {
+OSV_HD float osvThetaD(OSV_PRIVATE const OsvLens* L, float theta) {
     const float t2 = theta * theta;
     const float t4 = t2 * t2;
     const float t6 = t4 * t2;
@@ -663,7 +702,8 @@ OSV_HD float osvThetaD(const OsvLens* L, float theta) {
 /* Project a body-frame direction into lens pixel coordinates.
  * Returns 1 when the ray is inside the usable field of view and the pixel
  * lies inside the frame; theta receives the angle from the optical axis. */
-OSV_HD int osvProjectLens(const OsvLens* L, const float* dBody, float* px, float* py, float* theta) {
+OSV_HD int osvProjectLens(OSV_PRIVATE const OsvLens* L, OSV_PRIVATE const float* dBody, OSV_PRIVATE float* px,
+                          OSV_PRIVATE float* py, OSV_PRIVATE float* theta) {
     float dl[3];
     osvMat3MulVec(L->R, dBody, dl);
     const float rho = sqrtf(dl[0] * dl[0] + dl[1] * dl[1]);
@@ -693,7 +733,7 @@ OSV_HD int osvProjectLens(const OsvLens* L, const float* dBody, float* px, float
 /* Signed occlusion factor: 0 inside the occlusion polygon, ramping to 1 at
  * occlFeatherPx outside it.  Even-odd point-in-polygon plus distance to the
  * nearest edge.  With occlN == 0 the factor is always 1. */
-OSV_HD float osvOcclusionFactor(const OsvLens* L, float px, float py) {
+OSV_HD float osvOcclusionFactor(OSV_PRIVATE const OsvLens* L, float px, float py) {
     const int n = L->occlN;
     if (n < 3) {
         return 1.0f;
@@ -736,7 +776,7 @@ OSV_HD float osvOcclusionFactor(const OsvLens* L, float px, float py) {
 }
 
 /* Blend weight of a lens for a ray at angle theta landing on (px, py). */
-OSV_HD float osvLensWeight(const OsvLens* L, float theta, float px, float py) {
+OSV_HD float osvLensWeight(OSV_PRIVATE const OsvLens* L, float theta, float px, float py) {
     if (theta > L->thetaMax) {
         return 0.0f;
     }
@@ -785,7 +825,7 @@ OSV_HD float osvBilinear(OSV_GLOBAL const osv_u16* plane, int stride, int step, 
  * luma columns 2j and 2j+1 and is centred on luma x = 2j, so the chroma
  * coordinate is px / 2 horizontally and (py + 0.5) / 2 - 0.25 + 0.25 vertically
  * (vertically centred between the two rows -> py / 2). */
-OSV_HD void osvSampleYuv(const OsvPlane* P, float px, float py, float* yuv) {
+OSV_HD void osvSampleYuv(OSV_PRIVATE const OsvPlane* P, float px, float py, OSV_PRIVATE float* yuv) {
     yuv[0] = osvBilinear(P->y, P->strideY, 1, P->w, P->h, px, py, P->bitShift);
     const int step = P->chromaInterleaved ? 2 : 1;
     const float cxp = px * 0.5f + 0.25f; /* left-sited chroma: centre at 2j -> (2j+0.5)/2 = j+0.25 */
@@ -799,7 +839,7 @@ OSV_HD void osvSampleYuv(const OsvPlane* P, float px, float py, float* yuv) {
 /* ------------------------------------------------------------------------- */
 
 /* Longitude column index of a body direction in the polar-axis layout. */
-OSV_HD int osvSeamColumn(const OsvRenderParams* p, const float* dBody) {
+OSV_HD int osvSeamColumn(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE const float* dBody) {
     const float lon = atan2f(dBody[0], dBody[2]); /* -pi..pi */
     float f = (lon + OSV_KERNEL_PI) / OSV_KERNEL_TWO_PI;
     f = osvClampf(f, 0.0f, 0.999999f);
@@ -816,7 +856,8 @@ OSV_HD int osvSeamColumn(const OsvRenderParams* p, const float* dBody) {
 /* Rotate the body ray toward (delta > 0) or away from the optical axis of
  * lens i along the meridian through the axis.  Used to apply half of the
  * measured seam disparity to each lens. */
-OSV_HD void osvShiftTowardAxis(const OsvLens* L, const float* dBody, float deltaRad, float* out) {
+OSV_HD void osvShiftTowardAxis(OSV_PRIVATE const OsvLens* L, OSV_PRIVATE const float* dBody, float deltaRad,
+                               OSV_PRIVATE float* out) {
     /* lens optical axis expressed in the body frame = R^T * (0,0,1) */
     const float z[3] = {0.0f, 0.0f, 1.0f};
     float axis[3];
@@ -852,7 +893,8 @@ OSV_HD void osvShiftTowardAxis(const OsvLens* L, const float* dBody, float delta
  * correction across the wrap meridian and leave a visible vertical step at
  * longitude +/-180 - the one place the grid is guaranteed to be continuous in
  * the real world.  Latitude CLAMPS, because the band genuinely ends. */
-OSV_HD float osvWarpSample(const OsvRenderParams* p, OSV_GLOBAL const float* grid, float lon, float lat, int comp) {
+OSV_HD float osvWarpSample(OSV_PRIVATE const OsvRenderParams* p, OSV_GLOBAL const float* grid, float lon, float lat,
+                           int comp) {
     if (p->warpW <= 0 || p->warpH <= 0 || grid == 0) {
         return 0.0f;
     }
@@ -908,7 +950,7 @@ OSV_HD float osvWarpSample(const OsvRenderParams* p, OSV_GLOBAL const float* gri
  *
  * The band sits on the equator, a few degrees either side of it, so this is
  * nowhere near the polar singularity of atan2 wherever it is actually used. */
-OSV_HD void osvPolarDisplace(const float* d, float dLon, float dLat, float* out) {
+OSV_HD void osvPolarDisplace(OSV_PRIVATE const float* d, float dLon, float dLat, OSV_PRIVATE float* out) {
     const float lon = atan2f(d[0], d[2]) + dLon;
     const float lat = asinf(osvClampf(d[1], -1.0f, 1.0f)) + dLat;
     const float cl = cosf(lat);
@@ -939,7 +981,8 @@ OSV_HD void osvPolarDisplace(const float* d, float dLon, float dLat, float* out)
  *
  * `theta` is the ray's angle from the optical axis and `w` the shader's
  * lens weight for it (0 when the lens does not see the ray at all). */
-OSV_HD float osvSeamVisibility(const OsvRenderParams* p, const OsvLens* L, float theta, float w) {
+OSV_HD float osvSeamVisibility(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE const OsvLens* L, float theta,
+                               float w) {
     if (!(w > 0.0f)) {
         return 0.0f;
     }
@@ -970,7 +1013,7 @@ OSV_HD float osvSeamVisibility(const OsvRenderParams* p, const OsvLens* L, float
  * never leaves a hole or a dark smear, and the weights always sum to 1 and
  * vary continuously with every input.  Where both lenses see the ray fully
  * (the normal case) it is simply (1 - t1, t1). */
-OSV_HD void osvSeamMix(const float* vis, float t1, float* w) {
+OSV_HD void osvSeamMix(OSV_PRIVATE const float* vis, float t1, OSV_PRIVATE float* w) {
     const float a0 = vis[0] * (1.0f - t1);
     const float a1 = vis[1] * t1;
     const float deficit = fmaxf(1.0f - (a0 + a1), 0.0f);
@@ -992,8 +1035,8 @@ OSV_HD void osvSeamMix(const float* vis, float t1, float* w) {
  * longitude wrapping - a nearest-column lookup would draw the seam as a
  * staircase once a view is zoomed in far enough for one column to span a
  * few dozen output pixels. */
-OSV_HD void osvBlendSeamLookup(const OsvRenderParams* p, OSV_GLOBAL const float* table, float lon, float* lat,
-                               float* halfWidth) {
+OSV_HD void osvBlendSeamLookup(OSV_PRIVATE const OsvRenderParams* p, OSV_GLOBAL const float* table, float lon,
+                               OSV_PRIVATE float* lat, OSV_PRIVATE float* halfWidth) {
     const int n = p->blendSeamColumns;
     /* Continuous column position with centres at integer + 0.5. */
     const float fx = ((lon + OSV_KERNEL_PI) / OSV_KERNEL_TWO_PI) * (float)n - 0.5f;
@@ -1037,8 +1080,9 @@ OSV_HD float osvSeamSide(float lat, float s, float hw) {
  * Why only rays BOTH lenses see: everywhere else one lens is all there is,
  * and the coverage weights already say so - the carved seam changes nothing
  * outside the overlap, by construction. */
-OSV_HD float osvBlendSeamApply(const OsvRenderParams* p, OSV_GLOBAL const float* table, const float* dBody,
-                               const float* theta, float* w, float wsum) {
+OSV_HD float osvBlendSeamApply(OSV_PRIVATE const OsvRenderParams* p, OSV_GLOBAL const float* table,
+                               OSV_PRIVATE const float* dBody, OSV_PRIVATE const float* theta, OSV_PRIVATE float* w,
+                               float wsum) {
     if (!p->blendSeamEnabled || table == 0 || p->blendSeamColumns <= 0 || !p->blendEnabled || !(w[0] > 0.0f) ||
         !(w[1] > 0.0f)) {
         return wsum;
@@ -1074,7 +1118,8 @@ OSV_HD float osvBlendSeamApply(const OsvRenderParams* p, OSV_GLOBAL const float*
 /* Signed distance from stream pixel (px, py) to the rounded rectangle of
  * ghost g (negative inside; Inigo Quilez's box SDF with rounded corners),
  * plus the local coordinates scaled to +/-1 at the half extents. */
-OSV_HD float osvFlareGhostDistance(const OsvFlareGhost* g, float px, float py, float* u, float* v) {
+OSV_HD float osvFlareGhostDistance(OSV_PRIVATE const OsvFlareGhost* g, float px, float py, OSV_PRIVATE float* u,
+                                   OSV_PRIVATE float* v) {
     const float dx = px - g->cx;
     const float dy = py - g->cy;
     /* Into the ghost's own axes. */
@@ -1110,7 +1155,7 @@ OSV_HD float osvFlareRim(float d, float soft) {
 
 /* Plateau weight of one ghost at stream pixel (px, py) - the shape alone,
  * without its amplitudes.  Zero past the bounding circle. */
-OSV_HD float osvFlareGhostShape(const OsvFlareGhost* g, float px, float py) {
+OSV_HD float osvFlareGhostShape(OSV_PRIVATE const OsvFlareGhost* g, float px, float py) {
     const float dx = px - g->cx;
     const float dy = py - g->cy;
     if (dx * dx + dy * dy > g->reach2) {
@@ -1124,7 +1169,7 @@ OSV_HD float osvFlareGhostShape(const OsvFlareGhost* g, float px, float py) {
 /* Additive light of ghost g at stream pixel (px, py), native-linear RGB,
  * never negative.  Returns 0 (rgb untouched) past the bounding circle -
  * one compare for the overwhelming majority of pixels. */
-OSV_HD int osvFlareGhostLight(const OsvFlareGhost* g, float px, float py, float* rgb) {
+OSV_HD int osvFlareGhostLight(OSV_PRIVATE const OsvFlareGhost* g, float px, float py, OSV_PRIVATE float* rgb) {
     const float dx = px - g->cx;
     const float dy = py - g->cy;
     if (dx * dx + dy * dy > g->reach2) {
@@ -1163,7 +1208,7 @@ OSV_HD float osvFlareSoftSubtract(float x, float g) {
 
 /* Subtract the veil and every ghost of lens flare block F at stream pixel
  * (px, py) from the native-linear RGB triple `rgb` (in place). */
-OSV_HD void osvFlareRemove(const OsvFlareLens* F, float px, float py, float* rgb) {
+OSV_HD void osvFlareRemove(OSV_PRIVATE const OsvFlareLens* F, float px, float py, OSV_PRIVATE float* rgb) {
     if (F == 0 || rgb == 0) {
         return;
     }
@@ -1201,8 +1246,8 @@ OSV_HD void osvFlareRemove(const OsvFlareLens* F, float px, float py, float* rgb
  * cost of the analysis on a CPU, and the features it looks for - a sun disc
  * and ghosts tens of pixels across on smooth sky - lose nothing to the
  * sparser sampling. */
-OSV_HD void osvFlareDownsamplePixel(const OsvPlane* P, const OsvColorParams* color, int factor, int ox, int oy,
-                                    float* rgb) {
+OSV_HD void osvFlareDownsamplePixel(OSV_PRIVATE const OsvPlane* P, OSV_PRIVATE const OsvColorParams* color, int factor,
+                                    int ox, int oy, OSV_PRIVATE float* rgb) {
     rgb[0] = rgb[1] = rgb[2] = 0.0f;
     if (P == 0 || color == 0 || factor < 1 || P->w <= 0 || P->h <= 0) {
         return;
@@ -1297,8 +1342,8 @@ OSV_HD float osvPhotoDecay(float dist, float range) {
 
 /* Fill `ph` for the body ray `dBody`.  Everything position dependent is done
  * once per pixel here; the per-lens hooks below only read it. */
-OSV_HD void osvPhotoBegin(const OsvRenderParams* p, OSV_GLOBAL const float* photo, const float* dBody,
-                          OsvPhotoPixel* ph) {
+OSV_HD void osvPhotoBegin(OSV_PRIVATE const OsvRenderParams* p, OSV_GLOBAL const float* photo,
+                          OSV_PRIVATE const float* dBody, OSV_PRIVATE OsvPhotoPixel* ph) {
     ph->rimActive = 0;
     ph->gainActive = 0;
     ph->rim[0] = 0.0f;
@@ -1395,11 +1440,12 @@ OSV_HD void osvPhotoBegin(const OsvRenderParams* p, OSV_GLOBAL const float* phot
  * rather than recomputed - the polygon walk is the costliest part of a
  * weight.  fovProd == 0 implies fovPhoto == 0 (rim <= thetaMax, host clamp),
  * so the division is never needed there. */
-OSV_HD void osvPhotoLensWeight(const OsvRenderParams* p, OsvPhotoPixel* ph, int i, float theta, float wProd) {
+OSV_HD void osvPhotoLensWeight(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE OsvPhotoPixel* ph, int i, float theta,
+                               float wProd) {
     if (!ph->rimActive) {
         return;
     }
-    const OsvLens* L = &p->lens[i];
+    OSV_PRIVATE const OsvLens* L = &p->lens[i];
     const float rim = ph->rim[i];
     float fovPhoto = 0.0f;
     if (!(theta > rim)) {
@@ -1423,7 +1469,7 @@ OSV_HD void osvPhotoLensWeight(const OsvRenderParams* p, OsvPhotoPixel* ph, int 
  * those vanish (a direction only a lens past its usable rim sees, e.g. next
  * to the other lens's occlusion): then the production weights stay, and the
  * shader's occlusion rescue still applies after this. */
-OSV_HD void osvPhotoPickWeights(const OsvPhotoPixel* ph, float* w) {
+OSV_HD void osvPhotoPickWeights(OSV_PRIVATE const OsvPhotoPixel* ph, OSV_PRIVATE float* w) {
     if (!ph->rimActive) {
         return;
     }
@@ -1437,7 +1483,8 @@ OSV_HD void osvPhotoPickWeights(const OsvPhotoPixel* ph, float* w) {
  * (i == 0) up by 2^(+half), the master (i == 1) down by 2^(-half).  In
  * passthrough the blend runs on log code values, where a gain of `half`
  * stops is an offset of half x photoCodePerStop code units. */
-OSV_HD void osvPhotoApplyGain(const OsvRenderParams* p, const OsvPhotoPixel* ph, int i, int passthrough, float* val) {
+OSV_HD void osvPhotoApplyGain(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE const OsvPhotoPixel* ph, int i,
+                              int passthrough, OSV_PRIVATE float* val) {
     if (!ph->gainActive) {
         return;
     }
@@ -1469,7 +1516,7 @@ OSV_HD void osvPhotoApplyGain(const OsvRenderParams* p, const OsvPhotoPixel* ph,
  * model's luma units; OsvShadeLens::colour spreads it over the channels).
  * 0 when the correction is off or theta is at or below the first knot -
  * which is most of every frame, rejected with one comparison. */
-OSV_HD float osvShadeAmount(const OsvRenderParams* p, int i, float theta, float px, float py) {
+OSV_HD float osvShadeAmount(OSV_PRIVATE const OsvRenderParams* p, int i, float theta, float px, float py) {
     if (!p->shadeEnabled || !(p->shadeDThetaRad > 0.0f) || i < 0 || i > 1) {
         return 0.0f;
     }
@@ -1478,8 +1525,8 @@ OSV_HD float osvShadeAmount(const OsvRenderParams* p, int i, float theta, float 
     if (!(t > 0.0f)) {
         return 0.0f;
     }
-    const OsvLens* L = &p->lens[i];
-    const OsvShadeLens* S = &p->shade[i];
+    OSV_PRIVATE const OsvLens* L = &p->lens[i];
+    OSV_PRIVATE const OsvShadeLens* S = &p->shade[i];
 
     /* ---- radial: linear between knots, held at the last one ------------- */
     const float tc = fminf(t, (float)(OSV_SHADE_THETA_N - 1));
@@ -1518,7 +1565,7 @@ OSV_HD float osvShadeAmount(const OsvRenderParams* p, int i, float theta, float 
  * exact inverse of osvCodeToLinear per channel (passthrough output blends
  * in code space).  Light below the curve's code-0 level stays at code 0
  * rather than leaving the curve's domain. */
-OSV_HD float osvShadeCodeAdd(const OsvColorParams* color, float code, float add) {
+OSV_HD float osvShadeCodeAdd(OSV_PRIVATE const OsvColorParams* color, float code, float add) {
     if (color == 0 || color->enabled == 0) {
         return code + add; /* identity decode: code is light */
     }
@@ -1540,11 +1587,12 @@ OSV_HD float osvShadeCodeAdd(const OsvColorParams* color, float code, float add)
  * amount in scene-linear light, or - for passthrough, where `val` holds
  * code values - move each code to the code of its light plus that amount.
  * An amount of exactly 0 leaves the sample untouched, bit for bit. */
-OSV_HD void osvShadeApply(const OsvRenderParams* p, int i, float amount, int passthrough, float* val) {
+OSV_HD void osvShadeApply(OSV_PRIVATE const OsvRenderParams* p, int i, float amount, int passthrough,
+                          OSV_PRIVATE float* val) {
     if (amount == 0.0f || i < 0 || i > 1) {
         return;
     }
-    const OsvShadeLens* S = &p->shade[i];
+    OSV_PRIVATE const OsvShadeLens* S = &p->shade[i];
     if (passthrough) {
         for (int c = 0; c < 3; ++c) {
             val[c] = osvShadeCodeAdd(&p->color, val[c], S->colour[c] * amount);
@@ -1581,13 +1629,13 @@ OSV_HD void osvShadeApply(const OsvRenderParams* p, int i, float amount, int pas
  * (normalised radius <= thetaD(thetaMax)) times the selfie-stick factor at
  * the block centre.  Only covered pixels are averaged, so a texel on the rim
  * holds the colour of the image, never of the black beyond it. */
-OSV_HD void osvSeamLowDecimatePixel(const OsvRenderParams* p, const OsvPlane* P, int lens, int lx, int ly,
-                                    float* out) {
+OSV_HD void osvSeamLowDecimatePixel(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE const OsvPlane* P, int lens,
+                                    int lx, int ly, OSV_PRIVATE float* out) {
     out[0] = out[1] = out[2] = out[3] = 0.0f;
     if (lens < 0 || lens > 1 || P == 0) {
         return;
     }
-    const OsvLens* L = &p->lens[lens];
+    OSV_PRIVATE const OsvLens* L = &p->lens[lens];
     const int F = p->seamLowFactor;
     /* Defensive: an odd or tiny factor would break the 2 x 2 chroma walk,
      * a disabled lens or an empty plane has nothing to average. */
@@ -1671,8 +1719,8 @@ OSV_HD void osvSeamLowDecimatePixel(const OsvRenderParams* p, const OsvPlane* P,
  * `horizontal` is non-zero, along y otherwise.  Clamp-to-edge addressing;
  * the taps are normalised by their own sum, so the blur never changes the
  * mean (and the premultiplied RGB / A ratio survives it exactly). */
-OSV_HD void osvSeamLowBlurPixel(const OsvRenderParams* p, OSV_GLOBAL const float* src, int lens, int x, int y,
-                                int horizontal, float* out) {
+OSV_HD void osvSeamLowBlurPixel(OSV_PRIVATE const OsvRenderParams* p, OSV_GLOBAL const float* src, int lens, int x,
+                                int y, int horizontal, OSV_PRIVATE float* out) {
     out[0] = out[1] = out[2] = out[3] = 0.0f;
     const int W = p->seamLowW;
     const int H = p->seamLowH;
@@ -1716,8 +1764,8 @@ OSV_HD void osvSeamLowBlurPixel(const OsvRenderParams* p, OSV_GLOBAL const float
  * osvProjectLens returned), bilinear, un-premultiplied into `rgb`.  Returns
  * the coverage there; 0 (and rgb 0) when the lens has no image data nearby,
  * which the shader answers by leaving that pixel single-band. */
-OSV_HD float osvSeamLowSample(const OsvRenderParams* p, OSV_GLOBAL const float* low, int lens, float px, float py,
-                              float* rgb) {
+OSV_HD float osvSeamLowSample(OSV_PRIVATE const OsvRenderParams* p, OSV_GLOBAL const float* low, int lens, float px,
+                              float py, OSV_PRIVATE float* rgb) {
     rgb[0] = rgb[1] = rgb[2] = 0.0f;
     const int W = p->seamLowW;
     const int H = p->seamLowH;
@@ -1772,8 +1820,9 @@ OSV_HD float osvSeamLowSample(const OsvRenderParams* p, OSV_GLOBAL const float* 
  * - exactly where osvBlendSeamApply leaves it alone too, and when smoothing
  * is off.  Beyond the widened feather both mixes saturate to the same
  * values, so the two bands' weights agree and the pixel is unchanged. */
-OSV_HD int osvSeamSmoothWeights(const OsvRenderParams* p, OSV_GLOBAL const float* table, const float* dBody,
-                                const float* theta, const float* wPre, float* wl) {
+OSV_HD int osvSeamSmoothWeights(OSV_PRIVATE const OsvRenderParams* p, OSV_GLOBAL const float* table,
+                                OSV_PRIVATE const float* dBody, OSV_PRIVATE const float* theta,
+                                OSV_PRIVATE const float* wPre, OSV_PRIVATE float* wl) {
     wl[0] = wl[1] = 0.0f;
     if (!p->seamSmoothEnabled || !p->blendSeamEnabled || table == 0 || p->blendSeamColumns <= 0 ||
         !p->blendEnabled || !(wPre[0] > 0.0f) || !(wPre[1] > 0.0f)) {
@@ -1805,8 +1854,8 @@ OSV_HD int osvSeamSmoothWeights(const OsvRenderParams* p, OSV_GLOBAL const float
  * the same lens position), the lens gain, the photo gain - so the two bands
  * of one lens stay in one space and the difference the shader adds is a
  * difference of like with like. */
-OSV_HD void osvSeamLowShade(const OsvRenderParams* p, const OsvPhotoPixel* photoPx, int i, int passthrough,
-                            float px, float py, float shadeAmount, float* val) {
+OSV_HD void osvSeamLowShade(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE const OsvPhotoPixel* photoPx, int i,
+                            int passthrough, float px, float py, float shadeAmount, OSV_PRIVATE float* val) {
     if (!passthrough) {
         if (p->flareEnabled) {
             osvFlareRemove(&p->flare[i], px, py, val);
@@ -1839,10 +1888,10 @@ OSV_HD void osvSeamLowShade(const OsvRenderParams* p, const OsvPhotoPixel* photo
  * The ONE full entry point: every table the kernel knows.  The older names
  * below (osvShadePixelWSP, osvShadePixelWS, osvShadePixelW, osvShadePixel)
  * are thin wrappers passing null for the tables they predate. */
-OSV_HD void osvShadePixelWSPL(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
-                              OSV_GLOBAL const float* warp, OSV_GLOBAL const float* blendSeam,
-                              OSV_GLOBAL const float* photo, OSV_GLOBAL const float* seamLow, int x, int y,
-                              float* out) {
+OSV_HD void osvShadePixelWSPL(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE const OsvPlane* planes,
+                              OSV_GLOBAL const float* seam, OSV_GLOBAL const float* warp,
+                              OSV_GLOBAL const float* blendSeam, OSV_GLOBAL const float* photo,
+                              OSV_GLOBAL const float* seamLow, int x, int y, OSV_PRIVATE float* out) {
     float dView[3];
     if (!osvRayForPixel(p, (float)x, (float)y, dView)) {
         out[0] = out[1] = out[2] = out[3] = 0.0f;
@@ -1895,7 +1944,7 @@ OSV_HD void osvShadePixelWSPL(const OsvRenderParams* p, const OsvPlane* planes, 
     /* [WP-VIGNETTE] each lens's shading correction at its sample (0 = none). */
     float shadeAmt[2] = {0.0f, 0.0f};
     for (int i = 0; i < 2; ++i) {
-        const OsvLens* L = &p->lens[i];
+        OSV_PRIVATE const OsvLens* L = &p->lens[i];
         if (!L->enabled) {
             continue;
         }
@@ -1974,7 +2023,7 @@ OSV_HD void osvShadePixelWSPL(const OsvRenderParams* p, const OsvPlane* planes, 
      * transparent black below. */
     if (wsum <= 1e-4f) {
         for (int i = 0; i < 2; ++i) {
-            const OsvLens* L = &p->lens[i];
+            OSV_PRIVATE const OsvLens* L = &p->lens[i];
             /* projected[i] is the guard that makes px/py meaningful here. */
             if (!L->enabled || !projected[i]) {
                 continue;
@@ -2096,17 +2145,18 @@ OSV_HD void osvShadePixelWSPL(const OsvRenderParams* p, const OsvPlane* planes, 
 /* [WP-SEAMTOOLS] The entry point from before the seam smoothing's low band:
  * shade with every other table and no low band - bit for bit the shader as
  * it was, since nothing of the two-band path runs without the table. */
-OSV_HD void osvShadePixelWSP(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
-                             OSV_GLOBAL const float* warp, OSV_GLOBAL const float* blendSeam,
-                             OSV_GLOBAL const float* photo, int x, int y, float* out) {
+OSV_HD void osvShadePixelWSP(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE const OsvPlane* planes,
+                             OSV_GLOBAL const float* seam, OSV_GLOBAL const float* warp,
+                             OSV_GLOBAL const float* blendSeam, OSV_GLOBAL const float* photo, int x, int y,
+                             OSV_PRIVATE float* out) {
     osvShadePixelWSPL(p, planes, seam, warp, blendSeam, photo, (OSV_GLOBAL const float*)0, x, y, out);
 }
 
 /* [WP-PHOTO] The entry point from before the photometric seam table: shade
  * with every other table and no photo table. */
-OSV_HD void osvShadePixelWS(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
-                            OSV_GLOBAL const float* warp, OSV_GLOBAL const float* blendSeam, int x, int y,
-                            float* out) {
+OSV_HD void osvShadePixelWS(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE const OsvPlane* planes,
+                            OSV_GLOBAL const float* seam, OSV_GLOBAL const float* warp,
+                            OSV_GLOBAL const float* blendSeam, int x, int y, OSV_PRIVATE float* out) {
     osvShadePixelWSP(p, planes, seam, warp, blendSeam, (OSV_GLOBAL const float*)0, x, y, out);
 }
 
@@ -2114,8 +2164,9 @@ OSV_HD void osvShadePixelWS(const OsvRenderParams* p, const OsvPlane* planes, OS
  * existed: shade with no blend-seam table.  Kept under its old name so the
  * band analyses (which render each lens ALONE and must never see a seam) and
  * every existing call site keep their exact behaviour and signature. */
-OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam,
-                           OSV_GLOBAL const float* warp, int x, int y, float* out) {
+OSV_HD void osvShadePixelW(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE const OsvPlane* planes,
+                           OSV_GLOBAL const float* seam, OSV_GLOBAL const float* warp, int x, int y,
+                           OSV_PRIVATE float* out) {
     osvShadePixelWS(p, planes, seam, warp, (OSV_GLOBAL const float*)0, x, y, out);
 }
 
@@ -2125,8 +2176,8 @@ OSV_HD void osvShadePixelW(const OsvRenderParams* p, const OsvPlane* planes, OSV
  * null argument at every call site, because the OpenCL kernel and the parity
  * tests both call this name and a signature change there would ripple into
  * source strings compiled at runtime. */
-OSV_HD void osvShadePixel(const OsvRenderParams* p, const OsvPlane* planes, OSV_GLOBAL const float* seam, int x,
-                          int y, float* out) {
+OSV_HD void osvShadePixel(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE const OsvPlane* planes,
+                          OSV_GLOBAL const float* seam, int x, int y, OSV_PRIVATE float* out) {
     osvShadePixelW(p, planes, seam, (OSV_GLOBAL const float*)0, x, y, out);
 }
 
@@ -2164,9 +2215,14 @@ OSV_HD float osvHalfToFloat(unsigned int h) {
         /* normal: rebias 15 -> 127 */
         bits = (sign << 31) | ((exponent + 112u) << 23) | (mantissa << 13);
     }
+#if defined(OSV_KERNEL_METAL)
+    /* Metal reinterprets bits with as_type rather than through a union. */
+    return as_type<float>(bits);
+#else
     OsvFloatBits pun;
     pun.u = bits;
     return pun.f;
+#endif
 }
 
 /* Wrap an integer index into [0, n) (n > 0), used for the longitude seam. */
@@ -2181,7 +2237,8 @@ OSV_HD int osvWrapIndex(int i, int n) {
 /* Read one texel of the source as straight RGBA floats.  x and y must
  * already be inside the frame; the channel order and sample type of the
  * source are resolved here so the sampler above stays generic. */
-OSV_HD void osvFetchRgba(const OsvRgbaSource* src, OSV_GLOBAL const void* pixels, int x, int y, float* rgba) {
+OSV_HD void osvFetchRgba(OSV_PRIVATE const OsvRgbaSource* src, OSV_GLOBAL const void* pixels, int x, int y,
+                         OSV_PRIVATE float* rgba) {
     /* With flipY the pointer is at the last image row, so walking DOWN the
      * image walks UP in memory.  The index stays non-negative either way,
      * which is what the unsigned multiply below requires. */
@@ -2217,8 +2274,8 @@ OSV_HD void osvFetchRgba(const OsvRgbaSource* src, OSV_GLOBAL const void* pixels
 /* Bilinear sample of the Standard-layout equirect at a unit body direction.
  * Longitude wraps around the +/-180 degree seam, latitude clamps at the
  * poles.  Sample centres sit at integer + 0.5 like everywhere else. */
-OSV_HD void osvSampleEquirectRgba(const OsvRgbaSource* src, OSV_GLOBAL const void* pixels, const float* dBody,
-                                  float* rgba) {
+OSV_HD void osvSampleEquirectRgba(OSV_PRIVATE const OsvRgbaSource* src, OSV_GLOBAL const void* pixels,
+                                  OSV_PRIVATE const float* dBody, OSV_PRIVATE float* rgba) {
     const float W = (float)src->w;
     const float H = (float)src->h;
     /* Standard layout: d = (sin lon cos lat, cos lon cos lat, sin lat). */
@@ -2256,8 +2313,8 @@ OSV_HD void osvSampleEquirectRgba(const OsvRgbaSource* src, OSV_GLOBAL const voi
  * `out` receives straight RGBA in whatever encoding the source carries (the
  * function is colour agnostic); alpha is the sampled alpha unless
  * fillAlphaOne is set. */
-OSV_FN void osvReframeEquirectPixel(const OsvReframeParams* p, const OsvRgbaSource* src, OSV_GLOBAL const void* pixels,
-                                    int px, int py, float out[4]) {
+OSV_FN void osvReframeEquirectPixel(OSV_PRIVATE const OsvReframeParams* p, OSV_PRIVATE const OsvRgbaSource* src,
+                                    OSV_GLOBAL const void* pixels, int px, int py, OSV_PRIVATE float out[4]) {
     if (!out) {
         return;
     }
@@ -2329,7 +2386,7 @@ OSV_FN void osvReframeEquirectPixel(const OsvReframeParams* p, const OsvRgbaSour
  * Numerics: sin^2 of the ray's angle is formed as (nx^2 + ny^2) / |ray|^2
  * rather than 1 - cos^2, so the discriminant keeps full precision near the
  * view axis; the result is renormalised to absorb the last ulp of drift. */
-OSV_HD int osvDjiSphereRay(float focalPx, float eyeZ, float nx, float ny, float* d) {
+OSV_HD int osvDjiSphereRay(float focalPx, float eyeZ, float nx, float ny, OSV_PRIVATE float* d) {
     /* Every comparison is written so a NaN fails it. */
     if (!(focalPx > 0.0f) || !(eyeZ >= 0.0f)) {
         return 0;

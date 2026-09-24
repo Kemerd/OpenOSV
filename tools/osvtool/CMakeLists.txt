@@ -26,6 +26,11 @@ target_include_directories(osvtool PRIVATE "${CMAKE_SOURCE_DIR}/plugins/common")
 set_target_properties(osvtool PROPERTIES FOLDER "tools")
 
 # Copy runtime DLLs (FFmpeg etc.) next to the executable after each build.
-add_custom_command(TARGET osvtool POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:osvtool> $<TARGET_FILE_DIR:osvtool>
-  COMMAND_EXPAND_LISTS)
+# Windows only: elsewhere the list is always empty (shared libraries are found
+# through the RPATH CMake writes into the build tree), and copy_if_different
+# with nothing to copy is an error.
+if(WIN32)
+  add_custom_command(TARGET osvtool POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:osvtool> $<TARGET_FILE_DIR:osvtool>
+    COMMAND_EXPAND_LISTS)
+endif()

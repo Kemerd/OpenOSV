@@ -24,6 +24,9 @@
 #if defined(OSV_HAVE_OPENCL)
 #include "osv/render/OpenClRenderer.h"
 #endif
+#if defined(OSV_HAVE_METAL)
+#include "osv/render/MetalRenderer.h"
+#endif
 
 #include <cmath>
 #include <cstdio>
@@ -202,6 +205,27 @@ void checkClip(const PipelineOptions& po) {
             }
         } else {
             std::printf("[SKIP] opencl: %s\n", log::safe(reason).c_str());
+        }
+    }
+#endif
+#if defined(OSV_HAVE_METAL)
+    {
+        std::string reason;
+        if (render::MetalRenderer::available(&reason)) {
+            auto r = render::MetalRenderer::create(0);
+            if (r.ok()) {
+                auto img = r.value()->render(job.value());
+                if (img.ok()) {
+                    const auto stats = render::compareImages16(ref.value(), img.value());
+                    report("metal parity PSNR >= 60 dB", stats.psnrDb >= 60.0, std::to_string(stats.psnrDb) + " dB");
+                } else {
+                    report("metal render", false, img.error().toString());
+                }
+            } else {
+                report("metal create", false, r.error().toString());
+            }
+        } else {
+            std::printf("[SKIP] metal: %s\n", log::safe(reason).c_str());
         }
     }
 #endif

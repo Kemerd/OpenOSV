@@ -46,6 +46,9 @@
 #if defined(OSV_HAVE_OPENCL)
 #include "osv/render/OpenClRenderer.h"
 #endif
+#if defined(OSV_HAVE_METAL)
+#include "osv/render/MetalRenderer.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -591,6 +594,14 @@ TEST_CASE("seam smoothing renders the same on the CPU, CUDA and OpenCL", "[seamt
         auto r = render::OpenClRenderer::create(0);
         REQUIRE(r.ok());
         gpus.emplace_back("opencl", std::move(r).value());
+    }
+#endif
+#if defined(OSV_HAVE_METAL)
+    if (render::MetalRenderer::available(nullptr)) {
+        auto r = render::MetalRenderer::create(0);
+        INFO((r.ok() ? std::string() : r.error().message));
+        REQUIRE(r.ok());
+        gpus.emplace_back("metal", std::move(r).value());
     }
 #endif
     if (gpus.empty()) {

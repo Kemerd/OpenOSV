@@ -24,9 +24,12 @@
 
 #include "ImporterInstance.h"
 
+#if defined(_WIN32)
 #include "DelayLoad.h"
+#endif
 #include "Engine.h"
 #include "HostContext.h"
+#include "HostUtf16.h"
 #include "PluginLog.h"
 #include "UserDefaults.h"
 #include "osv/video/GpuDecoderPool.h"
@@ -39,6 +42,7 @@
 #include <new>
 #include <string>
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -46,15 +50,43 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 
 namespace osv::premiere {
 
 namespace {
 
+#if defined(_WIN32)
 /// Captured in DllMain; used by the Source Settings dialog to find its own
 /// resources.  A plain HINSTANCE store from DllMain is one of the very few
 /// things that is safe under the loader lock.
 HINSTANCE g_module = nullptr;
+#else
+/// macOS has no DllMain and the importer no dialog resources to find there
+/// (the Source Settings effect is the UI), so the handle stays null.
+void* const g_module = nullptr;
+#endif
+
+/// Copy a C string into a fixed char field, truncating, always terminated.
+/// strncpy_s(..., _TRUNCATE) on Windows, where it is what the importer always
+/// used; a bounded copy elsewhere, where there is no strncpy_s.
+void copyTruncated(char* dst, std::size_t capacity, const char* src) noexcept {
+    if (!dst || capacity == 0) {
+        return;
+    }
+#if defined(_WIN32)
+    ::strncpy_s(dst, capacity, src ? src : "", _TRUNCATE);
+#else
+    std::size_t n = 0;
+    if (src) {
+        while (n + 1 < capacity && src[n] != '\0') {
+            ++n;
+        }
+        std::memcpy(dst, src, n);
+    }
+    dst[n] = '\0';
+#endif
+}
 
 /// The process-wide plug-in state.  A function-local static rather than a
 /// namespace-scope object so its construction order is defined and so it is
@@ -218,8 +250,8 @@ csSDK_int32 doGetIndFormat(csSDK_int32 index, imIndFormatRec* rec) {
     std::memset(rec->FormatName, 0, sizeof(rec->FormatName));
     std::memset(rec->FormatShortName, 0, sizeof(rec->FormatShortName));
     std::memset(rec->PlatformExtension, 0, sizeof(rec->PlatformExtension));
-    ::strncpy_s(rec->FormatName, sizeof(rec->FormatName), kFormatName, _TRUNCATE);
-    ::strncpy_s(rec->FormatShortName, sizeof(rec->FormatShortName), kFormatShortName, _TRUNCATE);
+    copyTruncated(rec->FormatName, sizeof(rec->FormatName), kFormatName);
+    copyTruncated(rec->FormatShortName, sizeof(rec->FormatShortName), kFormatShortName);
 
     // Extensions are NUL separated and the LIST is NUL terminated, so the
     // bytes on the wire must be: o s v \0 l r f \0 \0.
@@ -253,8 +285,9 @@ csSDK_int32 doOpenFile8(imStdParms* stdParms, imFileRef* fileRef, imFileOpenRec8
     if (!rec->fileinfo.filepath) {
         return imBadFile;
     }
-    // prUTF16Char is a 16-bit code unit; on Windows that is exactly wchar_t.
-    const std::wstring path(reinterpret_cast<const wchar_t*>(rec->fileinfo.filepath));
+    // prUTF16Char is a 16-bit code unit: on Windows exactly wchar_t, on
+    // macOS transcoded to the native UTF-8 path (HostUtf16.h).
+    const std::filesystem::path path = pathFromHostUtf16(rec->fileinfo.filepath);
     if (path.empty()) {
         return imBadFile;
     }
@@ -533,7 +566,12 @@ void* allocateHandleFor(PlugMemoryFuncsPtr memFuncs, ImporterInstance* instance)
 // the module handle is stored, and the delay-load hook pointer is set (which
 // is a single atomic store - see plugins/common/DelayLoad.h).  No CUDA, no
 // FFmpeg, no logging, no allocation.
+//
+// Windows only.  A macOS bundle needs neither: its FFmpeg sits inside the
+// bundle under install names no other image uses (cmake/OsvPremiereSdk.cmake),
+// so the dynamic loader cannot bind it to a host's copy in the first place.
 
+#if defined(_WIN32)
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID /*reserved*/) {
     switch (reason) {
     case DLL_PROCESS_ATTACH:
@@ -556,6 +594,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID /*reserved*/) {
     }
     return TRUE;
 }
+#endif
 
 // ---------------------------------------------------------------------------
 //  xImportEntry

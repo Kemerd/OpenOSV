@@ -28,9 +28,12 @@
 #include "CalibrationUi.h"
 #include "ImporterInstance.h"
 
+#include "HostUtf16.h"
 #include "PluginLog.h"
 #include "UserDefaults.h"
+#if defined(_WIN32)
 #include "resource.h"
+#endif
 
 #include "osv/container/OsvFile.h"
 #include "osv/meta/CalibrationSelector.h"
@@ -42,6 +45,11 @@
 #include <filesystem>
 #include <string>
 
+// The modal dialog is a Win32 resource dialog.  On macOS there is none: the
+// OpenOSV Source Settings effect in the Effect Controls panel is where every
+// one of these settings is edited (docs/BUILDING_MAC.md), and the prefs
+// selectors below accept the clip's settings as they stand.
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -50,6 +58,7 @@
 #endif
 #include <windows.h>
 #include <commctrl.h>
+#endif
 
 namespace osv::premiere {
 
@@ -60,12 +69,20 @@ namespace {
 /// without showing a modal dialog, which is what an unattended render farm
 /// and the test suite need.
 [[nodiscard]] bool dialogSuppressed() noexcept {
+#if defined(_WIN32)
     char value[16] = {};
     std::size_t length = 0;
     if (::getenv_s(&length, value, sizeof(value), kNoDialogEnvVar) != 0 || length == 0) {
         return false;
     }
     return value[0] != '0';
+#else
+    const char* value = std::getenv(kNoDialogEnvVar);
+    if (!value || value[0] == '\0') {
+        return false;
+    }
+    return value[0] != '0';
+#endif
 }
 
 /// Log token of a calibration choice (the `osvtool --calib` spelling).
@@ -81,6 +98,7 @@ namespace {
     return "unknown";
 }
 
+#if defined(_WIN32)
 /// Fill a combo box from a NUL-separated list and select `index`.
 void fillCombo(HWND dialog, int control, const wchar_t* const* items, int count, int index) noexcept {
     HWND combo = ::GetDlgItem(dialog, control);
@@ -172,6 +190,7 @@ void fillComboStrings(HWND dialog, int control, const std::wstring* items, int c
     }
     ::SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(index >= 0 && index < count ? index : 0), 0);
 }
+#endif  // _WIN32
 
 /// Reduce a clip's calibration inventory to the facts the labels need.
 [[nodiscard]] CalibrationUiFacts factsFrom(const meta::CalibrationInventory& inv) noexcept {
@@ -208,7 +227,7 @@ void fillComboStrings(HWND dialog, int control, const std::wstring* items, int c
         if (!fileAccess || !fileAccess->filepath || fileAccess->filepath[0] == 0) {
             return {};
         }
-        const std::filesystem::path path(reinterpret_cast<const wchar_t*>(fileAccess->filepath));
+        const std::filesystem::path path = pathFromHostUtf16(fileAccess->filepath);
         Result<OsvFile> file = OsvFile::open(path);
         if (!file.ok()) {
             return {};
@@ -225,6 +244,7 @@ void fillComboStrings(HWND dialog, int control, const std::wstring* items, int c
     }
 }
 
+#if defined(_WIN32)
 // ---------------------------------------------------------------------------
 //  [WP-PHOTO] the sky seam fix rows
 // ---------------------------------------------------------------------------
@@ -767,6 +787,7 @@ INT_PTR CALLBACK sourceSettingsProc(HWND dialog, UINT message, WPARAM wParam, LP
         return FALSE;
     }
 }
+#endif  // _WIN32
 
 }  // namespace
 
@@ -790,6 +811,20 @@ bool showDialogWithFacts(void* ownerWindow, PrefsBlob& prefs, const CalibrationU
         return true;
     }
 
+#if !defined(_WIN32)
+    // No modal dialog on macOS: the settings are edited in the OpenOSV
+    // Source Settings effect (Effect Controls panel), which reaches the
+    // importer through imPerformSourceSettingsCommand.  Accepting the blob
+    // as it stands is exactly what the suppressed dialog does above, so the
+    // prefs protocol completes and the clip keeps its settings.
+    (void)ownerWindow;
+    (void)calibrationFacts;
+    PluginLog::oncef("dialog-macos", PluginLog::Level::Info,
+                     "source settings: no modal dialog on macOS - edit the clip's settings in the OpenOSV Source "
+                     "Settings effect (Effect Controls); accepting the current settings");
+    prefs.sanitise();
+    return true;
+#else
     HINSTANCE module = static_cast<HINSTANCE>(importerModuleHandle());
     if (!module) {
         PluginLog::error("source settings: the module handle is unknown; the dialog cannot be created");
@@ -816,6 +851,7 @@ bool showDialogWithFacts(void* ownerWindow, PrefsBlob& prefs, const CalibrationU
     // (parallax, flow backend, ...) survive an OK untouched.
     prefs = prefsFromControls(state.controls, prefs);
     return true;
+#endif
 }
 
 }  // namespace
@@ -841,7 +877,7 @@ void logDialogStartsFromDefaults(ImporterInstance* instance, const imFileAccessR
         if (instance) {
             clip = "'" + userDefaultsPathForLog(instance->path().filename()) + "'";
         } else if (fileAccess && fileAccess->filepath && fileAccess->filepath[0] != 0) {
-            const std::filesystem::path named(reinterpret_cast<const wchar_t*>(fileAccess->filepath));
+            const std::filesystem::path named = pathFromHostUtf16(fileAccess->filepath);
             clip = "'" + userDefaultsPathForLog(named.filename()) + "'";
         }
         PluginLog::info("source settings: {} has no stored settings{}; starting from the user defaults in {}", clip,
@@ -925,12 +961,26 @@ void logDialogStartsFromDefaults(ImporterInstance* instance, const imFileAccessR
     try {
         ImporterGlobals& g = globals();
         const std::wstring instancePath = instance ? instance->path().wstring() : std::wstring();
+#if defined(_WIN32)
         const wchar_t* accessPath =
             (fileAccess && fileAccess->filepath) ? reinterpret_cast<const wchar_t*>(fileAccess->filepath) : nullptr;
+#else
+        // The host's UTF-16 as our (UTF-32) wide string, kept alive here.
+        const std::wstring accessWide =
+            (fileAccess && fileAccess->filepath) ? wideFromHostUtf16(fileAccess->filepath) : std::wstring();
+        const wchar_t* accessPath = (fileAccess && fileAccess->filepath) ? accessWide.c_str() : nullptr;
+#endif
         const std::wstring target = prefsRefreshTarget(before, blob, instancePath.c_str(), accessPath);
         if (!target.empty() && g.suites.fileManager && g.suites.fileManager->RefreshFileAsync) {
+#if defined(_WIN32)
             const prSuiteError err =
                 g.suites.fileManager->RefreshFileAsync(reinterpret_cast<const prUTF16Char*>(target.c_str()));
+#else
+            // Back to the host's UTF-16, NUL-terminated by the u16string.
+            const std::u16string units = hostUtf16FromWide(target);
+            const prSuiteError err =
+                g.suites.fileManager->RefreshFileAsync(reinterpret_cast<const prUTF16Char*>(units.c_str()));
+#endif
             PluginLog::info("source settings: asked the host to refresh '{}' ({})",
                             std::filesystem::path(target).filename().string(),
                             err == suiteError_NoError ? "ok" : "refused");

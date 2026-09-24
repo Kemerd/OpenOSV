@@ -13,8 +13,22 @@
 #  OpenOSVImporter.rc.
 # =============================================================================
 
+# The platform halves of the module:
+#   * Windows: the direct-GPU engine and its OsvEngine_* exports (Engine.cpp,
+#     CUDA driver API) and the resources (.rc: IMPT, the dialog template,
+#     VERSIONINFO);
+#   * macOS: no CUDA, so no direct path - EngineNoDirect.cpp answers the
+#     importer's engine hooks truthfully for that build - and the IMPT
+#     resource comes from OpenOSVImporter.r through Rez (osv_add_pipl below).
+if(APPLE)
+  set(_osv_importer_platform_sources EngineNoDirect.cpp)
+else()
+  set(_osv_importer_platform_sources Engine.cpp OpenOSVImporter.rc resource.h)
+endif()
+
 osv_add_premiere_plugin(OpenOSVImporter
   KIND prm
+  EXPORTS xImportEntry
   SOURCES
     ImporterEntry.cpp
     ImporterInstance.cpp
@@ -27,7 +41,6 @@ osv_add_premiere_plugin(OpenOSVImporter
     PrefsMapping.cpp
     ProtectorGuard.cpp
     ProtectorGuard.h
-    Engine.cpp
     Engine.h
     FlareStage.cpp
     FlareStage.h
@@ -36,8 +49,7 @@ osv_add_premiere_plugin(OpenOSVImporter
     ImporterGpuFrame.cpp
     ImporterGpuFrame.h
     SourceSettingsDialog.cpp
-    OpenOSVImporter.rc
-    resource.h
+    ${_osv_importer_platform_sources}
 )
 
 target_link_libraries(OpenOSVImporter PRIVATE
@@ -45,6 +57,18 @@ target_link_libraries(OpenOSVImporter PRIVATE
   osv_render            # pulls core, container, meta, color, video, geom
   osv_ffmpeg            # the importer decodes its own AAC with swresample
 )
+
+if(APPLE)
+  # The IMPT resource Premiere recognises an importer by (Adobe's
+  # SDK_File_ImportPiPL.r), compiled by Rez into Contents/Resources.
+  osv_add_pipl(OpenOSVImporter
+    R_FILE  "${CMAKE_CURRENT_SOURCE_DIR}/OpenOSVImporter.r"
+    OUT_VAR OSV_IMPORTER_RSRC)
+  message(STATUS "  Importer target : OpenOSVImporter.bundle -> ${OSV_PLUGIN_STAGE_DIR}")
+  # Nothing below applies to a Mac bundle: no Win32 dialog libraries, no
+  # CUDA, no delay-load table (the bundle carries its own renamed FFmpeg).
+  return()
+endif()
 
 # The Source Settings dialog needs the common-controls and the shell/user
 # libraries; the rest of the module links only what osv_render drags in.

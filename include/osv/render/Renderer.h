@@ -44,9 +44,10 @@ public:
     [[nodiscard]] virtual const char* name() const noexcept = 0;
 };
 
-/// Create a renderer by name: "cpu", "cuda", "opencl" or "auto" (best
-/// available: cuda > opencl > cpu).  `chosen` receives the backend name.
-/// Backends compiled out return Unsupported.
+/// Create a renderer by name: "cpu", "cuda", "metal", "opencl" or "auto"
+/// (best available: cuda > metal > opencl > cpu; Metal exists on macOS
+/// only).  `chosen` receives the backend name.  Backends compiled out return
+/// Unsupported.
 Result<std::unique_ptr<IRenderer>> makeRenderer(const std::string& device, ThreadPool& pool, std::string* chosen);
 
 }  // namespace osv::render

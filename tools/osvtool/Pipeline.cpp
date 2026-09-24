@@ -130,8 +130,16 @@ void addPipelineOptions(CLI::App* sub, PipelineOptions& opt) {
         ->default_str("1000");
 
     auto* backendGroup = sub->add_option_group("Backends");
+#if defined(__APPLE__)
+    backendGroup->add_option("--hw", opt.hw, "Decoder acceleration: none|videotoolbox|auto")->default_str("none");
+#else
     backendGroup->add_option("--hw", opt.hw, "Decoder acceleration: none|d3d11va|cuda|auto")->default_str("none");
+#endif
+#if defined(__APPLE__)
+    backendGroup->add_option("--device", opt.device, "Renderer: cpu|metal|opencl|auto")->default_str("auto");
+#else
     backendGroup->add_option("--device", opt.device, "Renderer: cpu|cuda|opencl|auto")->default_str("auto");
+#endif
     backendGroup->add_option("--threads", opt.threads, "CPU threads (0 = all)")->default_val(0);
 }
 

@@ -14,12 +14,21 @@
         "avformat",
         "swscale",
         "swresample",
-        "nvcodec",
+        {
+          "name": "nvcodec",
+          "platform": "!osx"
+        },
         "zlib"
       ]
     },
-    "ffnvcodec",
-    "opencl",
+    {
+      "name": "ffnvcodec",
+      "platform": "!osx"
+    },
+    {
+      "name": "opencl",
+      "platform": "!osx"
+    },
     "catch2",
     "nlohmann-json",
     "cli11",

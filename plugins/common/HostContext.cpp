@@ -19,8 +19,14 @@ std::mutex g_instanceMutex;
 /// runs for it (see the header).
 HostContext* g_instance = nullptr;
 
-/// Backend names in slot order.
+/// Backend names in slot order, which is also Auto's preference order.
+/// macOS has no CUDA: its native GPU backend, Metal, takes the first slot
+/// (and the prefs value that means "CUDA" on Windows, see preferenceName).
+#if defined(__APPLE__)
+constexpr const char* kBackendNames[3] = {"metal", "opencl", "cpu"};
+#else
 constexpr const char* kBackendNames[3] = {"cuda", "opencl", "cpu"};
+#endif
 
 std::string lowerCopy(std::string_view s) {
     std::string out(s);
@@ -84,7 +90,14 @@ const char* HostContext::preferenceName(RenderDevicePreference pref) noexcept {
     switch (pref) {
     case RenderDevicePreference::Auto: return "auto";
     case RenderDevicePreference::Cpu: return "cpu";
+#if defined(__APPLE__)
+    // The stored value 2 is "the platform's GPU API": CUDA on Windows,
+    // Metal on macOS, so a project moved between the two keeps meaning
+    // "render on the GPU" (the Source Settings popup names it accordingly).
+    case RenderDevicePreference::Cuda: return "metal";
+#else
     case RenderDevicePreference::Cuda: return "cuda";
+#endif
     case RenderDevicePreference::OpenCl: return "opencl";
     }
     return "auto";

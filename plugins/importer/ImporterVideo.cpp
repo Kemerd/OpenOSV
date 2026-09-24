@@ -11,6 +11,7 @@
 #include "ImporterPlugin.h"
 
 #include "Engine.h"
+#include "HostUtf16.h"
 #include "ImporterInstance.h"
 
 #include "PixelCopy.h"
@@ -183,6 +184,7 @@ struct OfferedFormats {
 /// Copy a UTF-8 string into a prUTF16Char array (the host's path / stream
 /// name fields).  Always NUL terminated, never overruns.
 void copyUtf16(prUTF16Char* dst, std::size_t capacity, const std::wstring& src) noexcept {
+#if defined(_WIN32)
     if (!dst || capacity == 0) {
         return;
     }
@@ -191,6 +193,10 @@ void copyUtf16(prUTF16Char* dst, std::size_t capacity, const std::wstring& src) 
     for (std::size_t i = 0; i < n; ++i) {
         dst[i] = static_cast<prUTF16Char>(src[i]);
     }
+#else
+    // wchar_t is UTF-32 here: transcode instead of truncating each unit.
+    copyWideToHostUtf16(dst, capacity, src);
+#endif
 }
 
 /// Ticks per second the host's Time Suite reports, with Premiere's documented

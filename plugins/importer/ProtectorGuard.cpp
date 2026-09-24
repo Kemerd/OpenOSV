@@ -7,6 +7,7 @@
 #include "ProtectorGuard.h"
 
 #include "HostContext.h"
+#include "NumberParse.h"
 #include "PluginLog.h"
 
 #include "osv/render/LensProtectorCheck.h"
@@ -125,8 +126,9 @@ bool parseNumber(const std::string& text, T& out) noexcept {
     }
     const char* first = text.data();
     const char* last = first + text.size();
-    const auto [ptr, ec] = std::from_chars(first, last, out);
-    return ec == std::errc{} && ptr == last;
+    // std::from_chars, or its locale-free twin where the standard library
+    // has no floating-point from_chars (NumberParse.h).
+    return parseWholeNumber(first, last, out);
 }
 
 /// Parse a direction token written by appendDisk().
@@ -243,7 +245,7 @@ void appendDisk(const FileKey& key, const Verdict& v) noexcept {
 Result<std::pair<std::unique_ptr<video::DualStreamReader>, video::FramePair>> decodeFirstFrame(
     const std::filesystem::path& path, const meta::FormatInfo& format) {
     Error last{ErrorCode::Decoder, "no decoder could be opened"};
-    for (const video::HwAccel hw : {video::HwAccel::D3D11VA, video::HwAccel::None}) {
+    for (const video::HwAccel hw : {video::kHostFrameHwAccel, video::HwAccel::None}) {
         video::DecoderOptions opt;
         opt.hw = hw;
         opt.keepOnDevice = false;  // the band analysis reads host planes
