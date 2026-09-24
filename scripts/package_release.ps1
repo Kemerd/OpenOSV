@@ -1134,7 +1134,7 @@ echo  OpenOSV for DaVinci Resolve is installed (a preview).
 echo.
 echo  Start Resolve. In the Effects Library, under OpenFX, group
 echo  OpenOSV: OpenOSV Source (a generator, for .OSV clips) and
-echo  Open 360 Reframe (a filter, for any 360 clip).
+echo  OpenOSV 360 Reframe (a filter, for any 360 clip).
 echo ==============================================================
 '@
 
@@ -1301,7 +1301,7 @@ inside Resolve. Please report what you see.
 2. Start Resolve. In the Effects Library, under OpenFX, group OpenOSV:
    * OpenOSV Source - a generator. Drop it on the timeline, click
      "Choose .OSV File...", trim it to the length its Clip line shows.
-   * Open 360 Reframe - a filter for any 360 equirect clip. Set Project
+   * OpenOSV 360 Reframe - a filter for any 360 equirect clip. Set Project
      Settings > Image Scaling > Mismatched resolution to "Stretch frame
      to all corners" so the sphere fills the frame.
 3. Audio: cli\osvtool.exe extract CAM_0001.OSV --audio CAM_0001.aac

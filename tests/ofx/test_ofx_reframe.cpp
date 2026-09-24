@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// test_ofx_reframe.cpp - Open 360 Reframe as an OpenFX filter, on the CPU:
+// test_ofx_reframe.cpp - OpenOSV 360 Reframe as an OpenFX filter, on the CPU:
 // the picture is the Premiere effect's picture, the right way up, with the
 // supervised controls behaving exactly as they do in Premiere.
 

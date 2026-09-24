@@ -7,13 +7,17 @@ does (`tests/ofx`). Nobody on the project has run them in Resolve yet. Treat
 this as a preview. If you try it, especially on a Mac, please report what you
 see, or send a fix: see [Reporting a problem](#reporting-a-problem).
 
-`OpenOSV.ofx.bundle` holds two OpenFX effects. Both show up in Resolve's
-Effects Library under **OpenFX**, in the **OpenOSV** group:
+`OpenOSV.ofx.bundle` holds two OpenFX effects, both in the **OpenOSV**
+group: the generator under **Open FX > Generators**, the filter under
+**Open FX > Filters**. Resolve's search box looks only inside the category
+selected on its left, so select **Open FX** first and search for `OpenOSV`.
+The filter is Premiere's Open 360 Reframe, named **OpenOSV 360 Reframe** here
+so that one search finds both:
 
 | Effect | Kind | What it does |
 |---|---|---|
 | **OpenOSV Source** | Generator | Opens a DJI Osmo 360 `.OSV` (or its `.LRF` proxy) and stitches it with the Premiere importer's engine. It outputs either a reframed view or the whole 360 sphere. |
-| **Open 360 Reframe** | Filter | Points the Premiere effect's virtual camera into any equirectangular clip. On Windows it renders on the GPU (CUDA) when Resolve hands over CUDA images; otherwise, and on a Mac, on all CPU cores. |
+| **OpenOSV 360 Reframe** | Filter | Points the Premiere effect's virtual camera into any equirectangular clip. On Windows it renders on the GPU (CUDA) when Resolve hands over CUDA images; otherwise, and on a Mac, on all CPU cores. |
 
 Both effects compile the Premiere plug-ins' own source files, not a port of
 them:
@@ -82,7 +86,7 @@ Resolve can't open `.OSV` files, so the clip comes in through the generator.
    `K6 - 1234 frames at 59.940 fps (20.59 s)`). Trim the generator to that
    length: OpenFX gives a generator no way to tell Resolve how long it is.
    Past the end of the clip the generator renders transparent black.
-4. Frame the shot with the **Camera** controls. They are Open 360 Reframe's
+4. Frame the shot with the **Camera** controls. They are OpenOSV 360 Reframe's
    controls: Preset, Lens, Pan / Tilt / Roll, FOV, Correction Angle and Zoom
    (DJI lens), Classic FOV / Distortion (Classic lens), Keyframe Easing and
    Smooth Keyframes. They keyframe in the Inspector. Choosing a preset,
@@ -93,7 +97,7 @@ Resolve can't open `.OSV` files, so the clip comes in through the generator.
 - **Reframed view** (the default) renders the camera's view straight from the
   clip's native sphere, at the timeline's size.
 - **360 equirect** renders the whole sphere at the timeline's size. Use it
-  for a 2:1 timeline, a 360 export, or to feed **Open 360 Reframe** yourself.
+  for a 2:1 timeline, a 360 export, or to feed **OpenOSV 360 Reframe** yourself.
 
 **Start Frame** slides the clip under the generator: the clip frame shown on
 the generator's first frame. It counts the clip's own frames.
@@ -142,7 +146,7 @@ smoother playback, try one of these:
 
 ## Reframing other 360 footage
 
-**Open 360 Reframe** treats the whole image it is given as the sphere. On the
+**OpenOSV 360 Reframe** treats the whole image it is given as the sphere. On the
 Edit page Resolve scales every clip to the timeline before any effect sees
 it. So a 2:1 equirect on a 16:9 timeline must be **stretched** to fill the
 frame, not letterboxed:
@@ -219,7 +223,7 @@ The following can't be checked without Resolve:
 - **Playback speed inside Resolve.**
 - **macOS inside Resolve at all.** The bundle builds and passes its tests on
   a Mac, but nobody has loaded it into Resolve on one. On a Mac the stitch
-  runs on the GPU (Metal, through the clip engine). Open 360 Reframe renders
+  runs on the GPU (Metal, through the clip engine). OpenOSV 360 Reframe renders
   on the CPU: Resolve hands a Mac plug-in Metal buffers, and a Metal path for
   the filter isn't written yet.
 

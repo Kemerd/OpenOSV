@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// OfxReframeKernel.cu - Open 360 Reframe on DaVinci Resolve's CUDA images.
+// OfxReframeKernel.cu - OpenOSV 360 Reframe on DaVinci Resolve's CUDA images.
 //
 // Compiled to a fatbin and embedded in OpenOSV.ofx (plugins/ofx/CMakeLists.txt),
 // exactly like the Premiere effect's ReframeKernel.cu: the module imports

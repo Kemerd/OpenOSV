@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// test_ofx_cuda.cpp - Open 360 Reframe on the host's CUDA images, the way
+// test_ofx_cuda.cpp - OpenOSV 360 Reframe on the host's CUDA images, the way
 // DaVinci Resolve hands them over on an NVIDIA machine (OpenFX 1.5 CUDA
 // render): device pointers in kOfxImagePropData, the host's context current,
 // the host's stream in kOfxImageEffectPropCudaStream.

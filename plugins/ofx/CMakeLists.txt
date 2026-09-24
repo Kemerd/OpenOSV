@@ -5,7 +5,7 @@
 #    "OpenOSV Source"    a generator that stitches a .OSV clip with the
 #                        importer's own clip engine, as the full sphere or a
 #                        reframed view;
-#    "Open 360 Reframe"  a filter that reframes any equirectangular clip,
+#    "OpenOSV 360 Reframe"  a filter that reframes any equirectangular clip,
 #                        on the CPU or on the host's CUDA images.
 #
 #  Laid out as an OpenFX bundle, so it can be copied as it is into the

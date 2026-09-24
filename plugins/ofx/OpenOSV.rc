@@ -30,7 +30,7 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName",      "The OpenOSV Contributors"
-            VALUE "FileDescription",  "OpenOSV for OpenFX hosts - OpenOSV Source and Open 360 Reframe"
+            VALUE "FileDescription",  "OpenOSV for OpenFX hosts - OpenOSV Source and OpenOSV 360 Reframe"
             VALUE "FileVersion",      "1.0.0.0"
             VALUE "InternalName",     "OpenOSV"
             VALUE "LegalCopyright",   "Copyright (C) 2026 The OpenOSV Contributors. Apache-2.0."

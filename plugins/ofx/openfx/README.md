@@ -13,7 +13,7 @@ The C API headers of the OpenFX image effect standard, copied unmodified from
 They are vendored rather than taken from vcpkg because the `openfx` port at
 the project's pinned baseline is 1.4, which predates `ofxGPURender.h`'s CUDA
 properties (`kOfxImageEffectPropCudaRenderSupported` and friends). The CUDA
-path of the Open 360 Reframe filter is built on those.
+path of the OpenOSV 360 Reframe filter is built on those.
 
 Only the C API is used. The C++ "Support" library is not: the plug-in speaks
 to the host through the raw suites (`plugins/ofx/OfxHost.h`), so there is

@@ -10,7 +10,7 @@
 #
 #  DaVinci Resolve (free or Studio) lists the two effects after a restart,
 #  in the Effects Library under OpenFX, group OpenOSV: OpenOSV Source (a
-#  generator, for .OSV clips) and Open 360 Reframe (a filter, for any 360
+#  generator, for .OSV clips) and OpenOSV 360 Reframe (a filter, for any 360
 #  clip).  See docs/RESOLVE.md.
 #
 #  The folder belongs to root, so the copy runs through sudo (you are asked
@@ -187,6 +187,6 @@ priv xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null || true
 sign_bundle "$TARGET"
 
 info "Installed. Start DaVinci Resolve and look in the Effects Library under"
-info "OpenFX, group OpenOSV: OpenOSV Source (a generator) and Open 360 Reframe"
+info "OpenFX, group OpenOSV: OpenOSV Source (a generator) and OpenOSV 360 Reframe"
 info "(a filter). This build is UNTESTED on macOS: please report what you see at"
 info "https://github.com/Kemerd/OpenOSV/issues"

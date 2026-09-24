@@ -18,7 +18,7 @@
 | VideoToolbox hardware decode | yes | no (decode tests need the sample clip) | `--hw videotoolbox`, or `auto` |
 | Plug-in pieces that need no Adobe SDK | yes | yes (`tests/macos`) | The log, the text and number helpers, the Metal GPU path of the effect against its CPU path, the importer's engine hooks, and the bundle packaging (a probe bundle is built, loaded and inspected) |
 | Premiere plug-ins (importer, effect, Source Settings) | only when the SDK secret is set (below) | only the tests above | Never loaded into Premiere Pro on a Mac |
-| DaVinci Resolve bundle (`OpenOSV.ofx.bundle`) | yes, always (it needs no Adobe SDK) | yes (`tests/ofx`: loaded into a mock OpenFX host and compared with the Premiere effect's CPU render) | Never loaded into Resolve on a Mac. The stitch runs on Metal; Open 360 Reframe renders on the CPU |
+| DaVinci Resolve bundle (`OpenOSV.ofx.bundle`) | yes, always (it needs no Adobe SDK) | yes (`tests/ofx`: loaded into a mock OpenFX host and compared with the Premiere effect's CPU render) | Never loaded into Resolve on a Mac. The stitch runs on Metal; OpenOSV 360 Reframe renders on the CPU |
 | Release zip | yes | the packaged `osvtool` is started once | |
 
 ## Toolchain
@@ -58,7 +58,7 @@ Metal, then OpenCL, then the CPU.
 ## The DaVinci Resolve plug-ins (OpenFX)
 
 Every preset above builds `build/<preset>/plugins/ofx/OpenOSV.ofx.bundle`: the
-OpenOSV Source generator and the Open 360 Reframe filter, with FFmpeg embedded
+OpenOSV Source generator and the OpenOSV 360 Reframe filter, with FFmpeg embedded
 in `Contents/Frameworks`. No Adobe SDK is involved. Install it into
 `/Library/OFX/Plugins` with
 

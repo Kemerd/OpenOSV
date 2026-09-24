@@ -74,7 +74,7 @@ TEST_CASE("both plug-ins load and describe themselves", "[ofx][module]") {
     REQUIRE(f.ready);
 
     const PropertySet& r = f.reframe.descriptor.props;
-    CHECK(r.getString(kOfxPropLabel) == "Open 360 Reframe");
+    CHECK(r.getString(kOfxPropLabel) == "OpenOSV 360 Reframe");
     CHECK(r.getString(kOfxImageEffectPluginPropGrouping) == "OpenOSV");
     CHECK(r.getStrings(kOfxImageEffectPropSupportedContexts) ==
           std::vector<std::string>{kOfxImageEffectContextFilter, kOfxImageEffectContextGeneral});

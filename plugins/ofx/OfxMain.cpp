@@ -9,7 +9,7 @@
 // ===========================================================================
 // OpenOSV.ofx carries both OpenFX effects:
 //
-//   0  "Open 360 Reframe"  (org.openosv.Open360Reframe) - a filter
+//   0  "OpenOSV 360 Reframe"  (org.openosv.Open360Reframe) - a filter
 //   1  "OpenOSV Source"    (org.openosv.OSVSource)      - a generator
 //
 // The host sees two plug-ins and loads each separately (kOfxActionLoad per

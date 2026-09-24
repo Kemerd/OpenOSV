@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// OfxReframe.cpp - the Open 360 Reframe OpenFX filter (OfxReframe.h).
+// OfxReframe.cpp - the OpenOSV 360 Reframe OpenFX filter (OfxReframe.h).
 
 #include "OfxReframe.h"
 
@@ -38,7 +38,11 @@ OfxStatus describe(OfxImageEffectHandle effect) noexcept {
     if (!props) {
         return kOfxStatErrBadHandle;
     }
-    setString(props, kOfxPropLabel, "Open 360 Reframe");
+    // "OpenOSV" leads the name because Resolve's Effects search matches
+    // names, not groups: one search for "OpenOSV" finds both effects.
+    // Premiere's effect is still "Open 360 Reframe"; the identifier
+    // (org.openosv.Open360Reframe, stored in projects) never changes.
+    setString(props, kOfxPropLabel, "OpenOSV 360 Reframe");
     setString(props, kOfxImageEffectPluginPropGrouping, "OpenOSV");
     setString(props, kOfxPropPluginDescription,
               "Point a keyframable virtual camera into any 360 equirectangular clip. DJI Studio's lens, presets "

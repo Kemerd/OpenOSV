@@ -62,7 +62,7 @@ you edit:
   easing presets and stabilisation are one click away.
 * **DaVinci Resolve too (preview, free or Studio).** Same stitch, same
   camera, same controls, as two OpenFX effects: **OpenOSV Source** opens an
-  `.OSV` and stitches it with the importer's own engine, and **Open 360
+  `.OSV` and stitches it with the importer's own engine, and **OpenOSV 360
   Reframe** reframes any 360 clip, with CUDA on NVIDIA. See
   [`docs/RESOLVE.md`](docs/RESOLVE.md).
 

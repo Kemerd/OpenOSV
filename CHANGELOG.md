@@ -20,7 +20,7 @@ All notable changes to OpenOSV are documented here. The format follows
     Resolve doesn't draw, a **Clip** read-out shows the length to trim to,
     and **Start Frame** slides the clip. Colour Output defaults to Rec. 709
     here, because a generator can't tag a colour space.
-  * **Open 360 Reframe** is a filter for any equirectangular clip. It has
+  * **OpenOSV 360 Reframe** is a filter for any equirectangular clip. It has
     the Premiere effect's lenses, presets, supervision, Keyframe Easing and
     Smooth Keyframes, and renders on the CPU or on Resolve's CUDA images and
     stream.
@@ -34,7 +34,7 @@ All notable changes to OpenOSV are documented here. The format follows
   The bundle needs no Adobe SDK, so every build makes it (`OSV_BUILD_OFX`,
   on by default): on Windows, and on macOS as `OpenOSV.ofx.bundle` with
   FFmpeg embedded, built and tested on GitHub's Apple Silicon runners. On a
-  Mac the stitch runs on Metal, and Open 360 Reframe renders on the CPU.
+  Mac the stitch runs on Metal, and OpenOSV 360 Reframe renders on the CPU.
   Neither platform has been run inside Resolve yet. `scripts/install_ofx.ps1`
   and `scripts/install_ofx.sh` install it. The OpenFX 1.5.1 headers are
   vendored in `plugins/ofx/openfx` (BSD-3-Clause). See

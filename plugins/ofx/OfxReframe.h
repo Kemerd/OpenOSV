@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// OfxReframe.h - "Open 360 Reframe" as an OpenFX filter.
+// OfxReframe.h - "OpenOSV 360 Reframe" as an OpenFX filter.
 //
 // Point a virtual camera into ANY equirectangular clip - the OpenOSV Source
 // generator's 360 output, a DJI Studio export, another camera's sphere - and

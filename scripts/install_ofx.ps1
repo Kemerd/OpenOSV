@@ -14,7 +14,7 @@
     Library's OpenFX section, group OpenOSV, after a restart:
 
         OpenOSV Source      a generator: a .OSV clip, stitched
-        Open 360 Reframe    a filter: reframes any 360 equirectangular clip
+        OpenOSV 360 Reframe    a filter: reframes any 360 equirectangular clip
 
     Resolve scans for plug-ins only when it starts, so close it before
     running this script and start it again afterwards.  See docs\RESOLVE.md.
@@ -204,5 +204,5 @@ foreach ($file in $leftovers) {
 $files = @(Get-ChildItem -LiteralPath $target -Recurse -File)
 Write-Info ("Installed {0} files." -f $files.Count)
 Write-Info 'Start DaVinci Resolve and look in the Effects Library under OpenFX, group'
-Write-Info 'OpenOSV: OpenOSV Source (a generator) and Open 360 Reframe (a filter).'
+Write-Info 'OpenOSV: OpenOSV Source (a generator) and OpenOSV 360 Reframe (a filter).'
 exit 0

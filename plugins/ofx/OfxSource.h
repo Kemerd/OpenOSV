@@ -20,7 +20,7 @@
 //              --> the stitched sphere
 //              --> either the sphere itself ("360 equirect"), rendered
 //                  straight at the timeline's size, or a virtual camera into
-//                  it ("Reframed view") with the Open 360 Reframe controls.
+//                  it ("Reframed view") with the OpenOSV 360 Reframe controls.
 //
 // Reframing INSIDE the generator matters in Resolve: the Edit page scales a
 // clip to the timeline before any effect sees it, so a 2:1 sphere dropped on
