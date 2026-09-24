@@ -19,6 +19,10 @@ converted to HDR and ready to reframe. No export step, no transcode.
 
 <sub>An `.OSV` straight on a Premiere timeline, reframed by dragging the picture. Stitched, converted to HDR and rendered on the GPU as you drag.</sub>
 
+<img src="img/davinci_resolve_generator.png" alt="The same Osmo 360 clip in DaVinci Resolve through the OpenOSV Source generator: the reframed view in the viewer, and the generator's controls in the Inspector: OSV file, Output, Camera preset, Lens, Pan, Tilt, Roll, FOV, Zoom, Keyframe Easing and Colour Output" width="900">
+
+<sub>Same clip, DaVinci Resolve. **OpenOSV Source** stitches the `.OSV`; the camera, keyframes and colour live in the Inspector.</sub>
+
 </div>
 
 > **macOS is untested, and DaVinci Resolve is a preview.** Premiere Pro on
@@ -269,6 +273,39 @@ Source Settings.
    Settings**, or set RockSteady and Horizon Leveling in the OpenOSV window.
 9. **Export** as usual. For HDR, pick an HDR format (HEVC, for example) with
    Rec. 2100 PQ.
+
+---
+
+## Tutorial 3: editing in DaVinci Resolve
+
+Resolve can't open an `.OSV` on its own, so the clip comes in through a
+generator. It's a preview; [`docs/RESOLVE.md`](docs/RESOLVE.md) has the
+details and what's been checked.
+
+1. **Install** the Resolve zip (see [Download](#download)), then start
+   Resolve. It only looks for plug-ins when it starts.
+2. **Find the effects.** On the Edit page, open **Effects**, select
+   **Open FX** and search for **OpenOSV**. The search only looks inside the
+   category selected on the left, so select Open FX first.
+3. **Drop OpenOSV Source** (Open FX > Generators) onto a video track.
+4. **Pick the clip.** Select the generator, then click **Choose .OSV File...**
+   in the Inspector, or paste the path into **OSV File**. The **Clip** line
+   shows how long it is.
+5. **Trim the generator** to that length. OpenFX gives a generator no way to
+   tell Resolve how long it is; past the end it renders transparent.
+6. **Aim the camera** with **Preset**, **Pan / Tilt / Roll** and **Zoom**.
+   Every control keyframes with the Inspector's diamonds, and **Keyframe
+   Easing** gives you DJI Studio's curves. **Output: 360 equirect** hands you
+   the whole sphere instead.
+7. **Colour.** **Colour Output** starts at Rec. 709, which suits a new
+   project. Pick **BT.2100 PQ** or **HLG** for an HDR timeline, or **D-Log M**
+   to grade it yourself with the LUTs in the zip.
+8. **Audio.** A generator has none. `cli\osvtool.exe extract CAM_0001.OSV
+   --audio CAM_0001.aac` pulls the clip's track out; put it under the
+   generator.
+9. **Any other 360 clip**, like an exported equirect: drop **OpenOSV 360
+   Reframe** (Open FX > Filters) on it, and set the clip's **Scaling** to
+   **Stretch** (Inspector > Retime and Scaling) so the sphere fills the frame.
 
 ---
 
@@ -594,10 +631,14 @@ under the LGPL and linked dynamically; no GPL components are enabled.
 ## Legal
 
 OpenOSV is an independent project. It is not affiliated with, endorsed by or
-sponsored by DJI or Adobe. DJI, Osmo, Osmo 360, RockSteady and DJI Studio are
-trademarks of SZ DJI Technology Co., Ltd.; Adobe, Premiere Pro and After
-Effects are trademarks of Adobe Inc. The names are used only to say what
-OpenOSV works with.
+sponsored by DJI, Adobe or Blackmagic Design. DJI, Osmo, Osmo 360, RockSteady
+and DJI Studio are trademarks of SZ DJI Technology Co., Ltd.; Adobe, Premiere
+Pro and After Effects are trademarks of Adobe Inc.; DaVinci Resolve is a
+trademark of Blackmagic Design Pty. Ltd.; NVIDIA and CUDA are trademarks of
+NVIDIA Corporation; Apple, macOS and Metal are trademarks of Apple Inc.;
+Windows is a trademark of Microsoft Corporation; OpenCL is a trademark of
+Apple Inc. used by permission by Khronos. All other trademarks belong to
+their owners. The names are used only to say what OpenOSV works with.
 
 It contains no DJI code, binaries, neural-network models, LUT files or
 artwork. DJI's publicly distributed software was studied for

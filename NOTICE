@@ -5,10 +5,13 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 OpenOSV is an independent project.  It is not affiliated with, endorsed by or
 sponsored by SZ DJI Technology Co., Ltd. ("DJI"), Adobe Inc. or Blackmagic
-Design.  DJI, Osmo and Osmo 360 are trademarks of DJI; Adobe, Premiere Pro and
-After Effects are trademarks of Adobe; DaVinci Resolve is a trademark of
-Blackmagic Design; NVIDIA and CUDA are trademarks of NVIDIA Corporation.
-They are used only to say what OpenOSV is compatible with.  See docs/LEGAL.md.
+Design Pty. Ltd.  DJI, Osmo and Osmo 360 are trademarks of DJI; Adobe, Premiere
+Pro and After Effects are trademarks of Adobe; DaVinci Resolve is a trademark
+of Blackmagic Design; NVIDIA and CUDA are trademarks of NVIDIA Corporation;
+Apple, macOS and Metal are trademarks of Apple Inc.; Windows is a trademark of
+Microsoft Corporation; OpenCL is a trademark of Apple Inc. used by permission
+by Khronos.  All other trademarks belong to their owners.  These names are
+used only to say what OpenOSV is compatible with.  See docs/LEGAL.md.
 
 ================================================================================
 Independent implementation and interoperability

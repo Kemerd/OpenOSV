@@ -258,3 +258,10 @@ Adobe header: the clip engine is built with
 `OSV_CLIP_ENGINE_WITHOUT_PREMIERE`, which leaves out its one Premiere-only
 log detail. Premiere's direct GPU path (`Engine.cpp`) is replaced by
 `EngineNoDirect.cpp`, which answers that there is none.
+
+## Trademarks
+
+DaVinci Resolve is a trademark of Blackmagic Design Pty. Ltd. OpenOSV is not
+affiliated with, endorsed by or sponsored by Blackmagic Design; the name is
+used only to say what these plug-ins work with. Report problems with them to
+OpenOSV, not to Blackmagic Design. See [`LEGAL.md`](LEGAL.md).
