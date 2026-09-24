@@ -2223,7 +2223,7 @@ The full list is in `CHANGELOG.md`, in the zip and in the repository.
 * **Unsigned binaries.** SmartScreen warns on first run; Windows 11's Smart App Control, when it is on, may block unsigned plug-ins like these.
 * **CUDA covers Turing and newer** (GTX 16 / RTX 20 and later). On an older NVIDIA card, set **Render Device** to OpenCL in Source Settings; that setup is untested.
 * **No neural optical flow in the download.** Its runtime is 1.4 GB, so Auto uses the classical flow, which is the one the stitch is tuned on. Building from source with ONNX Runtime adds it back.
-* **Windows x64.** Premiere Pro, plus a DaVinci Resolve preview (`Install-Resolve.cmd`: OpenFX, tested against a mock host, not yet run inside Resolve). No macOS build or Final Cut plug-in; `osvtool` renders for any other editor.
+* **Windows x64 in this zip.** Premiere Pro, plus a DaVinci Resolve preview (`Install-Resolve.cmd`: OpenFX, tested against a mock host, not yet run inside Resolve). macOS (Apple Silicon) builds from source and on CI, but is untested in Premiere and Resolve: see `docs/BUILDING_MAC.md`. No Final Cut plug-in; `osvtool` renders for any other editor.
 * Tested on Premiere Pro 2026 with Osmo 360 footage.
 
 ## Checksums
