@@ -95,6 +95,7 @@ const char* dlogMFitName(DlogMFit fit) noexcept {
     case DlogMFit::DjiRefit: return "dji";
     case DlogMFit::Pocket3: return "pocket3";
     case DlogMFit::Osmo360: return "osmo360";
+    case DlogMFit::Avata360: return "avata360";
     }
     return "unknown";
 }
@@ -172,6 +173,10 @@ bool parseDlogMFit(std::string_view text, DlogMFit& out) noexcept {
     }
     if (t == "osmo360" || t == "osmo" || t == "osmo-360" || t == "360") {
         out = DlogMFit::Osmo360;
+        return true;
+    }
+    if (t == "avata360" || t == "avata" || t == "avata-360") {
+        out = DlogMFit::Avata360;
         return true;
     }
     return false;
@@ -266,6 +271,7 @@ const OsvDlogMCurve& dlogmCurve(DlogMFit fit) noexcept {
     switch (fit) {
     case DlogMFit::Pocket3: return kDlogMPocket3;
     case DlogMFit::DjiRefit: return kDlogMDjiRefit;
+    case DlogMFit::Avata360: return kDlogMAvata360;
     case DlogMFit::Osmo360: break;
     }
     // Anything out of range (a corrupt persisted preference byte) falls back
@@ -281,6 +287,9 @@ const OsvMat3f& nativeToWorkingForFit(DlogMFit fit) noexcept {
         // particular exists only so a project graded on it keeps rendering
         // identically, so it keeps the matrix it was graded with.
         return kNativeToRec2020_Pocket3;
+    case DlogMFit::Avata360:
+        // Fitted together with kDlogMAvata360; neither is meaningful alone.
+        return kNativeToRec2020_Avata360;
     case DlogMFit::Osmo360:
         break;
     }

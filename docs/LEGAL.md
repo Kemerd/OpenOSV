@@ -164,7 +164,9 @@ The findings are written up, as behaviour and formulas, in
 ### 5.4 Colour (fits to measurements of DJI's LUTs)
 
 These were obtained by measuring DJI's publicly distributed LUTs, not from
-DJI's programs. The LUTs are:
+DJI's programs. The one exception is the Avata 360 row, which was measured
+from DJI Studio's rendering of a contributor's own clip, because no Avata 360
+LUT exists. The LUTs are:
 
 * **"DJI Osmo 360 D-Log M to Rec.709 V1.cube"**, bundled with DJI Studio
   1.0.0.24724 (byte-identical to DJI's Pocket 3 D-Log M LUT, `docs/COLOR.md`);
@@ -176,6 +178,7 @@ DJI's programs. The LUTs are:
 | Osmo 360 D-Log M curve (7 constants, the default) | `kDlogMOsmo360` in `include/osv/color/DlogM.h` | Fitted by `scripts/fit_dlogm.py` to the 33 neutral-axis entries of the Osmo 360 Rec.709 LUT. |
 | "DJI-matched" D-Log M curve (7 constants, `--fit dji`) | `kDlogMDjiRefit` in `include/osv/color/DlogM.h` | Fitted by `scripts/fit_dlogm.py` to 64 neutral-axis measurements of `FT_StyleGeneralDlogm2HLG`. |
 | Osmo 360 native primaries matrix (9 constants, the default) | `kNativeToRec2020_Osmo360` in `include/osv/color/Matrices.h` | Fitted by `scripts/fit_primaries.py` to all 35 937 entries of the Osmo 360 Rec.709 LUT. |
+| Avata 360 D-Log M curve and primaries matrix (16 constants, `--fit avata360`) | `kDlogMAvata360` in `include/osv/color/DlogM.h`, `kNativeToRec2020_Avata360` in `include/osv/color/Matrices.h` | Fitted to a contributor's own Avata 360 D-Log M footage against DJI Studio's export of the same clip with its D-Log M conversion applied. DJI publishes no Avata 360 LUT, so no DJI LUT was read. Method and limits in the comment on `kDlogMAvata360`. |
 | The "DJI Studio" Rec.709 look (46 stored constants, 38 free) | `kLookDjiRec709` in `include/osv/color/Look.h`; `osvLookApply` in `include/osv/color/ColorMath.h` | OpenOSV's own parametric model, fitted by `scripts/fit_look.py` to all 35 937 entries of the Osmo 360 Rec.709 LUT plus pixels of the author's footage. Its gamut compression uses the published ACES Reference Gamut Compression curve. |
 | The Transfer Function (HDR) styles' tone-scale fit (the ACES 2 styles' g and t_1, the toe t_1 all four tone-scale styles share, and the constants derived from them) | `kHdrToneCurves` in `src/osv/color/ColorParams.cpp`; `osvHdrToneCurve` in `include/osv/color/ColorMath.h` | The ACES 2.0 tonescale (aces-core, Apache-2.0; attribution in `NOTICE`) least-squares fitted to the neutral axis of the Osmo 360 Rec.709 LUT (codes 0.08 to 1.0, as BT.1886 display light at 100 nits); `docs/COLOR.md`, "Transfer Function (HDR)". Only the fitted constants are shipped. |
 | The fact that DJI Studio applies that LUT to Osmo 360 D-Log M clips as its automatic "D-LOG M" filter | `include/osv/color/Look.h`, `docs/COLOR.md` | DJI Studio project files written for the author's clips. |
@@ -202,6 +205,7 @@ No LUT file, LUT image or other DJI LUT data is included beyond these values.
 |---|---|---|
 | The `djmd` metadata's protobuf message layout, field numbers, scalar types and field and enum names | `proto/dvtm_osmo360.proto` (OpenOSV's own transcription), `src/osv/meta/DjmdDecoder.cpp`, `include/osv/meta/Types.h` | Recorded clips, and the schema's names as used by DJI Studio for Windows and DJI's macOS Premiere importer. Cross-checked against the `dvtm_oq101.proto` published in the open-source telemetry-parser project (MIT OR Apache-2.0). |
 | The meaning of the calibration slots and fields (`native_refine`, far presets, lens-guard and water slots, `extri_lens_mode`, `digital_focal_length`, the occlusion polygon, the extrinsic quaternion) and the 5-term Kannala-Brandt lens model | `include/osv/meta/*`, `include/osv/geom/*`, `docs/FORMAT.md`, `docs/GEOMETRY.md` | The schema's names, recorded clips (every convention in `docs/GEOMETRY.md` was verified on real footage and has a test), and DJI's Premiere importer (which projects with the native calibration through a Kannala-Brandt model). |
+| Where the DJI Avata 360 records its colour mode: StreamMeta field 2, then 4, then 1 (19 = D-Log M; an empty 2.4 = Normal), where the Osmo 360 uses StreamMeta 4.1 | `readAvata360ColorMode` in `src/osv/meta/DjmdDecoder.cpp` | Recorded clips: three Avata 360 clips (two D-Log M, one Normal) from a contributor. |
 | The container: an ISO base media file with DJI's `djmd`, `dbgi` and `camd` additions and an index table in a `free` box | `include/osv/container/*`, `src/osv/container/*` | Recorded clips. The base format is the public ISO/IEC 14496-12 standard. |
 
 ### 5.6 Recorded in documentation only, not used by the code

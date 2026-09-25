@@ -3,7 +3,7 @@
 //
 // D-Log M curve constants and host-side helpers.
 //
-// Three curves are shipped:
+// Four curves are shipped:
 //   * kDlogMPocket3  - the published community fit of DJI Pocket 3 D-Log M ->
 //                      linear by Thatcher Freeman (see NOTICE).
 //   * kDlogMDjiRefit - the same seven-parameter form re-fitted by
@@ -12,7 +12,10 @@
 //   * kDlogMOsmo360  - the same form fitted to the neutral axis of DJI's own
 //                      Osmo 360 D-Log M -> Rec.709 LUT (the default; see the
 //                      comment on the constant for why it replaced the refit).
-// All three use the branch-intersection cut so the curve is C0 continuous and
+//   * kDlogMAvata360 - the same form fitted for the DJI Avata 360, for which
+//                      DJI publishes no LUT: a fit to DJI Studio's export of
+//                      paired footage (see the comment on the constant).
+// All four use the branch-intersection cut so the curve is C0 continuous and
 // have a closed-form inverse (linearToDlogm).
 #pragma once
 
@@ -131,6 +134,64 @@ inline constexpr OsvDlogMCurve kDlogMOsmo360 = {
     0.822056039f,      // intercept
     0.00786506109f,    // midGrayScaling (pins code 0.40 -> 0.18)
     0.406199919f,      // cut (== intercept / (slope2 - slope))
+    OSV_DLOGM_CUT_INTERSECTION,
+};
+
+/// DJI Avata 360 fit.  Selectable as `--fit avata360`; never the default.
+///
+/// Provenance: DJI publishes no D-Log M LUT for the Avata 360, and DJI
+/// Studio's export of Avata 360 D-Log M footage is far from kDlogMOsmo360.
+/// This curve and kNativeToRec2020_Avata360 were fitted together to paired
+/// footage from one Avata 360: a D-Log M .OSV clip (21 s, hovering indoors)
+/// against DJI Studio's export of the same clip with its D-Log M conversion
+/// applied (6000 x 3000 equirect, 10-bit BT.709).  A Normal clip from the same
+/// session and its export set the noise floor.  Only the fitted constants are
+/// shipped; no footage and no DJI output is (see NOTICE).
+///
+/// Method, in short.  Each fisheye was registered to the export by optical
+/// flow and a fitted Kannala-Brandt lens with a per-frame rotation (1.1 / 2.0
+/// px median residual on the Normal pair, at 3840 px).  Samples were taken on
+/// flat, unclipped regions away from the seam, 7 frames to fit and 6 held
+/// out.  The model is
+///     display = BT.709 OETF(2^e * kRec2020ToRec709 * M * lin(code))
+/// with this curve's form and kDlogMOsmo360's constraints: code 0.400 -> 0.18
+/// exactly, C0 at the cut, lin(0) >= 0, strictly increasing and
+/// slope2 / slope <= 3.  yShift and slope are held at kDlogMOsmo360's values,
+/// because the form has two exact degeneracies and these fix the gauge.  The
+/// fit lands on the same two bounds the Osmo fit does (lin(0) = 0, ratio 3).
+/// The exposure e (-0.20 stops) is fitted separately and is not in the curve,
+/// so code 0.400 still means 18 % grey.  The BT.709 OETF was chosen over
+/// sRGB and over HLG (which scripts/fit_dlogm.py found behind the Osmo 360
+/// LUT): it fits the toe better and holds up when a fit to one lens is scored
+/// on the other.
+///
+/// Held-out result, 8-bit display levels, median R / G / B:
+///     Normal control (the floor)      0.70 / 0.38 / 0.53
+///     kDlogMOsmo360 + its matrix      3.90 / 3.71 / 4.19
+///     this curve + its matrix         0.57 / 0.50 / 0.60
+/// (p90: 1.75 / 0.99 / 1.36, 10.42 / 10.04 / 10.25, 1.69 / 1.45 / 1.72).
+///
+/// Method check: the same procedure on an Osmo 360 clip and its DJI Studio
+/// export lands within 0.045 stops of kDlogMOsmo360 from code 0.15 to 0.50,
+/// 0.10 stops dark at 0.6 and 0.22 at 0.8.  This curve sits up to 1.0 stop
+/// from kDlogMOsmo360 (darker above grey), four times further than that.
+///
+/// Limits.  One clip, one room lit by daylight, mostly white and beige
+/// surfaces.  The neutral samples span codes 0.125 to 0.785, so the toe and
+/// everything above code 0.8 are extrapolated: code 1.0 -> 1.4152 here
+/// against 3.7647 for kDlogMOsmo360.  Treat highlights as unverified.
+///
+/// Anchors: code 0.400 -> lin 0.18000 (pinned), code 0.714 -> lin 0.60211,
+/// code 1.000 -> lin 1.41523.  The cut is reached at code 0.1614.
+inline constexpr OsvDlogMCurve kDlogMAvata360 = {
+    -2.064248825f,     // xShift
+    0.630835854f,      // yShift (held at kDlogMOsmo360's)
+    3.622988623f,      // scale
+    1.011886004f,      // slope (held at kDlogMOsmo360's)
+    3.035658012f,      // slope2
+    0.521917605f,      // intercept
+    0.027401822f,      // midGrayScaling (pins code 0.40 -> 0.18)
+    0.257893480f,      // cut (== intercept / (slope2 - slope))
     OSV_DLOGM_CUT_INTERSECTION,
 };
 

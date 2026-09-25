@@ -395,7 +395,7 @@ TEST_CASE("Osmo 360 is the default D-Log M curve", "[color]") {
 }
 
 TEST_CASE("Both D-Log M curves are strictly increasing and continuous", "[color]") {
-    for (const OsvDlogMCurve* c : {&kDlogMPocket3, &kDlogMDjiRefit, &kDlogMOsmo360}) {
+    for (const OsvDlogMCurve* c : {&kDlogMPocket3, &kDlogMDjiRefit, &kDlogMOsmo360, &kDlogMAvata360}) {
         const std::vector<double> v = denseCurve(*c, 4096);
         double maxStep = 0.0;
         for (std::size_t i = 1; i < v.size(); ++i) {
@@ -421,7 +421,7 @@ TEST_CASE("Both D-Log M curves are strictly increasing and continuous", "[color]
 }
 
 TEST_CASE("D-Log M inverse round trip", "[color]") {
-    for (const OsvDlogMCurve* c : {&kDlogMPocket3, &kDlogMDjiRefit, &kDlogMOsmo360}) {
+    for (const OsvDlogMCurve* c : {&kDlogMPocket3, &kDlogMDjiRefit, &kDlogMOsmo360, &kDlogMAvata360}) {
         for (int i = 0; i <= 1000; ++i) {
             const double code = i / 1000.0;
             const double lin = dlogmToLinearD(*c, code);
@@ -447,8 +447,8 @@ TEST_CASE("D-Log M inverse round trip", "[color]") {
 //  Matrices
 // -----------------------------------------------------------------------------
 TEST_CASE("Colour matrices preserve white", "[color]") {
-    for (const OsvMat3f* m : {&kNativeToRec2020_Pocket3, &kNativeToRec2020_Osmo360, &kRec2020ToRec709,
-                              &kRec709ToRec2020, &kIdentity3}) {
+    for (const OsvMat3f* m : {&kNativeToRec2020_Pocket3, &kNativeToRec2020_Osmo360, &kNativeToRec2020_Avata360,
+                              &kRec2020ToRec709, &kRec709ToRec2020, &kIdentity3}) {
         for (int row = 0; row < 3; ++row) {
             REQUIRE_THAT(static_cast<double>(mat3RowSum(*m, row)), WithinAbs(1.0, 2e-6));
         }
@@ -739,6 +739,90 @@ TEST_CASE("Curve and primaries matrix are selected together", "[color]") {
         REQUIRE(fromHlg.nativeToWorking.m[i] == kIdentity3.m[i]);
         REQUIRE(from709.nativeToWorking.m[i] == kRec709ToRec2020.m[i]);
     }
+}
+
+TEST_CASE("Avata 360 D-Log M curve and primaries", "[color]") {
+    // No DJI reference exists for this camera (see the comments on the
+    // constants), so these check the fit's own anchors and constraints.
+    REQUIRE(dlogmCurveValid(kDlogMAvata360));
+    // Grey is pinned exactly, as in every curve here; the toe sits on the
+    // lin(0) >= 0 bound.
+    REQUIRE_THAT(dlogmToLinear(kDlogMAvata360, 0.40f), WithinAbs(0.18, 1e-4));
+    REQUIRE_THAT(dlogmToLinear(kDlogMAvata360, 0.0f), WithinAbs(0.0, 1e-5));
+    REQUIRE(dlogmToLinear(kDlogMAvata360, 0.0f) >= -1e-6f);
+    // Values from the fit report, one inside the fitted range and one past
+    // its top (the neutral samples reached code 0.785).
+    REQUIRE_THAT(dlogmToLinear(kDlogMAvata360, 0.714f), WithinAbs(0.60211, 1e-4));
+    REQUIRE_THAT(dlogmToLinear(kDlogMAvata360, 1.0f), WithinAbs(1.41523, 1e-4));
+    // Same slope-ratio bound as kDlogMOsmo360 (the fit sits on it), and the
+    // cut is reached at code 0.1614.
+    REQUIRE(kDlogMAvata360.slope2 / kDlogMAvata360.slope <= 3.0f + 1e-6f);
+    REQUIRE_THAT(linearToDlogmD(kDlogMAvata360,
+                                kDlogMAvata360.midGrayScaling * (dlogmCutD(kDlogMAvata360) * kDlogMAvata360.slope2)),
+                 WithinAbs(0.16136, 1e-4));
+    // Grey lands on HLG 0.380 through the whole pipeline: the matrix rows
+    // sum to 1, so it cannot move a neutral.
+    REQUIRE_THAT(greyThrough(standardParams(DlogMFit::Avata360, OutputTransfer::HLG), 0.40f), WithinAbs(0.380, 0.001));
+
+    // White stays white, bit-exactly, as for kNativeToRec2020_Osmo360.
+    for (int row = 0; row < 3; ++row) {
+        REQUIRE_THAT(static_cast<double>(mat3RowSum(kNativeToRec2020_Avata360, row)), WithinAbs(1.0, 1e-9));
+    }
+    float white[3];
+    osvMat3Apply(&kNativeToRec2020_Avata360, 0.18f, 0.18f, 0.18f, white);
+    for (const float v : white) {
+        REQUIRE_THAT(v, WithinAbs(0.18, 2e-7));
+    }
+    // Invertible, orientation-preserving, positive diagonal.
+    const OsvMat3f& m = kNativeToRec2020_Avata360;
+    REQUIRE(m.m[0] > 0.0f);
+    REQUIRE(m.m[4] > 0.0f);
+    REQUIRE(m.m[8] > 0.0f);
+    OsvMat3f inverse{};
+    REQUIRE(mat3Inverse(m, inverse));
+    const double det =
+        static_cast<double>(m.m[0]) * (static_cast<double>(m.m[4]) * m.m[8] - static_cast<double>(m.m[5]) * m.m[7]) -
+        static_cast<double>(m.m[1]) * (static_cast<double>(m.m[3]) * m.m[8] - static_cast<double>(m.m[5]) * m.m[6]) +
+        static_cast<double>(m.m[2]) * (static_cast<double>(m.m[3]) * m.m[7] - static_cast<double>(m.m[4]) * m.m[6]);
+    REQUIRE_THAT(det, WithinAbs(1.075248, 1e-5));
+
+    // The implied red primary, stated so the caveat in Matrices.h cannot rot:
+    // positive luminance, but Z < 0, i.e. outside the spectral locus.  This
+    // matrix models a rendering; it is not a sensor characterisation.
+    const float kRgb2020ToXyz[9] = {0.6369580f, 0.1446169f, 0.1688810f, 0.2627002f, 0.6779981f,
+                                    0.0593017f, 0.0000000f, 0.0280727f, 1.0609851f};
+    const OsvMat3f toXyz = {{kRgb2020ToXyz[0], kRgb2020ToXyz[1], kRgb2020ToXyz[2], kRgb2020ToXyz[3], kRgb2020ToXyz[4],
+                             kRgb2020ToXyz[5], kRgb2020ToXyz[6], kRgb2020ToXyz[7], kRgb2020ToXyz[8]}};
+    for (int ch = 0; ch < 3; ++ch) {
+        float in2020[3];
+        float xyz[3];
+        osvMat3Apply(&m, ch == 0 ? 1.0f : 0.0f, ch == 1 ? 1.0f : 0.0f, ch == 2 ? 1.0f : 0.0f, in2020);
+        osvMat3Apply(&toXyz, in2020[0], in2020[1], in2020[2], xyz);
+        INFO("native primary " << ch);
+        REQUIRE(xyz[1] > 0.0f);  // positive luminance for all three
+        if (ch == 0) {
+            REQUIRE(xyz[2] < 0.0f);
+        }
+    }
+
+    // Selection: names, and the curve and the matrix travel together.
+    DlogMFit parsed{};
+    for (const char* text : {"avata360", "avata", "avata-360", "AVATA360"}) {
+        REQUIRE(parseDlogMFit(text, parsed));
+        REQUIRE(parsed == DlogMFit::Avata360);
+    }
+    REQUIRE(std::string_view(dlogMFitName(DlogMFit::Avata360)) == "avata360");
+    REQUIRE(&dlogmCurve(DlogMFit::Avata360) == &kDlogMAvata360);
+    REQUIRE(&nativeToWorkingForFit(DlogMFit::Avata360) == &kNativeToRec2020_Avata360);
+    const OsvColorParams p = makeColorParams(DlogMFit::Avata360, OutputTransfer::PQ, 0.0f, InputEncoding::DLogM);
+    REQUIRE(p.curve.scale == kDlogMAvata360.scale);
+    for (int i = 0; i < 9; ++i) {
+        REQUIRE(p.nativeToWorking.m[i] == kNativeToRec2020_Avata360.m[i]);
+    }
+    // The enum is persisted, so the new value was appended.
+    REQUIRE(static_cast<int>(DlogMFit::Avata360) == 3);
+    // Not the default: the Osmo 360 curve stays the default for every clip.
+    REQUIRE(kDefaultDlogMFit == DlogMFit::Osmo360);
 }
 
 TEST_CASE("Osmo 360 primaries beat the Pocket 3 fit on saturated colour", "[color]") {
