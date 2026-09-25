@@ -710,3 +710,46 @@ TEST_CASE("the Parallax Grid and Lens Alignment combos round trip and refuse gar
         REQUIRE(blob.sanitise());
     }
 }
+
+TEST_CASE("the transfer function combo round trips and refuses garbage", "[importer][prefs][mapping][hdrtone]") {
+    // [WP-HDRTONE] The combo index IS the PrefsHdrTone value; the default,
+    // ACES 2 Bright, is the first entry and the zero byte of every older
+    // blob.
+    REQUIRE(controlsFromPrefs(PrefsBlob::defaults()).hdrTone == 0);
+    REQUIRE(PrefsBlob::defaults().hdrToneChoice() == PrefsHdrTone::Aces2Bright);
+
+    // Every style survives the round trip, alone and beside every colour
+    // output (the dialog greys the combo for Rec.709 and the passthrough,
+    // but keeps the choice).
+    for (int tone = 0; tone < static_cast<int>(PrefsHdrTone::Count); ++tone) {
+        for (int color = 0; color < static_cast<int>(PrefsColorOutput::Count); ++color) {
+            PrefsBlob original = PrefsBlob::defaults();
+            original.hdrTone = static_cast<std::uint8_t>(tone);
+            original.colorOutput = static_cast<std::uint8_t>(color);
+            const DialogControls controls = controlsFromPrefs(original);
+            INFO("tone " << tone << " colour " << color);
+            REQUIRE(controls.hdrTone == tone);
+            REQUIRE(prefsFromControls(controls) == original);
+            REQUIRE(prefsFromControls(controls, original) == original);
+        }
+    }
+
+    // A combo with no selection (-1) or a corrupt index lands on the default.
+    for (const int hostile : {-1, static_cast<int>(PrefsHdrTone::Count), 99, std::numeric_limits<int>::min()}) {
+        DialogControls bad = controlsFromPrefs(PrefsBlob::defaults());
+        bad.hdrTone = hostile;
+        PrefsBlob blob = prefsFromControls(bad);
+        INFO("hostile " << hostile);
+        REQUIRE(blob.hdrToneChoice() == PrefsHdrTone::Aces2Bright);
+        REQUIRE(blob.sanitise());
+    }
+
+    // A corrupt stored byte reads (and repairs) as the default too.
+    std::uint8_t bytes[PrefsBlob::kSize];
+    const PrefsBlob fresh = PrefsBlob::defaults();
+    std::memcpy(bytes, &fresh, PrefsBlob::kSize);
+    bytes[offsetof(PrefsBlob, hdrTone)] = 0xB7;
+    const PrefsBlob repaired = PrefsBlob::fromBytes(bytes, sizeof(bytes));
+    REQUIRE(repaired.hdrToneChoice() == PrefsHdrTone::Aces2Bright);
+    REQUIRE(repaired.hdrTone == 0u);
+}

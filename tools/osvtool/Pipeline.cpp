@@ -119,7 +119,10 @@ void addPipelineOptions(CLI::App* sub, PipelineOptions& opt) {
 
     auto* colorGroup = sub->add_option_group("Colour");
     colorGroup->add_option("--color", opt.color, "pq|hlg|709|linear|dlogm")->default_str("pq");
-    colorGroup->add_option("--fit", opt.fit, "D-Log M curve: osmo360|dji|pocket3")->default_str("osmo360");
+    // osmo360 matches DJI's own D-Log M LUT, which DJI ships unchanged for the
+    // Pocket 3 as well; pocket3 is a legacy community fit (see docs/COLOR.md).
+    colorGroup->add_option("--fit", opt.fit, "D-Log M curve: osmo360 (DJI-matched, also for Pocket 3)|dji|pocket3 (legacy)")
+        ->default_str("osmo360");
     colorGroup->add_option("--input-encoding", opt.inputEncoding, "auto|dlogm|hlg|normal")->default_str("auto");
     colorGroup->add_option("--exposure", opt.exposureStops, "Exposure offset in stops")->default_val(0.0);
     colorGroup->add_option("--look", opt.look, "Rec.709 look: dji (DJI Studio, default) | standard")
@@ -128,6 +131,11 @@ void addPipelineOptions(CLI::App* sub, PipelineOptions& opt) {
     colorGroup->add_option("--hdr-peak", opt.hdrPeak,
                            "PQ output's peak in nits: 1000 (default, no roll-off) | 600 | 400 | 203 (SDR-safe)")
         ->default_str("1000");
+    // [WP-HDRTONE] The Source Settings "Transfer Function (HDR)" styles.
+    colorGroup->add_option("--tone", opt.tone,
+                           "HDR transfer function (D-Log M to pq|hlg): aces-bright (default, outdoor) | aces-detailed "
+                           "(indoor) | bt2408-natural | bt2408-punchy | bt2408-neutral")
+        ->default_str("aces-bright");
 
     auto* backendGroup = sub->add_option_group("Backends");
 #if defined(__APPLE__)
@@ -325,9 +333,18 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
         return Error{ErrorCode::InvalidArgument,
                      "unknown --hdr-peak '" + options.hdrPeak + "' (expected 1000, 600, 400 or 203)"};
     }
+    // [WP-HDRTONE] How D-Log M scene light becomes PQ / HLG display light
+    // (ignored by every other input and output): ACES 2 Bright unless another
+    // Source Settings style is asked for.
+    color::HdrTone tone = color::kDefaultHdrTone;
+    if (!color::parseHdrTone(options.tone, tone)) {
+        return Error{ErrorCode::InvalidArgument,
+                     "unknown --tone '" + options.tone +
+                         "' (expected aces-bright, aces-detailed, bt2408-natural, bt2408-punchy or bt2408-neutral)"};
+    }
     p->color = color::makeColorParams(fit, p->outputTransfer, static_cast<float>(options.exposureStops),
                                       p->inputEncoding, true, p->format.bitDepth ? p->format.bitDepth : 10, nullptr,
-                                      color::kBt2408SceneScale, look, hdrPeakNits);
+                                      color::kBt2408SceneScale, look, hdrPeakNits, tone);
 
     // ---- stabilisation ----------------------------------------------------------------
     const std::string stab = lower(options.stab);

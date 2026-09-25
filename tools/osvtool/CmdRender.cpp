@@ -121,6 +121,10 @@ constexpr const char* kCliPhoto[] = {"off", "rim", "full"};
 constexpr const char* kCliShading[] = {"off", "auto"};  // [WP-VIGNETTE]
 constexpr const char* kCliHdrPeak[] = {"1000", "600", "400", "203"};  // [WP-HDRPEAK] PrefsHdrPeak order
 static_assert(std::size(kCliHdrPeak) == static_cast<std::size_t>(osv::premiere::PrefsHdrPeak::Count));
+// [WP-HDRTONE] PrefsHdrTone order, spelled as osv::color::hdrToneName does.
+constexpr const char* kCliHdrTone[] = {"aces-bright", "aces-detailed", "bt2408-natural", "bt2408-punchy",
+                                       "bt2408-neutral"};
+static_assert(std::size(kCliHdrTone) == static_cast<std::size_t>(osv::premiere::PrefsHdrTone::Count));
 static_assert(std::size(kCliColor) == static_cast<std::size_t>(osv::premiere::PrefsColorOutput::Count));
 static_assert(std::size(kCliStab) == static_cast<std::size_t>(osv::premiere::PrefsStabilization::Count));
 static_assert(std::size(kCliCalib) == static_cast<std::size_t>(osv::premiere::PrefsCalibrationChoice::Count));
@@ -169,6 +173,9 @@ void applyUserDefaults(RenderOptions& o, const CLI::App& sub) {
     }
     if (!given("--hdr-peak")) {  // [WP-HDRPEAK]
         o.pipeline.hdrPeak = cliToken(kCliHdrPeak, p.hdrPeak);
+    }
+    if (!given("--tone")) {  // [WP-HDRTONE]
+        o.pipeline.tone = cliToken(kCliHdrTone, p.hdrTone);
     }
     if (!given("--stab")) {
         o.pipeline.stab = cliToken(kCliStab, p.stabilization);

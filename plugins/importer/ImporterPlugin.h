@@ -276,6 +276,10 @@ struct DialogControls {
     int parallaxGrid = 0;  ///< Combo index: 0 Auto, 1 Steady (per clip), 2 Follows scene (per moment).
     int lensAlign = 0;     ///< Combo index: 0 Auto (fit per clip), 1 Off (calibration only).
     // ---- [/WP-STEADY] ----------------------------------------------------------
+    /// [WP-HDRTONE] Combo index = PrefsHdrTone: 0 ACES 2 Bright (default),
+    /// 1 ACES 2 Detailed, 2 BT.2408 Natural, 3 BT.2408 Punchy, 4 BT.2408
+    /// Neutral.  Only D-Log M to the PQ and HLG outputs uses it.
+    int hdrTone = 0;
 };
 
 /// [WP-STEADY] The Parallax Grid choice of each dialog combo index (the

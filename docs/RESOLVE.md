@@ -113,9 +113,16 @@ and a new Resolve project's timeline is Rec. 709 Gamma 2.4, so Rec. 709 looks
 right straight away. For the other outputs:
 
 - **BT.2100 PQ / HLG**: use these in HDR or colour-managed projects whose
-  timeline colour space matches.
+  timeline colour space matches. **Transfer Function (HDR)**, right under
+  Colour Output, picks how D-Log M becomes HDR light: ACES 2 Bright (the
+  default, good for outdoor), ACES 2 Detailed (good for indoor), BT.2408
+  Deep Blacks Natural or Punchy, or BT.2408 Neutral (the rendering of 0.2.0).
+  Hover it for the hint; `docs/COLOR.md` has the details.
 - **D-Log M (no transform)**: gives you the camera's log to grade yourself,
-  for example with `luts\OpenOSV_Osmo360_DLogM_to_*.cube` or DJI's own LUT.
+  for example with a LUT from the zip's `LUTs` folder
+  (`LUTs\Rec709\DJI_Osmo_DLogM_to_Rec709_DJI_Look.cube` for a Rec. 709
+  timeline, `LUTs\Rec2100_PQ\...` or `LUTs\Rec2100_HLG\...` for HDR; its
+  `README.txt` says which) or DJI's own LUT.
 
 The stitching controls (Seam Search, Sky Seam Fix, Lens Shading, Parallax
 Grid, Lens Alignment and the rest) are Premiere's Source Settings, with the

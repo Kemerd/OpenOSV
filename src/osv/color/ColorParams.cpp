@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// makeColorParams, the enum name / parse helpers and [WP-HDRPEAK] the PQ
-// output's HDR peak roll-off set-up (setHdrPeak and its queries).
+// makeColorParams, the enum name / parse helpers, [WP-HDRPEAK] the PQ
+// output's HDR peak roll-off set-up (setHdrPeak and its queries) and
+// [WP-HDRTONE] the HDR tone styles (setHdrTone, their constants and names).
 
 #include "osv/color/ColorParams.h"
 
@@ -38,6 +39,50 @@ void setMatrix(OsvMat3f& dst, const OsvMat3f& src) noexcept {
     for (int i = 0; i < 9; ++i) {
         dst.m[i] = src.m[i];
     }
+}
+
+// -----------------------------------------------------------------------------
+//  [WP-HDRTONE] The styles' constants
+// -----------------------------------------------------------------------------
+//
+// All four tone-scale styles share one toe: t_1 = 0.0448692404, the ACES 2.0
+// flare term least-squares fitted to the grey scale of DJI's published
+// D-Log M -> Rec.709 LUT at 100 nits (together with g = 1.09839444,
+// c_d = 8.0359053 and r_hit = 3.85877606; 0.040 stop RMS).  What differs is
+// where each one puts grey and the sensor clip (code 1.0 = scene 3.7647 on
+// the osmo360 curve):
+//
+//   Detailed  the ACES 2.0 init_TSParams curve of that fit re-evaluated for a
+//             1000-nit peak, r_hit scaled by the ACES 2.0 rule
+//             r_hit(n) = r_hit(100) (1 + 3 log10(n / 100)) (128 at 100 nits
+//             -> 896 at 10000), i.e. 15.4351042 at 1000:
+//             grey 13.8, diffuse white 98, clip 374 nits.
+//   Bright    the same g and t_1, m_2 and s_2 solved so grey sits at
+//             BT.2408's 26 nits and the clip at 600: white 169 nits.
+//   Natural / the curve through BT.2408's anchors (0.18 -> 26, diffuse white
+//   Punchy    0.95775 -> 203, clip 3.7647 -> 1000 nits) with that toe.
+//             Natural tone-maps luminance (scene saturation), Punchy each
+//             channel (about 40 % more chroma).
+//
+// The numbers are the float64 reference renders' own, to the digit;
+// docs/COLOR.md has the derivation.  Indexed by HdrTone.
+constexpr HdrToneCurve kHdrToneCurves[kHdrToneCount] = {
+    // Aces2Bright
+    {OSV_HDR_TONE_PER_CHANNEL, 24.9763073, 9.93461981, 1.09839444, 0.0448692404, 600.0},
+    // Aces2Detailed
+    {OSV_HDR_TONE_PER_CHANNEL, 19.8623327, 13.2779859, 1.09839444, 0.0448692404, 1000.0},
+    // Bt2408Natural
+    {OSV_HDR_TONE_LUMINANCE, 1641.6635, 300.45295, 1.16036774, 0.0448692404, 1000.0},
+    // Bt2408Punchy
+    {OSV_HDR_TONE_PER_CHANNEL, 1641.6635, 300.45295, 1.16036774, 0.0448692404, 1000.0},
+    // Bt2408Neutral: the zeroed group, the scene-referred rendering.
+    {OSV_HDR_TONE_OFF, 0.0, 0.0, 0.0, 0.0, 0.0},
+};
+
+/// The table index of a style, or -1 for a value outside the enum.
+[[nodiscard]] int hdrToneIndex(HdrTone tone) noexcept {
+    const int index = static_cast<int>(tone);
+    return (index >= 0 && index < kHdrToneCount) ? index : -1;
 }
 
 }  // namespace
@@ -78,6 +123,32 @@ const char* lookName(Look look) noexcept {
     switch (look) {
     case Look::DjiStudio: return "dji";
     case Look::Standard: return "standard";
+    }
+    return "unknown";
+}
+
+const char* hdrToneName(HdrTone tone) noexcept {
+    // [WP-HDRTONE] The CLI spelling, also what the user defaults file stores.
+    switch (tone) {
+    case HdrTone::Aces2Bright: return "aces-bright";
+    case HdrTone::Aces2Detailed: return "aces-detailed";
+    case HdrTone::Bt2408Natural: return "bt2408-natural";
+    case HdrTone::Bt2408Punchy: return "bt2408-punchy";
+    case HdrTone::Bt2408Neutral: return "bt2408-neutral";
+    }
+    return "unknown";
+}
+
+const char* hdrToneLabel(HdrTone tone) noexcept {
+    // [WP-HDRTONE] The UI's words, the Source Settings popup items exactly.
+    // Premiere's effect controls have no tooltips, so the two ACES styles say
+    // where they work best in the label itself.
+    switch (tone) {
+    case HdrTone::Aces2Bright: return "ACES 2 - Bright (outdoor)";
+    case HdrTone::Aces2Detailed: return "ACES 2 - Detailed (indoor)";
+    case HdrTone::Bt2408Natural: return "BT.2408 - Deep Blacks + Natural";
+    case HdrTone::Bt2408Punchy: return "BT.2408 - Deep Blacks + Punchy";
+    case HdrTone::Bt2408Neutral: return "BT.2408 - Neutral";
     }
     return "unknown";
 }
@@ -163,6 +234,34 @@ bool parseLook(std::string_view text, Look& out) noexcept {
     return false;
 }
 
+bool parseHdrTone(std::string_view text, HdrTone& out) noexcept {
+    // [WP-HDRTONE] The stable names first, then the short forms the CLI help
+    // documents.  "standard" is the Neutral style because it is the standard
+    // BT.2408 scene-referred rendering, the way --look spells its own.
+    const std::string t = lowerAscii(text);
+    if (t == "aces-bright" || t == "aces2-bright" || t == "bright") {
+        out = HdrTone::Aces2Bright;
+        return true;
+    }
+    if (t == "aces-detailed" || t == "aces2-detailed" || t == "detailed") {
+        out = HdrTone::Aces2Detailed;
+        return true;
+    }
+    if (t == "bt2408-natural" || t == "natural") {
+        out = HdrTone::Bt2408Natural;
+        return true;
+    }
+    if (t == "bt2408-punchy" || t == "punchy") {
+        out = HdrTone::Bt2408Punchy;
+        return true;
+    }
+    if (t == "bt2408-neutral" || t == "neutral" || t == "standard") {
+        out = HdrTone::Bt2408Neutral;
+        return true;
+    }
+    return false;
+}
+
 const OsvDlogMCurve& dlogmCurve(DlogMFit fit) noexcept {
     switch (fit) {
     case DlogMFit::Pocket3: return kDlogMPocket3;
@@ -221,7 +320,7 @@ OsvColorParams makeDisabledColorParams() noexcept {
 
 OsvColorParams makeColorParams(DlogMFit fit, OutputTransfer transfer, float exposureStops, InputEncoding input,
                                bool narrowInput, std::uint32_t bitDepth, const OsvDlogMCurve* curveOverride,
-                               float sceneScale, Look look, float hdrPeakNits) noexcept {
+                               float sceneScale, Look look, float hdrPeakNits, HdrTone tone) noexcept {
     OsvColorParams p = makeDisabledColorParams();
     p.enabled = 1;
 
@@ -310,7 +409,80 @@ OsvColorParams makeColorParams(DlogMFit fit, OutputTransfer transfer, float expo
     // default 1000-nit target leaves the group zeroed, so the block is byte
     // for byte what it was before the setting existed.
     setHdrPeak(p, hdrPeakNits);
+
+    // --- [WP-HDRTONE] HDR tone style -----------------------------------------
+    // Keyed off the sanitised input and transfer the same way: only D-Log M
+    // to PQ / HLG gets a style, Neutral leaves the group zeroed, and an
+    // out-of-range value (a corrupt caller) is the default style - what a
+    // corrupt preference byte also reads as.
+    setHdrTone(p, tone);
     return p;
+}
+
+// -----------------------------------------------------------------------------
+//  [WP-HDRTONE] Transfer Function (HDR)
+// -----------------------------------------------------------------------------
+HdrToneCurve hdrToneCurve(HdrTone tone) noexcept {
+    // A corrupt value lands on the default style, like dlogmCurve's fit.
+    const int index = hdrToneIndex(tone);
+    return kHdrToneCurves[index >= 0 ? index : static_cast<int>(kDefaultHdrTone)];
+}
+
+double hdrToneNits(const HdrToneCurve& curve, double x) noexcept {
+    // Based on the ACES 2.0 tonescale in aces-core lib/Lib.Academy.Tonescale.ctl
+    // (Copyright Contributors to the ACES Project, Apache-2.0; see NOTICE).
+    // Neutral has no curve; unusable constants have none either (the same
+    // rule as osvHdrToneActive, every comparison NaN-safe).
+    if (curve.mode != OSV_HDR_TONE_PER_CHANNEL && curve.mode != OSV_HDR_TONE_LUMINANCE) {
+        return 0.0;
+    }
+    if (!(curve.m2 > 0.0) || !(curve.s2 > 0.0) || !(curve.g > 0.0) || !(curve.t1 >= 0.0)) {
+        return 0.0;
+    }
+    if (!std::isfinite(x) || x <= 0.0) {
+        return 0.0;
+    }
+    // f = m2 * (x / (x + s2))^g ; h = max(0, f^2 / (f + t1)) ; nits = 100 h.
+    const double f = curve.m2 * std::pow(x / (x + curve.s2), curve.g);
+    const double h = std::max(0.0, f * f / (f + curve.t1));
+    return static_cast<double>(OSV_HDR_TONE_REF_NITS) * h;
+}
+
+void setHdrTone(OsvColorParams& params, HdrTone tone) noexcept {
+    // Start from Neutral: every early return below leaves the zeroed group,
+    // which the kernel reads as the BT.2408 scene-referred rendering.
+    params.hdrToneMode = OSV_HDR_TONE_OFF;
+    params.hdrToneM2 = 0.0f;
+    params.hdrToneS2 = 0.0f;
+    params.hdrToneG = 0.0f;
+    params.hdrToneT1 = 0.0f;
+    params.hdrToneCapNits = 0.0f;
+
+    // The styles render D-Log M scene light; HLG and Normal clips are
+    // already display renderings of their own, and Rec.709, linear and the
+    // passthrough are not HDR outputs.
+    if (params.inputEncoding != OSV_INPUT_DLOGM ||
+        (params.transfer != OSV_TRANSFER_PQ && params.transfer != OSV_TRANSFER_HLG)) {
+        return;
+    }
+    // A value outside the enum is the default style (hdrToneCurve's rule);
+    // Neutral is the zeroed group.
+    const HdrToneCurve curve = hdrToneCurve(tone);
+    if (curve.mode == OSV_HDR_TONE_OFF) {
+        return;
+    }
+    // The ceiling never exceeds the mastering display the HLG inverse OOTF
+    // and the PQ roll-off are both normalised to.
+    const double peak = static_cast<double>(params.peakNits);
+    if (!std::isfinite(peak) || !(peak > 0.0)) {
+        return;
+    }
+    params.hdrToneMode = curve.mode;
+    params.hdrToneM2 = static_cast<float>(curve.m2);
+    params.hdrToneS2 = static_cast<float>(curve.s2);
+    params.hdrToneG = static_cast<float>(curve.g);
+    params.hdrToneT1 = static_cast<float>(curve.t1);
+    params.hdrToneCapNits = static_cast<float>(std::min(curve.capNits, peak));
 }
 
 // -----------------------------------------------------------------------------
@@ -379,7 +551,13 @@ float hdrPeakNitsOf(const OsvColorParams& params) noexcept {
     }
     // An active roll-off caps the output at its target; otherwise the OOTF's
     // own display peak is the brightest the output gets for in-range light.
-    return params.hdrPeakNits > 0.0f ? params.hdrPeakNits : params.peakNits;
+    const float peak = params.hdrPeakNits > 0.0f ? params.hdrPeakNits : params.peakNits;
+    // [WP-HDRTONE] A tone style never renders above its own ceiling (the
+    // roll-off only ever lowers light, so the smaller of the two bounds it).
+    if (osvHdrToneActive(&params) && params.hdrToneCapNits < peak) {
+        return params.hdrToneCapNits;
+    }
+    return peak;
 }
 
 float hdrPeakKneeNits(float targetNits, float sourcePeakNits) noexcept {
@@ -477,6 +655,30 @@ bool colorParamsValid(const OsvColorParams& params) noexcept {
             !(params.hdrPeakKnee < params.hdrPeakMaxLum)) {
             return false;
         }
+    }
+    // [WP-HDRTONE] The tone group: zeroed (Neutral) in full, or a D-Log M
+    // PQ / HLG block with a known mode and constants the kernel uses as they
+    // are - a block the kernel would silently render as Neutral is refused
+    // here instead of shipping a style it does not show.
+    const float toneGroup[] = {params.hdrToneM2, params.hdrToneS2, params.hdrToneG, params.hdrToneT1,
+                               params.hdrToneCapNits};
+    for (const float v : toneGroup) {
+        if (!std::isfinite(v)) {
+            return false;
+        }
+    }
+    if (params.hdrToneMode == OSV_HDR_TONE_OFF) {
+        for (const float v : toneGroup) {
+            if (v != 0.0f) {
+                return false;
+            }
+        }
+    } else if (params.hdrToneMode == OSV_HDR_TONE_PER_CHANNEL || params.hdrToneMode == OSV_HDR_TONE_LUMINANCE) {
+        if (!osvHdrToneActive(&params) || !(params.hdrToneCapNits <= params.peakNits)) {
+            return false;
+        }
+    } else {
+        return false;  // an unknown mode
     }
     return params.sceneScale > 0.0f && params.exposureGain > 0.0f && params.peakNits > 0.0f;
 }

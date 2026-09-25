@@ -64,6 +64,13 @@
 #define IDC_REC709_LOOK    1030
 #define IDC_STATIC_LOOK    1130
 
+// [WP-HDRTONE] The PQ / HLG outputs' transfer function (ACES 2 Bright ...
+// BT.2408 Neutral), in the row under Colour output.  Beside the look's ids
+// and clear of every id the dialog code creates at run time (1040-1049,
+// 1070, 1080-1081, 1140-1157, 1170, 1180-1181).
+#define IDC_HDR_TONE       1031
+#define IDC_STATIC_HDR_TONE 1131
+
 // [WP-DEFAULTS] "Save as Default": store the dialog's settings as the user's
 // defaults for new clips (plugins/common/UserDefaults.h), with a one-word
 // status line beside it.  Clear of every id above and of the ids the dialog

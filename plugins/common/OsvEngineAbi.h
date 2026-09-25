@@ -80,8 +80,13 @@ extern "C" {
  *       group (WP-HDRPEAK: hdrPeakNits, hdrPeakSrcCode, hdrPeakMaxLum,
  *       hdrPeakKnee - 16 bytes), so every field after the colour block
  *       moved; no new table or entry point.  A version-4 effect meeting a
- *       version-5 importer (or the reverse) refuses the engine, as above. */
-#define OSV_ENGINE_ABI_VERSION 5u
+ *       version-5 importer (or the reverse) refuses the engine, as above.
+ *    6  OsvColorParams grew by the HDR tone group (WP-HDRTONE: hdrToneMode,
+ *       hdrToneM2, hdrToneS2, hdrToneG, hdrToneT1, hdrToneCapNits - 24
+ *       bytes), so every field after the colour block moved again; no new
+ *       table or entry point.  A version-5 effect meeting a version-6
+ *       importer (or the reverse) refuses the engine, as above. */
+#define OSV_ENGINE_ABI_VERSION 6u
 
 /** Module file name of the importer that exports the engine. */
 #define OSV_ENGINE_MODULE_NAME L"OpenOSVImporter.prm"

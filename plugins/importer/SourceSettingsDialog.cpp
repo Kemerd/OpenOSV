@@ -140,6 +140,67 @@ void enableLookForOutput(HWND dialog) noexcept {
     }
 }
 
+/// [WP-HDRTONE] Grey the transfer function (and its label) unless Colour
+/// output is PQ or HLG, the two outputs it shapes.  Like the look, the
+/// selection is kept either way, so going back to an HDR output restores the
+/// user's choice.  (HLG and Normal clips ignore it too, but the dialog does
+/// not know the clip's encoding, so it greys by output only.)
+void enableHdrToneForOutput(HWND dialog) noexcept {
+    const int output = comboSelection(dialog, IDC_COLOR_OUTPUT);
+    const bool hdr =
+        output == static_cast<int>(PrefsColorOutput::PQ) || output == static_cast<int>(PrefsColorOutput::HLG);
+    for (const int id : {IDC_HDR_TONE, IDC_STATIC_HDR_TONE}) {
+        if (HWND control = ::GetDlgItem(dialog, id)) {
+            ::EnableWindow(control, hdr ? TRUE : FALSE);
+        }
+    }
+}
+
+/// [WP-HDRTONE] The tooltip on the transfer function combo and its label:
+/// the same hint the Resolve parameter carries (OSV_SS_HDR_TONE_HINT in
+/// plugins/sourcesettings/SourceSettingsParams.h).  Premiere's effect
+/// controls cannot show one, which is why those items name "(outdoor)" and
+/// "(indoor)" in the label as well.  The tooltip window is owned by the
+/// dialog, so the dialog's destruction takes it along.  Any failure leaves
+/// the dialog without a tooltip, never without the combo.
+void addHdrToneTooltip(HWND dialog) noexcept {
+    static const wchar_t kHint[] = L"Bright is good for outdoor, Detailed is good for indoor.";
+    HWND combo = ::GetDlgItem(dialog, IDC_HDR_TONE);
+    if (!combo) {
+        return;
+    }
+    // The tooltip class lives in comctl32; registering it is idempotent.
+    INITCOMMONCONTROLSEX icc{};
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_TAB_CLASSES;  // includes the tooltip class
+    ::InitCommonControlsEx(&icc);
+    HWND tip = ::CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                 CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, dialog, nullptr,
+                                 reinterpret_cast<HINSTANCE>(::GetWindowLongPtrW(dialog, GWLP_HINSTANCE)), nullptr);
+    if (!tip) {
+        PluginLog::oncef("dialog/hdr-tone-tip", PluginLog::Level::Debug,
+                         "source settings: no tooltip window for the transfer function combo");
+        return;
+    }
+    // One tool per window: the combo, and the label beside it.  The V2 size
+    // is accepted by every comctl32 version, whichever the host activates.
+    for (const int id : {IDC_HDR_TONE, IDC_STATIC_HDR_TONE}) {
+        HWND control = ::GetDlgItem(dialog, id);
+        if (!control) {
+            continue;
+        }
+        TOOLINFOW info{};
+        info.cbSize = TTTOOLINFOW_V2_SIZE;
+        info.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        info.hwnd = dialog;
+        info.uId = reinterpret_cast<UINT_PTR>(control);
+        info.lpszText = const_cast<wchar_t*>(kHint);
+        ::SendMessageW(tip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
+    }
+    // Wrap long hints instead of one screen-wide line.
+    ::SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, 320);
+}
+
 /// Write a double into an edit control with two decimals.
 void setEditDouble(HWND dialog, int control, double value) noexcept {
     wchar_t text[32] = {};
@@ -290,8 +351,9 @@ constexpr int kRowStep = 20;
 int growDialogForRows(HWND dialog, int rows) noexcept {
     const int kGrow = rows * kRowStep;
     // The first row sits where the OK button is now, in dialog units (the
-    // template's own layout decides; 209 is what it says today).
-    int firstRow = 208;
+    // template's own layout decides; OK sits at 243 since [WP-HDRTONE]'s
+    // row, and this fallback is only used when the geometry cannot be read).
+    int firstRow = 242;
     RECT unit{0, 0, 100, 100};
     HWND ok = ::GetDlgItem(dialog, IDOK);
     RECT okRect{};
@@ -708,6 +770,18 @@ void controlsToWidgets(HWND dialog, const DialogControls& c, const CalibrationUi
                   "the look combo does not list every PrefsLook value");
     fillCombo(dialog, IDC_REC709_LOOK, kLooks, static_cast<int>(std::size(kLooks)), c.look);
     enableLookForOutput(dialog);
+
+    // [WP-HDRTONE] The transfer function, indexed by PrefsHdrTone (ACES 2
+    // Bright first: zero is the default and what every older blob holds).
+    // The same words as the Source Settings effect's popup items.  Greyed
+    // unless Colour output is PQ or HLG.
+    static const wchar_t* const kTones[] = {L"ACES 2 - Bright (outdoor)", L"ACES 2 - Detailed (indoor)",
+                                            L"BT.2408 - Deep Blacks + Natural", L"BT.2408 - Deep Blacks + Punchy",
+                                            L"BT.2408 - Neutral"};
+    static_assert(std::size(kTones) == static_cast<std::size_t>(PrefsHdrTone::Count),
+                  "the transfer function combo does not list every PrefsHdrTone value");
+    fillCombo(dialog, IDC_HDR_TONE, kTones, static_cast<int>(std::size(kTones)), c.hdrTone);
+    enableHdrToneForOutput(dialog);
 }
 
 /// Read the widgets back into the controls.
@@ -723,6 +797,11 @@ void widgetsToControls(HWND dialog, DialogControls& c) noexcept {
     c.flareRemoval = ::IsDlgButtonChecked(dialog, IDC_FLARE_REMOVAL) == BST_CHECKED;  // [WP-FLARE]
     c.exposureStops = getEditDouble(dialog, IDC_EXPOSURE, c.exposureStops);
     c.look = comboSelection(dialog, IDC_REC709_LOOK);  // [WP-LOOK]
+    // [WP-HDRTONE] A template without the row (never shipped) keeps the
+    // style the dialog opened with.
+    if (::GetDlgItem(dialog, IDC_HDR_TONE)) {
+        c.hdrTone = comboSelection(dialog, IDC_HDR_TONE);
+    }
     photoWidgetsToControls(dialog, c);  // [WP-PHOTO]
     seamToolWidgetsToControls(dialog, c);  // [WP-SEAMTOOLS]
     shadingWidgetsToControls(dialog, c);  // [WP-VIGNETTE]
@@ -746,6 +825,7 @@ INT_PTR CALLBACK sourceSettingsProc(HWND dialog, UINT message, WPARAM wParam, LP
             addHdrPeakRow(dialog, state->controls);       // [WP-HDRPEAK]
             addSteadyRows(dialog, state->controls);       // [WP-STEADY]
         }
+        addHdrToneTooltip(dialog);  // [WP-HDRTONE]
         placeDefaultsRow(dialog);  // [WP-DEFAULTS] after every block that moves OK
         return TRUE;  // Let the dialog manager set the initial focus.
     }
@@ -772,10 +852,12 @@ INT_PTR CALLBACK sourceSettingsProc(HWND dialog, UINT message, WPARAM wParam, LP
             return TRUE;
         }
         // [WP-LOOK] A new Colour output re-evaluates whether the look applies
-        // - and [WP-HDRPEAK] whether the HDR peak does.
+        // - and [WP-HDRPEAK] whether the HDR peak does, and [WP-HDRTONE]
+        // whether the transfer function does.
         if (id == IDC_COLOR_OUTPUT && HIWORD(wParam) == CBN_SELCHANGE) {
             enableLookForOutput(dialog);
             enableHdrPeakForOutput(dialog);
+            enableHdrToneForOutput(dialog);
             return TRUE;
         }
         return FALSE;
@@ -990,9 +1072,11 @@ void logDialogStartsFromDefaults(ImporterInstance* instance, const imFileAccessR
         PluginLog::warn("source settings: could not request a refresh of the clip");
     }
 
-    PluginLog::info("source settings accepted: colour {}, look {}, HDR peak {:.0f} nits, size {}, stab {}, seam {}, "
-                    "gain {}, calib {} ({}), fit {}, exposure {:+.2f}, device {}, sun ghost removal {}",
-                    blob.colorOutput, blob.look, static_cast<double>(blob.hdrPeakNits()), blob.outputSize,
+    PluginLog::info("source settings accepted: colour {}, HDR tone {}, look {}, HDR peak {:.0f} nits, size {}, "
+                    "stab {}, seam {}, gain {}, calib {} ({}), fit {}, exposure {:+.2f}, device {}, sun ghost "
+                    "removal {}",
+                    blob.colorOutput, blob.hdrTone /* [WP-HDRTONE] */, blob.look,
+                    static_cast<double>(blob.hdrPeakNits()), blob.outputSize,
                     blob.stabilization, blob.seamSearch, blob.gainMatch, blob.calibration,
                     calibrationChoiceToken(blob.calibrationChoice()), blob.dlogmFit,
                     static_cast<double>(blob.exposureStops), blob.renderDevice, blob.flareRemoval);

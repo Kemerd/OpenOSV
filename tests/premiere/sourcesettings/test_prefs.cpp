@@ -187,6 +187,24 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
             CHECK(blob.hdrPeakNits() == kPrefsHdrPeakNits[static_cast<std::size_t>(item - 1)]);
         }
     }
+    SECTION("Transfer Function (HDR)") {
+        // [WP-HDRTONE] "ACES 2 - Bright (outdoor)" -> 0 (what an older blob's
+        // zero byte means) through "BT.2408 - Neutral" -> 4, in enum order.
+        for (int item = 1; item <= OSV_SS_HDR_TONE_COUNT; ++item) {
+            PrefsBuffer buffer;
+            fixture.setPopup(kIndexHdrTone, item);
+            INFO("popup value " << item);
+            const PrefsBlob blob = translate(fixture, buffer);
+            CHECK(blob.hdrTone == static_cast<std::uint8_t>(item - 1));
+            CHECK(static_cast<int>(blob.hdrToneChoice()) == item - 1);
+        }
+        PrefsBuffer first;
+        fixture.setPopup(kIndexHdrTone, 1);
+        CHECK(translate(fixture, first).hdrToneChoice() == PrefsHdrTone::Aces2Bright);
+        PrefsBuffer last;
+        fixture.setPopup(kIndexHdrTone, OSV_SS_HDR_TONE_COUNT);
+        CHECK(translate(fixture, last).hdrToneChoice() == PrefsHdrTone::Bt2408Neutral);
+    }
     SECTION("Output Size") {
         for (int item = 1; item <= OSV_SS_SIZE_COUNT; ++item) {
             PrefsBuffer buffer;
@@ -997,6 +1015,40 @@ TEST_CASE("the pure mapping round-trips the HDR peak choice", "[sourcesettings][
     CHECK(controlsFromPrefs(old).hdrPeak == OSV_SS_HDR_PEAK_DEFAULT);
 }
 
+TEST_CASE("the pure mapping round-trips the HDR transfer function", "[sourcesettings][mapping][hdrtone]") {
+    // [WP-HDRTONE] Every item, both directions; hostile popup values fall
+    // back to ACES 2 Bright (the default) rather than producing a blob that
+    // needs repair.
+    for (int item = 1; item <= OSV_SS_HDR_TONE_COUNT; ++item) {
+        ControlValues c;
+        c.hdrTone = item;
+        const PrefsBlob blob = prefsFromControls(c);
+        REQUIRE(blob.isValid());
+        CHECK(blob.hdrTone == static_cast<std::uint8_t>(item - 1));
+        CHECK(controlsFromPrefs(blob).hdrTone == item);
+    }
+    for (const int hostile : {std::numeric_limits<int>::min(), -1, 0, OSV_SS_HDR_TONE_COUNT + 1, 99}) {
+        ControlValues c;
+        c.hdrTone = hostile;
+        PrefsBlob blob = prefsFromControls(c);
+        CHECK(blob.hdrToneChoice() == PrefsHdrTone::Aces2Bright);
+        CHECK(blob.sanitise());
+    }
+    // An older project's blob (zero byte) shows as ACES 2 Bright, the
+    // default, and a corrupt byte in a stored blob is shown as it too.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.hdrTone = 0;
+    CHECK(controlsFromPrefs(old).hdrTone == OSV_SS_HDR_TONE_DEFAULT);
+    old.hdrTone = 0xEE;
+    CHECK(controlsFromPrefs(old).hdrTone == OSV_SS_HDR_TONE_DEFAULT);
+    // It is its own byte: changing it moves nothing else in the blob.
+    ControlValues neutral;
+    neutral.hdrTone = OSV_SS_HDR_TONE_COUNT;
+    PrefsBlob expected = PrefsBlob::defaults();
+    expected.hdrTone = static_cast<std::uint8_t>(PrefsHdrTone::Bt2408Neutral);
+    CHECK(prefsFromControls(neutral) == expected);
+}
+
 TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesettings][mapping]") {
     // A default-constructed ControlValues is what the header's defaults say;
     // translating it must give exactly PrefsBlob::defaults().
@@ -1013,6 +1065,7 @@ TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesetting
     CHECK(c.directColour == OSV_SS_DIRECT_COLOUR_DEFAULT);
     CHECK(c.rec709Look == OSV_SS_LOOK_DEFAULT);  // [WP-LOOK]
     CHECK(c.hdrPeak == OSV_SS_HDR_PEAK_DEFAULT);  // [WP-HDRPEAK]
+    CHECK(c.hdrTone == OSV_SS_HDR_TONE_DEFAULT);  // [WP-HDRTONE]
     CHECK(c.seamSearch == (OSV_SS_SEAM_SEARCH_DEFAULT != 0));
     CHECK(c.gainMatch == (OSV_SS_GAIN_MATCH_DEFAULT != 0));
     CHECK(c.flareRemoval == (OSV_SS_FLARE_REMOVAL_DEFAULT != 0));  // [WP-FLARE]

@@ -565,7 +565,7 @@ absent, so that fact cannot be forgotten.
 
 As in the reframe effect, `PF_ADD_TOPIC` and `PF_END_TOPIC` each issue their
 own `PF_ADD_PARAM`, so a group occupies two real parameter slots and the
-`GROUP_END` slot sits in the MIDDLE of the list. There are 33 parameters: 25
+`GROUP_END` slot sits in the MIDDLE of the list. There are 34 parameters: 26
 value controls, 2 buttons and 6 group markers. `SourceSettingsParams.h`
 spells the index table out literally. Ids are permanent and only ever
 appended; indices moved when a control joined a group (the ids did not).
@@ -582,44 +582,46 @@ meaning; forcing the bare-lens set is new and therefore last.
 | Index | ID | Name | Type | Items / range | Default | Prefs field |
 |---|---|---|---|---|---|---|
 | 1 | 1 | Colour Output | popup | BT.2100 PQ \| BT.2100 HLG \| Rec. 709 \| D-Log M (no transform) | PQ | `colorOutput` |
-| 2 | 15 | Look (Rec. 709 only) | popup | DJI (default) \| OpenOSV standard | DJI | `look` |
-| 3 | 46 | HDR Peak (PQ only) | popup | 1000 nits (default) \| 600 nits \| 400 nits \| 203 nits (SDR-safe) | 1000 nits | `hdrPeak` |
-| 4 | 2 | Output Size | popup | Native (2 x decoded height) \| 4K (3840 x 1920) \| 2560 x 1280 \| 2K (1920 x 960) | Native | `outputSize` |
-| 5 | 3 | Stabilisation | popup | Off \| Horizon Lock \| Full \| Smooth \| Smooth + Horizon Lock | Smooth + Horizon Lock | `stabilization` |
-| 6 | 4 | Stitching | topic (GROUP_START) | | | |
-| 7 | 5 | Seam Search | checkbox (also carves the seam) | | on | `seamSearch` |
-| 8 | 6 | Exposure Match | checkbox | | on | `gainMatch` |
-| 9 | 7 | Calibration | popup | Auto (as recorded) \| Lens Protectors / ND Filters \| Underwater \| Native (bare lenses) | Auto | `calibration` + `calibrationForceNative` |
-| 10 | 16 | Sun Ghost Removal | checkbox | | on | `flareRemoval` |
-| 11 | 17 | Sky Seam Fix | popup | Off \| Rim only \| Rim and colour | Rim and colour | `photoSeam` |
-| 12 | 18 | Sky Seam Strength | float slider | 0..100 %, whole percent | 100 | `photoStrength` |
-| 13 | 19 | Seam Edge Inset | float slider | 0..6 deg, tenths | 2.6 | `seamInset` |
-| 14 | 20 | Seam Blend | float slider | 0.2..8 deg, hundredths shown, twentieths stored | 1.5 | `seamBlend` |
-| 15 | 21 | Parallax Blend | float slider | 0..4 deg (0 = hard cut), as above | 0.35 | `parallaxBlend` |
-| 16 | 22 | Seam Smoothing | float slider | 0..8 deg (0 = off), as above | 0 | `seamSmoothing` |
-| 17 | 23 | Near Offset | float slider | -3..+3 deg, hundredths | 0 | `nearOffset` |
-| 18 | 24 | Far Offset | float slider | -3..+3 deg, hundredths | 0 | `farOffset` |
-| 19 | 34 | Lens Shading | popup | Off \| Auto | Auto | `lensShading` |
-| 20 | 35 | Shading Strength | float slider | 0..100 %, whole percent | 100 | `shadingStrength` |
-| 21 | 40 | Parallax Grid | popup | Auto (steady unless the scene moves) \| Steady (per clip) \| Follows scene (per moment) | Auto | `parallaxGrid` |
-| 22 | 41 | Lens Alignment | popup | Auto (fit per clip) \| Off (calibration only) | Auto | `lensAlign` |
-| 23 | 8 | (closes Stitching) | GROUP_END | | | |
-| 24 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
-| 25 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 \| Osmo 360 | Osmo 360 | `dlogmFit` |
-| 26 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
-| 27 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
-| 28 | 14 | Program Monitor Colour | popup | Sequence space (fast) \| Match Source monitor | Sequence space | `directColour` |
-| 29 | 13 | (closes Advanced) | GROUP_END | | | |
-| 30 | 30 | Defaults | topic (GROUP_START, starts collapsed) | | | |
-| 31 | 31 | Save | button, `PF_ParamFlag_SUPERVISE` | "Save as Default for New Clips" | | writes the user defaults file |
-| 32 | 32 | Restore | button, `PF_ParamFlag_SUPERVISE` | "Restore Built-in Defaults" | | removes it |
-| 33 | 33 | (closes Defaults) | GROUP_END | | | |
+| 2 | 50 | Transfer Function (HDR) | popup | ACES 2 - Bright (outdoor) \| ACES 2 - Detailed (indoor) \| BT.2408 - Deep Blacks + Natural \| BT.2408 - Deep Blacks + Punchy \| BT.2408 - Neutral | ACES 2 - Bright | `hdrTone` |
+| 3 | 15 | Look (Rec. 709 only) | popup | DJI (default) \| OpenOSV standard | DJI | `look` |
+| 4 | 46 | HDR Peak (PQ only) | popup | 1000 nits (default) \| 600 nits \| 400 nits \| 203 nits (SDR-safe) | 1000 nits | `hdrPeak` |
+| 5 | 2 | Output Size | popup | Native (2 x decoded height) \| 4K (3840 x 1920) \| 2560 x 1280 \| 2K (1920 x 960) | Native | `outputSize` |
+| 6 | 3 | Stabilisation | popup | Off \| Horizon Lock \| Full \| Smooth \| Smooth + Horizon Lock | Smooth + Horizon Lock | `stabilization` |
+| 7 | 4 | Stitching | topic (GROUP_START) | | | |
+| 8 | 5 | Seam Search | checkbox (also carves the seam) | | on | `seamSearch` |
+| 9 | 6 | Exposure Match | checkbox | | on | `gainMatch` |
+| 10 | 7 | Calibration | popup | Auto (as recorded) \| Lens Protectors / ND Filters \| Underwater \| Native (bare lenses) | Auto | `calibration` + `calibrationForceNative` |
+| 11 | 16 | Sun Ghost Removal | checkbox | | on | `flareRemoval` |
+| 12 | 17 | Sky Seam Fix | popup | Off \| Rim only \| Rim and colour | Rim and colour | `photoSeam` |
+| 13 | 18 | Sky Seam Strength | float slider | 0..100 %, whole percent | 100 | `photoStrength` |
+| 14 | 19 | Seam Edge Inset | float slider | 0..6 deg, tenths | 2.6 | `seamInset` |
+| 15 | 20 | Seam Blend | float slider | 0.2..8 deg, hundredths shown, twentieths stored | 1.5 | `seamBlend` |
+| 16 | 21 | Parallax Blend | float slider | 0..4 deg (0 = hard cut), as above | 0.35 | `parallaxBlend` |
+| 17 | 22 | Seam Smoothing | float slider | 0..8 deg (0 = off), as above | 0 | `seamSmoothing` |
+| 18 | 23 | Near Offset | float slider | -3..+3 deg, hundredths | 0 | `nearOffset` |
+| 19 | 24 | Far Offset | float slider | -3..+3 deg, hundredths | 0 | `farOffset` |
+| 20 | 34 | Lens Shading | popup | Off \| Auto | Auto | `lensShading` |
+| 21 | 35 | Shading Strength | float slider | 0..100 %, whole percent | 100 | `shadingStrength` |
+| 22 | 40 | Parallax Grid | popup | Auto (steady unless the scene moves) \| Steady (per clip) \| Follows scene (per moment) | Auto | `parallaxGrid` |
+| 23 | 41 | Lens Alignment | popup | Auto (fit per clip) \| Off (calibration only) | Auto | `lensAlign` |
+| 24 | 8 | (closes Stitching) | GROUP_END | | | |
+| 25 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
+| 26 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 \| Osmo 360 | Osmo 360 | `dlogmFit` |
+| 27 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
+| 28 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
+| 29 | 14 | Program Monitor Colour | popup | Sequence space (fast) \| Match Source monitor | Sequence space | `directColour` |
+| 30 | 13 | (closes Advanced) | GROUP_END | | | |
+| 31 | 30 | Defaults | topic (GROUP_START, starts collapsed) | | | |
+| 32 | 31 | Save | button, `PF_ParamFlag_SUPERVISE` | "Save as Default for New Clips" | | writes the user defaults file |
+| 33 | 32 | Restore | button, `PF_ParamFlag_SUPERVISE` | "Restore Built-in Defaults" | | removes it |
+| 34 | 33 | (closes Defaults) | GROUP_END | | | |
 
 The Defaults group is always last and its indices are defined relative to
 the Advanced terminator, so a control added to an earlier group moves them
 without renumbering; ids 20-29 are left to the Stitching group. The lens
 shading correction's ids (34-35) come after every id already shipped, the
-steady seam's (40-41) after those, and the HDR peak's (46) after those.
+steady seam's (40-41) after those, the HDR peak's (46) after those, and the
+transfer function's (50) after those.
 See "User defaults for new clips" below.
 
 An effect saved before ids 15-19 (or 34-35, or 40-41) existed has no stored
@@ -772,6 +774,40 @@ itself. Also in the importer dialog ("Parallax
 grid", "Lens alignment") and osvtool (`seam --lens-align`, `seam --steady`,
 `seam --regions` for the ground / sky / wing scores).
 
+#### Transfer Function (HDR) (id 50)
+
+How D-Log M scene light becomes display light on the BT.2100 PQ and HLG
+outputs (docs/COLOR.md, "Transfer Function (HDR)"). It sits right under
+Colour Output, above Look, because it is the HDR outputs' counterpart of the
+Rec. 709 look.
+
+| Choice | 18 % grey | Diffuse white | Sensor clip | In short |
+|---|---|---|---|---|
+| ACES 2 - Bright (outdoor), the default | 26 nits | 169 | 600 | ACES 2.0 tonescale fitted to DJI's rendering, grey at BT.2408's level, soft shoulder |
+| ACES 2 - Detailed (indoor) | 13.8 | 98 | 374 | the same fit at a 1000-nit peak: darker, the most highlight detail |
+| BT.2408 - Deep Blacks + Natural | 26 | 203 | 1000 | BT.2408's anchors with DJI's toe, on luminance: scene saturation |
+| BT.2408 - Deep Blacks + Punchy | 26 | 203 | 1000 | the same curve per channel: about 40 % more chroma |
+| BT.2408 - Neutral | 26 | 195 | 1008 | the scene-referred rendering of 0.2.0 and earlier, bit for bit |
+
+Effect controls have no tooltips, so "(outdoor)" / "(indoor)" are in the item
+labels; the importer dialog and the Resolve parameter carry the hint "Bright
+is good for outdoor, Detailed is good for indoor." HLG and Normal clips,
+Rec. 709, linear and the passthrough ignore it. HDR Peak still applies after
+it. It follows the clip onto the direct path: a clip rendered into a PQ or
+HLG working space - whatever its own Colour Output - uses its own style, and
+a change moves the Source Settings generation like any colour setting. The
+Properties panel names the style for the PQ and HLG outputs.
+
+ACES 2 Bright for new clips, for every blob written before the setting
+existed (its zero at `PrefsBlob` offset 55) and for an effect saved before
+id 50 existed (the control's default) - so an existing project's HDR output
+changes to the new default, as the Rec. 709 look did in its time; pick
+BT.2408 - Neutral for the earlier rendering, bit for bit. Also in the
+importer dialog ("Transfer (HDR)", greyed unless Colour output is PQ or HLG),
+the user defaults file (`"hdrTone": "aces-bright" | "aces-detailed" |
+"bt2408-natural" | "bt2408-punchy" | "bt2408-neutral"`) and osvtool
+(`render --tone`, `lut --tone`).
+
 #### HDR peak (id 46)
 
 The display peak the BT.2100 PQ output's highlights roll off into, with the
@@ -797,8 +833,9 @@ space is untouched by it. The Properties panel says "HDR peak: 600 nits
 
 1000 for new clips, for every blob written before the setting existed (its
 zero at `PrefsBlob` offset 54) and for an effect saved before id 46 existed
-(the control's default) - so every existing project renders exactly as
-before. Also in the importer dialog (greyed unless Colour output is PQ), the
+(the control's default) - so every existing project rolls off exactly as
+before. (The figures above are the BT.2408 Neutral style's; ACES 2 Bright,
+the Transfer Function default, never passes 600 nits by itself.) Also in the importer dialog (greyed unless Colour output is PQ), the
 user defaults file (`"hdrPeakNits": 1000 | 600 | 400 | 203`) and osvtool
 (`render --hdr-peak`, `lut --hdr-peak`).
 
@@ -1126,7 +1163,9 @@ One named key per setting - never a dump of the 128 bytes, so it survives
   "savedBy": "OpenOSV 0.1.0",
   "settings": {
     "colourOutput": "rec709",             // pq | hlg | rec709 | dlogm
+    "hdrTone": "aces-bright",             // aces-bright | aces-detailed | bt2408-natural | bt2408-punchy | bt2408-neutral
     "rec709Look": "dji",                  // dji | standard
+    "hdrPeakNits": 1000,                  // 1000 | 600 | 400 | 203
     "outputSize": "2560x1280",            // native | 3840x1920 | 2560x1280 | 1920x960
     "stabilisation": "smooth-horizon-lock", // off | horizon-lock | full | smooth | smooth-horizon-lock
     "seamSearch": true,

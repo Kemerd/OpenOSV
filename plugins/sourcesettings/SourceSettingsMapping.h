@@ -98,6 +98,8 @@ struct ControlValues {
     // ---- [WP-STEADY] ------------------------------------------------------------
     int parallaxGrid = OSV_SS_PARALLAX_GRID_DEFAULT;  ///< 1-based popup value (kParallaxGridByPopup).
     int lensAlign = OSV_SS_LENS_ALIGN_DEFAULT;        ///< 1-based popup value (kLensAlignByPopup).
+    // ---- [WP-HDRTONE] -----------------------------------------------------------
+    int hdrTone = OSV_SS_HDR_TONE_DEFAULT;  ///< 1-based popup value (PrefsHdrTone + 1).
 };
 
 /// Control values -> PrefsBlob.

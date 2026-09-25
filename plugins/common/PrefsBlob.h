@@ -213,6 +213,27 @@ static_assert(sizeof(kPrefsHdrPeakNits) / sizeof(kPrefsHdrPeakNits[0]) ==
                   static_cast<std::size_t>(PrefsHdrPeak::Count),
               "kPrefsHdrPeakNits does not list every PrefsHdrPeak value");
 
+/// [WP-HDRTONE] "Transfer Function (HDR)": how D-Log M scene light becomes
+/// display light on the BT.2100 PQ and HLG outputs (osv::color::HdrTone,
+/// same values; see osv::color::setHdrTone and docs/COLOR.md).  HLG / Normal
+/// input, Rec.709, linear and the passthrough ignore this byte.  Persisted,
+/// so append-only.
+enum class PrefsHdrTone : std::uint8_t {
+    /// ACES 2 - Bright (outdoor): grey at BT.2408's 26 nits, the sensor clip
+    /// at 600.  The default, and - like the Rec.709 look's zero - what the
+    /// zero byte of every older project reads as.
+    Aces2Bright = 0,
+    /// ACES 2 - Detailed (indoor): grey 13.8 nits, the clip at 374.
+    Aces2Detailed = 1,
+    /// BT.2408 - Deep Blacks + Natural: BT.2408's anchors on luminance.
+    Bt2408Natural = 2,
+    /// BT.2408 - Deep Blacks + Punchy: the same curve per channel.
+    Bt2408Punchy = 3,
+    /// BT.2408 - Neutral: the scene-referred rendering of 0.2.0 and earlier.
+    Bt2408Neutral = 4,
+    Count
+};
+
 /// Renderer selection; the numeric values are the ones stored in the blob
 /// and match HostContext's RenderDevicePreference.
 enum class PrefsRenderDevice : std::uint8_t {
@@ -406,10 +427,11 @@ struct PrefsBlob {
     /// PrefsHdrPeak: the display peak the PQ output's highlights roll off
     /// into.  0 = 1000 nits (no roll-off), the default and every older blob.
     std::uint8_t hdrPeak = 0;
-    /// Offset 55: the rest of this package's range.  Zero, and zeroed by
-    /// sanitise().
-    std::uint8_t padAfterHdrPeak = 0;
     // ---- [/WP-HDRPEAK] --------------------------------------------------------
+    /// [WP-HDRTONE] PrefsHdrTone: the PQ / HLG outputs' transfer function
+    /// style, in the spare byte after the HDR peak (offset 55).  0 = ACES 2
+    /// Bright, the default and what every older blob's zero reads as.
+    std::uint8_t hdrTone = 0;
     std::uint8_t reserved[72] = {};    ///< Zero; future fields.
 
     /// seamInset: the default inset in tenths of a degree (2.6 deg - the
@@ -505,6 +527,10 @@ struct PrefsBlob {
         // "Steady seam and lens alignment").
         p.parallaxGrid = static_cast<std::uint8_t>(PrefsParallaxGrid::Auto);
         p.lensAlign = static_cast<std::uint8_t>(PrefsLensAlign::Auto);
+        // [WP-HDRTONE] ACES 2 Bright for the PQ / HLG outputs: grey where
+        // BT.2408 puts it, a soft shoulder into a 600-nit sensor clip.  It is
+        // the zero byte, so written out only to say so.
+        p.hdrTone = static_cast<std::uint8_t>(PrefsHdrTone::Aces2Bright);
         return p;
     }
 
@@ -672,13 +698,13 @@ struct PrefsBlob {
             clean = false;
         }
         // [WP-HDRPEAK] zero is the default (1000 nits, no roll-off), so a
-        // corrupt byte lands there; its spare byte stays zero.
+        // corrupt byte lands there.
         clampEnum(hdrPeak, static_cast<std::uint8_t>(PrefsHdrPeak::Count),
                   static_cast<std::uint8_t>(PrefsHdrPeak::Nits1000));
-        if (padAfterHdrPeak != 0) {
-            padAfterHdrPeak = 0;
-            clean = false;
-        }
+        // [WP-HDRTONE] zero is the default style (ACES 2 Bright), so a
+        // corrupt byte lands there too.
+        clampEnum(hdrTone, static_cast<std::uint8_t>(PrefsHdrTone::Count),
+                  static_cast<std::uint8_t>(PrefsHdrTone::Aces2Bright));
         // [WP-STEADY] Corrupt choices land on the DEFAULT (Auto), like
         // parallax and the sky seam fix: a fresh blob's setting.  The padding
         // and the rest of the range stay zero.
@@ -744,6 +770,12 @@ struct PrefsBlob {
     /// [WP-HDRPEAK] The PQ output's target peak in nits (1000 = no roll-off).
     [[nodiscard]] float hdrPeakNits() const noexcept {
         return kPrefsHdrPeakNits[static_cast<std::size_t>(hdrPeakChoice())];
+    }
+    /// [WP-HDRTONE] The HDR transfer function style; an out-of-range byte (an
+    /// unsanitised blob) reads as the default, ACES 2 Bright.
+    [[nodiscard]] PrefsHdrTone hdrToneChoice() const noexcept {
+        return hdrTone < static_cast<std::uint8_t>(PrefsHdrTone::Count) ? static_cast<PrefsHdrTone>(hdrTone)
+                                                                        : PrefsHdrTone::Aces2Bright;
     }
     /// True when the flow-based parallax correction should run.
     [[nodiscard]] bool parallaxEnabled() const noexcept { return parallaxMode() == PrefsParallax::On; }
@@ -1038,9 +1070,13 @@ static_assert(offsetof(PrefsBlob, steadyReserved) == 52, "PrefsBlob layout drift
 // older blob's zero byte reads as PrefsHdrPeak::Nits1000 - no roll-off, the
 // PQ output it always had.
 static_assert(offsetof(PrefsBlob, hdrPeak) == 54, "PrefsBlob layout drifted");
-static_assert(offsetof(PrefsBlob, padAfterHdrPeak) == 55, "PrefsBlob layout drifted");
+// [WP-HDRTONE] hdrTone takes offset 55, the HDR peak range's spare byte.  An
+// older blob's zero byte reads as PrefsHdrTone::Aces2Bright, the default -
+// the same rule the Rec.709 look's byte introduced.
+static_assert(offsetof(PrefsBlob, hdrTone) == 55, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, reserved) == 56, "PrefsBlob layout drifted");
 static_assert(static_cast<int>(PrefsHdrPeak::Nits1000) == 0, "zero must stay the no-roll-off default");
+static_assert(static_cast<int>(PrefsHdrTone::Aces2Bright) == 0, "zero must stay the default HDR tone style");
 // The codes' upper bounds are the ranges the controls offer.
 static_assert(PrefsBlob::kMaxSeamBlendCode == 8 * PrefsBlob::kSeamToolStepsPerDeg + 1, "Seam Blend reaches 8 deg");
 static_assert(PrefsBlob::kMinSeamBlendCode == 4 + 1, "Seam Blend starts at 0.2 deg");

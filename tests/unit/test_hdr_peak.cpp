@@ -73,9 +73,14 @@ namespace {
 constexpr float kRolledTargets[] = {600.0f, 400.0f, 203.0f};
 
 /// A PQ block for the default Osmo 360 fit with a given target peak.
-[[nodiscard]] OsvColorParams pqBlock(float hdrPeakNits, float stops = 0.0f) {
+///
+/// [WP-HDRTONE] The BT.2408 scene-referred rendering (the Neutral tone
+/// style) unless another style is named: these tests pin the roll-off
+/// against the PQ formula that existed before either setting, and
+/// test_hdr_tone.cpp covers the roll-off after the tone styles.
+[[nodiscard]] OsvColorParams pqBlock(float hdrPeakNits, float stops = 0.0f, HdrTone tone = HdrTone::Bt2408Neutral) {
     return makeColorParams(DlogMFit::Osmo360, OutputTransfer::PQ, stops, InputEncoding::DLogM, true, 10, nullptr,
-                           kBt2408SceneScale, kDefaultLook, hdrPeakNits);
+                           kBt2408SceneScale, kDefaultLook, hdrPeakNits, tone);
 }
 
 /// A D-Log M code triple through the whole pipeline.
@@ -128,17 +133,25 @@ TEST_CASE("1000 nits is bit for bit the PQ output before the setting existed", "
     // The block: the default argument, an explicit 1000 and anything above
     // the source peak all leave the whole group zeroed, i.e. the block is
     // byte-identical to one built before the fields existed.
+    // [WP-HDRTONE] The default block also carries the default tone style;
+    // with the Neutral style set on it, it is the pre-setting block.
     const OsvColorParams def = makeColorParams(DlogMFit::Osmo360, OutputTransfer::PQ, 0.0f);
+    OsvColorParams defNeutral = def;
+    setHdrTone(defNeutral, HdrTone::Bt2408Neutral);
     const OsvColorParams explicit1000 = pqBlock(1000.0f);
     const OsvColorParams above = pqBlock(4000.0f);
     CHECK(def.hdrPeakNits == 0.0f);
     CHECK(def.hdrPeakSrcCode == 0.0f);
     CHECK(def.hdrPeakMaxLum == 0.0f);
     CHECK(def.hdrPeakKnee == 0.0f);
-    CHECK(std::memcmp(&def, &explicit1000, sizeof(OsvColorParams)) == 0);
-    CHECK(std::memcmp(&def, &above, sizeof(OsvColorParams)) == 0);
+    CHECK(std::memcmp(&defNeutral, &explicit1000, sizeof(OsvColorParams)) == 0);
+    CHECK(std::memcmp(&defNeutral, &above, sizeof(OsvColorParams)) == 0);
     CHECK(colorParamsValid(def));
-    CHECK(hdrPeakNitsOf(def) == 1000.0f);
+    CHECK(colorParamsValid(defNeutral));
+    CHECK(hdrPeakNitsOf(defNeutral) == 1000.0f);
+    // The default style never renders above its own 600-nit ceiling, and the
+    // peak query says so.
+    CHECK(hdrPeakNitsOf(def) == 600.0f);
 
     // The pixels: every code of a dense neutral and coloured sweep, with and
     // without exposure (so light above the 1000-nit master is included),
@@ -655,6 +668,51 @@ Result<geom::LensRig> sweepRig(int streamW) {
     REQUIRE(stats.maxAbsCode <= 64);
 }
 
+/// [WP-HDRTONE] The same parity bar for every Transfer Function (HDR) style,
+/// on both HDR outputs: the tone stage (osvHdrToneApply) is shared C that the
+/// GPU backends compile themselves - OpenCL at run time - so each style is
+/// rendered through the whole pipeline on `gpu` and on the CPU reference.
+/// The exposure lift puts a real share of the sweep on each style's shoulder.
+[[maybe_unused]] void checkToneParity(render::IRenderer& gpu, const char* label) {
+    ThreadPool pool;
+    render::CpuRenderer cpu(pool);
+    const int W = 600;
+    auto rig = sweepRig(W);
+    REQUIRE(rig.ok());
+    auto slave = makeSweepFrame(static_cast<std::uint32_t>(W), 0.0f);
+    auto master = makeSweepFrame(static_cast<std::uint32_t>(W), 1.3f);
+    video::FramePair pair;
+    pair.lens = {slave.frame, master.frame};
+    geom::EquirectMap map;
+    map.w = 1024;
+    map.h = 512;
+
+    const HdrTone tones[] = {HdrTone::Aces2Bright, HdrTone::Aces2Detailed, HdrTone::Bt2408Natural,
+                             HdrTone::Bt2408Punchy};
+    const OutputTransfer outputs[] = {OutputTransfer::PQ, OutputTransfer::HLG};
+    for (const HdrTone tone : tones) {
+        for (const OutputTransfer out : outputs) {
+            // The style must really be armed, or this would only re-test Neutral.
+            const OsvColorParams cp = makeColorParams(DlogMFit::Osmo360, out, 1.0f, InputEncoding::DLogM, true, 10,
+                                                      nullptr, kBt2408SceneScale, kDefaultLook,
+                                                      kDefaultHdrPeakNits, tone);
+            REQUIRE(cp.hdrToneMode != OSV_HDR_TONE_OFF);
+            auto job = render::RenderParamsBuilder().rig(rig.value()).equirect(map).color(cp).build(pair);
+            REQUIRE(job.ok());
+            auto ref = cpu.render(job.value());
+            auto test = gpu.render(job.value());
+            REQUIRE(ref.ok());
+            REQUIRE(test.ok());
+            const render::ImageDiffStats stats = render::compareImages16(ref.value(), test.value());
+            INFO(label << " " << hdrToneName(tone) << " " << outputTransferName(out) << ": PSNR " << stats.psnrDb
+                       << " dB, max diff " << stats.maxAbsCode << " codes, within2 " << stats.fractionWithin2);
+            REQUIRE(stats.psnrDb >= 60.0);
+            REQUIRE(stats.fractionWithin2 >= 0.9995);
+            REQUIRE(stats.maxAbsCode <= 64);
+        }
+    }
+}
+
 }  // namespace
 
 #if defined(OSV_HAVE_CUDA)
@@ -666,6 +724,16 @@ TEST_CASE("CUDA renders the HDR peak roll-off like the CPU reference", "[color][
     auto r = render::CudaRenderer::create(0);
     REQUIRE(r.ok());
     checkPeakParity(*r.value(), "cuda");
+}
+
+TEST_CASE("CUDA renders every HDR transfer function style like the CPU reference", "[color][hdrtone][cuda]") {
+    std::string reason;
+    if (!render::CudaRenderer::available(&reason)) {
+        SKIP("CUDA unavailable: " << reason);
+    }
+    auto r = render::CudaRenderer::create(0);
+    REQUIRE(r.ok());
+    checkToneParity(*r.value(), "cuda");
 }
 #endif
 
@@ -680,5 +748,17 @@ TEST_CASE("OpenCL renders the HDR peak roll-off like the CPU reference", "[color
         FAIL("OpenCL renderer creation failed: " << r.error().message);
     }
     checkPeakParity(*r.value(), "opencl");
+}
+
+TEST_CASE("OpenCL renders every HDR transfer function style like the CPU reference", "[color][hdrtone][opencl]") {
+    std::string reason;
+    if (!render::OpenClRenderer::available(&reason)) {
+        SKIP("OpenCL unavailable: " << reason);
+    }
+    auto r = render::OpenClRenderer::create(0);
+    if (!r.ok()) {
+        FAIL("OpenCL renderer creation failed: " << r.error().message);
+    }
+    checkToneParity(*r.value(), "opencl");
 }
 #endif

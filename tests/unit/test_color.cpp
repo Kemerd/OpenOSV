@@ -57,11 +57,17 @@ using osvtest::kOsmo360Rec709Table;
 /// computes for it.  The default Rec.709 output is now the DJI Studio look,
 /// which deliberately is NOT that function (test_look.cpp covers it), so those
 /// tests select the standard rendering explicitly rather than weakening what
-/// they assert.  For every other transfer the look is ignored and this is
-/// exactly makeColorParams(fit, transfer, stops).
+/// they assert.
+///
+/// [WP-HDRTONE] Likewise the HDR outputs: their default is now the ACES 2
+/// Bright tone style (test_hdr_tone.cpp covers it), and the BT.2408
+/// scene-referred rendering these tests and the golden describe is the
+/// Neutral style, so that is selected explicitly too.  For Linear and the
+/// passthrough both choices are ignored and this is exactly
+/// makeColorParams(fit, transfer, stops).
 OsvColorParams standardParams(DlogMFit fit, OutputTransfer transfer, float stops = 0.0f) {
     return makeColorParams(fit, transfer, stops, InputEncoding::DLogM, true, 10, nullptr, kBt2408SceneScale,
-                           Look::Standard);
+                           Look::Standard, kDefaultHdrPeakNits, HdrTone::Bt2408Neutral);
 }
 
 /// Run a grey code through the full pipeline of a parameter block.
@@ -261,8 +267,9 @@ TEST_CASE("DJI refit D-Log M curve matches the DJI HLG placement", "[color]") {
     REQUIRE_THAT(hlgOf(0.714f), WithinAbs(0.750, 0.015));
     REQUIRE_THAT(hlgOf(1.000f), WithinAbs(0.990, 0.015));
 
-    // Full pipeline (makeColorParams) for grey inputs vs the 64-point table.
-    const OsvColorParams p = makeColorParams(DlogMFit::DjiRefit, OutputTransfer::HLG, 0.0f);
+    // Full pipeline (makeColorParams) for grey inputs vs the 64-point table,
+    // through the scene-referred HLG signal the table describes.
+    const OsvColorParams p = standardParams(DlogMFit::DjiRefit, OutputTransfer::HLG);
     REQUIRE(colorParamsValid(p));
     double worst = 0.0;
     for (int i = 0; i < 64; ++i) {
@@ -294,7 +301,7 @@ TEST_CASE("Osmo 360 D-Log M curve matches DJI's Osmo 360 reference", "[color]") 
     // output: on the neutral axis they must be the SAME function, which is
     // the algebraic claim the whole fit rests on, so this asserts it rather
     // than assuming it.
-    const OsvColorParams hlgP = makeColorParams(DlogMFit::Osmo360, OutputTransfer::HLG, 0.0f);
+    const OsvColorParams hlgP = standardParams(DlogMFit::Osmo360, OutputTransfer::HLG);
     const OsvColorParams sdrP = standardParams(DlogMFit::Osmo360, OutputTransfer::Rec709);
     REQUIRE(colorParamsValid(hlgP));
     REQUIRE(colorParamsValid(sdrP));
@@ -341,7 +348,7 @@ TEST_CASE("Osmo 360 D-Log M curve matches DJI's Osmo 360 reference", "[color]") 
     // The point of the refit: it must beat the curve it replaced on this
     // reference.  A future "improvement" that loses to kDlogMDjiRefit here is
     // not an improvement, so this is a comparison, not a fixed threshold.
-    const OsvColorParams oldP = makeColorParams(DlogMFit::DjiRefit, OutputTransfer::HLG, 0.0f);
+    const OsvColorParams oldP = standardParams(DlogMFit::DjiRefit, OutputTransfer::HLG);
     double oldWorst = 0.0;
     double oldSumSq = 0.0;
     for (std::size_t i = 0; i < kOsmo360Rec709Table.size(); ++i) {
@@ -663,9 +670,10 @@ TEST_CASE("Swapping the primaries matrix cannot move the neutral axis", "[color]
     }
 
     // The BT.2408 anchors themselves, through the shipped default pairing
-    // (Osmo 360 curve + Osmo 360 matrix): 18 % grey at code 0.400 lands on
-    // HLG 0.380 and the matrix swap did not move it.
-    const OsvColorParams hlg = makeColorParams(DlogMFit::Osmo360, OutputTransfer::HLG, 0.0f);
+    // (Osmo 360 curve + Osmo 360 matrix) and the scene-referred HLG signal:
+    // 18 % grey at code 0.400 lands on HLG 0.380 and the matrix swap did not
+    // move it.
+    const OsvColorParams hlg = standardParams(DlogMFit::Osmo360, OutputTransfer::HLG);
     REQUIRE_THAT(static_cast<double>(greyThrough(hlg, 0.40f)), WithinAbs(0.380, 1e-4));
     // Rec.709 output is the same function of the code on the neutral axis
     // (it is the HLG signal in Rec.709 primaries), which is the identity the

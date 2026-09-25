@@ -638,6 +638,12 @@ For the ITU-R documents, "used" is the revision the code was written from
     EETF", read in BT.2408-7, 2023), applied per R'G'B' component, behind the
     PQ output's HDR Peak Brightness setting (`osvHdrPeakRolloff`,
     `docs/COLOR.md` "HDR peak brightness").
+  - Implemented: the display-light anchors (18 % grey at 26 nits, HDR
+    reference white at 203 nits) that the Transfer Function (HDR) styles
+    are pinned to: grey for ACES 2 Bright and the two Deep Blacks styles,
+    grey and diffuse white for the Deep Blacks styles, and the BT.2408
+    Neutral style is the scene-referred rendering above (`setHdrTone`,
+    `docs/COLOR.md` "Transfer Function (HDR)").
 - ITU-R. **Report BT.2390: High dynamic range television for production and
   international programme exchange.** Used BT.2390-8 (02/2020); current
   BT.2390-12 (03/2025). <https://www.itu.int/pub/R-REP-BT.2390>
@@ -668,6 +674,27 @@ For the ITU-R documents, "used" is the revision the code was written from
   - Implemented: the compression curve in the look's soft gamut compression
     (`osvLookApply` in `ColorMath.h`), from its mathematical description; no
     ACES code is included.
+- Contributors to the ACES Project (Academy Software Foundation).
+  **aces-core: `lib/Lib.Academy.Tonescale.ctl`**, the ACES 2.0 tonescale
+  (`tonescale_fwd`, `init_TSParams`). ACES 2.0, 2024-2025. Apache-2.0.
+  <https://github.com/aces-aswf/aces-core/blob/main/lib/Lib.Academy.Tonescale.ctl>
+  - Implemented: the tonescale's Michaelis-Menten form with the flare term,
+    f = m_2 (x / (x + s_2))^g, h = max(0, f^2 / (f + t_1)), display light
+    100 h nits, behind the Transfer Function (HDR) styles (`osvHdrToneCurve`
+    and `osvHdrToneApply` in `ColorMath.h`, constants in
+    `src/osv/color/ColorParams.cpp`; attribution in `NOTICE`). The ACES 2
+    styles' g, c_d, t_1 and r_hit were least-squares fitted to the neutral
+    axis of DJI's published D-Log M to Rec.709 LUT through `init_TSParams`
+    and its peak rule r_hit(n) = r_hit(100) (1 + 3 log10(n / 100)); the
+    BT.2408 styles keep that t_1. Only the tonescale is used: none of the
+    ACES 2.0 Output Transform's other stages (the JMh chroma compression and
+    gamut mapping) are implemented (`docs/COLOR.md` "Transfer Function
+    (HDR)").
+- Daniele Siragusano. **Output Transform Tone Scale** (proposal in the ACES
+  Output Transforms virtual working group). ACESCentral community, 2021.
+  <https://community.acescentral.com/t/output-transform-tone-scale/3498/14>
+  - Reference: the Michaelis-Menten tone scale with a surround gamma from
+    which the ACES 2.0 tonescale above was developed.
 - CIE. **CIE 015:2018, Colorimetry, 4th Edition.** 2018.
   <https://doi.org/10.25039/TR.015.2018>
   - Implemented: CIE 1976 L\*a\*b\* in the look's fit and tests.

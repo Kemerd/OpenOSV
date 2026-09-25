@@ -54,6 +54,10 @@ void describe(OfxParamSetHandle set) noexcept {
                   "for HDR, or D-Log M to grade from the camera's log with your own LUT.",
                   kColourGroup, kStatic},
                  OSV_SS_COLOR_ITEMS, kColorOutputDefault0);
+    // [WP-HDRTONE] How D-Log M becomes PQ / HLG display light, right under
+    // the output it shapes, with the hint Premiere's panel cannot show.
+    defineChoice(set, kHdrTone, {OSV_SS_HDR_TONE_NAME, OSV_SS_HDR_TONE_HINT, kColourGroup, kStatic},
+                 OSV_SS_HDR_TONE_ITEMS, OSV_SS_HDR_TONE_DEFAULT - 1);
     defineChoice(set, kLook,
                  {"Look (Rec. 709 only)",
                   "DJI renders D-Log M the way DJI Studio does. OpenOSV standard is the neutral HLG-in-709 rendering.",
@@ -185,6 +189,7 @@ ControlValues read(OfxParamSetHandle set, OfxTime time) noexcept {
     };
 
     c.colorOutput = popup(kColorOutput, kColorOutputDefault0 + 1);
+    c.hdrTone = popup(kHdrTone, c.hdrTone);  // [WP-HDRTONE]
     c.rec709Look = popup(kLook, c.rec709Look);
     c.hdrPeak = popup(kHdrPeak, c.hdrPeak);
     c.stabilization = popup(kStabilization, c.stabilization);

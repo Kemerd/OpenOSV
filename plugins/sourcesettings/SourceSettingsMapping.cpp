@@ -121,6 +121,10 @@ PrefsBlob prefsFromControls(const ControlValues& controls) noexcept {
     // [WP-HDRPEAK] The PQ output's peak (ignored by the other outputs); an
     // out-of-range popup value keeps the default from defaults(), 1000 nits.
     blob.hdrPeak = fromPopup(controls.hdrPeak, OSV_SS_HDR_PEAK_COUNT, blob.hdrPeak);
+    // [WP-HDRTONE] The PQ / HLG outputs' transfer function (ignored by the
+    // other outputs); an out-of-range popup value keeps the default from
+    // defaults(), ACES 2 Bright.  The popup is in enum order.
+    blob.hdrTone = fromPopup(controls.hdrTone, OSV_SS_HDR_TONE_COUNT, blob.hdrTone);
 
     // Clamp everything into range and zero the reserved bytes.  After this
     // the blob is byte-for-byte what the importer expects, which is the
@@ -179,6 +183,7 @@ ControlValues controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.lensShading = toPopup(clean.lensShading, OSV_SS_LENS_SHADING_COUNT);
     c.shadingStrengthPercent = clean.shadingStrengthPercent();
     c.hdrPeak = toPopup(clean.hdrPeak, OSV_SS_HDR_PEAK_COUNT);  // [WP-HDRPEAK]
+    c.hdrTone = toPopup(clean.hdrTone, OSV_SS_HDR_TONE_COUNT);  // [WP-HDRTONE]
     // [WP-STEADY] The popup items whose choices are the blob's; item 1 (Auto)
     // for a choice missing from a table, which sanitise() rules out.
     c.parallaxGrid = 1;

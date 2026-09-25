@@ -69,6 +69,15 @@ Colour science provenance
   Recommendations BT.2100-2, BT.2020-2 and BT.709-6 and the ITU-R Reports
   BT.2408-5 and BT.2390-8.  The HDR peak roll-off is the reference EETF of
   the public ITU-R Report BT.2408-7, Annex 5.
+* The HDR outputs' "Transfer Function (HDR)" styles use a tone scale based
+  on the ACES 2.0 tonescale (aces-core lib/Lib.Academy.Tonescale.ctl, see
+  "Third-party components" below).  The ACES 2 styles' contrast and toe were
+  least-squares fitted to the neutral axis of DJI's publicly distributed
+  D-Log M to Rec.709 LUT; the BT.2408 styles pass through the BT.2408
+  anchors with that toe.  What is shipped is OpenOSV's own fitted constants
+  (src/osv/color/ColorParams.cpp); no DJI LUT data is included.  It is the
+  ACES 2.0 tonescale only: none of the ACES Output Transform's other stages
+  are implemented.
 * The "DJI-matched" D-Log M decoding curve (kDlogMDjiRefit, `--fit dji`) is an
   analytic 7-parameter fit produced by scripts/fit_dlogm.py from 64
   neutral-axis measurements of DJI's publicly distributed D-Log M to HLG
@@ -133,6 +142,13 @@ Third-party components
 * spdlog                            MIT                https://github.com/gabime/spdlog
 * fmt                               MIT                https://github.com/fmtlib/fmt
 * tinyexr                           BSD-3-Clause       https://github.com/syoyo/tinyexr
+* aces-core (ACES 2.0 tonescale)    Apache-2.0         https://github.com/aces-aswf/aces-core
+  Copyright Contributors to the ACES Project.  The HDR tone scale
+  (Michaelis-Menten with flare) is based on the ACES 2.0 tonescale in
+  aces-core lib/Lib.Academy.Tonescale.ctl, Apache License 2.0; modified:
+  parameters fitted to DJI's published D-Log M LUT, applied per channel / to
+  luminance (osvHdrToneCurve / osvHdrToneApply in
+  include/osv/color/ColorMath.h).
 * OpenFX API headers                BSD-3-Clause       https://github.com/AcademySoftwareFoundation/openfx
   Copyright (c) OpenFX and contributors to the OpenFX project.  Vendored in
   plugins/ofx/openfx (release 1.5.1, unmodified) for the DaVinci Resolve

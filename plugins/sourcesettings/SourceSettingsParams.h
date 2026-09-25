@@ -175,7 +175,7 @@
 #define OSV_SS_ID_DEFAULTS_TOPIC_END 33
 /* [WP-VIGNETTE] The lens shading correction: two NEW ids after the last one
  * in use (34-39 are this package's range), placed inside the Stitching group
- * right after Far Offset (indices 19-20 since [WP-HDRPEAK]); everything after
+ * right after Far Offset (indices 20-21 since [WP-HDRTONE]); everything after
  * them moved up by two - indices are not persisted, ids are.  The Defaults
  * group stays last. */
 #define OSV_SS_ID_LENS_SHADING 34
@@ -183,21 +183,28 @@
 
 /* [WP-STEADY] "Parallax Grid" and "Lens Alignment": two NEW ids from this
  * package's range (40-45), placed inside the Stitching group right after
- * Shading Strength (indices 21-22 since [WP-HDRPEAK]); everything after them
+ * Shading Strength (indices 22-23 since [WP-HDRTONE]); everything after them
  * moved up by two - indices are not persisted, ids are.  The Defaults group
  * stays last. */
 #define OSV_SS_ID_PARALLAX_GRID 40
 #define OSV_SS_ID_LENS_ALIGN 41
 
 /* [WP-HDRPEAK] "HDR Peak (PQ only)": a NEW id from this package's range
- * (46-47), placed at the top level right after Look (index 3) because the
- * three colour controls are read together; every index after it moved up by
- * one - indices are not persisted, ids are. */
+ * (46-47), placed at the top level right after Look (index 4 since
+ * [WP-HDRTONE]) because the colour controls are read together; every index
+ * after it moved up by one - indices are not persisted, ids are. */
 #define OSV_SS_ID_HDR_PEAK 46
 
-/* Total parameters excluding the input layer: 25 value controls + 2 buttons
+/* [WP-HDRTONE] "Transfer Function (HDR)": a NEW id from the next free range
+ * (50-51), placed at the top level right after Colour Output (index 2),
+ * above Look, because it is the HDR outputs' counterpart of the Rec. 709
+ * look; every index after it moved up by one - indices are not persisted,
+ * ids are. */
+#define OSV_SS_ID_HDR_TONE 50
+
+/* Total parameters excluding the input layer: 26 value controls + 2 buttons
  * + 6 group markers.  out_data->num_params is this + 1. */
-#define OSV_SOURCE_SETTINGS_PARAM_COUNT 33
+#define OSV_SOURCE_SETTINGS_PARAM_COUNT 34
 
 /* ==========================================================================
  *  Popup item strings
@@ -323,6 +330,28 @@
 #define OSV_SS_HDR_PEAK_ITEMS "1000 nits (default)|600 nits|400 nits|203 nits (SDR-safe)"
 #define OSV_SS_HDR_PEAK_COUNT 4
 #define OSV_SS_HDR_PEAK_DEFAULT 1
+
+/* [WP-HDRTONE] "Transfer Function (HDR)" - PrefsHdrTone: Aces2Bright,
+ * Aces2Detailed, Bt2408Natural, Bt2408Punchy, Bt2408Neutral.
+ *
+ * How D-Log M scene light becomes display light on the BT.2100 PQ and HLG
+ * outputs (docs/COLOR.md, "Transfer Function (HDR)").  The two ACES 2 styles
+ * are the ACES 2.0 tonescale fitted to DJI's own D-Log M rendering: Bright
+ * puts grey at BT.2408's 26 nits with a soft 600-nit shoulder, Detailed keeps
+ * DJI's contrast at a 1000-nit peak.  The two Deep Blacks styles hit
+ * BT.2408's anchors with DJI's toe, Natural on luminance and Punchy per
+ * channel.  Neutral is the scene-referred rendering of 0.2.0 and earlier.
+ * Premiere effect controls have no tooltips, so the labels carry "(outdoor)"
+ * / "(indoor)" themselves; the same strings are osv::color::hdrToneLabel()'s.
+ * HLG / Normal clips, Rec. 709 and the passthrough ignore it.  Default 1 =
+ * ACES 2 Bright (PrefsHdrTone::Aces2Bright is 0). */
+#define OSV_SS_HDR_TONE_NAME "Transfer Function (HDR)"
+#define OSV_SS_HDR_TONE_ITEMS "ACES 2 - Bright (outdoor)|ACES 2 - Detailed (indoor)|BT.2408 - Deep Blacks + Natural|BT.2408 - Deep Blacks + Punchy|BT.2408 - Neutral"
+#define OSV_SS_HDR_TONE_COUNT 5
+#define OSV_SS_HDR_TONE_DEFAULT 1
+/* The hint the hosts that show tooltips put on the control (the importer's
+ * dialog, the OpenFX parameter). */
+#define OSV_SS_HDR_TONE_HINT "Bright is good for outdoor, Detailed is good for indoor."
 
 /* [WP-PHOTO] "Sky Seam Fix" - PrefsPhotoSeam: Off, RimOnly, RimAndGain.
  *
@@ -471,68 +500,70 @@ namespace osv::premiere::sourcesettings {
 /// deriving it from the ids is precisely the mistake that unbalances groups.
 ///
 ///   1  Colour Output
-///   2  Look (Rec. 709 only)     [WP-LOOK]
-///   3  HDR Peak (PQ only)       [WP-HDRPEAK]
-///   4  Output Size
-///   5  Stabilisation
-///   6  Stitching          (GROUP_START)
-///   7    Seam Search
-///   8    Exposure Match
-///   9    Calibration
-///  10    Sun Ghost Removal        [WP-FLARE]
-///  11    Sky Seam Fix             [WP-PHOTO]
-///  12    Sky Seam Strength        [WP-PHOTO]
-///  13    Seam Edge Inset          [WP-PHOTO]
-///  14    Seam Blend               [WP-SEAMTOOLS]
-///  15    Parallax Blend           [WP-SEAMTOOLS]
-///  16    Seam Smoothing           [WP-SEAMTOOLS]
-///  17    Near Offset              [WP-SEAMTOOLS]
-///  18    Far Offset               [WP-SEAMTOOLS]
-///  19    Lens Shading             [WP-VIGNETTE]
-///  20    Shading Strength         [WP-VIGNETTE]
-///  21    Parallax Grid            [WP-STEADY]
-///  22    Lens Alignment           [WP-STEADY]
-///  23  (GROUP_END, Stitching)
-///  24  Advanced           (GROUP_START, starts collapsed)
-///  25    D-Log M Curve
-///  26    Exposure
-///  27    Render Device
-///  28    Program Monitor Colour   [WP-SETTINGS]
-///  29  (GROUP_END, Advanced)
-///  30  Defaults           (GROUP_START, starts collapsed)   [WP-DEFAULTS]
-///  31    Save       [Save as Default for New Clips]
-///  32    Restore    [Restore Built-in Defaults]
-///  33  (GROUP_END, Defaults)
+///   2  Transfer Function (HDR)  [WP-HDRTONE]
+///   3  Look (Rec. 709 only)     [WP-LOOK]
+///   4  HDR Peak (PQ only)       [WP-HDRPEAK]
+///   5  Output Size
+///   6  Stabilisation
+///   7  Stitching          (GROUP_START)
+///   8    Seam Search
+///   9    Exposure Match
+///  10    Calibration
+///  11    Sun Ghost Removal        [WP-FLARE]
+///  12    Sky Seam Fix             [WP-PHOTO]
+///  13    Sky Seam Strength        [WP-PHOTO]
+///  14    Seam Edge Inset          [WP-PHOTO]
+///  15    Seam Blend               [WP-SEAMTOOLS]
+///  16    Parallax Blend           [WP-SEAMTOOLS]
+///  17    Seam Smoothing           [WP-SEAMTOOLS]
+///  18    Near Offset              [WP-SEAMTOOLS]
+///  19    Far Offset               [WP-SEAMTOOLS]
+///  20    Lens Shading             [WP-VIGNETTE]
+///  21    Shading Strength         [WP-VIGNETTE]
+///  22    Parallax Grid            [WP-STEADY]
+///  23    Lens Alignment           [WP-STEADY]
+///  24  (GROUP_END, Stitching)
+///  25  Advanced           (GROUP_START, starts collapsed)
+///  26    D-Log M Curve
+///  27    Exposure
+///  28    Render Device
+///  29    Program Monitor Colour   [WP-SETTINGS]
+///  30  (GROUP_END, Advanced)
+///  31  Defaults           (GROUP_START, starts collapsed)   [WP-DEFAULTS]
+///  32    Save       [Save as Default for New Clips]
+///  33    Restore    [Restore Built-in Defaults]
+///  34  (GROUP_END, Defaults)
 enum ParamIndex : int {
     kIndexColorOutput = 1,
-    kIndexRec709Look = 2,
-    kIndexHdrPeak = 3,          // [WP-HDRPEAK]
-    kIndexOutputSize = 4,
-    kIndexStabilization = 5,
-    kIndexStitchTopic = 6,
-    kIndexSeamSearch = 7,
-    kIndexGainMatch = 8,
-    kIndexCalibration = 9,
-    kIndexFlareRemoval = 10,    // [WP-FLARE]
-    kIndexPhotoSeam = 11,       // [WP-PHOTO]
-    kIndexPhotoStrength = 12,   // [WP-PHOTO]
-    kIndexSeamInset = 13,       // [WP-PHOTO]
-    kIndexSeamBlend = 14,       // [WP-SEAMTOOLS]
-    kIndexParallaxBlend = 15,   // [WP-SEAMTOOLS]
-    kIndexSeamSmoothing = 16,   // [WP-SEAMTOOLS]
-    kIndexNearOffset = 17,      // [WP-SEAMTOOLS]
-    kIndexFarOffset = 18,       // [WP-SEAMTOOLS]
-    kIndexLensShading = 19,     // [WP-VIGNETTE]
-    kIndexShadingStrength = 20, // [WP-VIGNETTE]
-    kIndexParallaxGrid = 21,    // [WP-STEADY]
-    kIndexLensAlign = 22,       // [WP-STEADY]
-    kIndexStitchTopicEnd = 23,
-    kIndexAdvancedTopic = 24,
-    kIndexDlogmFit = 25,
-    kIndexExposure = 26,
-    kIndexRenderDevice = 27,
-    kIndexDirectColour = 28,
-    kIndexAdvancedTopicEnd = 29,
+    kIndexHdrTone = 2,          // [WP-HDRTONE]
+    kIndexRec709Look = 3,
+    kIndexHdrPeak = 4,          // [WP-HDRPEAK]
+    kIndexOutputSize = 5,
+    kIndexStabilization = 6,
+    kIndexStitchTopic = 7,
+    kIndexSeamSearch = 8,
+    kIndexGainMatch = 9,
+    kIndexCalibration = 10,
+    kIndexFlareRemoval = 11,    // [WP-FLARE]
+    kIndexPhotoSeam = 12,       // [WP-PHOTO]
+    kIndexPhotoStrength = 13,   // [WP-PHOTO]
+    kIndexSeamInset = 14,       // [WP-PHOTO]
+    kIndexSeamBlend = 15,       // [WP-SEAMTOOLS]
+    kIndexParallaxBlend = 16,   // [WP-SEAMTOOLS]
+    kIndexSeamSmoothing = 17,   // [WP-SEAMTOOLS]
+    kIndexNearOffset = 18,      // [WP-SEAMTOOLS]
+    kIndexFarOffset = 19,       // [WP-SEAMTOOLS]
+    kIndexLensShading = 20,     // [WP-VIGNETTE]
+    kIndexShadingStrength = 21, // [WP-VIGNETTE]
+    kIndexParallaxGrid = 22,    // [WP-STEADY]
+    kIndexLensAlign = 23,       // [WP-STEADY]
+    kIndexStitchTopicEnd = 24,
+    kIndexAdvancedTopic = 25,
+    kIndexDlogmFit = 26,
+    kIndexExposure = 27,
+    kIndexRenderDevice = 28,
+    kIndexDirectColour = 29,
+    kIndexAdvancedTopicEnd = 30,
     // [WP-DEFAULTS] Always the last group, so its indices are written
     // relative to the Advanced terminator: a control added to an earlier
     // group moves them with it and nothing here has to be renumbered.
@@ -546,7 +577,9 @@ enum ParamIndex : int {
 /// paramsSetup() adds them in this order and a test walks this table against
 /// the list the built module actually produced.
 inline constexpr int kParamIdByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
-    OSV_SS_ID_COLOR_OUTPUT,     OSV_SS_ID_REC709_LOOK,
+    OSV_SS_ID_COLOR_OUTPUT,
+    OSV_SS_ID_HDR_TONE,  // [WP-HDRTONE]
+    OSV_SS_ID_REC709_LOOK,
     OSV_SS_ID_HDR_PEAK,  // [WP-HDRPEAK]
     OSV_SS_ID_OUTPUT_SIZE,   OSV_SS_ID_STABILIZATION,
     OSV_SS_ID_STITCH_TOPIC,     OSV_SS_ID_SEAM_SEARCH,   OSV_SS_ID_GAIN_MATCH,
@@ -571,8 +604,9 @@ inline constexpr int kParamCount = OSV_SOURCE_SETTINGS_PARAM_COUNT;
 /// This is the count that has to round trip through a PrefsBlob
 /// ([WP-SEAMTOOLS] five more since the seam tools, [WP-VIGNETTE] two more
 /// since the lens shading correction, [WP-HDRPEAK] one more for the HDR
-/// peak, [WP-STEADY] two more since the steady seam and lens alignment).
-inline constexpr int kValueParamCount = 25;
+/// peak, [WP-STEADY] two more since the steady seam and lens alignment,
+/// [WP-HDRTONE] one more for the HDR transfer function).
+inline constexpr int kValueParamCount = 26;
 
 /// The parameter names, in index order, so a test can compare the built
 /// module's list without repeating the strings.
@@ -583,7 +617,8 @@ inline constexpr int kValueParamCount = 25;
 /// rather than a labelled control.  Writing "Stitching" here would have
 /// described a field the SDK never fills.
 inline constexpr const char* kParamNameByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
-    "Colour Output", "Look (Rec. 709 only)", "HDR Peak (PQ only)" /* [WP-HDRPEAK] */, "Output Size",
+    "Colour Output", OSV_SS_HDR_TONE_NAME /* [WP-HDRTONE] */, "Look (Rec. 709 only)",
+    "HDR Peak (PQ only)" /* [WP-HDRPEAK] */, "Output Size",
     "Stabilisation", "Stitching", "Seam Search",
     "Exposure Match", "Calibration",  "Sun Ghost Removal",  "Sky Seam Fix", "Sky Seam Strength",
     "Seam Edge Inset", "Seam Blend",  "Parallax Blend", "Seam Smoothing", "Near Offset", "Far Offset",

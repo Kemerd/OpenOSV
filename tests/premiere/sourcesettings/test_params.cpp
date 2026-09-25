@@ -249,6 +249,7 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
     SECTION("the types are the documented ones") {
         const std::pair<int, PF_ParamType> expected[] = {
             {kIndexColorOutput, PF_Param_POPUP},     {kIndexRec709Look, PF_Param_POPUP},
+            {kIndexHdrTone, PF_Param_POPUP},  // [WP-HDRTONE]
             {kIndexHdrPeak, PF_Param_POPUP},  // [WP-HDRPEAK]
             {kIndexOutputSize, PF_Param_POPUP},
             {kIndexStabilization, PF_Param_POPUP},   {kIndexStitchTopic, PF_Param_GROUP_START},
@@ -290,6 +291,7 @@ TEST_CASE("every value-carrying control refuses to vary over time", "[sourcesett
         kIndexFlareRemoval,
         kIndexRec709Look,
         kIndexHdrPeak,  // [WP-HDRPEAK]
+        kIndexHdrTone,  // [WP-HDRTONE]
         kIndexPhotoSeam, kIndexPhotoStrength, kIndexSeamInset,  // [WP-PHOTO]
         kIndexSeamBlend, kIndexParallaxBlend, kIndexSeamSmoothing, kIndexNearOffset, kIndexFarOffset,  // [WP-SEAMTOOLS]
         kIndexLensShading, kIndexShadingStrength,  // [WP-VIGNETTE]
@@ -349,8 +351,8 @@ TEST_CASE("the two groups are balanced and every control is inside the intended 
 
     // The four top-level controls really are top level, and the seven grouped
     // ones really are one level in.
-    for (const int index : {kIndexColorOutput, kIndexRec709Look, kIndexHdrPeak, kIndexOutputSize,
-                            kIndexStabilization}) {
+    for (const int index : {kIndexColorOutput, kIndexHdrTone /* [WP-HDRTONE] */, kIndexRec709Look, kIndexHdrPeak,
+                            kIndexOutputSize, kIndexStabilization}) {
         INFO("top-level index " << index);
         CHECK(depthAt[static_cast<std::size_t>(index)] == 0);
     }
@@ -376,6 +378,7 @@ TEST_CASE("the popup item lists are the documented ones", "[sourcesettings][para
     const std::pair<int, const char*> expected[] = {
         {kIndexColorOutput, OSV_SS_COLOR_ITEMS},   {kIndexRec709Look, OSV_SS_LOOK_ITEMS},
         {kIndexHdrPeak, OSV_SS_HDR_PEAK_ITEMS},  // [WP-HDRPEAK]
+        {kIndexHdrTone, OSV_SS_HDR_TONE_ITEMS},  // [WP-HDRTONE]
         {kIndexOutputSize, OSV_SS_SIZE_ITEMS},
         {kIndexStabilization, OSV_SS_STAB_ITEMS},  {kIndexCalibration, OSV_SS_CALIB_ITEMS},
         {kIndexDlogmFit, OSV_SS_FIT_ITEMS},        {kIndexRenderDevice, OSV_SS_DEVICE_ITEMS},
@@ -393,6 +396,13 @@ TEST_CASE("the popup item lists are the documented ones", "[sourcesettings][para
     // existed stores popup values 1..4, which must still name the same four
     // modes, with Smooth + Horizon Lock appended after them.
     CHECK(popupItems(params[kIndexStabilization - 1]) == "Off|Horizon Lock|Full|Smooth|Smooth + Horizon Lock");
+    // [WP-HDRTONE] The transfer function, spelled out in PrefsHdrTone order
+    // (a saved project stores the popup value): the two ACES 2 styles say
+    // where they work best, because the panel has no tooltips.
+    CHECK(popupItems(params[kIndexHdrTone - 1]) ==
+          "ACES 2 - Bright (outdoor)|ACES 2 - Detailed (indoor)|BT.2408 - Deep Blacks + Natural|"
+          "BT.2408 - Deep Blacks + Punchy|BT.2408 - Neutral");
+    CHECK(std::string(params[kIndexHdrTone - 1].PF_DEF_NAME) == "Transfer Function (HDR)");
 }
 
 TEST_CASE("the Exposure slider's valid range is the blob's own clamp range",
@@ -441,6 +451,7 @@ TEST_CASE("every control's default is PrefsBlob::defaults()", "[sourcesettings][
     CHECK(params[kIndexDirectColour - 1].u.pd.dephault == static_cast<A_long>(defaults.directColour) + 1);
     CHECK(params[kIndexRec709Look - 1].u.pd.dephault == static_cast<A_long>(defaults.look) + 1);  // [WP-LOOK]
     CHECK(params[kIndexHdrPeak - 1].u.pd.dephault == static_cast<A_long>(defaults.hdrPeak) + 1);  // [WP-HDRPEAK]
+    CHECK(params[kIndexHdrTone - 1].u.pd.dephault == static_cast<A_long>(defaults.hdrTone) + 1);  // [WP-HDRTONE]
 
     CHECK(params[kIndexSeamSearch - 1].u.bd.dephault == static_cast<A_long>(defaults.seamSearch));
     CHECK(params[kIndexGainMatch - 1].u.bd.dephault == static_cast<A_long>(defaults.gainMatch));
@@ -482,6 +493,7 @@ TEST_CASE("the popups list every value of their prefs enum", "[sourcesettings][p
         {kIndexDirectColour, static_cast<int>(PrefsDirectColour::Count)},
         {kIndexRec709Look, static_cast<int>(PrefsLook::Count)},
         {kIndexHdrPeak, static_cast<int>(PrefsHdrPeak::Count)},  // [WP-HDRPEAK]
+        {kIndexHdrTone, static_cast<int>(PrefsHdrTone::Count)},  // [WP-HDRTONE]
         {kIndexPhotoSeam, static_cast<int>(PrefsPhotoSeam::Count)},  // [WP-PHOTO]
         {kIndexLensShading, static_cast<int>(PrefsLensShading::Count)},  // [WP-VIGNETTE]
         {kIndexParallaxGrid, static_cast<int>(PrefsParallaxGrid::Count)},  // [WP-STEADY]

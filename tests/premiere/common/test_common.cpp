@@ -210,10 +210,10 @@ TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     static_assert(offsetof(PrefsBlob, parallaxGrid) == 50, "parallaxGrid sits at 50");
     static_assert(offsetof(PrefsBlob, lensAlign) == 51, "lensAlign sits at 51");
     static_assert(offsetof(PrefsBlob, steadyReserved) == 52, "52-53 are WP-STEADY's spare bytes");
-    // [WP-HDRPEAK] hdrPeak at 54 (its range is 54-55); the reserved block
-    // now starts at 56.
+    // [WP-HDRPEAK] hdrPeak at 54 (its range is 54-55); [WP-HDRTONE] hdrTone
+    // takes the spare byte at 55; the reserved block starts at 56.
     static_assert(offsetof(PrefsBlob, hdrPeak) == 54, "hdrPeak sits at 54");
-    static_assert(offsetof(PrefsBlob, padAfterHdrPeak) == 55, "offset 55 is unused padding");
+    static_assert(offsetof(PrefsBlob, hdrTone) == 55, "hdrTone sits at 55");
     static_assert(offsetof(PrefsBlob, reserved) == 56, "reserved fills the rest");
     static_assert(std::is_trivially_copyable_v<PrefsBlob>, "the blob is memcpy'd to and from the host");
 

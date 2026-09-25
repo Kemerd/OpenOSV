@@ -67,12 +67,12 @@ Neither this repository nor the binaries built from it contain:
 
 How this was checked (2026-09-23): `git ls-files` lists no `.onnx`, `.bin`,
 `.mlpackage`, `.dll`, `.dylib`, `.exe`, `.pb` or `.osv` file, and no such
-file, nothing under `ref/`, and no LUT other than the three below appears
-anywhere in the git history. The only tracked binary or media files are:
+file, nothing under `ref/`, and no LUT other than OpenOSV's own generated
+tables below appears anywhere in the git history. The only tracked binary or media files are:
 
 | Files | What they are |
 |---|---|
-| `luts/*.cube` (3) | Generated in full by `osvtool lut` from OpenOSV's own fitted models (`scripts/gen_luts.ps1`). `tests/unit/test_cube.cpp` regenerates them and requires byte equality with the committed copies. |
+| `luts/*/*.cube` (12; three before 0.2.1) | Generated in full by `osvtool lut` from OpenOSV's own fitted models (`scripts/gen_luts.ps1`), with `luts/README.txt`. `tests/unit/test_cube.cpp` regenerates them and requires byte equality with the committed copies. |
 | `tests/fixtures/*.mp4` (4, 0.9-1.6 KB each) | Synthetic container fixtures written by `scripts/make_fixtures.py`. |
 | `docs/research/neural_sky_seam_f32.png`, `research/flare/*.jpg`, `research/photo/*.tif` | Crops of OpenOSV's own renders of the project author's own recording (section 10). |
 
@@ -177,6 +177,7 @@ DJI's programs. The LUTs are:
 | "DJI-matched" D-Log M curve (7 constants, `--fit dji`) | `kDlogMDjiRefit` in `include/osv/color/DlogM.h` | Fitted by `scripts/fit_dlogm.py` to 64 neutral-axis measurements of `FT_StyleGeneralDlogm2HLG`. |
 | Osmo 360 native primaries matrix (9 constants, the default) | `kNativeToRec2020_Osmo360` in `include/osv/color/Matrices.h` | Fitted by `scripts/fit_primaries.py` to all 35 937 entries of the Osmo 360 Rec.709 LUT. |
 | The "DJI Studio" Rec.709 look (46 stored constants, 38 free) | `kLookDjiRec709` in `include/osv/color/Look.h`; `osvLookApply` in `include/osv/color/ColorMath.h` | OpenOSV's own parametric model, fitted by `scripts/fit_look.py` to all 35 937 entries of the Osmo 360 Rec.709 LUT plus pixels of the author's footage. Its gamut compression uses the published ACES Reference Gamut Compression curve. |
+| The Transfer Function (HDR) styles' tone-scale fit (the ACES 2 styles' g and t_1, the toe t_1 all four tone-scale styles share, and the constants derived from them) | `kHdrToneCurves` in `src/osv/color/ColorParams.cpp`; `osvHdrToneCurve` in `include/osv/color/ColorMath.h` | The ACES 2.0 tonescale (aces-core, Apache-2.0; attribution in `NOTICE`) least-squares fitted to the neutral axis of the Osmo 360 Rec.709 LUT (codes 0.08 to 1.0, as BT.1886 display light at 100 nits); `docs/COLOR.md`, "Transfer Function (HDR)". Only the fitted constants are shipped. |
 | The fact that DJI Studio applies that LUT to Osmo 360 D-Log M clips as its automatic "D-LOG M" filter | `include/osv/color/Look.h`, `docs/COLOR.md` | DJI Studio project files written for the author's clips. |
 
 **Measured values recorded in the repository.** Besides the fitted constants,

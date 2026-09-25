@@ -214,15 +214,23 @@ are the good ones, so you never *have* to touch any of it. See
   look to a mean **dE2000 of 0.50** on the test clip. About 1.0 is the
   smallest difference the eye can see. OpenOSV's own neutral rendering is one
   click away.
+* **Transfer Function (HDR).** Five ways to turn D-Log M into PQ or HLG:
+  two tone scales based on the ACES 2.0 tonescale and fitted to DJI's own
+  rendering (**Bright**, the default, is good for outdoor; **Detailed** for
+  indoor), two BT.2408 styles with deep blacks (**Natural** and **Punchy**),
+  and the plain BT.2408 rendering of 0.2.0 (**Neutral**).
 * **HDR Peak Brightness.** Tone-maps PQ to 1000, 600, 400 or 203 nits
   (BT.2390), so highlights roll off like a real HDR master instead of
   clipping.
 * **Exposure Match** evens out the two lenses. **Exposure** shifts the whole
   clip in stops.
 * **16-bit and 32-bit float.** HDR is never squeezed through 8 bits.
-* **LUTs included.** D-Log M → Rec.2100 PQ, → HLG and → Rec.709 `.cube` files
-  for other editors, installed next to the plug-ins. All the colour maths is
-  open and documented in [`docs/COLOR.md`](docs/COLOR.md).
+* **LUTs included.** A `LUTs` folder of D-Log M `.cube` files for other
+  editors: Rec.2100 PQ and HLG in all five HDR styles, and Rec.709 with DJI's
+  look or OpenOSV's. One set fits the Osmo 360 and the Pocket 3, which share
+  DJI's D-Log M LUT; its `README.txt` says which file to use. Installed next
+  to the plug-ins. All the colour maths is open and documented in
+  [`docs/COLOR.md`](docs/COLOR.md).
 
 ---
 
@@ -298,8 +306,9 @@ details and what's been checked.
    Easing** gives you DJI Studio's curves. **Output: 360 equirect** hands you
    the whole sphere instead.
 7. **Colour.** **Colour Output** starts at Rec. 709, which suits a new
-   project. Pick **BT.2100 PQ** or **HLG** for an HDR timeline, or **D-Log M**
-   to grade it yourself with the LUTs in the zip.
+   project. Pick **BT.2100 PQ** or **HLG** for an HDR timeline (then
+   **Transfer Function (HDR)**: Bright for outdoor, Detailed for indoor), or
+   **D-Log M** to grade it yourself with the LUTs in the zip's `LUTs` folder.
 8. **Audio.** A generator has none. `cli\osvtool.exe extract CAM_0001.OSV
    --audio CAM_0001.aac` pulls the clip's track out; put it under the
    generator.

@@ -397,6 +397,57 @@ TEST_CASE("writeCube rejects bad options and readCube rejects bad files", "[colo
 //  The shipped LUTs in <repo>/luts
 // -----------------------------------------------------------------------------
 
+namespace {
+
+/// One committed table: where it lives under luts/, and the osvtool lut
+/// arguments scripts/gen_luts.ps1 bakes it with.
+struct ShippedLut {
+    const char* dir;
+    const char* name;
+    OutputTransfer transfer;
+    Look look;
+    HdrTone tone;
+    const char* title;
+};
+
+/// [WP-HDRTONE] The set: one per BT.2100 output and Transfer Function (HDR)
+/// style, and the two Rec.709 looks, all on the osmo360 curve - DJI's D-Log M
+/// LUT is the same file for the Osmo 360 and the Pocket 3, so one set,
+/// labelled DJI_Osmo, serves both.  Must stay in step with the list in
+/// scripts/gen_luts.ps1 (folder, name, look, tone, TITLE).
+constexpr ShippedLut kShippedLuts[] = {
+    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_ACES2_Bright.cube", OutputTransfer::PQ, Look::DjiStudio,
+     HdrTone::Aces2Bright, "OpenOSV D-Log M to Rec.2100 PQ, ACES 2 Bright (outdoor) - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_ACES2_Detailed.cube", OutputTransfer::PQ, Look::DjiStudio,
+     HdrTone::Aces2Detailed, "OpenOSV D-Log M to Rec.2100 PQ, ACES 2 Detailed (indoor) - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_BT2408_DeepBlacks_Natural.cube", OutputTransfer::PQ,
+     Look::DjiStudio, HdrTone::Bt2408Natural,
+     "OpenOSV D-Log M to Rec.2100 PQ, BT.2408 Deep Blacks + Natural - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_BT2408_DeepBlacks_Punchy.cube", OutputTransfer::PQ,
+     Look::DjiStudio, HdrTone::Bt2408Punchy,
+     "OpenOSV D-Log M to Rec.2100 PQ, BT.2408 Deep Blacks + Punchy - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_BT2408_Neutral.cube", OutputTransfer::PQ, Look::DjiStudio,
+     HdrTone::Bt2408Neutral, "OpenOSV D-Log M to Rec.2100 PQ, BT.2408 Neutral - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_ACES2_Bright.cube", OutputTransfer::HLG, Look::DjiStudio,
+     HdrTone::Aces2Bright, "OpenOSV D-Log M to Rec.2100 HLG, ACES 2 Bright (outdoor) - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_ACES2_Detailed.cube", OutputTransfer::HLG, Look::DjiStudio,
+     HdrTone::Aces2Detailed, "OpenOSV D-Log M to Rec.2100 HLG, ACES 2 Detailed (indoor) - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_BT2408_DeepBlacks_Natural.cube", OutputTransfer::HLG,
+     Look::DjiStudio, HdrTone::Bt2408Natural,
+     "OpenOSV D-Log M to Rec.2100 HLG, BT.2408 Deep Blacks + Natural - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_BT2408_DeepBlacks_Punchy.cube", OutputTransfer::HLG,
+     Look::DjiStudio, HdrTone::Bt2408Punchy,
+     "OpenOSV D-Log M to Rec.2100 HLG, BT.2408 Deep Blacks + Punchy - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_BT2408_Neutral.cube", OutputTransfer::HLG, Look::DjiStudio,
+     HdrTone::Bt2408Neutral, "OpenOSV D-Log M to Rec.2100 HLG, BT.2408 Neutral - DJI Osmo 360 / Pocket 3"},
+    {"Rec709", "DJI_Osmo_DLogM_to_Rec709_DJI_Look.cube", OutputTransfer::Rec709, Look::DjiStudio,
+     HdrTone::Aces2Bright, "OpenOSV D-Log M to Rec.709, DJI look - DJI Osmo 360 / Pocket 3"},
+    {"Rec709", "DJI_Osmo_DLogM_to_Rec709_OpenOSV_Standard.cube", OutputTransfer::Rec709, Look::Standard,
+     HdrTone::Aces2Bright, "OpenOSV D-Log M to Rec.709, OpenOSV standard - DJI Osmo 360 / Pocket 3"},
+};
+
+}  // namespace
+
 /// The committed .cube files must be exactly what the current pipeline
 /// produces.
 ///
@@ -418,30 +469,30 @@ TEST_CASE("writeCube rejects bad options and readCube rejects bad files", "[colo
 /// also catches a header, title or formatting drift that a value comparison
 /// would wave through.
 TEST_CASE("The committed LUTs match the current pipeline", "[color][cube]") {
-    struct Shipped {
-        const char* name;
-        OutputTransfer transfer;
-        const char* title;
-    };
-    // Must stay in step with the LUT list in scripts/gen_luts.ps1.
-    static const Shipped kShipped[] = {
-        {"OpenOSV_Osmo360_DLogM_to_Rec2100_PQ.cube", OutputTransfer::PQ,
-         "OpenOSV Osmo 360 D-Log M to Rec.2100 PQ (osmo360 curve)"},
-        {"OpenOSV_Osmo360_DLogM_to_Rec2100_HLG.cube", OutputTransfer::HLG,
-         "OpenOSV Osmo 360 D-Log M to Rec.2100 HLG (osmo360 curve)"},
-        {"OpenOSV_Osmo360_DLogM_to_Rec709.cube", OutputTransfer::Rec709,
-         "OpenOSV Osmo 360 D-Log M to Rec.709 (osmo360 curve, DJI Studio look)"},
-    };
-
     const std::filesystem::path dir = osvtest::lutsDir();
-    for (const Shipped& s : kShipped) {
-        const std::filesystem::path committed = dir / s.name;
+    // The folder holds the set and nothing else: a renamed or retired table
+    // left behind would ship stale.
+    std::size_t cubesOnDisk = 0;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(dir)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".cube") {
+            ++cubesOnDisk;
+        }
+    }
+    CHECK(cubesOnDisk == std::size(kShippedLuts));
+    // And the README that says which file to use is there.
+    CHECK(std::filesystem::exists(dir / "README.txt"));
+
+    for (const ShippedLut& s : kShippedLuts) {
+        const std::filesystem::path committed = dir / s.dir / s.name;
         INFO("shipped LUT: " << committed.string());
         REQUIRE(std::filesystem::exists(committed));
 
         // Regenerate with the exact arguments the generator uses: the default
-        // curve, 65^3, no exposure offset, D-Log M input, the same TITLE.
-        const OsvColorParams params = makeColorParams(kDefaultDlogMFit, s.transfer, 0.0f);
+        // curve, 65^3, no exposure offset, D-Log M input, the look and the
+        // [WP-HDRTONE] transfer function style named, the same TITLE.
+        const OsvColorParams params = makeColorParams(kDefaultDlogMFit, s.transfer, 0.0f, InputEncoding::DLogM,
+                                                      true, 10, nullptr, kBt2408SceneScale, s.look,
+                                                      kDefaultHdrPeakNits, s.tone);
         REQUIRE(colorParamsValid(params));
         CubeOptions options;
         options.size = 65;
@@ -572,19 +623,37 @@ TEST_CASE("The committed LUTs land the BT.2408 anchors", "[color][cube]") {
     };
     // PQ differs from HLG because the OOTF and the PQ inverse EOTF replace the
     // HLG OETF.  BT.2408 reference points: 18 % grey is 38 % HLG and 38 % PQ
-    // (26 nit); diffuse white is 75 % HLG and 58 % PQ (203 nit), and the PQ
-    // column below lands on 0.5794 against that 0.5807.
+    // (26 nit); diffuse white is 75 % HLG and 58 % PQ (203 nit).  The Neutral
+    // style is that scene-referred rendering, and its PQ column lands on
+    // 0.5794 against that 0.5807.
     //
-    // Rec.709 carries the default DJI Studio look (include/osv/color/Look.h),
-    // whose neutral axis is DJI's own grey scale rather than the HLG signal:
-    // DJI's Osmo 360 file reads 0.3882 and 0.7404 at these two grid points,
-    // the look 0.3847 and 0.7457.  (Before the look existed this row equalled
-    // the HLG row, 0.3873 / 0.7479; Look::Standard still renders that.)
+    // [WP-HDRTONE] The tone-scale styles move these on purpose: Bright and
+    // the two BT.2408 Deep Blacks styles keep grey at 26 nits (PQ 0.3842 /
+    // 0.3845 at grid 26, whose code 0.406 sits a little above grey) and put
+    // diffuse white at 169 and 203 nits (PQ 0.5638 / 0.5836); Detailed is a
+    // stop darker (13.8 / 98 nits, PQ 0.3298 / 0.5087).  Their HLG tables
+    // are the same light for a 1000-nit HLG display.
+    //
+    // Rec.709 carries the DJI Studio look (include/osv/color/Look.h), whose
+    // neutral axis is DJI's own grey scale rather than the HLG signal: DJI's
+    // Osmo 360 file reads 0.3882 and 0.7404 at these two grid points, the
+    // look 0.3847 and 0.7457.  The OpenOSV standard look is the HLG signal,
+    // 0.3873 / 0.7479, exactly the Neutral HLG row.
     static const Anchor kAnchors[] = {
-        {"OpenOSV_Osmo360_DLogM_to_Rec2100_PQ.cube", 0.3849, 0.5794},
-        {"OpenOSV_Osmo360_DLogM_to_Rec2100_HLG.cube", 0.3873, 0.7479},
-        {"OpenOSV_Osmo360_DLogM_to_Rec709.cube", 0.3847, 0.7457},
+        {"Rec2100_PQ/DJI_Osmo_DLogM_to_Rec2100_PQ_ACES2_Bright.cube", 0.3841, 0.5638},
+        {"Rec2100_PQ/DJI_Osmo_DLogM_to_Rec2100_PQ_ACES2_Detailed.cube", 0.3298, 0.5087},
+        {"Rec2100_PQ/DJI_Osmo_DLogM_to_Rec2100_PQ_BT2408_DeepBlacks_Natural.cube", 0.3845, 0.5836},
+        {"Rec2100_PQ/DJI_Osmo_DLogM_to_Rec2100_PQ_BT2408_DeepBlacks_Punchy.cube", 0.3845, 0.5836},
+        {"Rec2100_PQ/DJI_Osmo_DLogM_to_Rec2100_PQ_BT2408_Neutral.cube", 0.3849, 0.5794},
+        {"Rec2100_HLG/DJI_Osmo_DLogM_to_Rec2100_HLG_ACES2_Bright.cube", 0.3859, 0.7231},
+        {"Rec2100_HLG/DJI_Osmo_DLogM_to_Rec2100_HLG_ACES2_Detailed.cube", 0.2969, 0.6307},
+        {"Rec2100_HLG/DJI_Osmo_DLogM_to_Rec2100_HLG_BT2408_DeepBlacks_Natural.cube", 0.3865, 0.7544},
+        {"Rec2100_HLG/DJI_Osmo_DLogM_to_Rec2100_HLG_BT2408_DeepBlacks_Punchy.cube", 0.3865, 0.7544},
+        {"Rec2100_HLG/DJI_Osmo_DLogM_to_Rec2100_HLG_BT2408_Neutral.cube", 0.3873, 0.7479},
+        {"Rec709/DJI_Osmo_DLogM_to_Rec709_DJI_Look.cube", 0.3847, 0.7457},
+        {"Rec709/DJI_Osmo_DLogM_to_Rec709_OpenOSV_Standard.cube", 0.3873, 0.7479},
     };
+    static_assert(std::size(kAnchors) == std::size(kShippedLuts), "every shipped LUT has its anchors");
 
     for (const Anchor& an : kAnchors) {
         const std::filesystem::path path = dir / an.name;

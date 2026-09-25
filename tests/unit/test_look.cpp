@@ -64,10 +64,12 @@ OsvColorParams djiParams(float stops = 0.0f) {
     return makeColorParams(DlogMFit::Osmo360, OutputTransfer::Rec709, stops);
 }
 
-/// The same block with the standard (pre-look) rendering.
-OsvColorParams standardParams(OutputTransfer transfer, float stops = 0.0f) {
+/// The same block with the standard (pre-look) rendering.  [WP-HDRTONE] The
+/// HDR outputs keep the default tone style unless another is named, so this
+/// differs from the default block in the look alone.
+OsvColorParams standardParams(OutputTransfer transfer, float stops = 0.0f, HdrTone tone = kDefaultHdrTone) {
     return makeColorParams(DlogMFit::Osmo360, transfer, stops, InputEncoding::DLogM, true, 10, nullptr,
-                           kBt2408SceneScale, Look::Standard);
+                           kBt2408SceneScale, Look::Standard, kDefaultHdrPeakNits, tone);
 }
 
 /// A D-Log M code triple through the full pipeline.
@@ -212,9 +214,10 @@ TEST_CASE("the DJI Studio look is the default Rec.709 rendering, and only Rec.70
 
     // The standard Rec.709 rendering is still reachable and is still the HLG
     // signal in Rec.709 primaries (its golden values are pinned in
-    // test_color.cpp against scripts/colour_reference.py).
+    // test_color.cpp against scripts/colour_reference.py) - [WP-HDRTONE] the
+    // scene-referred HLG signal, i.e. the Neutral style.
     const OsvColorParams standard709 = standardParams(OutputTransfer::Rec709);
-    const OsvColorParams hlg = standardParams(OutputTransfer::HLG);
+    const OsvColorParams hlg = standardParams(OutputTransfer::HLG, 0.0f, HdrTone::Bt2408Neutral);
     REQUIRE(standard709.look.id == OSV_LOOK_STANDARD);
     REQUIRE(lookOf(standard709) == Look::Standard);
     for (int i = 0; i <= 32; ++i) {

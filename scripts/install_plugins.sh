@@ -19,7 +19,8 @@
 #     refuses to load unsigned code, and an ad-hoc signature is what a build
 #     from source gets.
 #
-#     The .cube LUTs go into a LUTs/ folder beside the modules.
+#     The LUT set (its Rec2100_PQ, Rec2100_HLG and Rec709 folders and
+#     README.txt) goes into a LUTs/ folder beside the modules, folders kept.
 #
 #  2. THE SEQUENCE PRESETS into the CURRENT user's Premiere settings:
 #
@@ -352,10 +353,9 @@ install_luts() {
         info "No luts directory at '$source'; skipping the colour LUTs."
         return
     fi
-    local count=0 f
-    for f in "$source"/*.cube; do
-        [ -f "$f" ] && count=$((count + 1))
-    done
+    # Every table in every output folder (Rec2100_PQ, Rec2100_HLG, Rec709).
+    local count
+    count=$(find "$source" -type f -name '*.cube' | wc -l | tr -d ' ')
     if [ "$count" -eq 0 ]; then
         info "No .cube files in '$source'; skipping the colour LUTs."
         return
@@ -365,13 +365,22 @@ install_luts() {
         warn "could not create $target; the colour LUTs were not installed"
         return
     fi
-    for f in "$source"/*.cube; do
-        [ -f "$f" ] || continue
-        priv cp -f "$f" "$target/" || warn "could not copy $(basename "$f")"
-    done
+    # Replace, never merge: tables an older release installed (0.2.0 put
+    # three OpenOSV_Osmo360_*.cube files at the top of this folder) would
+    # otherwise sit beside the new set looking current.  Only our own kinds
+    # of file are removed; the folder is OpenOSV's.
+    priv find "$target" -type f \( -name '*.cube' -o -name 'README.txt' \) -exec rm -f {} + 2>/dev/null || true
+    # Copy with the folders kept: <source>/Rec2100_PQ/x.cube lands in
+    # <target>/Rec2100_PQ/x.cube.
+    local f rel
+    while IFS= read -r f; do
+        rel="${f#"$source"/}"
+        priv mkdir -p "$target/$(dirname "$rel")" || true
+        priv cp -f "$f" "$target/$rel" || warn "could not copy $rel"
+    done < <(find "$source" -type f \( -name '*.cube' -o -name 'README.txt' \) | sort)
     echo
     step "Installed $count colour LUT(s)"
-    info "into $target"
+    info "into $target (README.txt there says which one to pick)"
     info "Apply one with Lumetri Color > Creative > Look > Browse..., only on a"
     info "D-Log M PASSTHROUGH output - never on top of a PQ / HLG / 709 output."
 }

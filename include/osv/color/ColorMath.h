@@ -94,6 +94,25 @@
 /** Tone knots an OsvLookParams can carry (a uniform grid over code [0,1]). */
 #define OSV_LOOK_MAX_KNOTS 17
 
+/** [WP-HDRTONE] How OsvColorParams::hdrToneMode applies the HDR tone scale
+ *  (see osvHdrToneApply).  OFF is the zeroed block: the BT.2408
+ *  scene-referred rendering (HLG OETF / HLG OOTF + PQ) every build before
+ *  the setting existed produced.  Persisted only through osv::color::HdrTone,
+ *  never renumbered. */
+#define OSV_HDR_TONE_OFF 0
+#define OSV_HDR_TONE_PER_CHANNEL 1
+#define OSV_HDR_TONE_LUMINANCE 2
+
+/** [WP-HDRTONE] The tone scale's reference luminance n_r in nits: its output
+ *  h is in units of this (ACES 2.0 Lib.Academy.Tonescale, n_r = 100). */
+#define OSV_HDR_TONE_REF_NITS 100.0f
+
+/** [WP-HDRTONE] Largest scene-linear value the tone scale takes in.  Far past
+ *  any sensor clip (3.76) and any exposure boost, and small enough that
+ *  x + s2 stays finite; it also turns +inf into a value whose ratio
+ *  x / (x + s2) is exactly 1, i.e. the curve's own ceiling. */
+#define OSV_HDR_TONE_MAX_SCENE 1e30f
+
 /* ---------------------------------------------------------------------------
  *  POD types
  * ------------------------------------------------------------------------- */
@@ -203,6 +222,21 @@ typedef struct OsvColorParams {
     float hdrPeakSrcCode;         /**< PQ code of the source (mastering) peak, PQ(peakNits). */
     float hdrPeakMaxLum;          /**< PQ(hdrPeakNits) / hdrPeakSrcCode: the target peak in the normalised range. */
     float hdrPeakKnee;            /**< BT.2408 knee start KS = 1.5 * hdrPeakMaxLum - 0.5, normalised. */
+    /* [WP-HDRTONE] "Transfer Function (HDR)" (see osvHdrToneApply).  Appended
+     * after the HDR peak group so every field above keeps its offset: six
+     * 4-byte members, 24 bytes, so the block's size stays a multiple of 8 and
+     * nothing after it in OsvRenderParams changes alignment.  A zeroed group
+     * (hdrToneMode == OSV_HDR_TONE_OFF) is the BT.2408 "Neutral" rendering,
+     * bit for bit the HDR output of every build before the setting existed.
+     * makeColorParams fills it for D-Log M input to the PQ and HLG outputs
+     * only, with the host-side constants of the chosen style
+     * (osv::color::setHdrTone), so the kernel does no set-up work per pixel. */
+    int hdrToneMode;              /**< OSV_HDR_TONE_*; OFF (0) = the Neutral BT.2408 rendering. */
+    float hdrToneM2;              /**< Michaelis-Menten scale m_2 (> 0), in units of OSV_HDR_TONE_REF_NITS. */
+    float hdrToneS2;              /**< Michaelis-Menten half-saturation s_2 (> 0), scene-linear. */
+    float hdrToneG;               /**< Contrast exponent g (> 0). */
+    float hdrToneT1;              /**< ACES 2.0 flare (toe) term t_1 (>= 0). */
+    float hdrToneCapNits;         /**< Display light ceiling in nits (0 < cap <= peakNits). */
 } OsvColorParams;
 
 /* ---------------------------------------------------------------------------
@@ -685,6 +719,193 @@ OSV_HD float osvHdrPeakRolloff(OSV_PRIVATE const OsvColorParams* params, float p
 }
 
 /* ---------------------------------------------------------------------------
+ *  [WP-HDRTONE] Transfer Function (HDR): D-Log M scene light -> HDR display
+ *  light through a Michaelis-Menten tone scale
+ *
+ *  Defined ahead of the pipeline stages for the same reason as the looks and
+ *  the HDR peak: osvLinearToOutput calls it, and C and OpenCL C both need the
+ *  definition before the call.
+ *
+ *  The BT.2100 outputs of every earlier build are scene-referred: the scene
+ *  is scaled so 18 % grey sits at BT.2408's 26 nits and the HLG OOTF (or the
+ *  HLG signal itself) does the rest.  That rendering stays, bit for bit, as
+ *  the zeroed block ("BT.2408 - Neutral").  The four other styles replace it
+ *  with an explicit display rendering, the ACES 2.0 tone scale
+ *  (aces-core Lib.Academy.Tonescale.ctl, Daniele Siragusano's
+ *  Michaelis-Menten form with a flare term):
+ *
+ *      f    = m_2 * (x / (x + s_2))^g            x = max(x, 0), scene-linear
+ *      h    = max(0, f^2 / (f + t_1))
+ *      nits = 100 * h                              n_r = 100
+ *
+ *  applied either to each working (Rec.2020) channel or to the pixel's
+ *  BT.2020 luminance with the channel ratios kept, and capped at the style's
+ *  display ceiling.  See docs/COLOR.md, "Transfer Function (HDR)", for the
+ *  constants of each style and where they come from.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * @brief The tone scale's display light for one scene-linear value, in nits.
+ *
+ * Based on the ACES 2.0 tonescale in aces-core lib/Lib.Academy.Tonescale.ctl
+ * (Copyright Contributors to the ACES Project, Apache-2.0; see NOTICE).
+ *
+ * Uncapped: the per-channel caller caps each channel, the luminance caller
+ * caps the channels it scales with this.  Negative light and NaN are black
+ * (fmaxf returns the non-NaN operand), values past OSV_HDR_TONE_MAX_SCENE
+ * (including +inf) are held there, where the ratio is exactly 1 and the
+ * curve sits at its ceiling 100 * m_2^2 / (m_2 + t_1).  A zero t_1 at x = 0
+ * gives 0 / 0; the max() with 0 turns that NaN into black as well.
+ *
+ * @param params  The colour block (its hdrTone* constants); null yields 0.
+ * @param x       Scene-linear value, 18 % grey = 0.18.
+ * @return        Display light in nits, >= 0 and finite for every input.
+ */
+OSV_HD float osvHdrToneCurve(OSV_PRIVATE const OsvColorParams* params, float x) {
+    if (params == 0) {
+        return 0.0f;
+    }
+    /* Clamp the scene value into the range the rational term handles. */
+    x = fminf(fmaxf(x, 0.0f), OSV_HDR_TONE_MAX_SCENE);
+    /* Michaelis-Menten compression, then the contrast power. */
+    const float r = x / (x + params->hdrToneS2);
+    const float f = params->hdrToneM2 * powf(r, params->hdrToneG);
+    /* The ACES 2.0 flare term: a toe that pulls the deepest shadows down. */
+    const float h = fmaxf(f * f / (f + params->hdrToneT1), 0.0f);
+    return OSV_HDR_TONE_REF_NITS * h;
+}
+
+/**
+ * @brief True when the block asks for one of the tone-scale styles and can
+ *        carry it out.
+ *
+ * Only a D-Log M block to the PQ or HLG output, with a known mode and usable
+ * constants (m_2, s_2, g and the cap positive, t_1 not negative - every
+ * comparison NaN-safe), qualifies.  Everything else - the zeroed group, and
+ * any corrupt one - takes the BT.2408 Neutral path, exactly as a block built
+ * before the setting existed.
+ */
+OSV_HD int osvHdrToneActive(OSV_PRIVATE const OsvColorParams* params) {
+    if (params == 0) {
+        return 0;
+    }
+    /* A style exists only for the two tone-scale modes. */
+    if (params->hdrToneMode != OSV_HDR_TONE_PER_CHANNEL && params->hdrToneMode != OSV_HDR_TONE_LUMINANCE) {
+        return 0;
+    }
+    /* D-Log M scene light to a BT.2100 output, nothing else. */
+    if (params->inputEncoding != OSV_INPUT_DLOGM ||
+        (params->transfer != OSV_TRANSFER_PQ && params->transfer != OSV_TRANSFER_HLG)) {
+        return 0;
+    }
+    /* Constants the curve can divide by and aim at. */
+    if (!(params->hdrToneM2 > 0.0f) || !(params->hdrToneS2 > 0.0f) || !(params->hdrToneG > 0.0f) ||
+        !(params->hdrToneT1 >= 0.0f) || !(params->hdrToneCapNits > 0.0f)) {
+        return 0;
+    }
+    return 1;
+}
+
+/**
+ * @brief Render one working value through the block's HDR tone style and
+ *        encode it for the PQ or HLG output.
+ *
+ * `working` is the pipeline's value after the camera matrix and exposure
+ * (Rec.2020 scene-linear, 18 % grey = 0.18, NO scene scale).  Steps:
+ *
+ *  1. Display light in nits, Rec.2020, for a 1000-nit mastering display:
+ *       per-channel  nits_c = min(T(working_c), cap)
+ *       luminance    Y = 0.2627 R + 0.6780 G + 0.0593 B  (channels >= 0)
+ *                    nits_c = min(working_c * T(Y) / Y, cap)  (0 when Y is ~0)
+ *     Per channel desaturates what shoulders (and adds chroma in the
+ *     mid-tones); the luminance form keeps the scene's own saturation.
+ *  2. workingToOutput (the identity for both BT.2100 outputs).
+ *  3. PQ:  the ST 2084 inverse EOTF per channel, then [WP-HDRPEAK] the HDR
+ *          peak roll-off when one is set - after every style, as for Neutral.
+ *     HLG: the BT.2100 inverse OOTF for the peakNits (1000) display with
+ *          system gamma ootfGamma (1.2):
+ *            Fd = nits / peakNits,  Yd = luma(Fd),
+ *            E  = Fd * Yd^((1 - gamma) / gamma)   (0 when Yd <= 0)
+ *          then the HLG OETF, clamped to [0, 1].
+ *
+ * The caller checks osvHdrToneActive first; with a null block the output is
+ * black rather than a read through the pointer.
+ */
+OSV_HD void osvHdrToneApply(OSV_PRIVATE const OsvColorParams* params, OSV_PRIVATE const float working[3],
+                            OSV_PRIVATE float out[3]) {
+    float nits[3];
+    float disp[3];
+    int i;
+    if (params == 0) {
+        out[0] = out[1] = out[2] = 0.0f;
+        return;
+    }
+    const float cap = params->hdrToneCapNits;
+
+    /* 1. Scene light -> display light, one of the two modes. */
+    if (params->hdrToneMode == OSV_HDR_TONE_LUMINANCE) {
+        /* Luminance mode: tone-map BT.2020 Y, keep the channel ratios. */
+        float c[3];
+        for (i = 0; i < 3; ++i) {
+            c[i] = fminf(fmaxf(working[i], 0.0f), OSV_HDR_TONE_MAX_SCENE);
+        }
+        const float y = OSV_BT2020_LUMA_R * c[0] + OSV_BT2020_LUMA_G * c[1] + OSV_BT2020_LUMA_B * c[2];
+        if (y > 1e-9f) {
+            /* Every weight is >= 0.0593, so c / Y <= 16.9: the product
+             * stays finite for any clamped input. */
+            const float gain = osvHdrToneCurve(params, y) / y;
+            for (i = 0; i < 3; ++i) {
+                nits[i] = fminf(c[i] * gain, cap);
+            }
+        } else {
+            /* No light (or none worth a ratio): black. */
+            nits[0] = nits[1] = nits[2] = 0.0f;
+        }
+    } else {
+        /* Per-channel mode: each working channel through the curve. */
+        for (i = 0; i < 3; ++i) {
+            nits[i] = fminf(osvHdrToneCurve(params, working[i]), cap);
+        }
+    }
+
+    /* 2. Output primaries (identity for BT.2100), never negative light. */
+    osvMat3Apply(&params->workingToOutput, nits[0], nits[1], nits[2], disp);
+    for (i = 0; i < 3; ++i) {
+        disp[i] = fmaxf(disp[i], 0.0f);
+    }
+
+    /* 3a. PQ: absolute display light straight into ST 2084. */
+    if (params->transfer == OSV_TRANSFER_PQ) {
+        for (i = 0; i < 3; ++i) {
+            out[i] = osvSaturatef(osvPqInverseEotf(disp[i]));
+        }
+        /* [WP-HDRPEAK] The same roll-off, skipped for a zeroed group. */
+        if (params->hdrPeakNits > 0.0f) {
+            for (i = 0; i < 3; ++i) {
+                out[i] = osvHdrPeakRolloff(params, out[i]);
+            }
+        }
+        return;
+    }
+
+    /* 3b. HLG: undo the display's OOTF for the mastering display, so an HLG
+     *     display at peakNits shows exactly the nits computed above. */
+    {
+        const float peak = (params->peakNits > 0.0f) ? params->peakNits : 1000.0f;
+        const float gamma = (params->ootfGamma > 0.0f) ? params->ootfGamma : 1.2f;
+        float fd[3];
+        for (i = 0; i < 3; ++i) {
+            fd[i] = disp[i] / peak;
+        }
+        const float yd = OSV_BT2020_LUMA_R * fd[0] + OSV_BT2020_LUMA_G * fd[1] + OSV_BT2020_LUMA_B * fd[2];
+        const float scale = (yd > 0.0f) ? powf(yd, (1.0f - gamma) / gamma) : 0.0f;
+        for (i = 0; i < 3; ++i) {
+            out[i] = osvSaturatef(osvHlgOetf(fmaxf(fd[i] * scale, 0.0f)));
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
  *  Pipeline stages
  * ------------------------------------------------------------------------- */
 
@@ -764,6 +985,11 @@ OSV_HD void osvCodeToLinear(OSV_PRIVATE const OsvColorParams* params, OSV_PRIVAT
  * @brief Scene-linear native RGB -> encoded output signal.
  *
  * Steps: nativeToWorking matrix, exposure gain, then per transfer:
+ *  - HLG / PQ with a [WP-HDRTONE] tone style (osvHdrToneActive: D-Log M
+ *             input, hdrToneMode not OFF): osvHdrToneApply on the working
+ *             value - display light from the tone scale, then the PQ encode
+ *             (and the HDR peak roll-off) or the inverse HLG OOTF + OETF.
+ *             Otherwise, the BT.2408 Neutral rendering:
  *  - HLG:     * sceneScale, workingToOutput, HLG OETF per channel.
  *  - PQ:      * sceneScale, workingToOutput, HLG OOTF (peakNits, ootfGamma on
  *             BT.2020 luminance), PQ inverse EOTF per channel, then
@@ -809,6 +1035,17 @@ OSV_HD void osvLinearToOutput(OSV_PRIVATE const OsvColorParams* params, OSV_PRIV
      * a corrupt one, also falls through to the standard rendering. */
     if (params->transfer == OSV_TRANSFER_REC709 && params->look.id == OSV_LOOK_DJI) {
         osvLookApply(&params->look, working, out);
+        return;
+    }
+
+    /* [WP-HDRTONE] A tone-scale style on the PQ / HLG output of D-Log M: it
+     * takes the working value after exposure and produces the final signal
+     * itself, replacing the scene scale and the HLG OOTF below.  A zeroed
+     * group (OSV_HDR_TONE_OFF, "BT.2408 - Neutral") and any unusable one
+     * skip this line, so that output is bit for bit what it was before the
+     * setting existed. */
+    if (osvHdrToneActive(params)) {
+        osvHdrToneApply(params, working, out);
         return;
     }
 

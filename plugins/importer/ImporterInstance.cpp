@@ -178,6 +178,24 @@ void trimAnalysisCache(MapT& cache, std::size_t limit, const typename MapT::key_
     return color::kDefaultLook;
 }
 
+/// [WP-HDRTONE] Map the prefs transfer function onto the library's HDR tone
+/// style (the same values).  Zero - every blob written before the byte
+/// existed, and every fresh one - is ACES 2 Bright, the library default; a
+/// byte outside the enum lands there too.  Only D-Log M to PQ / HLG has a
+/// style; makeColorParams ignores it otherwise.
+[[nodiscard]] color::HdrTone toHdrTone(PrefsHdrTone tone) noexcept {
+    switch (tone) {
+    case PrefsHdrTone::Aces2Detailed: return color::HdrTone::Aces2Detailed;
+    case PrefsHdrTone::Bt2408Natural: return color::HdrTone::Bt2408Natural;
+    case PrefsHdrTone::Bt2408Punchy:  return color::HdrTone::Bt2408Punchy;
+    case PrefsHdrTone::Bt2408Neutral: return color::HdrTone::Bt2408Neutral;
+    case PrefsHdrTone::Aces2Bright:
+    case PrefsHdrTone::Count:
+    default:                          break;
+    }
+    return color::kDefaultHdrTone;
+}
+
 /// Map the prefs choice onto the calibration selector's choice.  Auto - the
 /// default, and what every blob with calibration 0 written before the
 /// choice existed means - follows the accessory the camera recorded; the
@@ -605,13 +623,13 @@ Status ImporterInstance::parseOnce() {
 #else
         const char* declared = colorSpaceTokenFor(m_prefs);
 #endif
-        PluginLog::info("colour: '{}': source {} ({}) -> input encoding {}, output {} ({}), Rec.709 look {}, "
-                        "HDR peak {:.0f} nits",
+        PluginLog::info("colour: '{}': source {} ({}) -> input encoding {}, output {} ({}), HDR tone {}, "
+                        "Rec.709 look {}, HDR peak {:.0f} nits",
                         m_path.filename().string(), meta::colorModeName(m_format.colorMode),
                         m_format.colorModeFromMetadata ? "from metadata" : "inferred from luma statistics",
                         color::inputEncodingName(in), color::outputTransferName(toOutputTransfer(m_prefs.color())),
-                        declared, color::lookName(toLook(m_prefs.lookChoice())),
-                        static_cast<double>(m_prefs.hdrPeakNits()));
+                        declared, color::hdrToneName(toHdrTone(m_prefs.hdrToneChoice())),  // [WP-HDRTONE]
+                        color::lookName(toLook(m_prefs.lookChoice())), static_cast<double>(m_prefs.hdrPeakNits()));
     }
     return okStatus();
 }
@@ -1196,10 +1214,11 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
     publishSettingsLocked(true);
 
     // Colour depends on colorOutput, dlogmFit, exposureStops, [WP-LOOK] the
-    // Rec.709 look and [WP-HDRPEAK] the PQ output's peak.
+    // Rec.709 look, [WP-HDRPEAK] the PQ output's peak and [WP-HDRTONE] the
+    // HDR outputs' transfer function.
     if (!m_colorBuilt || previous.colorOutput != incoming.colorOutput || previous.dlogmFit != incoming.dlogmFit ||
         previous.exposureStops != incoming.exposureStops || previous.look != incoming.look ||
-        previous.hdrPeak != incoming.hdrPeak) {
+        previous.hdrPeak != incoming.hdrPeak || previous.hdrTone != incoming.hdrTone) {
         rebuildColor();
     }
 
@@ -1300,11 +1319,13 @@ void ImporterInstance::rebuildColor() {
     // stream (10 for the Osmo 360, 8 for the LRF proxy).
     // The look is passed for every output; makeColorParams applies it only to
     // Rec.709 (the one output with a fitted look) and ignores it otherwise.
-    // [WP-HDRPEAK] Likewise the HDR peak, which only the PQ output uses.
+    // [WP-HDRPEAK] Likewise the HDR peak, which only the PQ output uses, and
+    // [WP-HDRTONE] the transfer function, which only D-Log M to PQ / HLG uses.
     m_color = color::makeColorParams(toDlogMFit(m_prefs.fit()), toOutputTransfer(m_prefs.color()),
                                      m_prefs.exposureStops, input, true,
                                      m_format.bitDepth ? m_format.bitDepth : 10u, nullptr, color::kBt2408SceneScale,
-                                     toLook(m_prefs.lookChoice()), m_prefs.hdrPeakNits());
+                                     toLook(m_prefs.lookChoice()), m_prefs.hdrPeakNits(),
+                                     toHdrTone(m_prefs.hdrToneChoice()));
     m_colorBuilt = true;
 }
 
@@ -2325,11 +2346,13 @@ Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_
         // a Rec.709 working space gets the look the user chose for Rec.709.
         // [WP-HDRPEAK] So does its HDR peak: any clip rendered into a PQ
         // working space rolls off into the peak chosen for it.
+        // [WP-HDRTONE] And its transfer function: a Rec.709 clip rendered
+        // into a PQ or HLG working space gets the style chosen for HDR.
         color = color::makeColorParams(toDlogMFit(m_prefs.fit()), static_cast<color::OutputTransfer>(outputTransfer),
                                        m_prefs.exposureStops, inputEncodingFor(m_format.colorMode), true,
                                        m_format.bitDepth ? m_format.bitDepth : 10u, nullptr,
                                        color::kBt2408SceneScale, toLook(m_prefs.lookChoice()),
-                                       m_prefs.hdrPeakNits());
+                                       m_prefs.hdrPeakNits(), toHdrTone(m_prefs.hdrToneChoice()));
     }
 
     // ---- the stitch block ------------------------------------------------------
@@ -2510,12 +2533,14 @@ OsvColorParams ImporterInstance::colorForTransfer(int outputTransfer) const {
         return m_color;
     }
     // [WP-LOOK] the same look as the clip's own block, so a Rec.709
-    // connection-space override renders the look the user chose, and
-    // [WP-HDRPEAK] a PQ one the HDR peak the user chose.
+    // connection-space override renders the look the user chose,
+    // [WP-HDRPEAK] a PQ one the HDR peak the user chose, and [WP-HDRTONE] a
+    // PQ or HLG one the transfer function the user chose.
     return color::makeColorParams(toDlogMFit(m_prefs.fit()), static_cast<color::OutputTransfer>(outputTransfer),
                                   m_prefs.exposureStops, inputEncodingFor(m_format.colorMode), true,
                                   m_format.bitDepth ? m_format.bitDepth : 10u, nullptr, color::kBt2408SceneScale,
-                                  toLook(m_prefs.lookChoice()), m_prefs.hdrPeakNits());
+                                  toLook(m_prefs.lookChoice()), m_prefs.hdrPeakNits(),
+                                  toHdrTone(m_prefs.hdrToneChoice()));
 }
 
 Result<render::RenderJob> ImporterInstance::buildEquirectJob(std::uint32_t index, const video::FramePair& pair,
@@ -3002,6 +3027,18 @@ std::string ImporterInstance::analysisText() const {
     default:                       break;
     }
     line(std::string("Output colour: ") + outName + ", full-range RGB " + depth);
+    // [WP-HDRTONE] The HDR outputs name their transfer function: the styles
+    // render visibly apart.  Only a D-Log M clip has one; an HLG or Normal
+    // clip's own rendering is kept.
+    if (m_prefs.color() == PrefsColorOutput::PQ || m_prefs.color() == PrefsColorOutput::HLG) {
+        const color::HdrTone tone = toHdrTone(m_prefs.hdrToneChoice());
+        if (inputEncodingFor(m_format.colorMode) == color::InputEncoding::DLogM) {
+            line(std::string("Transfer function (HDR): ") + color::hdrToneLabel(tone));
+        } else {
+            line(std::string("Transfer function (HDR): ") + color::hdrToneLabel(tone) +
+                 " (D-Log M only; this clip keeps its own rendering)");
+        }
+    }
     // [WP-HDRPEAK] Said only when the PQ output does not carry the master's
     // full 1000 nits, with where the roll-off starts - and, for any other
     // output, that the setting is there but not used by it.

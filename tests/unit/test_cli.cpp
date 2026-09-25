@@ -427,10 +427,11 @@ TEST_CASE("osvtool lut --hdr-peak rolls a PQ table off and leaves HLG alone", "[
     CHECK(d.title == a.title);
     CHECK(d.title.find("peak") == std::string::npos);
     // 400 is a different table, never above PQ(400 nits) = 0.6526, and
-    // named as such; the default reaches past it.
+    // named as such; the default reaches past it ([WP-HDRTONE] the default
+    // ACES 2 Bright style's own ceiling is 600 nits, PQ 0.6963).
     CHECK(d.data != b.data);
     CHECK(b.maxValue <= 0.65262);
-    CHECK(d.maxValue > 0.70);
+    CHECK(d.maxValue > 0.66);
     CHECK(b.title.find("400-nit peak") != std::string::npos);
 
     // HLG is display-relative: the table is the default one, and the report
@@ -449,6 +450,76 @@ TEST_CASE("osvtool lut --hdr-peak rolls a PQ table off and leaves HLG alone", "[
     CHECK(bad.output.find("--hdr-peak") != std::string::npos);
 }
 
+// [WP-HDRTONE] osvtool lut --tone: each style is its own PQ / HLG table and
+// names itself in the title, aces-bright is the default, the short names
+// are the long ones, Rec.709 ignores the option and says so, and anything
+// else is refused.
+TEST_CASE("osvtool lut --tone selects the HDR transfer function", "[cli][hdrtone]") {
+    if (std::string(kToolPath).empty() || !std::filesystem::exists(kToolPath)) {
+        SKIP("osvtool not built");
+    }
+    // The data lines and the TITLE line of a .cube.
+    const auto read = [](const std::filesystem::path& path) {
+        std::ifstream in(path);
+        std::string line;
+        std::pair<std::string, std::string> dataAndTitle;
+        while (std::getline(in, line)) {
+            if (line.rfind("TITLE", 0) == 0) {
+                dataAndTitle.second = line;
+            } else if (!line.empty() && (std::isdigit(static_cast<unsigned char>(line[0])) || line[0] == '-')) {
+                dataAndTitle.first += line;
+                dataAndTitle.first += '\n';
+            }
+        }
+        return dataAndTitle;
+    };
+    const char* const kTones[] = {"aces-bright", "aces-detailed", "bt2408-natural", "bt2408-punchy", "bt2408-neutral"};
+    for (const char* transfer : {"pq", "hlg"}) {
+        std::vector<std::string> tables;
+        for (const char* tone : kTones) {
+            const auto path = osvtest::tempDir() / (std::string("cli_tone_") + transfer + "_" + tone + ".cube");
+            const RunResult r = runTool(std::string("lut --out-transfer ") + transfer + " --size 9 --tone " + tone +
+                                        " " + quoted(path));
+            INFO(r.output);
+            REQUIRE(r.exitCode == 0);
+            CHECK(r.output.find("tone      :") != std::string::npos);
+            const auto [data, title] = read(path);
+            CHECK(title.find(std::string(tone) + " tone") != std::string::npos);
+            tables.push_back(data);
+        }
+        // Five styles, five different tables.
+        for (std::size_t i = 0; i < tables.size(); ++i) {
+            for (std::size_t j = i + 1; j < tables.size(); ++j) {
+                INFO(transfer << ": " << kTones[i] << " vs " << kTones[j]);
+                CHECK(tables[i] != tables[j]);
+            }
+        }
+        // The default is ACES 2 Bright, and "neutral" is bt2408-neutral.
+        const auto implicit = osvtest::tempDir() / (std::string("cli_tone_") + transfer + "_default.cube");
+        REQUIRE(runTool(std::string("lut --out-transfer ") + transfer + " --size 9 " + quoted(implicit)).exitCode == 0);
+        CHECK(read(implicit).first == tables[0]);
+        const auto shortName = osvtest::tempDir() / (std::string("cli_tone_") + transfer + "_short.cube");
+        REQUIRE(runTool(std::string("lut --out-transfer ") + transfer + " --size 9 --tone neutral " +
+                        quoted(shortName))
+                    .exitCode == 0);
+        CHECK(read(shortName).first == tables[4]);
+    }
+    // Rec.709 has no transfer function style: the table is the default one
+    // and the report says the option was ignored.
+    const auto sdrDefault = osvtest::tempDir() / "cli_tone_709_default.cube";
+    const auto sdrNeutral = osvtest::tempDir() / "cli_tone_709_neutral.cube";
+    REQUIRE(runTool("lut --out-transfer 709 --size 9 " + quoted(sdrDefault)).exitCode == 0);
+    const RunResult r709 = runTool("lut --out-transfer 709 --size 9 --tone bt2408-neutral " + quoted(sdrNeutral));
+    REQUIRE(r709.exitCode == 0);
+    CHECK(r709.output.find("ignored") != std::string::npos);
+    CHECK(read(sdrDefault).first == read(sdrNeutral).first);
+    CHECK(read(sdrDefault).second.find("tone") == std::string::npos);
+    // An unknown style is a usage error, not a silent default.
+    const RunResult bad = runTool("lut --out-transfer pq --tone aces " + quoted(osvtest::tempDir() / "x.cube"));
+    CHECK(bad.exitCode == 1);
+    CHECK(bad.output.find("--tone") != std::string::npos);
+}
+
 // [WP-HDRPEAK] osvtool render --hdr-peak on the sample clip: the PQ still
 // never passes the chosen peak, its sidecar records it, and a bad value is
 // refused.
@@ -458,8 +529,12 @@ TEST_CASE("osvtool render --hdr-peak caps the PQ still at the chosen peak", "[cl
         SKIP("osvtool not built");
     }
     const std::string clip = quoted(osvtest::sampleOsv());
-    // Frame 30: the sunlit white aircraft beside the camera.
-    const std::string common = " --frame 30 --mode equirect --size 512x256 --device cpu --color pq --out ";
+    // Frame 30: the sunlit white aircraft beside the camera.  [WP-HDRTONE]
+    // On the BT.2408 Neutral style, whose 1000-nit master has highlights up
+    // to the full 1000 nits; the default ACES 2 Bright style is checked
+    // after it.
+    const std::string common =
+        " --frame 30 --mode equirect --size 512x256 --device cpu --color pq --tone bt2408-neutral --out ";
     const auto fullTif = osvtest::tempDir() / "cli_peak_1000.tif";
     const auto peakTif = osvtest::tempDir() / "cli_peak_203.tif";
     const RunResult a = runTool("render " + clip + common + quoted(fullTif));
@@ -490,6 +565,18 @@ TEST_CASE("osvtool render --hdr-peak caps the PQ still at the chosen peak", "[cl
     };
     CHECK(sidecar(fullTif).find("\"peak_nits\": 1000") != std::string::npos);
     CHECK(sidecar(peakTif).find("\"peak_nits\": 203") != std::string::npos);
+    // [WP-HDRTONE] The default style's own ceiling is 600 nits (PQ 0.6963):
+    // the still never passes it, and its sidecar says so.
+    const auto brightTif = osvtest::tempDir() / "cli_peak_bright.tif";
+    const RunResult c = runTool("render " + clip +
+                                " --frame 30 --mode equirect --size 512x256 --device cpu --color pq --out " +
+                                quoted(brightTif));
+    INFO(c.output);
+    REQUIRE(c.exitCode == 0);
+    auto bright = osv::io::readImage(brightTif);
+    REQUIRE(bright.ok());
+    CHECK(maxColour(bright.value().data) <= 0.69630f + 1.0f / 65535.0f);
+    CHECK(sidecar(brightTif).find("\"peak_nits\": 600") != std::string::npos);
     // Refused with the reason named.
     const RunResult bad = runTool("render " + clip + common + quoted(peakTif) + " --hdr-peak 500");
     CHECK(bad.exitCode != 0);

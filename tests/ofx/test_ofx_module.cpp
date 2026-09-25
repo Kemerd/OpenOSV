@@ -205,6 +205,20 @@ TEST_CASE("the generator's context: output clip, clip controls, camera, stitch",
     CHECK(colour->props.getInt(kOfxParamPropDefault) == 2);
     CHECK(items(OSV_SS_COLOR_ITEMS)[2] == "Rec. 709");
 
+    // [WP-HDRTONE] Transfer Function (HDR): the Source Settings effect's five
+    // styles, ACES 2 Bright by default, with the hint Premiere's panel cannot
+    // show, right under Colour Output.
+    const Param* tone = ctx->params.find(osv::ofx::source_params::kHdrTone);
+    REQUIRE(tone);
+    CHECK(tone->type == kOfxParamTypeChoice);
+    CHECK(tone->props.getString(kOfxPropLabel) == "Transfer Function (HDR)");
+    CHECK(tone->props.getStrings(kOfxParamPropChoiceOption) == items(OSV_SS_HDR_TONE_ITEMS));
+    CHECK(tone->props.getInt(kOfxParamPropDefault) == 0);
+    CHECK(items(OSV_SS_HDR_TONE_ITEMS)[0] == "ACES 2 - Bright (outdoor)");
+    CHECK(tone->props.getString(kOfxParamPropHint) == "Bright is good for outdoor, Detailed is good for indoor.");
+    CHECK(tone->props.getString(kOfxParamPropParent) == osv::ofx::source_params::kColourGroup);
+    CHECK(std::string(osv::ofx::source_params::kAllParams[2]) == osv::ofx::source_params::kHdrTone);
+
     // Every stitch setting is static per clip: no keyframes.
     for (const char* name : osv::ofx::source_params::kAllParams) {
         const Param* p = ctx->params.find(name);

@@ -109,6 +109,7 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
     p.renderDevice = static_cast<std::uint8_t>(PrefsRenderDevice::OpenCl);
     p.directColour = static_cast<std::uint8_t>(PrefsDirectColour::MatchSource);
     p.hdrPeak = static_cast<std::uint8_t>(PrefsHdrPeak::Nits400);  // [WP-HDRPEAK]
+    p.hdrTone = static_cast<std::uint8_t>(PrefsHdrTone::Bt2408Punchy);  // [WP-HDRTONE]
     REQUIRE(p.sanitise());  // already clean: every value above is in range
     return p;
 }
@@ -200,6 +201,7 @@ TEST_CASE("the defaults file round-trips every value of every setting bit for bi
              static_cast<int>(PrefsLensAlign::Count));  // [WP-STEADY]
         each([](PrefsBlob& p, std::uint8_t v) { p.directColour = v; }, static_cast<int>(PrefsDirectColour::Count));
         each([](PrefsBlob& p, std::uint8_t v) { p.hdrPeak = v; }, static_cast<int>(PrefsHdrPeak::Count));  // [WP-HDRPEAK]
+        each([](PrefsBlob& p, std::uint8_t v) { p.hdrTone = v; }, static_cast<int>(PrefsHdrTone::Count));  // [WP-HDRTONE]
         each([](PrefsBlob& p, std::uint8_t v) { p.seamSearch = v; }, 2);
         each([](PrefsBlob& p, std::uint8_t v) { p.gainMatch = v; }, 2);
         each([](PrefsBlob& p, std::uint8_t v) { p.flareRemoval = v; }, 2);
@@ -260,8 +262,8 @@ TEST_CASE("the defaults file covers every byte of the blob that holds a setting"
     for (std::size_t i = 0; i < sizeof(PrefsBlob::steadyReserved); ++i) {
         padding.insert(offsetof(PrefsBlob, steadyReserved) + i);
     }
-    // [WP-HDRPEAK] its own spare byte.
-    padding.insert(offsetof(PrefsBlob, padAfterHdrPeak));
+    // [WP-HDRPEAK] its spare byte is [WP-HDRTONE]'s hdrTone now, which has a
+    // key of its own - so no padding is left in that range.
 
     std::vector<int> owners(PrefsBlob::kSize, 0);
     std::set<std::string> keys;
@@ -315,6 +317,7 @@ TEST_CASE("the written file is the documented, human-readable format", "[userdef
     CHECK(text.find("\"exposureStops\": -1.7") != std::string::npos);
     CHECK(text.find("\"programMonitorColour\": \"match-source\"") != std::string::npos);
     CHECK(text.find("\"hdrPeakNits\": 400") != std::string::npos);  // [WP-HDRPEAK]
+    CHECK(text.find("\"hdrTone\": \"bt2408-punchy\"") != std::string::npos);  // [WP-HDRTONE]
     // Plain ASCII text ending with a newline.
     CHECK(std::all_of(text.begin(), text.end(), [](char c) { return static_cast<unsigned char>(c) < 0x80; }));
     REQUIRE_FALSE(text.empty());
@@ -713,4 +716,42 @@ TEST_CASE("the HDR peak is saved as its nits and only the four choices read back
         R"({"format": "openosv-source-settings-defaults", "version": 1, "settings": {"hdrPeakNits": 600.0}})");
     REQUIRE(parsed.ok());
     CHECK(parsed.value().prefs.hdrPeakChoice() == PrefsHdrPeak::Nits600);
+}
+
+TEST_CASE("the HDR transfer function is saved by name and only the five names read back",
+          "[userdefaults][hdrtone]") {
+    // [WP-HDRTONE] Every style round-trips under the name osvtool's --tone
+    // takes; the built-in default is spelled out too.
+    const char* const kNames[] = {"aces-bright", "aces-detailed", "bt2408-natural", "bt2408-punchy",
+                                  "bt2408-neutral"};
+    static_assert(std::size(kNames) == static_cast<std::size_t>(PrefsHdrTone::Count));
+    for (int i = 0; i < static_cast<int>(PrefsHdrTone::Count); ++i) {
+        PrefsBlob p = PrefsBlob::defaults();
+        p.hdrTone = static_cast<std::uint8_t>(i);
+        const std::string text = userDefaultsToJson(p);
+        const std::string expected = std::string("\"hdrTone\": \"") + kNames[i] + "\"";
+        INFO(expected);
+        CHECK(text.find(expected) != std::string::npos);
+        CHECK(roundTrip(p) == p);
+    }
+    CHECK(userDefaultsToJson(PrefsBlob::defaults()).find("\"hdrTone\": \"aces-bright\"") != std::string::npos);
+    // Case does not matter; anything else is refused (and noted) and the
+    // built-in style stays.
+    {
+        const auto parsed = userDefaultsFromJson(
+            R"({"format": "openosv-source-settings-defaults", "version": 1, "settings": {"hdrTone": "BT2408-Neutral"}})");
+        REQUIRE(parsed.ok());
+        CHECK(parsed.value().prefs.hdrToneChoice() == PrefsHdrTone::Bt2408Neutral);
+    }
+    for (const char* bad : {"\"aces\"", "\"\"", "3", "true", "\"bt2408-neutral \""}) {
+        const std::string doc = std::string(R"({"format": "openosv-source-settings-defaults", "version": 1, )") +
+                                R"("settings": {"hdrTone": )" + bad + "}}";
+        const auto parsed = userDefaultsFromJson(doc);
+        INFO(doc);
+        REQUIRE(parsed.ok());
+        CHECK(parsed.value().prefs.hdrToneChoice() == PrefsHdrTone::Aces2Bright);
+        const auto& notes = parsed.value().notes;
+        CHECK(std::any_of(notes.begin(), notes.end(),
+                          [](const std::string& n) { return n.find("\"hdrTone\"") != std::string::npos; }));
+    }
 }

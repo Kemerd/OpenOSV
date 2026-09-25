@@ -9,8 +9,9 @@
 // Controls panel whenever the clip is selected, and their values are handed
 // to OpenOSVImporter.prm as a flat preferences blob.  It exists so the stitch
 // options (colour output, output size, stabilisation, seam search, exposure
-// match, calibration slot, D-Log M curve, exposure, render device, the
-// Rec.709 look, [WP-HDRPEAK] the PQ output's HDR peak, sun ghost removal, the
+// match, calibration slot, D-Log M curve, exposure, render device,
+// [WP-HDRTONE] the HDR outputs' transfer function, the Rec.709 look,
+// [WP-HDRPEAK] the PQ output's HDR peak, sun ghost removal, the
 // sky seam fix, the carved seam's tweaks
 // and the reframe effect's Program Monitor Colour) are simply VISIBLE, instead
 // of hiding behind the modal dialog in imGetPrefs8.
@@ -30,7 +31,7 @@
 //                                    SetIsSourceSettingsEffect(), which is
 //                                    what tells Premiere this is a master
 //                                    clip settings effect and not a filter.
-//   PF_Cmd_PARAMS_SETUP              the twenty-three controls, each flagged
+//   PF_Cmd_PARAMS_SETUP              the twenty-six controls, each flagged
 //                                    PF_ParamFlag_CANNOT_TIME_VARY.
 //   PF_Cmd_SEQUENCE_SETUP            PerformSourceSettingsCommand(), which
 //                                    round-trips a blob through the importer
@@ -191,8 +192,13 @@ static_assert(kIndexDirectColour == kIndexRenderDevice + 1,
               "Program Monitor Colour follows Render Device inside the Advanced group");
 static_assert(kIndexAdvancedTopicEnd == kIndexDirectColour + 1,
               "the Advanced group must close immediately after Program Monitor Colour");
-static_assert(kIndexRec709Look == kIndexColorOutput + 1,
-              "the Rec.709 look sits directly under Colour Output");
+// [WP-HDRTONE] the HDR transfer function sits directly under Colour Output,
+// and the Rec.709 look directly under it.
+static_assert(kIndexHdrTone == kIndexColorOutput + 1 && kIndexRec709Look == kIndexHdrTone + 1,
+              "Transfer Function (HDR) sits between Colour Output and Look");
+static_assert(kParamIdByIndex[kIndexHdrTone - 1] == OSV_SS_ID_HDR_TONE,
+              "kParamIdByIndex is not aligned with the ParamIndex enum");
+static_assert(OSV_SS_ID_HDR_TONE >= 50 && OSV_SS_ID_HDR_TONE <= 51, "WP-HDRTONE's parameter ids live in 50-51");
 static_assert(kParamIdByIndex[kIndexColorOutput - 1] == OSV_SS_ID_COLOR_OUTPUT,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
 static_assert(kParamIdByIndex[kIndexRec709Look - 1] == OSV_SS_ID_REC709_LOOK,
@@ -323,6 +329,10 @@ private:
     if (const PF_ParamDef* p = def(kIndexColorOutput)) {
         c.colorOutput = static_cast<int>(p->u.pd.value);
     }
+    // [WP-HDRTONE]
+    if (const PF_ParamDef* p = def(kIndexHdrTone)) {
+        c.hdrTone = static_cast<int>(p->u.pd.value);
+    }
     // [WP-LOOK]
     if (const PF_ParamDef* p = def(kIndexRec709Look)) {
         c.rec709Look = static_cast<int>(p->u.pd.value);
@@ -452,6 +462,7 @@ void writeControls(PF_ParamDef* params[], const ControlValues& wanted) noexcept 
     };
 
     setPopup(kIndexColorOutput, wanted.colorOutput);
+    setPopup(kIndexHdrTone, wanted.hdrTone);        // [WP-HDRTONE]
     setPopup(kIndexRec709Look, wanted.rec709Look);  // [WP-LOOK]
     setPopup(kIndexHdrPeak, wanted.hdrPeak);        // [WP-HDRPEAK]
     setPopup(kIndexOutputSize, wanted.outputSize);
@@ -572,7 +583,7 @@ PF_Err globalSetdown(PF_InData*, PF_OutData*) noexcept {
     return PF_Err_NONE;
 }
 
-/// PF_Cmd_PARAMS_SETUP: the twenty-three controls, and [WP-DEFAULTS] the Defaults
+/// PF_Cmd_PARAMS_SETUP: the twenty-six controls, and [WP-DEFAULTS] the Defaults
 /// group's two buttons at the end (buttons hold no value, so they have no
 /// time axis to refuse and carry only PF_ParamFlag_SUPERVISE).
 ///
@@ -595,7 +606,18 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Colour Output", OSV_SS_COLOR_COUNT, OSV_SS_COLOR_DEFAULT, OSV_SS_COLOR_ITEMS, kStaticFlags,
                   OSV_SS_ID_COLOR_OUTPUT);
 
-    // ---- 2. Look (Rec. 709 only) [WP-LOOK] ---------------------------------
+    // ---- 2. Transfer Function (HDR) [WP-HDRTONE] ----------------------------
+    // How D-Log M scene light becomes display light on the PQ and HLG
+    // outputs, right under the output it belongs to: the ACES 2.0 tonescale
+    // fitted to DJI's rendering (Bright, the default, or Detailed), BT.2408's
+    // anchors with deep blacks (Natural or Punchy), or the BT.2408
+    // scene-referred rendering of earlier builds (Neutral).  Effect controls
+    // have no tooltips, so the items say "(outdoor)" / "(indoor)" themselves.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUPX(OSV_SS_HDR_TONE_NAME, OSV_SS_HDR_TONE_COUNT, OSV_SS_HDR_TONE_DEFAULT, OSV_SS_HDR_TONE_ITEMS,
+                  kStaticFlags, OSV_SS_ID_HDR_TONE);
+
+    // ---- 3. Look (Rec. 709 only) [WP-LOOK] ---------------------------------
     // The Rec. 709 output's display look, right under the output it belongs
     // to: DJI Studio's rendering (the default) or OpenOSV's standard one.
     // The name carries "(Rec. 709 only)" because PQ, HLG and the passthrough
@@ -604,7 +626,7 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Look (Rec. 709 only)", OSV_SS_LOOK_COUNT, OSV_SS_LOOK_DEFAULT, OSV_SS_LOOK_ITEMS, kStaticFlags,
                   OSV_SS_ID_REC709_LOOK);
 
-    // ---- 3. HDR Peak (PQ only) [WP-HDRPEAK] --------------------------------
+    // ---- 4. HDR Peak (PQ only) [WP-HDRPEAK] --------------------------------
     // The display peak the PQ output's highlights roll off into (BT.2408
     // Annex 5 EETF): 1000 nits (the default) leaves the master untouched,
     // 600 / 400 compress only what is above their knees, 203 keeps the whole
@@ -615,7 +637,7 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("HDR Peak (PQ only)", OSV_SS_HDR_PEAK_COUNT, OSV_SS_HDR_PEAK_DEFAULT, OSV_SS_HDR_PEAK_ITEMS,
                   kStaticFlags, OSV_SS_ID_HDR_PEAK);
 
-    // ---- 4. Output Size ----------------------------------------------------
+    // ---- 5. Output Size ----------------------------------------------------
     // The size a new sequence built from the clip inherits, which is why the
     // labels spell the pixels out.  Every entry is 2:1 because a full
     // 360 x 180 sphere is; the 16:9 delivery crop is the reframe effect's job.
@@ -623,37 +645,37 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Output Size", OSV_SS_SIZE_COUNT, OSV_SS_SIZE_DEFAULT, OSV_SS_SIZE_ITEMS, kStaticFlags,
                   OSV_SS_ID_OUTPUT_SIZE);
 
-    // ---- 5. Stabilisation --------------------------------------------------
+    // ---- 6. Stabilisation --------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Stabilisation", OSV_SS_STAB_COUNT, OSV_SS_STAB_DEFAULT, OSV_SS_STAB_ITEMS, kStaticFlags,
                   OSV_SS_ID_STABILIZATION);
 
-    // ---- 6. Stitching topic ------------------------------------------------
+    // ---- 7. Stitching topic ------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_TOPICX("Stitching", PF_ParamFlag_NONE, OSV_SS_ID_STITCH_TOPIC);
 
-    // ---- 7. Seam Search ----------------------------------------------------
+    // ---- 8. Seam Search ----------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Seam Search", OSV_SS_SEAM_SEARCH_DEFAULT, kStaticFlags, OSV_SS_ID_SEAM_SEARCH);
 
-    // ---- 8. Exposure Match -------------------------------------------------
+    // ---- 9. Exposure Match -------------------------------------------------
     // The blob field is called gainMatch; the label says what it does to a
     // user, which is match the two lenses' exposure across the seam.
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Exposure Match", OSV_SS_GAIN_MATCH_DEFAULT, kStaticFlags, OSV_SS_ID_GAIN_MATCH);
 
-    // ---- 9. Calibration ----------------------------------------------------
+    // ---- 10. Calibration ----------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Calibration", OSV_SS_CALIB_COUNT, OSV_SS_CALIB_DEFAULT, OSV_SS_CALIB_ITEMS, kStaticFlags,
                   OSV_SS_ID_CALIBRATION);
 
-    // ---- 10. Sun Ghost Removal [WP-FLARE] -------------------------------------
+    // ---- 11. Sun Ghost Removal [WP-FLARE] -------------------------------------
     // Subtracts the fitted reflections of a sun that is in frame
     // (docs/research/FLARE.md).  On by default, as PrefsBlob::defaults().
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOXX("Sun Ghost Removal", OSV_SS_FLARE_REMOVAL_DEFAULT, kStaticFlags, OSV_SS_ID_FLARE_REMOVAL);
 
-    // ---- 11. Sky Seam Fix [WP-PHOTO] -----------------------------------------
+    // ---- 12. Sky Seam Fix [WP-PHOTO] -----------------------------------------
     // The photometric seam field (docs/research/NEURAL_STITCHING.md, section
     // 8): each lens's blend weight ends at its measured usable rim, and in
     // "Rim and colour" a 2-D gain field evens the two lenses' brightness and
@@ -663,7 +685,7 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Sky Seam Fix", OSV_SS_PHOTO_SEAM_COUNT, OSV_SS_PHOTO_SEAM_DEFAULT, OSV_SS_PHOTO_SEAM_ITEMS,
                   kStaticFlags, OSV_SS_ID_PHOTO_SEAM);
 
-    // ---- 12. Sky Seam Strength [WP-PHOTO] ------------------------------------
+    // ---- 13. Sky Seam Strength [WP-PHOTO] ------------------------------------
     // How much of the colour field applies, in whole percent (the blob's
     // step), shown with the host's percent sign.
     AEFX_CLR_STRUCT(def);
@@ -671,7 +693,7 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_PHOTO_STRENGTH_MIN, OSV_SS_PHOTO_STRENGTH_MAX, OSV_SS_PHOTO_STRENGTH_DEFAULT,
                          PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT, kStaticFlags, OSV_SS_ID_PHOTO_STRENGTH);
 
-    // ---- 13. Seam Edge Inset [WP-PHOTO] --------------------------------------
+    // ---- 14. Seam Edge Inset [WP-PHOTO] --------------------------------------
     // Degrees inside the calibrated field of view where the render blend
     // ends when the sky seam fix is off or refused (the fix's per-longitude
     // rim replaces it otherwise); tenths, the blob's step.
@@ -680,16 +702,16 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_SEAM_INSET_MAX, OSV_SS_SEAM_INSET_DEFAULT, PF_Precision_TENTHS,
                          PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_SEAM_INSET);
 
-    // ---- 14-18. The carved seam's tweaks [WP-SEAMTOOLS] --------------------
+    // ---- 15-19. The carved seam's tweaks [WP-SEAMTOOLS] --------------------
     // Degrees, hundredths shown (the blob keeps twentieths for the widths,
     // hundredths for the offsets).  Every default is the seam as it renders
     // without them, and each changes only the overlap band.
-    //   14 Seam Blend      feather where the lenses agree;
-    //   15 Parallax Blend  feather where they disagree (0 = a hard cut);
-    //   16 Seam Smoothing  colour and shading blend this wide, detail still
+    //   15 Seam Blend      feather where the lenses agree;
+    //   16 Parallax Blend  feather where they disagree (0 = a hard cut);
+    //   17 Seam Smoothing  colour and shading blend this wide, detail still
     //                      switches at the seam (0 = off);
-    //   17 Near Offset     nudge near content along the seam;
-    //   18 Far Offset      nudge far content along the seam.
+    //   18 Near Offset     nudge near content along the seam;
+    //   19 Far Offset      nudge far content along the seam.
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Seam Blend", OSV_SS_SEAM_BLEND_MIN, OSV_SS_SEAM_BLEND_MAX, OSV_SS_SEAM_BLEND_MIN,
                          OSV_SS_SEAM_BLEND_MAX, OSV_SS_SEAM_BLEND_DEFAULT, PF_Precision_HUNDREDTHS,
@@ -711,7 +733,7 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_SEAM_OFFSET_MAX, OSV_SS_SEAM_OFFSET_DEFAULT, PF_Precision_HUNDREDTHS,
                          PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_FAR_OFFSET);
 
-    // ---- 19. Lens Shading [WP-VIGNETTE] --------------------------------------
+    // ---- 20. Lens Shading [WP-VIGNETTE] --------------------------------------
     // Each lens's own brightness structure near its rim, measured from its
     // own sky and added back before the blend (docs/research/
     // NEURAL_STITCHING.md, section 9).  Default Auto, as PrefsBlob::defaults().
@@ -719,7 +741,7 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Lens Shading", OSV_SS_LENS_SHADING_COUNT, OSV_SS_LENS_SHADING_DEFAULT, OSV_SS_LENS_SHADING_ITEMS,
                   kStaticFlags, OSV_SS_ID_LENS_SHADING);
 
-    // ---- 20. Shading Strength [WP-VIGNETTE] ----------------------------------
+    // ---- 21. Shading Strength [WP-VIGNETTE] ----------------------------------
     // How much of the measured correction applies, in whole percent (the
     // blob's step), shown with the host's percent sign.
     AEFX_CLR_STRUCT(def);
@@ -727,7 +749,7 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_SHADING_STRENGTH_MIN, OSV_SS_SHADING_STRENGTH_MAX, OSV_SS_SHADING_STRENGTH_DEFAULT,
                          PF_Precision_INTEGER, PF_ValueDisplayFlag_PERCENT, kStaticFlags, OSV_SS_ID_SHADING_STRENGTH);
 
-    // ---- 21. Parallax Grid [WP-STEADY] -----------------------------------------
+    // ---- 22. Parallax Grid [WP-STEADY] -----------------------------------------
     // Whether the seam corrections are held still for the whole clip (a
     // rigid mount: nothing at the seam moves) or measured per moment
     // (handheld, near objects moving past); Auto decides from the clip
@@ -736,14 +758,14 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Parallax Grid", OSV_SS_PARALLAX_GRID_COUNT, OSV_SS_PARALLAX_GRID_DEFAULT,
                   OSV_SS_PARALLAX_GRID_ITEMS, kStaticFlags, OSV_SS_ID_PARALLAX_GRID);
 
-    // ---- 22. Lens Alignment [WP-STEADY] ----------------------------------------
+    // ---- 23. Lens Alignment [WP-STEADY] ----------------------------------------
     // Fit the small rotation between the two lenses once per clip and fold it
     // into the stitch, or trust the recorded calibration.  Default Auto.
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Lens Alignment", OSV_SS_LENS_ALIGN_COUNT, OSV_SS_LENS_ALIGN_DEFAULT, OSV_SS_LENS_ALIGN_ITEMS,
                   kStaticFlags, OSV_SS_ID_LENS_ALIGN);
 
-    // ---- 23. Close the Stitching group -------------------------------------
+    // ---- 24. Close the Stitching group -------------------------------------
     // PF_END_TOPIC issues its own PF_ADD_PARAM (Param_Utils.h:309-316), so the
     // terminator occupies a parameter slot of its own and everything after it
     // shifts up by one.  Leaving it out would not merely lose a divider: the
@@ -753,16 +775,16 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_STITCH_TOPIC_END);
 
-    // ---- 24. Advanced topic (collapsed: most users never touch it) ----------
+    // ---- 25. Advanced topic (collapsed: most users never touch it) ----------
     AEFX_CLR_STRUCT(def);
     PF_ADD_TOPICX("Advanced", PF_ParamFlag_START_COLLAPSED, OSV_SS_ID_ADVANCED_TOPIC);
 
-    // ---- 25. D-Log M Curve -------------------------------------------------
+    // ---- 26. D-Log M Curve -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("D-Log M Curve", OSV_SS_FIT_COUNT, OSV_SS_FIT_DEFAULT, OSV_SS_FIT_ITEMS, kStaticFlags,
                   OSV_SS_ID_DLOGM_FIT);
 
-    // ---- 26. Exposure ------------------------------------------------------
+    // ---- 27. Exposure ------------------------------------------------------
     // Valid range is the blob's own +/- 6 stops (static_asserted below the
     // handlers); the slider shows the useful +/- 3 so a drag has resolution.
     AEFX_CLR_STRUCT(def);
@@ -770,12 +792,12 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_EXPOSURE_SLIDER_MIN, OSV_SS_EXPOSURE_SLIDER_MAX, OSV_SS_EXPOSURE_DEFAULT,
                          PF_Precision_TENTHS, PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_EXPOSURE);
 
-    // ---- 27. Render Device -------------------------------------------------
+    // ---- 28. Render Device -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Render Device", OSV_SS_DEVICE_COUNT, OSV_SS_DEVICE_DEFAULT, OSV_SS_DEVICE_ITEMS, kStaticFlags,
                   OSV_SS_ID_RENDER_DEVICE);
 
-    // ---- 28. Program Monitor Colour [WP-SETTINGS] --------------------------
+    // ---- 29. Program Monitor Colour [WP-SETTINGS] --------------------------
     // What Open 360 Reframe shows when this clip's Colour Output is not the
     // sequence's working space: the scene rendered straight into it (fast,
     // the default) or Premiere's own conversion of the output (matches the
@@ -785,11 +807,11 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Program Monitor Colour", OSV_SS_DIRECT_COLOUR_COUNT, OSV_SS_DIRECT_COLOUR_DEFAULT,
                   OSV_SS_DIRECT_COLOUR_ITEMS, kStaticFlags, OSV_SS_ID_DIRECT_COLOUR);
 
-    // ---- 29. Close the Advanced group --------------------------------------
+    // ---- 30. Close the Advanced group --------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_ADVANCED_TOPIC_END);
 
-    // ---- 30-33. Defaults [WP-DEFAULTS] -------------------------------------
+    // ---- 31-34. Defaults [WP-DEFAULTS] -------------------------------------
     // Two momentary buttons: store this clip's settings as the defaults every
     // NEW clip starts from, or remove them so new clips start from the
     // built-in defaults again.  Neither changes this clip.  A button carries
@@ -1046,11 +1068,13 @@ PF_Err translateParamsToPrefs(PF_InData* in_data, PF_ParamDef* params[],
     // memcpy of exactly our struct size is the whole write.
     std::memcpy(extra->prefsPC, &blob, PrefsBlob::kSize);
 
-    PluginLog::debug("source settings: translated - colour {}, look {}, HDR peak {:.0f} nits, size {}, stab {}, "
-                     "seam {}, gain {}, calib {}, fit {}, exposure {:+.2f}, device {}, sun ghost removal {}, sky seam "
-                     "fix {} at {:.0f} %, seam edge inset {:.1f} deg, seam blend {:.2f} / parallax blend {:.2f} / "
-                     "smoothing {:.2f} deg, near / far offset {:+.2f} / {:+.2f} deg, lens shading {} at {:.0f} %",
-                     blob.colorOutput, blob.look, static_cast<double>(blob.hdrPeakNits()), blob.outputSize,
+    PluginLog::debug("source settings: translated - colour {}, HDR tone {}, look {}, HDR peak {:.0f} nits, size {}, "
+                     "stab {}, seam {}, gain {}, calib {}, fit {}, exposure {:+.2f}, device {}, sun ghost removal {}, "
+                     "sky seam fix {} at {:.0f} %, seam edge inset {:.1f} deg, seam blend {:.2f} / parallax blend "
+                     "{:.2f} / smoothing {:.2f} deg, near / far offset {:+.2f} / {:+.2f} deg, lens shading {} at "
+                     "{:.0f} %",
+                     blob.colorOutput, blob.hdrTone /* [WP-HDRTONE] */, blob.look,
+                     static_cast<double>(blob.hdrPeakNits()), blob.outputSize,
                      blob.stabilization, blob.seamSearch,
                      blob.gainMatch, blob.calibration, blob.dlogmFit, static_cast<double>(blob.exposureStops),
                      blob.renderDevice, blob.flareRemoval, blob.photoSeam, blob.photoStrengthPercent(),
@@ -1111,6 +1135,12 @@ static_assert(OSV_SS_HDR_PEAK_COUNT == static_cast<int>(osv::premiere::PrefsHdrP
               "the HDR Peak popup does not list every PrefsHdrPeak value");
 static_assert(OSV_SS_HDR_PEAK_DEFAULT == static_cast<int>(osv::premiere::PrefsHdrPeak::Nits1000) + 1,
               "the HDR Peak popup's default is not PrefsBlob::defaults()' 1000 nits");
+// [WP-HDRTONE] The Transfer Function popup lists every PrefsHdrTone value in
+// enum order, and its default is the zero byte (ACES 2 Bright).
+static_assert(OSV_SS_HDR_TONE_COUNT == static_cast<int>(osv::premiere::PrefsHdrTone::Count),
+              "the Transfer Function (HDR) popup does not list every PrefsHdrTone value");
+static_assert(OSV_SS_HDR_TONE_DEFAULT == static_cast<int>(osv::premiere::PrefsHdrTone::Aces2Bright) + 1,
+              "the Transfer Function (HDR) popup's default is not PrefsBlob::defaults()' ACES 2 Bright");
 // [WP-PHOTO] The sky seam fix: the popup covers PrefsPhotoSeam and the two
 // sliders offer exactly the range the blob can store - whole percent
 // 0..100 (codes 1..101) and tenths 0.0..6.0 (codes 1..61) - with the blob's

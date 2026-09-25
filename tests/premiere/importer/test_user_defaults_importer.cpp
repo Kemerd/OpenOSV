@@ -352,3 +352,40 @@ TEST_CASE("the dialog template carries the Save as Default button on the OK row"
     ::DestroyWindow(dialog);
     ::FreeLibrary(module);
 }
+
+TEST_CASE("the dialog template carries the transfer function under Colour output", "[importer][dialog][hdrtone]") {
+    // [WP-HDRTONE] The row the dialog code fills, greys and puts its tooltip
+    // on, as the built .prm carries it.
+    HMODULE module = ::LoadLibraryExW(importerModulePath().c_str(), nullptr,
+                                      LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    REQUIRE(module != nullptr);
+    HWND dialog = ::CreateDialogParamW(module, MAKEINTRESOURCEW(IDD_SOURCE_SETTINGS), nullptr, &inertDialogProc, 0);
+    REQUIRE(dialog != nullptr);
+
+    HWND colour = ::GetDlgItem(dialog, IDC_COLOR_OUTPUT);
+    HWND tone = ::GetDlgItem(dialog, IDC_HDR_TONE);
+    HWND label = ::GetDlgItem(dialog, IDC_STATIC_HDR_TONE);
+    HWND look = ::GetDlgItem(dialog, IDC_REC709_LOOK);
+    REQUIRE(colour != nullptr);
+    REQUIRE(tone != nullptr);
+    REQUIRE(label != nullptr);
+    REQUIRE(look != nullptr);
+    wchar_t text[64] = {};
+    ::GetWindowTextW(label, text, static_cast<int>(std::size(text)));
+    CHECK(std::wstring(text) == L"Transfer (HDR):");
+    // One row under Colour output, one row above the Rec.709 look, aligned
+    // with both, and nothing overlapping.
+    RECT c{};
+    RECT t{};
+    RECT l{};
+    REQUIRE(::GetWindowRect(colour, &c));
+    REQUIRE(::GetWindowRect(tone, &t));
+    REQUIRE(::GetWindowRect(look, &l));
+    CHECK(t.left == c.left);
+    CHECK(t.left == l.left);
+    CHECK(t.top > c.top);
+    CHECK(l.top > t.top);
+
+    ::DestroyWindow(dialog);
+    ::FreeLibrary(module);
+}

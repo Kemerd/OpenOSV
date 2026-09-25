@@ -18,8 +18,9 @@
        script is not elevated it explains why and relaunches itself with the
        same arguments through UAC.
 
-       The .cube LUTs from <repo>\luts are copied into a LUTs\ subfolder of
-       that same directory, so Lumetri has a stable path to browse to and
+       The LUT set from <repo>\luts (its Rec2100_PQ, Rec2100_HLG and Rec709
+       folders and README.txt) is copied into a LUTs\ subfolder of that same
+       directory, folders kept, so Lumetri has a stable path to browse to and
        -Uninstall removes them with everything else.  They are build output
        (scripts\gen_luts.ps1); a checkout where that has never been run just
        gets a note and no LUTs.
@@ -367,8 +368,12 @@ function Assert-HostsClosed {
 # ---------------------------------------------------------------------------
 #  Colour LUTs
 #
-#  The .cube files in <repo>\luts are copied into <Destination>\LUTs so a user
-#  can point Lumetri at a stable path instead of hunting through a build tree.
+#  The LUT set in <repo>\luts - one folder per output (Rec2100_PQ,
+#  Rec2100_HLG, Rec709) and the README.txt that says which file to use - is
+#  copied into <Destination>\LUTs, folders kept, so a user can point Lumetri
+#  at a stable path instead of hunting through a build tree.  In a release
+#  package the folder beside scripts\ is spelled LUTs; Windows paths are
+#  case-insensitive, so the same lookup finds it.
 #
 #  This runs in the ELEVATED half, unlike the sequence presets: the target is
 #  under Program Files next to the modules, is machine-wide rather than
@@ -387,11 +392,16 @@ function Install-Luts {
         Write-Info "No luts directory at '$source'; skipping the colour LUTs."
         return
     }
-    $files = @(Get-ChildItem -LiteralPath $source -File -Filter '*.cube' -ErrorAction SilentlyContinue)
+    # Every table in every output folder, and the README beside them.
+    $files = @(Get-ChildItem -LiteralPath $source -File -Recurse -Filter '*.cube' -ErrorAction SilentlyContinue)
     if ($files.Count -eq 0) {
         Write-Info "No .cube files in '$source'; skipping the colour LUTs."
         Write-Info 'Run scripts\gen_luts.ps1 to generate them.'
         return
+    }
+    $readme = Get-Item -LiteralPath (Join-Path $source 'README.txt') -ErrorAction SilentlyContinue
+    if ($readme) {
+        $files += $readme
     }
 
     $target = Join-Path $Path $script:LutFolderName
@@ -399,18 +409,35 @@ function Install-Luts {
         if (-not (Test-Path -LiteralPath $target)) {
             New-Item -ItemType Directory -Path $target -Force | Out-Null
         }
+        # Replace, never merge: tables an older release installed (0.2.0 put
+        # three OpenOSV_Osmo360_*.cube files at the top of this folder) would
+        # otherwise sit beside the new set looking current.  Only our own
+        # kinds of file are removed; the folder is OpenOSV's.
+        Get-ChildItem -LiteralPath $target -Recurse -File -Include '*.cube', 'README.txt' -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        # Copy with the folders kept: <source>\Rec2100_PQ\x.cube lands in
+        # <target>\Rec2100_PQ\x.cube.
+        $root = (Resolve-Path -LiteralPath $source).Path.TrimEnd('\') + '\'
         foreach ($file in $files) {
-            Copy-Item -LiteralPath $file.FullName -Destination $target -Force
+            $relative = $file.FullName.Substring($root.Length)
+            $destination = Join-Path $target $relative
+            $folder = Split-Path -Parent $destination
+            if (-not (Test-Path -LiteralPath $folder)) {
+                New-Item -ItemType Directory -Path $folder -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
         }
-        Write-Step "Installed $($files.Count) colour LUT(s)"
+        $cubes = @($files | Where-Object { $_.Extension -eq '.cube' })
+        Write-Step "Installed $($cubes.Count) colour LUT(s)"
         Write-Info "into $target"
         foreach ($file in $files) {
-            Write-Info "    $($file.Name)"
+            Write-Info "    $($file.FullName.Substring($root.Length))"
         }
         Write-Info 'Apply one with Lumetri Color > Creative > Look > Browse...,'
         Write-Info 'or Basic Correction > Input LUT > Browse..., and point it there.'
         Write-Info 'Only on a D-Log M PASSTHROUGH output - never on top of a'
         Write-Info 'PQ / HLG / 709 output, which is already converted.'
+        Write-Info 'README.txt there says which one to pick.'
     }
     catch {
         Write-Warn "Could not install the colour LUTs into '$target': $($_.Exception.Message)"

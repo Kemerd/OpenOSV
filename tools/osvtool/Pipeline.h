@@ -69,6 +69,9 @@ struct PipelineOptions {
     double exposureStops = 0.0;
     std::string look = "dji";                     ///< dji | standard (Rec.709 output only)
     std::string hdrPeak = "1000";                 ///< [WP-HDRPEAK] 1000 | 600 | 400 | 203 nits (PQ output only)
+    /// [WP-HDRTONE] aces-bright | aces-detailed | bt2408-natural | bt2408-punchy
+    /// | bt2408-neutral (D-Log M to PQ / HLG only)
+    std::string tone = "aces-bright";
 
     // Decode / render backends
     std::string hw = "none";                      ///< none | d3d11va | cuda | auto

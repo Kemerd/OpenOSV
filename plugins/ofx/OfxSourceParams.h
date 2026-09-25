@@ -33,6 +33,8 @@ namespace osv::ofx::source_params {
 // ---------------------------------------------------------------------------
 inline constexpr const char* kColourGroup = "colourGroup";
 inline constexpr const char* kColorOutput = "colorOutput";
+/// [WP-HDRTONE] "Transfer Function (HDR)": the PQ / HLG outputs' style.
+inline constexpr const char* kHdrTone = "hdrTone";
 inline constexpr const char* kLook = "look";
 inline constexpr const char* kHdrPeak = "hdrPeak";
 inline constexpr const char* kStabilization = "stabilization";
@@ -61,7 +63,7 @@ inline constexpr const char* kSphereSize = "sphereSize";
 
 /// Every parameter describe() defines, in definition order (for the tests).
 inline constexpr const char* kAllParams[] = {
-    kColourGroup,   kColorOutput,   kLook,         kHdrPeak,         kStabilization, kStitchGroup,
+    kColourGroup,   kColorOutput,   kHdrTone /* [WP-HDRTONE] */, kLook, kHdrPeak, kStabilization, kStitchGroup,
     kSeamSearch,    kGainMatch,     kCalibration,  kFlareRemoval,    kSkySeamFix,    kSkySeamStrength,
     kSeamEdgeInset, kSeamBlend,     kParallaxBlend, kSeamSmoothing,  kNearOffset,    kFarOffset,
     kLensShading,   kShadingStrength, kParallaxGrid, kLensAlignment, kAdvancedGroup, kDlogmCurve,

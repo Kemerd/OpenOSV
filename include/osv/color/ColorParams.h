@@ -96,8 +96,10 @@ inline constexpr float kHdrPeakChoicesNits[] = {1000.0f, 600.0f, 400.0f, 203.0f}
 void setHdrPeak(OsvColorParams& params, float targetNits) noexcept;
 
 /// The peak the block's PQ output can reach in nits: its roll-off target
-/// when one is active, otherwise its OOTF peak (1000).  0 for a block that
-/// is not PQ, because only PQ output is an absolute display light level.
+/// when one is active, otherwise its OOTF peak (1000), and [WP-HDRTONE]
+/// never more than an active tone style's ceiling (600 for ACES 2 Bright).
+/// 0 for a block that is not PQ, because only PQ output is an absolute
+/// display light level.
 [[nodiscard]] float hdrPeakNitsOf(const OsvColorParams& params) noexcept;
 
 /// Where the roll-off starts for a target, in nits: the BT.2408 knee
@@ -110,6 +112,93 @@ void setHdrPeak(OsvColorParams& params, float targetNits) noexcept;
 /// choices), also spelled with a "nits" suffix, and "sdr" / "sdr-safe" for
 /// 203.  Returns false and leaves `nits` untouched for anything else.
 [[nodiscard]] bool parseHdrPeak(std::string_view text, float& nits) noexcept;
+
+// -----------------------------------------------------------------------------
+//  [WP-HDRTONE] Transfer Function (HDR)
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief How D-Log M scene light becomes HDR display light on the BT.2100 PQ
+ *        and HLG outputs ("Transfer Function (HDR)" in Source Settings).
+ *
+ * Persisted (as PrefsHdrTone in the importer's preference blob, where zero
+ * means "the default"), so the values are append-only and never renumbered.
+ * Only D-Log M input to the PQ and HLG outputs has a style; HLG / Normal
+ * input, Rec.709, linear and the passthrough ignore it.  docs/COLOR.md,
+ * "Transfer Function (HDR)", has the constants, anchors and provenance.
+ */
+enum class HdrTone : int {
+    /// ACES 2.0 tone scale fitted to DJI's own D-Log M -> Rec.709 LUT, grey
+    /// pinned at BT.2408's 26 nits and the sensor clip at 600 nits: bright,
+    /// with a soft highlight shoulder.  The default - good for outdoor.
+    Aces2Bright = 0,
+    /// The same ACES 2.0 fit re-evaluated for a 1000-nit display with the
+    /// ACES peak rule: grey 13.8 nits, diffuse white 98, clip 374.  More
+    /// highlight detail, darker overall - good for indoor.
+    Aces2Detailed = 1,
+    /// Through BT.2408's anchors (grey 26, diffuse white 203, clip 1000 nits)
+    /// with DJI's toe flare (deep blacks), on luminance: scene saturation.
+    Bt2408Natural = 2,
+    /// The same curve per channel: about 40 % more chroma.
+    Bt2408Punchy = 3,
+    /// The BT.2408 scene-referred rendering (HLG OETF / HLG OOTF + PQ) of
+    /// every build before the setting existed, bit for bit.
+    Bt2408Neutral = 4,
+};
+
+/// Number of HdrTone values (the Source Settings popup lists every one).
+inline constexpr int kHdrToneCount = 5;
+
+/// The style new code, the CLI and a zeroed preference byte select.
+inline constexpr HdrTone kDefaultHdrTone = HdrTone::Aces2Bright;
+
+/// The constants of one style's tone scale (see osvHdrToneApply), in double
+/// precision so tests and tools can evaluate the reference curve.
+/// mode == OSV_HDR_TONE_OFF (every constant zero) is the Neutral rendering.
+struct HdrToneCurve {
+    int mode = OSV_HDR_TONE_OFF;  ///< OSV_HDR_TONE_PER_CHANNEL / _LUMINANCE, or OFF.
+    double m2 = 0.0;              ///< Michaelis-Menten scale m_2 (units of 100 nits).
+    double s2 = 0.0;              ///< Michaelis-Menten half-saturation s_2 (scene-linear).
+    double g = 0.0;               ///< Contrast exponent g.
+    double t1 = 0.0;              ///< ACES 2.0 flare term t_1.
+    double capNits = 0.0;         ///< Display light ceiling in nits.
+};
+
+/// The constants of a style; an out-of-range value (a corrupt persisted
+/// byte) returns the default style's, like dlogmCurve does.
+[[nodiscard]] HdrToneCurve hdrToneCurve(HdrTone tone) noexcept;
+
+/// The reference tone scale in double precision: display nits (uncapped) for
+/// scene-linear `x` (18 % grey = 0.18), 100 * max(0, f^2 / (f + t_1)) with
+/// f = m_2 * (max(x, 0) / (max(x, 0) + s_2))^g.  0 for a curve with
+/// mode == OSV_HDR_TONE_OFF or unusable constants, and for non-finite x.
+[[nodiscard]] double hdrToneNits(const HdrToneCurve& curve, double x) noexcept;
+
+/**
+ * @brief Set the HDR tone style on an already built block.
+ *
+ * Fills the block's hdrTone* group with the style's constants (floats), the
+ * cap limited to the block's own peakNits.  The group is ZEROED - the
+ * Neutral rendering - for HdrTone::Bt2408Neutral and whenever the block is
+ * not D-Log M input to the PQ or HLG output, so every such block is
+ * byte-identical to one built before the setting existed.  A value outside
+ * the enum (a corrupt caller) is the default style, as in hdrToneCurve.
+ */
+void setHdrTone(OsvColorParams& params, HdrTone tone) noexcept;
+
+/// Stable lower-case names ("aces-bright", "aces-detailed",
+/// "bt2408-natural", "bt2408-punchy", "bt2408-neutral").
+[[nodiscard]] const char* hdrToneName(HdrTone tone) noexcept;
+
+/// The label the UI shows ("ACES 2 - Bright (outdoor)", ...), the same text
+/// as the Source Settings popup items.
+[[nodiscard]] const char* hdrToneLabel(HdrTone tone) noexcept;
+
+/// Parse a style (case-insensitive): "aces-bright" / "bright",
+/// "aces-detailed" / "detailed", "bt2408-natural" / "natural",
+/// "bt2408-punchy" / "punchy", "bt2408-neutral" / "neutral" / "standard".
+/// Returns false and leaves `out` untouched for anything else.
+[[nodiscard]] bool parseHdrTone(std::string_view text, HdrTone& out) noexcept;
 
 /// Stable lower-case names ("dji", "pocket3", "osmo360").
 [[nodiscard]] const char* dlogMFitName(DlogMFit fit) noexcept;
@@ -176,11 +265,17 @@ void setHdrPeak(OsvColorParams& params, float targetNits) noexcept;
  * @param hdrPeakNits    [WP-HDRPEAK] Target display peak of the PQ output
  *                       (see setHdrPeak).  The default, 1000, is no roll-off.
  *                       Ignored by every other transfer.
+ * @param tone           [WP-HDRTONE] How D-Log M scene light becomes display
+ *                       light on the PQ and HLG outputs (see setHdrTone).
+ *                       The default is ACES 2 Bright; HdrTone::Bt2408Neutral
+ *                       is the rendering of every build before the setting.
+ *                       Ignored by every other input and transfer.
  *
  * Inputs outside their valid range are clamped (bit depth to 8..16, non-finite
  * stops to 0, non-positive scene scale to the BT.2408 default, an unknown look
- * to the standard rendering, a non-finite HDR peak to no roll-off) rather than
- * rejected, so the function can never produce a block that crashes a kernel.
+ * to the standard rendering, a non-finite HDR peak to no roll-off, an unknown
+ * tone style to the default one) rather than rejected, so the function can
+ * never produce a block that crashes a kernel.
  */
 [[nodiscard]] OsvColorParams makeColorParams(DlogMFit fit, OutputTransfer transfer, float exposureStops,
                                              InputEncoding input = InputEncoding::DLogM, bool narrowInput = true,
@@ -188,7 +283,8 @@ void setHdrPeak(OsvColorParams& params, float targetNits) noexcept;
                                              const OsvDlogMCurve* curveOverride = nullptr,
                                              float sceneScale = kBt2408SceneScale,
                                              Look look = kDefaultLook,
-                                             float hdrPeakNits = kDefaultHdrPeakNits) noexcept;
+                                             float hdrPeakNits = kDefaultHdrPeakNits,
+                                             HdrTone tone = kDefaultHdrTone) noexcept;
 
 /// A disabled block (every stage copies input to output).
 [[nodiscard]] OsvColorParams makeDisabledColorParams() noexcept;

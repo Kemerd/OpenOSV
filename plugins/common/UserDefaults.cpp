@@ -149,6 +149,12 @@ constexpr const char* kFlowTokens[] = {"auto", "classical", "neural"};
 constexpr const char* kPhotoTokens[] = {"off", "rim-only", "rim-and-colour"};
 constexpr const char* kDirectTokens[] = {"sequence-space", "match-source"};
 constexpr const char* kShadingTokens[] = {"off", "auto"};  // [WP-VIGNETTE]
+// [WP-HDRTONE] PrefsHdrTone order, spelled as osv::color::hdrToneName and
+// osvtool's --tone spell them.
+constexpr const char* kHdrToneTokens[] = {"aces-bright", "aces-detailed", "bt2408-natural", "bt2408-punchy",
+                                          "bt2408-neutral"};
+static_assert(std::size(kHdrToneTokens) == static_cast<std::size_t>(PrefsHdrTone::Count),
+              "hdrTone does not spell every PrefsHdrTone value");
 // [WP-STEADY] In ENUM order (the token list is indexed by the stored value),
 // which is not the panel's order: the enums keep the older behaviour at 0.
 constexpr const char* kGridTokens[] = {"follows-scene", "steady", "auto"};
@@ -344,6 +350,11 @@ const FieldSpec kFields[] = {
     {{"colourOutput", OSV_UD_FIELD(colorOutput), 0, 0},
      [](const PrefsBlob& p) { return tokenJson(p.colorOutput, kColourTokens); },
      [](const Json& v, PrefsBlob& p, std::string& why, bool&) { return tokenFrom(v, kColourTokens, p.colorOutput, why); }},
+    // [WP-HDRTONE] The PQ / HLG outputs' transfer function, right under
+    // Colour Output as in the panel.
+    {{"hdrTone", OSV_UD_FIELD(hdrTone), 0, 0},
+     [](const PrefsBlob& p) { return tokenJson(p.hdrTone, kHdrToneTokens); },
+     [](const Json& v, PrefsBlob& p, std::string& why, bool&) { return tokenFrom(v, kHdrToneTokens, p.hdrTone, why); }},
     {{"rec709Look", OSV_UD_FIELD(look), 0, 0},
      [](const PrefsBlob& p) { return tokenJson(p.look, kLookTokens); },
      [](const Json& v, PrefsBlob& p, std::string& why, bool&) { return tokenFrom(v, kLookTokens, p.look, why); }},

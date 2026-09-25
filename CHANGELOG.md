@@ -6,6 +6,53 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-24
+
+### Added
+
+* **Transfer Function (HDR).** A per-clip choice of how D-Log M becomes
+  BT.2100 PQ or HLG light, right under Colour Output in Source Settings, the
+  importer dialog and the DaVinci Resolve generator:
+  * **ACES 2 - Bright (outdoor)**, the new default: a tone scale based on
+    the ACES 2.0 tonescale, its contrast and toe fitted to DJI's published
+    D-Log M to Rec.709 LUT. Grey sits at BT.2408's 26 nits, diffuse white at
+    169, and a soft shoulder ends at 600 nits at the sensor clip.
+  * **ACES 2 - Detailed (indoor)**: the same fit at a 1000-nit peak. Grey
+    13.8 nits, white 98, clip 374: darker, with the most highlight detail.
+  * **BT.2408 - Deep Blacks + Natural** and **+ Punchy**: BT.2408's grey
+    (26), reference white (203) and a 1000-nit clip, with DJI's toe. Natural
+    tone-maps luminance and keeps the scene's saturation; Punchy works per
+    channel, about 40 % more chroma.
+  * **BT.2408 - Neutral**: the scene-referred rendering of 0.2.0 and
+    earlier, bit for bit.
+
+  Bright and Detailed carry "(outdoor)" / "(indoor)" in their names because
+  Premiere's effect controls show no tooltips; the dialog and Resolve show
+  the hint. HLG and Normal clips, Rec.709 (it keeps its Look), linear and the
+  passthrough ignore the choice. HDR Peak still rolls the PQ output off after
+  every style. A project saved by 0.2.0 opens on ACES 2 Bright; pick BT.2408 -
+  Neutral to get its HDR output back unchanged. Also in the user defaults
+  file (`hdrTone`), osvtool (`render --tone`, `lut --tone`) and the direct
+  path. Engine ABI 6.
+* **A LUT set per output, in a `LUTs` folder.** Twelve 65^3 tables labelled
+  `DJI_Osmo_*`, one set for the Pocket 3 and the Osmo 360, which share DJI's
+  D-Log M LUT: `Rec2100_PQ` and `Rec2100_HLG` in all five HDR styles,
+  `Rec709` with DJI's look and with OpenOSV's standard rendering, and a
+  `README.txt` that says which one to use. They replace the three
+  `OpenOSV_Osmo360_*.cube` files; the `BT2408_Neutral` and `DJI_Look` tables
+  hold the same data those did. Installed with the plug-ins into
+  `OpenOSV\LUTs\` (replacing the old files), and both zips carry the folder.
+
+### Fixed
+
+* **LUTs made with the `pocket3` fit turned blues purple.** On real Pocket 3
+  D-Log M footage, `--fit pocket3` shifted hues about 10 degrees (blue toward
+  violet, grey sky toward lavender) and flattened contrast: lifted blacks,
+  highlights short of peak. The `osmo360` fit is matched to DJI's own D-Log M
+  LUT, the same file for the Pocket 3 and the Osmo 360, and stays within 1 to
+  2 degrees; the documentation and `osvtool --help` now say it is the one to
+  use for both cameras, and the shipped LUT set uses it.
+
 ## [0.2.0] - 2026-09-24
 
 ### Changed

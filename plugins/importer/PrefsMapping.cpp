@@ -161,6 +161,7 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     shadingControlsFromPrefs(prefs, c);  // [WP-VIGNETTE]
     c.hdrPeak = static_cast<int>(prefs.hdrPeakChoice());  // [WP-HDRPEAK]
     steadyControlsFromPrefs(prefs, c);  // [WP-STEADY]
+    c.hdrTone = static_cast<int>(prefs.hdrToneChoice());  // [WP-HDRTONE]
     return c;
 }
 
@@ -227,6 +228,9 @@ PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& bas
     blob.hdrPeak = pick(controls.hdrPeak, static_cast<int>(PrefsHdrPeak::Count),
                         static_cast<std::uint8_t>(PrefsHdrPeak::Nits1000));
     applySteadyControls(controls, blob);  // [WP-STEADY]
+    // [WP-HDRTONE] An out-of-range index lands on ACES 2 Bright, the default.
+    blob.hdrTone = pick(controls.hdrTone, static_cast<int>(PrefsHdrTone::Count),
+                        static_cast<std::uint8_t>(PrefsHdrTone::Aces2Bright));
 
     blob.sanitise();
     return blob;

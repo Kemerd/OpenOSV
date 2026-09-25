@@ -62,6 +62,7 @@ using osv::premiere::DialogControls;
 using osv::premiere::PrefsBlob;
 using osv::premiere::PrefsColorOutput;
 using osv::premiere::PrefsHdrPeak;
+using osv::premiere::PrefsHdrTone;  // [WP-HDRTONE]
 using osv::premiere::test::ImporterHarness;
 using osv::premiere::test::sampleClipAvailable;
 using osv::premiere::test::sampleClipPath;
@@ -105,18 +106,25 @@ struct PeakCudaContext {
 };
 
 /// The library's block for the default fit, `transfer` and `peak`: exactly
-/// what every importer route builds for a 10-bit D-Log M clip.
+/// what every importer route builds for a 10-bit D-Log M clip whose
+/// [WP-HDRTONE] transfer function is the BT.2408 Neutral style (the
+/// rendering these tests pinned the roll-off on; test_hdr_tone.cpp covers
+/// the roll-off after the tone-scale styles).
 [[nodiscard]] OsvColorParams libraryBlock(osv::color::OutputTransfer transfer, float peak) {
     return osv::color::makeColorParams(osv::color::kDefaultDlogMFit, transfer, 0.0f,
                                        osv::color::InputEncoding::DLogM, true, 10u, nullptr,
-                                       osv::color::kBt2408SceneScale, osv::color::kDefaultLook, peak);
+                                       osv::color::kBt2408SceneScale, osv::color::kDefaultLook, peak,
+                                       osv::color::HdrTone::Bt2408Neutral);
 }
 
-/// Default prefs with a colour output and an HDR peak.
+/// Default prefs with a colour output and an HDR peak, on [WP-HDRTONE] the
+/// Neutral style (its 1000-nit master has highlights up to the full 1000
+/// nits to roll off; the default ACES 2 Bright style already stops at 600).
 [[nodiscard]] PrefsBlob prefsWith(PrefsColorOutput output, PrefsHdrPeak peak) {
     PrefsBlob p = PrefsBlob::defaults();
     p.colorOutput = static_cast<std::uint8_t>(output);
     p.hdrPeak = static_cast<std::uint8_t>(peak);
+    p.hdrTone = static_cast<std::uint8_t>(PrefsHdrTone::Bt2408Neutral);
     return p;
 }
 
@@ -285,15 +293,17 @@ TEST_CASE("the HDR peak byte defaults to 1000 nits and repairs corruption", "[im
         CHECK(static_cast<int>(p.hdrPeakChoice()) == v);
     }
     // A corrupt byte lands on the default; an unsanitised one already reads
-    // as the default; the padding around it is zeroed.
+    // as the default; the reserved byte before it is zeroed, and
+    // [WP-HDRTONE] the byte after it - the transfer function now - lands on
+    // its own default.
     p.hdrPeak = 0xC3;
     CHECK(p.hdrPeakNits() == 1000.0f);
-    p.padAfterHdrPeak = 0x5A;
+    p.hdrTone = 0x5A;
     // [WP-STEADY] byte 53, the reserved byte right before it.
     p.steadyReserved[1] = 0x11;
     REQUIRE_FALSE(p.sanitise());
     CHECK(p.hdrPeakChoice() == PrefsHdrPeak::Nits1000);
-    CHECK(p.padAfterHdrPeak == 0);
+    CHECK(p.hdrToneChoice() == PrefsHdrTone::Aces2Bright);
     CHECK(p.steadyReserved[1] == 0);
     // And the byte sits in the range assigned to it, inside the 128 bytes.
     static_assert(offsetof(PrefsBlob, hdrPeak) == 54, "hdrPeak sits at 54");
