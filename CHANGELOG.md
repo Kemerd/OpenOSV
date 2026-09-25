@@ -6,6 +6,22 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+* **DJI Avata 360 D-Log M curve, `--fit avata360`.** A D-Log M curve and
+  primaries matrix for the Avata 360 (`kDlogMAvata360`,
+  `kNativeToRec2020_Avata360`), for `osvtool render` and `osvtool lut`. DJI
+  publishes no Avata 360 LUT, so it is a fit to DJI Studio's export of one
+  Avata 360 clip; its limits are in `docs/COLOR.md`. The Osmo 360 curve stays
+  the default. The Premiere and Resolve curve menus do not list it yet.
+
+### Fixed
+
+* **The Avata 360's colour mode is read from where it records it.** The
+  Avata 360 (`dvtm_AVATA360.proto`) keeps its colour mode at StreamMeta 2.4.1,
+  and its StreamMeta 4 is empty, so every Avata clip, D-Log M included, was
+  reported as Normal. `osvtool probe` now reports D-Log M for them.
+
 ## [0.2.1] - 2026-09-24
 
 ### Added

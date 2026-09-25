@@ -102,6 +102,14 @@ Colour science provenance
   `scripts/fit_primaries.py --from-cube DJI_Osmo360_DLogM_to_Rec709.cube`
   from measurements of all 35937 entries of the same LUT.  Only the nine
   fitted constants are shipped (include/osv/color/Matrices.h).
+* The "Avata 360" D-Log M decoding curve (kDlogMAvata360, `--fit avata360`)
+  and its native primaries matrix (kNativeToRec2020_Avata360) are
+  least-squares fits of the same 7-parameter form and a 3x3, made by an
+  OpenOSV contributor from their own DJI Avata 360 footage measured against
+  DJI Studio's export of the same clips with DJI's D-Log M conversion
+  applied.  DJI publishes no Avata 360 D-Log M LUT.  Only the 16 fitted
+  constants are shipped (include/osv/color/DlogM.h,
+  include/osv/color/Matrices.h); no footage and no DJI output is included.
 * The "Pocket 3" D-Log M curve (kDlogMPocket3) reproduces the numeric
   constants of the publicly published community fit by Thatcher Freeman
   ("DJI Pocket 3 D-Log M to DWG.dctl", github.com/thatcherfreeman/

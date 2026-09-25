@@ -217,7 +217,7 @@ struct StreamMeta {
     std::int32_t type = 0;                                  ///< 1.2 (0 video, 1 audio)
     std::string name;                                       ///< 1.3 ("video")
     VideoInfo video;                                        ///< 3
-    ColorMode colorMode = ColorMode::Unknown;               ///< 4.1
+    ColorMode colorMode = ColorMode::Unknown;               ///< 4.1 (2.4.1 on the Avata 360, see DjmdDecoder)
     std::int32_t fovType = 0;                               ///< 5.1 (3 = WIDE)
     PanoDewarpParams dewarp;                                ///< 6
     ExtriLensMode extriLensMode = ExtriLensMode::Native;    ///< 7.1

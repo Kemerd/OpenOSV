@@ -114,6 +114,28 @@ inline constexpr OsvMat3f kNativeToRec2020_Osmo360 = {{
     -0.009603872f, -0.094263740f, 1.103867650f,
 }};
 
+/// DJI Avata 360 native primaries -> Rec.2020 linear, paired with
+/// kDlogMAvata360 (see osv::color::nativeToWorkingForFit).
+///
+/// Provenance: fitted jointly with kDlogMAvata360 to paired footage (a D-Log
+/// M clip against DJI Studio's export of it), on all samples rather than the
+/// neutral ones only; the method and the held-out result are in the comment
+/// on kDlogMAvata360.  Rows sum to 1 exactly in float32, so white stays white
+/// and the neutral axis depends on the curve alone.  Determinant +1.075248,
+/// positive diagonal.
+///
+/// What it is not: a sensor characterisation.  The footage was a room of
+/// mostly white and beige surfaces, so saturated colours are weakly
+/// constrained.  All three implied native primaries have positive luminance,
+/// but the red one lies outside the spectral locus (Z < 0, x = 4.15), and some
+/// saturated codes land outside Rec.2020 (code 0.6 / 0.3 / 0.2 gives blue
+/// -0.068).  It models DJI Studio's rendering of this camera, no more.
+inline constexpr OsvMat3f kNativeToRec2020_Avata360 = {{
+    0.706524789f, 0.176516764f, 0.116958447f,
+    -0.183691555f, 1.116191272f, 0.067500283f,
+    -0.302259748f, 0.033496898f, 1.268762850f,
+}};
+
 /// Rec.2020 linear -> Rec.709 linear (BT.2087 / derived from the primaries).
 inline constexpr OsvMat3f kRec2020ToRec709 = {{
     1.660491f, -0.587641f, -0.072850f,

@@ -25,7 +25,8 @@ namespace osv::color {
 enum class DlogMFit : int {
     DjiRefit = 0,  ///< kDlogMDjiRefit (Pocket-3-era HLG measurements).
     Pocket3 = 1,   ///< kDlogMPocket3 (public Pocket 3 constants).
-    Osmo360 = 2    ///< kDlogMOsmo360 (default; fitted to the Osmo 360 reference).
+    Osmo360 = 2,   ///< kDlogMOsmo360 (default; fitted to the Osmo 360 reference).
+    Avata360 = 3   ///< kDlogMAvata360 (fitted to DJI Studio exports of Avata 360 footage).
 };
 
 /// The curve new code and the CLI defaults select.  Named so the default can
@@ -200,7 +201,7 @@ void setHdrTone(OsvColorParams& params, HdrTone tone) noexcept;
 /// Returns false and leaves `out` untouched for anything else.
 [[nodiscard]] bool parseHdrTone(std::string_view text, HdrTone& out) noexcept;
 
-/// Stable lower-case names ("dji", "pocket3", "osmo360").
+/// Stable lower-case names ("dji", "pocket3", "osmo360", "avata360").
 [[nodiscard]] const char* dlogMFitName(DlogMFit fit) noexcept;
 /// Stable lower-case names ("hlg", "pq", "709", "linear", "dlogm").
 [[nodiscard]] const char* outputTransferName(OutputTransfer transfer) noexcept;
@@ -210,7 +211,8 @@ void setHdrTone(OsvColorParams& params, HdrTone tone) noexcept;
 [[nodiscard]] const char* lookName(Look look) noexcept;
 
 /// Parse a name (case-insensitive; accepts the aliases documented in the CLI
-/// help: "dji"/"refit", "pocket3"/"pocket", "osmo360"/"osmo").  Returns false
+/// help: "dji"/"refit", "pocket3"/"pocket", "osmo360"/"osmo",
+/// "avata360"/"avata").  Returns false
 /// and leaves `out` untouched when the text is not recognised.
 [[nodiscard]] bool parseDlogMFit(std::string_view text, DlogMFit& out) noexcept;
 /// Parse "pq", "hlg", "709"/"rec709"/"sdr", "linear"/"exr", "dlogm"/"passthrough"/"none".
@@ -242,6 +244,8 @@ void setHdrTone(OsvColorParams& params, HdrTone tone) noexcept;
 ///                           point of keeping this fit is bit-stable output
 ///                           for projects already graded on it, which a matrix
 ///                           change would break.
+///   * DlogMFit::Avata360 -> kNativeToRec2020_Avata360 (fitted together with
+///                           the curve from the same paired footage).
 ///
 /// An out-of-range fit (a corrupt persisted preference byte) returns the
 /// default matrix rather than an arbitrary one, matching dlogmCurve.
