@@ -117,23 +117,26 @@ inline constexpr OsvMat3f kNativeToRec2020_Osmo360 = {{
 /// DJI Avata 360 native primaries -> Rec.2020 linear, paired with
 /// kDlogMAvata360 (see osv::color::nativeToWorkingForFit).
 ///
-/// Provenance: fitted jointly with kDlogMAvata360 to paired footage (a D-Log
-/// M clip against DJI Studio's export of it), on all samples rather than the
-/// neutral ones only; the method and the held-out result are in the comment
-/// on kDlogMAvata360.  Rows sum to 1 exactly in float32, so white stays white
-/// and the neutral axis depends on the curve alone.  Determinant +1.075248,
-/// positive diagonal.
+/// Provenance: `python scripts/fit_primaries.py --from-cube "DJI Avata 360
+/// D-Log M to Rec.709 V1.cube" --curve kDlogMAvata360 --name
+/// kNativeToRec2020_Avata360`, the same fit as kNativeToRec2020_Osmo360 on
+/// all 35937 entries of DJI's own Avata 360 LUT (DJI Studio 1.0.0.24724).
+/// Full-cube RMS 0.0567 HLG code (the Pocket 3 matrix: 0.1119); four starts,
+/// one basin.  Rows sum to 1 exactly in float32, so white stays white and the
+/// neutral axis depends on the curve alone.  Determinant +0.782958.
 ///
-/// What it is not: a sensor characterisation.  The footage was a room of
-/// mostly white and beige surfaces, so saturated colours are weakly
-/// constrained.  All three implied native primaries have positive luminance,
-/// but the red one lies outside the spectral locus (Z < 0, x = 4.15), and some
-/// saturated codes land outside Rec.2020 (code 0.6 / 0.3 / 0.2 gives blue
-/// -0.068).  It models DJI Studio's rendering of this camera, no more.
+/// Implied primaries R (0.7052, 0.3074), G (0.2854, 0.8093), B (0.1519,
+/// 0.0718), each with positive luminance.  R and G sit just beyond the
+/// spectral locus (Z = -0.009 and -0.080), as a matrix fitted to a display
+/// LUT often lands - kNativeToRec2020_Osmo360's do too - where the first
+/// Avata 360 matrix it replaces, fitted to a white room, put its red at
+/// x = 4.15.  As with the Osmo 360, the ~38 % of entries DJI gamut-maps onto
+/// 0 or 1 set the residual floor; the Rec.709 look (kLookDjiRec709Avata360)
+/// models that mapping, a 3x3 cannot.
 inline constexpr OsvMat3f kNativeToRec2020_Avata360 = {{
-    0.706524789f, 0.176516764f, 0.116958447f,
-    -0.183691555f, 1.116191272f, 0.067500283f,
-    -0.302259748f, 0.033496898f, 1.268762850f,
+    0.750926971f, 0.190621704f, 0.058451325f,
+    0.018074622f, 0.940968931f, 0.040956438f,
+    -0.008520790f, -0.100171611f, 1.108692408f,
 }};
 
 /// Rec.2020 linear -> Rec.709 linear (BT.2087 / derived from the primaries).

@@ -93,6 +93,9 @@ Usage
     python scripts/fit_look.py --cube "<path to DJI Osmo 360 D-Log M to Rec.709 V1.cube>"
     python scripts/fit_look.py --samples frame0.tif frame20.tif --json look.json
 
+    # the Avata 360 look: its own LUT, curve and matrix (no footage samples)
+    python scripts/fit_look.py --cube "<path to DJI Avata 360 D-Log M to Rec.709 V1.cube>"                                --curve kDlogMAvata360 --matrix kNativeToRec2020_Avata360
+
 ``--samples`` takes 16-bit TIFFs rendered with
 ``osvtool render <clip> --mode equirect --color dlogm --out frame.tif`` (read
 with OpenCV when it is installed) or ``.npy`` arrays of D-Log M codes (N x 3).
@@ -544,6 +547,13 @@ def main():
     ap.add_argument("--restarts", type=int, default=0,
                     help="extra solver passes from the last solution (0 reproduces the shipped constants)")
     ap.add_argument("--json", help="write the fitted constants and the report here")
+    # A camera other than the Osmo 360 brings its own reference LUT and its
+    # own shipped curve and matrix: the look is fitted to the light that
+    # camera's fit produces, and its shaper is that camera's curve.
+    ap.add_argument("--curve", default="kDlogMOsmo360",
+                    help="D-Log M curve in include/osv/color/DlogM.h (decode and shaper)")
+    ap.add_argument("--matrix", default="kNativeToRec2020_Osmo360",
+                    help="native -> Rec.2020 matrix in include/osv/color/Matrices.h")
     args = ap.parse_args()
 
     if not 2 < args.knots <= MAX_KNOTS:
@@ -557,34 +567,35 @@ def main():
     # ---- reference and the shipped curve / matrix ---------------------------
     try:
         codes, table, size, title = fp.read_cube(args.cube)
-        curve = fp.parse_dlogm_curve("kDlogMOsmo360")
-        m_osmo = parse_matrix("kNativeToRec2020_Osmo360")
+        curve = fp.parse_dlogm_curve(args.curve)
+        m_camera = parse_matrix(args.matrix)
         samples = load_samples(args.samples, args.per_file, seed=1)
     except ValueError as exc:
         print("error: %s" % exc)
         return 2
     print("reference: %s (%d^3, %s)" % (args.cube, size, title or "no TITLE"))
+    print("camera fit: %s + %s" % (args.curve, args.matrix))
     shaper = Shaper(curve)
     lin = fp.dlogm_to_linear(curve, codes)
     ref_lab = signal_to_lab(table)
     neutral = [i * (1 + size + size * size) for i in range(size)]
 
     # ---- baseline: the shipped standard rendering ---------------------------
-    base = fp.render(m_osmo, lin)
+    base = fp.render(m_camera, lin)
     base_de = delta_e2000(ref_lab, signal_to_lab(base))
     report = {"reference": os.path.basename(args.cube), "cube_before": summary(base_de)}
     print("\nstandard rendering vs reference, whole cube : " + fmt(report["cube_before"]))
     if len(samples):
         s_ref = trilinear(table, size, samples)
         s_lin = fp.dlogm_to_linear(curve, samples)
-        s_base = delta_e2000(signal_to_lab(s_ref), signal_to_lab(fp.render(m_osmo, s_lin)))
+        s_base = delta_e2000(signal_to_lab(s_ref), signal_to_lab(fp.render(m_camera, s_lin)))
         report["samples_before"] = summary(s_base)
         print("standard rendering vs reference, samples    : " + fmt(report["samples_before"]))
 
     # ---- fit ---------------------------------------------------------------
     model = LookModel(args.knots, shaper)
     rec709 = fp.REC2020_TO_709
-    p0, lo, hi = model.initial(np.linspace(0.0, 1.0, size), table[neutral, 1], rec709 @ m_osmo)
+    p0, lo, hi = model.initial(np.linspace(0.0, 1.0, size), table[neutral, 1], rec709 @ m_camera)
     rng = np.random.default_rng(0)
     if len(samples):
         pick = rng.choice(len(samples), min(args.fit_pixels, len(samples)), replace=False)

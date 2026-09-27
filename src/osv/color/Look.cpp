@@ -20,6 +20,26 @@ namespace {
 /// misses 1 by a few ulp, never by more than this.
 constexpr float kRowSumTolerance = 1e-4f;
 
+/// One camera's DJI look: the fitted constants, and the curve and matrix of
+/// the camera fit they were fitted through.  The look maps that camera's
+/// native light, and its shaper is that camera's curve, so the three always
+/// travel together.
+struct CameraLook {
+    const LookFit& fit;           ///< kLookDjiRec709 / kLookDjiRec709Avata360.
+    const OsvDlogMCurve& shaper;  ///< The curve the look was fitted through.
+    const OsvMat3f& native;       ///< That camera's native -> Rec.2020 matrix.
+};
+
+/// The DJI look for a camera fit.  The Avata 360 has its own (DJI ships it a
+/// different LUT); every other fit keeps the Osmo 360 look it always had,
+/// which is a consistent Rec.2020-referred rendering for the legacy curves.
+CameraLook cameraLook(DlogMFit cameraFit) noexcept {
+    if (cameraFit == DlogMFit::Avata360) {
+        return CameraLook{kLookDjiRec709Avata360, kDlogMAvata360, kNativeToRec2020_Avata360};
+    }
+    return CameraLook{kLookDjiRec709, kDlogMOsmo360, kNativeToRec2020_Osmo360};
+}
+
 /// A zeroed block: id OSV_LOOK_STANDARD, which the kernel skips entirely.
 OsvLookParams noLook() noexcept {
     OsvLookParams p{};
@@ -130,34 +150,36 @@ bool monotoneTangents(const float* tone, int count, float* slopes) noexcept {
 // -----------------------------------------------------------------------------
 //  Kernel block
 // -----------------------------------------------------------------------------
-OsvLookParams makeLookParams(Look look, OutputTransfer transfer) noexcept {
+OsvLookParams makeLookParams(Look look, OutputTransfer transfer, DlogMFit cameraFit) noexcept {
     if (!lookApplies(look, transfer)) {
         return noLook();
     }
-    const LookFit& fit = kLookDjiRec709;
+    const CameraLook camera = cameraLook(cameraFit);
+    const LookFit& fit = camera.fit;
     OsvLookParams p = noLook();
     p.id = OSV_LOOK_DJI;
     p.knots = OSV_LOOK_MAX_KNOTS;
 
-    // The fit maps Osmo 360 native light; the kernel hands the look Rec.2020
-    // working light (after nativeToWorking), so undo that matrix first.  A
-    // singular camera matrix cannot happen with the shipped constants, but if
-    // it ever did the look is dropped rather than applied to the wrong space.
+    // The fit maps the camera's native light; the kernel hands the look
+    // Rec.2020 working light (after nativeToWorking), so undo that camera's
+    // matrix first.  A singular camera matrix cannot happen with the shipped
+    // constants, but if it ever did the look is dropped rather than applied
+    // to the wrong space.
     OsvMat3f workingToNative{};
-    if (!mat3Inverse(kNativeToRec2020_Osmo360, workingToNative)) {
+    if (!mat3Inverse(camera.native, workingToNative)) {
         return noLook();
     }
     p.toLook = mat3Mul(fit.nativeToLook, workingToNative);
 
-    // Shaper: the Osmo 360 D-Log M curve, with its tangent at code 0 for the
+    // Shaper: the camera's D-Log M curve, with its tangent at code 0 for the
     // linear continuation below.  d(lin)/d(code) at code 0 is analytic:
     // ln 2 * scale * 2^yShift times the slope of whichever branch code 0 is on
     // (the toe for every shipped curve), times midGrayScaling - the same
     // expression scripts/fit_look.py fitted with, in double.
-    p.shaper = kDlogMOsmo360;
-    p.shaperLin0 = dlogmToLinear(kDlogMOsmo360, 0.0f);
+    p.shaper = camera.shaper;
+    p.shaperLin0 = dlogmToLinear(camera.shaper, 0.0f);
     {
-        const OsvDlogMCurve& c = kDlogMOsmo360;
+        const OsvDlogMCurve& c = camera.shaper;
         const double tmp0 = std::exp2(static_cast<double>(c.yShift)) + static_cast<double>(c.xShift);
         const double branch = tmp0 < dlogmCutD(c) ? static_cast<double>(c.slope) : static_cast<double>(c.slope2);
         const double d = std::log(2.0) * static_cast<double>(c.scale) * std::exp2(static_cast<double>(c.yShift)) *
@@ -187,7 +209,7 @@ OsvLookParams makeLookParams(Look look, OutputTransfer transfer) noexcept {
     return lookParamsValid(p) ? p : noLook();
 }
 
-void setLook(OsvColorParams& params, Look look) noexcept {
+void setLook(OsvColorParams& params, Look look, DlogMFit cameraFit) noexcept {
     // Sanitise the stored transfer the same way makeColorParams does, so a
     // corrupt block cannot select a look for an unknown output.
     const int t = params.transfer;
@@ -195,7 +217,7 @@ void setLook(OsvColorParams& params, Look look) noexcept {
         params.look = noLook();
         return;
     }
-    params.look = makeLookParams(look, static_cast<OutputTransfer>(t));
+    params.look = makeLookParams(look, static_cast<OutputTransfer>(t), cameraFit);
 }
 
 bool lookParamsValid(const OsvLookParams& look) noexcept {

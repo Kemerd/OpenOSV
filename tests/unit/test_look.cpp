@@ -663,6 +663,106 @@ TEST_CASE("the DJI look against DJI's whole Osmo 360 LUT", "[color][look][dji-lu
     REQUIRE(s[0] > 2.7);
 }
 
+TEST_CASE("each camera fit carries its own DJI look", "[color][look]") {
+    // DJI ships the Avata 360 its own Rec.709 LUT, so the Avata 360 fit gets
+    // its own look; every other fit keeps the Osmo 360 look it always had.
+    const OsvLookParams osmo = makeLookParams(Look::DjiStudio, OutputTransfer::Rec709);
+    const OsvLookParams avata = makeLookParams(Look::DjiStudio, OutputTransfer::Rec709, DlogMFit::Avata360);
+    REQUIRE(lookParamsValid(osmo));
+    REQUIRE(lookParamsValid(avata));
+    REQUIRE(avata.id == OSV_LOOK_DJI);
+    // The shaper is the curve the look was fitted through.
+    REQUIRE(avata.shaper.scale == kDlogMAvata360.scale);
+    REQUIRE(avata.shaper.intercept == kDlogMAvata360.intercept);
+    REQUIRE(osmo.shaper.scale == kDlogMOsmo360.scale);
+    // Its tone knots are the Avata 360 file's grey scale, not the Osmo 360's.
+    REQUIRE(avata.tone[1] == kLookDjiRec709Avata360.tone[1]);
+    REQUIRE(avata.tone[1] != osmo.tone[1]);
+    // toLook undoes the Avata 360 matrix: composed with it, it is the fit's
+    // own native -> look matrix.
+    const OsvMat3f composed = mat3Mul(avata.toLook, kNativeToRec2020_Avata360);
+    for (int i = 0; i < 9; ++i) {
+        INFO("element " << i);
+        REQUIRE_THAT(composed.m[i], WithinAbs(kLookDjiRec709Avata360.nativeToLook.m[i], 2e-6));
+    }
+    // The default argument, the Osmo 360 fit and the legacy fits: the Osmo look.
+    for (const DlogMFit fit : {DlogMFit::Osmo360, DlogMFit::DjiRefit, DlogMFit::Pocket3, static_cast<DlogMFit>(77)}) {
+        const OsvLookParams p = makeLookParams(Look::DjiStudio, OutputTransfer::Rec709, fit);
+        INFO("fit " << static_cast<int>(fit));
+        REQUIRE(p.shaper.scale == osmo.shaper.scale);
+        REQUIRE(p.tone[1] == osmo.tone[1]);
+        REQUIRE(p.toLook.m[0] == osmo.toLook.m[0]);
+    }
+    // makeColorParams picks the look of the fit it decodes with ...
+    const OsvColorParams params = makeColorParams(DlogMFit::Avata360, OutputTransfer::Rec709, 0.0f);
+    REQUIRE(params.look.tone[1] == avata.tone[1]);
+    // ... setLook keeps to the camera it is told, and the look never lands on HDR.
+    OsvColorParams swapped = makeColorParams(DlogMFit::Avata360, OutputTransfer::Rec709, 0.0f, InputEncoding::DLogM,
+                                             true, 10, nullptr, kBt2408SceneScale, Look::Standard);
+    REQUIRE(lookOf(swapped) == Look::Standard);
+    setLook(swapped, Look::DjiStudio, DlogMFit::Avata360);
+    REQUIRE(swapped.look.tone[1] == avata.tone[1]);
+    REQUIRE(makeLookParams(Look::DjiStudio, OutputTransfer::PQ, DlogMFit::Avata360).id == OSV_LOOK_STANDARD);
+}
+
+TEST_CASE("the Avata 360 DJI look against DJI's whole Avata 360 LUT", "[color][look][dji-lut]") {
+    // DJI Studio installs the reference beside the Osmo 360 one;
+    // OSV_DJI_AVATA360_LUT overrides the path.  Nothing from the file is kept.
+    std::filesystem::path path;
+    if (const char* env = std::getenv("OSV_DJI_AVATA360_LUT"); env != nullptr && env[0] != '\0') {
+        path = env;
+    } else {
+        path = "C:/Program Files/DJI Studio/1.0.0.24724/filter/LUT/LOG_Avata360_DLogM/"
+               "DJI Avata 360 D-Log M to Rec.709 V1.cube";
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        SKIP("DJI's Avata 360 LUT is not installed (set OSV_DJI_AVATA360_LUT)");
+    }
+    auto lut = readCube(path);
+    REQUIRE(lut.ok());
+    REQUIRE(lut.value().size == 33);
+
+    // The Avata 360 fit with its look, and the Osmo 360 fit (the default, and
+    // all an Avata 360 clip had before) for comparison.
+    const OsvColorParams avata = makeColorParams(DlogMFit::Avata360, OutputTransfer::Rec709, 0.0f);
+    const OsvColorParams osmo = djiParams();
+    std::vector<double> avataDe;
+    std::vector<double> osmoDe;
+    const std::uint32_t n = lut.value().size;
+    for (std::uint32_t b = 0; b < n; ++b) {
+        for (std::uint32_t g = 0; g < n; ++g) {
+            for (std::uint32_t r = 0; r < n; ++r) {
+                float ref[3];
+                lut.value().at(r, g, b, ref);
+                const std::array<double, 3> want = {ref[0], ref[1], ref[2]};
+                const float cr = static_cast<float>(r) / static_cast<float>(n - 1);
+                const float cg = static_cast<float>(g) / static_cast<float>(n - 1);
+                const float cb = static_cast<float>(b) / static_cast<float>(n - 1);
+                avataDe.push_back(deltaE(through(avata, cr, cg, cb), want));
+                osmoDe.push_back(deltaE(through(osmo, cr, cg, cb), want));
+            }
+        }
+    }
+    const auto stats = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        double sum = 0.0;
+        for (double d : v) {
+            sum += d;
+        }
+        return std::array<double, 3>{sum / static_cast<double>(v.size()), v[v.size() * 95 / 100], v.back()};
+    };
+    const auto a = stats(avataDe);
+    const auto o = stats(osmoDe);
+    INFO("Avata 360 fit + look: mean " << a[0] << " p95 " << a[1] << " max " << a[2] << "; Osmo 360 fit: mean "
+                                       << o[0] << " p95 " << o[1] << " max " << o[2]);
+    // Fit report: 1.683 / 3.657 / 6.344; the Osmo 360 fit measures 2.52 / 6.50 / 17.3.
+    REQUIRE(a[0] < 1.75);
+    REQUIRE(a[1] < 3.8);
+    REQUIRE(a[2] < 6.8);
+    REQUIRE(o[0] > 2.3);
+}
+
 // -----------------------------------------------------------------------------
 //  Backend parity
 // -----------------------------------------------------------------------------
