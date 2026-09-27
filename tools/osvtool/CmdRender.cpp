@@ -113,7 +113,7 @@ struct RenderOptions {
 constexpr const char* kCliColor[] = {"pq", "hlg", "709", "dlogm"};
 constexpr const char* kCliStab[] = {"off", "horizon", "full", "smooth", "smooth-horizon"};
 constexpr const char* kCliCalib[] = {"auto", "native", "lens-guards", "underwater"};  // PrefsCalibrationChoice
-constexpr const char* kCliFit[] = {"dji", "pocket3", "osmo360"};
+constexpr const char* kCliFit[] = {"dji", "pocket3", "osmo360", "avata360"};
 constexpr const char* kCliDevice[] = {"auto", "cpu", "cuda", "opencl"};
 constexpr const char* kCliLook[] = {"dji", "standard"};
 constexpr const char* kCliFlow[] = {"auto", "classical", "neural"};

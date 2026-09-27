@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <random>
 #include <string>
@@ -507,6 +508,127 @@ TEST_CASE("Stabilization SmoothLevel levels pitch and roll and follows the smoot
     }
 }
 
+TEST_CASE("A lens-up / lens-down rig levels with a steady heading", "[attitude][stab]") {
+    // The Avata 360 flies its 360 camera with one lens up and one down: the
+    // body's +Y (the lens axis) is vertical.  Z-up world here.
+    const Vec3d worldUp{0.0, 0.0, 1.0};
+    // Body +Y straight up: rotX(90) takes +Y to +Z (and +Z to -Y).
+    const Quatd upright = Quatd::fromAxisAngle(Vec3d{1.0, 0.0, 0.0}, deg2rad(90.0));
+    // The drone tilting 5 degrees forward, back and sideways, and turning.
+    const auto tilted = [&](const Vec3d& axis, double deg) {
+        return Quatd::fromAxisAngle(axis, deg2rad(deg)) * upright;
+    };
+    const std::vector<Quatd> clip = {
+        upright,
+        tilted(Vec3d{1.0, 0.0, 0.0}, 5.0),
+        tilted(Vec3d{1.0, 0.0, 0.0}, -5.0),
+        tilted(Vec3d{0.0, 1.0, 0.0}, 5.0),
+        tilted(Vec3d{0.0, 1.0, 0.0}, -5.0),
+        tilted(Vec3d{0.0, 0.0, 1.0}, 30.0),
+    };
+
+    // The mount: a quarter turn with the upward lens axis as up.
+    const Mat3d mount = levellingMount(clip, worldUp);
+    REQUIRE(mount.distance(Mat3d::identity()) > 1.0);
+    REQUIRE((mount.transposed() * mount).distance(Mat3d::identity()) < 1e-12);
+    REQUIRE_THAT(mount.determinant(), Catch::Matchers::WithinAbs(1.0, 1e-12));
+    REQUIRE((mount.col(2) - Vec3d{0.0, 1.0, 0.0}).norm() < 1e-12);   // up = the body's +Y
+    REQUIRE((mount.col(1) - Vec3d{0.0, 0.0, -1.0}).norm() < 1e-12);  // forward = the body's -Z
+
+    StabilizationParams mounted;
+    mounted.mode = StabilizationMode::HorizonLock;
+    mounted.mount = mount;
+    StabilizationParams unmounted;
+    unmounted.mode = StabilizationMode::HorizonLock;
+    const auto viewForward = [&](const Quatd& body, const StabilizationParams& p) {
+        return body.toMatrix() * (stabilizationBodyFromWorld(body, p, upright, worldUp) * Vec3d{0.0, 1.0, 0.0});
+    };
+    const auto viewUp = [&](const Quatd& body, const StabilizationParams& p) {
+        return body.toMatrix() * (stabilizationBodyFromWorld(body, p, upright, worldUp) * Vec3d{0.0, 0.0, 1.0});
+    };
+    // Mounted: level on every pose, and the heading is the reference one
+    // (the upright body's -Z: world +Y) through every tilt ...
+    const Vec3d heading0 = viewForward(upright, mounted);
+    REQUIRE((heading0 - Vec3d{0.0, 1.0, 0.0}).norm() < 1e-9);
+    double worstTiltHeadingDeg = 0.0;
+    double worstUnmountedDeg = 0.0;
+    for (std::size_t k = 1; k + 1 < clip.size(); ++k) {
+        INFO("pose " << k);
+        REQUIRE((viewUp(clip[k], mounted) - worldUp).norm() < 1e-9);
+        worstTiltHeadingDeg = std::max(worstTiltHeadingDeg, rad2deg(viewForward(clip[k], mounted).angleTo(heading0)));
+        worstUnmountedDeg =
+            std::max(worstUnmountedDeg, rad2deg(viewForward(clip[k], unmounted).angleTo(viewForward(upright, unmounted))));
+    }
+    INFO("worst heading change over 5 deg tilts: mounted " << worstTiltHeadingDeg << " deg, unmounted "
+                                                          << worstUnmountedDeg << " deg");
+    REQUIRE(worstTiltHeadingDeg < 0.5);
+    // ... where the unmounted levelling, in gimbal lock, swings by tens of degrees.
+    REQUIRE(worstUnmountedDeg > 30.0);
+    // ... and a turn of the aircraft still turns the view.
+    const Vec3d turned = viewForward(clip.back(), mounted);
+    REQUIRE_THAT(rad2deg(turned.angleTo(heading0)), Catch::Matchers::WithinAbs(30.0, 1e-6));
+    REQUIRE_THAT(turned.dot(worldUp), Catch::Matchers::WithinAbs(0.0, 1e-9));
+
+    // SmoothLevel uses the same frame.
+    StabilizationParams smoothLevel = mounted;
+    smoothLevel.mode = StabilizationMode::SmoothLevel;
+    const Mat3d cs = stabilizationBodyFromWorld(clip[3], smoothLevel, upright, worldUp, clip[3]);
+    REQUIRE((clip[3].toMatrix() * (cs * Vec3d{0.0, 0.0, 1.0}) - worldUp).norm() < 1e-9);
+
+    // The other lens up: up is the body's -Y, forward its +Z.
+    std::vector<Quatd> flipped;
+    for (const Quatd& q : clip) {
+        flipped.push_back(q * Quatd::fromAxisAngle(Vec3d{1.0, 0.0, 0.0}, deg2rad(180.0)));
+    }
+    const Mat3d flippedMount = levellingMount(flipped, worldUp);
+    REQUIRE((flippedMount.col(2) - Vec3d{0.0, -1.0, 0.0}).norm() < 1e-12);
+    REQUIRE((flippedMount.col(1) - Vec3d{0.0, 0.0, 1.0}).norm() < 1e-12);
+    REQUIRE_THAT(flippedMount.determinant(), Catch::Matchers::WithinAbs(1.0, 1e-12));
+}
+
+TEST_CASE("A lenses-level rig keeps the unmounted levelling exactly", "[attitude][stab]") {
+    const Vec3d worldUp{0.0, 0.0, 1.0};
+    std::mt19937_64 rng(11u);
+    // Handheld: +Y within 40 degrees of the horizon on every pose.
+    std::vector<Quatd> clip;
+    for (int i = 0; i < 64; ++i) {
+        const double yaw = deg2rad(std::uniform_real_distribution<double>(-180.0, 180.0)(rng));
+        const double pitch = deg2rad(std::uniform_real_distribution<double>(-40.0, 40.0)(rng));
+        const double roll = deg2rad(std::uniform_real_distribution<double>(-60.0, 60.0)(rng));
+        clip.push_back(Quatd::fromMatrix(Mat3d::rotZ(yaw) * Mat3d::rotX(pitch) * Mat3d::rotY(roll)));
+    }
+    const Mat3d mount = levellingMount(clip, worldUp);
+    REQUIRE(mount.distance(Mat3d::identity()) == 0.0);
+    // With the identity mount the correction is bit for bit what it was.
+    for (const StabilizationMode mode : {StabilizationMode::HorizonLock, StabilizationMode::SmoothLevel}) {
+        StabilizationParams plain;
+        plain.mode = mode;
+        StabilizationParams withMount = plain;
+        withMount.mount = mount;
+        for (std::size_t k = 0; k < clip.size(); ++k) {
+            const Mat3d a = stabilizationBodyFromWorld(clip[k], plain, clip[0], worldUp, clip[(k + 1) % clip.size()]);
+            const Mat3d b =
+                stabilizationBodyFromWorld(clip[k], withMount, clip[0], worldUp, clip[(k + 1) % clip.size()]);
+            for (int i = 0; i < 9; ++i) {
+                REQUIRE(a.m[i] == b.m[i]);
+            }
+        }
+    }
+    // Degenerate input: no samples, non-finite samples or no up axis.
+    REQUIRE(levellingMount({}, worldUp).distance(Mat3d::identity()) == 0.0);
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    REQUIRE(levellingMount({Quatd{nan, 0.0, 0.0, 0.0}}, worldUp).distance(Mat3d::identity()) == 0.0);
+    REQUIRE(levellingMount(clip, Vec3d{0.0, 0.0, 0.0}).distance(Mat3d::identity()) == 0.0);
+    // A mount that is not a rotation is ignored rather than applied.
+    StabilizationParams corrupt;
+    corrupt.mode = StabilizationMode::HorizonLock;
+    corrupt.mount = Mat3d::fromColumns(Vec3d{2.0, 0.0, 0.0}, Vec3d{0.0, 1.0, 0.0}, Vec3d{0.0, 0.0, 1.0});
+    StabilizationParams plain;
+    plain.mode = StabilizationMode::HorizonLock;
+    REQUIRE(stabilizationBodyFromWorld(clip[3], corrupt, clip[0], worldUp)
+                .distance(stabilizationBodyFromWorld(clip[3], plain, clip[0], worldUp)) == 0.0);
+}
+
 TEST_CASE("Quaternion log/exp and ZXY Euler round trips", "[attitude][stab]") {
     std::mt19937_64 rng(9u);
     for (int n = 0; n < 200; ++n) {
@@ -740,6 +862,20 @@ TEST_CASE("Stabilization Full on the sample clip is identity at the reference fr
     const Mat3d h = stabilizationBodyFromWorld(last, params, reference, track.worldUp());
     const Vec3d viewUpWorld = last.toMatrix() * (h * Vec3d{0.0, 0.0, 1.0});
     REQUIRE(rad2deg(viewUpWorld.angleTo(track.worldUp())) < 1e-6);
+}
+
+TEST_CASE("The sample clip is a lenses-level rig: its levelling mount is the identity", "[attitude][sample]") {
+    OSV_REQUIRE_SAMPLE();
+    const std::unique_ptr<SampleMeta> sample = openSample();
+    auto built = AttitudeTrack::build(sample->track, AttitudeTrack::Options{});
+    REQUIRE(built.ok());
+    std::vector<Quatd> bodies;
+    for (const auto& s : built.value().samples()) {
+        bodies.push_back(s.worldFromBody);
+    }
+    REQUIRE(!bodies.empty());
+    // A handheld Osmo 360: every levelled render stays exactly as it was.
+    REQUIRE(levellingMount(bodies, built.value().worldUp()).distance(Mat3d::identity()) == 0.0);
 }
 
 TEST_CASE("Stabilization SmoothLevel on the sample clip is level on every frame and steadier in heading",

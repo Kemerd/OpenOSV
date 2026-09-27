@@ -94,7 +94,8 @@ Usage
     python scripts/fit_look.py --samples frame0.tif frame20.tif --json look.json
 
     # the Avata 360 look: its own LUT, curve and matrix (no footage samples)
-    python scripts/fit_look.py --cube "<path to DJI Avata 360 D-Log M to Rec.709 V1.cube>"                                --curve kDlogMAvata360 --matrix kNativeToRec2020_Avata360
+    python scripts/fit_look.py --cube "<path to DJI Avata 360 D-Log M to Rec.709 V1.cube>" \
+                               --curve kDlogMAvata360 --matrix kNativeToRec2020_Avata360
 
 ``--samples`` takes 16-bit TIFFs rendered with
 ``osvtool render <clip> --mode equirect --color dlogm --out frame.tif`` (read

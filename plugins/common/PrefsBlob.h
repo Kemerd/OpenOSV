@@ -117,6 +117,7 @@ enum class PrefsDlogmFit : std::uint8_t {
     DjiRefit = 0,
     Pocket3 = 1,
     Osmo360 = 2,
+    Avata360 = 3,  ///< DJI Avata 360: its own curve, matrix and Rec.709 look.
     Count
 };
 

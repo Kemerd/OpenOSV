@@ -736,8 +736,9 @@ void controlsToWidgets(HWND dialog, const DialogControls& c, const CalibrationUi
     }
 
     // Order must match PrefsDlogmFit exactly (the static_assert below pins the
-    // count, not the order).  Osmo 360 is last because the enum is append-only.
-    static const wchar_t* const kFit[] = {L"DJI refit", L"Pocket 3", L"Osmo 360"};
+    // count, not the order).  The enum is append-only, so the default (Osmo
+    // 360) is not first and the Avata 360 comes after it.
+    static const wchar_t* const kFit[] = {L"DJI refit", L"Pocket 3", L"Osmo 360", L"Avata 360"};
     fillCombo(dialog, IDC_DLOGM_FIT, kFit, static_cast<int>(std::size(kFit)), c.dlogmFit);
 
     static const wchar_t* const kDevice[] = {L"Auto", L"CPU", L"CUDA", L"OpenCL"};

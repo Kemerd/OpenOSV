@@ -404,46 +404,85 @@ namespace {
 struct ShippedLut {
     const char* dir;
     const char* name;
+    DlogMFit fit;  ///< The camera set's curve (also its matrix and Rec.709 look).
     OutputTransfer transfer;
     Look look;
     HdrTone tone;
     const char* title;
 };
 
-/// [WP-HDRTONE] The set: one per BT.2100 output and Transfer Function (HDR)
-/// style, and the two Rec.709 looks, all on the osmo360 curve - DJI's D-Log M
-/// LUT is the same file for the Osmo 360 and the Pocket 3, so one set,
-/// labelled DJI_Osmo, serves both.  Must stay in step with the list in
-/// scripts/gen_luts.ps1 (folder, name, look, tone, TITLE).
+/// [WP-HDRTONE] One set per DJI D-Log M LUT, each with one table per BT.2100
+/// output and Transfer Function (HDR) style, and the two Rec.709 looks.  DJI's
+/// D-Log M LUT is the same file for the Osmo 360 and the Pocket 3, so one set,
+/// DJI_Osmo on the osmo360 curve, serves both; the Avata 360 has its own LUT
+/// and its own set, DJI_Avata360 on the avata360 curve.  Must stay in step
+/// with the list in scripts/gen_luts.ps1 (folder, name, fit, look, tone,
+/// TITLE).
 constexpr ShippedLut kShippedLuts[] = {
-    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_ACES2_Bright.cube", OutputTransfer::PQ, Look::DjiStudio,
-     HdrTone::Aces2Bright, "OpenOSV D-Log M to Rec.2100 PQ, ACES 2 Bright (outdoor) - DJI Osmo 360 / Pocket 3"},
-    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_ACES2_Detailed.cube", OutputTransfer::PQ, Look::DjiStudio,
-     HdrTone::Aces2Detailed, "OpenOSV D-Log M to Rec.2100 PQ, ACES 2 Detailed (indoor) - DJI Osmo 360 / Pocket 3"},
-    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_BT2408_DeepBlacks_Natural.cube", OutputTransfer::PQ,
+    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_ACES2_Bright.cube", DlogMFit::Osmo360, OutputTransfer::PQ,
+     Look::DjiStudio, HdrTone::Aces2Bright,
+     "OpenOSV D-Log M to Rec.2100 PQ, ACES 2 Bright (outdoor) - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_ACES2_Detailed.cube", DlogMFit::Osmo360, OutputTransfer::PQ,
+     Look::DjiStudio, HdrTone::Aces2Detailed,
+     "OpenOSV D-Log M to Rec.2100 PQ, ACES 2 Detailed (indoor) - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_BT2408_DeepBlacks_Natural.cube", DlogMFit::Osmo360, OutputTransfer::PQ,
      Look::DjiStudio, HdrTone::Bt2408Natural,
      "OpenOSV D-Log M to Rec.2100 PQ, BT.2408 Deep Blacks + Natural - DJI Osmo 360 / Pocket 3"},
-    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_BT2408_DeepBlacks_Punchy.cube", OutputTransfer::PQ,
+    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_BT2408_DeepBlacks_Punchy.cube", DlogMFit::Osmo360, OutputTransfer::PQ,
      Look::DjiStudio, HdrTone::Bt2408Punchy,
      "OpenOSV D-Log M to Rec.2100 PQ, BT.2408 Deep Blacks + Punchy - DJI Osmo 360 / Pocket 3"},
-    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_BT2408_Neutral.cube", OutputTransfer::PQ, Look::DjiStudio,
-     HdrTone::Bt2408Neutral, "OpenOSV D-Log M to Rec.2100 PQ, BT.2408 Neutral - DJI Osmo 360 / Pocket 3"},
-    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_ACES2_Bright.cube", OutputTransfer::HLG, Look::DjiStudio,
-     HdrTone::Aces2Bright, "OpenOSV D-Log M to Rec.2100 HLG, ACES 2 Bright (outdoor) - DJI Osmo 360 / Pocket 3"},
-    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_ACES2_Detailed.cube", OutputTransfer::HLG, Look::DjiStudio,
-     HdrTone::Aces2Detailed, "OpenOSV D-Log M to Rec.2100 HLG, ACES 2 Detailed (indoor) - DJI Osmo 360 / Pocket 3"},
-    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_BT2408_DeepBlacks_Natural.cube", OutputTransfer::HLG,
-     Look::DjiStudio, HdrTone::Bt2408Natural,
+    {"Rec2100_PQ", "DJI_Osmo_DLogM_to_Rec2100_PQ_BT2408_Neutral.cube", DlogMFit::Osmo360, OutputTransfer::PQ,
+     Look::DjiStudio, HdrTone::Bt2408Neutral,
+     "OpenOSV D-Log M to Rec.2100 PQ, BT.2408 Neutral - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_ACES2_Bright.cube", DlogMFit::Osmo360, OutputTransfer::HLG,
+     Look::DjiStudio, HdrTone::Aces2Bright,
+     "OpenOSV D-Log M to Rec.2100 HLG, ACES 2 Bright (outdoor) - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_ACES2_Detailed.cube", DlogMFit::Osmo360, OutputTransfer::HLG,
+     Look::DjiStudio, HdrTone::Aces2Detailed,
+     "OpenOSV D-Log M to Rec.2100 HLG, ACES 2 Detailed (indoor) - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_BT2408_DeepBlacks_Natural.cube", DlogMFit::Osmo360,
+     OutputTransfer::HLG, Look::DjiStudio, HdrTone::Bt2408Natural,
      "OpenOSV D-Log M to Rec.2100 HLG, BT.2408 Deep Blacks + Natural - DJI Osmo 360 / Pocket 3"},
-    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_BT2408_DeepBlacks_Punchy.cube", OutputTransfer::HLG,
-     Look::DjiStudio, HdrTone::Bt2408Punchy,
+    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_BT2408_DeepBlacks_Punchy.cube", DlogMFit::Osmo360,
+     OutputTransfer::HLG, Look::DjiStudio, HdrTone::Bt2408Punchy,
      "OpenOSV D-Log M to Rec.2100 HLG, BT.2408 Deep Blacks + Punchy - DJI Osmo 360 / Pocket 3"},
-    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_BT2408_Neutral.cube", OutputTransfer::HLG, Look::DjiStudio,
-     HdrTone::Bt2408Neutral, "OpenOSV D-Log M to Rec.2100 HLG, BT.2408 Neutral - DJI Osmo 360 / Pocket 3"},
-    {"Rec709", "DJI_Osmo_DLogM_to_Rec709_DJI_Look.cube", OutputTransfer::Rec709, Look::DjiStudio,
+    {"Rec2100_HLG", "DJI_Osmo_DLogM_to_Rec2100_HLG_BT2408_Neutral.cube", DlogMFit::Osmo360, OutputTransfer::HLG,
+     Look::DjiStudio, HdrTone::Bt2408Neutral,
+     "OpenOSV D-Log M to Rec.2100 HLG, BT.2408 Neutral - DJI Osmo 360 / Pocket 3"},
+    {"Rec709", "DJI_Osmo_DLogM_to_Rec709_DJI_Look.cube", DlogMFit::Osmo360, OutputTransfer::Rec709, Look::DjiStudio,
      HdrTone::Aces2Bright, "OpenOSV D-Log M to Rec.709, DJI look - DJI Osmo 360 / Pocket 3"},
-    {"Rec709", "DJI_Osmo_DLogM_to_Rec709_OpenOSV_Standard.cube", OutputTransfer::Rec709, Look::Standard,
-     HdrTone::Aces2Bright, "OpenOSV D-Log M to Rec.709, OpenOSV standard - DJI Osmo 360 / Pocket 3"},
+    {"Rec709", "DJI_Osmo_DLogM_to_Rec709_OpenOSV_Standard.cube", DlogMFit::Osmo360, OutputTransfer::Rec709,
+     Look::Standard, HdrTone::Aces2Bright, "OpenOSV D-Log M to Rec.709, OpenOSV standard - DJI Osmo 360 / Pocket 3"},
+    {"Rec2100_PQ", "DJI_Avata360_DLogM_to_Rec2100_PQ_ACES2_Bright.cube", DlogMFit::Avata360, OutputTransfer::PQ,
+     Look::DjiStudio, HdrTone::Aces2Bright, "OpenOSV D-Log M to Rec.2100 PQ, ACES 2 Bright (outdoor) - DJI Avata 360"},
+    {"Rec2100_PQ", "DJI_Avata360_DLogM_to_Rec2100_PQ_ACES2_Detailed.cube", DlogMFit::Avata360, OutputTransfer::PQ,
+     Look::DjiStudio, HdrTone::Aces2Detailed,
+     "OpenOSV D-Log M to Rec.2100 PQ, ACES 2 Detailed (indoor) - DJI Avata 360"},
+    {"Rec2100_PQ", "DJI_Avata360_DLogM_to_Rec2100_PQ_BT2408_DeepBlacks_Natural.cube", DlogMFit::Avata360,
+     OutputTransfer::PQ, Look::DjiStudio, HdrTone::Bt2408Natural,
+     "OpenOSV D-Log M to Rec.2100 PQ, BT.2408 Deep Blacks + Natural - DJI Avata 360"},
+    {"Rec2100_PQ", "DJI_Avata360_DLogM_to_Rec2100_PQ_BT2408_DeepBlacks_Punchy.cube", DlogMFit::Avata360,
+     OutputTransfer::PQ, Look::DjiStudio, HdrTone::Bt2408Punchy,
+     "OpenOSV D-Log M to Rec.2100 PQ, BT.2408 Deep Blacks + Punchy - DJI Avata 360"},
+    {"Rec2100_PQ", "DJI_Avata360_DLogM_to_Rec2100_PQ_BT2408_Neutral.cube", DlogMFit::Avata360, OutputTransfer::PQ,
+     Look::DjiStudio, HdrTone::Bt2408Neutral, "OpenOSV D-Log M to Rec.2100 PQ, BT.2408 Neutral - DJI Avata 360"},
+    {"Rec2100_HLG", "DJI_Avata360_DLogM_to_Rec2100_HLG_ACES2_Bright.cube", DlogMFit::Avata360, OutputTransfer::HLG,
+     Look::DjiStudio, HdrTone::Aces2Bright, "OpenOSV D-Log M to Rec.2100 HLG, ACES 2 Bright (outdoor) - DJI Avata 360"},
+    {"Rec2100_HLG", "DJI_Avata360_DLogM_to_Rec2100_HLG_ACES2_Detailed.cube", DlogMFit::Avata360, OutputTransfer::HLG,
+     Look::DjiStudio, HdrTone::Aces2Detailed,
+     "OpenOSV D-Log M to Rec.2100 HLG, ACES 2 Detailed (indoor) - DJI Avata 360"},
+    {"Rec2100_HLG", "DJI_Avata360_DLogM_to_Rec2100_HLG_BT2408_DeepBlacks_Natural.cube", DlogMFit::Avata360,
+     OutputTransfer::HLG, Look::DjiStudio, HdrTone::Bt2408Natural,
+     "OpenOSV D-Log M to Rec.2100 HLG, BT.2408 Deep Blacks + Natural - DJI Avata 360"},
+    {"Rec2100_HLG", "DJI_Avata360_DLogM_to_Rec2100_HLG_BT2408_DeepBlacks_Punchy.cube", DlogMFit::Avata360,
+     OutputTransfer::HLG, Look::DjiStudio, HdrTone::Bt2408Punchy,
+     "OpenOSV D-Log M to Rec.2100 HLG, BT.2408 Deep Blacks + Punchy - DJI Avata 360"},
+    {"Rec2100_HLG", "DJI_Avata360_DLogM_to_Rec2100_HLG_BT2408_Neutral.cube", DlogMFit::Avata360, OutputTransfer::HLG,
+     Look::DjiStudio, HdrTone::Bt2408Neutral, "OpenOSV D-Log M to Rec.2100 HLG, BT.2408 Neutral - DJI Avata 360"},
+    {"Rec709", "DJI_Avata360_DLogM_to_Rec709_DJI_Look.cube", DlogMFit::Avata360, OutputTransfer::Rec709,
+     Look::DjiStudio, HdrTone::Aces2Bright, "OpenOSV D-Log M to Rec.709, DJI look - DJI Avata 360"},
+    {"Rec709", "DJI_Avata360_DLogM_to_Rec709_OpenOSV_Standard.cube", DlogMFit::Avata360, OutputTransfer::Rec709,
+     Look::Standard, HdrTone::Aces2Bright, "OpenOSV D-Log M to Rec.709, OpenOSV standard - DJI Avata 360"},
 };
 
 }  // namespace
@@ -487,10 +526,10 @@ TEST_CASE("The committed LUTs match the current pipeline", "[color][cube]") {
         INFO("shipped LUT: " << committed.string());
         REQUIRE(std::filesystem::exists(committed));
 
-        // Regenerate with the exact arguments the generator uses: the default
+        // Regenerate with the exact arguments the generator uses: the set's
         // curve, 65^3, no exposure offset, D-Log M input, the look and the
         // [WP-HDRTONE] transfer function style named, the same TITLE.
-        const OsvColorParams params = makeColorParams(kDefaultDlogMFit, s.transfer, 0.0f, InputEncoding::DLogM,
+        const OsvColorParams params = makeColorParams(s.fit, s.transfer, 0.0f, InputEncoding::DLogM,
                                                       true, 10, nullptr, kBt2408SceneScale, s.look,
                                                       kDefaultHdrPeakNits, s.tone);
         REQUIRE(colorParamsValid(params));
@@ -639,6 +678,11 @@ TEST_CASE("The committed LUTs land the BT.2408 anchors", "[color][cube]") {
     // Osmo 360 file reads 0.3882 and 0.7404 at these two grid points, the
     // look 0.3847 and 0.7457.  The OpenOSV standard look is the HLG signal,
     // 0.3873 / 0.7479, exactly the Neutral HLG row.
+    //
+    // The Avata 360 set: its curve places light within 2 % of the Osmo 360's
+    // above grey, so its HDR rows sit within 0.0011 of the Osmo rows.  Its
+    // Rec.709 look follows DJI's Avata 360 file, which reads 0.3766 and 0.7359
+    // here (the look 0.3723 and 0.7371) - darker at grey than the Osmo 360's.
     static const Anchor kAnchors[] = {
         {"Rec2100_PQ/DJI_Osmo_DLogM_to_Rec2100_PQ_ACES2_Bright.cube", 0.3841, 0.5638},
         {"Rec2100_PQ/DJI_Osmo_DLogM_to_Rec2100_PQ_ACES2_Detailed.cube", 0.3298, 0.5087},
@@ -652,6 +696,18 @@ TEST_CASE("The committed LUTs land the BT.2408 anchors", "[color][cube]") {
         {"Rec2100_HLG/DJI_Osmo_DLogM_to_Rec2100_HLG_BT2408_Neutral.cube", 0.3873, 0.7479},
         {"Rec709/DJI_Osmo_DLogM_to_Rec709_DJI_Look.cube", 0.3847, 0.7457},
         {"Rec709/DJI_Osmo_DLogM_to_Rec709_OpenOSV_Standard.cube", 0.3873, 0.7479},
+        {"Rec2100_PQ/DJI_Avata360_DLogM_to_Rec2100_PQ_ACES2_Bright.cube", 0.3842, 0.5632},
+        {"Rec2100_PQ/DJI_Avata360_DLogM_to_Rec2100_PQ_ACES2_Detailed.cube", 0.3299, 0.5081},
+        {"Rec2100_PQ/DJI_Avata360_DLogM_to_Rec2100_PQ_BT2408_DeepBlacks_Natural.cube", 0.3845, 0.5829},
+        {"Rec2100_PQ/DJI_Avata360_DLogM_to_Rec2100_PQ_BT2408_DeepBlacks_Punchy.cube", 0.3845, 0.5829},
+        {"Rec2100_PQ/DJI_Avata360_DLogM_to_Rec2100_PQ_BT2408_Neutral.cube", 0.3850, 0.5787},
+        {"Rec2100_HLG/DJI_Avata360_DLogM_to_Rec2100_HLG_ACES2_Bright.cube", 0.3860, 0.7222},
+        {"Rec2100_HLG/DJI_Avata360_DLogM_to_Rec2100_HLG_ACES2_Detailed.cube", 0.2970, 0.6297},
+        {"Rec2100_HLG/DJI_Avata360_DLogM_to_Rec2100_HLG_BT2408_DeepBlacks_Natural.cube", 0.3866, 0.7533},
+        {"Rec2100_HLG/DJI_Avata360_DLogM_to_Rec2100_HLG_BT2408_DeepBlacks_Punchy.cube", 0.3866, 0.7533},
+        {"Rec2100_HLG/DJI_Avata360_DLogM_to_Rec2100_HLG_BT2408_Neutral.cube", 0.3874, 0.7468},
+        {"Rec709/DJI_Avata360_DLogM_to_Rec709_DJI_Look.cube", 0.3723, 0.7371},
+        {"Rec709/DJI_Avata360_DLogM_to_Rec709_OpenOSV_Standard.cube", 0.3874, 0.7468},
     };
     static_assert(std::size(kAnchors) == std::size(kShippedLuts), "every shipped LUT has its anchors");
 

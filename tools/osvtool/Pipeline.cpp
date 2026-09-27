@@ -392,13 +392,20 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
             return Error{ErrorCode::Malformed, "clip has no attitude samples; cannot stabilise"};
         }
         p->referenceAttitude = p->attitude->worldFromBody(p->attitude->beginUs());
+        std::vector<Quatd> perFrame;
+        perFrame.reserve(p->attitude->samples().size());
+        for (const auto& s : p->attitude->samples()) {
+            perFrame.push_back(s.worldFromBody);
+        }
+        // The same mount the importer measures: identity for a lenses-level
+        // camera, a quarter turn for a lens-up / lens-down one (Avata 360).
+        p->stabParams.mount = geom::levellingMount(perFrame, p->attitude->worldUp());
+        if (p->stabParams.mount.distance(Mat3d::identity()) > 0.0) {
+            p->notes.push_back("stabilisation: the lens axes are vertical over the clip; levelling takes its heading "
+                               "from the body's horizontal axis");
+        }
         // Both smoothing modes read the per-frame smoothed orientation.
         if (geom::stabilizationUsesSmoothing(p->stabParams.mode)) {
-            std::vector<Quatd> perFrame;
-            perFrame.reserve(p->attitude->samples().size());
-            for (const auto& s : p->attitude->samples()) {
-                perFrame.push_back(s.worldFromBody);
-            }
             p->smoothedAttitude = geom::Smoother(p->stabParams.smoothSigmaFrames).smooth(perFrame);
         }
     }

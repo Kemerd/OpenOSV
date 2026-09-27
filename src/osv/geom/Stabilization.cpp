@@ -85,6 +85,17 @@ Mat3d fromEulerZXY(const EulerZXY& e) noexcept {
 // -----------------------------------------------------------------------------
 namespace {
 
+/// True when `m` is finite, orthonormal and right-handed (to 1e-6): the only
+/// kind of matrix a levelling mount may be.
+bool isRotation(const Mat3d& m) noexcept {
+    for (const double v : m.m) {
+        if (!std::isfinite(v)) {
+            return false;
+        }
+    }
+    return (m.transposed() * m).distance(Mat3d::identity()) < 1e-6 && m.determinant() > 0.0;
+}
+
 /// Build an orthonormal world basis (right, forward, up) with `up` as the
 /// third axis and the horizontal projection of `forwardHint` as the second.
 /// Returns false when the hint is (anti)parallel to up and no basis can be
@@ -174,9 +185,17 @@ Mat3d stabilizationBodyFromWorld(const Quatd& worldFromBody, const Stabilization
 
     case StabilizationMode::HorizonLock:
     case StabilizationMode::SmoothLevel: {
+        // The levelling works in the mounted frame (levellingMount): every
+        // pose is taken as world <- body <- mounted, and the result mapped
+        // back into the body at the end.  An identity mount - every Osmo 360
+        // clip - makes this exactly the unmounted computation.  A mount that
+        // is not a proper rotation (a corrupt caller) is ignored.
+        const Mat3d mount = isRotation(params.mount) ? params.mount : Mat3d::identity();
+        const Mat3d rWm = rWb * mount;
+        const Mat3d rRefM = rRef * mount;
         // World basis with the reference heading as forward and true up as up.
         Mat3d basis;
-        if (!referenceHorizonBasis(worldUp, rRef, basis)) {
+        if (!referenceHorizonBasis(worldUp, rRefM, basis)) {
             return Mat3d::identity();
         }
         // The pose whose level part the view keeps.  HorizonLock levels the
@@ -185,18 +204,57 @@ Mat3d stabilizationBodyFromWorld(const Quatd& worldFromBody, const Stabilization
         // smoothed heading (RockSteady) and pitch / roll are level (Horizon
         // Leveling).  Without a usable smoothed pose it levels the body -
         // the horizon stays level even when the smoothing is unavailable.
-        Mat3d rWorldFromSource = rWb;
+        Mat3d rWorldFromSource = rWm;
         if (params.mode == StabilizationMode::SmoothLevel && smoothed.has_value() && smoothed->isFinite()) {
-            rWorldFromSource = smoothed->normalized().toMatrix();
+            rWorldFromSource = smoothed->normalized().toMatrix() * mount;
         }
         const Mat3d rLevelledFromView = levelledFromView(basis, rWorldFromSource, params);
-        // Current body orientation expressed in the same levelled basis.
-        const Mat3d rLevelledFromBody = basis.transposed() * rWb;
-        // body <- levelled <- view.
-        return rLevelledFromBody.transposed() * rLevelledFromView;
+        // Current (mounted) body orientation expressed in the same levelled basis.
+        const Mat3d rLevelledFromMounted = basis.transposed() * rWm;
+        // body <- mounted <- levelled <- view.
+        return mount * (rLevelledFromMounted.transposed() * rLevelledFromView);
     }
     }
     return Mat3d::identity();
+}
+
+// -----------------------------------------------------------------------------
+//  Levelling mount
+// -----------------------------------------------------------------------------
+Mat3d levellingMount(const std::vector<Quatd>& worldFromBody, const Vec3d& worldUp) noexcept {
+    const Vec3d up = worldUp.normalized();
+    if (!(up.norm() > 0.5)) {
+        return Mat3d::identity();
+    }
+    // How vertical the body's +Y (the lens axis) is over the clip: the mean of
+    // |cos| to up decides the frame, the mean of the signed cos which lens is
+    // the upper one.  Every sample counts once; a clip is a few thousand.
+    double sumAbs = 0.0;
+    double sumSigned = 0.0;
+    std::size_t used = 0;
+    for (const Quatd& q : worldFromBody) {
+        if (!q.isFinite()) {
+            continue;
+        }
+        const double c = (q.normalized().toMatrix() * Vec3d{0.0, 1.0, 0.0}).dot(up);
+        if (!std::isfinite(c)) {
+            continue;
+        }
+        sumAbs += std::fabs(c);
+        sumSigned += c;
+        ++used;
+    }
+    // cos(45 deg): closer to the horizon than to vertical keeps the body as
+    // it is, which is every clip the Osmo 360 has recorded.
+    constexpr double kVerticalLensAxisCos = 0.70710678118654752;
+    if (used == 0 || sumAbs / static_cast<double>(used) <= kVerticalLensAxisCos) {
+        return Mat3d::identity();
+    }
+    // A quarter turn about +X: columns (X, s*Z, -s*Y), right handed for either
+    // sign since X x (s*Z) = -s*Y.  With +Y up on average s = -1, giving
+    // (right +X, forward -Z, up +Y); with +Y down s = +1, giving (+X, +Z, -Y).
+    const double s = (sumSigned >= 0.0) ? -1.0 : 1.0;
+    return Mat3d::fromColumns(Vec3d{1.0, 0.0, 0.0}, Vec3d{0.0, 0.0, s}, Vec3d{0.0, -s, 0.0});
 }
 
 // -----------------------------------------------------------------------------

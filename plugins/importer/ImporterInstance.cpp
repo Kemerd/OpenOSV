@@ -155,6 +155,7 @@ void trimAnalysisCache(MapT& cache, std::size_t limit, const typename MapT::key_
     switch (fit) {
     case PrefsDlogmFit::Pocket3:  return color::DlogMFit::Pocket3;
     case PrefsDlogmFit::DjiRefit: return color::DlogMFit::DjiRefit;
+    case PrefsDlogmFit::Avata360: return color::DlogMFit::Avata360;
     case PrefsDlogmFit::Osmo360:
     case PrefsDlogmFit::Count:
     default:                      break;
@@ -1363,14 +1364,25 @@ void ImporterInstance::rebuildStabilization() {
     m_attitude = std::move(built).value();
     m_referenceAttitude = m_attitude->worldFromBody(m_attitude->beginUs());
 
+    std::vector<Quatd> perFrame;
+    perFrame.reserve(m_attitude->samples().size());
+    for (const auto& s : m_attitude->samples()) {
+        perFrame.push_back(s.worldFromBody);
+    }
+    // How the rig is mounted, from the whole track: identity for a camera
+    // held lenses-level (every Osmo 360 clip), a quarter turn for one flown
+    // lens-up / lens-down (the Avata 360), whose heading would otherwise sit
+    // in gimbal lock.
+    m_stabParams.mount = geom::levellingMount(perFrame, m_attitude->worldUp());
+    if (m_stabParams.mount.distance(Mat3d::identity()) > 0.0) {
+        PluginLog::info("stabilisation: '{}': the lens axes are vertical over the clip; levelling takes its heading "
+                        "from the body's horizontal axis",
+                        m_path.filename().string());
+    }
+
     // Smooth and Smooth + horizon lock both read the smoothed orientation;
     // the smoothing is one pass over the track, done once per mode change.
     if (geom::stabilizationUsesSmoothing(m_stabParams.mode)) {
-        std::vector<Quatd> perFrame;
-        perFrame.reserve(m_attitude->samples().size());
-        for (const auto& s : m_attitude->samples()) {
-            perFrame.push_back(s.worldFromBody);
-        }
         m_smoothedAttitude = geom::Smoother(m_stabParams.smoothSigmaFrames).smooth(perFrame);
     }
 }

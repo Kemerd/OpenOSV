@@ -11,14 +11,15 @@
     repository so a user can point Lumetri or Resolve at them without
     building anything, not because they are source.
 
-    One set serves both cameras.  DJI ships the same D-Log M LUT for the Osmo
-    360 and the Pocket 3, and the osmo360 curve is fitted to it, so the set
-    is labelled DJI_Osmo and baked with that curve:
+    One set per DJI D-Log M LUT.  DJI ships the same D-Log M LUT for the Osmo
+    360 and the Pocket 3, and the osmo360 curve is fitted to it, so that set
+    is labelled DJI_Osmo and baked with that curve.  The Avata 360 has a LUT
+    of its own, and a set of its own, DJI_Avata360, baked with avata360:
 
         luts\
-          Rec2100_PQ\    DJI_Osmo_DLogM_to_Rec2100_PQ_<style>.cube   (5 styles)
-          Rec2100_HLG\   DJI_Osmo_DLogM_to_Rec2100_HLG_<style>.cube  (5 styles)
-          Rec709\        DJI_Osmo_DLogM_to_Rec709_<look>.cube        (2 looks)
+          Rec2100_PQ\    <set>_DLogM_to_Rec2100_PQ_<style>.cube   (5 styles)
+          Rec2100_HLG\   <set>_DLogM_to_Rec2100_HLG_<style>.cube  (5 styles)
+          Rec709\        <set>_DLogM_to_Rec709_<look>.cube        (2 looks)
           README.txt     which file to use
 
     The five HDR styles are Source Settings' "Transfer Function (HDR)"
@@ -49,9 +50,10 @@
     and keeps the trilinear error below the quantisation of a 10-bit signal.
 
 .PARAMETER Fit
-    D-Log M curve to bake.  Defaults to osmo360, the project default: the
-    curve fitted to DJI's own D-Log M LUT, which is the same file for the
-    Osmo 360 and the Pocket 3 (see docs/COLOR.md).
+    Only the set baked with this curve: osmo360 (DJI_Osmo, the Osmo 360 and
+    the Pocket 3) or avata360 (DJI_Avata360).  Every set when omitted.  Each
+    set always uses its own curve; this only picks which sets to write or
+    check.
 
 .PARAMETER Check
     Regenerates into a temporary folder and compares against OutDir instead of
@@ -75,7 +77,7 @@ param(
     [string] $OsvTool,
     [string] $OutDir,
     [int]    $Size = 65,
-    [string] $Fit = 'osmo360',
+    [string] $Fit = '',
     [switch] $Check
 )
 
@@ -96,14 +98,20 @@ if (-not $OutDir) { $OutDir = Join-Path $repoRoot 'luts' }
 #  data is redistributed, see NOTICE), the output, the style and the two
 #  cameras, because a .cube carries no other provenance.
 #
-#  Every entry names its --look and --tone explicitly, so no file can change
-#  if a library default ever moves.  The HDR tables ignore the look and the
+#  Every entry names its --fit, --look and --tone explicitly, so no file can
+#  change if a library default ever moves.  The HDR tables ignore the look and the
 #  Rec.709 tables ignore the tone.
 #
-#  tests/unit/test_cube.cpp holds the same list (folder, name, transfer,
+#  tests/unit/test_cube.cpp holds the same list (folder, name, fit, transfer,
 #  look, tone, title) and must be kept in step with it.
 # ---------------------------------------------------------------------------
-$script:Cameras = 'DJI Osmo 360 / Pocket 3'
+# One camera set per DJI D-Log M LUT: its file-name prefix, the curve it is
+# baked with (which also picks the camera's primaries matrix and Rec.709
+# look), and the cameras its TITLE names.
+$script:CameraSets = @(
+    @{ Prefix = 'DJI_Osmo';     Fit = 'osmo360';  Cameras = 'DJI Osmo 360 / Pocket 3' }
+    @{ Prefix = 'DJI_Avata360'; Fit = 'avata360'; Cameras = 'DJI Avata 360' }
+)
 $script:HdrStyles = @(
     @{ Suffix = 'ACES2_Bright';               Tone = 'aces-bright';    Label = 'ACES 2 Bright (outdoor)' }
     @{ Suffix = 'ACES2_Detailed';             Tone = 'aces-detailed';  Label = 'ACES 2 Detailed (indoor)' }
@@ -112,27 +120,32 @@ $script:HdrStyles = @(
     @{ Suffix = 'BT2408_Neutral';             Tone = 'bt2408-neutral'; Label = 'BT.2408 Neutral' }
 )
 $script:Luts = @()
-foreach ($output in @(
-        @{ Dir = 'Rec2100_PQ';  Transfer = 'pq';  Name = 'Rec2100_PQ';  Title = 'Rec.2100 PQ' }
-        @{ Dir = 'Rec2100_HLG'; Transfer = 'hlg'; Name = 'Rec2100_HLG'; Title = 'Rec.2100 HLG' })) {
-    foreach ($style in $script:HdrStyles) {
-        $script:Luts += @{
-            Dir      = $output.Dir
-            Name     = "DJI_Osmo_DLogM_to_$($output.Name)_$($style.Suffix).cube"
-            Transfer = $output.Transfer
-            Look     = 'dji'
-            Tone     = $style.Tone
-            Title    = "OpenOSV D-Log M to $($output.Title), $($style.Label) - $($script:Cameras)"
+foreach ($camera in $script:CameraSets) {
+    foreach ($output in @(
+            @{ Dir = 'Rec2100_PQ';  Transfer = 'pq';  Name = 'Rec2100_PQ';  Title = 'Rec.2100 PQ' }
+            @{ Dir = 'Rec2100_HLG'; Transfer = 'hlg'; Name = 'Rec2100_HLG'; Title = 'Rec.2100 HLG' })) {
+        foreach ($style in $script:HdrStyles) {
+            $script:Luts += @{
+                Dir      = $output.Dir
+                Name     = "$($camera.Prefix)_DLogM_to_$($output.Name)_$($style.Suffix).cube"
+                Fit      = $camera.Fit
+                Transfer = $output.Transfer
+                Look     = 'dji'
+                Tone     = $style.Tone
+                Title    = "OpenOSV D-Log M to $($output.Title), $($style.Label) - $($camera.Cameras)"
+            }
         }
     }
-}
-$script:Luts += @{
-    Dir = 'Rec709'; Name = 'DJI_Osmo_DLogM_to_Rec709_DJI_Look.cube'; Transfer = '709'; Look = 'dji'
-    Tone = 'aces-bright'; Title = "OpenOSV D-Log M to Rec.709, DJI look - $($script:Cameras)"
-}
-$script:Luts += @{
-    Dir = 'Rec709'; Name = 'DJI_Osmo_DLogM_to_Rec709_OpenOSV_Standard.cube'; Transfer = '709'; Look = 'standard'
-    Tone = 'aces-bright'; Title = "OpenOSV D-Log M to Rec.709, OpenOSV standard - $($script:Cameras)"
+    $script:Luts += @{
+        Dir = 'Rec709'; Name = "$($camera.Prefix)_DLogM_to_Rec709_DJI_Look.cube"; Fit = $camera.Fit
+        Transfer = '709'; Look = 'dji'; Tone = 'aces-bright'
+        Title = "OpenOSV D-Log M to Rec.709, DJI look - $($camera.Cameras)"
+    }
+    $script:Luts += @{
+        Dir = 'Rec709'; Name = "$($camera.Prefix)_DLogM_to_Rec709_OpenOSV_Standard.cube"; Fit = $camera.Fit
+        Transfer = '709'; Look = 'standard'; Tone = 'aces-bright'
+        Title = "OpenOSV D-Log M to Rec.709, OpenOSV standard - $($camera.Cameras)"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -141,13 +154,17 @@ $script:Luts += @{
 # ---------------------------------------------------------------------------
 $script:ReadmeName = 'README.txt'
 $script:ReadmeText = @'
-OpenOSV LUTs for DJI D-Log M (Osmo 360 and Pocket 3)
-====================================================
+OpenOSV LUTs for DJI D-Log M (Osmo 360, Pocket 3 and Avata 360)
+===============================================================
 
 Apply these ONLY to raw D-Log M footage, never on top of a clip that is
 already converted (an OpenOSV PQ / HLG / Rec.709 output, or DJI's own LUT).
 
-Pick the folder that matches your timeline:
+Pick the set that matches your camera:
+  DJI_Osmo_*       Osmo 360 and Pocket 3 (DJI ships one D-Log M LUT for both)
+  DJI_Avata360_*   Avata 360 (DJI ships it a D-Log M LUT of its own)
+
+Then the folder that matches your timeline:
   Rec2100_PQ\    HDR10 / PQ timelines
   Rec2100_HLG\   HLG timelines
   Rec709\        SDR timelines
@@ -163,8 +180,8 @@ Rec.709:
   DJI_Look                     DJI's own Rec.709 look. The default.
   OpenOSV_Standard             OpenOSV's neutral Rec.709 rendering.
 
-One set fits both cameras: DJI ships the same D-Log M LUT for the Osmo 360
-and the Pocket 3, and these tables use OpenOSV's curve fitted to it.
+Each set uses OpenOSV's curve, primaries and Rec.709 look fitted to that
+camera's own DJI D-Log M LUT.
 Generated by scripts\gen_luts.ps1 (osvtool lut). Apache-2.0.
 '@
 
@@ -206,7 +223,7 @@ function New-Lut {
     $path = Join-Path $folder $Spec.Name
     # 2>&1 so a failure message from the tool reaches the transcript rather
     # than the void; the output is only printed when the exit code is bad.
-    $output = & $Tool lut --fit $Fit --look $Spec.Look --tone $Spec.Tone --out-transfer $Spec.Transfer `
+    $output = & $Tool lut --fit $Spec.Fit --look $Spec.Look --tone $Spec.Tone --out-transfer $Spec.Transfer `
         --size $Size --title $Spec.Title $path 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host ($output -join [Environment]::NewLine)
@@ -268,6 +285,15 @@ try {
     if ($Size -lt 2 -or $Size -gt 256) {
         throw "-Size must be in [2, 256] (got $Size)."
     }
+    # -Fit narrows the work to one camera set; every set otherwise.  The
+    # stale-file check below still knows the whole set.
+    $selected = @($script:Luts)
+    if ($Fit) {
+        $selected = @($script:Luts | Where-Object { $_.Fit -eq $Fit.ToLowerInvariant() })
+        if ($selected.Count -eq 0) {
+            throw "-Fit '$Fit' names no set (expected one of: $(($script:CameraSets | ForEach-Object { $_.Fit }) -join ', '))."
+        }
+    }
 
     if ($Check) {
         # ---- verification mode -------------------------------------------
@@ -279,7 +305,7 @@ try {
         try {
             Write-Step "Checking $OutDir against a fresh generation"
             $differences = @()
-            foreach ($spec in $script:Luts) {
+            foreach ($spec in $selected) {
                 New-Lut -Tool $OsvTool -Spec $spec -Directory $temp | Out-Null
                 $relative = Join-Path $spec.Dir $spec.Name
                 $problem = Compare-Generated -Committed (Join-Path $OutDir $relative) `
@@ -321,10 +347,10 @@ try {
     if (-not (Test-Path -LiteralPath $OutDir -PathType Container)) {
         New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
     }
-    Write-Step "Writing $($script:Luts.Count) LUT(s) and $($script:ReadmeName) into $OutDir"
-    Write-Info "curve: $Fit    size: ${Size}^3"
+    Write-Step "Writing $($selected.Count) LUT(s) and $($script:ReadmeName) into $OutDir"
+    Write-Info ("curves: {0}    size: ${Size}^3" -f (($selected | ForEach-Object { $_.Fit } | Select-Object -Unique) -join ', '))
     Write-Host ''
-    foreach ($spec in $script:Luts) {
+    foreach ($spec in $selected) {
         $anchor = New-Lut -Tool $OsvTool -Spec $spec -Directory $OutDir
         $relative = Join-Path $spec.Dir $spec.Name
         $bytes = (Get-Item -LiteralPath (Join-Path $OutDir $relative)).Length
