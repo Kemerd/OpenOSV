@@ -6,6 +6,7 @@
 
 Free and open source. Drop an `.OSV` on your timeline and it's stitched,
 converted to HDR and ready to reframe. No export step, no transcode.
+DJI Avata 360 clips open too (new: not yet tested on Avata footage here).
 
 [![Licence: Apache-2.0](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
 ![Platform: Windows | macOS (preview)](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20%7C%20macOS%20%28preview%29-0078D6.svg)
@@ -228,7 +229,8 @@ are the good ones, so you never *have* to touch any of it. See
 * **LUTs included.** A `LUTs` folder of D-Log M `.cube` files for other
   editors: Rec.2100 PQ and HLG in all five HDR styles, and Rec.709 with DJI's
   look or OpenOSV's. One set fits the Osmo 360 and the Pocket 3, which share
-  DJI's D-Log M LUT; its `README.txt` says which file to use. Installed next
+  DJI's D-Log M LUT, and one the Avata 360, which has its own; the
+  `README.txt` says which file to use. Installed next
   to the plug-ins. All the colour maths is open and documented in
   [`docs/COLOR.md`](docs/COLOR.md).
 

@@ -55,6 +55,39 @@ schema. The fields that matter:
 Repeated scalars may be packed or unpacked; unknown fields are skipped by
 wire type; every field is optional.
 
+### Other cameras: the same messages, other numbers
+
+`ClipMeta.1.1` (`proto_file_name`) names the camera's schema. Every DJI camera
+builds its `ProductMeta` from the same library messages (`DewarpParams`,
+`PanoDewarpParams`, `Quaternion`, the scalar wrappers, the IMU batches), but
+numbers the fields of `ClipMeta`, `StreamMeta`, `FrameMeta` and
+`FrameMetaOfCamera` its own way. `DjmdDecoder` maps each known schema onto the
+Osmo 360 numbering above, so the typed structs and their `present` bits mean
+the same on every camera; frames after the first carry no header and are read
+in sample 0's schema. `osvtool probe` prints the schema used.
+
+The DJI Avata 360 (`dvtm_AVATA360.proto`), where it differs:
+
+| Avata 360 | Meaning | Osmo 360 |
+|---|---|---|
+| ClipMeta.6 | `digital_focal_length` | ClipMeta.8 |
+| ClipMeta.8 | IMU sampling rate | ClipMeta.10 |
+| ClipMeta.12 | sensor resolution | ClipMeta.14 |
+| ClipMeta.14 | `flat_res` (not read) | - |
+| StreamMeta.2.4 | `color_mode`, inside `camera_stream_meta` | StreamMeta.4 |
+| StreamMeta.4 | `fov_type` (empty on every clip seen) | StreamMeta.5 |
+| StreamMeta.5 | `PanoDewarpParams` | StreamMeta.6 |
+| StreamMeta.6 | `extri_lens_mode` | StreamMeta.7 |
+| FrameMeta.4 | `drone_frame_meta` (the aircraft's telemetry; not read) | - |
+| FrameMeta.5 | `gimbal_frame_meta` | FrameMeta.4 |
+| FrameMetaOfCamera.22 / .23 | `camera_attitude` / `camera_acc` | .9 / .10 |
+| FrameMetaOfIMU.4 | a single fused attitude batch, used when field 2 has none | - |
+
+The Avata 360 flies its 360 camera with one lens up and one down, so its lens
+axis (the body's +Y) is vertical: Horizon Leveling measures that from the
+attitude track and levels about the body's horizontal axis instead
+(`levellingMount`, `include/osv/geom/Stabilization.h`).
+
 ### Calibration sets and lens accessories
 
 The camera writes **every** `PanoDewarpParams` slot; the sets it has no

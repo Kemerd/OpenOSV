@@ -8,19 +8,37 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ### Added
 
-* **DJI Avata 360 D-Log M curve, `--fit avata360`.** A D-Log M curve and
-  primaries matrix for the Avata 360 (`kDlogMAvata360`,
-  `kNativeToRec2020_Avata360`), for `osvtool render` and `osvtool lut`. DJI
-  publishes no Avata 360 LUT, so it is a fit to DJI Studio's export of one
-  Avata 360 clip; its limits are in `docs/COLOR.md`. The Osmo 360 curve stays
-  the default. The Premiere and Resolve curve menus do not list it yet.
+* **DJI Avata 360 clips open, stitch and reframe.** The Avata 360 writes the
+  same metadata messages as the Osmo 360 under other field numbers, so its
+  calibration, focal length, sensor size, colour mode, lens accessory and
+  attitude were read from the wrong places and no Avata clip opened. They are
+  now read in the Avata 360's own numbering (`osvtool probe` names the schema
+  a clip was read with). Not yet checked on Avata 360 footage in this
+  repository: reports welcome.
+* **Avata 360 colour, fitted to DJI's own Avata 360 LUT.** DJI Studio bundles a
+  D-Log M to Rec.709 LUT for the Avata 360 that differs from the Osmo 360 one.
+  `--fit avata360` (curve, primaries and Rec.709 look) is fitted to it the way
+  the Osmo 360 fit is fitted to its own: 1.68 dE2000 mean from DJI's Avata 360
+  rendering, against 2.52 for the Osmo 360 fit. The first Avata 360 curve and
+  matrix (contributed in #1, fitted to DJI Studio exports before the LUT was
+  found) are replaced. Osmo 360 stays the default.
+* **"Avata 360" in the D-Log M Curve menus** of Source Settings (Premiere) and
+  OpenOSV Source (Resolve). Saved projects read as before.
+* **Avata 360 LUTs.** `luts/` gains a `DJI_Avata360` set beside the Osmo 360 /
+  Pocket 3 one: Rec.2100 PQ and HLG in all five HDR styles, and Rec.709 with
+  DJI's Avata 360 look or OpenOSV's.
 
 ### Fixed
 
-* **The Avata 360's colour mode is read from where it records it.** The
-  Avata 360 (`dvtm_AVATA360.proto`) keeps its colour mode at StreamMeta 2.4.1,
-  and its StreamMeta 4 is empty, so every Avata clip, D-Log M included, was
-  reported as Normal. `osvtool probe` now reports D-Log M for them.
+* **The Avata 360's colour mode is read from where it records it**
+  (StreamMeta 2.4, #1). Every Avata clip, D-Log M included, was reported as
+  Normal.
+* **Horizon Leveling holds its heading on a lens-up / lens-down rig.** The
+  Avata 360 flies with one lens up and one down; levelling about the vertical
+  lens axis sat in gimbal lock, where a small tilt swung the view. OpenOSV
+  now measures the mount from the clip's attitude track and levels about the
+  body's horizontal axis instead. Clips held lenses-level, every Osmo 360
+  clip, render exactly as before.
 
 ## [0.2.1] - 2026-09-24
 
