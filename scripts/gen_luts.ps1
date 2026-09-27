@@ -291,7 +291,8 @@ try {
     if ($Fit) {
         $selected = @($script:Luts | Where-Object { $_.Fit -eq $Fit.ToLowerInvariant() })
         if ($selected.Count -eq 0) {
-            throw "-Fit '$Fit' names no set (expected one of: $(($script:CameraSets | ForEach-Object { $_.Fit }) -join ', '))."
+            $known = ($script:CameraSets | ForEach-Object { $_.Fit }) -join ', '
+            throw "-Fit '$Fit' names no set (expected one of: $known)."
         }
     }
 
@@ -348,7 +349,8 @@ try {
         New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
     }
     Write-Step "Writing $($selected.Count) LUT(s) and $($script:ReadmeName) into $OutDir"
-    Write-Info ("curves: {0}    size: ${Size}^3" -f (($selected | ForEach-Object { $_.Fit } | Select-Object -Unique) -join ', '))
+    $curves = ($selected | ForEach-Object { $_.Fit } | Select-Object -Unique) -join ', '
+    Write-Info "curves: $curves    size: ${Size}^3"
     Write-Host ''
     foreach ($spec in $selected) {
         $anchor = New-Lut -Tool $OsvTool -Spec $spec -Directory $OutDir
