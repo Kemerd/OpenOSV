@@ -25,8 +25,9 @@
 // ---- our layers -----------------------------------------------------------
 #include "HostSuites.h"
 #include "PrefsBlob.h"
-// kSourceSettingsMatchName / kSourceSettingsMatchNameW: the one spelling of
-// the Source Settings effect's match name, shared with that effect's PiPL.
+// kSourceSettingsMatchName / kSourceSettingsHostMatchNameW: the one spelling
+// of the Source Settings effect's match name, shared with that effect's PiPL,
+// and the host's "AE." form of it that the importer advertises.
 #include "SourceSettingsIdentity.h"
 
 #include <atomic>

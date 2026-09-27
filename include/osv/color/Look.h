@@ -153,7 +153,9 @@ bool monotoneTangents(const float* tone, int count, float* slopes) noexcept;
 /// treats as "no look".
 [[nodiscard]] OsvLookParams makeLookParams(Look look, OutputTransfer transfer) noexcept;
 
-/// Replace the look of an already built parameter block, for its own transfer.
+/// Replace the look of an already built parameter block, for its own transfer
+/// and input.  Only a D-Log M input gets a look: HLG and Normal clips are
+/// display renderings already, and are left without one.
 void setLook(OsvColorParams& params, Look look) noexcept;
 
 /// The look a parameter block carries (Standard for a zeroed / foreign block).

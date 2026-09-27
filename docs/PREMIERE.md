@@ -553,13 +553,24 @@ absent, so that fact cannot be forgotten.
   `static_assert`s each against the real `AE_Effect.h` macro.
 * **The match name is the entire interface.** Premiere pairs importer and
   effect by comparing `imFileInfoRec8::sourceSettingsMatchName`
-  (`PrSDKImport.h:425`) to the PiPL's `AE_Effect_Match_Name`, with no
+  (`PrSDKImport.h:425`) to the name it registered the effect under, with no
   handshake and no diagnostic on a mismatch: one mistyped character and the
   panel simply never shows the options, with nothing in any log to say why.
   So the string lives once, in `plugins/common/SourceSettingsIdentity.h`, and
   is read by the effect's `.r`, the effect's `.cpp` and the importer. A test
   reads the resource back out of the built module and compares it to that
   header; another reads it out of a live `imGetInfo8`.
+* **The importer names the effect the way Premiere does: `AE.` + the PiPL
+  match name** (`AE.OpenOSV.SourceSettings`, `OSV_SOURCE_SETTINGS_HOST_MATCH_NAME`).
+  Premiere registers every AE-API effect with that prefix. Given the bare
+  PiPL name, as 0.2.1 and earlier did, it still finds and attaches the
+  effect, but never recognises the instance already on the master clip:
+  every time it re-checks the clip (the Master tab, a sequence settings
+  change, a proxy attach) it adds another Source Settings effect, and a
+  source settings effect cannot be deleted. A third-party importer developer
+  hit the same thing on Adobe's forum ("Premiere Importer Development With
+  Source Settings Effect") and fixed it with the prefix. The PiPL match name
+  itself never changes: projects store it.
 
 ### Parameters (IDs are permanent; the INDEX is not the ID)
 
@@ -1048,7 +1059,8 @@ ends up showing "2560 x 1280" while decoding at 6000 x 3000.
   users and is the only route left on a machine where the `.aex` failed to
   install. Both paths write the same `PrefsBlob`.
 * `imGetInfo8` fills `sourceSettingsMatchName` from
-  `kSourceSettingsMatchNameW`.
+  `kSourceSettingsHostMatchNameW`: the host's `AE.`-prefixed name (see
+  "Identity" above for the duplicate effects the bare name caused).
 * `imPerformSourceSettingsCommand` (selector 66, `param1` an
   `imFileAccessRec8*`, `param2` an `imSourceSettingsCommandRec*`) is in
   `SourceSettingsDialog.cpp` beside the other prefs selectors. With a live
@@ -2112,8 +2124,8 @@ and a test runs five repaints and asserts the live-object count is zero.
      version words, info flags, reserved word and both out-flag words are
      compared to `SourceSettingsParams.h`. **The match name is compared to
      `kSourceSettingsMatchName`** from `plugins/common/SourceSettingsIdentity.h`
-     - the same constant `ImporterVideo.cpp` copies into
-     `sourceSettingsMatchName` - and the narrow and wide spellings are checked
+     - the constant `ImporterVideo.cpp` copies into `sourceSettingsMatchName`
+     behind Premiere's `AE.` prefix - and the narrow and wide spellings are checked
      against each other. Resource 16001 is asserted absent (one PiPL per
      module). The VERSIONINFO block is checked too.
    * `PF_Cmd_GLOBAL_SETUP`: `out_flags` / `out_flags2` / `my_version` equal

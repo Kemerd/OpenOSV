@@ -343,8 +343,10 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
                      "unknown --tone '" + options.tone +
                          "' (expected aces-bright, aces-detailed, bt2408-natural, bt2408-punchy or bt2408-neutral)"};
     }
+    // The expansion is built for the decoded sample scale (the LRF proxy's
+    // 8-bit samples arrive widened to 10 bits), never the stream's coded depth.
     p->color = color::makeColorParams(fit, p->outputTransfer, static_cast<float>(options.exposureStops),
-                                      p->inputEncoding, true, p->format.bitDepth ? p->format.bitDepth : 10, nullptr,
+                                      p->inputEncoding, true, video::kDecodedSampleBits, nullptr,
                                       color::kBt2408SceneScale, look, hdrPeakNits, tone);
 
     // ---- stabilisation ----------------------------------------------------------------

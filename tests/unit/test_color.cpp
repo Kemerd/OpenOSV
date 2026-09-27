@@ -982,6 +982,47 @@ TEST_CASE("PQ, HLG and Rec.709 grey pipelines", "[color]") {
     REQUIRE(greyThrough(off, 0.4321f) == 0.4321f);
 }
 
+TEST_CASE("an SDR (Normal) recording comes out of the Rec.709 output as recorded", "[color]") {
+    // A Normal-mode clip is a Rec.709 display rendering already.  On the
+    // Rec.709 output it must come back as recorded: the HLG-on-SDR rendering
+    // (the right one for D-Log M scene light) put its white at 75 % and its
+    // grey near 0.38, and the DJI look - fitted to D-Log M - graded it a
+    // second time.  Both looks are asked for, and neither may touch it.
+    for (const Look look : {Look::DjiStudio, Look::Standard}) {
+        const OsvColorParams p = makeColorParams(DlogMFit::Osmo360, OutputTransfer::Rec709, 0.0f,
+                                                 InputEncoding::Rec709Normal, true, 10, nullptr, kBt2408SceneScale,
+                                                 look);
+        // The look block is empty for a clip that is not D-Log M.
+        REQUIRE(p.look.id == OSV_LOOK_STANDARD);
+        // (Not at the BT.709 knee itself, code 0.081, where the published
+        // constants leave the two branches 2.5e-4 apart.)
+        for (const float code : {0.0f, 0.05f, 0.07f, 0.09f, 0.2f, 0.41f, 0.6f, 0.8f, 0.95f, 1.0f}) {
+            INFO("look " << static_cast<int>(look) << ", code " << code);
+            CHECK_THAT(greyThrough(p, code), WithinAbs(code, 1e-4));
+        }
+        // A saturated colour keeps its channels too (709 -> 2020 -> 709).
+        const float in[3] = {0.8f, 0.3f, 0.1f};
+        float out[3] = {0.0f, 0.0f, 0.0f};
+        osvCodeToOutput(&p, in, out);
+        for (int c = 0; c < 3; ++c) {
+            CHECK_THAT(out[c], WithinAbs(in[c], 1e-4));
+        }
+    }
+    // Exposure still works on it, in light: +1 stop doubles a mid grey's light.
+    const OsvColorParams up = makeColorParams(DlogMFit::Osmo360, OutputTransfer::Rec709, 1.0f,
+                                              InputEncoding::Rec709Normal);
+    CHECK_THAT(greyThrough(up, rec709Oetf(0.1f)), WithinAbs(rec709Oetf(0.2f), 1e-4));
+    // D-Log M keeps its look and its rendering: this is the Normal input only.
+    const OsvColorParams dlogm = makeColorParams(DlogMFit::Osmo360, OutputTransfer::Rec709, 0.0f,
+                                                 InputEncoding::DLogM, true, 10, nullptr, kBt2408SceneScale,
+                                                 Look::DjiStudio);
+    CHECK(dlogm.look.id == OSV_LOOK_DJI);
+    // HLG input is a display rendering too: no look on it either.
+    const OsvColorParams hlg = makeColorParams(DlogMFit::Osmo360, OutputTransfer::Rec709, 0.0f, InputEncoding::HLG,
+                                               true, 10, nullptr, kBt2408SceneScale, Look::DjiStudio);
+    CHECK(hlg.look.id == OSV_LOOK_STANDARD);
+}
+
 TEST_CASE("HLG input encoding round trips through the pipeline", "[color]") {
     const OsvColorParams p = makeColorParams(DlogMFit::DjiRefit, OutputTransfer::HLG, 0.0f, InputEncoding::HLG);
     REQUIRE(p.inputEncoding == OSV_INPUT_HLG);

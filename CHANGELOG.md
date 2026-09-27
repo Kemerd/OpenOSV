@@ -6,21 +6,85 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-27
+
 ### Added
 
 * **DJI Avata 360 D-Log M curve, `--fit avata360`.** A D-Log M curve and
   primaries matrix for the Avata 360 (`kDlogMAvata360`,
-  `kNativeToRec2020_Avata360`), for `osvtool render` and `osvtool lut`. DJI
-  publishes no Avata 360 LUT, so it is a fit to DJI Studio's export of one
-  Avata 360 clip; its limits are in `docs/COLOR.md`. The Osmo 360 curve stays
-  the default. The Premiere and Resolve curve menus do not list it yet.
+  `kNativeToRec2020_Avata360`), for `osvtool lut` and
+  `osvtool render --engine classic`. DJI publishes no Avata 360 LUT, so it
+  is a fit to DJI Studio's export of one Avata 360 clip; its limits are in
+  `docs/COLOR.md`. The Osmo 360 curve stays the default. The Premiere and
+  Resolve curve menus do not list it yet.
 
 ### Fixed
+
+* **The .LRF proxy rendered magenta.** The decoder widens the proxy's 8-bit
+  samples to the 10-bit scale every render kernel reads, but the colour
+  conversion was built for 8 bits: every sample read four times too bright
+  and neutral chroma far off centre, so the picture came out magenta and
+  white. The conversion now always follows the decoded sample scale
+  (`video::kDecodedSampleBits`). Premiere, DaVinci Resolve and `osvtool`
+  all had it. An importer test now checks the proxy's colours in Rec.709.
+* **A new, undeletable OpenOSV Source Settings effect appeared on the master
+  clip** whenever Premiere re-checked the clip (the Master tab, a sequence
+  settings change, attaching a proxy). The importer named the effect by its
+  bare match name, while Premiere registers it as `AE.OpenOSV.SourceSettings`,
+  so it never recognised the one already there. The importer now gives the
+  name Premiere uses. Extra copies a project already collected stay, but no
+  new ones are added.
+* **SDR clips were treated as HDR.** A clip recorded in the Normal colour
+  mode:
+  * now starts with **Rec.709** output instead of PQ, so its picture isn't
+    re-encoded as HDR. Stored settings and an explicit choice still win, and
+    PQ and HLG are still in the menu.
+  * now comes out of the Rec.709 output as recorded. It used to go through
+    the HDR scene-light rendering (white at 75 %) and DJI's D-Log M look,
+    which dimmed it and graded it a second time. The look now applies to
+    D-Log M clips only.
+* **D-Log M passthrough skipped Gain Match.** The exposure match between the
+  lenses is now applied to the passthrough's code values, like the lens
+  shading and the sky seam fix already were. Without it, a seam could keep a
+  brightness step wherever the sky seam field wasn't in force.
+* **`osvtool render` looked worse, and ran slower, than Premiere.** It ran a
+  research pipeline of its own:
+  * every correction was off unless asked for;
+  * decoding was in software;
+  * a seam was carved for every frame on the CPU.
+
+  `--seam-carve` alone left the sky seams, the sun ghosts and the parallax
+  that Premiere removes.
 
 * **The Avata 360's colour mode is read from where it records it.** The
   Avata 360 (`dvtm_AVATA360.proto`) keeps its colour mode at StreamMeta 2.4.1,
   and its StreamMeta 4 is empty, so every Avata clip, D-Log M included, was
   reported as Normal. `osvtool probe` now reports D-Log M for them.
+
+### Changed
+
+* **`osvtool render` runs the plug-ins' own clip engine** (`--engine plugin`,
+  the default). A render is the frame Premiere shows for a new clip with the
+  same Source Settings:
+  * parallax correction, carved seam, sky seam fix, lens shading;
+  * **sun ghost removal**, new on the command line;
+  * the steady per-clip analyses and lens alignment;
+  * hardware decoding, and the GPU where there is one (CUDA, or OpenCL on
+    AMD and Intel).
+
+  Options you don't give start at the Source Settings defaults. That
+  includes stabilisation: Smooth + Horizon Lock unless `--stab` says
+  otherwise. An SDR clip renders to Rec.709 unless `--color` says otherwise.
+  An equirect without `--size` takes Output Size (Native).
+* **New options:** `--flare` / `--no-flare`, `--parallax-grid` and
+  `--lens-align`.
+* **`--engine classic`** keeps the old pipeline. It is the only home of the
+  geometry-convention and blend research options (`--lens-fov`, `--hw`,
+  `--blend-fov`, `--seam-interval`, `--mode equirect-polar`,
+  `--color linear` and the others). The default engine refuses them by name
+  rather than ignoring them.
+* `osvtool.exe` delay-loads the NVIDIA driver, so it still starts on
+  machines without one.
 
 ## [0.2.1] - 2026-09-24
 

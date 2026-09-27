@@ -1606,6 +1606,57 @@ OSV_HD void osvShadeApply(OSV_PRIVATE const OsvRenderParams* p, int i, float amo
 /* ---- [/WP-VIGNETTE] ------------------------------------------------------ */
 
 /* ------------------------------------------------------------------------- */
+/*  The lenses' exposure match (Gain Match)                                   */
+/* ------------------------------------------------------------------------- */
+
+/* Passthrough: the code value of `gain` times the light of `code`, in the
+ * input encoding - the exact inverse of osvCodeToLinear per channel, the way
+ * osvShadeCodeAdd moves a code by an amount of light.  Light below the
+ * curve's code-0 level stays at code 0.  A gain of exactly 1 returns the code
+ * untouched, bit for bit. */
+OSV_HD float osvGainCode(OSV_PRIVATE const OsvColorParams* color, float code, float gain) {
+    if (gain == 1.0f) {
+        return code;
+    }
+    if (color == 0 || color->enabled == 0) {
+        return code * gain; /* identity decode: code is light */
+    }
+    if (color->inputEncoding == OSV_INPUT_HLG) {
+        const float scale = (color->sceneScale > 1e-12f) ? color->sceneScale : 1.0f;
+        const float lin = osvHlgInverseOetf(code) / scale;
+        return osvHlgOetf(fmaxf(lin * gain, 0.0f) * scale);
+    }
+    if (color->inputEncoding == OSV_INPUT_REC709_NORMAL) {
+        return osvRec709Oetf(fmaxf(osvRec709InverseOetf(code) * gain, 0.0f));
+    }
+    /* D-Log M */
+    const float floorLin = osvDlogmToLinear(&color->curve, 0.0f);
+    const float lin = osvDlogmToLinear(&color->curve, code);
+    return osvDlogmToCode(&color->curve, fmaxf(lin * gain, floorLin));
+}
+
+/* Lens i's exposure-match gain on one decoded sample: a multiply in native
+ * linear light, or - for passthrough, where `val` holds code values - each
+ * code moved to the code of its light times the gain.  The passthrough used
+ * to skip the gain altogether, so a D-Log M passthrough frame kept the step
+ * in brightness between the lenses that Gain Match exists to remove wherever
+ * the photometric seam field was not in force. */
+OSV_HD void osvGainApply(OSV_PRIVATE const OsvRenderParams* p, int i, int passthrough, OSV_PRIVATE float* val) {
+    if (i < 0 || i > 1) {
+        return;
+    }
+    if (passthrough) {
+        for (int c = 0; c < 3; ++c) {
+            val[c] = osvGainCode(&p->color, val[c], p->lens[i].gain[c]);
+        }
+        return;
+    }
+    val[0] *= p->lens[i].gain[0];
+    val[1] *= p->lens[i].gain[1];
+    val[2] *= p->lens[i].gain[2];
+}
+
+/* ------------------------------------------------------------------------- */
 /*  [WP-SEAMTOOLS] Two-band seam smoothing                                    */
 /* ------------------------------------------------------------------------- */
 /* The low band's build stages and its lookup, in front of the shader for the
@@ -1861,12 +1912,10 @@ OSV_HD void osvSeamLowShade(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE co
             osvFlareRemove(&p->flare[i], px, py, val);
         }
         osvShadeApply(p, i, shadeAmount, 0, val); /* [WP-VIGNETTE] */
-        val[0] *= p->lens[i].gain[0];
-        val[1] *= p->lens[i].gain[1];
-        val[2] *= p->lens[i].gain[2];
     } else {
         osvShadeApply(p, i, shadeAmount, 1, val); /* [WP-VIGNETTE] code values */
     }
+    osvGainApply(p, i, passthrough, val); /* the exposure match, in whichever space `val` holds */
     osvPhotoApplyGain(p, photoPx, i, passthrough, val);
 }
 /* ---- [/WP-SEAMTOOLS] ----------------------------------------------------- */
@@ -2089,10 +2138,10 @@ OSV_HD void osvShadePixelWSPL(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE 
             }
             /* [/WP-FLARE] */
             osvShadeApply(p, i, shadeAmt[i], 0, val); /* [WP-VIGNETTE] native linear, before the gains */
-            val[0] *= p->lens[i].gain[0];
-            val[1] *= p->lens[i].gain[1];
-            val[2] *= p->lens[i].gain[2];
         }
+        /* The exposure match: in light, or on the code values of the
+         * passthrough - the one step that output used to skip. */
+        osvGainApply(p, i, passthrough, val);
         osvPhotoApplyGain(p, &photoPx, i, passthrough, val); /* [WP-PHOTO] half the lens ratio each way */
         acc[0] += val[0] * w[i];
         acc[1] += val[1] * w[i];

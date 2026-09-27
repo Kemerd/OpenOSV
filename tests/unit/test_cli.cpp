@@ -222,8 +222,14 @@ TEST_CASE("osvtool probe/render/seam/selfcheck on the sample clip", "[cli][sampl
     }
 
     SECTION("render polar equirect to linear EXR") {
+        // Both are research outputs of the classic pipeline; the plug-ins'
+        // engine (the default) renders the standard equirect and the
+        // Source Settings outputs only, and says so.
         const auto exr = osvtest::tempDir() / "cli_equirect.exr";
-        const RunResult r = runTool("render " + clip + " --frame 0 --mode equirect-polar --size 1024x512 --color linear --device cpu --out " + quoted(exr));
+        const RunResult refused = runTool("render " + clip + " --frame 0 --mode equirect-polar --size 1024x512 --color linear --device cpu --out " + quoted(exr));
+        REQUIRE(refused.exitCode != 0);
+        REQUIRE(refused.output.find("--engine classic") != std::string::npos);
+        const RunResult r = runTool("render " + clip + " --engine classic --frame 0 --mode equirect-polar --size 1024x512 --color linear --device cpu --out " + quoted(exr));
         INFO(r.output);
         REQUIRE(r.exitCode == 0);
         auto img = osv::io::readExr(exr);
@@ -651,15 +657,19 @@ TEST_CASE("osvtool render --use-user-defaults follows the saved defaults only wh
     // Asked: the saved Rec.709 / standard look / +0.5 stops on the CPU...
     const Rendered fromDefaults = render("cli_ud_defaults.tif", " --use-user-defaults", true);
     CHECK(fromDefaults.output.find("--use-user-defaults:") != std::string::npos);
-    // ...is exactly the render those options spell out by hand.
+    // ...is exactly the render those options spell out by hand.  The
+    // plug-ins' engine starts from the Source Settings defaults, so "by hand"
+    // also switches off what the file switches off; the keys the file does
+    // not carry are the built-in values on both sides.
+    const std::string savedOff = " --stab off --no-seam-search --no-gain --photo off --no-parallax";
     const Rendered byHand =
-        render("cli_ud_byhand.tif", " --device cpu --color 709 --look standard --exposure 0.5", false);
+        render("cli_ud_byhand.tif", " --device cpu --color 709 --look standard --exposure 0.5" + savedOff, false);
     CHECK(fromDefaults.pixels == byHand.pixels);
 
     // An option given on the command line wins over the saved default.
     const Rendered overridden = render("cli_ud_override.tif", " --use-user-defaults --look dji", true);
     const Rendered overriddenByHand =
-        render("cli_ud_override_byhand.tif", " --device cpu --color 709 --look dji --exposure 0.5", false);
+        render("cli_ud_override_byhand.tif", " --device cpu --color 709 --look dji --exposure 0.5" + savedOff, false);
     CHECK(overridden.pixels == overriddenByHand.pixels);
     CHECK(overridden.pixels != fromDefaults.pixels);
 
@@ -671,4 +681,65 @@ TEST_CASE("osvtool render --use-user-defaults follows the saved defaults only wh
     CHECK(notAsked.pixels != fromDefaults.pixels);
     CHECK(notAsked.output.find("--use-user-defaults") == std::string::npos);
 #endif
+}
+
+// The default engine of osvtool render is the plug-ins' own clip engine: a
+// render is the frame Premiere shows for a new clip, with the Source Settings
+// defaults for whatever the command line leaves out.  The classic research
+// pipeline stays one flag away, and each engine refuses the other's options
+// instead of ignoring them.
+TEST_CASE("osvtool render uses the plug-ins' engine by default; --engine classic keeps the research options",
+          "[cli][engine][sample]") {
+    OSV_REQUIRE_SAMPLE();
+    if (std::string(kToolPath).empty() || !std::filesystem::exists(kToolPath)) {
+        SKIP("osvtool not built");
+    }
+    const std::string clip = quoted(osvtest::sampleOsv());
+    const std::string frame = " --frame 0 --size 320x160 --device cpu --out ";
+
+    // The default is the plug-ins' engine, and a plain equirect without
+    // --size takes the Source Settings Output Size (Native: 2 x lens height).
+    const auto native = osvtest::tempDir() / "cli_engine_native.tif";
+    const RunResult plain =
+        runTool("render " + clip + " --frame 0 --mode equirect --device cpu --no-flare --out " + quoted(native));
+    INFO(plain.output);
+    REQUIRE(plain.exitCode == 0);
+    CHECK(plain.output.find("plug-in clip engine") != std::string::npos);
+    auto nativeImage = osv::io::readImage(native);
+    REQUIRE(nativeImage.ok());
+    CHECK(nativeImage.value().w == 2u * nativeImage.value().h);
+    CHECK(nativeImage.value().h == 3000u);
+
+    // A reframe through the engine frames exactly like the classic one: the
+    // same virtual camera, only the stitch differs.
+    const auto viaEngine = osvtest::tempDir() / "cli_engine_view.tif";
+    const RunResult view = runTool("render " + clip + " --preset wide" + frame + quoted(viaEngine));
+    INFO(view.output);
+    REQUIRE(view.exitCode == 0);
+    auto viewImage = osv::io::readImage(viaEngine);
+    REQUIRE(viewImage.ok());
+    CHECK(viewImage.value().w == 320u);
+    CHECK(viewImage.value().h == 160u);
+
+    // A research option on the default engine is refused, with the way out.
+    const auto refusedPath = osvtest::tempDir() / "cli_engine_refused.tif";
+    const RunResult refused = runTool("render " + clip + " --lens-fov 190" + frame + quoted(refusedPath));
+    CHECK(refused.exitCode != 0);
+    CHECK(refused.output.find("--lens-fov") != std::string::npos);
+    CHECK(refused.output.find("--engine classic") != std::string::npos);
+    // ...and accepted by the classic pipeline.
+    const RunResult classic =
+        runTool("render " + clip + " --engine classic --lens-fov 190" + frame + quoted(refusedPath));
+    INFO(classic.output);
+    CHECK(classic.exitCode == 0);
+    CHECK(classic.output.find("plug-in clip engine") == std::string::npos);
+
+    // An option of the plug-ins' engine is refused by the classic pipeline.
+    const RunResult noFlare = runTool("render " + clip + " --engine classic --no-flare" + frame + quoted(refusedPath));
+    CHECK(noFlare.exitCode != 0);
+    CHECK(noFlare.output.find("--flare") != std::string::npos);
+
+    // Unknown engine names never reach a render.
+    const RunResult bogus = runTool("render " + clip + " --engine turbo" + frame + quoted(refusedPath));
+    CHECK(bogus.exitCode != 0);
 }

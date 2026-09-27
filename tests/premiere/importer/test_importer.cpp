@@ -28,9 +28,10 @@
 #include "PrSDKPixelFormat.h"
 
 #include "PrefsBlob.h"
-// kSourceSettingsMatchNameW: the one spelling of the Source Settings effect's
-// match name.  The same header the effect's PiPL is generated from, which is
-// what makes the importer/effect binding provably one string.
+// kSourceSettingsMatchNameW / kSourceSettingsHostMatchNameW: the one spelling
+// of the Source Settings effect's match name, and the host's "AE." form of it.
+// The same header the effect's PiPL is generated from, which is what makes
+// the importer/effect binding provably one string.
 #include "SourceSettingsIdentity.h"
 #include "TestLogIsolation.h"
 
@@ -1650,8 +1651,13 @@ TEST_CASE("imGetInfo8 advertises the Source Settings effect's match name",
     //
     // prUTF16Char is a 16-bit code unit, which on Windows is wchar_t.
     const std::wstring advertised(reinterpret_cast<const wchar_t*>(info.sourceSettingsMatchName));
-    REQUIRE(advertised == std::wstring(kSourceSettingsMatchNameW));
+    REQUIRE(advertised == std::wstring(kSourceSettingsHostMatchNameW));
     REQUIRE_FALSE(advertised.empty());
+    // It is the HOST's name for the effect: "AE." + the PiPL match name,
+    // exactly.  The bare PiPL name attaches the effect too, but Premiere then
+    // adds another undeletable copy to the master clip every time it
+    // re-checks it (Master tab, sequence settings, proxy attach).
+    REQUIRE(advertised == std::wstring(L"AE.") + kSourceSettingsMatchNameW);
     // It must fit the field WITH its terminator, or the host reads past it.
     REQUIRE(advertised.size() < 256u);
 }
@@ -1917,6 +1923,9 @@ TEST_CASE("the .LRF proxy opens and describes itself", "[importer][open][lrf][sa
     prefs.seamSearch = 0;
     prefs.gainMatch = 0;
     prefs.stabilization = static_cast<std::uint8_t>(PrefsStabilization::Off);
+    // Rec.709, where a wrong YCbCr expansion shows plainly in the colour check
+    // at the end.  PQ compresses the same fault into a mild tint.
+    prefs.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::Rec709);
 
     ImporterHarness::SourceVideoRequest request;
     request.frameTime = 0;
@@ -1940,6 +1949,12 @@ TEST_CASE("the .LRF proxy opens and describes itself", "[importer][open][lrf][sa
     std::size_t opaque = 0;
     std::size_t total = 0;
     bool varies = false;
+    // Per-channel sums over the opaque pixels, for the colour check below
+    // (the PPix is BGRA: p[0] blue, p[1] green, p[2] red).
+    double sumB = 0.0;
+    double sumG = 0.0;
+    double sumR = 0.0;
+    std::size_t redBlueClipped = 0;  // red AND blue at the top of the range
     const float* first = frame.pixel(0, 0);
     for (std::uint32_t y = 0; y < frame.height; y += 4u) {
         for (std::uint32_t x = 0; x < frame.width; x += 4u) {
@@ -1950,6 +1965,12 @@ TEST_CASE("the .LRF proxy opens and describes itself", "[importer][open][lrf][sa
             }
             if (p[3] > 0.5f) {
                 ++opaque;
+                sumB += p[0];
+                sumG += p[1];
+                sumR += p[2];
+                if (p[0] > 0.98f && p[2] > 0.98f) {
+                    ++redBlueClipped;
+                }
             }
             if (!varies && (p[0] != first[0] || p[1] != first[1] || p[2] != first[2])) {
                 varies = true;
@@ -1963,6 +1984,25 @@ TEST_CASE("the .LRF proxy opens and describes itself", "[importer][open][lrf][sa
     CHECK(coverage > 0.90);
     // A uniform frame would satisfy every check above and still be wrong.
     CHECK(varies);
+
+    // ---- the colours are the camera's, not magenta ----------------------------
+    // The proxy's 8-bit samples reach the kernel widened to the 10-bit scale
+    // (video::kDecodedSampleBits).  A colour block built for the stream's
+    // coded depth (8) read every sample four times too hot, and the neutral
+    // chroma of 512 far above centre: red and blue saturated, green lower,
+    // the whole frame magenta and white.  Measured on the sample in Rec.709:
+    // that fault gives means of R 1.00 / G 0.62 / B 1.00 with red and blue
+    // clipped almost everywhere; the proxy read correctly gives R 0.57 /
+    // G 0.45 / B 0.36, sky, ground and a white aircraft.
+    REQUIRE(opaque > 0u);
+    const double meanB = sumB / static_cast<double>(opaque);
+    const double meanG = sumG / static_cast<double>(opaque);
+    const double meanR = sumR / static_cast<double>(opaque);
+    const double clippedFraction = static_cast<double>(redBlueClipped) / static_cast<double>(opaque);
+    INFO("LRF mean colour R " << meanR << ", G " << meanG << ", B " << meanB << "; red and blue clipped on "
+                              << 100.0 * clippedFraction << "% of the pixels");
+    CHECK(std::max({meanR, meanG, meanB}) < 0.8);
+    CHECK(clippedFraction < 0.1);
 
     if (ppix->Dispose) {
         ppix->Dispose(hand);

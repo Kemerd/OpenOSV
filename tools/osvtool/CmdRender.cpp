@@ -3,12 +3,35 @@
 //
 // osvtool render: decode, stitch/reframe and write stills or an HDR MP4.
 //
-// Pipeline per frame: decode pair -> optional seam/gain analysis -> build
-// parameters -> renderer -> writer.  Writing runs on its own thread behind a
-// bounded queue so encoding overlaps the next frame's decode and render.
+// Two engines produce the frames:
+//
+//   plugin   (the default) the clip engine of the Premiere and Resolve
+//            plug-ins, ImporterInstance, compiled in without any Adobe or
+//            OpenFX header.  A frame is exactly the frame Premiere shows for
+//            a new clip with the same Source Settings: parallax grid, carved
+//            seam, photometric field, lens shading, sun ghost removal, the
+//            steady per-clip analyses and lens alignment, on the GPU where
+//            there is one.  Options the command line does not give come from
+//            the Source Settings defaults (or, with --use-user-defaults, from
+//            the ones saved in Premiere).
+//   classic  the research pipeline below: decode pair -> optional seam /
+//            gain / parallax analysis -> build parameters -> renderer, every
+//            analysis per frame and each one off unless asked for.  It keeps
+//            the geometry-convention and blend options the plug-ins take
+//            from the clip itself.
+//
+// Either way, writing runs on its own thread behind a bounded queue so
+// encoding overlaps the next frame's decode and render.
 
 #include "Commands.h"
 #include "Pipeline.h"
+
+// The plug-ins' clip engine and its (SDK-free) layer, compiled into osvtool
+// by tools/osvtool/CMakeLists.txt with OSV_CLIP_ENGINE_WITHOUT_PREMIERE.
+#include "HostContext.h"
+#include "ImporterInstance.h"
+#include "PluginLog.h"
+#include "PrefsBlob.h"
 
 #include "osv/core/Log.h"
 #include "osv/geom/EquirectMap.h"
@@ -29,6 +52,7 @@
 #include "UserDefaults.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -37,8 +61,11 @@
 #include <deque>
 #include <exception>
 #include <iterator>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace osvtool {
@@ -49,6 +76,13 @@ namespace {
 
 struct RenderOptions {
     PipelineOptions pipeline;
+    /// plugin (the plug-ins' clip engine, the default) | classic (the
+    /// research pipeline).  See the file comment.
+    std::string engine = "plugin";
+    // ---- plugin engine only: Source Settings with no classic equivalent ----
+    bool flare = true;            ///< Sun ghost removal (--flare / --no-flare).
+    std::string parallaxGrid;     ///< follows | steady | auto (empty = the defaults').
+    std::string lensAlign;        ///< off | auto (empty = the defaults').
     int frame = -1;               ///< Single frame (-1 = use range/all)
     std::string range;            ///< "a-b"
     bool all = false;
@@ -257,7 +291,8 @@ void applyUserDefaults(RenderOptions& o, const CLI::App& sub) {
 
     // ---- what osvtool does not do ------------------------------------------------
     if (p.flareRemoval != 0) {
-        log::info("--use-user-defaults: sun ghost removal is a Premiere importer stage; osvtool renders without it");
+        log::info("--use-user-defaults: sun ghost removal is a stage of the plug-ins' engine; --engine classic "
+                  "renders without it");
     }
 }
 
@@ -325,6 +360,229 @@ private:
     bool m_closed = false;
 };
 
+/// The frames --frame / --range / --all ask for, checked against the clip's
+/// `total`.  kExitOk with [first, last] filled, or the exit code after the
+/// message was printed.
+int selectFrames(const RenderOptions& o, std::uint32_t total, std::uint32_t& first, std::uint32_t& last) {
+    if (total == 0) {
+        std::fprintf(stderr, "error: clip has no frames\n");
+        return kExitInput;
+    }
+    first = 0;
+    last = 0;
+    if (o.all) {
+        last = total - 1;
+    } else if (!o.range.empty()) {
+        const std::size_t dash = o.range.find('-');
+        try {
+            first = static_cast<std::uint32_t>(std::stoul(o.range.substr(0, dash)));
+            last = dash == std::string::npos ? first : static_cast<std::uint32_t>(std::stoul(o.range.substr(dash + 1)));
+        } catch (...) {
+            std::fprintf(stderr, "error: --range must be a-b\n");
+            return kExitUsage;
+        }
+    } else {
+        first = last = o.frame < 0 ? 0 : static_cast<std::uint32_t>(o.frame);
+    }
+    if (first > last || last >= total) {
+        std::fprintf(stderr, "error: frame range %u-%u outside 0-%u\n", first, last, total - 1);
+        return kExitUsage;
+    }
+    return kExitOk;
+}
+
+/// The virtual camera of --mode reframe: --preset, --proj, --fov,
+/// --distortion, --yaw / --pitch / --roll and --correction, at `w` x `h`.
+/// Both engines frame with it, so a view is the same view whichever one
+/// stitched it.  kExitOk with `cam` filled, or the exit code after the
+/// message was printed.
+int buildCamera(const RenderOptions& o, int w, int h, geom::VirtualCamera& cam) {
+    cam = geom::VirtualCamera{};
+    cam.w = w;
+    cam.h = h;
+    if (!o.preset.empty()) {
+        const geom::Preset* preset = geom::findPreset(o.preset);
+        if (!preset) {
+            std::fprintf(stderr, "error: unknown --preset '%s'\n", log::safe(o.preset).c_str());
+            return kExitUsage;
+        }
+        geom::applyPreset(*preset, cam);
+    } else {
+        const std::string proj = o.proj;
+        if (proj == "rectilinear") {
+            cam.projection = geom::Projection::Rectilinear;
+        } else if (proj == "fisheye") {
+            cam.projection = geom::Projection::Fisheye;
+        } else if (proj == "stereographic") {
+            cam.projection = geom::Projection::Stereographic;
+        } else if (proj == "eye-offset") {
+            cam.projection = geom::Projection::EyeOffset;
+        } else {
+            std::fprintf(stderr, "error: unknown --proj '%s'\n", log::safe(proj).c_str());
+            return kExitUsage;
+        }
+    }
+    if (o.fovSet || o.preset.empty()) {
+        cam.hfovDeg = o.fov;
+    }
+    // --distortion overrides the preset's eye offset; without a preset it
+    // is the offset of --proj eye-offset (and ignored by the other models).
+    if (o.distortionSet || o.preset.empty()) {
+        if (!std::isfinite(o.distortion) || o.distortion < 0.0 || o.distortion > 1.0) {
+            std::fprintf(stderr, "error: --distortion must be within 0..1\n");
+            return kExitUsage;
+        }
+        cam.eyeOffset = o.distortion;
+    }
+    cam.yawDeg = o.yaw;
+    cam.pitchDeg += o.pitch;
+    cam.rollDeg = o.roll;
+    cam.correctionAngleDeg = o.correction;
+    if (!cam.isValid()) {
+        std::fprintf(stderr, "error: invalid virtual camera (check --fov)\n");
+        return kExitUsage;
+    }
+    // The eye-offset model silently clamps its FOV; tell the user when
+    // the request was reduced so the framing is not a surprise.
+    if (cam.projection == geom::Projection::EyeOffset && cam.effectiveHfovDeg() < cam.hfovDeg) {
+        log::warn("--fov {:.1f} exceeds the eye-offset limit for distortion {:.2f}; using {:.1f} degrees",
+                  cam.hfovDeg, cam.eyeOffset, cam.effectiveHfovDeg());
+    }
+    return kExitOk;
+}
+
+/// Where the frames go: an ffmpeg pipe for .mp4 / .mov, stills otherwise,
+/// written on a thread of their own behind a bounded queue so encoding
+/// overlaps the next frame's decode and render.  Both engines write
+/// through it, so an output means the same thing whichever one rendered it.
+class FrameSink {
+public:
+    FrameSink() = default;
+    FrameSink(const FrameSink&) = delete;
+    FrameSink& operator=(const FrameSink&) = delete;
+    ~FrameSink() { stopWriter(); }
+
+    /// Open the pipe (video) or pick the image format (stills) for frames of
+    /// `w` x `h` at `fps` encoded with `transfer`; `pqPeakNits` is what a PQ
+    /// still records as its peak.  Starts the writer thread.  kExitOk, or
+    /// the exit code after the message was printed.
+    int open(const RenderOptions& o, int w, int h, double fps, color::OutputTransfer transfer, float pqPeakNits,
+             bool multi) {
+        m_out = o.out;
+        m_multi = multi;
+        const bool toVideo = std::filesystem::path(o.out).extension() == ".mp4" ||
+                             std::filesystem::path(o.out).extension() == ".mov";
+        m_tag.rec2020 = transfer != color::OutputTransfer::Rec709;
+        switch (transfer) {
+        case color::OutputTransfer::HLG: m_tag.transfer = io::ImageTransfer::HLG; break;
+        case color::OutputTransfer::PQ: m_tag.transfer = io::ImageTransfer::PQ; break;
+        case color::OutputTransfer::Rec709: m_tag.transfer = io::ImageTransfer::Rec709; break;
+        case color::OutputTransfer::Linear: m_tag.transfer = io::ImageTransfer::Linear; break;
+        case color::OutputTransfer::Passthrough: m_tag.transfer = io::ImageTransfer::DLogM; break;
+        }
+        // [WP-HDRPEAK] A PQ still records the peak its highlights were rolled
+        // off into (1000, the OOTF display, when --hdr-peak is left alone).
+        if (transfer == color::OutputTransfer::PQ) {
+            m_tag.peakNits = pqPeakNits;
+        }
+        if (toVideo) {
+            if (transfer == color::OutputTransfer::Linear || transfer == color::OutputTransfer::Passthrough) {
+                std::fprintf(stderr, "error: video output needs --color pq|hlg|709\n");
+                return kExitUsage;
+            }
+            io::FfmpegPipeOptions fo;
+            fo.ffmpegExe = o.ffmpeg;
+            fo.width = static_cast<std::uint32_t>(w);
+            fo.height = static_cast<std::uint32_t>(h);
+            fo.fps = fps;
+            fo.codec = o.codec;
+            fo.crf = o.crf;
+            fo.transfer = transfer == color::OutputTransfer::HLG      ? io::PipeTransfer::HLG
+                          : transfer == color::OutputTransfer::Rec709 ? io::PipeTransfer::Rec709
+                                                                      : io::PipeTransfer::PQ;
+            if (!o.noAudio) {
+                fo.audioSource = o.pipeline.input;
+            }
+            auto pw = io::FfmpegPipeWriter::open(fo, o.out);
+            if (!pw.ok()) {
+                std::fprintf(stderr, "error: %s\n", log::safe(pw.error().toString()).c_str());
+                return kExitRuntime;
+            }
+            m_pipe.emplace(std::move(pw).value());
+        }
+        m_imageFormat = io::formatFromExtension(o.out);
+        if (!toVideo && m_imageFormat == io::ImageFormat::Exr && transfer != color::OutputTransfer::Linear) {
+            log::warn("writing non-linear values into an EXR; use --color linear for scene-referred output");
+        }
+        m_writer = std::thread([this] { writerLoop(); });
+        return kExitOk;
+    }
+
+    /// Queue one frame (blocks while the queue is full).
+    void push(std::uint32_t index, render::ImageRGBAf image) { m_queue.push(index, std::move(image)); }
+
+    /// True once the writer has failed; the render loop stops feeding it.
+    [[nodiscard]] bool failed() const noexcept { return m_failed.load(); }
+
+    /// Drain the queue, stop the writer and close the pipe.  Returns
+    /// `exitCode`, or kExitRuntime (after the message) when writing failed.
+    int finish(int exitCode) {
+        stopWriter();
+        if (m_failed) {
+            std::fprintf(stderr, "error: writer: %s\n", log::safe(m_error).c_str());
+            exitCode = kExitRuntime;
+        }
+        if (m_pipe) {
+            Status st = m_pipe->close();
+            if (!st.ok()) {
+                std::fprintf(stderr, "error: %s\n", log::safe(st.error().toString()).c_str());
+                exitCode = kExitRuntime;
+            }
+            m_pipe.reset();
+        }
+        return exitCode;
+    }
+
+private:
+    void writerLoop() {
+        std::uint32_t index = 0;
+        render::ImageRGBAf image;
+        while (m_queue.pop(index, image)) {
+            Status st = okStatus();
+            if (m_pipe) {
+                st = m_pipe->writeFrame(image);
+            } else {
+                st = io::writeImage(outputPathFor(m_out, index, m_multi), image, m_imageFormat, m_tag);
+            }
+            if (!st.ok()) {
+                std::lock_guard<std::mutex> lock(m_errorMutex);
+                m_error = st.error().toString();
+                m_failed = true;
+                m_queue.close();
+                return;
+            }
+        }
+    }
+
+    void stopWriter() {
+        m_queue.close();
+        if (m_writer.joinable()) {
+            m_writer.join();
+        }
+    }
+
+    std::string m_out;
+    bool m_multi = false;
+    io::ImageTag m_tag;
+    io::ImageFormat m_imageFormat = io::ImageFormat::Png16;
+    std::optional<io::FfmpegPipeWriter> m_pipe;
+    FrameQueue m_queue{3};
+    std::thread m_writer;
+    std::atomic<bool> m_failed{false};
+    std::string m_error;
+    std::mutex m_errorMutex;
+};
+
 int runRender(const RenderOptions& o) {
     // ---- open the pipeline ------------------------------------------------------
     // The per-frame analyses shade bands from host planes, so they decide
@@ -344,29 +602,9 @@ int runRender(const RenderOptions& o) {
     }
 
     // ---- frame selection ----------------------------------------------------------
-    const std::uint32_t total = P.frameCount();
-    if (total == 0) {
-        std::fprintf(stderr, "error: clip has no frames\n");
-        return kExitInput;
-    }
     std::uint32_t first = 0, last = 0;
-    if (o.all) {
-        last = total - 1;
-    } else if (!o.range.empty()) {
-        const std::size_t dash = o.range.find('-');
-        try {
-            first = static_cast<std::uint32_t>(std::stoul(o.range.substr(0, dash)));
-            last = dash == std::string::npos ? first : static_cast<std::uint32_t>(std::stoul(o.range.substr(dash + 1)));
-        } catch (...) {
-            std::fprintf(stderr, "error: --range must be a-b\n");
-            return kExitUsage;
-        }
-    } else {
-        first = last = o.frame < 0 ? 0 : static_cast<std::uint32_t>(o.frame);
-    }
-    if (first > last || last >= total) {
-        std::fprintf(stderr, "error: frame range %u-%u outside 0-%u\n", first, last, total - 1);
-        return kExitUsage;
+    if (const int selected = selectFrames(o, P.frameCount(), first, last); selected != kExitOk) {
+        return selected;
     }
     const bool multi = last > first;
 
@@ -416,55 +654,8 @@ int runRender(const RenderOptions& o) {
         map.h = h;
         builder.equirect(map);
     } else if (mode == "reframe") {
-        cam.w = w;
-        cam.h = h;
-        if (!o.preset.empty()) {
-            const geom::Preset* preset = geom::findPreset(o.preset);
-            if (!preset) {
-                std::fprintf(stderr, "error: unknown --preset '%s'\n", log::safe(o.preset).c_str());
-                return kExitUsage;
-            }
-            geom::applyPreset(*preset, cam);
-        } else {
-            const std::string proj = o.proj;
-            if (proj == "rectilinear") {
-                cam.projection = geom::Projection::Rectilinear;
-            } else if (proj == "fisheye") {
-                cam.projection = geom::Projection::Fisheye;
-            } else if (proj == "stereographic") {
-                cam.projection = geom::Projection::Stereographic;
-            } else if (proj == "eye-offset") {
-                cam.projection = geom::Projection::EyeOffset;
-            } else {
-                std::fprintf(stderr, "error: unknown --proj '%s'\n", log::safe(proj).c_str());
-                return kExitUsage;
-            }
-        }
-        if (o.fovSet || o.preset.empty()) {
-            cam.hfovDeg = o.fov;
-        }
-        // --distortion overrides the preset's eye offset; without a preset it
-        // is the offset of --proj eye-offset (and ignored by the other models).
-        if (o.distortionSet || o.preset.empty()) {
-            if (!std::isfinite(o.distortion) || o.distortion < 0.0 || o.distortion > 1.0) {
-                std::fprintf(stderr, "error: --distortion must be within 0..1\n");
-                return kExitUsage;
-            }
-            cam.eyeOffset = o.distortion;
-        }
-        cam.yawDeg = o.yaw;
-        cam.pitchDeg += o.pitch;
-        cam.rollDeg = o.roll;
-        cam.correctionAngleDeg = o.correction;
-        if (!cam.isValid()) {
-            std::fprintf(stderr, "error: invalid virtual camera (check --fov)\n");
-            return kExitUsage;
-        }
-        // The eye-offset model silently clamps its FOV; tell the user when
-        // the request was reduced so the framing is not a surprise.
-        if (cam.projection == geom::Projection::EyeOffset && cam.effectiveHfovDeg() < cam.hfovDeg) {
-            log::warn("--fov {:.1f} exceeds the eye-offset limit for distortion {:.2f}; using {:.1f} degrees",
-                      cam.hfovDeg, cam.eyeOffset, cam.effectiveHfovDeg());
+        if (const int built = buildCamera(o, w, h, cam); built != kExitOk) {
+            return built;
         }
         builder.camera(cam);
     } else {
@@ -472,78 +663,12 @@ int runRender(const RenderOptions& o) {
         return kExitUsage;
     }
 
-    // ---- output sink --------------------------------------------------------------------
-    const bool toVideo = std::filesystem::path(o.out).extension() == ".mp4" ||
-                         std::filesystem::path(o.out).extension() == ".mov";
-    std::optional<io::FfmpegPipeWriter> pipeWriter;
-    io::ImageTag tag;
-    tag.rec2020 = P.outputTransfer != color::OutputTransfer::Rec709;
-    switch (P.outputTransfer) {
-    case color::OutputTransfer::HLG: tag.transfer = io::ImageTransfer::HLG; break;
-    case color::OutputTransfer::PQ: tag.transfer = io::ImageTransfer::PQ; break;
-    case color::OutputTransfer::Rec709: tag.transfer = io::ImageTransfer::Rec709; break;
-    case color::OutputTransfer::Linear: tag.transfer = io::ImageTransfer::Linear; break;
-    case color::OutputTransfer::Passthrough: tag.transfer = io::ImageTransfer::DLogM; break;
+    // ---- output sink and its writer thread --------------------------------------------
+    FrameSink sink;
+    if (const int opened = sink.open(o, w, h, P.fps(), P.outputTransfer, color::hdrPeakNitsOf(P.color), multi);
+        opened != kExitOk) {
+        return opened;
     }
-    // [WP-HDRPEAK] A PQ still records the peak its highlights were rolled
-    // off into (1000, the OOTF display, when --hdr-peak is left alone).
-    if (P.outputTransfer == color::OutputTransfer::PQ) {
-        tag.peakNits = color::hdrPeakNitsOf(P.color);
-    }
-    if (toVideo) {
-        if (P.outputTransfer == color::OutputTransfer::Linear || P.outputTransfer == color::OutputTransfer::Passthrough) {
-            std::fprintf(stderr, "error: video output needs --color pq|hlg|709\n");
-            return kExitUsage;
-        }
-        io::FfmpegPipeOptions fo;
-        fo.ffmpegExe = o.ffmpeg;
-        fo.width = static_cast<std::uint32_t>(w);
-        fo.height = static_cast<std::uint32_t>(h);
-        fo.fps = P.fps();
-        fo.codec = o.codec;
-        fo.crf = o.crf;
-        fo.transfer = P.outputTransfer == color::OutputTransfer::HLG      ? io::PipeTransfer::HLG
-                      : P.outputTransfer == color::OutputTransfer::Rec709 ? io::PipeTransfer::Rec709
-                                                                           : io::PipeTransfer::PQ;
-        if (!o.noAudio) {
-            fo.audioSource = o.pipeline.input;
-        }
-        auto pw = io::FfmpegPipeWriter::open(fo, o.out);
-        if (!pw.ok()) {
-            std::fprintf(stderr, "error: %s\n", log::safe(pw.error().toString()).c_str());
-            return kExitRuntime;
-        }
-        pipeWriter.emplace(std::move(pw).value());
-    }
-    const io::ImageFormat imageFormat = io::formatFromExtension(o.out);
-    if (!toVideo && imageFormat == io::ImageFormat::Exr && P.outputTransfer != color::OutputTransfer::Linear) {
-        log::warn("writing non-linear values into an EXR; use --color linear for scene-referred output");
-    }
-
-    // ---- writer thread ----------------------------------------------------------------
-    FrameQueue queue(3);
-    std::atomic<bool> writerFailed{false};
-    std::string writerError;
-    std::mutex writerErrorMutex;
-    std::thread writer([&] {
-        std::uint32_t index = 0;
-        render::ImageRGBAf image;
-        while (queue.pop(index, image)) {
-            Status st = okStatus();
-            if (pipeWriter) {
-                st = pipeWriter->writeFrame(image);
-            } else {
-                st = io::writeImage(outputPathFor(o.out, index, multi), image, imageFormat, tag);
-            }
-            if (!st.ok()) {
-                std::lock_guard<std::mutex> lock(writerErrorMutex);
-                writerError = st.error().toString();
-                writerFailed = true;
-                queue.close();
-                return;
-            }
-        }
-    });
 
     // ---- flow backend selection ------------------------------------------------------------
     render::FlowBackendKind parallaxBackend = render::FlowBackendKind::Auto;
@@ -619,7 +744,7 @@ int runRender(const RenderOptions& o) {
     render::PhotoSeamHistory photoHistory;
     Vec3d globalGain[2] = {Vec3d{1, 1, 1}, Vec3d{1, 1, 1}};
     bool haveBlendSeam = false;
-    for (std::uint32_t f = first; f <= last && !writerFailed; ++f) {
+    for (std::uint32_t f = first; f <= last && !sink.failed(); ++f) {
         auto pair = P.reader->read(f);
         if (!pair.ok()) {
             std::fprintf(stderr, "error: frame %u: %s\n", f, log::safe(pair.error().toString()).c_str());
@@ -843,7 +968,7 @@ int runRender(const RenderOptions& o) {
             exitCode = kExitRuntime;
             break;
         }
-        queue.push(f, std::move(img).value());
+        sink.push(f, std::move(img).value());
 
         if ((f - first) % 10 == 9 || f == last) {
             const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -852,18 +977,453 @@ int runRender(const RenderOptions& o) {
                          sec > 0 ? done / sec : 0.0, P.rendererName.c_str());
         }
     }
-    queue.close();
-    writer.join();
-    if (writerFailed) {
-        std::fprintf(stderr, "error: writer: %s\n", log::safe(writerError).c_str());
-        exitCode = kExitRuntime;
-    }
-    if (pipeWriter) {
-        Status st = pipeWriter->close();
-        if (!st.ok()) {
-            std::fprintf(stderr, "error: %s\n", log::safe(st.error().toString()).c_str());
-            exitCode = kExitRuntime;
+    return sink.finish(exitCode);
+}
+
+// ===========================================================================
+//  --engine plugin: the plug-ins' clip engine
+// ===========================================================================
+
+/// The engine's log lines on osvtool's console (PluginLog::setMirror): the
+/// clip engine logs through the plug-ins' logger, which osvtool never points
+/// at a file, so nothing it does lands in the plug-ins' own log files.
+void mirrorEngineLog(premiere::PluginLog::Level level, std::string_view text) noexcept {
+    try {
+        const std::string line = log::safe(text);
+        switch (level) {
+        case premiere::PluginLog::Level::Trace:
+        case premiere::PluginLog::Level::Debug: log::debug("engine: {}", line); break;
+        case premiere::PluginLog::Level::Info: log::info("engine: {}", line); break;
+        case premiere::PluginLog::Level::Warn: log::warn("engine: {}", line); break;
+        case premiere::PluginLog::Level::Error: log::error("engine: {}", line); break;
+        case premiere::PluginLog::Level::Off:
+        default: break;
         }
+    } catch (...) {
+        // A console line is never worth an exception into the engine.
+    }
+}
+
+/// Installs the mirror for one render and takes it down again, whatever path
+/// the render leaves by.
+struct EngineLogScope {
+    EngineLogScope() noexcept { premiere::PluginLog::setMirror(&mirrorEngineLog); }
+    ~EngineLogScope() { premiere::PluginLog::setMirror(nullptr); }
+    EngineLogScope(const EngineLogScope&) = delete;
+    EngineLogScope& operator=(const EngineLogScope&) = delete;
+};
+
+/// Index of `token` in `tokens`, or -1.
+template <std::size_t N>
+[[nodiscard]] int tokenIndex(const char* const (&tokens)[N], std::string_view token) noexcept {
+    for (std::size_t i = 0; i < N; ++i) {
+        if (token == tokens[i]) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+/// "a | b | c" for an error message.
+template <std::size_t N>
+[[nodiscard]] std::string tokenList(const char* const (&tokens)[N]) {
+    std::string out;
+    for (std::size_t i = 0; i < N; ++i) {
+        out += (i == 0 ? "" : " | ");
+        out += tokens[i];
+    }
+    return out;
+}
+
+/// Options of the classic pipeline that the plug-ins' engine takes from the
+/// clip itself (the geometry conventions, the calibrated lens FOV and blend)
+/// or has no use for.  Given with --engine plugin they are an error, never
+/// silently ignored: a render that looks different from what was asked for
+/// is worse than one that does not start.
+constexpr const char* kClassicOnlyOptions[] = {
+    "--protector",   "--stitch-distance", "--crop-scale",   "--focal-source",   "--extrinsic-order",
+    "--extrinsic-sense", "--lens-fov",    "--feather",      "--occlusion",      "--blend",
+    "--attitude-convention", "--smooth-sigma", "--input-encoding", "--hw",      "--threads",
+    "--blend-fov",   "--blend-feather",   "--photo-decay",  "--seam-low-sigma", "--seam-interval",
+};
+
+/// The plugin engine's own options, which the classic pipeline has no use for.
+constexpr const char* kPluginOnlyOptions[] = {"--flare", "--parallax-grid", "--lens-align"};
+
+/// The Source Settings a plugin-engine render uses: the built-in defaults of
+/// a new clip - or, with --use-user-defaults, the ones saved in Premiere -
+/// with every option given on the command line on top.  `colorGiven` says
+/// whether --color was one of them (otherwise an SDR recording keeps the
+/// Rec.709 output the engine starts it with).  kExitOk, or kExitUsage after
+/// the message was printed.
+int enginePrefs(const RenderOptions& o, const CLI::App& sub, premiere::PrefsBlob& out, bool& colorGiven) {
+    namespace pr = osv::premiere;
+    const auto given = [&sub](const char* name) { return sub.count(name) > 0; };
+    const auto usage = [](const std::string& message) {
+        std::fprintf(stderr, "error: %s\n", log::safe(message).c_str());
+        return kExitUsage;
+    };
+
+    // ---- where the settings start -------------------------------------------------
+    if (o.useUserDefaults) {
+        const pr::UserDefaults user = pr::currentUserDefaults();
+        out = user.prefs;
+        if (user.fromFile) {
+            log::info("--use-user-defaults: {} - {}", pr::userDefaultsPathForLog(user.path),
+                      pr::userDefaultsSummary(user.prefs));
+        } else {
+            log::info("--use-user-defaults: no usable defaults file ({}); using the built-in Source Settings "
+                      "defaults",
+                      user.path.empty() ? std::string("no location") : pr::userDefaultsPathForLog(user.path));
+        }
+    } else {
+        out = pr::PrefsBlob::defaults();
+    }
+    if (!out.isValid()) {
+        out = pr::PrefsBlob::defaults();
+    }
+
+    // ---- colour ---------------------------------------------------------------------
+    colorGiven = given("--color");
+    if (colorGiven) {
+        color::OutputTransfer transfer = color::OutputTransfer::PQ;
+        if (!color::parseOutputTransfer(o.pipeline.color, transfer)) {
+            return usage("unknown --color '" + o.pipeline.color + "' (pq | hlg | 709 | dlogm)");
+        }
+        switch (transfer) {
+        case color::OutputTransfer::PQ: out.colorOutput = static_cast<std::uint8_t>(pr::PrefsColorOutput::PQ); break;
+        case color::OutputTransfer::HLG: out.colorOutput = static_cast<std::uint8_t>(pr::PrefsColorOutput::HLG); break;
+        case color::OutputTransfer::Rec709:
+            out.colorOutput = static_cast<std::uint8_t>(pr::PrefsColorOutput::Rec709);
+            break;
+        case color::OutputTransfer::Passthrough:
+            out.colorOutput = static_cast<std::uint8_t>(pr::PrefsColorOutput::DLogM);
+            break;
+        case color::OutputTransfer::Linear:
+        default:
+            return usage("--color linear is a research output of the classic pipeline; add --engine classic");
+        }
+    }
+    if (given("--look")) {
+        color::Look look = color::kDefaultLook;
+        if (!color::parseLook(o.pipeline.look, look)) {
+            return usage("unknown --look '" + o.pipeline.look + "' (dji | standard)");
+        }
+        out.look = static_cast<std::uint8_t>(look == color::Look::Standard ? pr::PrefsLook::Standard
+                                                                             : pr::PrefsLook::DjiStudio);
+    }
+    if (given("--hdr-peak")) {
+        float nits = 0.0f;
+        const int index = color::parseHdrPeak(o.pipeline.hdrPeak, nits)
+                              ? tokenIndex(kCliHdrPeak, std::to_string(std::lround(nits)))
+                              : -1;
+        if (index < 0) {
+            return usage("unknown --hdr-peak '" + o.pipeline.hdrPeak + "' (" + tokenList(kCliHdrPeak) + ")");
+        }
+        out.hdrPeak = static_cast<std::uint8_t>(index);
+    }
+    if (given("--tone")) {
+        color::HdrTone tone = color::kDefaultHdrTone;
+        const int index =
+            color::parseHdrTone(o.pipeline.tone, tone) ? tokenIndex(kCliHdrTone, color::hdrToneName(tone)) : -1;
+        if (index < 0) {
+            return usage("unknown --tone '" + o.pipeline.tone + "' (" + tokenList(kCliHdrTone) + ")");
+        }
+        out.hdrTone = static_cast<std::uint8_t>(index);
+    }
+    if (given("--fit")) {
+        color::DlogMFit fit = color::kDefaultDlogMFit;
+        const int index =
+            color::parseDlogMFit(o.pipeline.fit, fit) ? tokenIndex(kCliFit, color::dlogMFitName(fit)) : -1;
+        if (index < 0) {
+            return usage("--fit '" + o.pipeline.fit + "' is not a Source Settings curve (" + tokenList(kCliFit) +
+                         "); add --engine classic to render with it");
+        }
+        out.dlogmFit = static_cast<std::uint8_t>(index);
+    }
+    if (given("--exposure")) {
+        if (!std::isfinite(o.pipeline.exposureStops) || o.pipeline.exposureStops < pr::PrefsBlob::kMinExposureStops ||
+            o.pipeline.exposureStops > pr::PrefsBlob::kMaxExposureStops) {
+            return usage("--exposure must be within -6..6 stops");
+        }
+        out.exposureStops = static_cast<float>(o.pipeline.exposureStops);
+    }
+
+    // ---- stabilisation, calibration, device -----------------------------------------------
+    if (given("--stab")) {
+        const int index = tokenIndex(kCliStab, o.pipeline.stab);
+        if (index < 0) {
+            return usage("unknown --stab '" + o.pipeline.stab + "' (" + tokenList(kCliStab) + ")");
+        }
+        out.stabilization = static_cast<std::uint8_t>(index);
+    }
+    if (given("--calib")) {
+        const int index = tokenIndex(kCliCalib, o.pipeline.calib);
+        if (index < 0) {
+            return usage("unknown --calib '" + o.pipeline.calib + "' (" + tokenList(kCliCalib) + ")");
+        }
+        out.setCalibrationChoice(static_cast<pr::PrefsCalibrationChoice>(index));
+    }
+    if (given("--device")) {
+        const int index = tokenIndex(kCliDevice, o.pipeline.device);
+        if (index < 0) {
+            return usage("unknown --device '" + o.pipeline.device + "' (" + tokenList(kCliDevice) + ")");
+        }
+        out.renderDevice = static_cast<std::uint8_t>(index);
+    }
+
+    // ---- the stitch -------------------------------------------------------------------------
+    // "Seam search" is both halves of the seam in the plug-ins: the disparity
+    // correction and the carved seam.  --seam-carve therefore turns it on (it
+    // is on by default already); --no-seam-search turns both off.
+    if (given("--seam-search")) {
+        out.seamSearch = o.seamSearch ? 1 : 0;
+    }
+    if (given("--seam-carve") && o.seamCarve) {
+        out.seamSearch = 1;
+    }
+    if (given("--gain")) {
+        out.gainMatch = o.gain ? 1 : 0;
+    }
+    if (given("--parallax")) {
+        out.parallax = static_cast<std::uint8_t>(o.parallax ? pr::PrefsParallax::On : pr::PrefsParallax::Off);
+    }
+    if (given("--flow-backend")) {
+        const int index = tokenIndex(kCliFlow, o.flowBackend);
+        if (index < 0) {
+            return usage("unknown --flow-backend '" + o.flowBackend + "' (" + tokenList(kCliFlow) + ")");
+        }
+        out.flowBackend = static_cast<std::uint8_t>(index);
+    }
+    if (given("--photo")) {
+        const int index = tokenIndex(kCliPhoto, o.photo);
+        if (index < 0) {
+            return usage("unknown --photo '" + o.photo + "' (" + tokenList(kCliPhoto) + ")");
+        }
+        out.photoSeam = static_cast<std::uint8_t>(index);
+    }
+    if (given("--photo-strength")) {
+        if (!(o.photoStrength >= 0.0 && o.photoStrength <= 1.0)) {
+            return usage("--photo-strength must be within 0..1");
+        }
+        out.setPhotoStrengthPercent(100.0 * o.photoStrength);
+    }
+    if (given("--shading")) {
+        const int index = tokenIndex(kCliShading, o.shading);
+        if (index < 0) {
+            return usage("unknown --shading '" + o.shading + "' (" + tokenList(kCliShading) + ")");
+        }
+        out.lensShading = static_cast<std::uint8_t>(index);
+    }
+    if (given("--shading-strength")) {
+        if (!(o.shadingStrength >= 0.0 && o.shadingStrength <= 1.0)) {
+            return usage("--shading-strength must be within 0..1");
+        }
+        out.setShadingStrengthPercent(100.0 * o.shadingStrength);
+    }
+    // The seam tools, in the ranges the Source Settings sliders offer.
+    const auto inRange = [](double v, double lo, double hi) { return std::isfinite(v) && v >= lo && v <= hi; };
+    const render::SeamTools& tools = o.seamTools;
+    if (given("--seam-blend")) {
+        if (!inRange(tools.seamBlendDeg, render::kMinSeamBlendDeg, render::kMaxSeamBlendDeg)) {
+            return usage("--seam-blend must be within 0.2..8 degrees");
+        }
+        out.setSeamBlendDeg(tools.seamBlendDeg);
+    }
+    if (given("--parallax-blend")) {
+        if (!inRange(tools.parallaxBlendDeg, 0.0, render::kMaxParallaxBlendDeg)) {
+            return usage("--parallax-blend must be within 0..4 degrees");
+        }
+        out.setParallaxBlendDeg(tools.parallaxBlendDeg);
+    }
+    if (given("--seam-smoothing")) {
+        if (!inRange(tools.smoothingDeg, 0.0, render::kMaxSeamSmoothingDeg)) {
+            return usage("--seam-smoothing must be within 0..8 degrees");
+        }
+        out.setSeamSmoothingDeg(tools.smoothingDeg);
+    }
+    if (given("--near-offset")) {
+        if (!inRange(tools.nearOffsetDeg, -render::kMaxSeamOffsetDeg, render::kMaxSeamOffsetDeg)) {
+            return usage("--near-offset must be within -3..3 degrees");
+        }
+        out.setNearOffsetDeg(tools.nearOffsetDeg);
+    }
+    if (given("--far-offset")) {
+        if (!inRange(tools.farOffsetDeg, -render::kMaxSeamOffsetDeg, render::kMaxSeamOffsetDeg)) {
+            return usage("--far-offset must be within -3..3 degrees");
+        }
+        out.setFarOffsetDeg(tools.farOffsetDeg);
+    }
+
+    // ---- what only the plugin engine has --------------------------------------------------
+    if (given("--flare")) {
+        out.flareRemoval = o.flare ? 1 : 0;
+    }
+    if (given("--parallax-grid")) {
+        constexpr const char* kGrid[] = {"follows", "steady", "auto"};  // PrefsParallaxGrid order
+        static_assert(std::size(kGrid) == static_cast<std::size_t>(pr::PrefsParallaxGrid::Count));
+        const int index = tokenIndex(kGrid, o.parallaxGrid);
+        if (index < 0) {
+            return usage("unknown --parallax-grid '" + o.parallaxGrid + "' (" + tokenList(kGrid) + ")");
+        }
+        out.parallaxGrid = static_cast<std::uint8_t>(index);
+    }
+    if (given("--lens-align")) {
+        constexpr const char* kAlign[] = {"off", "auto"};  // PrefsLensAlign order
+        static_assert(std::size(kAlign) == static_cast<std::size_t>(pr::PrefsLensAlign::Count));
+        const int index = tokenIndex(kAlign, o.lensAlign);
+        if (index < 0) {
+            return usage("unknown --lens-align '" + o.lensAlign + "' (" + tokenList(kAlign) + ")");
+        }
+        out.lensAlign = static_cast<std::uint8_t>(index);
+    }
+    out.sanitise();
+    return kExitOk;
+}
+
+/// OSV output transfer of a Source Settings colour output.
+[[nodiscard]] color::OutputTransfer transferOf(premiere::PrefsColorOutput output) noexcept {
+    switch (output) {
+    case premiere::PrefsColorOutput::HLG: return color::OutputTransfer::HLG;
+    case premiere::PrefsColorOutput::Rec709: return color::OutputTransfer::Rec709;
+    case premiere::PrefsColorOutput::DLogM: return color::OutputTransfer::Passthrough;
+    case premiere::PrefsColorOutput::PQ:
+    case premiere::PrefsColorOutput::Count:
+    default: return color::OutputTransfer::PQ;
+    }
+}
+
+/// Render with the plug-ins' clip engine: every frame exactly as Premiere
+/// (or Resolve) renders it for a new clip with these Source Settings.
+int runEngineRender(const RenderOptions& o, const CLI::App& sub) {
+    namespace pr = osv::premiere;
+    const EngineLogScope logScope;
+
+    // ---- what the plugin engine takes and what it does not ------------------------------
+    for (const char* name : kClassicOnlyOptions) {
+        if (sub.count(name) > 0) {
+            std::fprintf(stderr,
+                         "error: %s belongs to the classic pipeline; add --engine classic to use it (the default "
+                         "engine is the plug-ins' own, which takes this from the clip)\n",
+                         name);
+            return kExitUsage;
+        }
+    }
+    if (o.mode != "equirect" && o.mode != "reframe") {
+        std::fprintf(stderr, "error: --mode %s needs --engine classic (the plug-ins render equirect and reframe)\n",
+                     log::safe(o.mode).c_str());
+        return kExitUsage;
+    }
+
+    // ---- the Source Settings ------------------------------------------------------------------
+    pr::PrefsBlob prefs = pr::PrefsBlob::defaults();
+    bool colorGiven = false;
+    if (const int built = enginePrefs(o, sub, prefs, colorGiven); built != kExitOk) {
+        return built;
+    }
+
+    // ---- the clip -------------------------------------------------------------------------------
+    // Opened exactly as the plug-ins open a NEW clip: seeded with its starting
+    // settings before open() (which builds the lens rig from the calibration
+    // in force), then handed the settings to render with.  Its own starting
+    // point decides the one thing the command line may leave to it: an SDR
+    // recording keeps the Rec.709 output it starts with unless --color says
+    // otherwise.
+    auto clip = std::make_unique<pr::ImporterInstance>(o.pipeline.input);
+    clip->setEngineOwned(true);
+    clip->seedStartingPrefs(prefs, std::string());
+    const Status opened = clip->open();
+    if (!opened.ok()) {
+        std::fprintf(stderr, "error: %s\n", log::safe(opened.error().toString()).c_str());
+        return opened.error().code == ErrorCode::Io || opened.error().code == ErrorCode::Malformed ? kExitInput
+                                                                                                    : kExitRuntime;
+    }
+    pr::PrefsBlob settings = clip->prefs();
+    if (colorGiven) {
+        settings.colorOutput = prefs.colorOutput;
+    }
+    clip->applyPrefs(&settings, pr::PrefsBlob::kSize);
+    log::info("engine: plug-in clip engine, {} frames at {:.3f} fps", clip->frameCount(), clip->fps());
+
+    // ---- frames -----------------------------------------------------------------------------------
+    std::uint32_t first = 0, last = 0;
+    if (const int selected = selectFrames(o, clip->frameCount(), first, last); selected != kExitOk) {
+        return selected;
+    }
+    const bool multi = last > first;
+
+    // ---- output geometry ------------------------------------------------------------------------
+    // An equirect without --size is the Source Settings Output Size (Native,
+    // 3840 x 1920, 2560 x 1280 or 1920 x 960), as Premiere sizes it.
+    pr::OutputGeometry geometry;
+    if (o.mode == "equirect" && sub.count("--size") == 0) {
+        geometry = clip->geometryFor(settings);
+    } else {
+        int w = 0, h = 0;
+        if (!parseSize(o.size, w, h)) {
+            std::fprintf(stderr, "error: --size must be WxH\n");
+            return kExitUsage;
+        }
+        geometry.width = w;
+        geometry.height = h;
+        if (o.mode == "reframe") {
+            geom::VirtualCamera cam;
+            if (const int built = buildCamera(o, w, h, cam); built != kExitOk) {
+                return built;
+            }
+            geometry.view = cam;
+        }
+    }
+    if (!geometry.valid()) {
+        std::fprintf(stderr, "error: no usable output size for this clip\n");
+        return kExitUsage;
+    }
+
+    // ---- output sink ------------------------------------------------------------------------------
+    const OsvColorParams frameColor = clip->colorParams();
+    const color::OutputTransfer transfer = transferOf(settings.color());
+    FrameSink sink;
+    if (const int sinkOpened = sink.open(o, geometry.width, geometry.height, clip->fps(), transfer,
+                                         color::hdrPeakNitsOf(frameColor), multi);
+        sinkOpened != kExitOk) {
+        return sinkOpened;
+    }
+
+    // ---- main loop ----------------------------------------------------------------------------------
+    // Exact renders: every analysis a frame needs is made before it is drawn,
+    // as for a Premiere export.  The frame is copied out of the engine's
+    // frame cache under the clip's lock, because the next render reuses it.
+    const auto t0 = std::chrono::steady_clock::now();
+    int exitCode = kExitOk;
+    for (std::uint32_t f = first; f <= last && !sink.failed(); ++f) {
+        render::ImageRGBAf frame;
+        {
+            std::lock_guard<std::mutex> lock(clip->lock());
+            auto rendered = clip->renderFrame(f, geometry, false, pr::RenderPurpose::Exact);
+            if (!rendered.ok() || rendered.value() == nullptr) {
+                std::fprintf(stderr, "error: frame %u: %s\n", f,
+                             rendered.ok() ? "no image" : log::safe(rendered.error().toString()).c_str());
+                exitCode = kExitRuntime;
+                break;
+            }
+            frame = *rendered.value();
+        }
+        sink.push(f, std::move(frame));
+
+        if ((f - first) % 10 == 9 || f == last) {
+            const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            const double done = static_cast<double>(f - first + 1);
+            std::fprintf(stderr, "  %u/%u frames  %.1f fps  (%s)\n", f - first + 1, last - first + 1,
+                         sec > 0 ? done / sec : 0.0, clip->rendererName().c_str());
+        }
+    }
+    exitCode = sink.finish(exitCode);
+
+    // The clip (its decoders, analysis workers) before the renderers it
+    // leased, while the GPU runtime is still there.
+    clip.reset();
+    if (pr::HostContext::exists()) {
+        pr::HostContext::shutdown();
     }
     return exitCode;
 }
@@ -874,6 +1434,21 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
     auto opt = std::make_shared<RenderOptions>();
     CLI::App* sub = app.add_subcommand("render", "Reframe or stitch frames to stills or an HDR MP4");
     addPipelineOptions(sub, opt->pipeline);
+
+    // Which engine renders (see the file comment).
+    auto* engine = sub->add_option_group("Engine");
+    engine
+        ->add_option("--engine", opt->engine,
+                     "plugin (default): the Premiere / Resolve plug-ins' own clip engine - every frame as Premiere "
+                     "renders a new clip, with its Source Settings defaults for whatever is not given here | "
+                     "classic: the research pipeline, every analysis off unless asked for")
+        ->default_str("plugin")
+        ->check(CLI::IsMember({"plugin", "classic"}));
+    engine->add_flag("--flare,!--no-flare", opt->flare, "plugin engine: sun ghost removal (Source Settings default: on)");
+    engine->add_option("--parallax-grid", opt->parallaxGrid,
+                       "plugin engine: follows (per moment) | steady (one correction for the clip) | auto (default)");
+    engine->add_option("--lens-align", opt->lensAlign,
+                       "plugin engine: off | auto (default; fit the small rotation between the lenses per clip)");
 
     auto* sel = sub->add_option_group("Frames");
     sel->add_option("--frame", opt->frame, "Single frame index")->default_val(-1);
@@ -964,16 +1539,30 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
                   "(OPENOSV_DEFAULTS_FILE, else %APPDATA%\\OpenOSV\\defaults.json); options given here still win");
 
     sub->callback([opt, sub, &ctx]() {
-        if (opt->useUserDefaults) {
-            // A lookup or an allocation failing here must end the command
-            // with a message, not escape through CLI11's parse().
-            try {
-                applyUserDefaults(*opt, *sub);
-            } catch (const std::exception& e) {
-                std::fprintf(stderr, "error: --use-user-defaults: %s\n", log::safe(e.what()).c_str());
-                ctx.exitCode = kExitRuntime;
+        // A lookup or an allocation failing here must end the command with a
+        // message, not escape through CLI11's parse().
+        try {
+            if (opt->engine == "plugin") {
+                // The plug-ins' engine reads --use-user-defaults itself, as a
+                // whole Source Settings blob (enginePrefs).
+                ctx.exitCode = runEngineRender(*opt, *sub);
                 return;
             }
+            for (const char* name : kPluginOnlyOptions) {
+                if (sub->count(name) > 0) {
+                    std::fprintf(stderr, "error: %s is an option of the plug-ins' engine; drop --engine classic\n",
+                                 name);
+                    ctx.exitCode = kExitUsage;
+                    return;
+                }
+            }
+            if (opt->useUserDefaults) {
+                applyUserDefaults(*opt, *sub);
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "error: %s\n", log::safe(e.what()).c_str());
+            ctx.exitCode = kExitRuntime;
+            return;
         }
         ctx.exitCode = runRender(*opt);
     });

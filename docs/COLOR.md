@@ -230,6 +230,13 @@ or **Creative > Look > Browse...**. Apply one only to a clip the importer
 delivered as **D-Log M passthrough** -- never on top of a PQ, HLG or Rec.709
 output, which is already converted.
 
+The passthrough is still stitched like every other output: the lens shading,
+the photometric seam field and the exposure match between the lenses (Gain
+Match) are applied to the code values, each code moved to the code of its
+light after the correction. Before 0.2.2 the passthrough skipped Gain Match,
+which left a brightness step at the seam wherever the photometric field was
+not in force. Sun ghost removal is the one stage it does not run.
+
 ## Standards used
 
 * BT.2100 HLG: a = 0.17883277, b = 0.28466892, c = 0.55991073; OOTF with
@@ -729,18 +736,35 @@ differently through the two front ends. `Unknown` and the modes with no curve
 of their own (D-Cinelike, Vivid, D-Log, D-Log2) resolve to D-Log M, the mode
 this container overwhelmingly carries.
 
-What the importer does for each source mode, at the default PQ output:
+What the importer does for each source mode, for a new clip:
 
 | `color_mode` | Input encoding | Output transfer | Declared to Premiere |
 |---|---|---|---|
 | 19 D-Log M | D-Log M (curve applied) | PQ | `kPrOverranged2100PQ` |
 | 9 HLG | HLG (inverse OETF; **no** log curve) | PQ | `kPrOverranged2100PQ` |
-| 0 Normal | Rec.709 (inverse OETF; **no** log curve) | PQ | `kPrOverranged2100PQ` |
+| 0 Normal | Rec.709 (inverse OETF; **no** log curve) | **Rec.709** | `kPrOverranged709` |
 
 So "auto PQ for D-Log M footage" is the default, and a non-log source is
 converted from its own encoding rather than being treated as log. Changing the
 output preference changes the last two columns only; the input encoding column
 never moves.
+
+**An SDR recording stays SDR.** A Normal-mode clip is an SDR picture already.
+Made PQ, it is only re-encoded as HDR, and on a Rec.709 timeline Premiere then
+tone maps it back down. So while a new clip still runs on its starting
+settings (the user's saved defaults, else the built-in ones), the importer
+switches a PQ or HLG starting output to Rec.709 for a Normal clip
+(`ImporterInstance::parseOnce`). Stored settings replace that as they replace
+any starting point. PQ and HLG stay in the menu for anybody mastering SDR
+material into HDR. `osvtool render` does the same unless `--color` is given.
+
+**SDR in, SDR out.** On the Rec.709 output a Normal clip is encoded back with
+the BT.709 OETF it was decoded with, so it comes out as recorded, changed only
+by the stitch (gains, shading, exposure). The standard rendering below is for
+scene light: it puts diffuse white at 75 %, which dimmed and flattened a
+Normal clip before 0.2.2. The DJI look is fitted to D-Log M and applies to
+D-Log M clips only (`setLook`), the same rule as the HDR tone styles, so a
+Normal or HLG clip is never graded a second time.
 
 Every clip logs one line at open recording exactly this, so an unexpected
 preview is answerable from a support log without reproducing it:

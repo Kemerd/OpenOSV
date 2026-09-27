@@ -20,7 +20,7 @@
  *   2. plugins/sourcesettings/SourceSettingsMain.cpp   - the effect, which
  *      static_asserts its own constant against the macro;
  *   3. plugins/importer/ImporterVideo.cpp              - the importer, which
- *      copies it into sourceSettingsMatchName.
+ *      copies it, with the host's "AE." prefix, into sourceSettingsMatchName.
  *
  * A test additionally reads the built .aex's PiPL back out of the module and
  * compares it to this macro, so the resource and the code cannot drift even
@@ -48,6 +48,21 @@
  * would lose the master-clip effect that carries its stitch settings. */
 #define OSV_SOURCE_SETTINGS_MATCH_NAME "OpenOSV.SourceSettings"
 
+/* The name PREMIERE knows the effect by, which is what the importer must put
+ * in imFileInfoRec8::sourceSettingsMatchName.
+ *
+ * Premiere registers every AE-API effect as "AE." + its PiPL match name (the
+ * same reason the panel asks for "AE.OpenOSV.Open360Reframe").  Given the
+ * bare PiPL name, Premiere still finds and instantiates the effect, but it
+ * never recognises the instance already on the master clip as that effect.
+ * So every time it re-checks the clip (the Master tab, a sequence settings
+ * change, a proxy attach) it adds ANOTHER Source Settings effect, and a source
+ * settings effect cannot be deleted.  A third-party importer developer on
+ * Adobe's forum hit exactly this and fixed it with the prefix.
+ *
+ * Derived from the permanent name above, never spelled out separately. */
+#define OSV_SOURCE_SETTINGS_HOST_MATCH_NAME "AE." OSV_SOURCE_SETTINGS_MATCH_NAME
+
 /* Displayed in the Effect Controls panel header and in the Effects panel. */
 #define OSV_SOURCE_SETTINGS_DISPLAY_NAME "OpenOSV Source Settings"
 
@@ -66,10 +81,16 @@ namespace osv::premiere {
 /// diverge.
 inline constexpr const char* kSourceSettingsMatchName = OSV_SOURCE_SETTINGS_MATCH_NAME;
 
-/// The same string as UTF-16, because imFileInfoRec8::sourceSettingsMatchName
-/// is a prUTF16Char[256] field.  Spelled with the L prefix applied to the
+/// The same string as UTF-16.  Spelled with the L prefix applied to the
 /// macro so the two literals are generated from one token sequence.
 inline constexpr const wchar_t* kSourceSettingsMatchNameW = L"" OSV_SOURCE_SETTINGS_MATCH_NAME;
+
+/// The host's name for the effect ("AE." + the match name) as UTF-16,
+/// because imFileInfoRec8::sourceSettingsMatchName is a prUTF16Char[256]
+/// field.  This, not the bare match name, is what the importer advertises
+/// (see OSV_SOURCE_SETTINGS_HOST_MATCH_NAME for the duplicate effects the
+/// bare name caused).
+inline constexpr const wchar_t* kSourceSettingsHostMatchNameW = L"" OSV_SOURCE_SETTINGS_HOST_MATCH_NAME;
 
 }  // namespace osv::premiere
 

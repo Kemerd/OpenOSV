@@ -71,6 +71,9 @@ LogState& state() {
 std::atomic<int> g_level{static_cast<int>(PluginLog::Level::Info)};
 std::atomic<bool> g_levelInitialised{false};
 
+/// The host's console copy (PluginLog::setMirror); null when there is none.
+std::atomic<PluginLog::Mirror> g_mirror{nullptr};
+
 /// Apply OSV_PLUGIN_LOG_LEVEL once (debug / trace / info / warn / error / off).
 void applyEnvironmentLevel() noexcept {
     bool expected = false;
@@ -351,10 +354,17 @@ void PluginLog::write(Level level, std::string_view text) noexcept {
         }
 
         debugOutput(line);
+
+        // The host's own console, when it has one (setMirror).
+        if (const Mirror mirror = g_mirror.load()) {
+            mirror(level, text);
+        }
     } catch (...) {
         // Dropping a log line is the only acceptable failure mode here.
     }
 }
+
+void PluginLog::setMirror(Mirror mirror) noexcept { g_mirror.store(mirror); }
 
 bool PluginLog::once(std::string_view key, Level level, std::string_view text) noexcept {
     if (!enabled(level)) {

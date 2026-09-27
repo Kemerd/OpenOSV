@@ -49,6 +49,7 @@
 #include "osv/geom/Blend.h"
 #include "osv/geom/LensRig.h"
 #include "osv/geom/Stabilization.h"
+#include "osv/geom/VirtualCamera.h"
 #include "osv/meta/FormatInfo.h"
 #include "osv/meta/MetadataTrack.h"
 #include "osv/meta/Types.h"
@@ -116,12 +117,39 @@ class GpuReadback;
 
 /// Output geometry derived from the prefs and the clip's native size.
 struct OutputGeometry {
-    std::int32_t width = 0;   ///< Equirect width (2 x height).
-    std::int32_t height = 0;  ///< Equirect height.
+    std::int32_t width = 0;   ///< Equirect width (2 x height), or the view's width.
+    std::int32_t height = 0;  ///< Equirect height, or the view's height.
 
-    [[nodiscard]] bool valid() const noexcept { return width > 0 && height > 0; }
+    /// When set, the frame is this virtual camera's VIEW instead of the
+    /// equirect: rendered straight from the fisheyes (the kernel's reframe
+    /// mode) with exactly the analyses, stabilisation and colour the equirect
+    /// gets, so no sphere is rendered and resampled on the way.  Its w / h
+    /// must equal width / height.  Nothing in Premiere sets it - the effect
+    /// reframes the importer's equirect, and the direct path traces its own
+    /// view - so every Premiere frame is the equirect, as before; osvtool's
+    /// reframe is the caller.
+    std::optional<geom::VirtualCamera> view;
+
+    [[nodiscard]] bool valid() const noexcept {
+        if (width <= 0 || height <= 0) {
+            return false;
+        }
+        return !view || (view->w == width && view->h == height && view->isValid());
+    }
     [[nodiscard]] bool operator==(const OutputGeometry& o) const noexcept {
-        return width == o.width && height == o.height;
+        if (width != o.width || height != o.height || view.has_value() != o.view.has_value()) {
+            return false;
+        }
+        if (!view) {
+            return true;
+        }
+        // Every field that moves a pixel; a cached frame of another view is
+        // never served for this one.
+        const geom::VirtualCamera& a = *view;
+        const geom::VirtualCamera& b = *o.view;
+        return a.projection == b.projection && a.w == b.w && a.h == b.h && a.hfovDeg == b.hfovDeg &&
+               a.yawDeg == b.yawDeg && a.pitchDeg == b.pitchDeg && a.rollDeg == b.rollDeg &&
+               a.correctionAngleDeg == b.correctionAngleDeg && a.eyeOffset == b.eyeOffset;
     }
 };
 
@@ -308,6 +336,12 @@ public:
     // from a nested call.)
     void applyPrefsLocked(const void* bytes, std::size_t length);
     [[nodiscard]] PrefsBlob prefsLocked() const noexcept;
+
+    /// The colour block the clip's frames are encoded with, as applyPrefs()
+    /// built it from the prefs in force.  osvtool tags its stills and video
+    /// from it (a PQ still records the peak its highlights were rolled into).
+    /// Takes lock() itself.
+    [[nodiscard]] OsvColorParams colorParams() const;
 
     // ---- rendering ---------------------------------------------------------
     /// Decode + stitch frame `index` at `geometry`.  `draft` disables the

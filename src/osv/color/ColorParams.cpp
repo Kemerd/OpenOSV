@@ -407,11 +407,11 @@ OsvColorParams makeColorParams(DlogMFit fit, OutputTransfer transfer, float expo
     }
 
     // --- display look ---------------------------------------------------------
-    // Filled for the (sanitised) transfer actually stored above, so a look can
-    // never land on an output it was not fitted for; makeLookParams returns a
-    // zeroed "no look" block for every other combination and for an
-    // out-of-range Look value.
-    p.look = makeLookParams(look, static_cast<OutputTransfer>(p.transfer));
+    // Filled for the (sanitised) input and transfer actually stored above, so
+    // a look can never land on an output it was not fitted for, or on a clip
+    // that is not D-Log M; setLook leaves a zeroed "no look" block for every
+    // other combination and for an out-of-range Look value.
+    setLook(p, look);
 
     // --- [WP-HDRPEAK] PQ highlight roll-off ----------------------------------
     // Also keyed off the sanitised transfer: only PQ gets a target, and the
