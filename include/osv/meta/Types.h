@@ -21,6 +21,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace osv::meta {
@@ -62,10 +63,34 @@ enum class EisStatus : std::int32_t {
     RsAuto = 9
 };
 
+/// Which camera's field numbering a djmd sample uses.
+///
+/// Every DJI camera writes the same library messages (DewarpParams,
+/// PanoDewarpParams, Quaternion, the scalar wrappers ...), but each product's
+/// ProductMeta arranges them under its own field numbers.  The typed structs
+/// below document the Osmo 360's numbering; DjmdDecoder maps every other
+/// schema onto it, so `present` bits and the "4.1"-style comments mean the
+/// same thing whichever camera wrote the clip.
+enum class DjmdSchema : std::uint8_t {
+    Osmo360 = 0,   ///< dvtm_oq101.proto: the numbering this file documents (the default).
+    Avata360 = 1   ///< dvtm_AVATA360.proto: same messages, other field numbers (DjmdDecoder.cpp).
+};
+
+/// ClipMetaHeader.proto_file_name of each known schema.
+inline constexpr const char* kOsmo360ProtoFile = "dvtm_oq101.proto";
+inline constexpr const char* kAvata360ProtoFile = "dvtm_AVATA360.proto";
+
+/// The schema a ClipMetaHeader.proto_file_name names.  Anything unrecognised
+/// (including an empty name) is read with the Osmo 360 numbering, which is
+/// what every clip was read with before a second schema existed.
+[[nodiscard]] DjmdSchema djmdSchemaForProto(std::string_view protoFileName) noexcept;
+
 /// Human readable names for the enums above (for JSON / probe output).
 [[nodiscard]] const char* colorModeName(ColorMode mode) noexcept;
 [[nodiscard]] const char* extriLensModeName(ExtriLensMode mode) noexcept;
 [[nodiscard]] const char* eisStatusName(EisStatus status) noexcept;
+/// "Osmo 360" / "Avata 360".
+[[nodiscard]] const char* djmdSchemaName(DjmdSchema schema) noexcept;
 
 // -----------------------------------------------------------------------------
 //  Quaternion as stored by the camera: message Quaternion {1 w, 2 x, 3 y, 4 z}
@@ -217,7 +242,7 @@ struct StreamMeta {
     std::int32_t type = 0;                                  ///< 1.2 (0 video, 1 audio)
     std::string name;                                       ///< 1.3 ("video")
     VideoInfo video;                                        ///< 3
-    ColorMode colorMode = ColorMode::Unknown;               ///< 4.1 (2.4.1 on the Avata 360, see DjmdDecoder)
+    ColorMode colorMode = ColorMode::Unknown;               ///< 4.1, or 2.4.1 (camera_stream_meta) on the Avata 360
     std::int32_t fovType = 0;                               ///< 5.1 (3 = WIDE)
     PanoDewarpParams dewarp;                                ///< 6
     ExtriLensMode extriLensMode = ExtriLensMode::Native;    ///< 7.1
@@ -281,6 +306,9 @@ struct ProductMeta {
     std::optional<ClipMeta> clip;
     std::optional<StreamMeta> stream;
     std::optional<FrameMeta> frame;
+    /// The numbering the sample was read with: named by its own ClipMeta
+    /// header when it has one (sample 0), otherwise the caller's hint.
+    DjmdSchema schema = DjmdSchema::Osmo360;
     std::vector<std::string> warnings;  ///< Non-fatal decode problems.
 };
 

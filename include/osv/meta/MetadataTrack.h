@@ -70,6 +70,10 @@ public:
     /// True when stream() holds at least one usable calibration record.
     [[nodiscard]] bool hasCalibration() const noexcept;
 
+    /// The field numbering sample 0 named (DjmdSchema::Osmo360 when it named
+    /// none); every later sample is decoded with it.
+    [[nodiscard]] DjmdSchema schema() const noexcept { return m_schema; }
+
     /// The djmd track this object was loaded from.
     [[nodiscard]] std::uint32_t trackId() const noexcept { return m_trackId; }
 
@@ -134,6 +138,7 @@ private:
     std::uint32_t m_frameCount = 0;
     std::optional<ClipMeta> m_clip;
     std::optional<StreamMeta> m_stream;
+    DjmdSchema m_schema = DjmdSchema::Osmo360;  ///< From sample 0; used for every frame.
     std::vector<std::string> m_warnings;
     std::unique_ptr<Cache> m_cache;
 };

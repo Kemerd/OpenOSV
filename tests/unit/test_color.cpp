@@ -742,31 +742,33 @@ TEST_CASE("Curve and primaries matrix are selected together", "[color]") {
 }
 
 TEST_CASE("Avata 360 D-Log M curve and primaries", "[color]") {
-    // No DJI reference exists for this camera (see the comments on the
-    // constants), so these check the fit's own anchors and constraints.
+    // Both constants are fits to DJI's own Avata 360 D-Log M -> Rec.709 LUT
+    // (scripts/fit_dlogm.py / fit_primaries.py --from-cube, as for the Osmo
+    // 360); these pin the fit's anchors and constraints so a pasted constant
+    // cannot drift silently.
     REQUIRE(dlogmCurveValid(kDlogMAvata360));
     // Grey is pinned exactly, as in every curve here; the toe sits on the
     // lin(0) >= 0 bound.
     REQUIRE_THAT(dlogmToLinear(kDlogMAvata360, 0.40f), WithinAbs(0.18, 1e-4));
     REQUIRE_THAT(dlogmToLinear(kDlogMAvata360, 0.0f), WithinAbs(0.0, 1e-5));
     REQUIRE(dlogmToLinear(kDlogMAvata360, 0.0f) >= -1e-6f);
-    // Values from the fit report, one inside the fitted range and one past
-    // its top (the neutral samples reached code 0.785).
-    REQUIRE_THAT(dlogmToLinear(kDlogMAvata360, 0.714f), WithinAbs(0.60211, 1e-4));
-    REQUIRE_THAT(dlogmToLinear(kDlogMAvata360, 1.0f), WithinAbs(1.41523, 1e-4));
+    // The fit report's anchors.  Above grey the Avata 360's file places its
+    // grey scale within ~2 % of the Osmo 360's (0.95775 and 3.76470).
+    REQUIRE_THAT(dlogmToLinear(kDlogMAvata360, 0.714f), WithinAbs(0.95287, 1e-4));
+    REQUIRE_THAT(dlogmToLinear(kDlogMAvata360, 1.0f), WithinAbs(3.63053, 1e-3));
     // Same slope-ratio bound as kDlogMOsmo360 (the fit sits on it), and the
-    // cut is reached at code 0.1614.
+    // cut is reached at code 0.1548.
     REQUIRE(kDlogMAvata360.slope2 / kDlogMAvata360.slope <= 3.0f + 1e-6f);
     REQUIRE_THAT(linearToDlogmD(kDlogMAvata360,
                                 kDlogMAvata360.midGrayScaling * (dlogmCutD(kDlogMAvata360) * kDlogMAvata360.slope2)),
-                 WithinAbs(0.16136, 1e-4));
+                 WithinAbs(0.15481, 1e-4));
     // Grey lands on HLG 0.380 through the whole pipeline: the matrix rows
     // sum to 1, so it cannot move a neutral.
     REQUIRE_THAT(greyThrough(standardParams(DlogMFit::Avata360, OutputTransfer::HLG), 0.40f), WithinAbs(0.380, 0.001));
 
-    // White stays white, bit-exactly, as for kNativeToRec2020_Osmo360.
+    // White stays white, as for kNativeToRec2020_Osmo360.
     for (int row = 0; row < 3; ++row) {
-        REQUIRE_THAT(static_cast<double>(mat3RowSum(kNativeToRec2020_Avata360, row)), WithinAbs(1.0, 1e-9));
+        REQUIRE_THAT(static_cast<double>(mat3RowSum(kNativeToRec2020_Avata360, row)), WithinAbs(1.0, 2e-7));
     }
     float white[3];
     osvMat3Apply(&kNativeToRec2020_Avata360, 0.18f, 0.18f, 0.18f, white);
@@ -784,25 +786,25 @@ TEST_CASE("Avata 360 D-Log M curve and primaries", "[color]") {
         static_cast<double>(m.m[0]) * (static_cast<double>(m.m[4]) * m.m[8] - static_cast<double>(m.m[5]) * m.m[7]) -
         static_cast<double>(m.m[1]) * (static_cast<double>(m.m[3]) * m.m[8] - static_cast<double>(m.m[5]) * m.m[6]) +
         static_cast<double>(m.m[2]) * (static_cast<double>(m.m[3]) * m.m[7] - static_cast<double>(m.m[4]) * m.m[6]);
-    REQUIRE_THAT(det, WithinAbs(1.075248, 1e-5));
+    REQUIRE_THAT(det, WithinAbs(0.782958, 1e-5));
 
-    // The implied red primary, stated so the caveat in Matrices.h cannot rot:
-    // positive luminance, but Z < 0, i.e. outside the spectral locus.  This
-    // matrix models a rendering; it is not a sensor characterisation.
+    // The implied native primaries, as the fit report states them: positive
+    // luminance for all three, and the chromaticities Matrices.h quotes.
     const float kRgb2020ToXyz[9] = {0.6369580f, 0.1446169f, 0.1688810f, 0.2627002f, 0.6779981f,
                                     0.0593017f, 0.0000000f, 0.0280727f, 1.0609851f};
     const OsvMat3f toXyz = {{kRgb2020ToXyz[0], kRgb2020ToXyz[1], kRgb2020ToXyz[2], kRgb2020ToXyz[3], kRgb2020ToXyz[4],
                              kRgb2020ToXyz[5], kRgb2020ToXyz[6], kRgb2020ToXyz[7], kRgb2020ToXyz[8]}};
+    const double kPrimaryXy[3][2] = {{0.7052, 0.3074}, {0.2854, 0.8093}, {0.1519, 0.0718}};
     for (int ch = 0; ch < 3; ++ch) {
         float in2020[3];
         float xyz[3];
         osvMat3Apply(&m, ch == 0 ? 1.0f : 0.0f, ch == 1 ? 1.0f : 0.0f, ch == 2 ? 1.0f : 0.0f, in2020);
         osvMat3Apply(&toXyz, in2020[0], in2020[1], in2020[2], xyz);
         INFO("native primary " << ch);
-        REQUIRE(xyz[1] > 0.0f);  // positive luminance for all three
-        if (ch == 0) {
-            REQUIRE(xyz[2] < 0.0f);
-        }
+        REQUIRE(xyz[1] > 0.0f);
+        const double sum = static_cast<double>(xyz[0]) + xyz[1] + xyz[2];
+        REQUIRE_THAT(xyz[0] / sum, WithinAbs(kPrimaryXy[ch][0], 5e-4));
+        REQUIRE_THAT(xyz[1] / sum, WithinAbs(kPrimaryXy[ch][1], 5e-4));
     }
 
     // Selection: names, and the curve and the matrix travel together.

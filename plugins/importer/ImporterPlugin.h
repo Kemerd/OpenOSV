@@ -249,7 +249,7 @@ struct DialogControls {
     bool seamSearch = true;
     bool gainMatch = true;
     int calibration = 0;    ///< Combo index = PrefsCalibrationChoice: 0 Auto, 1 Native, 2 Lens protectors, 3 Underwater.
-    int dlogmFit = 0;       ///< Combo index: 0 DJI refit, 1 Pocket 3.
+    int dlogmFit = 0;       ///< Combo index: 0 DJI refit, 1 Pocket 3, 2 Osmo 360, 3 Avata 360.
     double exposureStops = 0.0;
     int renderDevice = 0;   ///< Combo index: 0 Auto, 1 CPU, 2 CUDA, 3 OpenCL.
     int look = 0;           ///< [WP-LOOK] Combo index = PrefsLook: 0 DJI (default), 1 OpenOSV standard.

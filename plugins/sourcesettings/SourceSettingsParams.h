@@ -269,11 +269,11 @@
 #define OSV_SS_CALIB_COUNT 4
 #define OSV_SS_CALIB_DEFAULT 1
 
-/* PrefsDlogmFit: DjiRefit, Pocket3, Osmo360.  The enum is append-only (the
- * values are persisted), so Osmo 360 is last in the list even though it is
- * the default; the default is the 1-based popup index 3. */
-#define OSV_SS_FIT_ITEMS "DJI Refit|Pocket 3|Osmo 360"
-#define OSV_SS_FIT_COUNT 3
+/* PrefsDlogmFit: DjiRefit, Pocket3, Osmo360, Avata360.  The enum is
+ * append-only (the values are persisted), so Osmo 360 is not first even
+ * though it is the default; the default is the 1-based popup index 3. */
+#define OSV_SS_FIT_ITEMS "DJI Refit|Pocket 3|Osmo 360|Avata 360"
+#define OSV_SS_FIT_COUNT 4
 #define OSV_SS_FIT_DEFAULT 3
 
 /* PrefsRenderDevice: Auto, Cpu, Cuda, OpenCl.  Entry 3 is the platform's GPU

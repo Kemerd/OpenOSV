@@ -466,7 +466,7 @@ share a demuxer, so conforming cannot disturb video seeks.
 | `seamSearch` | 0/1 | 1 |
 | `gainMatch` | 0/1 | 1 |
 | `calibration` | 0 native, 1 lens guards, 2 underwater | 0 |
-| `dlogmFit` | 0 DJI refit, 1 Pocket 3 | 0 |
+| `dlogmFit` | 0 DJI refit, 1 Pocket 3, 2 Osmo 360, 3 Avata 360 | 2 |
 | `exposureStops` | float | 0 |
 | `renderDevice` | 0 auto, 1 CPU, 2 CUDA, 3 OpenCL | 0 |
 | `reserved[..]` | zero | |

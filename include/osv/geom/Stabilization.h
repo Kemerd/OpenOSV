@@ -70,7 +70,30 @@ struct StabilizationParams {
     bool lockPitch = true;           ///< HorizonLock / SmoothLevel: cancel pitch.
     bool lockRoll = true;            ///< HorizonLock / SmoothLevel: cancel roll.
     double smoothSigmaFrames = 15.0; ///< Smooth / SmoothLevel: Gaussian sigma of the window (frames).
+    /// HorizonLock / SmoothLevel: how the lens rig is mounted, body <- levelling
+    /// frame (see levellingMount).  Identity - the default - levels the body
+    /// itself, heading from its +Y, which is every Osmo 360 clip.
+    Mat3d mount;
 };
+
+/// The levelling frame of a clip: which body axes Horizon Leveling treats as
+/// right, forward and up, measured over the clip's whole attitude track.
+///
+/// Levelling decomposes the pose as yaw * pitch * roll about the body's
+/// +Y (forward), which is only well conditioned while +Y is closer to the
+/// horizon than to vertical.  A camera held with its lenses level (the Osmo
+/// 360 in the hand or on a stick) always is.  One flown with a lens up and a
+/// lens down (the Avata 360's 360 mode) never is: +Y is within a few degrees
+/// of vertical on every frame, the decomposition sits in gimbal lock, and a
+/// 5 degree tilt forward or sideways swings the heading by up to 90 degrees.
+///
+/// Returns the identity when the mean |cos| between the body's +Y and up is
+/// at most cos(45 deg) over the samples (and for no usable sample at all).
+/// Otherwise it returns the quarter turn about the body's +X that makes the
+/// body's horizontal +/-Z axis the levelling frame's forward and whichever of
+/// +/-Y points up on average its up; as a matrix, its columns are those body
+/// directions (right, forward, up).  It is a proper rotation either way.
+[[nodiscard]] Mat3d levellingMount(const std::vector<Quatd>& worldFromBody, const Vec3d& worldUp) noexcept;
 
 /// Quaternion logarithm: rotation vector (axis * angle) of a unit quaternion.
 [[nodiscard]] Vec3d quatLog(const Quatd& q) noexcept;

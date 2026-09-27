@@ -162,6 +162,7 @@ Result<MetadataTrack> MetadataTrack::load(const OsvFile& file, std::optional<std
     track.m_frameCount = chosen->samples.count();
     track.m_clip = std::move(first.clip);
     track.m_stream = std::move(first.stream);
+    track.m_schema = first.schema;
     track.m_warnings = std::move(selectionWarnings);
     for (std::string& w : first.warnings) {
         track.m_warnings.push_back(std::move(w));
@@ -173,8 +174,9 @@ Result<MetadataTrack> MetadataTrack::load(const OsvFile& file, std::optional<std
         track.m_cache->frames[0] = std::move(first.frame);
     }
 
-    log::debug("meta: loaded djmd track {} ({} samples, clip={}, stream={}, calibration={})", track.m_trackId,
-               track.m_frameCount, track.hasClip(), track.hasStream(), track.hasCalibration());
+    log::debug("meta: loaded djmd track {} ({} samples, {} schema, clip={}, stream={}, calibration={})",
+               track.m_trackId, track.m_frameCount, djmdSchemaName(track.m_schema), track.hasClip(),
+               track.hasStream(), track.hasCalibration());
     return track;
 }
 
@@ -190,7 +192,9 @@ Result<FrameMeta> MetadataTrack::decodeFrame(std::uint32_t index) const {
         return Error{ErrorCode::NotFound, std::format("frame {} out of range (track has {} samples)", index, m_frameCount)};
     }
     OSV_TRY_ASSIGN(ByteSpan sample, m_file->sample(m_trackId, index));
-    OSV_TRY_ASSIGN(ProductMeta product, DjmdDecoder::decode(sample));
+    // Frames after the first carry no ClipMeta header to name their camera:
+    // they are numbered the way sample 0 said.
+    OSV_TRY_ASSIGN(ProductMeta product, DjmdDecoder::decode(sample, m_schema));
     if (!product.frame.has_value()) {
         return Error{ErrorCode::Malformed, std::format("djmd sample {} holds no FrameMeta", index)};
     }

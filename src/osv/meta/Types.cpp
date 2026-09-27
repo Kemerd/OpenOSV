@@ -12,6 +12,27 @@
 namespace osv::meta {
 
 // -----------------------------------------------------------------------------
+//  Schemas
+// -----------------------------------------------------------------------------
+
+DjmdSchema djmdSchemaForProto(std::string_view protoFileName) noexcept {
+    // Exact match only: the name is what the camera writes into every clip,
+    // and a near miss is far more likely a new product than a typo.
+    if (protoFileName == kAvata360ProtoFile) {
+        return DjmdSchema::Avata360;
+    }
+    return DjmdSchema::Osmo360;
+}
+
+const char* djmdSchemaName(DjmdSchema schema) noexcept {
+    switch (schema) {
+    case DjmdSchema::Osmo360: return "Osmo 360";
+    case DjmdSchema::Avata360: return "Avata 360";
+    }
+    return "Unknown";
+}
+
+// -----------------------------------------------------------------------------
 //  Enum names
 // -----------------------------------------------------------------------------
 

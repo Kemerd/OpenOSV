@@ -143,7 +143,7 @@ constexpr const char* kStabTokens[] = {"off", "horizon-lock", "full", "smooth", 
 // PrefsCalibration byte: "native" means the FORCED bare-lens set, and "auto"
 // follows the accessory the camera recorded, exactly as the UIs say.
 constexpr const char* kCalibTokens[] = {"auto", "native", "lens-protectors", "underwater"};
-constexpr const char* kFitTokens[] = {"dji-refit", "pocket3", "osmo360"};
+constexpr const char* kFitTokens[] = {"dji-refit", "pocket3", "osmo360", "avata360"};
 constexpr const char* kDeviceTokens[] = {"auto", "cpu", "cuda", "opencl"};
 constexpr const char* kFlowTokens[] = {"auto", "classical", "neural"};
 constexpr const char* kPhotoTokens[] = {"off", "rim-only", "rim-and-colour"};

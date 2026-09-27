@@ -144,7 +144,7 @@ void describe(OfxParamSetHandle set) noexcept {
     // ---- Advanced (collapsed) ---------------------------------------------------
     defineGroup(set, kAdvancedGroup, {"Advanced", nullptr, nullptr, true}, false);
     defineChoice(set, kDlogmCurve,
-                 {"D-Log M Curve", "The D-Log M decoding curve. Osmo 360 is fitted to this camera.", kAdvancedGroup,
+                 {"D-Log M Curve", "The D-Log M decoding curve. Pick the camera that shot the clip.", kAdvancedGroup,
                   kStatic},
                  OSV_SS_FIT_ITEMS, OSV_SS_FIT_DEFAULT - 1);
     DoubleRange exposure;

@@ -140,6 +140,56 @@ inline constexpr LookFit kLookDjiRec709 = {
     1.000000210e+00f,                                          // gamutPower
 };
 
+/// The DJI Studio Rec.709 look for Avata 360 D-Log M.
+///
+/// DJI Studio gives the Avata 360 its own "D-LOG M" filter (slug
+/// LOG_Avata360_DLogM) and its own file, "DJI Avata 360 D-Log M to Rec.709
+/// V1.cube" (MD5 371ec662...e29c), not the Osmo 360 one: the same model as
+/// kLookDjiRec709, fitted to that file.
+///
+/// Provenance: `python scripts/fit_look.py --cube "DJI Avata 360 D-Log M to
+/// Rec.709 V1.cube" --curve kDlogMAvata360 --matrix kNativeToRec2020_Avata360`
+/// against DJI Studio 1.0.0.24724's file, whole cube only (no Avata 360
+/// footage was available to add samples).  Fit report: whole cube 1.683
+/// dE2000 mean / 3.657 p95 / 6.344 max (standard rendering 3.486 / 8.158 /
+/// 13.23); neutral axis 0.180 mean / 0.442 max.  Neutral axis strictly
+/// increasing; the worst luminance drop along 400 random exposure ramps is
+/// 3.5e-6 of display light.  Three extra solver passes gain nothing.
+///
+/// Through osvtool (the kernel, 33^3 bake), Avata 360 D-Log M against DJI's
+/// file: 1.68 dE2000 mean with this look, 2.23 with the Osmo 360 look on the
+/// Avata 360 curve and matrix, 2.52 with the Osmo 360 fit throughout.
+///
+/// The matrix is in the Avata 360 fit's native terms (makeLookParams composes
+/// it with the inverse of kNativeToRec2020_Avata360) and the shaper is
+/// kDlogMAvata360.
+inline constexpr LookFit kLookDjiRec709Avata360 = {
+    {{
+        1.147027680e+00f, -1.690380499e-01f, 2.201036973e-02f,
+        -9.889847378e-02f, 1.068726710e+00f, 3.017176412e-02f,
+        -2.414073994e-02f, -2.357919413e-01f, 1.259932681e+00f,
+    }},
+    {
+        0.000000000e+00f, 2.832500667e-03f, 4.421038963e-02f, 1.043450499e-01f,
+        1.771940989e-01f, 2.542268996e-01f, 3.329695007e-01f, 4.100616334e-01f,
+        4.769082203e-01f, 5.433116051e-01f, 6.190271632e-01f, 6.989114475e-01f,
+        7.740466382e-01f, 8.437760862e-01f, 9.040965517e-01f, 9.588026523e-01f,
+        1.000000000e+00f,
+    },
+    3.237314635e-01f,  // hueStart
+    4.495237131e-01f,  // hueWidth
+    1.450809400e-01f,  // hueAmount
+    7.715535853e-01f,  // hueExponent
+    {{
+        1.081076504e+00f, -9.255309685e-02f, 1.147659333e-02f,
+        -8.580543515e-03f, 1.027215460e+00f, -1.863491651e-02f,
+        -4.885587268e-02f, -3.622442228e-02f, 1.085080295e+00f,
+    }},
+    {7.472436146e-01f, 5.441833467e-01f, 4.220392273e-01f},  // gamutThreshold
+    {3.999999997e+00f, 1.974219796e+00f, 1.302364526e+00f},  // gamutLimit
+    1.000000000e+00f,                                          // gamutPower
+};
+
 /// Fritsch-Carlson monotone tangents (dT/du) for `count` knots on a uniform
 /// grid over [0, 1].  `slopes` must hold OSV_LOOK_MAX_KNOTS floats; entries
 /// from `count` on are zeroed.  Writes zeros and returns false for a count
@@ -148,15 +198,19 @@ inline constexpr LookFit kLookDjiRec709 = {
 /// block independently.
 bool monotoneTangents(const float* tone, int count, float* slopes) noexcept;
 
-/// The kernel block for `look` on `transfer`.  A look that does not apply to
-/// the transfer (or Look::Standard) returns a zeroed block, which the kernel
-/// treats as "no look".
-[[nodiscard]] OsvLookParams makeLookParams(Look look, OutputTransfer transfer) noexcept;
+/// The kernel block for `look` on `transfer`, for the camera `cameraFit`
+/// decodes.  Each camera fit that DJI ships its own Rec.709 LUT for has its
+/// own DJI look (the Osmo 360's and the Avata 360's); the legacy fits use the
+/// Osmo 360's.  A look that does not apply to the transfer (or Look::Standard)
+/// returns a zeroed block, which the kernel treats as "no look".
+[[nodiscard]] OsvLookParams makeLookParams(Look look, OutputTransfer transfer,
+                                           DlogMFit cameraFit = kDefaultDlogMFit) noexcept;
 
 /// Replace the look of an already built parameter block, for its own transfer
-/// and input.  Only a D-Log M input gets a look: HLG and Normal clips are
-/// display renderings already, and are left without one.
-void setLook(OsvColorParams& params, Look look) noexcept;
+/// and input, and the camera fit it was built with.  Only a D-Log M input
+/// gets a look: HLG and Normal clips are display renderings already, and are
+/// left without one.
+void setLook(OsvColorParams& params, Look look, DlogMFit cameraFit = kDefaultDlogMFit) noexcept;
 
 /// The look a parameter block carries (Standard for a zeroed / foreign block).
 [[nodiscard]] Look lookOf(const OsvColorParams& params) noexcept;

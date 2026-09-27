@@ -463,7 +463,11 @@ int runProbe(const ProbeOptions& opt) {
     doc["metaTrackId"] = meta ? meta->trackId() : 0u;
     doc["frameCount"] = meta ? meta->frameCount() : 0u;
     if (meta) {
-        std::printf("metadata: djmd track %u, %u frames\n", meta->trackId(), meta->frameCount());
+        // The schema says whose field numbering the file was read with; the
+        // wrong one reads the wrong fields, so it is always printed.
+        doc["schema"] = djmdSchemaName(meta->schema());
+        std::printf("metadata: djmd track %u, %u frames, %s schema\n", meta->trackId(), meta->frameCount(),
+                    djmdSchemaName(meta->schema()));
         if (meta->hasClip()) {
             const ClipMeta& c = meta->clip();
             doc["clip"] = toJson(c);

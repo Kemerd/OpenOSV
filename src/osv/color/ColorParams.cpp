@@ -410,8 +410,9 @@ OsvColorParams makeColorParams(DlogMFit fit, OutputTransfer transfer, float expo
     // Filled for the (sanitised) input and transfer actually stored above, so
     // a look can never land on an output it was not fitted for, or on a clip
     // that is not D-Log M; setLook leaves a zeroed "no look" block for every
-    // other combination and for an out-of-range Look value.
-    setLook(p, look);
+    // other combination and for an out-of-range Look value.  The look is the
+    // camera's own: the Avata 360's DJI rendering is not the Osmo 360's.
+    setLook(p, look, fit);
 
     // --- [WP-HDRPEAK] PQ highlight roll-off ----------------------------------
     // Also keyed off the sanitised transfer: only PQ gets a target, and the
