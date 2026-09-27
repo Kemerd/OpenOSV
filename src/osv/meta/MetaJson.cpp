@@ -230,6 +230,7 @@ json toJson(const ProductMeta& p) {
     j["clip"] = p.clip ? toJson(*p.clip) : json(nullptr);
     j["stream"] = p.stream ? toJson(*p.stream) : json(nullptr);
     j["frame"] = p.frame ? toJson(*p.frame) : json(nullptr);
+    j["schema"] = djmdSchemaName(p.schema);
     json warnings = json::array();
     for (const std::string& w : p.warnings) {
         warnings.push_back(safeString(w));

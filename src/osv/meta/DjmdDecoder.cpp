@@ -13,7 +13,6 @@
 #include <cmath>
 #include <format>
 #include <optional>
-#include <string_view>
 
 namespace osv::meta {
 
@@ -198,60 +197,180 @@ void decodeClipHeader(ByteSpan body, ClipHeader& out, std::vector<std::string>* 
 }
 
 // -----------------------------------------------------------------------------
-//  DJI Avata 360
+//  Schemas: each camera's field numbers mapped onto the Osmo 360's
+// -----------------------------------------------------------------------------
+//
+//  Every DJI camera builds its ProductMeta from the same library messages,
+//  but numbers the fields of four of them - ClipMeta, StreamMeta, FrameMeta
+//  and FrameMetaOfCamera - its own way.  Everything below those four
+//  (DewarpParams, PanoDewarpParams, Quaternion, the scalar wrappers, the IMU
+//  batches) is shared and numbered identically on every camera.
+//
+//  Rather than a second copy of every decoder, each schema maps its own field
+//  numbers onto the canonical ones - the Osmo 360's, which Types.h documents -
+//  before the single set of switch statements below sees them.  `present`
+//  bits therefore always carry canonical numbers, so FormatDetector's
+//  "colour mode = StreamMeta bit 4" means the same on every camera.
+//
+//  The Avata 360's numbering is its schema as used by DJI Studio for Windows.
+//  Its StreamMeta shape - camera_stream_meta at 2 with the colour mode at
+//  2.4, fov_type at 4 (empty on every clip seen), pano_dewarp_params at 5 -
+//  was checked against three recorded Avata 360 clips by a contributor.
 // -----------------------------------------------------------------------------
 
-/// ClipMetaHeader.proto_file_name of the DJI Avata 360.
-constexpr std::string_view kAvata360Proto = "dvtm_AVATA360.proto";
+/// One message's product field number -> canonical field number table.
+/// Index = the product's field number; 0 = a field the canonical message
+/// does not have (dropped and noted at debug level).  A null table is the
+/// identity: the Osmo 360 itself, and every message that is not remapped.
+struct FieldMap {
+    const std::uint8_t* to = nullptr;  ///< Canonical number per product number.
+    std::size_t size = 0;              ///< Entries in `to`.
+};
 
-/// Re-read the colour mode of an Avata 360 StreamMeta.
-///
-/// The Avata 360 keeps its colour mode one level deeper than the Osmo 360:
-/// StreamMeta field 2 is a camera sub-message whose field 4 wraps the mode.
-/// StreamMeta field 4, the Osmo's colour mode, is an empty message on every
-/// Avata sample seen, so decodeStreamMeta reads it as Normal.  This replaces
-/// that reading.  Checked on three Avata 360 clips: two D-Log M (2.4.1 = 19)
-/// and one Normal (2.4 empty).  Only those two shapes are trusted; anything
-/// else leaves the mode Unknown, so the histogram auto-detect decides instead.
-void readAvata360ColorMode(ByteSpan streamBody, StreamMeta& s, std::vector<std::string>* warnings) {
-    // What decodeStreamMeta took from field 4 is not a colour mode here.
-    s.colorMode = ColorMode::Unknown;
-    s.present.reset(4);
+/// The four remapped messages of one schema.
+struct SchemaMaps {
+    FieldMap clipMeta;     ///< ClipMeta (ProductMeta 1).
+    FieldMap streamMeta;   ///< StreamMeta (ProductMeta 2).
+    FieldMap frameMeta;    ///< FrameMeta (ProductMeta 3).
+    FieldMap cameraFrame;  ///< FrameMetaOfCamera (FrameMeta 2).
+};
 
-    // StreamMeta 2.4, proto3 last-occurrence-wins at both levels.  Other
-    // fields are skipped silently: decodeStreamMeta has already seen them.
-    std::optional<ProtoField> wrapper;
-    scanMessage(streamBody, "StreamMeta (Avata 360)", warnings, [&](const ProtoField& f) {
-        if (f.number != 2 || !expectMessage(f, "StreamMeta (Avata 360)", warnings)) {
+// ---- Osmo 360 ----------------------------------------------------------------
+
+/// The Osmo 360's StreamMeta is the canonical one except that it has no
+/// field 2: camera_stream_meta is canonical only so the Avata 360's colour
+/// mode has a home, and an Osmo 360 field 2 must stay an unknown field.
+constexpr std::uint8_t kOsmoStreamMeta[] = {
+    0,  // 0: never a field number
+    1,  // 1 stream_meta_header
+    0,  // 2 (not in the Osmo 360 schema)
+    3,  // 3 video_stream_meta
+    4,  // 4 color_mode
+    5,  // 5 fov_type
+    6,  // 6 pano_dewarp_params
+    7,  // 7 extri_lens_mode
+    8,  // 8 shading_calib_mode_num
+};
+
+// ---- Avata 360 ---------------------------------------------------------------
+
+constexpr std::uint8_t kAvataClipMeta[] = {
+    0,   // 0: never a field number
+    1,   // 1 clip_meta_header
+    2,   // 2 clip_streams_meta
+    3,   // 3 distortion_coefficients
+    4,   // 4 sensor_readout_time
+    5,   // 5 sensor_read_direction
+    8,   // 6 digital_focal_length
+    9,   // 7 eis_status
+    10,  // 8 imu_sampling_rate
+    11,  // 9 sensor_fps
+    12,  // 10 ITD_value
+    13,  // 11 LRO_value
+    14,  // 12 sensor_res
+    16,  // 13 style_filter_mode
+    0,   // 14 flat_res (no Osmo 360 counterpart)
+    17,  // 15 yltm_enable
+};
+
+constexpr std::uint8_t kAvataStreamMeta[] = {
+    0,  // 0: never a field number
+    1,  // 1 stream_meta_header
+    2,  // 2 camera_stream_meta (its field 4 is the colour mode)
+    3,  // 3 video_stream_meta
+    5,  // 4 fov_type
+    6,  // 5 pano_dewarp_params
+    7,  // 6 extri_lens_mode
+};
+
+constexpr std::uint8_t kAvataFrameMeta[] = {
+    0,  // 0: never a field number
+    1,  // 1 frame_meta_header
+    2,  // 2 camera_frame_meta
+    3,  // 3 imu_frame_meta
+    0,  // 4 drone_frame_meta (the aircraft's own telemetry; not used)
+    4,  // 5 gimbal_frame_meta
+    5,  // 6 ebike_frame_meta
+};
+
+constexpr std::uint8_t kAvataCameraFrame[] = {
+    0,   // 0: never a field number
+    1,   // 1 camera_dev_header
+    2,   // 2 exposure_index
+    3,   // 3 iso
+    4,   // 4 exposure_time
+    5,   // 5 digital_zoom_ratio
+    6,   // 6 white_balance_cct
+    7,   // 7 orientation
+    0,   // 8 exposure_value
+    0,   // 9 color_temp_atmosphere
+    0,   // 10 focal_length
+    0,   // 11 absolute_altitude
+    16,  // 12 sensor_temperature
+    0,   // 13 sensor_active_size
+    0,   // 14 f_number
+    0,   // 15 digital_focal_length (per frame; the clip-level one is used)
+    0,   // 16 sensor_shift_param
+    0,   // 17 fancy_mode
+    0,   // 18 liveview_hfov
+    0,   // 19 aec_eagle
+    0,   // 20 expo_balance_mode
+    8,   // 21 current_underwater_confidence
+    9,   // 22 camera_attitude
+    10,  // 23 camera_acc
+    11,  // 24 sharpness
+    12,  // 25 denoising
+    14,  // 26 track_ret
+    15,  // 27 aec_ae
+    0,   // 28 track_result_box_3d
+    0,   // 29 track_roi_box_list_sur
+};
+
+/// Wrap a table as a FieldMap (the size comes from the array itself).
+template <std::size_t N>
+constexpr FieldMap fieldMap(const std::uint8_t (&table)[N]) noexcept {
+    return FieldMap{table, N};
+}
+
+/// The tables of `schema`.
+SchemaMaps schemaMaps(DjmdSchema schema) noexcept {
+    switch (schema) {
+    case DjmdSchema::Avata360:
+        return SchemaMaps{fieldMap(kAvataClipMeta), fieldMap(kAvataStreamMeta), fieldMap(kAvataFrameMeta),
+                          fieldMap(kAvataCameraFrame)};
+    case DjmdSchema::Osmo360: break;
+    }
+    // The Osmo 360, and anything out of range: canonical numbering throughout.
+    return SchemaMaps{FieldMap{}, fieldMap(kOsmoStreamMeta), FieldMap{}, FieldMap{}};
+}
+
+/// `raw` renumbered into the canonical numbering.  Number 0 means the
+/// canonical message has no such field (a number past the table included).
+ProtoField canonicalField(const ProtoField& raw, const FieldMap& map) noexcept {
+    ProtoField f = raw;
+    if (map.to != nullptr) {
+        f.number = raw.number < map.size ? map.to[raw.number] : 0u;
+    }
+    return f;
+}
+
+/// The proto_file_name in a ClipMeta body's header (field 1.1), or empty.
+/// A cheap pre-scan: ClipMeta's own numbering depends on it.
+std::string clipProtoFileName(ByteSpan clipBody) {
+    std::string name;
+    // Silent scans: decodeClipMeta scans the same bytes again and reports
+    // anything malformed there, once.
+    scanMessage(clipBody, "ClipMeta", nullptr, [&](const ProtoField& f) {
+        if (f.number != 1 || f.wire != WireType::LengthDelimited) {
             return;
         }
-        scanMessage(f.bytes, "StreamMeta.2 (Avata 360)", warnings, [&](const ProtoField& g) {
-            if (g.number == 4) {
-                wrapper = g;
+        scanMessage(f.bytes, "ClipMeta.header", nullptr, [&](const ProtoField& g) {
+            if (g.number == 1 && g.wire == WireType::LengthDelimited) {
+                name = g.asString();  // proto3: last occurrence wins
             }
         });
     });
-    if (!wrapper) {
-        addWarning(warnings, "Avata 360 colour mode not recorded (no StreamMeta 2.4)");
-        return;
-    }
-    if (!expectMessage(*wrapper, "StreamMeta.2.4 (Avata 360)", warnings)) {
-        return;
-    }
-    const std::optional<ProtoField> mode = wrappedField(wrapper->bytes, "StreamMeta.2.4 (Avata 360)", warnings);
-    if (mode && mode->wire != WireType::Varint) {
-        addWarning(warnings, std::format("Avata 360 colour mode has wire type {}", wireTypeName(mode->wire)));
-        return;
-    }
-    // An empty wrapper is proto3's unwritten default, Normal.
-    const std::int32_t code = mode ? mode->asI32() : 0;
-    if (code != static_cast<std::int32_t>(ColorMode::DLogM) && code != static_cast<std::int32_t>(ColorMode::Normal)) {
-        addWarning(warnings,
-                   std::format("Avata 360 colour mode {} has not been verified on a sample; left unknown", code));
-        return;
-    }
-    s.colorMode = static_cast<ColorMode>(code);
-    s.present.set(4);
+    return name;
 }
 
 }  // namespace
@@ -289,7 +408,11 @@ Quaternion DjmdDecoder::decodeQuaternion(ByteSpan body, std::vector<std::string>
 Result<ClipMeta> DjmdDecoder::decodeClipMeta(ByteSpan body, std::vector<std::string>* warnings) {
     ClipMeta clip;
     std::size_t decoded = 0;
-    const bool clean = scanMessage(body, "ClipMeta", warnings, [&](const ProtoField& f) {
+    // The header (field 1 on every camera) names the schema, and the schema
+    // numbers every other field of this very message: read the name first.
+    const FieldMap map = schemaMaps(djmdSchemaForProto(clipProtoFileName(body))).clipMeta;
+    const bool clean = scanMessage(body, "ClipMeta", warnings, [&](const ProtoField& raw) {
+        const ProtoField f = canonicalField(raw, map);
         // Every known field lives in an embedded message; anything else with
         // a known number is malformed and reported (once, below the switch).
         const bool isMsg = f.wire == WireType::LengthDelimited;
@@ -382,12 +505,13 @@ Result<ClipMeta> DjmdDecoder::decodeClipMeta(ByteSpan body, std::vector<std::str
             }
             break;
         default:
-            noteUnknown("ClipMeta", f);
+            // Reported under the number the camera wrote, not the canonical one.
+            noteUnknown("ClipMeta", raw);
             return;
         }
         // Wrong wire type for a known wrapped field: say so once.
         if (!isMsg) {
-            expectMessage(f, "ClipMeta", warnings);
+            expectMessage(raw, "ClipMeta", warnings);
             return;
         }
         if (f.number < clip.present.size()) {
@@ -477,13 +601,16 @@ Result<DewarpParams> DjmdDecoder::decodeDewarp(ByteSpan body, std::vector<std::s
 //  StreamMeta
 // -----------------------------------------------------------------------------
 
-Result<StreamMeta> DjmdDecoder::decodeStreamMeta(ByteSpan body, std::vector<std::string>* warnings) {
+Result<StreamMeta> DjmdDecoder::decodeStreamMeta(ByteSpan body, std::vector<std::string>* warnings,
+                                                 DjmdSchema schema) {
     StreamMeta s;
     std::size_t decoded = 0;
-    const bool clean = scanMessage(body, "StreamMeta", warnings, [&](const ProtoField& f) {
-        if (!expectMessage(f, "StreamMeta", warnings)) {
+    const FieldMap map = schemaMaps(schema).streamMeta;
+    const bool clean = scanMessage(body, "StreamMeta", warnings, [&](const ProtoField& raw) {
+        if (!expectMessage(raw, "StreamMeta", warnings)) {
             return;
         }
+        const ProtoField f = canonicalField(raw, map);
         switch (f.number) {
         case 1:
             scanMessage(f.bytes, "StreamMeta.header", warnings, [&](const ProtoField& g) {
@@ -493,6 +620,26 @@ Result<StreamMeta> DjmdDecoder::decodeStreamMeta(ByteSpan body, std::vector<std:
                 case 3: s.name = g.asString(); break;
                 default: noteUnknown("StreamMeta.header", g); break;
                 }
+            });
+            break;
+        case 2:
+            // camera_stream_meta {1 device_header, 2 device_version,
+            // 3 device_sn, 4 color_mode, 5 sharpness, 6 denoise}: the Avata
+            // 360 keeps its colour mode here, in the same library ColorMode
+            // wrapper the Osmo 360 writes at StreamMeta 4, so the value means
+            // the same (19 D-Log M, 9 HLG, an empty wrapper Normal).  The
+            // rest is identification the stitcher does not need.
+            scanMessage(f.bytes, "StreamMeta.camera_stream_meta", warnings, [&](const ProtoField& g) {
+                if (g.number != 4) {
+                    return;
+                }
+                if (!expectMessage(g, "StreamMeta.camera_stream_meta", warnings)) {
+                    return;
+                }
+                s.colorMode = static_cast<ColorMode>(
+                    wrappedI32(g.bytes, "StreamMeta.camera_stream_meta.color_mode", warnings));
+                // Canonical bit 4 is "the colour mode was recorded".
+                s.present.set(4);
             });
             break;
         case 3:
@@ -542,7 +689,8 @@ Result<StreamMeta> DjmdDecoder::decodeStreamMeta(ByteSpan body, std::vector<std:
             s.shadingCalibModeNum = wrappedU32(f.bytes, "StreamMeta.shading_calib_mode_num", warnings);
             break;
         default:
-            noteUnknown("StreamMeta", f);
+            // Reported under the number the camera wrote, not the canonical one.
+            noteUnknown("StreamMeta", raw);
             return;
         }
         if (f.number < s.present.size()) {
@@ -552,6 +700,12 @@ Result<StreamMeta> DjmdDecoder::decodeStreamMeta(ByteSpan body, std::vector<std:
     });
     if (decoded == 0 && !clean) {
         return Error{ErrorCode::Malformed, "StreamMeta: no decodable field"};
+    }
+    // The Osmo 360 has always written its colour mode, so a missing one there
+    // is unremarkable; on the Avata 360 it is worth a line, because the
+    // histogram auto-detect then decides the whole colour path.
+    if (schema == DjmdSchema::Avata360 && !s.present.test(4)) {
+        addWarning(warnings, "Avata 360 colour mode not recorded (no StreamMeta camera_stream_meta.color_mode)");
     }
     return s;
 }
@@ -582,14 +736,15 @@ ImuBatch decodeImuBatch(ByteSpan body, const char* ctx, std::vector<std::string>
     return b;
 }
 
-/// FrameMetaOfCamera (field 2 of FrameMeta).
-void decodeCameraFrame(ByteSpan body, CameraFrame& cam, std::vector<std::string>* warnings) {
+/// FrameMetaOfCamera (field 2 of FrameMeta), numbered by `map`.
+void decodeCameraFrame(ByteSpan body, CameraFrame& cam, std::vector<std::string>* warnings, const FieldMap& map) {
     const char* ctx = "FrameMeta.camera_frame_meta";
-    scanMessage(body, ctx, warnings, [&](const ProtoField& f) {
+    scanMessage(body, ctx, warnings, [&](const ProtoField& raw) {
         // Every field of this message is itself a message.
-        if (!expectMessage(f, ctx, warnings)) {
+        if (!expectMessage(raw, ctx, warnings)) {
             return;
         }
+        const ProtoField f = canonicalField(raw, map);
         switch (f.number) {
         case 1:
             // Device header (id/name/frequency of the camera device): unused.
@@ -642,14 +797,16 @@ void decodeCameraFrame(ByteSpan body, CameraFrame& cam, std::vector<std::string>
             break;
         case 16: cam.sensorTemperature = wrappedFloat(f.bytes, "camera.sensor_temperature", warnings); break;
         case 17: cam.eqFocal = wrappedRepeatedI32(f.bytes, "camera.equivalent_focal_length", warnings); break;
-        default: noteUnknown(ctx, f); break;
+        default: noteUnknown(ctx, raw); break;
         }
     });
 }
 
-/// FrameMetaOfIMU (field 3 of FrameMeta).
+/// FrameMetaOfIMU (field 3 of FrameMeta).  Numbered identically on every
+/// camera; the Avata 360's schema only appends fields 4 and 5.
 void decodeImuFrame(ByteSpan body, ImuData& imu, std::vector<std::string>* warnings) {
     const char* ctx = "FrameMeta.imu_frame_meta";
+    ImuBatch single;  // field 4, the fallback for a missing current batch
     scanMessage(body, ctx, warnings, [&](const ProtoField& f) {
         if (!expectMessage(f, ctx, warnings)) {
             return;
@@ -672,9 +829,19 @@ void decodeImuFrame(ByteSpan body, ImuData& imu, std::vector<std::string>* warni
             });
             break;
         case 3: imu.vsyncPos = wrappedU32(f.bytes, "imu.IMU_vsync_pos", warnings); break;
+        case 4:
+            // IMU_single_attitude_after_fusion: a lone DeviceAttitude - the
+            // very type of field 2's current_frame - that the Avata 360's
+            // schema adds beside the three-batch message.  Kept aside and
+            // used only when field 2 brings no current batch (below).
+            single = decodeImuBatch(f.bytes, "imu.IMU_single_attitude_after_fusion", warnings);
+            break;
         default: noteUnknown(ctx, f); break;
         }
     });
+    if (!imu.current.present && single.present) {
+        imu.current = std::move(single);
+    }
 }
 
 /// FrameMetaOfGimbal (field 4 of FrameMeta): only the device header is kept.
@@ -713,13 +880,16 @@ void decodeGimbalFrame(ByteSpan body, FrameMeta& frame, std::vector<std::string>
 
 }  // namespace
 
-Result<FrameMeta> DjmdDecoder::decodeFrameMeta(ByteSpan body, std::vector<std::string>* warnings) {
+Result<FrameMeta> DjmdDecoder::decodeFrameMeta(ByteSpan body, std::vector<std::string>* warnings,
+                                               DjmdSchema schema) {
     FrameMeta frame;
     std::size_t decoded = 0;
-    const bool clean = scanMessage(body, "FrameMeta", warnings, [&](const ProtoField& f) {
-        if (!expectMessage(f, "FrameMeta", warnings)) {
+    const SchemaMaps maps = schemaMaps(schema);
+    const bool clean = scanMessage(body, "FrameMeta", warnings, [&](const ProtoField& raw) {
+        if (!expectMessage(raw, "FrameMeta", warnings)) {
             return;
         }
+        const ProtoField f = canonicalField(raw, maps.frameMeta);
         switch (f.number) {
         case 1:
             scanMessage(f.bytes, "FrameMeta.header", warnings, [&](const ProtoField& g) {
@@ -733,7 +903,7 @@ Result<FrameMeta> DjmdDecoder::decodeFrameMeta(ByteSpan body, std::vector<std::s
                 }
             });
             break;
-        case 2: decodeCameraFrame(f.bytes, frame.camera, warnings); break;
+        case 2: decodeCameraFrame(f.bytes, frame.camera, warnings, maps.cameraFrame); break;
         case 3: {
             ImuData imu;
             decodeImuFrame(f.bytes, imu, warnings);
@@ -742,7 +912,8 @@ Result<FrameMeta> DjmdDecoder::decodeFrameMeta(ByteSpan body, std::vector<std::s
         }
         case 4: decodeGimbalFrame(f.bytes, frame, warnings); break;
         default:
-            noteUnknown("FrameMeta", f);
+            // Reported under the number the camera wrote, not the canonical one.
+            noteUnknown("FrameMeta", raw);
             return;
         }
         ++decoded;
@@ -757,15 +928,22 @@ Result<FrameMeta> DjmdDecoder::decodeFrameMeta(ByteSpan body, std::vector<std::s
 //  ProductMeta
 // -----------------------------------------------------------------------------
 
-Result<ProductMeta> DjmdDecoder::decode(ByteSpan sample) {
+Result<ProductMeta> DjmdDecoder::decode(ByteSpan sample, DjmdSchema schemaHint) {
     if (sample.empty()) {
         return Error{ErrorCode::InvalidArgument, "djmd sample is empty"};
     }
     ProductMeta product;
+    product.schema = schemaHint;
     std::size_t decoded = 0;
-    // The StreamMeta body, kept for the Avata 360 colour mode, which can only
-    // be read once the ClipMeta header has named the camera.
-    ByteSpan streamBody;
+
+    // ---- pass 1: ClipMeta, which names the schema ------------------------------
+    // StreamMeta and FrameMeta are numbered by the schema, and nothing obliges
+    // the camera to write ClipMeta first, so their bodies are only collected
+    // here (in order: proto3 keeps the last good occurrence) and decoded once
+    // the header has been read.  ProductMeta's own numbering (1 clip,
+    // 2 stream, 3 frame) is the same on every camera.
+    std::vector<ByteSpan> streamBodies;
+    std::vector<ByteSpan> frameBodies;
     const bool clean = scanMessage(sample, "ProductMeta", &product.warnings, [&](const ProtoField& f) {
         if (!expectMessage(f, "ProductMeta", &product.warnings)) {
             return;
@@ -781,33 +959,35 @@ Result<ProductMeta> DjmdDecoder::decode(ByteSpan sample) {
             }
             break;
         }
-        case 2: {
-            auto stream = decodeStreamMeta(f.bytes, &product.warnings);
-            if (stream.ok()) {
-                product.stream = std::move(stream).value();
-                streamBody = f.bytes;
-                ++decoded;
-            } else {
-                addWarning(&product.warnings, stream.error().toString());
-            }
-            break;
-        }
-        case 3: {
-            auto frame = decodeFrameMeta(f.bytes, &product.warnings);
-            if (frame.ok()) {
-                product.frame = std::move(frame).value();
-                ++decoded;
-            } else {
-                addWarning(&product.warnings, frame.error().toString());
-            }
-            break;
-        }
+        case 2: streamBodies.push_back(f.bytes); break;
+        case 3: frameBodies.push_back(f.bytes); break;
         default: noteUnknown("ProductMeta", f); break;
         }
     });
-    // After the scan, so the order of ClipMeta and StreamMeta does not matter.
-    if (product.clip && product.stream && product.clip->header.protoFileName == kAvata360Proto) {
-        readAvata360ColorMode(streamBody, *product.stream, &product.warnings);
+    // A sample that names its camera overrides the hint: sample 0 is where
+    // the hint comes from in the first place.
+    if (product.clip && !product.clip->header.protoFileName.empty()) {
+        product.schema = djmdSchemaForProto(product.clip->header.protoFileName);
+    }
+
+    // ---- pass 2: StreamMeta and FrameMeta in the sample's schema ---------------
+    for (const ByteSpan body : streamBodies) {
+        auto stream = decodeStreamMeta(body, &product.warnings, product.schema);
+        if (stream.ok()) {
+            product.stream = std::move(stream).value();
+            ++decoded;
+        } else {
+            addWarning(&product.warnings, stream.error().toString());
+        }
+    }
+    for (const ByteSpan body : frameBodies) {
+        auto frame = decodeFrameMeta(body, &product.warnings, product.schema);
+        if (frame.ok()) {
+            product.frame = std::move(frame).value();
+            ++decoded;
+        } else {
+            addWarning(&product.warnings, frame.error().toString());
+        }
     }
     if (decoded == 0) {
         // Nothing usable: report the scan failure if there was one, otherwise

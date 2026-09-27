@@ -910,89 +910,226 @@ TEST_CASE("Quaternion decoding zero-fills missing components", "[meta][proto]") 
     REQUIRE(q.toQuatdXYZW().w == 0.25);
 }
 
-TEST_CASE("The Avata 360 colour mode is read from StreamMeta 2.4 and not from 4", "[meta][proto]") {
-    // Layout of the three Avata 360 clips this was checked on (two D-Log M,
-    // one Normal): StreamMeta field 2 is a camera sub-message whose field 4
-    // wraps the colour mode, and StreamMeta field 4 - the Osmo 360's colour
-    // mode - is an empty message.  Read the Osmo way, every Avata clip is
-    // Normal.  `colorWrapper` is StreamMeta 2.4's payload, or null to leave
-    // field 2.4 out.  `streamFirst` puts StreamMeta ahead of ClipMeta.
-    const auto avataSample = [](const char* proto, const Pb* colorWrapper, bool streamFirst = false) {
-        Pb header;
-        header.str(1, proto).str(10, "DJI Avata360");
-        Pb clip;
-        clip.msg(1, header);
-        Pb camera;
-        camera.msg(1, Pb().vint(2, 1).str(4, "DJI FCA188"));
-        camera.msg(3, Pb().str(1, "SN"));
-        if (colorWrapper != nullptr) {
-            camera.msg(4, *colorWrapper);
-        }
-        camera.msg(5, Pb());
-        Pb stream;
-        stream.msg(1, Pb().str(3, "video"));
-        stream.msg(2, camera);
-        stream.msg(3, Pb().vint(1, 3840).vint(2, 3840).vint(5, 10));
-        stream.msg(4, Pb());  // empty on every Avata 360 sample seen
-        Pb product;
-        if (streamFirst) {
-            product.msg(2, stream).msg(1, clip);
-        } else {
-            product.msg(1, clip).msg(2, stream);
-        }
-        return product;
-    };
-    const auto decodeStream = [](const Pb& sample, std::vector<std::string>* warnings = nullptr) {
+namespace {
+
+/// A synthetic Avata 360 sample, numbered the way the Avata 360's schema
+/// numbers it.  Its StreamMeta is the shape a contributor recorded on three
+/// Avata 360 clips (camera_stream_meta at 2 with the colour mode at 2.4, an
+/// empty fov_type at 4, the calibration at 5); ClipMeta and FrameMeta follow
+/// the same schema.  `colorWrapper` is StreamMeta 2.4's payload, or null to
+/// leave 2.4 out; `streamFirst` puts StreamMeta ahead of ClipMeta;
+/// `withClip` false leaves ClipMeta out (every sample after the first).
+Pb makeAvataSample(const char* proto, const Pb* colorWrapper, bool streamFirst = false, bool withClip = true) {
+    const Quaternion qs{0.0026615f, 0.0019091f, -0.7056412f, 0.7085618f, true};
+    const Quaternion qm{0.7036960f, 0.7103991f, -0.0046943f, -0.0110939f, true};
+
+    // ---- ClipMeta: Avata numbering (digital_focal_length 6, sensor_res 12) ----
+    Pb header;
+    header.str(1, proto).str(3, "1.0.0").str(10, "DJI Avata360");
+    Pb clip;
+    clip.msg(1, header);
+    clip.msg(2, Pb().vint(1, 2).vint(2, 1));
+    clip.msg(5, Pb().vint(1, 4));
+    clip.msg(6, Pb().f32(1, 1061.25f));              // digital_focal_length
+    clip.msg(7, Pb().vint(1, 0));                    // eis_status
+    clip.msg(8, Pb().vint(1, 1000));                 // imu_sampling_rate (the Osmo's focal-length number)
+    clip.msg(9, Pb().f32(1, 59.94f));                // sensor_fps
+    clip.msg(12, Pb().vint(1, 3840).vint(2, 3840));  // sensor_res
+    clip.msg(13, Pb().vint(1, 2));                   // style_filter_mode
+    clip.msg(14, Pb().vint(1, 7680));                // flat_res: no Osmo counterpart, dropped
+    clip.msg(15, Pb().vint(1, 1));                   // yltm_enable
+
+    // ---- StreamMeta: camera_stream_meta 2, fov_type 4, pano 5, lens mode 6 ----
+    Pb camera;
+    camera.msg(1, Pb().vint(2, 1).str(4, "DJI FCA188"));
+    camera.msg(3, Pb().str(1, "SN"));
+    if (colorWrapper != nullptr) {
+        camera.msg(4, *colorWrapper);
+    }
+    camera.msg(5, Pb());
+    Pb pano;
+    pano.msg(1, makeDewarp(1061.9f, 1061.7f, 1917.0f, 1919.1f, true, qs));
+    pano.msg(2, makeDewarp(1061.0f, 1060.9f, 1908.8f, 1918.7f, true, qm));
+    Pb stream;
+    stream.msg(1, Pb().str(3, "video"));
+    stream.msg(2, camera);
+    stream.msg(3, Pb().vint(1, 3840).vint(2, 3840).vint(5, 10));
+    stream.msg(4, Pb());             // fov_type: empty on every Avata 360 sample seen
+    stream.msg(5, pano);             // pano_dewarp_params
+    stream.msg(6, Pb().vint(1, 1));  // extri_lens_mode = lens guards
+
+    // ---- FrameMeta: camera 2 (attitude 22, acc 23), IMU 3, drone 4, gimbal 5 ----
+    const Quaternion att{0.46131432f, 0.54081959f, 0.54205739f, 0.44819313f, true};
+    Pb cameraFrame;
+    cameraFrame.msg(3, Pb().f32(1, 100.0f));     // iso
+    cameraFrame.msg(12, Pb().f32(1, 41.5f));     // sensor_temperature
+    cameraFrame.msg(15, Pb().f32(1, 1061.25f));  // per-frame digital_focal_length: dropped
+    cameraFrame.msg(22, Pb().f32(1, att.w).f32(2, att.x).f32(3, att.y).f32(4, att.z));  // camera_attitude
+    cameraFrame.msg(23, Pb().f32(2, 0.1f).f32(3, 9.7f).f32(4, -0.2f));                  // camera_acc
+    cameraFrame.msg(24, Pb().f32(1, 3.0f));      // sharpness
+    Pb single;  // IMU_single_attitude_after_fusion: the only attitude batch here
+    single.vint(1, 1234).vint(2, 99);
+    single.msg(3, Pb().f32(1, att.w).f32(2, att.x).f32(3, att.y).f32(4, att.z));
+    Pb imu;
+    imu.msg(1, Pb().vint(1, 2));
+    imu.msg(3, Pb().vint(1, 1));
+    imu.msg(4, single);
+    Pb frame;
+    frame.msg(1, Pb().vint(1, 0).vint(2, 1000).vint(3, 0));
+    frame.msg(2, cameraFrame);
+    frame.msg(3, imu);
+    frame.msg(4, Pb().msg(2, Pb().f32(1, 5.0f)));  // drone_frame_meta: the aircraft's own, not used
+    frame.msg(5, Pb().msg(1, Pb().str(4, "Avata gimbal").f32(5, 59.94f)));
+
+    Pb product;
+    if (!withClip) {
+        product.msg(3, frame);
+    } else if (streamFirst) {
+        product.msg(2, stream).msg(1, clip).msg(3, frame);
+    } else {
+        product.msg(1, clip).msg(2, stream).msg(3, frame);
+    }
+    return product;
+}
+
+}  // namespace
+
+TEST_CASE("The Avata 360 schema: calibration, focal length, colour mode and attitude", "[meta][proto]") {
+    const auto decodeAll = [](const Pb& sample) {
         const Result<ProductMeta> decoded = DjmdDecoder::decode(sample.span());
         REQUIRE(decoded.ok());
+        REQUIRE(decoded.value().clip.has_value());
         REQUIRE(decoded.value().stream.has_value());
-        if (warnings != nullptr) {
-            *warnings = decoded.value().warnings;
-        }
-        return *decoded.value().stream;
+        REQUIRE(decoded.value().frame.has_value());
+        return decoded.value();
     };
     const Pb dlogm = Pb().vint(1, 19);
     const Pb empty;
 
-    SECTION("D-Log M") {
-        const StreamMeta s = decodeStream(avataSample("dvtm_AVATA360.proto", &dlogm));
+    SECTION("Every message reads in the Avata numbering") {
+        const ProductMeta p = decodeAll(makeAvataSample(kAvata360ProtoFile, &dlogm));
+        REQUIRE(p.schema == DjmdSchema::Avata360);
+        REQUIRE(p.warnings.empty());
+
+        // ClipMeta: 6 is the digital focal length, 8 the IMU rate, 12 the sensor.
+        const ClipMeta& c = *p.clip;
+        REQUIRE_THAT(c.digitalFocalLength, WithinRel(1061.25f, 1e-6f));
+        REQUIRE(c.imuSamplingRate == 1000);
+        REQUIRE(c.sensorW == 3840);
+        REQUIRE(c.sensorH == 3840);
+        REQUIRE_THAT(c.sensorFps, WithinRel(59.94f, 1e-6f));
+        REQUIRE(c.styleFilterMode == 2);
+        REQUIRE(c.yltmEnable == 1);
+        // present bits are canonical (Osmo 360) numbers whatever the camera.
+        for (const std::size_t bit : {1, 2, 5, 8, 9, 10, 11, 14, 16, 17}) {
+            INFO("canonical ClipMeta bit " << bit);
+            REQUIRE(c.present.test(bit));
+        }
+        REQUIRE_FALSE(c.present.test(6));
+        REQUIRE_FALSE(c.present.test(12));
+
+        // StreamMeta: the calibration at 5, the lens mode at 6, the colour at 2.4.
+        const StreamMeta& s = *p.stream;
         REQUIRE(s.colorMode == ColorMode::DLogM);
         REQUIRE(s.present.test(4));
-        // The rest of StreamMeta still decodes the usual way.
         REQUIRE(s.video.width == 3840);
         REQUIRE(s.name == "video");
+        REQUIRE(s.fovType == 0);
+        REQUIRE(s.present.test(5));
+        REQUIRE(s.present.test(6));
+        REQUIRE(s.extriLensMode == ExtriLensMode::LensGuards);
+        REQUIRE(s.present.test(7));
+        const DewarpParams* slave = s.dewarp.get(PanoDewarpParams::NativeRefineSlave);
+        const DewarpParams* master = s.dewarp.get(PanoDewarpParams::NativeRefineMaster);
+        REQUIRE(slave != nullptr);
+        REQUIRE(master != nullptr);
+        REQUIRE(slave->hasCore());
+        REQUIRE(master->hasCore());
+        REQUIRE_THAT(slave->fx, WithinRel(1061.9f, 1e-6f));
+        REQUIRE_THAT(master->camExtriQ.w, WithinRel(0.7036960f, 1e-6f));
+        // ... and the selector stitches with it, exactly as on an Osmo 360.
+        const Result<CalibrationSet> set = CalibrationSelector::select(s, {}, nullptr);
+        REQUIRE(set.ok());
+        REQUIRE(set.value().sourceSlave == "native_refine_slave");
+
+        // FrameMeta: attitude 22, acc 23, the single IMU batch, gimbal at 5.
+        const FrameMeta& f = *p.frame;
+        REQUIRE(f.camera.iso == 100.0f);
+        REQUIRE(f.camera.sensorTemperature == 41.5f);
+        REQUIRE(f.camera.sharpness == 3.0f);
+        REQUIRE(f.camera.attitude.present);
+        REQUIRE_THAT(f.camera.attitude.w, WithinRel(0.46131432f, 1e-6f));
+        REQUIRE(f.camera.accPresent);
+        REQUIRE(f.camera.acc.y == 9.7f);
+        REQUIRE(f.imu.has_value());
+        REQUIRE(f.imu->current.present);
+        REQUIRE(f.imu->current.ts == 1234);
+        REQUIRE(f.imu->current.q.size() == 1);
+        REQUIRE(f.imu->vsyncPos == 1);
+        REQUIRE(f.gimbalDeviceName == "Avata gimbal");
     }
-    SECTION("D-Log M with StreamMeta ahead of ClipMeta") {
-        const StreamMeta s = decodeStream(avataSample("dvtm_AVATA360.proto", &dlogm, true));
-        REQUIRE(s.colorMode == ColorMode::DLogM);
-        REQUIRE(s.present.test(4));
+    SECTION("StreamMeta ahead of ClipMeta") {
+        const ProductMeta p = decodeAll(makeAvataSample(kAvata360ProtoFile, &dlogm, true));
+        REQUIRE(p.schema == DjmdSchema::Avata360);
+        REQUIRE(p.stream->colorMode == ColorMode::DLogM);
+        REQUIRE(p.stream->dewarp.get(PanoDewarpParams::NativeRefineMaster) != nullptr);
+        REQUIRE(p.frame->camera.attitude.present);
     }
     SECTION("An empty 2.4 is proto3's unwritten 0, Normal") {
-        const StreamMeta s = decodeStream(avataSample("dvtm_AVATA360.proto", &empty));
-        REQUIRE(s.colorMode == ColorMode::Normal);
-        REQUIRE(s.present.test(4));
+        const ProductMeta p = decodeAll(makeAvataSample(kAvata360ProtoFile, &empty));
+        REQUIRE(p.stream->colorMode == ColorMode::Normal);
+        REQUIRE(p.stream->present.test(4));
     }
     SECTION("No 2.4 is not recorded, never Normal") {
-        std::vector<std::string> warnings;
-        const StreamMeta s = decodeStream(avataSample("dvtm_AVATA360.proto", nullptr), &warnings);
-        REQUIRE(s.colorMode == ColorMode::Unknown);
-        REQUIRE_FALSE(s.present.test(4));
-        REQUIRE_FALSE(warnings.empty());
+        const ProductMeta p = decodeAll(makeAvataSample(kAvata360ProtoFile, nullptr));
+        REQUIRE(p.stream->colorMode == ColorMode::Unknown);
+        REQUIRE_FALSE(p.stream->present.test(4));
+        REQUIRE_FALSE(p.warnings.empty());
     }
-    SECTION("A mode no Avata 360 sample has shown is left unknown") {
+    SECTION("2.4 is the library ColorMode, so HLG reads as HLG") {
+        // The Osmo 360's StreamMeta 4 and the Avata 360's 2.4 are the same
+        // library message and enumeration.
         const Pb hlg = Pb().vint(1, 9);
-        std::vector<std::string> warnings;
-        const StreamMeta s = decodeStream(avataSample("dvtm_AVATA360.proto", &hlg), &warnings);
-        REQUIRE(s.colorMode == ColorMode::Unknown);
-        REQUIRE_FALSE(s.present.test(4));
-        REQUIRE_FALSE(warnings.empty());
+        const ProductMeta p = decodeAll(makeAvataSample(kAvata360ProtoFile, &hlg));
+        REQUIRE(p.stream->colorMode == ColorMode::HLG);
+        REQUIRE(p.stream->present.test(4));
     }
-    SECTION("Any other proto keeps the Osmo 360 reading of field 4") {
-        // Same bytes, Osmo proto name: 2.4 is ignored and the empty field 4
-        // reads as Normal, exactly as before.
-        const StreamMeta s = decodeStream(avataSample("dvtm_oq101.proto", &dlogm));
-        REQUIRE(s.colorMode == ColorMode::Normal);
-        REQUIRE(s.present.test(4));
+    SECTION("Any other proto keeps the Osmo 360 numbering") {
+        // Same bytes, Osmo proto name: 2 is not an Osmo field, the empty 4
+        // reads as Normal, 5 is fov_type and 6 holds no calibration.
+        const ProductMeta p = decodeAll(makeAvataSample(kOsmo360ProtoFile, &dlogm));
+        REQUIRE(p.schema == DjmdSchema::Osmo360);
+        REQUIRE(p.stream->colorMode == ColorMode::Normal);
+        REQUIRE(p.stream->present.test(4));
+        REQUIRE(p.stream->dewarp.get(PanoDewarpParams::NativeRefineSlave) == nullptr);
+        // Which is exactly how an Avata clip read before the schema existed:
+        // the IMU rate as the focal length, flat_res as the sensor size.
+        REQUIRE(p.clip->digitalFocalLength == 1000.0f);
+        REQUIRE(p.clip->sensorW == 7680);
+        REQUIRE_FALSE(p.frame->camera.attitude.present);
+    }
+    SECTION("Frames without a ClipMeta are read in the schema they are given") {
+        // Samples 1..N carry FrameMeta alone; MetadataTrack passes sample 0's
+        // schema as the hint.
+        const Pb frameOnly = makeAvataSample(kAvata360ProtoFile, &dlogm, false, false);
+        const Result<ProductMeta> asAvata = DjmdDecoder::decode(frameOnly.span(), DjmdSchema::Avata360);
+        REQUIRE(asAvata.ok());
+        REQUIRE(asAvata.value().schema == DjmdSchema::Avata360);
+        REQUIRE_FALSE(asAvata.value().clip.has_value());
+        REQUIRE(asAvata.value().frame->camera.attitude.present);
+        // Read as an Osmo 360 frame, 22 means nothing and the attitude is absent.
+        const Result<ProductMeta> asOsmo = DjmdDecoder::decode(frameOnly.span());
+        REQUIRE(asOsmo.ok());
+        REQUIRE(asOsmo.value().schema == DjmdSchema::Osmo360);
+        REQUIRE_FALSE(asOsmo.value().frame->camera.attitude.present);
+    }
+    SECTION("Schema names and lookup") {
+        REQUIRE(djmdSchemaForProto(kAvata360ProtoFile) == DjmdSchema::Avata360);
+        REQUIRE(djmdSchemaForProto(kOsmo360ProtoFile) == DjmdSchema::Osmo360);
+        REQUIRE(djmdSchemaForProto("") == DjmdSchema::Osmo360);
+        REQUIRE(djmdSchemaForProto("dvtm_avata360.proto") == DjmdSchema::Osmo360);  // exact names only
+        REQUIRE(std::string(djmdSchemaName(DjmdSchema::Avata360)) == "Avata 360");
+        REQUIRE(std::string(djmdSchemaName(static_cast<DjmdSchema>(200))) == "Unknown");
     }
 }
 
