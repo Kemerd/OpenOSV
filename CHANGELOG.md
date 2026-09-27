@@ -34,6 +34,14 @@ All notable changes to OpenOSV are documented here. The format follows
   so it never recognised the one already there. The importer now gives the
   name Premiere uses. Extra copies a project already collected stay, but no
   new ones are added.
+* **Dark patches along the seam of close-up shots.** To close a parallax gap,
+  the correction moves each lens's sample toward its rim. That lowered the
+  blend weights, and the alpha was taken from them, so a corrected seam went
+  partly transparent in proportion to the parallax it fixed. On a camera set
+  on the ground that showed as dark cones along the seam, one per row of the
+  correction grid. The alpha now comes from what the lenses see of that
+  direction without the correction. A direction the correction would push
+  off both lenses renders uncorrected instead of as a hole.
 * **SDR clips were treated as HDR.** A clip recorded in the Normal colour
   mode:
   * now starts with **Rec.709** output instead of PQ, so its picture isn't

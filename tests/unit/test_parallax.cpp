@@ -481,6 +481,75 @@ TEST_CASE("a zero warp grid renders bit-identically to no grid", "[render][paral
     REQUIRE(std::memcmp(a.value().data.data(), b.value().data.data(), a.value().data.size() * sizeof(float)) == 0);
 }
 
+TEST_CASE("a parallax warp never makes a direction the rig sees transparent", "[render][parallax][coverage]") {
+    // The warp closes a disparity by moving each lens's sample toward its
+    // own rim, which lowers both feather weights.  Those weights must still
+    // decide the MIX, but not the coverage: the direction is exactly as seen
+    // as it was.  Taking the alpha from the warped weights made every warped
+    // seam partly transparent in proportion to the parallax it corrected -
+    // on a camera set on the ground, dark cones along the seam, one per row
+    // of the grid, wherever the host showed black through.
+    const SceneFixture& s = scene();
+    REQUIRE(s.ok);
+    ThreadPool pool;
+    render::CpuRenderer cpu(pool);
+    geom::BlendParams blend;
+    const OsvColorParams cp =
+        color::makeColorParams(color::kDefaultDlogMFit, color::OutputTransfer::Rec709, 0.0f);
+    geom::EquirectMap map;
+    map.layout = geom::EquirectLayout::Standard;
+    map.w = 512;
+    map.h = 256;
+
+    render::RenderParamsBuilder plainBuilder;
+    plainBuilder.rig(s.rig).equirect(map).blend(blend, true).color(cp).alphaCoverage(true);
+    auto plainJob = plainBuilder.build(s.parallax);
+    REQUIRE(plainJob.ok());
+    auto plain = cpu.render(plainJob.value());
+    REQUIRE(plain.ok());
+
+    // A constant 9 degree correction, both ways across the meridian and
+    // along it: whichever way the seam runs, one of them pushes both lenses
+    // outward, and an object close to the camera asks for that much.  Before
+    // the coverage came from the unwarped rays, 6 degrees took up to 42 % of
+    // the alpha from 12,349 of these pixels and 9 degrees all of it.
+    const float step = static_cast<float>(deg2rad(9.0));
+    for (const std::pair<float, float> d : {std::pair<float, float>{step, 0.0f}, {-step, 0.0f}, {0.0f, step},
+                                            {0.0f, -step}}) {
+        std::vector<float> uv(32u * 8u * 2u);
+        for (std::size_t i = 0; i < uv.size(); i += 2) {
+            uv[i] = d.first;
+            uv[i + 1] = d.second;
+        }
+        render::RenderParamsBuilder warpBuilder;
+        warpBuilder.rig(s.rig).equirect(map).blend(blend, true).color(cp).alphaCoverage(true).warp(
+            uv, 32, 8, static_cast<float>(deg2rad(80.0)), static_cast<float>(deg2rad(-80.0)));
+        auto warpJob = warpBuilder.build(s.parallax);
+        REQUIRE(warpJob.ok());
+        REQUIRE(warpJob.value().params.warpEnabled == 1);
+        auto warped = cpu.render(warpJob.value());
+        REQUIRE(warped.ok());
+        REQUIRE(warped.value().data.size() == plain.value().data.size());
+
+        // Alpha may only ever rise where the warp found a lens the plain
+        // blend did not use; it may never fall.
+        std::size_t darker = 0;
+        float worst = 0.0f;
+        const std::vector<float>& a = plain.value().data;
+        const std::vector<float>& b = warped.value().data;
+        for (std::size_t i = 3; i < a.size(); i += 4) {
+            const float drop = a[i] - b[i];
+            if (drop > 1e-5f) {
+                ++darker;
+                worst = std::max(worst, drop);
+            }
+        }
+        INFO("warp (" << d.first << ", " << d.second << "): " << darker << " pixels lost coverage, worst by "
+                      << worst);
+        CHECK(darker == 0u);
+    }
+}
+
 TEST_CASE("osvWarpSample wraps longitude, and is zero outside the grid's latitude span", "[render][parallax]") {
     // A 4 x 3 grid whose dLon value equals its column index: continuity
     // across the +/-180 meridian is then visible as the interpolation between
