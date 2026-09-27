@@ -23,7 +23,7 @@ transfer               ->  PQ / HLG: the Transfer Function (HDR) style (see belo
 
 ## D-Log M curves
 
-DJI publishes no formula for D-Log M. Three analytic 7-parameter curves of the
+DJI publishes no formula for D-Log M. Four analytic 7-parameter curves of the
 form
 
 ```
@@ -39,10 +39,40 @@ branches so the curve is continuous:
 | `kDlogMOsmo360` (**default**) | `osmo360` | least-squares fit to the 33 neutral-axis samples of DJI's own **Osmo 360** D-Log M to Rec.709 LUT (`scripts/fit_dlogm.py --from-cube`) | 0.180 | 3.765 |
 | `kDlogMDjiRefit` | `dji` | least-squares fit to 64 neutral-axis measurements of a Pocket-3-era D-Log M to HLG rendering | 0.180 | 3.429 |
 | `kDlogMPocket3` | `pocket3` | public Pocket 3 fit constants (Thatcher Freeman) | 0.180 | 2.47 |
+| `kDlogMAvata360` | `avata360` | fit to DJI Studio's export of one **Avata 360** D-Log M clip (no DJI LUT exists; see below) | 0.180 | 1.415 |
 
-All three pin 18 % grey: code 0.400 -> scene-linear 0.180 -> HLG 0.380
+All four pin 18 % grey: code 0.400 -> scene-linear 0.180 -> HLG 0.380
 (BT.2408). The toe below code ~0.24 is crushed 8-bit data in DJI's LUTs and is
 weighted low in every fit.
+
+### The Avata 360 curve
+
+DJI publishes no D-Log M LUT for the Avata 360, and DJI Studio renders Avata
+D-Log M footage far from `kDlogMOsmo360`. `kDlogMAvata360` and
+`kNativeToRec2020_Avata360` were fitted together to one Avata 360 D-Log M
+clip against DJI Studio's export of it, with a Normal clip and its export as
+the noise floor. The fit models DJI's Avata rendering as the BT.709 OETF of
+scene light, with its own exposure (-0.20 stops) kept out of the curve.
+Held-out error, median 8-bit display levels (R / G / B):
+
+| | p50 | p90 |
+|---|---|---|
+| Normal control (the floor) | 0.70 / 0.38 / 0.53 | 1.75 / 0.99 / 1.36 |
+| `osmo360` curve and matrix | 3.90 / 3.71 / 4.19 | 10.42 / 10.04 / 10.25 |
+| `avata360` curve and matrix | 0.57 / 0.50 / 0.60 | 1.69 / 1.45 / 1.72 |
+
+The same method run on an Osmo 360 clip lands within 0.045 stops of
+`kDlogMOsmo360` from code 0.15 to 0.50, and 0.22 stops dark at code 0.8.
+
+Limits: one hovering clip in one white room. The neutral samples span codes
+0.125 to 0.785, so the toe and the highlights are extrapolated (code 1.0 ->
+1.415, against 3.765 for `osmo360`), and saturated colours are weakly
+constrained: the matrix's implied red primary lies outside the spectral
+locus. It is selectable, never the default, and the Rec.709 look is still
+the Osmo 360 one. Details in the comment on `kDlogMAvata360`.
+
+`StreamMeta.color_mode` is at 4.1 on the Osmo 360 but at 2.4.1 on the Avata
+360, whose field 4 is empty; `DjmdDecoder` reads the Avata's from 2.4.1.
 
 ### Why the default changed to `kDlogMOsmo360`
 

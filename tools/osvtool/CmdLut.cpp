@@ -4,7 +4,7 @@
 // `osvtool lut`: bake the D-Log M -> HLG / PQ / Rec.709 pipeline into a .cube
 // 3D LUT for NLEs that cannot load OpenOSV directly.
 //
-//   osvtool lut [--fit osmo360|dji|pocket3] [--out-transfer pq|hlg|709] [--size 65]
+//   osvtool lut [--fit osmo360|avata360|dji|pocket3] [--out-transfer pq|hlg|709] [--size 65]
 //               [--exposure 0] [--title "..."] [--input dlogm|hlg|709]
 //               [--look dji|standard] [--hdr-peak 1000|600|400|203]
 //               [--tone aces-bright|aces-detailed|bt2408-natural|bt2408-punchy|bt2408-neutral]
@@ -49,7 +49,7 @@ int runLut(const LutOptions& opt) {
     // --- validate the enum-like strings ------------------------------------
     DlogMFit fit = kDefaultDlogMFit;
     if (!parseDlogMFit(opt.fit, fit)) {
-        std::fprintf(stderr, "error: unknown --fit '%s' (expected osmo360, dji or pocket3)\n",
+        std::fprintf(stderr, "error: unknown --fit '%s' (expected osmo360, avata360, dji or pocket3)\n",
                      osv::log::safe(opt.fit).c_str());
         return kExitUsage;
     }
@@ -206,6 +206,7 @@ void registerLutCommand(CLI::App& app, CommandContext& ctx) {
     // (a community colour-chart fit) otherwise looks like the obvious pick.
     sub->add_option("--fit", opt->fit,
                     "D-Log M curve: osmo360 (default; matches DJI's own D-Log M LUT, Pocket 3 included), "
+                    "avata360 (fitted to DJI Studio exports; DJI publishes no Avata 360 LUT), "
                     "dji or pocket3 (legacy community fit, shifts hues ~10 deg)")
         ->capture_default_str();
     sub->add_option("--out-transfer", opt->outTransfer, "Output encoding: pq (default), hlg, 709, linear, dlogm")

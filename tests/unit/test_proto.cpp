@@ -910,6 +910,92 @@ TEST_CASE("Quaternion decoding zero-fills missing components", "[meta][proto]") 
     REQUIRE(q.toQuatdXYZW().w == 0.25);
 }
 
+TEST_CASE("The Avata 360 colour mode is read from StreamMeta 2.4 and not from 4", "[meta][proto]") {
+    // Layout of the three Avata 360 clips this was checked on (two D-Log M,
+    // one Normal): StreamMeta field 2 is a camera sub-message whose field 4
+    // wraps the colour mode, and StreamMeta field 4 - the Osmo 360's colour
+    // mode - is an empty message.  Read the Osmo way, every Avata clip is
+    // Normal.  `colorWrapper` is StreamMeta 2.4's payload, or null to leave
+    // field 2.4 out.  `streamFirst` puts StreamMeta ahead of ClipMeta.
+    const auto avataSample = [](const char* proto, const Pb* colorWrapper, bool streamFirst = false) {
+        Pb header;
+        header.str(1, proto).str(10, "DJI Avata360");
+        Pb clip;
+        clip.msg(1, header);
+        Pb camera;
+        camera.msg(1, Pb().vint(2, 1).str(4, "DJI FCA188"));
+        camera.msg(3, Pb().str(1, "SN"));
+        if (colorWrapper != nullptr) {
+            camera.msg(4, *colorWrapper);
+        }
+        camera.msg(5, Pb());
+        Pb stream;
+        stream.msg(1, Pb().str(3, "video"));
+        stream.msg(2, camera);
+        stream.msg(3, Pb().vint(1, 3840).vint(2, 3840).vint(5, 10));
+        stream.msg(4, Pb());  // empty on every Avata 360 sample seen
+        Pb product;
+        if (streamFirst) {
+            product.msg(2, stream).msg(1, clip);
+        } else {
+            product.msg(1, clip).msg(2, stream);
+        }
+        return product;
+    };
+    const auto decodeStream = [](const Pb& sample, std::vector<std::string>* warnings = nullptr) {
+        const Result<ProductMeta> decoded = DjmdDecoder::decode(sample.span());
+        REQUIRE(decoded.ok());
+        REQUIRE(decoded.value().stream.has_value());
+        if (warnings != nullptr) {
+            *warnings = decoded.value().warnings;
+        }
+        return *decoded.value().stream;
+    };
+    const Pb dlogm = Pb().vint(1, 19);
+    const Pb empty;
+
+    SECTION("D-Log M") {
+        const StreamMeta s = decodeStream(avataSample("dvtm_AVATA360.proto", &dlogm));
+        REQUIRE(s.colorMode == ColorMode::DLogM);
+        REQUIRE(s.present.test(4));
+        // The rest of StreamMeta still decodes the usual way.
+        REQUIRE(s.video.width == 3840);
+        REQUIRE(s.name == "video");
+    }
+    SECTION("D-Log M with StreamMeta ahead of ClipMeta") {
+        const StreamMeta s = decodeStream(avataSample("dvtm_AVATA360.proto", &dlogm, true));
+        REQUIRE(s.colorMode == ColorMode::DLogM);
+        REQUIRE(s.present.test(4));
+    }
+    SECTION("An empty 2.4 is proto3's unwritten 0, Normal") {
+        const StreamMeta s = decodeStream(avataSample("dvtm_AVATA360.proto", &empty));
+        REQUIRE(s.colorMode == ColorMode::Normal);
+        REQUIRE(s.present.test(4));
+    }
+    SECTION("No 2.4 is not recorded, never Normal") {
+        std::vector<std::string> warnings;
+        const StreamMeta s = decodeStream(avataSample("dvtm_AVATA360.proto", nullptr), &warnings);
+        REQUIRE(s.colorMode == ColorMode::Unknown);
+        REQUIRE_FALSE(s.present.test(4));
+        REQUIRE_FALSE(warnings.empty());
+    }
+    SECTION("A mode no Avata 360 sample has shown is left unknown") {
+        const Pb hlg = Pb().vint(1, 9);
+        std::vector<std::string> warnings;
+        const StreamMeta s = decodeStream(avataSample("dvtm_AVATA360.proto", &hlg), &warnings);
+        REQUIRE(s.colorMode == ColorMode::Unknown);
+        REQUIRE_FALSE(s.present.test(4));
+        REQUIRE_FALSE(warnings.empty());
+    }
+    SECTION("Any other proto keeps the Osmo 360 reading of field 4") {
+        // Same bytes, Osmo proto name: 2.4 is ignored and the empty field 4
+        // reads as Normal, exactly as before.
+        const StreamMeta s = decodeStream(avataSample("dvtm_oq101.proto", &dlogm));
+        REQUIRE(s.colorMode == ColorMode::Normal);
+        REQUIRE(s.present.test(4));
+    }
+}
+
 TEST_CASE("Enum names are stable and total", "[meta]") {
     REQUIRE(std::string(colorModeName(ColorMode::DLogM)) == "DLogM");
     REQUIRE(std::string(colorModeName(static_cast<ColorMode>(1234))) == "Unknown");

@@ -13,6 +13,7 @@
 #include <cmath>
 #include <format>
 #include <optional>
+#include <string_view>
 
 namespace osv::meta {
 
@@ -194,6 +195,63 @@ void decodeClipHeader(ByteSpan body, ClipHeader& out, std::vector<std::string>* 
         default: noteUnknown("ClipMeta.header", f); break;
         }
     });
+}
+
+// -----------------------------------------------------------------------------
+//  DJI Avata 360
+// -----------------------------------------------------------------------------
+
+/// ClipMetaHeader.proto_file_name of the DJI Avata 360.
+constexpr std::string_view kAvata360Proto = "dvtm_AVATA360.proto";
+
+/// Re-read the colour mode of an Avata 360 StreamMeta.
+///
+/// The Avata 360 keeps its colour mode one level deeper than the Osmo 360:
+/// StreamMeta field 2 is a camera sub-message whose field 4 wraps the mode.
+/// StreamMeta field 4, the Osmo's colour mode, is an empty message on every
+/// Avata sample seen, so decodeStreamMeta reads it as Normal.  This replaces
+/// that reading.  Checked on three Avata 360 clips: two D-Log M (2.4.1 = 19)
+/// and one Normal (2.4 empty).  Only those two shapes are trusted; anything
+/// else leaves the mode Unknown, so the histogram auto-detect decides instead.
+void readAvata360ColorMode(ByteSpan streamBody, StreamMeta& s, std::vector<std::string>* warnings) {
+    // What decodeStreamMeta took from field 4 is not a colour mode here.
+    s.colorMode = ColorMode::Unknown;
+    s.present.reset(4);
+
+    // StreamMeta 2.4, proto3 last-occurrence-wins at both levels.  Other
+    // fields are skipped silently: decodeStreamMeta has already seen them.
+    std::optional<ProtoField> wrapper;
+    scanMessage(streamBody, "StreamMeta (Avata 360)", warnings, [&](const ProtoField& f) {
+        if (f.number != 2 || !expectMessage(f, "StreamMeta (Avata 360)", warnings)) {
+            return;
+        }
+        scanMessage(f.bytes, "StreamMeta.2 (Avata 360)", warnings, [&](const ProtoField& g) {
+            if (g.number == 4) {
+                wrapper = g;
+            }
+        });
+    });
+    if (!wrapper) {
+        addWarning(warnings, "Avata 360 colour mode not recorded (no StreamMeta 2.4)");
+        return;
+    }
+    if (!expectMessage(*wrapper, "StreamMeta.2.4 (Avata 360)", warnings)) {
+        return;
+    }
+    const std::optional<ProtoField> mode = wrappedField(wrapper->bytes, "StreamMeta.2.4 (Avata 360)", warnings);
+    if (mode && mode->wire != WireType::Varint) {
+        addWarning(warnings, std::format("Avata 360 colour mode has wire type {}", wireTypeName(mode->wire)));
+        return;
+    }
+    // An empty wrapper is proto3's unwritten default, Normal.
+    const std::int32_t code = mode ? mode->asI32() : 0;
+    if (code != static_cast<std::int32_t>(ColorMode::DLogM) && code != static_cast<std::int32_t>(ColorMode::Normal)) {
+        addWarning(warnings,
+                   std::format("Avata 360 colour mode {} has not been verified on a sample; left unknown", code));
+        return;
+    }
+    s.colorMode = static_cast<ColorMode>(code);
+    s.present.set(4);
 }
 
 }  // namespace
@@ -705,6 +763,9 @@ Result<ProductMeta> DjmdDecoder::decode(ByteSpan sample) {
     }
     ProductMeta product;
     std::size_t decoded = 0;
+    // The StreamMeta body, kept for the Avata 360 colour mode, which can only
+    // be read once the ClipMeta header has named the camera.
+    ByteSpan streamBody;
     const bool clean = scanMessage(sample, "ProductMeta", &product.warnings, [&](const ProtoField& f) {
         if (!expectMessage(f, "ProductMeta", &product.warnings)) {
             return;
@@ -724,6 +785,7 @@ Result<ProductMeta> DjmdDecoder::decode(ByteSpan sample) {
             auto stream = decodeStreamMeta(f.bytes, &product.warnings);
             if (stream.ok()) {
                 product.stream = std::move(stream).value();
+                streamBody = f.bytes;
                 ++decoded;
             } else {
                 addWarning(&product.warnings, stream.error().toString());
@@ -743,6 +805,10 @@ Result<ProductMeta> DjmdDecoder::decode(ByteSpan sample) {
         default: noteUnknown("ProductMeta", f); break;
         }
     });
+    // After the scan, so the order of ClipMeta and StreamMeta does not matter.
+    if (product.clip && product.stream && product.clip->header.protoFileName == kAvata360Proto) {
+        readAvata360ColorMode(streamBody, *product.stream, &product.warnings);
+    }
     if (decoded == 0) {
         // Nothing usable: report the scan failure if there was one, otherwise
         // the sample simply held no known message.
