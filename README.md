@@ -565,12 +565,39 @@ HDR video, export LUTs.
 # What's in this clip? (camera, mode, colour, calibration, gyro)
 osvtool probe CAM_XXXX.OSV --json probe.json
 
-# A reframed, horizon-levelled Rec.2100 PQ video, rendered on the GPU
-osvtool render CAM_XXXX.OSV --all --preset wide --stab horizon --color pq --device cuda --out out.mp4
+# The stitched 360 video, stitched exactly as Premiere stitches it
+osvtool render CAM_XXXX.OSV --all --mode equirect --size 3840x1920 --stab horizon --color 709 --out CAM_XXXX_360.mp4
+
+# A reframed, horizon-levelled Rec.2100 PQ video
+osvtool render CAM_XXXX.OSV --all --preset wide --stab horizon --color pq --out out.mp4
 
 # A D-Log M -> Rec.2100 PQ LUT for any editor
 osvtool lut --fit dji --out-transfer pq --size 65 dlogm_to_pq.cube
 ```
+
+A whole folder, in `cmd`:
+
+```bat
+for %f in (*.OSV) do cli\osvtool.exe render "%f" --all --mode equirect --size 3840x1920 --stab horizon --color 709 --out "%~nf_360.mp4"
+```
+
+* **Same engine as the plug-ins.** `render` runs the Premiere and Resolve
+  plug-ins' own clip engine: parallax correction, carved seam, sky seam fix,
+  lens shading, sun ghost removal, stabilisation. Anything you don't set
+  starts at the Source Settings defaults, and `--use-user-defaults` takes the
+  ones you saved in Premiere. It uses the GPU when there is one: NVDEC and
+  CUDA on NVIDIA, hardware decoding and OpenCL on AMD and Intel.
+* **Stabilisation.** `--stab off | horizon | full | smooth | smooth-horizon`.
+  `full` is DJI Studio's direction lock: the view keeps the first frame's
+  heading.
+* **Video** goes through the `ffmpeg` on your `PATH` (or `--ffmpeg`). Pick the
+  encoder for your GPU: `--codec hevc_nvenc` (NVIDIA, the default),
+  `hevc_amf` (AMD), `hevc_qsv` (Intel), `libx265` (any CPU).
+* **Not in the CLI yet:** animated reframes (a render uses one fixed angle)
+  and the 360 metadata tag. Run the output through Google's Spatial Media
+  Metadata Injector before uploading to YouTube.
+* `--engine classic` is the older research pipeline, with the
+  geometry-convention and blend options the plug-ins take from the clip.
 
 Exit codes: `0` ok, `1` usage error, `2` input error, `3` runtime error.
 

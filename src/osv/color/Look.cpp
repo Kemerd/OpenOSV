@@ -195,6 +195,14 @@ void setLook(OsvColorParams& params, Look look) noexcept {
         params.look = noLook();
         return;
     }
+    // The look is fitted to D-Log M scene light (its shaper IS the D-Log M
+    // curve), the same rule as the HDR tone styles: an HLG or Normal clip is
+    // already a display rendering of its own, and the look on top would
+    // grade it a second time.
+    if (params.inputEncoding != OSV_INPUT_DLOGM) {
+        params.look = noLook();
+        return;
+    }
     params.look = makeLookParams(look, static_cast<OutputTransfer>(t));
 }
 

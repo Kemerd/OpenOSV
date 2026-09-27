@@ -762,7 +762,9 @@ struct HevcStreamDecoder::Impl {
         }
         out.plane = {y, c1, c2};
         out.strideElems = {out.width, chromaRow, chromaRow};
-        out.bitDepth = 10;
+        // Widened by two bits above, so the samples are on the one scale the
+        // kernels read (and the colour block is built for).
+        out.bitDepth = kDecodedSampleBits;
         out.bitShift = 0;
         out.chromaInterleaved = interleavedChroma;
         out.owner = std::static_pointer_cast<void>(buffer);
@@ -785,7 +787,12 @@ struct HevcStreamDecoder::Impl {
             if (f->hw_frames_ctx && f->hw_frames_ctx->data) {
                 swFormat = reinterpret_cast<const AVHWFramesContext*>(f->hw_frames_ctx->data)->sw_format;
             }
-            if (format == AV_PIX_FMT_CUDA && keepOnDevice) {
+            // The kernels read 16-bit words, so only a P010 surface can stay
+            // on the device.  An 8-bit (NV12) surface - the .LRF proxy on
+            // NVDEC - is copied back and widened like any other 8-bit frame;
+            // read in place, every word would pair two neighbouring bytes.
+            const bool tenBit = (swFormat == AV_PIX_FMT_P010LE || swFormat == AV_PIX_FMT_P010BE);
+            if (format == AV_PIX_FMT_CUDA && keepOnDevice && tenBit) {
                 // Expose the CUDA device pointers; the AVFrame keeps the
                 // surface alive for as long as the caller holds `owner`.
                 std::shared_ptr<AVFrame> shared = ff::shareFrame(std::move(decoded));
@@ -795,9 +802,8 @@ struct HevcStreamDecoder::Impl {
                 ref.pitchBytes = static_cast<std::size_t>(std::max(0, shared->linesize[0]));
                 ref.width = static_cast<std::uint32_t>(std::max(0, shared->width));
                 ref.height = static_cast<std::uint32_t>(std::max(0, shared->height));
-                const bool tenBit = (swFormat == AV_PIX_FMT_P010LE || swFormat == AV_PIX_FMT_P010BE);
-                ref.bitDepth = tenBit ? 10 : 8;
-                ref.bitShift = tenBit ? 6 : 0;
+                ref.bitDepth = 10;
+                ref.bitShift = 6;
                 ref.deviceIndex = cudaDeviceIndex;
                 ref.owner = std::static_pointer_cast<void>(shared);
                 if (!ref.valid()) {

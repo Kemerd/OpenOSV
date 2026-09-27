@@ -608,6 +608,61 @@ TEST_CASE("passthrough output moves each code to the code of its light plus the 
     }
 }
 
+TEST_CASE("passthrough output applies Gain Match to each code through its light", "[lensshading][gain]") {
+    // The exposure match between the lenses used to be skipped on the D-Log M
+    // passthrough, so that output kept the step in brightness at the seam
+    // wherever the photometric field was not in force.  It is now applied on
+    // the code values: each code moves to the code of its light times the
+    // gain, the passthrough twin of the multiply every other output does.
+    for (const int encoding : {OSV_INPUT_DLOGM, OSV_INPUT_HLG, OSV_INPUT_REC709_NORMAL}) {
+        OsvColorParams cp = color::makeColorParams(color::kDefaultDlogMFit, color::OutputTransfer::Passthrough, 0.0f);
+        cp.inputEncoding = encoding;
+        for (const float code : {0.25f, 0.4f, 0.55f, 0.7f}) {
+            // A gain of exactly 1 leaves the code untouched, bit for bit.
+            CHECK(osvGainCode(&cp, code, 1.0f) == code);
+            for (const float gain : {0.8f, 0.95f, 1.07f, 1.3f}) {
+                const float out = osvGainCode(&cp, code, gain);
+                const float c3[3] = {code, code, code};
+                const float o3[3] = {out, out, out};
+                float lin[3];
+                float linOut[3];
+                osvCodeToLinear(&cp, c3, lin);
+                osvCodeToLinear(&cp, o3, linOut);
+                INFO("encoding " << encoding << ", code " << code << ", gain " << gain);
+                CHECK_THAT(linOut[1], Catch::Matchers::WithinAbs(static_cast<double>(lin[1] * gain),
+                                                                 2e-4 * std::max(1.0, static_cast<double>(lin[1]))));
+                // Brighter light is a higher code, dimmer a lower one.
+                CHECK((gain > 1.0f ? out > code : out < code));
+            }
+        }
+    }
+
+    // osvGainApply: the lens's own gain per channel, in whichever space the
+    // sample is in; lens 1 untouched when only lens 0 has a gain.
+    OsvRenderParams p{};
+    p.color = color::makeColorParams(color::kDefaultDlogMFit, color::OutputTransfer::Passthrough, 0.0f);
+    p.lens[0].gain[0] = 1.2f;
+    p.lens[0].gain[1] = 1.0f;
+    p.lens[0].gain[2] = 0.9f;
+    p.lens[1].gain[0] = p.lens[1].gain[1] = p.lens[1].gain[2] = 1.0f;
+    float code0[3] = {0.4f, 0.4f, 0.4f};
+    osvGainApply(&p, 0, 1, code0);
+    CHECK(code0[0] > 0.4f);
+    CHECK(code0[1] == 0.4f);
+    CHECK(code0[2] < 0.4f);
+    float code1[3] = {0.4f, 0.4f, 0.4f};
+    osvGainApply(&p, 1, 1, code1);
+    CHECK(code1[0] == 0.4f);
+    CHECK(code1[1] == 0.4f);
+    CHECK(code1[2] == 0.4f);
+    // Every other output multiplies the light, exactly as before.
+    float light[3] = {0.5f, 0.5f, 0.5f};
+    osvGainApply(&p, 0, 0, light);
+    CHECK(light[0] == 0.5f * 1.2f);
+    CHECK(light[1] == 0.5f);
+    CHECK(light[2] == 0.5f * 0.9f);
+}
+
 TEST_CASE("the parameter block keeps the 4 KB kernel budget with the shading block", "[lensshading]") {
     static_assert(sizeof(OsvRenderParams) <= 4096, "OsvRenderParams must stay within the 4 KB kernel budget");
     static_assert(sizeof(OsvShadeLens) == (3 + OSV_SHADE_RANK * (OSV_SHADE_THETA_N + OSV_SHADE_PHI_N)) * 4,

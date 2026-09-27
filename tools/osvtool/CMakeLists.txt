@@ -23,6 +23,48 @@ target_link_libraries(osvtool PRIVATE ${_osvtool_libs})
 target_sources(osvtool PRIVATE "${CMAKE_SOURCE_DIR}/plugins/common/UserDefaults.cpp")
 target_include_directories(osvtool PRIVATE "${CMAKE_SOURCE_DIR}/plugins/common")
 
+# -----------------------------------------------------------------------------
+#  render --engine plugin (the default): the plug-ins' own clip engine
+#
+#  Exactly the sources the OpenFX bundle compiles for its "OpenOSV Source"
+#  (plugins/ofx/CMakeLists.txt, "the importer's clip engine" and "the shared,
+#  SDK-free plug-in layer"), with OSV_CLIP_ENGINE_WITHOUT_PREMIERE so no Adobe
+#  header is ever included.  A render is then the frame Premiere and Resolve
+#  show for the same Source Settings, not a second implementation of it.
+# -----------------------------------------------------------------------------
+set(_osvtool_importer "${CMAKE_SOURCE_DIR}/plugins/importer")
+set(_osvtool_common   "${CMAKE_SOURCE_DIR}/plugins/common")
+target_sources(osvtool PRIVATE
+  "${_osvtool_importer}/ImporterInstance.cpp"
+  "${_osvtool_importer}/SteadyStage.cpp"
+  "${_osvtool_importer}/FlareStage.cpp"
+  "${_osvtool_importer}/ProtectorGuard.cpp"
+  "${_osvtool_importer}/ImporterAudio.cpp"
+  "${_osvtool_importer}/ImporterGpuFrame.cpp"
+  # No direct GPU path outside Premiere (the Open 360 Reframe effect's).
+  "${_osvtool_importer}/EngineNoDirect.cpp"
+  "${_osvtool_common}/HostContext.cpp"
+  "${_osvtool_common}/PixelCopy.cpp")
+if(WIN32)
+  target_sources(osvtool PRIVATE "${_osvtool_common}/PluginLog.cpp")
+else()
+  target_sources(osvtool PRIVATE "${_osvtool_common}/PluginLogPosix.cpp")
+endif()
+target_include_directories(osvtool PRIVATE "${_osvtool_importer}")
+target_compile_definitions(osvtool PRIVATE OSV_CLIP_ENGINE_WITHOUT_PREMIERE=1)
+if(TARGET osv_ffmpeg)
+  target_link_libraries(osvtool PRIVATE osv_ffmpeg)  # the clip engine decodes its own audio track
+endif()
+if(WIN32 AND OSV_ENABLE_CUDA)
+  # The clip engine drives NVDEC through the CUDA DRIVER API.  nvcuda.dll
+  # comes with NVIDIA's display driver, so it is DELAY-loaded: osvtool must
+  # still start on a machine with an AMD or Intel GPU and no NVIDIA driver,
+  # where the engine never reaches a driver call (it asks the runtime for a
+  # device first, as the plug-ins do) and renders with OpenCL or the CPU.
+  target_link_libraries(osvtool PRIVATE CUDA::cuda_driver delayimp)
+  target_link_options(osvtool PRIVATE "/DELAYLOAD:nvcuda.dll")
+endif()
+
 set_target_properties(osvtool PROPERTIES FOLDER "tools")
 
 # Copy runtime DLLs (FFmpeg etc.) next to the executable after each build.

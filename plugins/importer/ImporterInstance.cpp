@@ -601,6 +601,25 @@ Status ImporterInstance::parseOnce() {
 
     m_parsed = true;
 
+    // ---- an SDR recording starts SDR ------------------------------------------
+    // The starting settings (the user's saved defaults, else the built-in
+    // ones) say PQ, which is right for D-Log M.  A Normal-mode recording is an
+    // SDR picture already: made PQ it would only be re-encoded as HDR, and on
+    // a Rec.709 timeline Premiere would then tone map it back down.  So while
+    // the instance still runs on those starting settings, an SDR clip gets
+    // Rec.709 output instead.  A clip with stored settings is handed them at
+    // imGetInfo8, next, and they replace this exactly as they replace the
+    // seed; a NEW clip keeps it, and its Source Settings show Rec.709.  PQ
+    // and HLG stay one click away for anybody who wants SDR in an HDR master.
+    if (!m_settingsPublishedFromHost && !m_colorBuilt &&
+        inputEncodingFor(m_format.colorMode) == color::InputEncoding::Rec709Normal &&
+        (m_prefs.color() == PrefsColorOutput::PQ || m_prefs.color() == PrefsColorOutput::HLG)) {
+        PluginLog::info("colour: '{}' was recorded in SDR (Normal colour mode): unless it has stored settings, it "
+                        "starts with Rec.709 output instead of {}, so its picture is not re-encoded as HDR",
+                        m_path.filename().string(), color::outputTransferName(toOutputTransfer(m_prefs.color())));
+        m_prefs.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::Rec709);
+    }
+
     // ---- one line per clip, so colour decisions are answerable from a log --
     //
     // This is the line to look for when footage previews wrong.  It states the
@@ -1254,6 +1273,11 @@ PrefsBlob ImporterInstance::prefs() const {
 
 PrefsBlob ImporterInstance::prefsLocked() const noexcept { return m_prefs; }
 
+OsvColorParams ImporterInstance::colorParams() const {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    return m_color;
+}
+
 // [WP-SETTINGS]
 void ImporterInstance::publishSettingsLocked(bool fromHost) noexcept {
     // The engine's own instance only ever APPLIES published settings;
@@ -1315,15 +1339,17 @@ AudioDecoder* ImporterInstance::audioLocked() { return audioImpl(); }
 
 void ImporterInstance::rebuildColor() {
     const color::InputEncoding input = inputEncodingFor(m_format.colorMode);
-    // The camera always writes narrow-range YCbCr; bit depth comes from the
-    // stream (10 for the Osmo 360, 8 for the LRF proxy).
+    // The camera always writes narrow-range YCbCr.  The expansion is built
+    // for the DECODED sample scale, not the stream's coded depth: the decoder
+    // widens the LRF proxy's 8-bit samples to 10 bits, and an expansion built
+    // for 8 turned the whole proxy magenta (video::kDecodedSampleBits).
     // The look is passed for every output; makeColorParams applies it only to
     // Rec.709 (the one output with a fitted look) and ignores it otherwise.
     // [WP-HDRPEAK] Likewise the HDR peak, which only the PQ output uses, and
     // [WP-HDRTONE] the transfer function, which only D-Log M to PQ / HLG uses.
     m_color = color::makeColorParams(toDlogMFit(m_prefs.fit()), toOutputTransfer(m_prefs.color()),
                                      m_prefs.exposureStops, input, true,
-                                     m_format.bitDepth ? m_format.bitDepth : 10u, nullptr, color::kBt2408SceneScale,
+                                     video::kDecodedSampleBits, nullptr, color::kBt2408SceneScale,
                                      toLook(m_prefs.lookChoice()), m_prefs.hdrPeakNits(),
                                      toHdrTone(m_prefs.hdrToneChoice()));
     m_colorBuilt = true;
@@ -2350,7 +2376,7 @@ Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_
         // into a PQ or HLG working space gets the style chosen for HDR.
         color = color::makeColorParams(toDlogMFit(m_prefs.fit()), static_cast<color::OutputTransfer>(outputTransfer),
                                        m_prefs.exposureStops, inputEncodingFor(m_format.colorMode), true,
-                                       m_format.bitDepth ? m_format.bitDepth : 10u, nullptr,
+                                       video::kDecodedSampleBits, nullptr,
                                        color::kBt2408SceneScale, toLook(m_prefs.lookChoice()),
                                        m_prefs.hdrPeakNits(), toHdrTone(m_prefs.hdrToneChoice()));
     }
@@ -2538,7 +2564,7 @@ OsvColorParams ImporterInstance::colorForTransfer(int outputTransfer) const {
     // PQ or HLG one the transfer function the user chose.
     return color::makeColorParams(toDlogMFit(m_prefs.fit()), static_cast<color::OutputTransfer>(outputTransfer),
                                   m_prefs.exposureStops, inputEncodingFor(m_format.colorMode), true,
-                                  m_format.bitDepth ? m_format.bitDepth : 10u, nullptr, color::kBt2408SceneScale,
+                                  video::kDecodedSampleBits, nullptr, color::kBt2408SceneScale,
                                   toLook(m_prefs.lookChoice()), m_prefs.hdrPeakNits(),
                                   toHdrTone(m_prefs.hdrToneChoice()));
 }
@@ -2582,6 +2608,14 @@ Result<render::RenderJob> ImporterInstance::buildEquirectJob(std::uint32_t index
     outcome = applyAnalyses(index, pair, draft, purpose, pool, builder);
 
     builder.stabilization(stabilizationFor(index));
+
+    // ---- a view, when one was asked for (osvtool's reframe) ---------------
+    // Straight from the fisheyes, with everything above - analyses,
+    // stabilisation, colour - exactly as the equirect gets it.
+    if (geometry.view) {
+        builder.camera(*geometry.view);
+        return builder.build(pair);
+    }
 
     // ---- equirect output ---------------------------------------------------
     // The renderer takes any output size, so a request for 4K or 2K renders

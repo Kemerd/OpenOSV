@@ -120,8 +120,8 @@ END
 //  VERSIONINFO
 // ---------------------------------------------------------------------------
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,2,1,0
- PRODUCTVERSION 0,2,1,0
+ FILEVERSION 0,2,2,0
+ PRODUCTVERSION 0,2,2,0
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -138,12 +138,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "The OpenOSV Contributors"
             VALUE "FileDescription",  "OpenOSV importer for DJI Osmo 360 .OSV clips"
-            VALUE "FileVersion",      "0.2.1.0"
+            VALUE "FileVersion",      "0.2.2.0"
             VALUE "InternalName",     "OpenOSVImporter"
             VALUE "LegalCopyright",   "Copyright (C) 2026 The OpenOSV Contributors. Apache-2.0."
             VALUE "OriginalFilename", "OpenOSVImporter.prm"
             VALUE "ProductName",      "OpenOSV"
-            VALUE "ProductVersion",   "0.2.1.0"
+            VALUE "ProductVersion",   "0.2.2.0"
         END
     END
     BLOCK "VarFileInfo"

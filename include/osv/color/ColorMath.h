@@ -994,7 +994,9 @@ OSV_HD void osvCodeToLinear(OSV_PRIVATE const OsvColorParams* params, OSV_PRIVAT
  *  - PQ:      * sceneScale, workingToOutput, HLG OOTF (peakNits, ootfGamma on
  *             BT.2020 luminance), PQ inverse EOTF per channel, then
  *             [WP-HDRPEAK] osvHdrPeakRolloff per channel when hdrPeakNits > 0.
- *  - Rec709:  with look.id == OSV_LOOK_DJI, osvLookApply on the working
+ *  - Rec709:  a Normal (SDR) input first: workingToOutput and the BT.709
+ *             OETF it was decoded with, so SDR comes out as recorded.  Then
+ *             with look.id == OSV_LOOK_DJI, osvLookApply on the working
  *             value (the DJI Studio look, Look.h).  Otherwise the standard
  *             rendering: * sceneScale, workingToOutput (2020 -> 709) in
  *             linear light, HLG OETF - the HLG signal is the SDR picture
@@ -1024,6 +1026,22 @@ OSV_HD void osvLinearToOutput(OSV_PRIVATE const OsvColorParams* params, OSV_PRIV
     if (params->transfer == OSV_TRANSFER_LINEAR) {
         /* Raw scene-linear in the output primaries; nothing else applied. */
         osvMat3Apply(&params->workingToOutput, working[0], working[1], working[2], out);
+        return;
+    }
+
+    /* SDR in, SDR out.  A Normal (SDR) recording is already a Rec.709
+     * display rendering, so on the Rec.709 output it is encoded back with the
+     * very curve it was decoded with: its picture comes out as recorded,
+     * white at 100 %, changed only by the stitch (gains, shading, exposure).
+     * The HLG-on-SDR rendering below places HDR scene light (diffuse white at
+     * 75 %) and would dim and flatten it, and a look fitted to D-Log M would
+     * grade it a second time - so this runs before either, whatever the
+     * look block says. */
+    if (params->transfer == OSV_TRANSFER_REC709 && params->inputEncoding == OSV_INPUT_REC709_NORMAL) {
+        osvMat3Apply(&params->workingToOutput, working[0], working[1], working[2], tmp);
+        for (i = 0; i < 3; ++i) {
+            out[i] = osvSaturatef(osvRec709Oetf(fmaxf(tmp[i], 0.0f)));
+        }
         return;
     }
 

@@ -22,6 +22,20 @@
 
 namespace osv::video {
 
+/// The sample scale of EVERY decoded frame the render kernels read.
+///
+/// 10-bit streams arrive as they are, P010 words are brought down by
+/// `bitShift`, and 8-bit streams (the .LRF proxy's H.264) are widened by two
+/// bits in the decoder.  So whatever the stream's coded depth, the kernels
+/// always see samples on this scale.
+///
+/// The colour block's YCbCr expansion (color::makeColorParams' `bitDepth`)
+/// must therefore be built for THIS depth, never for the stream's coded depth
+/// (meta::FormatInfo::bitDepth).  Built for 8 bits, an 8-bit proxy reads four
+/// times too bright, and its neutral chroma (512 on this scale) lands far
+/// above 128, which turns every pixel magenta.
+inline constexpr std::uint8_t kDecodedSampleBits = 10;
+
 struct PlanarFrame16 {
     std::uint32_t width = 0;                  ///< Luma width in pixels.
     std::uint32_t height = 0;                 ///< Luma height in pixels.

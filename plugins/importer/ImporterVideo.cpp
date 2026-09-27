@@ -585,19 +585,23 @@ csSDK_int32 handleGetInfo8(imStdParms* stdParms, imFileAccessRec8* fileAccess, i
 
     // ---- the Source Settings effect ----------------------------------------
     // This string is the ENTIRE binding between the importer and
-    // OpenOSVSourceSettings.aex: Premiere looks for an installed effect whose
-    // PiPL match name is byte-identical to it and attaches that effect to the
-    // master clip, which is what puts the stitch options in the Effect
-    // Controls panel instead of behind the modal dialog.  There is no
-    // handshake and no diagnostic on a mismatch, so it comes from the same
-    // header the effect's PiPL is generated from (plugins/common/
-    // SourceSettingsIdentity.h) and a test compares the two.
+    // OpenOSVSourceSettings.aex: Premiere looks for the installed effect of
+    // this name and attaches it to the master clip, which is what puts the
+    // stitch options in the Effect Controls panel instead of behind the modal
+    // dialog.  There is no handshake and no diagnostic on a mismatch, so it
+    // comes from the same header the effect's PiPL is generated from
+    // (plugins/common/SourceSettingsIdentity.h) and a test compares the two.
+    //
+    // It is the HOST's name, "AE." + the PiPL match name.  The bare PiPL name
+    // also attaches the effect, but Premiere then never finds it on the clip
+    // again and adds one more undeletable copy every time it re-checks the
+    // master clip (OSV_SOURCE_SETTINGS_HOST_MATCH_NAME explains).
     //
     // The modal dialog (imGetPrefs8) is deliberately left working alongside
     // it: right-click > Source Settings is muscle memory for a lot of users,
     // and a machine where the .aex failed to install still needs a way to
     // reach the options.  Both paths write the same PrefsBlob.
-    copyUtf16(info->sourceSettingsMatchName, 256, kSourceSettingsMatchNameW);
+    copyUtf16(info->sourceSettingsMatchName, 256, kSourceSettingsHostMatchNameW);
 
     PluginLog::info("imGetInfo8: {} x {} equirect, {} frames, {} ticks/frame, audio {} ch", geometry.width,
                     geometry.height, instance->frameCount(), static_cast<long long>(vid.frameRate),

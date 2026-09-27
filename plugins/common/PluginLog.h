@@ -54,6 +54,18 @@ public:
     /// Write one already formatted line.
     static void write(Level level, std::string_view text) noexcept;
 
+    /// A second destination for every line that passes the level: called
+    /// with the level and the bare message (no timestamp, pid or newline),
+    /// after the file write, outside the file lock, from whichever thread
+    /// logged.  It must not throw and must not log through PluginLog.
+    ///
+    /// For a host with a console of its own: osvtool, which runs the clip
+    /// engine without Premiere, prints the engine's lines with its own logger
+    /// and never calls init(), so nothing lands in the plug-ins' log files.
+    /// Null (the default) switches it off.
+    using Mirror = void (*)(Level level, std::string_view text) noexcept;
+    static void setMirror(Mirror mirror) noexcept;
+
     /// Write a message only the first time `key` is seen.  Returns true when
     /// the message was written.
     static bool once(std::string_view key, Level level, std::string_view text) noexcept;

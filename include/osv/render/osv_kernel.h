@@ -1606,6 +1606,57 @@ OSV_HD void osvShadeApply(OSV_PRIVATE const OsvRenderParams* p, int i, float amo
 /* ---- [/WP-VIGNETTE] ------------------------------------------------------ */
 
 /* ------------------------------------------------------------------------- */
+/*  The lenses' exposure match (Gain Match)                                   */
+/* ------------------------------------------------------------------------- */
+
+/* Passthrough: the code value of `gain` times the light of `code`, in the
+ * input encoding - the exact inverse of osvCodeToLinear per channel, the way
+ * osvShadeCodeAdd moves a code by an amount of light.  Light below the
+ * curve's code-0 level stays at code 0.  A gain of exactly 1 returns the code
+ * untouched, bit for bit. */
+OSV_HD float osvGainCode(OSV_PRIVATE const OsvColorParams* color, float code, float gain) {
+    if (gain == 1.0f) {
+        return code;
+    }
+    if (color == 0 || color->enabled == 0) {
+        return code * gain; /* identity decode: code is light */
+    }
+    if (color->inputEncoding == OSV_INPUT_HLG) {
+        const float scale = (color->sceneScale > 1e-12f) ? color->sceneScale : 1.0f;
+        const float lin = osvHlgInverseOetf(code) / scale;
+        return osvHlgOetf(fmaxf(lin * gain, 0.0f) * scale);
+    }
+    if (color->inputEncoding == OSV_INPUT_REC709_NORMAL) {
+        return osvRec709Oetf(fmaxf(osvRec709InverseOetf(code) * gain, 0.0f));
+    }
+    /* D-Log M */
+    const float floorLin = osvDlogmToLinear(&color->curve, 0.0f);
+    const float lin = osvDlogmToLinear(&color->curve, code);
+    return osvDlogmToCode(&color->curve, fmaxf(lin * gain, floorLin));
+}
+
+/* Lens i's exposure-match gain on one decoded sample: a multiply in native
+ * linear light, or - for passthrough, where `val` holds code values - each
+ * code moved to the code of its light times the gain.  The passthrough used
+ * to skip the gain altogether, so a D-Log M passthrough frame kept the step
+ * in brightness between the lenses that Gain Match exists to remove wherever
+ * the photometric seam field was not in force. */
+OSV_HD void osvGainApply(OSV_PRIVATE const OsvRenderParams* p, int i, int passthrough, OSV_PRIVATE float* val) {
+    if (i < 0 || i > 1) {
+        return;
+    }
+    if (passthrough) {
+        for (int c = 0; c < 3; ++c) {
+            val[c] = osvGainCode(&p->color, val[c], p->lens[i].gain[c]);
+        }
+        return;
+    }
+    val[0] *= p->lens[i].gain[0];
+    val[1] *= p->lens[i].gain[1];
+    val[2] *= p->lens[i].gain[2];
+}
+
+/* ------------------------------------------------------------------------- */
 /*  [WP-SEAMTOOLS] Two-band seam smoothing                                    */
 /* ------------------------------------------------------------------------- */
 /* The low band's build stages and its lookup, in front of the shader for the
@@ -1861,12 +1912,10 @@ OSV_HD void osvSeamLowShade(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE co
             osvFlareRemove(&p->flare[i], px, py, val);
         }
         osvShadeApply(p, i, shadeAmount, 0, val); /* [WP-VIGNETTE] */
-        val[0] *= p->lens[i].gain[0];
-        val[1] *= p->lens[i].gain[1];
-        val[2] *= p->lens[i].gain[2];
     } else {
         osvShadeApply(p, i, shadeAmount, 1, val); /* [WP-VIGNETTE] code values */
     }
+    osvGainApply(p, i, passthrough, val); /* the exposure match, in whichever space `val` holds */
     osvPhotoApplyGain(p, photoPx, i, passthrough, val);
 }
 /* ---- [/WP-SEAMTOOLS] ----------------------------------------------------- */
@@ -1874,6 +1923,74 @@ OSV_HD void osvSeamLowShade(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE co
 /* ------------------------------------------------------------------------- */
 /*  The shader                                                                */
 /* ------------------------------------------------------------------------- */
+
+/* Project the direction `dBody` into both lenses for the shader: the 1-D
+ * seam shift, then the 2-D parallax warp (warpLon / warpLat, both zero for
+ * none), then each lens's position, blend weight, angle from its axis,
+ * rim-limited photometric weight and shading amount, and finally the
+ * photometric weight pick.  Every array is written for both lenses; `photo`
+ * is the pixel's photometric state as osvPhotoBegin left it.  The shader calls
+ * it once per pixel, and a second time without the warp wherever a warp is in
+ * force (see osvShadePixelWSPL). */
+OSV_HD void osvProjectLensPair(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE const float* dBody, float seamDelta,
+                               float warpLon, float warpLat, OSV_PRIVATE OsvPhotoPixel* photo, OSV_PRIVATE float* w,
+                               OSV_PRIVATE float* px, OSV_PRIVATE float* py, OSV_PRIVATE int* projected,
+                               OSV_PRIVATE float* thetaL, OSV_PRIVATE float* shadeAmt) {
+    for (int i = 0; i < 2; ++i) {
+        w[i] = 0.0f;
+        px[i] = 0.0f;
+        py[i] = 0.0f;
+        projected[i] = 0;
+        thetaL[i] = 0.0f;
+        shadeAmt[i] = 0.0f;
+    }
+    for (int i = 0; i < 2; ++i) {
+        OSV_PRIVATE const OsvLens* L = &p->lens[i];
+        if (!L->enabled) {
+            continue;
+        }
+        float dl[3];
+        if (seamDelta != 0.0f) {
+            /* both lenses move symmetrically relative to their own axis */
+            osvShiftTowardAxis(L, dBody, seamDelta, dl);
+        } else {
+            dl[0] = dBody[0];
+            dl[1] = dBody[1];
+            dl[2] = dBody[2];
+        }
+        /* 2-D parallax warp, applied on top of the 1-D seam shift.
+         *
+         * Master (i == 1) moves by +(dLon, dLat), slave (i == 0) by the
+         * negation, so the two sampling directions separate by the full
+         * measured disparity and the content they fetch meets in the middle.
+         *
+         * The sign really does flip here, unlike the seam shift above.  The
+         * seam shift is expressed relative to EACH lens's own axis, and the
+         * two axes point in opposite directions, so one shared "toward the
+         * axis" angle is already an opposite move on the sphere.  The warp is
+         * expressed in one shared (lon, lat) frame, where opposite moves need
+         * opposite signs.  Mixing the two conventions turns the correction
+         * into a rigid shift of BOTH lenses the same way, which moves the
+         * picture without closing any disparity at all. */
+        if (warpLon != 0.0f || warpLat != 0.0f) {
+            const float sgn = (i == 1) ? 1.0f : -1.0f;
+            float tmp[3];
+            osvPolarDisplace(dl, sgn * warpLon, sgn * warpLat, tmp);
+            dl[0] = tmp[0];
+            dl[1] = tmp[1];
+            dl[2] = tmp[2];
+        }
+        float theta;
+        if (osvProjectLens(L, dl, &px[i], &py[i], &theta)) {
+            w[i] = osvLensWeight(L, theta, px[i], py[i]);
+            projected[i] = 1;
+            thetaL[i] = theta;
+            osvPhotoLensWeight(p, photo, i, theta, w[i]); /* [WP-PHOTO] rim-limited twin of w[i] */
+            shadeAmt[i] = osvShadeAmount(p, i, theta, px[i], py[i]); /* [WP-VIGNETTE] */
+        }
+    }
+    osvPhotoPickWeights(photo, w); /* [WP-PHOTO] rim-limited weights unless both vanish */
+}
 
 /* Compute output pixel (x, y).  `planes` holds the two lens frames, `seam`
  * the optional per-column seam shift table in degrees (may be 0 when
@@ -1929,6 +2046,9 @@ OSV_HD void osvShadePixelWSPL(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE 
     /* [WP-PHOTO] per-pixel rim and gain lookup (a no-op when photoEnabled == 0) */
     OsvPhotoPixel photoPx;
     osvPhotoBegin(p, photo, dBody, &photoPx);
+    /* The photometric state before any lens was projected, for the unwarped
+     * pass below. */
+    const OsvPhotoPixel photoStart = photoPx;
 
     /* Project into both lenses and compute their weights. */
     float w[2] = {0.0f, 0.0f};
@@ -1943,52 +2063,42 @@ OSV_HD void osvShadePixelWSPL(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE 
     float thetaL[2] = {0.0f, 0.0f};
     /* [WP-VIGNETTE] each lens's shading correction at its sample (0 = none). */
     float shadeAmt[2] = {0.0f, 0.0f};
-    for (int i = 0; i < 2; ++i) {
-        OSV_PRIVATE const OsvLens* L = &p->lens[i];
-        if (!L->enabled) {
-            continue;
-        }
-        float dl[3];
-        if (seamDelta != 0.0f) {
-            /* both lenses move symmetrically relative to their own axis */
-            osvShiftTowardAxis(L, dBody, seamDelta, dl);
-        } else {
-            dl[0] = dBody[0];
-            dl[1] = dBody[1];
-            dl[2] = dBody[2];
-        }
-        /* 2-D parallax warp, applied on top of the 1-D seam shift.
-         *
-         * Master (i == 1) moves by +(dLon, dLat), slave (i == 0) by the
-         * negation, so the two sampling directions separate by the full
-         * measured disparity and the content they fetch meets in the middle.
-         *
-         * The sign really does flip here, unlike the seam shift above.  The
-         * seam shift is expressed relative to EACH lens's own axis, and the
-         * two axes point in opposite directions, so one shared "toward the
-         * axis" angle is already an opposite move on the sphere.  The warp is
-         * expressed in one shared (lon, lat) frame, where opposite moves need
-         * opposite signs.  Mixing the two conventions turns the correction
-         * into a rigid shift of BOTH lenses the same way, which moves the
-         * picture without closing any disparity at all. */
-        if (warpLon != 0.0f || warpLat != 0.0f) {
-            const float sgn = (i == 1) ? 1.0f : -1.0f;
-            float tmp[3];
-            osvPolarDisplace(dl, sgn * warpLon, sgn * warpLat, tmp);
-            dl[0] = tmp[0];
-            dl[1] = tmp[1];
-            dl[2] = tmp[2];
-        }
-        float theta;
-        if (osvProjectLens(L, dl, &px[i], &py[i], &theta)) {
-            w[i] = osvLensWeight(L, theta, px[i], py[i]);
-            projected[i] = 1;
-            thetaL[i] = theta;
-            osvPhotoLensWeight(p, &photoPx, i, theta, w[i]); /* [WP-PHOTO] rim-limited twin of w[i] */
-            shadeAmt[i] = osvShadeAmount(p, i, theta, px[i], py[i]); /* [WP-VIGNETTE] */
+    osvProjectLensPair(p, dBody, seamDelta, warpLon, warpLat, &photoPx, w, px, py, projected, thetaL, shadeAmt);
+
+    /* ---- what the parallax warp may not change ----------------------------
+     * The warp closes a disparity by moving each lens's sample toward its own
+     * rim, which lowers both feather weights.  They still decide the MIX, but
+     * not how well the rig sees this direction: taken as the coverage, they
+     * made every warped seam partly transparent in proportion to the parallax
+     * it corrected (a camera set on the ground showed dark cones along the
+     * seam, one per row of the grid).  So wherever a warp is in force, the
+     * direction is projected once more without it, and its coverage is the
+     * least the alpha can be.  And where the warp pushed BOTH samples off
+     * their lenses, the direction renders unwarped rather than as a hole. */
+    float unwarpedCoverage = -1.0f;
+    if (warpLon != 0.0f || warpLat != 0.0f) {
+        OsvPhotoPixel photoPlain = photoStart;
+        float w0[2];
+        float px0[2];
+        float py0[2];
+        int projected0[2];
+        float thetaL0[2];
+        float shadeAmt0[2];
+        osvProjectLensPair(p, dBody, seamDelta, 0.0f, 0.0f, &photoPlain, w0, px0, py0, projected0, thetaL0,
+                           shadeAmt0);
+        unwarpedCoverage = p->blendEnabled ? (w0[0] + w0[1]) : fmaxf(w0[0], w0[1]);
+        if (w[0] + w[1] <= 1e-4f && w0[0] + w0[1] > 1e-4f) {
+            photoPx = photoPlain;
+            for (int i = 0; i < 2; ++i) {
+                w[i] = w0[i];
+                px[i] = px0[i];
+                py[i] = py0[i];
+                projected[i] = projected0[i];
+                thetaL[i] = thetaL0[i];
+                shadeAmt[i] = shadeAmt0[i];
+            }
         }
     }
-    osvPhotoPickWeights(&photoPx, w); /* [WP-PHOTO] rim-limited weights unless both vanish */
 
     if (!p->blendEnabled) {
         /* Nearest-lens selection: keep only the heavier weight. */
@@ -2052,8 +2162,9 @@ OSV_HD void osvShadePixelWSPL(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE 
      * A copy only - nothing below reads it unless smoothing is on. */
     const float wPre[2] = {w[0], w[1]};
 
-    /* [WP-SEAM] carved seam: re-weights the blend; alpha keeps the coverage. */
-    const float coverage = wsum;
+    /* [WP-SEAM] carved seam: re-weights the blend; alpha keeps the coverage
+     * (never less than the unwarped rays give this direction, see above). */
+    const float coverage = fmaxf(wsum, unwarpedCoverage);
     wsum = osvBlendSeamApply(p, blendSeam, dBody, thetaL, w, wsum);
 
     /* [WP-SEAMTOOLS] the low band's own (wide) weights, when this ray is one
@@ -2089,10 +2200,10 @@ OSV_HD void osvShadePixelWSPL(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE 
             }
             /* [/WP-FLARE] */
             osvShadeApply(p, i, shadeAmt[i], 0, val); /* [WP-VIGNETTE] native linear, before the gains */
-            val[0] *= p->lens[i].gain[0];
-            val[1] *= p->lens[i].gain[1];
-            val[2] *= p->lens[i].gain[2];
         }
+        /* The exposure match: in light, or on the code values of the
+         * passthrough - the one step that output used to skip. */
+        osvGainApply(p, i, passthrough, val);
         osvPhotoApplyGain(p, &photoPx, i, passthrough, val); /* [WP-PHOTO] half the lens ratio each way */
         acc[0] += val[0] * w[i];
         acc[1] += val[1] * w[i];
