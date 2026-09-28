@@ -29,6 +29,18 @@
       "name": "opencl",
       "platform": "!osx"
     },
+    {
+      "name": "imgui",
+      "features": [
+        "glfw-binding",
+        "opengl3-binding"
+      ],
+      "platform": "windows | osx"
+    },
+    {
+      "name": "glfw3",
+      "platform": "windows | osx"
+    },
     "catch2",
     "nlohmann-json",
     "cli11",

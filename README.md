@@ -468,6 +468,10 @@ in: **More info → Run anyway**. Either installer asks for admin rights once.
 
 `Uninstall.cmd`, in the same zip, takes it all back out.
 
+Both zips also carry **`cli\osvgui.exe`, OpenOSV Studio**: drop clips on it
+and batch-render them without an editor
+([below](#openosv-studio-the-batch-app)).
+
 **Needs** Windows 10/11 x64, and Premiere Pro 2022 or later (tested on 2026)
 or DaVinci Resolve, free or Studio (first run on 21).
 **GPU:** CUDA on NVIDIA GTX 16 / RTX 20 and newer (Turing, Ampere, Ada,
@@ -571,6 +575,40 @@ delivery. Three presets appear under **File > New > Sequence > OpenOSV**:
 
 All three are 59.94 fps exactly. 60 fps would drift a frame every thousand
 against the footage.
+
+## OpenOSV Studio: the batch app
+
+![OpenOSV Studio rendering a queue of Osmo 360 clips](img/osvgui.png)
+
+A small window in front of `osvtool`: drop clips or whole folders on it,
+pick the output, press **Start**. It renders the queue one clip at a time
+with the plug-ins' own engine. It's `cli\osvgui.exe` in either release zip,
+and it runs the `osvtool.exe` beside it (or the one on your `PATH`).
+
+1. **Queue clips.** Drag `.OSV` files or folders onto the window, or use
+   **Add files** / **Add folder**. Folders are searched all the way down;
+   `.LRF` proxies and empty files are skipped.
+2. **Pick the output.** A 360 equirect, tagged as 360 video for YouTube and
+   VR players, or a reframed flat view: a DJI preset or your own field of
+   view, with pan, tilt and roll. Then size, colour, stabilisation, sun ghost
+   removal, encoder and quality. Colour **Auto** turns D-Log M into HDR10
+   and keeps SDR clips SDR. **Use my Premiere defaults** takes colour,
+   stabilisation and sun ghosts from the Source Settings you saved there.
+3. **Check the command.** The **Command** box shows exactly what runs for
+   the next clip; **Whole folder** turns it into a loop you can script.
+   **Extra arguments** (under Advanced) go on the end of every command:
+   `--range 0-299` renders the first five seconds.
+4. **Start.** Every clip shows its progress and time left, the footer the
+   whole batch. **Pause after this clip** stops when the current one is done;
+   **Stop** ends it now and deletes the unfinished file. **Log** shows
+   osvtool's own output.
+
+Video needs FFmpeg, as below. The app finds it, links to a download when
+it's missing, and picks the fastest HEVC encoder that works on your machine
+(NVENC, AMF, Quick Sync, else x265). It remembers every setting and the
+window in `%APPDATA%\OpenOSV\osvgui.json` (macOS: `~/Library/Application
+Support/OpenOSV/osvgui.json`). The details, and which option each control
+sets: [`docs/STUDIO.md`](docs/STUDIO.md).
 
 ## The command-line tool
 

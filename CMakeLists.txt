@@ -102,6 +102,28 @@ find_package(nlohmann_json CONFIG REQUIRED)
 find_package(CLI11 CONFIG REQUIRED)
 find_package(tinyexr CONFIG REQUIRED)
 
+# OpenOSV Studio (tools/osvgui), the desktop app in front of osvtool, draws
+# with Dear ImGui on GLFW + OpenGL 3.  vcpkg.json asks for both on Windows
+# and macOS; the app is built by default when they are there and skipped,
+# with a note, when they are not (osvtool, the plug-ins and the tests do not
+# need them).
+find_package(imgui CONFIG QUIET)
+find_package(glfw3 CONFIG QUIET)
+find_package(OpenGL QUIET)
+if(TARGET imgui::imgui AND TARGET glfw AND TARGET OpenGL::GL)
+  set(_osv_gui_available ON)
+else()
+  set(_osv_gui_available OFF)
+endif()
+option(OSV_BUILD_GUI "Build OpenOSV Studio (osvgui), the desktop app for osvtool" ${_osv_gui_available})
+if(OSV_BUILD_GUI AND NOT _osv_gui_available)
+  message(STATUS "OpenOSV Studio: Dear ImGui (glfw + opengl3 bindings), GLFW or OpenGL not found; osvgui is not built")
+  set(OSV_BUILD_GUI OFF)
+endif()
+if(OSV_BUILD_GUI AND APPLE)
+  enable_language(OBJCXX)  # Platform_mac.mm: the AppKit open panels
+endif()
+
 # -----------------------------------------------------------------------------
 #  Version header generated from the project() version
 # -----------------------------------------------------------------------------
@@ -115,6 +137,8 @@ add_subdirectory(src)
 
 if(OSV_BUILD_TOOLS)
   add_subdirectory(tools/osvtool)
+  # osvgui_core (always, for the unit tests) and, with OSV_BUILD_GUI, osvgui.
+  add_subdirectory(tools/osvgui)
 endif()
 
 if(OSV_BUILD_TESTS)
@@ -149,6 +173,7 @@ if(APPLE)
 endif()
 message(STATUS "  Tests          : ${OSV_BUILD_TESTS}")
 message(STATUS "  Tools          : ${OSV_BUILD_TOOLS}")
+message(STATUS "  Studio (GUI)   : ${OSV_BUILD_GUI}")
 message(STATUS "  Sample clip    : ${OSV_SAMPLE_FILE}")
 message(STATUS "  Premiere plugs : ${OSV_BUILD_PREMIERE}")
 message(STATUS "  OpenFX plugs   : ${OSV_BUILD_OFX}")
