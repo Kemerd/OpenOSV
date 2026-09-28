@@ -43,5 +43,6 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx);
 void registerLutCommand(CLI::App& app, CommandContext& ctx);
 void registerSeamCommand(CLI::App& app, CommandContext& ctx);
 void registerSelfcheckCommand(CLI::App& app, CommandContext& ctx);
+void registerSphericalCommand(CLI::App& app, CommandContext& ctx);
 
 }  // namespace osvtool

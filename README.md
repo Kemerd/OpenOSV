@@ -589,6 +589,9 @@ osvtool render CAM_XXXX.OSV --all --preset wide --stab horizon --color pq --out 
 
 # A D-Log M -> Rec.2100 PQ LUT for any editor
 osvtool lut --fit dji --out-transfer pq --size 65 dlogm_to_pq.cube
+
+# Tag a Premiere or Resolve equirect export as 360 video
+osvtool spherical my_export_360.mp4
 ```
 
 A whole folder, in `cmd`:
@@ -609,9 +612,13 @@ for %f in (*.OSV) do cli\osvtool.exe render "%f" --all --mode equirect --size 38
 * **Video** goes through the `ffmpeg` on your `PATH` (or `--ffmpeg`). Pick the
   encoder for your GPU: `--codec hevc_nvenc` (NVIDIA, the default),
   `hevc_amf` (AMD), `hevc_qsv` (Intel), `libx265` (any CPU).
-* **Not in the CLI yet:** animated reframes (a render uses one fixed angle)
-  and the 360 metadata tag. Run the output through Google's Spatial Media
-  Metadata Injector before uploading to YouTube.
+* **360 metadata.** An `--mode equirect` `.mp4` / `.mov` comes out tagged as
+  360 video (Spherical Video V1 and V2), so YouTube, VR players and 360
+  editors open it as a sphere. No Spatial Media Metadata Injector needed.
+  `--no-spherical-metadata` leaves it untagged. `osvtool spherical file.mp4`
+  tags any equirect video, Premiere and Resolve exports included: in place,
+  or into `--out`.
+* **Not in the CLI yet:** animated reframes (a render uses one fixed angle).
 * `--engine classic` is the older research pipeline, with the
   geometry-convention and blend options the plug-ins take from the clip.
 
