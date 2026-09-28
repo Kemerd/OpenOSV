@@ -6,6 +6,8 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-28
+
 ### Added
 
 * **OpenOSV Studio (`osvgui`), a batch app for `osvtool`.** Drop `.OSV`
@@ -77,6 +79,9 @@ All notable changes to OpenOSV are documented here. The format follows
   [@arkanos](https://github.com/arkanos), who found the missing step and has
   the Resolve plug-ins working on a MacBook Pro M4 with macOS 26.6.1
   ([#2](https://github.com/Kemerd/OpenOSV/issues/2)).
+* **The README's command-line section is a how-to now:** setting up
+  `osvtool` and FFmpeg, recipes for a YouTube-ready 360 video, HDR, a
+  reframed view, a test run and a whole folder, and the options that matter.
 
 ## [0.2.2] - 2026-09-27
 

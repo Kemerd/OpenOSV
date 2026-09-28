@@ -1333,11 +1333,15 @@ cli\osvtool.exe works without Premiere: inspect a clip, render stills or
 HDR video, write LUTs. "cli\osvtool.exe --help" lists the commands.
 
     cli\osvtool.exe probe CAM_0001.OSV
+    cli\osvtool.exe render CAM_0001.OSV --all --mode equirect --size 3840x1920 --stab horizon --color 709 --out CAM_0001_360.mp4
+
+The second one is a whole clip as a 360 video, tagged for YouTube and VR.
 
 cli\osvgui.exe is OpenOSV Studio, the same renders without typing: drop
 .OSV files or whole folders on it, pick the output, press Start. It runs
 the osvtool.exe beside it, one clip after another. Video needs FFmpeg
-(https://ffmpeg.org/download.html); the app says so when it is missing.
+("winget install Gyan.FFmpeg", or https://ffmpeg.org/download.html); the
+app says so when it is missing.
 
 Both need the Microsoft Visual C++ 2015-2022 Redistributable (x64), which
 Premiere Pro installs.
@@ -1461,7 +1465,8 @@ cli\osvtool.exe works on its own: inspect a clip, render stills or HDR
 video, write LUTs, extract audio. "cli\osvtool.exe --help" lists the
 commands. cli\osvgui.exe is OpenOSV Studio, the same renders without
 typing: drop .OSV files or whole folders on it, pick the output, press
-Start. Video needs FFmpeg (https://ffmpeg.org/download.html).
+Start. Video needs FFmpeg ("winget install Gyan.FFmpeg", or
+https://ffmpeg.org/download.html).
 Both need the Microsoft Visual C++ 2015-2022 Redistributable (x64):
 https://aka.ms/vs/17/release/vc_redist.x64.exe
 The plug-ins themselves use the one DaVinci Resolve ships.

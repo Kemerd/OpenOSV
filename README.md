@@ -614,7 +614,8 @@ sets: [`docs/STUDIO.md`](docs/STUDIO.md).
 
 `osvtool` renders without an editor: 360 videos ready for YouTube, reframed
 flat videos, stills, LUTs. It runs the Premiere and Resolve plug-ins' own
-engine, so a render is the frame Premiere shows.
+engine, so a render is the frame Premiere shows. Rather click than type?
+[OpenOSV Studio](#openosv-studio-the-batch-app), above, runs the same renders.
 
 ### Set it up once
 
