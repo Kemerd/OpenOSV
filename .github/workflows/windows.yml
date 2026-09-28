@@ -7,6 +7,19 @@
 #                   [opencl] / [hwaccel] tests are excluded by the ctest preset)
 #    build-cpu    : CPU-only configuration to keep the no-GPU build honest
 #
+#  Both run on windows-2022, the Visual Studio 2022 toolset every local build
+#  uses (scripts/vsdev.cmd); windows-latest moved on to Visual Studio 2026.
+#
+#  vcpkg is cloned at exactly the manifest's builtin-baseline, as on macOS.
+#  The MSVC developer shell points VCPKG_ROOT at Visual Studio's own bundled
+#  vcpkg under "C:\Program Files": that copy is not at the baseline, and the
+#  ports built through msys2 (ffnvcodec, FFmpeg) fail on the space in its
+#  path.  The set-up step therefore points VCPKG_ROOT back at the workspace
+#  clone for every later step.
+#
+#  Built packages go to a GitHub Actions cache through vcpkg's "files" binary
+#  provider, so FFmpeg is compiled once, not on every run.
+#
 #  The sample clip is not in the repository.  When the OSV_SAMPLE_URL secret is
 #  set the clip is downloaded and the [sample] tests run; otherwise they SKIP.
 # =============================================================================
@@ -19,41 +32,65 @@ on:
   workflow_dispatch:
 
 env:
-  VCPKG_ROOT: ${{ github.workspace }}/vcpkg
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_BINARY_CACHE_DIR: ${{ github.workspace }}\.vcpkg-binary-cache
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}\\.vcpkg-binary-cache,readwrite"
 
 jobs:
   build-cuda:
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-
-      - name: Export GitHub Actions cache variables for vcpkg
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: MSVC developer shell
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
+      # -----------------------------------------------------------------------
+      #  vcpkg at exactly the manifest's builtin-baseline, in the workspace.
+      #  Runs after the developer shell so its VCPKG_ROOT is the one that wins.
+      # -----------------------------------------------------------------------
+      - name: Set up vcpkg at the manifest baseline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:GITHUB_WORKSPACE 'vcpkg'
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          git clone --quiet https://github.com/microsoft/vcpkg.git $root
+          if ($LASTEXITCODE -ne 0) { throw 'git clone of vcpkg failed' }
+          git -C $root checkout --quiet $baseline
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg has no commit $baseline" }
+          & (Join-Path $root 'bootstrap-vcpkg.bat') -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'bootstrap-vcpkg failed' }
+          New-Item -ItemType Directory -Force $env:VCPKG_BINARY_CACHE_DIR | Out-Null
+          "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE_DIR }}
+          key: vcpkg-bin-win2022-x64-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.job }}
+          restore-keys: |
+            vcpkg-bin-win2022-x64-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-bin-win2022-x64-
+
+      # A fingerprint of the cache before the install, so the save step below
+      # only uploads a new cache entry when vcpkg actually built something.
+      - name: Fingerprint the binary cache
+        shell: pwsh
+        run: |
+          $list = (Get-ChildItem -Recurse -File $env:VCPKG_BINARY_CACHE_DIR | ForEach-Object FullName | Sort-Object) -join "`n"
+          $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($list)))
+          "VCPKG_CACHE_BEFORE=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Install CUDA toolkit (compile only)
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: '12.9.0'
           method: 'network'
           sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
           use-github-cache: true
-
-      - name: Set up vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgDirectory: ${{ env.VCPKG_ROOT }}
-          vcpkgJsonGlob: vcpkg.json
 
       - name: Download sample clip (optional)
         if: ${{ env.OSV_SAMPLE_URL != '' }}
@@ -63,8 +100,37 @@ jobs:
           curl -L -o CAM_20260904090647_0010_D.OSV "$env:OSV_SAMPLE_URL"
         shell: pwsh
 
+      # The configure installs the vcpkg manifest (and fills the binary cache).
       - name: Configure
         run: cmake --preset ci-windows
+
+      - name: Decide whether the binary cache changed
+        if: always()
+        id: vcpkg-cache-diff
+        shell: pwsh
+        run: |
+          $list = (Get-ChildItem -Recurse -File $env:VCPKG_BINARY_CACHE_DIR -ErrorAction SilentlyContinue | ForEach-Object FullName | Sort-Object) -join "`n"
+          $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($list)))
+          "changed=$(if ($hash -ne $env:VCPKG_CACHE_BEFORE) { 'true' } else { 'false' })" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # Saved even when the configure failed half way: every package that did
+      # build is worth keeping for the next attempt.
+      - name: Save vcpkg binary cache
+        if: always() && steps.vcpkg-cache-diff.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE_DIR }}
+          key: vcpkg-bin-win2022-x64-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.job }}
+
+      - name: Upload vcpkg logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcpkg-logs-windows-cuda
+          path: |
+            ${{ env.VCPKG_ROOT }}/buildtrees/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Build
         run: cmake --build --preset ci-windows
@@ -78,34 +144,80 @@ jobs:
           name: osvtool-windows-x64
           path: |
             build/ci-windows/bin/osvtool.exe
+            build/ci-windows/bin/osvgui.exe
             build/ci-windows/bin/*.dll
 
   build-cpu:
-    runs-on: windows-latest
-    timeout-minutes: 120
+    runs-on: windows-2022
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-
-      - name: Export GitHub Actions cache variables for vcpkg
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: MSVC developer shell
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Set up vcpkg
-        uses: lukka/run-vcpkg@v11
+      # Same as build-cuda: vcpkg at the baseline, VCPKG_ROOT back at it.
+      - name: Set up vcpkg at the manifest baseline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:GITHUB_WORKSPACE 'vcpkg'
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          git clone --quiet https://github.com/microsoft/vcpkg.git $root
+          if ($LASTEXITCODE -ne 0) { throw 'git clone of vcpkg failed' }
+          git -C $root checkout --quiet $baseline
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg has no commit $baseline" }
+          & (Join-Path $root 'bootstrap-vcpkg.bat') -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'bootstrap-vcpkg failed' }
+          New-Item -ItemType Directory -Force $env:VCPKG_BINARY_CACHE_DIR | Out-Null
+          "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@v4
         with:
-          vcpkgDirectory: ${{ env.VCPKG_ROOT }}
-          vcpkgJsonGlob: vcpkg.json
+          path: ${{ env.VCPKG_BINARY_CACHE_DIR }}
+          key: vcpkg-bin-win2022-x64-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.job }}
+          restore-keys: |
+            vcpkg-bin-win2022-x64-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-bin-win2022-x64-
+
+      - name: Fingerprint the binary cache
+        shell: pwsh
+        run: |
+          $list = (Get-ChildItem -Recurse -File $env:VCPKG_BINARY_CACHE_DIR | ForEach-Object FullName | Sort-Object) -join "`n"
+          $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($list)))
+          "VCPKG_CACHE_BEFORE=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Configure (CPU only)
         run: cmake --preset windows-msvc-cpu-only
+
+      - name: Decide whether the binary cache changed
+        if: always()
+        id: vcpkg-cache-diff
+        shell: pwsh
+        run: |
+          $list = (Get-ChildItem -Recurse -File $env:VCPKG_BINARY_CACHE_DIR -ErrorAction SilentlyContinue | ForEach-Object FullName | Sort-Object) -join "`n"
+          $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($list)))
+          "changed=$(if ($hash -ne $env:VCPKG_CACHE_BEFORE) { 'true' } else { 'false' })" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Save vcpkg binary cache
+        if: always() && steps.vcpkg-cache-diff.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE_DIR }}
+          key: vcpkg-bin-win2022-x64-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.job }}
+
+      - name: Upload vcpkg logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcpkg-logs-windows-cpu
+          path: |
+            ${{ env.VCPKG_ROOT }}/buildtrees/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Build
         run: cmake --build --preset windows-msvc-cpu-only

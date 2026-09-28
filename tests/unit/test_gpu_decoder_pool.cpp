@@ -411,19 +411,24 @@ TEST_CASE("GpuDecoderPool stays within its bound, expires and clears", "[video][
         GpuDecoderPool::Limits quick = limits;
         quick.idleTtl = std::chrono::milliseconds(150);
         pool.setLimits(quick);
-        REQUIRE(pool.park(openOrSkip()));
+        // Opened outside REQUIRE: a SKIP inside an assertion is caught by it
+        // and reported as an unexpected exception instead of a skip.
+        std::unique_ptr<GpuClipDecoder> dec = openOrSkip();
+        REQUIRE(pool.park(std::move(dec)));
         REQUIRE(waitFor([&] { return pool.idleCount() == 0; }, std::chrono::seconds(5)));
         REQUIRE(pool.stats().expired == 1);
     }
     SECTION("clear() releases everything and the reaper is gone when it returns") {
-        REQUIRE(pool.park(openOrSkip()));
+        std::unique_ptr<GpuClipDecoder> first = openOrSkip();
+        REQUIRE(pool.park(std::move(first)));
         REQUIRE(pool.reaperRunning());
         pool.clear();
         REQUIRE(pool.idleCount() == 0);
         REQUIRE_FALSE(pool.reaperRunning());
         REQUIRE(pool.stats().cleared == 1);
         // Still usable.
-        REQUIRE(pool.park(openOrSkip()));
+        std::unique_ptr<GpuClipDecoder> second = openOrSkip();
+        REQUIRE(pool.park(std::move(second)));
         REQUIRE(pool.idleCount() == 1);
     }
 }
@@ -431,7 +436,8 @@ TEST_CASE("GpuDecoderPool stays within its bound, expires and clears", "[video][
 TEST_CASE("a GPU pool destroyed with a decoder parked releases it", "[video][gpu][pool][sample]") {
     {
         GpuDecoderPool pool(testLimits());
-        REQUIRE(pool.park(openOrSkip()));
+        std::unique_ptr<GpuClipDecoder> parked = openOrSkip();
+        REQUIRE(pool.park(std::move(parked)));
     }
     // The next open on the same device must work normally.
     std::unique_ptr<GpuClipDecoder> dec = openOrSkip();
