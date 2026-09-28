@@ -499,14 +499,25 @@ constexpr ShippedLut kShippedLuts[] = {
 /// mismatch nobody notices until a grade looks wrong.
 ///
 /// So this regenerates each one in-process from makeColorParams + writeCube -
-/// the same two calls osvtool makes - and compares byte for byte.  A failure
+/// the same two calls osvtool makes - and compares the two files.  A failure
 /// here is not a bug in the test: it means "run scripts/gen_luts.ps1 and
 /// commit the result".
 ///
-/// The comparison is on bytes rather than on sampled values on purpose: byte
-/// equality is what makes the committed file provably generator output, and it
-/// also catches a header, title or formatting drift that a value comparison
-/// would wave through.
+/// How they are compared:
+///
+///   * every header line (TITLE, LUT_3D_SIZE, DOMAIN_*) must be IDENTICAL, so
+///     a title or formatting drift still fails;
+///   * every value must agree within 2e-5.
+///
+/// Values are not compared byte for byte, on any platform.  The transcendental
+/// functions behind the curves (powf, exp2f, logf) come from the platform's
+/// math library, and that library is free to round the last ulp differently:
+/// Apple's does, and so does Windows' own - ucrtbase.dll ships with the
+/// operating system and picks FMA code paths by CPU, so a CI runner on Windows
+/// Server printed a different last decimal than the Windows 11 machine that
+/// generated the set.  The PQ encode raises to the 78.84th power, which turns
+/// one ulp into dozens; 7e-6 was the largest difference measured.  A real
+/// pipeline change moves thousands of entries by far more than 2e-5.
 TEST_CASE("The committed LUTs match the current pipeline", "[color][cube]") {
     const std::filesystem::path dir = osvtest::lutsDir();
     // The folder holds the set and nothing else: a renamed or retired table
@@ -541,14 +552,8 @@ TEST_CASE("The committed LUTs match the current pipeline", "[color][cube]") {
         INFO((st.ok() ? std::string("ok") : st.error().toString()));
         REQUIRE(st.ok());
 
-#if !defined(_MSC_VER)
-        // The committed LUTs are generated on Windows.  Another platform's
-        // math library rounds a transcendental differently in the last ulp
-        // now and then (Apple's powf / exp2f do), which moves the last
-        // printed decimals of a few entries - up to 7e-6 measured on the PQ
-        // LUT, where the curve is steepest - so here the files are compared
-        // as numbers: every header line equal, every value within 2e-5.  A
-        // real pipeline change moves thousands of entries by far more.
+        // Headers equal, values within 2e-5: see the comment above the test
+        // for why the values are compared as numbers on every platform.
         {
             constexpr double kTolerance = 2e-5;
             std::ifstream ta(committed);
@@ -592,52 +597,6 @@ TEST_CASE("The committed LUTs match the current pipeline", "[color][cube]") {
             INFO("re-run scripts/gen_luts.ps1 and commit the result");
             REQUIRE(worst <= kTolerance);
         }
-#else
-        // Sizes first, so a length mismatch reports a number rather than a
-        // byte offset.
-        const auto committedSize = std::filesystem::file_size(committed);
-        const auto freshSize = std::filesystem::file_size(fresh);
-        INFO("committed " << committedSize << " bytes, regenerated " << freshSize << " bytes");
-        INFO("re-run scripts/gen_luts.ps1 and commit the result");
-        REQUIRE(committedSize == freshSize);
-
-        // Stream the comparison rather than loading 7 MB twice, and report the
-        // first differing offset, which is what identifies the change.
-        std::ifstream a(committed, std::ios::binary);
-        std::ifstream b(fresh, std::ios::binary);
-        REQUIRE(a.good());
-        REQUIRE(b.good());
-        std::vector<char> bufA(1 << 16);
-        std::vector<char> bufB(1 << 16);
-        std::uintmax_t offset = 0;
-        constexpr std::uintmax_t kNoDiff = static_cast<std::uintmax_t>(-1);
-        std::uintmax_t firstDiff = kNoDiff;
-        while (a && b) {
-            a.read(bufA.data(), static_cast<std::streamsize>(bufA.size()));
-            b.read(bufB.data(), static_cast<std::streamsize>(bufB.size()));
-            const std::streamsize gotA = a.gcount();
-            const std::streamsize gotB = b.gcount();
-            if (gotA != gotB) {
-                firstDiff = offset;
-                break;
-            }
-            if (gotA == 0) {
-                break;
-            }
-            for (std::streamsize i = 0; i < gotA; ++i) {
-                if (bufA[static_cast<std::size_t>(i)] != bufB[static_cast<std::size_t>(i)]) {
-                    firstDiff = offset + static_cast<std::uintmax_t>(i);
-                    break;
-                }
-            }
-            if (firstDiff != kNoDiff) {
-                break;
-            }
-            offset += static_cast<std::uintmax_t>(gotA);
-        }
-        INFO("first differing byte offset: " << firstDiff);
-        REQUIRE(firstDiff == kNoDiff);
-#endif
     }
 }
 

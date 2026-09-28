@@ -537,11 +537,18 @@ TEST_CASE("luminance mode keeps the scene's chromaticity, per channel adds chrom
         const double spreadPunchy = std::fabs(std::log(pqNits(c[0]) / pqNits(c[2])));
         CHECK(spreadPunchy > spreadNatural);
     }
-    // On the neutral axis the two are the same curve.
+    // On the neutral axis the two are the same curve - up to float rounding.
+    // The two modes reach it through different operations (a luminance ratio
+    // against three separate channels), and the PQ encode raises to the
+    // 78.84th power, so a last-ulp difference in the platform's powf / exp2f
+    // grows to dozens of ulps at the output: 4e-6 was measured on a Windows
+    // Server CI runner, under 2e-6 on Windows 11.  1e-5 is still a hundredth
+    // of one 10-bit code value, while a real divergence between the two
+    // curves shows up at the 1e-3 level.
     for (int i = 0; i <= 64; ++i) {
         const float x = 0.18f * std::exp2(-6.0f + 10.0f * static_cast<float>(i) / 64.0f);
         CHECK_THAT(static_cast<double>(fromLinear(natural, x, x, x)[1]),
-                   WithinAbs(static_cast<double>(fromLinear(punchy, x, x, x)[1]), 2e-6));
+                   WithinAbs(static_cast<double>(fromLinear(punchy, x, x, x)[1]), 1e-5));
     }
 }
 

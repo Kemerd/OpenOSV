@@ -56,6 +56,14 @@ file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/test-output")
 # pointer attributes, device-to-host downloads of the cached frames).
 if(OSV_ENABLE_CUDA AND TARGET CUDA::cuda_driver)
   target_link_libraries(osv_tests PRIVATE CUDA::cuda_driver)
+  if(WIN32)
+    # nvcuda.dll comes with the NVIDIA display driver, not the toolkit.  A
+    # machine (or CI runner) without one must still START the suite - ctest
+    # lists the tests by running it - and the GPU tests then SKIP: they ask
+    # the CUDA runtime for a device before any driver call, as osvtool does.
+    target_link_options(osv_tests PRIVATE "/DELAYLOAD:nvcuda.dll")
+    target_link_libraries(osv_tests PRIVATE delayimp)
+  endif()
 endif()
 
 # -----------------------------------------------------------------------------
