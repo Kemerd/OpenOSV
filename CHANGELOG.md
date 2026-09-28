@@ -8,6 +8,13 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ### Fixed
 
+* **Wavy, stair-stepped lines in the stitch.** The seam correction measured
+  along the seam was also applied to every other pixel of both lenses,
+  rotating each one toward or away from its lens centre. Wherever the
+  correction varied, straight lines far from any seam came out wavy. On an 8K
+  clip, a fence thirty metres away became a staircase. The correction now acts
+  only near the seam, where it was measured (full within 6 degrees, fading out
+  by 12), and leaves the rest of the picture alone.
 * **An attached `.LRF` proxy played back glitchy.** Premiere requires an
   attached proxy to match its original's frame rate and duration, and its frame
   size to divide the original's. Anything else is accepted without a warning

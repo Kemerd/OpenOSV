@@ -853,6 +853,32 @@ OSV_HD int osvSeamColumn(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE const
     return c;
 }
 
+/* Where the per-column seam table acts, as the sine of the ray's latitude
+ * from the seam plane (the polar-axis latitude osvWarpSample uses too): in
+ * full up to OSV_SEAM_SHIFT_FULL_DEG, fading out smoothly to nothing at
+ * OSV_SEAM_SHIFT_ZERO_DEG.  The table is measured in a band of +/- 6 degrees
+ * around the seam (BandParams::bandHalfDeg) and says nothing about the rest
+ * of the sphere.  Applied everywhere, as it once was, it rotated every ray of
+ * both lenses toward or away from its lens axis - a 1.5 degree shift five
+ * degrees from a lens centre is a 30 % change of scale - so straight lines
+ * far from any seam came out wavy wherever the table varied. */
+#define OSV_SEAM_SHIFT_FULL_DEG 6.0f
+#define OSV_SEAM_SHIFT_ZERO_DEG 12.0f
+
+OSV_HD float osvSeamShiftTaper(float sinLat) {
+    const float s0 = sinf(OSV_SEAM_SHIFT_FULL_DEG * (OSV_KERNEL_PI / 180.0f));
+    const float s1 = sinf(OSV_SEAM_SHIFT_ZERO_DEG * (OSV_KERNEL_PI / 180.0f));
+    const float a = fabsf(sinLat);
+    if (!(a > s0)) {
+        return 1.0f; /* inside the measured band (a NaN ray takes this too: no change of behaviour) */
+    }
+    if (a >= s1) {
+        return 0.0f;
+    }
+    const float t = (a - s0) / (s1 - s0);
+    return 1.0f - t * t * (3.0f - 2.0f * t); /* 1 - smoothstep */
+}
+
 /* Rotate the body ray toward (delta > 0) or away from the optical axis of
  * lens i along the meridian through the axis.  Used to apply half of the
  * measured seam disparity to each lens. */
@@ -2023,7 +2049,11 @@ OSV_HD void osvShadePixelWSPL(OSV_PRIVATE const OsvRenderParams* p, OSV_PRIVATE 
      * angle farther from its own axis (a negative "toward axis" rotation). */
     float seamDelta = 0.0f;
     if (p->seamShiftEnabled && p->seamColumns > 0 && seam != 0) {
-        seamDelta = -seam[osvSeamColumn(p, dBody)] * (OSV_KERNEL_PI / 180.0f) * 0.5f;
+        /* Only near the seam, where the table was measured (osvSeamShiftTaper). */
+        const float taper = osvSeamShiftTaper(dBody[1]);
+        if (taper > 0.0f) {
+            seamDelta = -seam[osvSeamColumn(p, dBody)] * (OSV_KERNEL_PI / 180.0f) * 0.5f * taper;
+        }
     }
 
     /* Optional 2-D parallax warp: (dLon, dLat) for the master lens at this
