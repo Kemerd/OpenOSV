@@ -33,10 +33,10 @@ The version lives in one place: `project(openosv VERSION x.y.z)` in
 name and the tag all follow it. Keep `version-string` in `vcpkg.json` equal
 (the script warns when they differ). Semantic versioning.
 
-The OpenOSV panel has its own version, in three places a test keeps equal:
-`panel/uxp/manifest.json`, `panel/cep/CSXS/manifest.xml` and
-`OsvCore.PANEL_VERSION` in `panel/shared/osvcore.js`. Bump it only when the
-panel changed.
+The OpenOSV panel has its own version, in four places a test keeps equal:
+`panel/uxp/manifest.json`, `panel/cep/CSXS/manifest.xml`,
+`OsvCore.PANEL_VERSION` in `panel/shared/osvcore.js` and `VERSION` in
+`panel/cep/host/host.jsx`. Bump it only when the panel changed.
 
 ## 2. Move the changelog
 

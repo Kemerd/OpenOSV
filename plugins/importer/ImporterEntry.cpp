@@ -311,9 +311,24 @@ csSDK_int32 doOpenFile8(imStdParms* stdParms, imFileRef* fileRef, imFileOpenRec8
         // blob, it is what the clip is decoded with.  Seeded before open(),
         // because open() builds the lens rig from the calibration in force.
         // noteNewClipDefaults() logs the new-clip case once it is certain.
-        const UserDefaults startFrom = currentUserDefaults();
-        instance->seedStartingPrefs(startFrom.prefs,
-                                    startFrom.fromFile ? userDefaultsPathForLog(startFrom.path) : std::string());
+        //
+        // [PROXY] An .LRF beside its .OSV starts from the settings the .OSV
+        // is decoded with, when a Premiere instance of it has published them:
+        // Premiere does not carry a master clip's Source Settings over to its
+        // attached proxy, and a proxy on other settings (another stabilisation,
+        // another colour output) changes the picture whenever proxies are
+        // switched on.
+        PrefsBlob originalPrefs;
+        const std::filesystem::path original = ImporterInstance::proxyOriginalFor(std::filesystem::path(path));
+        if (!original.empty() && enginePublishedPrefs(original, originalPrefs)) {
+            instance->seedStartingPrefs(originalPrefs, std::string());
+            PluginLog::info("proxy: '{}' starts from the Source Settings of '{}'",
+                            std::filesystem::path(path).filename().string(), original.filename().string());
+        } else {
+            const UserDefaults startFrom = currentUserDefaults();
+            instance->seedStartingPrefs(startFrom.prefs,
+                                        startFrom.fromFile ? userDefaultsPathForLog(startFrom.path) : std::string());
+        }
     }
 
     const Status st = instance->open();

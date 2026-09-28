@@ -49,6 +49,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cwctype>
 #include <exception>
 #include <format>
 #include <iterator>
@@ -577,6 +578,11 @@ Status ImporterInstance::parseOnce() {
         m_creationTime1904 = m_file->movie().header.creationTime;
     }
 
+    // ---- [PROXY] an .LRF beside its .OSV is presented on the .OSV's timeline
+    if (m_format.sideBySideProxy) {
+        adoptProxyTimelineLocked();
+    }
+
     // ---- audio track (described now, decoded lazily) -----------------------
     for (const TrackInfo* t : m_file->tracksOfKind(TrackKind::Audio)) {
         if (!t || !t->audio) {
@@ -816,6 +822,12 @@ Status ImporterInstance::rebuildRig() {
     // change - never per frame.
     PluginLog::info("calibration: '{}': {}/{} - {}", m_path.filename().string(), m_calibration.sourceSlave,
                     m_calibration.sourceMaster, reason);
+    // How calibration pixels become stream pixels for this recording mode:
+    // the line that tells a misaligned seam of an unverified mode apart from
+    // parallax.
+    for (const std::string& n : scaleNotes) {
+        PluginLog::info("scaling: '{}': {}", m_path.filename().string(), n);
+    }
     if (!protectorNote.empty()) {
         // The three scores and the pick, so a protector clip's stitch can be
         // explained from the log alone.
@@ -1085,6 +1097,143 @@ double ImporterInstance::fps() const noexcept {
     return static_cast<double>(m_rateNum) / static_cast<double>(m_rateDen);
 }
 
+// ---------------------------------------------------------------------------
+//  [PROXY] An .LRF presented as the proxy of its .OSV
+// ---------------------------------------------------------------------------
+
+std::filesystem::path ImporterInstance::proxyOriginalFor(const std::filesystem::path& path) {
+    try {
+        // Only an .LRF has an original; the extension in any case.
+        std::wstring ext = path.extension().wstring();
+        for (wchar_t& c : ext) {
+            c = static_cast<wchar_t>(std::towlower(c));
+        }
+        if (ext != L".lrf") {
+            return {};
+        }
+        // The camera names the pair alike: CAM_..._D.LRF beside CAM_..._D.OSV.
+        // Both spellings are tried, for a case-sensitive volume.
+        for (const wchar_t* candidateExt : {L".OSV", L".osv"}) {
+            std::filesystem::path candidate = path;
+            candidate.replace_extension(candidateExt);
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(candidate, ec) && !ec) {
+                return candidate;
+            }
+        }
+    } catch (...) {
+        // A path the filesystem library cannot handle has no original.
+    }
+    return {};
+}
+
+void ImporterInstance::adoptProxyTimelineLocked() {
+    const std::filesystem::path original = proxyOriginalFor(m_path);
+    if (original.empty()) {
+        return;
+    }
+    const std::string name = m_path.filename().string();
+    const std::string originalName = original.filename().string();
+
+    // ---- the original's timeline --------------------------------------------
+    // Opened for its container and metadata only: no decoder, no rig.
+    auto file = OsvFile::open(original);
+    if (!file.ok()) {
+        PluginLog::info("proxy: '{}': '{}' is beside it but cannot be read ({}); presented on its own timeline",
+                        name, originalName, file.error().message);
+        return;
+    }
+    auto track = meta::MetadataTrack::load(file.value());
+    if (!track.ok()) {
+        PluginLog::info("proxy: '{}': '{}' has no readable metadata ({}); presented on its own timeline", name,
+                        originalName, track.error().message);
+        return;
+    }
+    auto format = meta::FormatDetector::detect(file.value(), &track.value());
+    if (!format.ok() || format.value().sideBySideProxy || format.value().streamH == 0) {
+        PluginLog::info("proxy: '{}': '{}' is not a dual-lens original; presented on its own timeline", name,
+                        originalName);
+        return;
+    }
+    const TrackInfo* video = file.value().track(format.value().videoTrackIds[0]);
+    if (!video || video->timescale == 0 || video->samples.count() == 0) {
+        PluginLog::info("proxy: '{}': '{}' has no usable video track; presented on its own timeline", name,
+                        originalName);
+        return;
+    }
+    const std::uint32_t frames = video->samples.count();
+    std::uint64_t delta = video->samples.sampleDuration(0);
+    if (delta == 0 && video->duration > 0) {
+        delta = video->duration / frames;
+    }
+    if (delta == 0 || delta > 0xFFFFFFFFull) {
+        PluginLog::info("proxy: '{}': '{}' has no usable frame rate; presented on its own timeline", name,
+                        originalName);
+        return;
+    }
+
+    // ---- the two first frames on the camera's clock ------------------------------
+    // Both files carry the camera's own microsecond timestamp per frame, on
+    // one clock, so the original's first frame has an exact place on the
+    // proxy's timeline.  Without them the two are taken to start together,
+    // which is how the camera writes them.
+    double offsetSeconds = 0.0;
+    auto proxyFirst = m_track.frame(0);
+    auto originalFirst = track.value().frame(0);
+    if (proxyFirst.ok() && originalFirst.ok() && proxyFirst.value().timestampUs != 0 &&
+        originalFirst.value().timestampUs != 0) {
+        offsetSeconds = (static_cast<double>(originalFirst.value().timestampUs) -
+                         static_cast<double>(proxyFirst.value().timestampUs)) /
+                        1e6;
+    }
+
+    // ---- they must cover the same moments ----------------------------------------
+    const double proxySeconds = fps() > 0.0 ? static_cast<double>(m_frameCount) / fps() : 0.0;
+    const double originalSeconds =
+        static_cast<double>(frames) * static_cast<double>(delta) / static_cast<double>(video->timescale);
+    if (!std::isfinite(offsetSeconds) || offsetSeconds >= proxySeconds || offsetSeconds + originalSeconds <= 0.0) {
+        PluginLog::info("proxy: '{}': '{}' was recorded at another time (offset {:.3f} s); presented on its own "
+                        "timeline",
+                        name, originalName, offsetSeconds);
+        return;
+    }
+
+    m_proxy.active = true;
+    m_proxy.original = original;
+    m_proxy.rateNum = video->timescale;
+    m_proxy.rateDen = static_cast<std::uint32_t>(delta);
+    m_proxy.frameCount = frames;
+    m_proxy.originalLensH = format.value().streamH;
+    m_proxy.offsetSeconds = offsetSeconds;
+    PluginLog::info("proxy: '{}' is presented as the proxy of '{}': {} frames at {:.3f} fps (its own: {} at "
+                    "{:.3f}), the original's first frame {:+.3f} s into it",
+                    name, originalName, frames,
+                    static_cast<double>(m_proxy.rateNum) / static_cast<double>(m_proxy.rateDen), m_frameCount, fps(),
+                    offsetSeconds);
+}
+
+std::uint32_t ImporterInstance::sourceFrameFor(std::uint32_t timelineIndex) const noexcept {
+    if (m_frameCount == 0) {
+        return 0;
+    }
+    if (!m_proxy.active || m_proxy.rateNum == 0 || m_proxy.rateDen == 0 || m_rateDen == 0) {
+        return std::min(timelineIndex, m_frameCount - 1u);
+    }
+    // The moment of the original's frame on the proxy's clock, then the
+    // proxy frame nearest it.
+    const double seconds = m_proxy.offsetSeconds + static_cast<double>(timelineIndex) *
+                                                       static_cast<double>(m_proxy.rateDen) /
+                                                       static_cast<double>(m_proxy.rateNum);
+    const double index = std::floor(seconds * static_cast<double>(m_rateNum) / static_cast<double>(m_rateDen) + 0.5);
+    if (!(index > 0.0)) {
+        return 0;
+    }
+    if (index >= static_cast<double>(m_frameCount - 1u)) {
+        return m_frameCount - 1u;
+    }
+    return static_cast<std::uint32_t>(index);
+}
+
 OutputGeometry ImporterInstance::nativeGeometryLocked() const noexcept {
     OutputGeometry g;
     // An equirect frame is 2:1.  The natural height is the per-lens stream
@@ -1109,14 +1258,48 @@ OutputGeometry ImporterInstance::nativeGeometry() const noexcept {
 }
 
 OutputGeometry ImporterInstance::geometryForLocked(const PrefsBlob& prefs) const noexcept {
+    OutputGeometry size;
     switch (prefs.size()) {
-    case PrefsOutputSize::UHD4K:   return OutputGeometry{3840, 1920};
-    case PrefsOutputSize::QHD2560: return OutputGeometry{2560, 1280};
-    case PrefsOutputSize::HD2K:    return OutputGeometry{1920, 960};
+    case PrefsOutputSize::UHD4K:   size = OutputGeometry{3840, 1920}; break;
+    case PrefsOutputSize::QHD2560: size = OutputGeometry{2560, 1280}; break;
+    case PrefsOutputSize::HD2K:    size = OutputGeometry{1920, 960}; break;
     case PrefsOutputSize::Native:
     case PrefsOutputSize::Count:
-    default:                     return nativeGeometryLocked();
+    default:
+        // [PROXY] Native is the ORIGINAL's native size for a proxy.
+        if (m_proxy.active && m_proxy.originalLensH > 0) {
+            size = OutputGeometry{static_cast<std::int32_t>(2u * m_proxy.originalLensH),
+                                  static_cast<std::int32_t>(m_proxy.originalLensH)};
+        } else {
+            return nativeGeometryLocked();
+        }
+        break;
     }
+    if (!m_proxy.active) {
+        return size;
+    }
+    // [PROXY] The original's size divided by the whole number that brings it
+    // closest to the proxy's own detail (2048 x 1024 for the camera's .LRF):
+    // 6000 x 3000 -> 2000 x 1000, 3840 x 1920 -> 1920 x 960.  Adobe supports
+    // a proxy whose size divides the original's; any other ratio is accepted
+    // without a warning and misbehaves.
+    const OutputGeometry own = nativeGeometryLocked();
+    if (!own.valid() || !size.valid()) {
+        return size;
+    }
+    int bestDivisor = 1;
+    std::int64_t bestDistance = std::abs(static_cast<std::int64_t>(size.width) - own.width);
+    for (int divisor = 2; divisor <= 16; ++divisor) {
+        if (size.width % divisor != 0 || size.height % divisor != 0) {
+            continue;
+        }
+        const std::int64_t distance = std::abs(static_cast<std::int64_t>(size.width / divisor) - own.width);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestDivisor = divisor;
+        }
+    }
+    return OutputGeometry{size.width / bestDivisor, size.height / bestDivisor};
 }
 
 OutputGeometry ImporterInstance::geometryFor(const PrefsBlob& prefs) const noexcept {

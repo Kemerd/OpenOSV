@@ -26,11 +26,13 @@ DJI Avata 360 clips open too (new: not yet tested on Avata footage here).
 
 </div>
 
-> **macOS is untested, and DaVinci Resolve is a preview.** Premiere Pro on
-> Windows is what OpenOSV is built and tested on. The macOS build and the
-> DaVinci Resolve plug-ins compile and pass their tests on CI. Resolve has
-> had a first run on Windows (Resolve 21, free), but nobody on the project
-> has run Premiere or Resolve on a Mac. If you can,
+> **macOS is community-tested, and DaVinci Resolve is a preview.** Premiere
+> Pro on Windows is what OpenOSV is built and tested on. The macOS build and
+> the DaVinci Resolve plug-ins compile and pass their tests on CI. Resolve has
+> had a first run on Windows (Resolve 21, free), and
+> [@arkanos](https://github.com/arkanos) has it working on a MacBook Pro M4
+> running macOS 26.6.1 ([issue #2](https://github.com/Kemerd/OpenOSV/issues/2),
+> thank you!). Premiere Pro on a Mac is still untested. If you can,
 > [build it](#build-from-source), try it, and
 > [file a bug report or a pull request](https://github.com/Kemerd/OpenOSV/issues)
 > for anything that goes wrong.
@@ -466,6 +468,10 @@ in: **More info → Run anyway**. Either installer asks for admin rights once.
 
 `Uninstall.cmd`, in the same zip, takes it all back out.
 
+Both zips also carry **`cli\osvgui.exe`, OpenOSV Studio**: drop clips on it
+and batch-render them without an editor
+([below](#openosv-studio-the-batch-app)).
+
 **Needs** Windows 10/11 x64, and Premiere Pro 2022 or later (tested on 2026)
 or DaVinci Resolve, free or Studio (first run on 21).
 **GPU:** CUDA on NVIDIA GTX 16 / RTX 20 and newer (Turing, Ampere, Ada,
@@ -478,10 +484,10 @@ Premiere, OpenOSV Source > Advanced in Resolve).
 One CMake project builds everything. You pick a preset for the platform, and
 the Premiere plug-ins come along when Adobe's SDKs are there:
 
-| | Windows | macOS, Apple Silicon (untested) |
+| | Windows | macOS, Apple Silicon |
 |---|---|---|
 | **Premiere Pro** | needs the Adobe SDKs | needs the Adobe SDKs (untested in Premiere) |
-| **DaVinci Resolve** (preview) | no Adobe SDK needed | no Adobe SDK needed |
+| **DaVinci Resolve** (preview) | no Adobe SDK needed | no Adobe SDK needed (working on an M4, [#2](https://github.com/Kemerd/OpenOSV/issues/2)) |
 
 Adobe's SDKs may not be redistributed, so they are never committed:
 [`docs/BUILDING.md`](docs/BUILDING.md) (Windows) and
@@ -515,25 +521,37 @@ cmake --build --preset windows-msvc-cuda-release
 scripts\install_ofx.ps1            # into C:\Program Files\Common Files\OFX\Plugins
 ```
 
-**Premiere Pro on macOS (untested).** You need macOS 13.3+ on Apple Silicon,
-the Xcode command line tools, CMake 3.28+, Ninja and vcpkg, plus the Adobe
-SDKs:
+**DaVinci Resolve on macOS.** You need macOS 13.3+ on Apple Silicon, the
+Xcode command line tools and [Homebrew](https://brew.sh). One script does
+the lot: it installs CMake, Ninja and pkg-config with brew, clones vcpkg
+into `~/vcpkg` (unless `VCPKG_ROOT` points at one), builds, and installs the
+bundle into `/Library/OFX/Plugins`:
 
 ```sh
-export VCPKG_ROOT=~/vcpkg
+scripts/build_mac.sh --install-ofx
+```
+
+Or by hand, the steps [@arkanos](https://github.com/arkanos) confirmed on an
+M4 ([issue #2](https://github.com/Kemerd/OpenOSV/issues/2)):
+
+```sh
+brew install cmake ninja pkg-config    # vcpkg's FFmpeg needs pkg-config
+git clone https://github.com/microsoft/vcpkg "$HOME/vcpkg"
+"$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+export VCPKG_ROOT="$HOME/vcpkg"
+cmake --preset macos-release
+cmake --build --preset macos-release
+scripts/install_ofx.sh                 # into /Library/OFX/Plugins
+```
+
+**Premiere Pro on macOS (untested).** Same tools, plus the Adobe SDKs:
+
+```sh
+export VCPKG_ROOT="$HOME/vcpkg"
 cmake --preset macos-premiere-release
 cmake --build --preset macos-premiere-release
 ctest --preset macos-premiere
 scripts/install_plugins.sh         # plug-ins, LUTs, sequence presets and the OpenOSV panel
-```
-
-**DaVinci Resolve on macOS (untested).** Same tools, no Adobe SDK:
-
-```sh
-export VCPKG_ROOT=~/vcpkg
-cmake --preset macos-release
-cmake --build --preset macos-release
-scripts/install_ofx.sh             # into /Library/OFX/Plugins
 ```
 
 On a Mac, Metal replaces CUDA. How to use the Resolve plug-ins, and exactly
@@ -558,46 +576,168 @@ delivery. Three presets appear under **File > New > Sequence > OpenOSV**:
 All three are 59.94 fps exactly. 60 fps would drift a frame every thousand
 against the footage.
 
+## OpenOSV Studio: the batch app
+
+![OpenOSV Studio rendering a queue of Osmo 360 clips](img/osvgui.png)
+
+A small window in front of `osvtool`: drop clips or whole folders on it,
+pick the output, press **Start**. It renders the queue one clip at a time
+with the plug-ins' own engine. It's `cli\osvgui.exe` in either release zip,
+and it runs the `osvtool.exe` beside it (or the one on your `PATH`).
+
+1. **Queue clips.** Drag `.OSV` files or folders onto the window, or use
+   **Add files** / **Add folder**. Folders are searched all the way down;
+   `.LRF` proxies and empty files are skipped.
+2. **Pick the output.** A 360 equirect, tagged as 360 video for YouTube and
+   VR players, or a reframed flat view: a DJI preset or your own field of
+   view, with pan, tilt and roll. Then size, colour, stabilisation, sun ghost
+   removal, encoder and quality. Colour **Auto** turns D-Log M into HDR10
+   and keeps SDR clips SDR. **Use my Premiere defaults** takes colour,
+   stabilisation and sun ghosts from the Source Settings you saved there.
+3. **Check the command.** The **Command** box shows exactly what runs for
+   the next clip; **Whole folder** turns it into a loop you can script.
+   **Extra arguments** (under Advanced) go on the end of every command:
+   `--range 0-299` renders the first five seconds.
+4. **Start.** Every clip shows its progress and time left, the footer the
+   whole batch. **Pause after this clip** stops when the current one is done;
+   **Stop** ends it now and deletes the unfinished file. **Log** shows
+   osvtool's own output.
+
+Video needs FFmpeg, as below. The app finds it, links to a download when
+it's missing, and picks the fastest HEVC encoder that works on your machine
+(NVENC, AMF, Quick Sync, else x265). It remembers every setting and the
+window in `%APPDATA%\OpenOSV\osvgui.json` (macOS: `~/Library/Application
+Support/OpenOSV/osvgui.json`). The details, and which option each control
+sets: [`docs/STUDIO.md`](docs/STUDIO.md).
+
 ## The command-line tool
 
-`osvtool` does everything without Premiere: inspect a clip, render stills or
-HDR video, export LUTs.
+`osvtool` renders without an editor: 360 videos ready for YouTube, reframed
+flat videos, stills, LUTs. It runs the Premiere and Resolve plug-ins' own
+engine, so a render is the frame Premiere shows. Rather click than type?
+[OpenOSV Studio](#openosv-studio-the-batch-app), above, runs the same renders.
+
+### Set it up once
+
+1. **Get it.** It's the `cli` folder of either release zip:
+   `cli\osvtool.exe`. Unzip it somewhere permanent, like `C:\OpenOSV`.
+2. **Install FFmpeg** for video output. Stills need nothing extra.
+
+   ```powershell
+   winget install Gyan.FFmpeg
+   ```
+
+   Open a new terminal afterwards so it's on your `PATH`, or point
+   `--ffmpeg` at any `ffmpeg.exe`.
+3. **Open a terminal in your footage folder.** In Explorer, right-click the
+   folder and choose **Open in Terminal**. The examples below write
+   `osvtool`; type the full path the first time
+   (`C:\OpenOSV\cli\osvtool.exe`), or add the `cli` folder to your `PATH`.
+
+It needs the Microsoft Visual C++ 2015-2022 Redistributable (x64), which
+Premiere Pro and Resolve already install.
+
+### Recipes
+
+**What's in this clip?** Camera, resolution, frame rate, colour mode,
+calibration, gyro:
 
 ```powershell
-# What's in this clip? (camera, mode, colour, calibration, gyro)
-osvtool probe CAM_XXXX.OSV --json probe.json
+osvtool probe CAM_0001.OSV
+```
 
-# The stitched 360 video, stitched exactly as Premiere stitches it
-osvtool render CAM_XXXX.OSV --all --mode equirect --size 3840x1920 --stab horizon --color 709 --out CAM_XXXX_360.mp4
+**A 360 video for YouTube or a VR headset.** The whole clip, stitched,
+horizon-levelled, in Rec.709, tagged as 360 so YouTube shows it as a sphere:
 
-# A reframed, horizon-levelled Rec.2100 PQ video
-osvtool render CAM_XXXX.OSV --all --preset wide --stab horizon --color pq --out out.mp4
+```powershell
+osvtool render CAM_0001.OSV --all --mode equirect --size 3840x1920 --stab horizon --color 709 --out CAM_0001_360.mp4
+```
 
-# A D-Log M -> Rec.2100 PQ LUT for any editor
+Use `--size 7680x3840` to keep all of an 8K clip.
+
+**The same in HDR.** Swap `--color 709` for `--color pq` (Rec.2100 PQ) or
+`--color hlg`.
+
+**A flat, reframed video.** Aim a virtual camera into the sphere. `--yaw`
+turns it left and right, `--pitch` tilts it up and down, `--fov` zooms
+(degrees):
+
+```powershell
+osvtool render CAM_0001.OSV --all --yaw 90 --pitch -10 --fov 100 --size 1920x1080 --stab full --color 709 --out CAM_0001_side.mp4
+```
+
+Or start from a look with `--preset wide | ultra-wide | asteroid |
+crystal-ball | dewarping`.
+
+**Try the settings on a few seconds first.** `--range 0-299` renders the
+first 300 frames (five seconds at 59.94 fps). `--frame 120 --out test.png`
+renders a single still.
+
+**A whole folder.** In PowerShell:
+
+```powershell
+Get-ChildItem *.OSV | ForEach-Object { osvtool render $_.FullName --all --mode equirect --size 3840x1920 --stab horizon --color 709 --out "$($_.BaseName)_360.mp4" }
+```
+
+In `cmd`:
+
+```bat
+for %f in (*.OSV) do osvtool render "%f" --all --mode equirect --size 3840x1920 --stab horizon --color 709 --out "%~nf_360.mp4"
+```
+
+**Tag an export as 360 video.** Rendered the sphere from Premiere or
+Resolve? This makes YouTube and VR players see it as 360, in place:
+
+```powershell
+osvtool spherical my_export_360.mp4
+```
+
+**Pull out the audio**, for a Resolve generator, which has none:
+
+```powershell
+osvtool extract CAM_0001.OSV --audio CAM_0001.aac
+```
+
+**A D-Log M to Rec.2100 PQ LUT** for any editor:
+
+```powershell
 osvtool lut --fit dji --out-transfer pq --size 65 dlogm_to_pq.cube
 ```
 
-A whole folder, in `cmd`:
+### The options you'll actually use
 
-```bat
-for %f in (*.OSV) do cli\osvtool.exe render "%f" --all --mode equirect --size 3840x1920 --stab horizon --color 709 --out "%~nf_360.mp4"
-```
+| Option | What it does |
+|---|---|
+| `--all`, `--range a-b`, `--frame N` | Every frame, a frame range, or one frame |
+| `--mode equirect` | The whole sphere (2:1). The default, `reframe`, is a flat view |
+| `--size WxH` | Output size, e.g. `3840x1920` for 360, `1920x1080` for flat |
+| `--color 709 \| pq \| hlg \| dlogm` | Rec.709 SDR, Rec.2100 PQ or HLG HDR, or the untouched D-Log M to grade yourself |
+| `--stab off \| horizon \| full \| smooth \| smooth-horizon` | Stabilisation. `horizon` levels it, `full` is DJI Studio's direction lock (the view keeps the first frame's heading) |
+| `--yaw`, `--pitch`, `--roll`, `--fov` | Aim and zoom a reframe, in degrees |
+| `--codec` | The encoder for your GPU: `hevc_nvenc` (NVIDIA, the default), `hevc_amf` (AMD), `hevc_qsv` (Intel), `libx265` (any CPU) |
+| `--crf N` | Quality; lower is better and bigger (default 18) |
+| `--exposure N` | Exposure offset in stops |
+| `--fit avata360` | Colour for DJI Avata 360 clips |
+| `--no-audio` | Leave the audio out |
+| `--no-spherical-metadata` | Don't tag an equirect video as 360 |
+| `--use-user-defaults` | Start from the Source Settings you saved in Premiere |
+| `--device cpu \| cuda \| opencl` | Force a renderer (default: the best GPU there is) |
 
-* **Same engine as the plug-ins.** `render` runs the Premiere and Resolve
-  plug-ins' own clip engine: parallax correction, carved seam, sky seam fix,
-  lens shading, sun ghost removal, stabilisation. Anything you don't set
-  starts at the Source Settings defaults, and `--use-user-defaults` takes the
-  ones you saved in Premiere. It uses the GPU when there is one: NVDEC and
-  CUDA on NVIDIA, hardware decoding and OpenCL on AMD and Intel.
-* **Stabilisation.** `--stab off | horizon | full | smooth | smooth-horizon`.
-  `full` is DJI Studio's direction lock: the view keeps the first frame's
-  heading.
-* **Video** goes through the `ffmpeg` on your `PATH` (or `--ffmpeg`). Pick the
-  encoder for your GPU: `--codec hevc_nvenc` (NVIDIA, the default),
-  `hevc_amf` (AMD), `hevc_qsv` (Intel), `libx265` (any CPU).
-* **Not in the CLI yet:** animated reframes (a render uses one fixed angle)
-  and the 360 metadata tag. Run the output through Google's Spatial Media
-  Metadata Injector before uploading to YouTube.
+`osvtool --help` lists the commands, and `osvtool render --help` every
+render option.
+
+### What else to know
+
+* **Same engine as the plug-ins.** `render` runs the plug-ins' own clip
+  engine: parallax correction, carved seam, sky seam fix, lens shading, sun
+  ghost removal, stabilisation. Anything you don't set starts at the Source
+  Settings defaults. It uses the GPU when there is one: NVDEC and CUDA on
+  NVIDIA, hardware decoding and OpenCL on AMD and Intel.
+* **360 metadata.** An `--mode equirect` `.mp4` / `.mov` comes out tagged as
+  360 video (Spherical Video V1 and V2), so YouTube, VR players and 360
+  editors open it as a sphere. No Spatial Media Metadata Injector needed.
+  Reframes stay flat.
+* **Not in the CLI yet:** animated reframes (a render uses one fixed angle).
 * `--engine classic` is the older research pipeline, with the
   geometry-convention and blend options the plug-ins take from the clip.
 

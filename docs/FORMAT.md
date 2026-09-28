@@ -133,3 +133,39 @@ the payload start and the size the payload length; for `covr`/`snal` the
 offset points at the `ilst` item box while the size is the raw JPEG length
 (the JPEG begins at offset + 24). OpenOSV verifies every entry against the
 box tree and flags mismatches instead of trusting the table.
+
+## 360 metadata written by osvtool
+
+`osvtool render --mode equirect` (`.mp4` / `.mov`) and `osvtool spherical`
+tag the first video track as monoscopic equirectangular 360 video, in both
+of Google's schemes
+([V1](https://github.com/google/spatial-media/blob/master/docs/spherical-video-rfc.md),
+[V2](https://github.com/google/spatial-media/blob/master/docs/spherical-video-v2-rfc.md)):
+
+```
+moov
+  trak                      first track with a 'vide' handler
+    tkhd, edts, mdia ...    unchanged
+      stsd
+        hvc1                every sample entry of the track (avc1, apch, ... alike)
+          hvcC, colr ...    unchanged
+          st3d              FullBox v0: stereo_mode 0 (monoscopic)              13 bytes
+          sv3d                                                                  88 bytes
+            svhd            FullBox v0: metadata_source "OpenOSV\0"
+            proj
+              prhd          FullBox v0: pose yaw, pitch, roll 0 (16.16)
+              equi          FullBox v0: bounds top, bottom, left, right 0 (0.32)
+          pasp, btrt        the optional boxes stay last
+    uuid ffcc8263-f855-4a93-8814-587a02521fdd
+                            GSpherical RDF/XML: Spherical true, Stitched true,
+                            StitchingSoftware OpenOSV, ProjectionType equirectangular
+```
+
+V1 is the box Google's Spatial Media Metadata Injector writes and YouTube
+reads; V2 is what FFmpeg (`Spherical Mapping` side data), VR players and 360
+editors read. Only `moov` is rebuilt: every box on the path gets its new size,
+and when `moov` sits before `mdat` (osvtool's ffmpeg writes `+faststart`)
+every `stco` / `co64` offset of every track moves by the bytes `moov` grew.
+An existing V1 box or `st3d` / `sv3d` pair is replaced, never doubled.
+`--mode reframe` is flat video, and `equirect-polar` puts the lens axes at the
+poles, a layout neither scheme describes, so neither is tagged.

@@ -1,10 +1,14 @@
 # Building OpenOSV on macOS
 
-> **Status: untested on real hardware.** Everything below builds, and most
-> of it is tested, on GitHub's macOS runners (Apple Silicon virtual
-> machines). Nobody has yet run the plug-ins inside Premiere Pro or DaVinci
-> Resolve on a Mac. The table says exactly what has and has not been
-> checked. If you have a Mac, please build it, try it, and
+> **Status: Resolve confirmed by a user, Premiere untested.** Everything
+> below builds, and most of it is tested, on GitHub's macOS runners (Apple
+> Silicon virtual machines). [@arkanos](https://github.com/arkanos) built it
+> on a MacBook Pro M4 running macOS 26.6.1 (Tahoe) and has the DaVinci
+> Resolve plug-ins working
+> ([issue #2](https://github.com/Kemerd/OpenOSV/issues/2), which is also
+> where the missing pkg-config step came from; thank you). Nobody has run
+> the Premiere Pro plug-ins on a Mac yet. The table says exactly what has
+> and has not been checked. If you have a Mac, please build it, try it, and
 > [file an issue or a pull request](https://github.com/Kemerd/OpenOSV/issues)
 > for anything that goes wrong.
 
@@ -18,7 +22,7 @@
 | VideoToolbox hardware decode | yes | no (decode tests need the sample clip) | `--hw videotoolbox`, or `auto` |
 | Plug-in pieces that need no Adobe SDK | yes | yes (`tests/macos`) | The log, the text and number helpers, the Metal GPU path of the effect against its CPU path, the importer's engine hooks, and the bundle packaging (a probe bundle is built, loaded and inspected) |
 | Premiere plug-ins (importer, effect, Source Settings) | only when the SDK secret is set (below) | only the tests above | Never loaded into Premiere Pro on a Mac |
-| DaVinci Resolve bundle (`OpenOSV.ofx.bundle`) | yes, always (it needs no Adobe SDK) | yes (`tests/ofx`: loaded into a mock OpenFX host and compared with the Premiere effect's CPU render) | Never loaded into Resolve on a Mac. The stitch runs on Metal; OpenOSV 360 Reframe renders on the CPU |
+| DaVinci Resolve bundle (`OpenOSV.ofx.bundle`) | yes, always (it needs no Adobe SDK) | yes (`tests/ofx`: loaded into a mock OpenFX host and compared with the Premiere effect's CPU render) | Working in Resolve on a MacBook Pro M4, macOS 26.6.1 ([issue #2](https://github.com/Kemerd/OpenOSV/issues/2)). The stitch runs on Metal; OpenOSV 360 Reframe renders on the CPU |
 | Release zip | yes | the packaged `osvtool` is started once | |
 
 ## Toolchain
@@ -29,15 +33,28 @@
 | Xcode | 16 or newer (15.3+ should work) | AppleClang, libc++, the Metal compiler and Rez. Without the Metal compiler (newer Xcodes download it separately: `xcodebuild -downloadComponent MetalToolchain`) the Metal renderer compiles its kernels at run time instead |
 | CMake | 3.28+ | |
 | Ninja | any | `brew install ninja` |
-| vcpkg | any recent checkout | Set `VCPKG_ROOT` |
+| pkg-config | any | `brew install pkg-config`. vcpkg's FFmpeg port needs it; the configure stops with that command if it is missing |
+| vcpkg | any recent checkout | `git clone https://github.com/microsoft/vcpkg "$HOME/vcpkg"`, then set `VCPKG_ROOT` |
 
 ## Configure, build, test
 
+The short way: `scripts/build_mac.sh` installs what is missing (Homebrew's
+cmake, ninja and pkg-config; vcpkg in `~/vcpkg` unless `VCPKG_ROOT` is set)
+and builds `macos-release`. `--install-ofx` then installs the Resolve
+bundle, `--test` runs the tests, `--help` lists the rest.
+
+The same by hand, as confirmed on an M4 in
+[issue #2](https://github.com/Kemerd/OpenOSV/issues/2):
+
 ```sh
-export VCPKG_ROOT=~/vcpkg
+brew install cmake ninja pkg-config
+git clone https://github.com/microsoft/vcpkg "$HOME/vcpkg"
+"$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+export VCPKG_ROOT="$HOME/vcpkg"
 cmake --preset macos-release
 cmake --build --preset macos-release
-ctest --preset macos
+ctest --preset macos               # optional
+scripts/install_ofx.sh             # the DaVinci Resolve plug-ins
 ```
 
 The first configure installs the vcpkg manifest (FFmpeg takes about five

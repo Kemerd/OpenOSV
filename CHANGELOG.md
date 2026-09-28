@@ -6,6 +6,83 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-28
+
+### Added
+
+* **OpenOSV Studio (`osvgui`), a batch app for `osvtool`.** Drop `.OSV`
+  files or whole folders on it, pick the output, press Start. 360 equirect
+  or a reframed view, size, colour, HDR style, stabilisation, sun ghost
+  removal, encoder, quality, audio and the 360 tag are each an `osvtool
+  render` option, and the window shows the exact command it runs next (or a
+  whole-folder loop to copy). The queue renders one clip at a time with
+  progress, time left, pause after the current clip and stop; folders are
+  searched all the way down and `.LRF` proxies skipped. It picks the fastest
+  HEVC encoder that works on the machine, points to FFmpeg when it's
+  missing, and remembers every setting. Windows and macOS; `cli\osvgui.exe`
+  in both release zips. See `docs/STUDIO.md`.
+* **360 video metadata.** `osvtool render --mode equirect` now tags its `.mp4`
+  / `.mov` as 360 video: Spherical Video V1 (the `uuid` box YouTube reads)
+  and V2 (`st3d` + `sv3d`, what FFmpeg, VR players and 360 editors read).
+  Upload it as it is; Google's Spatial Media Metadata Injector is no longer
+  needed. On by default, `--no-spherical-metadata` turns it off. Reframes
+  stay flat.
+* **`osvtool spherical`** tags an existing equirectangular video the same
+  way, such as a Premiere Pro or DaVinci Resolve export:
+  `osvtool spherical export.mp4` in place, or `--out tagged.mp4`. Only the
+  `moov` box is rebuilt; the media data is streamed to a temporary file that
+  replaces the original once complete, so a 50 GB file needs no 50 GB of
+  RAM and a failure leaves it untouched. Chunk offsets move with the `moov`.
+  A file already tagged is left alone, an older tag is replaced rather than
+  doubled, and truncated, malformed or fragmented files are refused.
+
+### Fixed
+
+* **Wavy, stair-stepped lines in the stitch.** The seam correction measured
+  along the seam was also applied to every other pixel of both lenses,
+  rotating each one toward or away from its lens centre. Wherever the
+  correction varied, straight lines far from any seam came out wavy. On an 8K
+  clip, a fence thirty metres away became a staircase. The correction now acts
+  only near the seam, where it was measured (full within 6 degrees, fading out
+  by 12), and leaves the rest of the picture alone.
+* **An attached `.LRF` proxy played back glitchy.** Premiere requires an
+  attached proxy to match its original's frame rate and duration, and its frame
+  size to divide the original's. Anything else is accepted without a warning
+  and misbehaves. The camera's `.LRF` is 29.97 fps (25 for a 50 fps clip)
+  against a 59.94 fps `.OSV`, and 2048 x 1024 against 6000 x 3000 or
+  7680 x 3840. An `.LRF` next to its `.OSV` now presents itself on the
+  original's timeline:
+  * the original's frame rate and length, each frame showing the moment the
+    original shows, matched by the camera's own timestamps;
+  * a size that divides the original's (2000 x 1000 for 6K, 1920 x 960 for
+    8K).
+
+  A new proxy also starts from the Source Settings its `.OSV` is decoded with,
+  so switching proxies on doesn't change the stabilisation or the colour. An
+  `.LRF` on its own is unchanged.
+* **The panel misread the D-Log M Curve popup** after Avata 360 joined it (four
+  entries, not three). It counted the entries to learn how the host numbers
+  popups, and the stale count could mistake the default curve for the last
+  entry. Panel 1.0.1.
+
+### Changed
+
+* The importer log says how calibration pixels map to stream pixels for each
+  clip, including the camera's own focal ratio for 8K, so a seam that's off
+  can be told apart from parallax.
+* **macOS build, step by step.** `scripts/build_mac.sh` installs what the
+  build needs (Homebrew's CMake, Ninja and pkg-config; vcpkg in `~/vcpkg`),
+  builds, and with `--install-ofx` installs the DaVinci Resolve bundle. A
+  configure without pkg-config, which vcpkg's FFmpeg needs, now stops at once
+  and names the fix instead of failing deep inside vcpkg. The README and
+  `docs/BUILDING_MAC.md` give the same steps by hand. Thanks to
+  [@arkanos](https://github.com/arkanos), who found the missing step and has
+  the Resolve plug-ins working on a MacBook Pro M4 with macOS 26.6.1
+  ([#2](https://github.com/Kemerd/OpenOSV/issues/2)).
+* **The README's command-line section is a how-to now:** setting up
+  `osvtool` and FFmpeg, recipes for a YouTube-ready 360 video, HDR, a
+  reframed view, a test run and a whole folder, and the options that matter.
+
 ## [0.2.2] - 2026-09-27
 
 ### Added

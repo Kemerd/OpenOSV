@@ -19,6 +19,8 @@
 #
 #    OpenOSV-<version>-macos-arm64/
 #      bin/osvtool               + the FFmpeg dylibs it loads, beside it
+#      bin/osvgui                OpenOSV Studio, the batch app (when it was
+#                                built: vcpkg's imgui and glfw3 ports)
 #      plugins/OpenOSV/          the Premiere bundles (only when they were built)
 #      luts/ presets/ panel/     as in the repository
 #      scripts/install_plugins.sh
@@ -82,11 +84,23 @@ mkdir -p "$STAGE/bin" "$STAGE/licenses" "$STAGE/scripts" "$STAGE/docs"
 step "osvtool"
 cp "$TOOL" "$STAGE/bin/osvtool"
 
+# OpenOSV Studio runs the osvtool beside it, so it ships in the same folder.
+GUI="$BUILD_DIR/bin/osvgui"
+HAVE_GUI=0
+if [ -x "$GUI" ]; then
+    cp "$GUI" "$STAGE/bin/osvgui"
+    HAVE_GUI=1
+    step "osvgui (OpenOSV Studio)"
+fi
+
 rpath_deps() {
     otool -L "$1" | tail -n +2 | awk '{print $1}' | grep '^@rpath/' | sed 's|^@rpath/||' || true
 }
 
 queue=("$STAGE/bin/osvtool")
+if [ "$HAVE_GUI" -eq 1 ]; then
+    queue+=("$STAGE/bin/osvgui")
+fi
 copied=""
 while [ "${#queue[@]}" -gt 0 ]; do
     current="${queue[0]}"
@@ -124,6 +138,9 @@ fix_rpaths() {
     fi
 }
 fix_rpaths "$STAGE/bin/osvtool" "@executable_path"
+if [ "$HAVE_GUI" -eq 1 ]; then
+    fix_rpaths "$STAGE/bin/osvgui" "@executable_path"
+fi
 for dep in $copied; do
     install_name_tool -id "@rpath/$dep" "$STAGE/bin/$dep"
     fix_rpaths "$STAGE/bin/$dep" "@loader_path"
@@ -134,6 +151,9 @@ for dep in $copied; do
     codesign --force --sign - --timestamp=none "$STAGE/bin/$dep"
 done
 codesign --force --sign - --timestamp=none "$STAGE/bin/osvtool"
+if [ "$HAVE_GUI" -eq 1 ]; then
+    codesign --force --sign - --timestamp=none "$STAGE/bin/osvgui"
+fi
 
 # The staged copy must run on its own before it is shipped.
 "$STAGE/bin/osvtool" --version >/dev/null || fail "the packaged osvtool does not start"

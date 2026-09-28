@@ -37,7 +37,7 @@
 
 var OpenOSVHost = (function () {
     // ---- identity (mirrors panel/shared/osvcore.js, checked by a test) ------
-    var VERSION = '1.0.0';
+    var VERSION = '1.0.1';
     var MATCH_NAME = 'OpenOSV.Open360Reframe';
     var HOST_MATCH_NAME = 'AE.OpenOSV.Open360Reframe';
     var DISPLAY_NAME = 'Open 360 Reframe';

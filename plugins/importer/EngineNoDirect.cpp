@@ -57,6 +57,14 @@ void enginePublishPrefs(const std::filesystem::path& path, const PrefsBlob& pref
     }
 }
 
+bool enginePublishedPrefs(const std::filesystem::path& path, PrefsBlob& out) noexcept {
+    // Publications are dropped in this build (see enginePublishPrefs), so
+    // there is never anything to hand back.
+    (void)path;
+    (void)out;
+    return false;
+}
+
 void engineShutdown() noexcept {
     // No engine clips, no decoders, no device memory: nothing to release.
 }

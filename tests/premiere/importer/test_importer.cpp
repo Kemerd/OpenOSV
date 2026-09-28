@@ -2011,6 +2011,216 @@ TEST_CASE("the .LRF proxy opens and describes itself", "[importer][open][lrf][sa
 }
 
 // =============================================================================
+//  [PROXY] The .LRF as Premiere's proxy of its .OSV
+// =============================================================================
+
+namespace {
+
+/// Mean absolute difference of the green channel of two frames of any sizes,
+/// sampled on a common 256 x 128 grid (nearest pixel of each), over the
+/// pixels both cover.  Green, because it carries most of the luminance.
+[[nodiscard]] double frameDifference(const DecodedFrame& a, const DecodedFrame& b) {
+    double sum = 0.0;
+    std::size_t n = 0;
+    for (std::uint32_t gy = 0; gy < 128u; ++gy) {
+        for (std::uint32_t gx = 0; gx < 256u; ++gx) {
+            const float* pa = a.pixel(gx * a.width / 256u, gy * a.height / 128u);
+            const float* pb = b.pixel(gx * b.width / 256u, gy * b.height / 128u);
+            if (pa[3] < 0.5f || pb[3] < 0.5f) {
+                continue;
+            }
+            sum += std::fabs(static_cast<double>(pa[1]) - static_cast<double>(pb[1]));
+            ++n;
+        }
+    }
+    return n > 0 ? sum / static_cast<double>(n) : 1.0;
+}
+
+/// Render timeline time `ticks` of `clip` at its advertised size with
+/// `prefs` and read it back.
+[[nodiscard]] DecodedFrame renderAt(ImporterHarness& harness, ImporterHarness::ClipHandle& clip,
+                                    const imFileInfoRec8& info, PrTime ticks, const PrefsBlob& prefs) {
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+    ImporterHarness::SourceVideoRequest request;
+    request.frameTime = ticks;
+    request.width = info.vidInfo.imageWidth;
+    request.height = info.vidInfo.imageHeight;
+    PPixHand hand = nullptr;
+    const csSDK_int32 result = harness.getSourceVideo(clip, request, prefs, hand);
+    INFO("imGetSourceVideo returned " << result);
+    REQUIRE(result == imNoErr);
+    REQUIRE(hand != nullptr);
+    DecodedFrame frame = readPPix(harness.host(), ppix, hand);
+    if (ppix->Dispose) {
+        ppix->Dispose(hand);
+    }
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+    return frame;
+}
+
+}  // namespace
+
+TEST_CASE("an .LRF beside its .OSV is presented as its proxy: the original's frame rate, length and a whole-number "
+          "size ratio",
+          "[importer][lrf][proxy][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    const std::filesystem::path proxy = sampleProxyPath();
+    std::error_code ec;
+    if (proxy.empty() || !std::filesystem::exists(proxy, ec)) {
+        SKIP("the .LRF proxy is not present at " << proxy.string());
+    }
+    // The camera's layout: CAM.LRF beside CAM.OSV.  The sample pair is laid
+    // out that way; the test says so rather than passing by accident.
+    std::filesystem::path original = proxy;
+    original.replace_extension(".OSV");
+    if (!std::filesystem::exists(original, ec)) {
+        SKIP("the sample .LRF is not beside its .OSV: " << original.string());
+    }
+
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    auto clip = harness.openClip(proxy);
+    INFO("open result " << clip.openResult());
+    REQUIRE(clip.open());
+    imFileInfoRec8 info{};
+    REQUIRE(harness.getInfo8(clip, info) == imNoErr);
+
+    // ---- Adobe's rules for an attached proxy ------------------------------------
+    // The recorded .LRF is 124 frames at 29.97 fps; its original (the sample
+    // .OSV, cut from the same recording) is 65 frames at 59.94.  The proxy
+    // takes the original's frame rate and length...
+    CHECK(info.vidScale == 60000);
+    CHECK(info.vidSampleSize == 1001);
+    CHECK(info.vidInfo.frameRate == kTicksPerFrame5994);
+    CHECK(info.vidDurationInFrames == kSampleFrames);
+    // ...and a size that divides the original's 6000 x 3000 by a whole
+    // number, the one nearest its own 2048 x 1024: 2000 x 1000.
+    CHECK(info.vidInfo.imageWidth == 2000);
+    CHECK(info.vidInfo.imageHeight == 1000);
+    CHECK(kSampleWidth % info.vidInfo.imageWidth == 0);
+    CHECK(kSampleHeight % info.vidInfo.imageHeight == 0);
+    // Audio channels must match too, and do.
+    CHECK(info.audInfo.numChannels == kSampleAudioChannels);
+
+    // ---- every timeline frame shows the same moment as the original's ----------
+    // The sample .OSV starts 1.068 s into its .LRF (the camera's timestamps),
+    // so the proxy's first frame is the .LRF's frame 32, not its frame 0.
+    // Rendered without stabilisation or ghost removal, the proxy's frame 0
+    // must look like the original's frame 0 far more than a frame a second
+    // away does - and more than the .LRF's own first frame would.
+    PrefsBlob prefs = PrefsBlob::defaults();
+    prefs.stabilization = static_cast<std::uint8_t>(PrefsStabilization::Off);
+    prefs.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::Rec709);
+    prefs.flareRemoval = 0;
+
+    // Its own importer id: the host's frame cache is keyed by it.
+    auto originalClip = harness.openClip(original, 8);
+    REQUIRE(originalClip.open());
+    imFileInfoRec8 originalInfo{};
+    REQUIRE(harness.getInfo8(originalClip, originalInfo) == imNoErr);
+    // The original at a size it advertises (a half of 6000 x 3000).
+    originalInfo.vidInfo.imageWidth = 3000;
+    originalInfo.vidInfo.imageHeight = 1500;
+    const DecodedFrame originalFrame0 = renderAt(harness, originalClip, originalInfo, 0, prefs);
+
+    const DecodedFrame proxyFrame0 = renderAt(harness, clip, info, 0, prefs);
+    CHECK(proxyFrame0.width == 2000u);
+    CHECK(proxyFrame0.height == 1000u);
+    const DecodedFrame proxyFrame60 = renderAt(harness, clip, info, 60 * kTicksPerFrame5994, prefs);
+    const double same = frameDifference(proxyFrame0, originalFrame0);
+    const double later = frameDifference(proxyFrame60, originalFrame0);
+    INFO("original frame 0 against the proxy's frame 0: " << same << ", against its frame 60: " << later);
+    CHECK(same < later);
+    CHECK(same < 0.03);
+}
+
+TEST_CASE("an .LRF on its own keeps its own timeline and size", "[importer][lrf][proxy][sample]") {
+    const std::filesystem::path proxy = sampleProxyPath();
+    std::error_code ec;
+    if (proxy.empty() || !std::filesystem::exists(proxy, ec)) {
+        SKIP("the .LRF proxy is not present at " << proxy.string());
+    }
+    // A copy with no .OSV beside it.
+    const std::filesystem::path alone =
+        std::filesystem::temp_directory_path() / "openosv-lrf-alone" / proxy.filename();
+    std::filesystem::create_directories(alone.parent_path(), ec);
+    std::filesystem::copy_file(proxy, alone, std::filesystem::copy_options::overwrite_existing, ec);
+    REQUIRE_FALSE(ec);
+
+    {
+        ImporterHarness harness;
+        REQUIRE(harness.loaded());
+        auto clip = harness.openClip(alone);
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info) == imNoErr);
+        // As recorded: 124 frames at 30000 / 1001, 2 x 1024 lens height.
+        CHECK(info.vidScale == 30000);
+        CHECK(info.vidSampleSize == 1001);
+        CHECK(info.vidDurationInFrames == 124);
+        CHECK(info.vidInfo.imageWidth == 2048);
+        CHECK(info.vidInfo.imageHeight == 1024);
+    }
+    // The clip is closed with the harness, so the copy can go.
+    std::filesystem::remove_all(alone.parent_path(), ec);
+}
+
+TEST_CASE("a new .LRF proxy starts from the Source Settings its .OSV is decoded with", "[importer][lrf][proxy][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    const std::filesystem::path proxy = sampleProxyPath();
+    std::error_code ec;
+    if (proxy.empty() || !std::filesystem::exists(proxy, ec)) {
+        SKIP("the .LRF proxy is not present at " << proxy.string());
+    }
+    std::filesystem::path original = proxy;
+    original.replace_extension(".OSV");
+    if (!std::filesystem::exists(original, ec)) {
+        SKIP("the sample .LRF is not beside its .OSV: " << original.string());
+    }
+#if !defined(_WIN32)
+    SKIP("only the Windows importer keeps the published settings (Engine.cpp)");
+#endif
+
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+
+    // The original, decoded with settings nobody would get by default.
+    PrefsBlob chosen = PrefsBlob::defaults();
+    chosen.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::HLG);
+    chosen.stabilization = static_cast<std::uint8_t>(PrefsStabilization::Full);
+    chosen.exposureStops = 0.75f;
+    REQUIRE(chosen.sanitise());
+    auto originalClip = harness.openClip(original, 8);
+    REQUIRE(originalClip.open());
+    imFileInfoRec8 originalInfo{};
+    REQUIRE(harness.getInfo8(originalClip, originalInfo, &chosen) == imNoErr);
+
+    // Its proxy, attached afterwards, with no settings of its own: Premiere
+    // does not carry the master clip's Source Settings over to it.
+    auto proxyClip = harness.openClip(proxy, 9);
+    REQUIRE(proxyClip.open());
+    imFileInfoRec8 proxyInfo{};
+    REQUIRE(harness.getInfo8(proxyClip, proxyInfo) == imNoErr);
+
+    // What the proxy is decoded with, as the importer reports it.
+    imFileAccessRec8 access{};
+    std::vector<char> buffer(PrefsBlob::kSize, 0);
+    const PrefsBlob probe = PrefsBlob::defaults();
+    std::memcpy(buffer.data(), &probe, PrefsBlob::kSize);
+    imSourceSettingsCommandRec rec{};
+    rec.ioData = buffer.data();
+    rec.inDataSize = static_cast<csSDK_int32>(PrefsBlob::kSize);
+    rec.inPrivateData = proxyClip.privateData();
+    REQUIRE(harness.send(imPerformSourceSettingsCommand, &access, &rec) == imNoErr);
+    const PrefsBlob proxyPrefs = PrefsBlob::fromBytes(buffer.data(), buffer.size());
+    CHECK(proxyPrefs.colorOutput == chosen.colorOutput);
+    CHECK(proxyPrefs.stabilization == chosen.stabilization);
+    CHECK(proxyPrefs.exposureStops == chosen.exposureStops);
+}
+
+// =============================================================================
 //  Timing
 // =============================================================================
 

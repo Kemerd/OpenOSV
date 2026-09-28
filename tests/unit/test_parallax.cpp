@@ -550,6 +550,70 @@ TEST_CASE("a parallax warp never makes a direction the rig sees transparent", "[
     }
 }
 
+TEST_CASE("the per-column seam table acts only near the seam", "[render][parallax][seamtable]") {
+    // The table is measured in a band of +/- 6 degrees around the seam and
+    // says nothing about the rest of the sphere.  Applied to every ray, it
+    // rotated each one toward or away from its lens axis - a real 8K clip
+    // with a table of -3 degrees in places bent a fence thirty metres away
+    // into a staircase.  It now acts in full within 6 degrees of the seam,
+    // fades out by 12, and leaves everything beyond bit for bit alone.
+    const SceneFixture& s = scene();
+    REQUIRE(s.ok);
+    ThreadPool pool;
+    render::CpuRenderer cpu(pool);
+    geom::BlendParams blend;
+    const OsvColorParams cp =
+        color::makeColorParams(color::kDefaultDlogMFit, color::OutputTransfer::Rec709, 0.0f);
+
+    // The polar-axis layout: row r is latitude 90 - 180 (r + 0.5) / H from
+    // the seam plane, so the seam is the middle row.
+    geom::EquirectMap map;
+    map.layout = geom::EquirectLayout::PolarAxis;
+    map.w = 512;
+    map.h = 256;
+
+    render::RenderParamsBuilder plainBuilder;
+    plainBuilder.rig(s.rig).equirect(map).blend(blend, true).color(cp);
+    auto plainJob = plainBuilder.build(s.parallax);
+    REQUIRE(plainJob.ok());
+    auto plain = cpu.render(plainJob.value());
+    REQUIRE(plain.ok());
+
+    // A constant 3 degree disparity for every column.
+    render::RenderParamsBuilder tableBuilder;
+    tableBuilder.rig(s.rig).equirect(map).blend(blend, true).color(cp).seam(std::vector<float>(2048u, 3.0f));
+    auto tableJob = tableBuilder.build(s.parallax);
+    REQUIRE(tableJob.ok());
+    REQUIRE(tableJob.value().params.seamShiftEnabled == 1);
+    auto table = cpu.render(tableJob.value());
+    REQUIRE(table.ok());
+
+    const std::vector<float>& a = plain.value().data;
+    const std::vector<float>& b = table.value().data;
+    REQUIRE(a.size() == b.size());
+    std::size_t farChanged = 0;
+    std::size_t nearChanged = 0;
+    std::size_t nearTotal = 0;
+    for (std::uint32_t y = 0; y < 256u; ++y) {
+        const double latDeg = 90.0 - 180.0 * (static_cast<double>(y) + 0.5) / 256.0;
+        for (std::uint32_t x = 0; x < 512u; ++x) {
+            const std::size_t i = (static_cast<std::size_t>(y) * 512u + x) * 4u;
+            const bool differs = std::memcmp(&a[i], &b[i], 4u * sizeof(float)) != 0;
+            if (std::fabs(latDeg) > 12.5) {
+                farChanged += differs ? 1u : 0u;
+            } else if (std::fabs(latDeg) < 4.0) {
+                ++nearTotal;
+                nearChanged += differs ? 1u : 0u;
+            }
+        }
+    }
+    INFO("far pixels changed: " << farChanged << "; near pixels changed: " << nearChanged << " of " << nearTotal);
+    // Nothing beyond the fade moves...
+    CHECK(farChanged == 0u);
+    // ...and the table still does its job at the seam.
+    CHECK(nearChanged > nearTotal / 2u);
+}
+
 TEST_CASE("osvWarpSample wraps longitude, and is zero outside the grid's latitude span", "[render][parallax]") {
     // A 4 x 3 grid whose dLon value equals its column index: continuity
     // across the +/-180 meridian is then visible as the interpolation between

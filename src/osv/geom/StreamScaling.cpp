@@ -92,7 +92,18 @@ Result<StreamScaling> StreamScaling::derive(int streamW, int streamH, int sensor
     if (streamW == sensorW && streamH == sensorH) {
         s.scale = 1.0;
         s.verified = true;
-        addNote(notes, "stream scale 1.0: stream equals the calibration frame");
+        // The camera's own focal length for the stream, beside the rule: on
+        // the 6K clip digital_focal_length / fx reproduces the verified crop
+        // scale to five digits, so on an 8K clip it says whether the stream
+        // really is the calibration frame at 1:1.
+        if (std::isfinite(digitalFocalLength) && digitalFocalLength > 0.0 && std::isfinite(calFxMean) &&
+            calFxMean > 0.0) {
+            addNote(notes, std::format("stream scale 1.0: stream equals the calibration frame (the recorded "
+                                       "digital_focal_length / fx is {:.6f})",
+                                       digitalFocalLength / calFxMean));
+        } else {
+            addNote(notes, "stream scale 1.0: stream equals the calibration frame");
+        }
         return s;
     }
 

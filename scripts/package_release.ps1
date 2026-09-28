@@ -15,7 +15,8 @@
 
     Each zip carries only what its editor uses, with its own Install.cmd,
     Uninstall.cmd, README.txt, licences and SHA256SUMS.txt; both carry
-    cli\osvtool.exe and the LUTs folder (one sub-folder per output and a
+    cli\osvtool.exe, cli\osvgui.exe (OpenOSV Studio, the batch app in front
+    of osvtool) and the LUTs folder (one sub-folder per output and a
     README.txt; one set for the Osmo 360 and the Pocket 3).  The Resolve zip
     is made whenever the
     build made the OpenFX bundle (OSV_BUILD_OFX, on in the release preset).
@@ -49,10 +50,10 @@
         folder), so the packaged script installs from the package with no
         arguments.  In the Resolve package, the OpenFX bundle sits at
         plugins\OpenOSV.ofx.bundle, where install_ofx.ps1 looks for it.
-        cli\ holds osvtool.exe and exactly the DLLs it imports.  The module
-        and CLI DLL sets are the import closure walked with dumpbin, so a
-        stale DLL left in the build folder by an older FFmpeg is never
-        shipped.
+        cli\ holds osvtool.exe, osvgui.exe and exactly the DLLs they
+        import (glfw3.dll comes with osvgui).  The module and CLI DLL sets
+        are the import closure walked with dumpbin, so a stale DLL left in
+        the build folder by an older FFmpeg is never shipped.
      4. Generates the LUTs with the PACKAGED osvtool (scripts\gen_luts.ps1),
         which also proves cli\ runs on its own, and builds the panel's .ccx
         with the PACKAGED install_plugins.ps1 (a dry run into a temporary
@@ -204,10 +205,17 @@ $script:ThirdParty = @(
        Dll  = '^OpenCL\.dll$';                                    File = 'OpenCL-ICD-Loader.txt' }
     @{ Port = 'miniz';         Name = 'miniz';                    Licence = 'MIT';
        Dll  = '^miniz\.dll$';                                     File = 'miniz.txt' }
+    # OpenOSV Studio (cli\osvgui.exe): GLFW as a DLL beside it, Dear ImGui
+    # (with the stb_truetype / stb_rect_pack / stb_textedit it embeds)
+    # linked in statically.
+    @{ Port = 'glfw3';         Name = 'GLFW';                     Licence = 'Zlib';
+       Dll  = '^glfw3\.dll$';                                     File = 'GLFW.txt' }
+    @{ Port = 'imgui';         Name = 'Dear ImGui';               Licence = 'MIT';
+       InFiles = @('osvgui.exe');                                 File = 'Dear-ImGui.txt' }
     @{ Port = 'ffnvcodec';     Name = 'nv-codec-headers';         Licence = 'MIT';
        In   = 'the FFmpeg DLLs (NVDEC / NVENC interface)';        File = 'nv-codec-headers.txt' }
     @{ Port = 'nlohmann-json'; Name = 'nlohmann/json';            Licence = 'MIT';
-       InFiles = @('OpenOSVImporter.prm', 'OpenOSVSourceSettings.aex', 'osvtool.exe'); File = 'nlohmann-json.txt' }
+       InFiles = @('OpenOSVImporter.prm', 'OpenOSVSourceSettings.aex', 'osvtool.exe', 'osvgui.exe'); File = 'nlohmann-json.txt' }
     @{ Port = 'cli11';         Name = 'CLI11';                    Licence = 'BSD-3-Clause';
        InFiles = @('osvtool.exe');                                File = 'CLI11.txt' }
     @{ Port = 'tinyexr';       Name = 'tinyexr';                  Licence = 'BSD-3-Clause';
@@ -599,6 +607,17 @@ function Get-BuildInfo {
         throw "The build has no '$osvtool'."
     }
 
+    # OpenOSV Studio ships beside osvtool in cli\.  It is built when vcpkg
+    # provides the imgui and glfw3 ports (vcpkg.json), which a release build
+    # always installs; a build without it is incomplete, not a variant.
+    $osvgui = Join-Path $bin 'osvgui.exe'
+    if (-not (Test-Path -LiteralPath $osvgui -PathType Leaf)) {
+        if ((Get-CacheValue $cache 'OSV_BUILD_GUI') -match '^(ON|TRUE|1|YES)$') {
+            throw "The build has no '$osvgui'. Build the $($script:Preset) preset completely first."
+        }
+        throw "'$Dir' was configured without OpenOSV Studio (OSV_BUILD_GUI is off: the vcpkg ports imgui and glfw3 were not found). Install the manifest (vcpkg.json) and configure again."
+    }
+
     # The OpenFX bundle: required when the build was configured with it, so
     # a half-built bundle fails here rather than shipping without Resolve.
     $ofxBundle = $null
@@ -673,6 +692,7 @@ function Get-BuildInfo {
         Stage        = $stage
         Bin          = $bin
         OsvTool      = $osvtool
+        OsvGui       = $osvgui
         Dumpbin      = $dumpbin
         Installed    = $installed
         Share        = $share
@@ -826,18 +846,23 @@ function Copy-OfxBundle {
 }
 
 # ---------------------------------------------------------------------------
-#  cli\: osvtool.exe and exactly the DLLs it imports.
+#  cli\: osvtool.exe, osvgui.exe (OpenOSV Studio, which runs the osvtool.exe
+#  beside it) and exactly the DLLs the two import - one closure, so a DLL
+#  both need is shipped once.
 # ---------------------------------------------------------------------------
 function Copy-CommandLineTool {
     param($Build, [string] $Package)
     $target = Join-Path $Package 'cli'
     New-Directory $target
-    $dlls = Resolve-DllClosure -Roots @($Build.OsvTool) -SearchDir $Build.Bin -Dumpbin $Build.Dumpbin
-    Copy-Item -LiteralPath $Build.OsvTool -Destination $target -Force
+    $roots = @($Build.OsvTool, $Build.OsvGui)
+    $dlls = Resolve-DllClosure -Roots $roots -SearchDir $Build.Bin -Dumpbin $Build.Dumpbin
+    foreach ($exe in $roots) {
+        Copy-Item -LiteralPath $exe -Destination $target -Force
+    }
     foreach ($dll in $dlls) {
         Copy-Item -LiteralPath $dll -Destination $target -Force
     }
-    Write-Info ("cli: osvtool.exe and {0} DLLs" -f $dlls.Count)
+    Write-Info ("cli: osvtool.exe, osvgui.exe and {0} DLLs" -f $dlls.Count)
     return @($dlls | ForEach-Object { Split-Path -Leaf $_ })
 }
 
@@ -880,6 +905,12 @@ function Test-PackagedCli {
     Write-Info "cli\osvtool.exe --version runs from the package alone:"
     foreach ($line in $run.Output) {
         Write-Info "    $line"
+    }
+    # OpenOSV Studio opens a window, so it is not started here; the closure
+    # walk above already proved every DLL it imports is beside it.
+    $gui = Join-Path $Package 'cli\osvgui.exe'
+    if (-not (Test-Path -LiteralPath $gui -PathType Leaf)) {
+        throw "The package has no '$gui'."
     }
 }
 
@@ -1296,14 +1327,23 @@ Close Premiere Pro and double-click Uninstall.cmd. Then start Premiere
 once while holding Shift, so it forgets the plug-ins.
 
 
-COMMAND LINE
-------------
+COMMAND LINE AND BATCH APP
+--------------------------
 cli\osvtool.exe works without Premiere: inspect a clip, render stills or
 HDR video, write LUTs. "cli\osvtool.exe --help" lists the commands.
 
     cli\osvtool.exe probe CAM_0001.OSV
+    cli\osvtool.exe render CAM_0001.OSV --all --mode equirect --size 3840x1920 --stab horizon --color 709 --out CAM_0001_360.mp4
 
-It needs the Microsoft Visual C++ 2015-2022 Redistributable (x64), which
+The second one is a whole clip as a 360 video, tagged for YouTube and VR.
+
+cli\osvgui.exe is OpenOSV Studio, the same renders without typing: drop
+.OSV files or whole folders on it, pick the output, press Start. It runs
+the osvtool.exe beside it, one clip after another. Video needs FFmpeg
+("winget install Gyan.FFmpeg", or https://ffmpeg.org/download.html); the
+app says so when it is missing.
+
+Both need the Microsoft Visual C++ 2015-2022 Redistributable (x64), which
 Premiere Pro installs.
 
 
@@ -1318,7 +1358,8 @@ presets\                       Premiere sequence presets
 panel\                         the OpenOSV window, CEP and UXP builds;
                                @CCX@ is the UXP installer
 scripts\install_plugins.ps1    what Install.cmd and Uninstall.cmd run
-cli\                           osvtool.exe and its DLLs
+cli\                           osvtool.exe, osvgui.exe (OpenOSV Studio)
+                               and their DLLs
 licenses\                      third-party licences (FFmpeg is LGPL-2.1)
 LICENSE, NOTICE                OpenOSV is Apache-2.0
 CHANGELOG.md                   what changed
@@ -1418,12 +1459,16 @@ UNINSTALL
 Close DaVinci Resolve and double-click Uninstall.cmd.
 
 
-COMMAND LINE
-------------
+COMMAND LINE AND BATCH APP
+--------------------------
 cli\osvtool.exe works on its own: inspect a clip, render stills or HDR
 video, write LUTs, extract audio. "cli\osvtool.exe --help" lists the
-commands. It needs the Microsoft Visual C++ 2015-2022 Redistributable
-(x64): https://aka.ms/vs/17/release/vc_redist.x64.exe
+commands. cli\osvgui.exe is OpenOSV Studio, the same renders without
+typing: drop .OSV files or whole folders on it, pick the output, press
+Start. Video needs FFmpeg ("winget install Gyan.FFmpeg", or
+https://ffmpeg.org/download.html).
+Both need the Microsoft Visual C++ 2015-2022 Redistributable (x64):
+https://aka.ms/vs/17/release/vc_redist.x64.exe
 The plug-ins themselves use the one DaVinci Resolve ships.
 
 
@@ -1435,7 +1480,8 @@ scripts\install_ofx.ps1        what Install.cmd and Uninstall.cmd run
 LUTs\                          D-Log M LUTs (Osmo 360 and Pocket 3) for
                                Rec.2100 PQ / HLG and Rec.709; its README.txt
                                says which one to use
-cli\                           osvtool.exe and its DLLs
+cli\                           osvtool.exe, osvgui.exe (OpenOSV Studio)
+                               and their DLLs
 licenses\                      third-party licences (FFmpeg is LGPL-2.1)
 LICENSE, NOTICE                OpenOSV is Apache-2.0
 CHANGELOG.md                   what changed
@@ -1849,7 +1895,8 @@ each comes under. Every text here is the component's own, verbatim.
     $runtime = if ($Editor -eq 'Resolve') {
         "Windows' own DLLs and the Microsoft Visual C++ runtime are not shipped.`n" +
         "Windows provides the first; DaVinci Resolve ships the second for the`n" +
-        "plug-ins, and cli\osvtool.exe uses the Visual C++ Redistributable."
+        "plug-ins, and cli\osvtool.exe and cli\osvgui.exe use the Visual C++`n" +
+        "Redistributable."
     }
     else {
         "Windows' own DLLs and the Microsoft Visual C++ runtime are not shipped;`nWindows and Premiere Pro provide them."

@@ -43,6 +43,13 @@ if(TARGET osvtool)
   add_dependencies(osv_tests osvtool)
 endif()
 
+# [gui] OpenOSV Studio's UI-free half (tools/osvgui): the queue scan, the
+# settings file, the command builder and the progress parser.
+if(TARGET osvgui_core)
+  target_link_libraries(osv_tests PRIVATE osvgui_core)
+  target_compile_definitions(osv_tests PRIVATE OSV_HAVE_GUI_CORE=1)
+endif()
+
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/test-output")
 
 # The GPU decoder tests drive the CUDA driver API directly (contexts,

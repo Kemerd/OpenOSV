@@ -20,8 +20,9 @@
 #  load unsigned code, and an ad-hoc signature is what a build from source
 #  gets.
 #
-#  UNTESTED: nobody has run this bundle inside Resolve on a Mac yet.  If it
-#  misbehaves, please file an issue or a pull request:
+#  Community-tested: working in Resolve on a MacBook Pro M4, macOS 26.6.1
+#  (issue #2).  If it misbehaves on yours, please file an issue or a pull
+#  request:
 #  https://github.com/Kemerd/OpenOSV/issues
 #
 #  Usage:
@@ -188,5 +189,5 @@ sign_bundle "$TARGET"
 
 info "Installed. Start DaVinci Resolve. In the Edit page's Effects panel, select"
 info "Open FX and search for OpenOSV: OpenOSV Source (a generator) and OpenOSV 360 Reframe"
-info "(a filter). This build is UNTESTED on macOS: please report what you see at"
+info "(a filter). Mac support is community-tested: please report anything odd at"
 info "https://github.com/Kemerd/OpenOSV/issues"

@@ -212,12 +212,13 @@ void copyUtf16(prUTF16Char* dst, std::size_t capacity, const std::wstring& src) 
     return 254016000000LL;
 }
 
-/// Ticks per video frame from the clip's exact container rational.
+/// Ticks per video frame from the clip's exact container rational - the
+/// timeline's, which for an .LRF proxy is its original's (isProxy()).
 /// ticksPerSecond * denominator / numerator is exact for 60000/1001 because
 /// 254016000000 is divisible by 60000.
 [[nodiscard]] PrTime ticksPerFrameFor(const ImporterInstance& instance) noexcept {
-    const std::uint32_t num = instance.rateNumerator();
-    const std::uint32_t den = instance.rateDenominator();
+    const std::uint32_t num = instance.timelineRateNumerator();
+    const std::uint32_t den = instance.timelineRateDenominator();
     if (num == 0 || den == 0) {
         return 0;
     }
@@ -227,9 +228,9 @@ void copyUtf16(prUTF16Char* dst, std::size_t capacity, const std::wstring& src) 
     return (tps * static_cast<PrTime>(den)) / static_cast<PrTime>(num);
 }
 
-/// Frame index for a host time, rounded to nearest and clamped into the clip
-/// (docs: "Frame index = inFrameTime / ticksPerFrame with rounding,
-/// clamped").
+/// Timeline frame index for a host time, rounded to nearest and clamped into
+/// the clip (docs: "Frame index = inFrameTime / ticksPerFrame with rounding,
+/// clamped").  The frame decoded for it is sourceFrameFor() of this.
 [[nodiscard]] std::uint32_t frameIndexFor(const ImporterInstance& instance, PrTime frameTime) noexcept {
     const PrTime perFrame = ticksPerFrameFor(instance);
     if (perFrame <= 0) {
@@ -242,7 +243,7 @@ void copyUtf16(prUTF16Char* dst, std::size_t capacity, const std::wstring& src) 
     // frame number by a rounded tick count lands a tick or two short, and
     // truncation would then serve the previous frame.
     const PrTime index = (frameTime + perFrame / 2) / perFrame;
-    const std::uint32_t total = instance.frameCount();
+    const std::uint32_t total = instance.timelineFrameCount();
     if (total == 0) {
         return 0;
     }
@@ -524,9 +525,11 @@ csSDK_int32 handleGetInfo8(imStdParms* stdParms, imFileAccessRec8* fileAccess, i
 
     // vidScale / vidSampleSize are filled from the same rational for hosts
     // that predate vid.frameRate.
-    info->vidScale = static_cast<csSDK_int32>(instance->rateNumerator());
-    info->vidSampleSize = static_cast<csSDK_int32>(instance->rateDenominator());
-    info->vidDurationInFrames = static_cast<csSDK_int64>(instance->frameCount());
+    // [PROXY] The timeline: an .LRF beside its .OSV reports the original's
+    // frame rate and length, which Premiere requires of an attached proxy.
+    info->vidScale = static_cast<csSDK_int32>(instance->timelineRateNumerator());
+    info->vidSampleSize = static_cast<csSDK_int32>(instance->timelineRateDenominator());
+    info->vidDurationInFrames = static_cast<csSDK_int64>(instance->timelineFrameCount());
 
     // vidDuration is the duration in the video timebase, i.e. frames *
     // sampleSize (PrSDKImport.h:399-401).  Compute it in 64 bits and SATURATE:
@@ -535,8 +538,8 @@ csSDK_int32 handleGetInfo8(imStdParms* stdParms, imFileAccessRec8* fileAccess, i
     // as a negative duration to any host that looks at it.  vidDurationInFrames
     // is set above and supersedes this field (PrSDKImport.h:426), but a field
     // we fill must not be able to hold a lie.
-    const std::int64_t durationTimebase =
-        static_cast<std::int64_t>(instance->frameCount()) * static_cast<std::int64_t>(instance->rateDenominator());
+    const std::int64_t durationTimebase = static_cast<std::int64_t>(instance->timelineFrameCount()) *
+                                          static_cast<std::int64_t>(instance->timelineRateDenominator());
     constexpr std::int64_t kMaxInt32 = 0x7FFFFFFF;
     if (durationTimebase > kMaxInt32) {
         PluginLog::oncef("importer/viddur", PluginLog::Level::Warn,
@@ -604,7 +607,7 @@ csSDK_int32 handleGetInfo8(imStdParms* stdParms, imFileAccessRec8* fileAccess, i
     copyUtf16(info->sourceSettingsMatchName, 256, kSourceSettingsHostMatchNameW);
 
     PluginLog::info("imGetInfo8: {} x {} equirect, {} frames, {} ticks/frame, audio {} ch", geometry.width,
-                    geometry.height, instance->frameCount(), static_cast<long long>(vid.frameRate),
+                    geometry.height, instance->timelineFrameCount(), static_cast<long long>(vid.frameRate),
                     instance->audioChannels());
     return imNoErr;
 }
@@ -1023,7 +1026,8 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
     // is leased inside, from the process-wide context, so imShutdown on
     // another thread cannot join it under a copy in progress.
     const Status rendered =
-        instance->renderFrameToHost(frameIndex, geometry, draft, renderPurposeFor(*rec), dst, layout, outputTransfer);
+        instance->renderFrameToHost(instance->sourceFrameFor(frameIndex), geometry, draft, renderPurposeFor(*rec), dst,
+                                    layout, outputTransfer);
     if (!rendered.ok()) {
         g.suites.ppix->Dispose(frame);
         PluginLog::error("imGetSourceVideo: frame {} failed: {}", frameIndex, rendered.error().message);
