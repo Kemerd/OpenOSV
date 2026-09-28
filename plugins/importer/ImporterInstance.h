@@ -272,6 +272,54 @@ public:
     /// Frames per second as a double (rateNumerator / rateDenominator).
     [[nodiscard]] double fps() const noexcept;
 
+    // ---- [PROXY] an .LRF presented as the proxy of its .OSV ----------------
+    //
+    // Premiere attaches a proxy reliably only when it matches its original:
+    // "the frame rate of the original clip and the proxy clip must match, as
+    // well as fielding, duration, and audio channels", and the frame size
+    // should divide the original's (Adobe, "Attach proxies to
+    // full-resolution media").  Anything else is accepted without a warning
+    // and plays back wrong.  The camera writes each .LRF beside its .OSV with
+    // the same name, at 29.97 fps for a 59.94 fps recording and 2048 x 1024
+    // against 6000 x 3000 - neither rule holds as recorded.
+    //
+    // So an .LRF with its .OSV beside it is PRESENTED on the .OSV's timeline:
+    // the .OSV's frame rate and frame count, each timeline frame showing the
+    // .LRF frame recorded at the same moment on the camera's clock, at a size
+    // that divides the .OSV's (geometryForLocked).  Everything inside the
+    // instance - decoding, analyses, stabilisation, renderFrame() - stays in
+    // the .LRF's own frames; only the host-facing layer uses the timeline and
+    // sourceFrameFor().  An .LRF on its own, and every .OSV, is presented on
+    // its own timeline exactly as before.
+
+    /// True when this clip is an .LRF presented as its .OSV's proxy.
+    [[nodiscard]] bool isProxy() const noexcept { return m_proxy.active; }
+
+    /// The .OSV this .LRF is presented as the proxy of (empty otherwise).
+    [[nodiscard]] const std::filesystem::path& proxyOriginal() const noexcept { return m_proxy.original; }
+
+    /// The timeline the host sees: the clip's own frame rate and frame count,
+    /// or for a proxy the original's.
+    [[nodiscard]] std::uint32_t timelineRateNumerator() const noexcept {
+        return m_proxy.active ? m_proxy.rateNum : m_rateNum;
+    }
+    [[nodiscard]] std::uint32_t timelineRateDenominator() const noexcept {
+        return m_proxy.active ? m_proxy.rateDen : m_rateDen;
+    }
+    [[nodiscard]] std::uint32_t timelineFrameCount() const noexcept {
+        return m_proxy.active ? m_proxy.frameCount : m_frameCount;
+    }
+
+    /// The clip's own frame shown at timeline frame `timelineIndex`: the same
+    /// index for a clip on its own timeline; for a proxy, the .LRF frame
+    /// recorded nearest the moment of the original's frame `timelineIndex`.
+    /// Always inside [0, frameCount()) for a parsed clip.
+    [[nodiscard]] std::uint32_t sourceFrameFor(std::uint32_t timelineIndex) const noexcept;
+
+    /// The .OSV an .LRF was recorded beside: the same folder and name with
+    /// the .OSV extension, when that file exists.  Empty for anything else.
+    [[nodiscard]] static std::filesystem::path proxyOriginalFor(const std::filesystem::path& path);
+
     /// Native equirect output size: 2 x decoded lens height by lens height.
     ///
     /// Takes m_mutex.  It has to: the answer depends on m_reader, which
@@ -632,6 +680,28 @@ private:
     std::uint32_t m_rateNum = 0;
     std::uint32_t m_rateDen = 0;
     std::uint64_t m_creationTime1904 = 0;
+
+    /// [PROXY] The original's timeline this .LRF is presented on (see
+    /// isProxy()).  Written once in parseOnce() under the lock and read-only
+    /// afterwards, like the timing fields above.
+    struct ProxyTimeline {
+        bool active = false;
+        std::filesystem::path original;    ///< The .OSV beside the .LRF.
+        std::uint32_t rateNum = 0;         ///< The original's frame rate rational.
+        std::uint32_t rateDen = 0;
+        std::uint32_t frameCount = 0;      ///< The original's frame count.
+        std::uint32_t originalLensH = 0;   ///< Its lens height: its native equirect is 2x this by this.
+        /// The original's first frame on the .LRF's own clock, in seconds
+        /// after the .LRF's first frame (the camera's timestamps of the two;
+        /// 0 when either file carries none).
+        double offsetSeconds = 0.0;
+    };
+    ProxyTimeline m_proxy;
+
+    /// [PROXY] Present this .LRF on its .OSV's timeline when the .OSV is
+    /// beside it and the two cover the same moments.  Caller holds m_mutex,
+    /// from parseOnce(), after the clip's own timing is known.
+    void adoptProxyTimelineLocked();
     std::int32_t m_audioChannels = 0;
     double m_audioSampleRate = 0.0;
     std::int64_t m_audioDuration = 0;

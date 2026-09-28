@@ -47,7 +47,7 @@
      * ====================================================================== */
 
     /** Version of the panel.  Kept equal to both manifests by a test. */
-    var PANEL_VERSION = '1.0.0';
+    var PANEL_VERSION = '1.0.1';
 
     /**
      * The PiPL match name of the reframe effect (ReframeParams.h,
@@ -230,16 +230,18 @@
     /**
      * Entry counts of the Source Settings popups whose readings can settle
      * how the host numbers popups (learnPopupBase): a 0 anywhere, or a
-     * popup's own count, is unambiguous.  D-Log M Curve's and Stabilisation's
-     * defaults are their LAST entries, so an untouched effect settles a host
-     * that counts from 1.
+     * popup's own count, is unambiguous.  Stabilisation's default is its LAST
+     * entry, so an untouched effect settles a host that counts from 1.  (The
+     * D-Log M Curve's default, Osmo 360, stopped being its last entry when
+     * Avata 360 joined the list; a stale count of 3 would have read that
+     * default as proof of counting from 1.)
      */
     var SOURCE_POPUP_COUNTS = Object.freeze({
         'Colour Output': 4,
         'Output Size': 4,
         'Stabilisation': 5,
         'Calibration': 4,
-        'D-Log M Curve': 3,
+        'D-Log M Curve': 4,
         'Render Device': 4
     });
 

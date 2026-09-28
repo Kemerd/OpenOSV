@@ -10,11 +10,11 @@
 -->
 <ExtensionManifest Version="6.0"
                    ExtensionBundleId="com.openosv.panel"
-                   ExtensionBundleVersion="1.0.0"
+                   ExtensionBundleVersion="1.0.1"
                    ExtensionBundleName="OpenOSV"
                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <ExtensionList>
-    <Extension Id="com.openosv.panel.main" Version="1.0.0"/>
+    <Extension Id="com.openosv.panel.main" Version="1.0.1"/>
   </ExtensionList>
   <ExecutionEnvironment>
     <HostList>

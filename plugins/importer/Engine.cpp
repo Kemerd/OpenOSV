@@ -363,11 +363,13 @@ std::atomic<std::uint64_t> g_nextPublisherToken{1};
 
 /// Frame index for a media time, rounded to nearest and clamped - the same
 /// rule the importer's own imGetSourceVideo applies, so the direct path and
-/// the equirect path always pick the same frame for the same time.
+/// the equirect path always pick the same frame for the same time.  Like
+/// imGetSourceVideo it counts on the clip's TIMELINE (an .LRF proxy's is its
+/// original's) and returns the clip's own frame shown there.
 [[nodiscard]] std::uint32_t frameIndexForTicks(const ImporterInstance& clip, std::int64_t ticks) noexcept {
-    const std::uint32_t num = clip.rateNumerator();
-    const std::uint32_t den = clip.rateDenominator();
-    const std::uint32_t count = clip.frameCount();
+    const std::uint32_t num = clip.timelineRateNumerator();
+    const std::uint32_t den = clip.timelineRateDenominator();
+    const std::uint32_t count = clip.timelineFrameCount();
     if (num == 0 || den == 0 || count == 0 || ticks <= 0) {
         return 0;
     }
@@ -376,7 +378,8 @@ std::atomic<std::uint64_t> g_nextPublisherToken{1};
         return 0;
     }
     const std::int64_t index = (ticks + perFrame / 2) / perFrame;
-    return static_cast<std::uint32_t>(std::clamp<std::int64_t>(index, 0, static_cast<std::int64_t>(count) - 1));
+    return clip.sourceFrameFor(
+        static_cast<std::uint32_t>(std::clamp<std::int64_t>(index, 0, static_cast<std::int64_t>(count) - 1)));
 }
 
 /// RAII push / pop of a CUDA context on the calling thread.
@@ -694,6 +697,20 @@ void enginePublishPrefs(const std::filesystem::path& path, const PrefsBlob& pref
 }
 
 // ---- [/WP-SETTINGS] -----------------------------------------------------------
+
+bool enginePublishedPrefs(const std::filesystem::path& path, PrefsBlob& out) noexcept {
+    try {
+        PublishedSettings found;
+        if (!publishedPrefs(keyFor(path), found)) {
+            return false;
+        }
+        out = found.prefs;
+        return true;
+    } catch (...) {
+        // An identity lookup that fails is simply "nothing published".
+        return false;
+    }
+}
 
 void engineShutdown() noexcept {
     try {

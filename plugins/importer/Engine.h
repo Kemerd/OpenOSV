@@ -64,6 +64,12 @@ struct SettingsPublisher {
 void enginePublishPrefs(const std::filesystem::path& path, const PrefsBlob& prefs,
                         const SettingsPublisher& publisher) noexcept;
 
+/// [PROXY] The Source Settings a Premiere instance of `path` last published,
+/// when any did (false otherwise, and always on a build without the direct
+/// path, where nothing is kept).  A new .LRF proxy starts from its .OSV's
+/// settings this way, so switching to the proxy does not change the picture.
+[[nodiscard]] bool enginePublishedPrefs(const std::filesystem::path& path, PrefsBlob& out) noexcept;
+
 // ---- [/WP-SETTINGS] ---------------------------------------------------------
 
 /// Drop every engine clip and its GPU decoder.  Called from imShutdown, while

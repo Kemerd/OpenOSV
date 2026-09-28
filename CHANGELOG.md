@@ -6,6 +6,34 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+* **An attached `.LRF` proxy played back glitchy.** Premiere requires an
+  attached proxy to match its original's frame rate and duration, and its frame
+  size to divide the original's. Anything else is accepted without a warning
+  and misbehaves. The camera's `.LRF` is 29.97 fps (25 for a 50 fps clip)
+  against a 59.94 fps `.OSV`, and 2048 x 1024 against 6000 x 3000 or
+  7680 x 3840. An `.LRF` next to its `.OSV` now presents itself on the
+  original's timeline:
+  * the original's frame rate and length, each frame showing the moment the
+    original shows, matched by the camera's own timestamps;
+  * a size that divides the original's (2000 x 1000 for 6K, 1920 x 960 for
+    8K).
+
+  A new proxy also starts from the Source Settings its `.OSV` is decoded with,
+  so switching proxies on doesn't change the stabilisation or the colour. An
+  `.LRF` on its own is unchanged.
+* **The panel misread the D-Log M Curve popup** after Avata 360 joined it (four
+  entries, not three). It counted the entries to learn how the host numbers
+  popups, and the stale count could mistake the default curve for the last
+  entry. Panel 1.0.1.
+
+### Changed
+
+* The importer log says how calibration pixels map to stream pixels for each
+  clip, including the camera's own focal ratio for 8K, so a seam that's off
+  can be told apart from parallax.
+
 ## [0.2.2] - 2026-09-27
 
 ### Added
