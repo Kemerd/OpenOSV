@@ -13,6 +13,19 @@
 # =============================================================================
 cmake_minimum_required(VERSION 3.28)
 
+# On a Mac, vcpkg's FFmpeg port needs pkg-config, and without it the first
+# configure fails deep inside vcpkg's port build with nothing that says why.
+# Checked here, before project() runs the vcpkg toolchain, so the message is
+# the first thing a user sees (GitHub issue #2; scripts/build_mac.sh installs
+# it).
+if(CMAKE_HOST_APPLE)
+  find_program(OSV_PKG_CONFIG_EXECUTABLE NAMES pkg-config pkgconf)
+  if(NOT OSV_PKG_CONFIG_EXECUTABLE)
+    message(FATAL_ERROR "pkg-config is needed to build on macOS: brew install pkg-config "
+                        "(scripts/build_mac.sh installs everything the build needs)")
+  endif()
+endif()
+
 project(openosv
         VERSION 0.2.2
         DESCRIPTION "Independent open-source DJI Osmo 360 .OSV parser, stitcher, reframer and HDR colour pipeline"

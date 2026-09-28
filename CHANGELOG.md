@@ -40,6 +40,15 @@ All notable changes to OpenOSV are documented here. The format follows
 * The importer log says how calibration pixels map to stream pixels for each
   clip, including the camera's own focal ratio for 8K, so a seam that's off
   can be told apart from parallax.
+* **macOS build, step by step.** `scripts/build_mac.sh` installs what the
+  build needs (Homebrew's CMake, Ninja and pkg-config; vcpkg in `~/vcpkg`),
+  builds, and with `--install-ofx` installs the DaVinci Resolve bundle. A
+  configure without pkg-config, which vcpkg's FFmpeg needs, now stops at once
+  and names the fix instead of failing deep inside vcpkg. The README and
+  `docs/BUILDING_MAC.md` give the same steps by hand. Thanks to
+  [@arkanos](https://github.com/arkanos), who found the missing step and has
+  the Resolve plug-ins working on a MacBook Pro M4 with macOS 26.6.1
+  ([#2](https://github.com/Kemerd/OpenOSV/issues/2)).
 
 ## [0.2.2] - 2026-09-27
 

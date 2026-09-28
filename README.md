@@ -26,11 +26,13 @@ DJI Avata 360 clips open too (new: not yet tested on Avata footage here).
 
 </div>
 
-> **macOS is untested, and DaVinci Resolve is a preview.** Premiere Pro on
-> Windows is what OpenOSV is built and tested on. The macOS build and the
-> DaVinci Resolve plug-ins compile and pass their tests on CI. Resolve has
-> had a first run on Windows (Resolve 21, free), but nobody on the project
-> has run Premiere or Resolve on a Mac. If you can,
+> **macOS is community-tested, and DaVinci Resolve is a preview.** Premiere
+> Pro on Windows is what OpenOSV is built and tested on. The macOS build and
+> the DaVinci Resolve plug-ins compile and pass their tests on CI. Resolve has
+> had a first run on Windows (Resolve 21, free), and
+> [@arkanos](https://github.com/arkanos) has it working on a MacBook Pro M4
+> running macOS 26.6.1 ([issue #2](https://github.com/Kemerd/OpenOSV/issues/2),
+> thank you!). Premiere Pro on a Mac is still untested. If you can,
 > [build it](#build-from-source), try it, and
 > [file a bug report or a pull request](https://github.com/Kemerd/OpenOSV/issues)
 > for anything that goes wrong.
@@ -478,10 +480,10 @@ Premiere, OpenOSV Source > Advanced in Resolve).
 One CMake project builds everything. You pick a preset for the platform, and
 the Premiere plug-ins come along when Adobe's SDKs are there:
 
-| | Windows | macOS, Apple Silicon (untested) |
+| | Windows | macOS, Apple Silicon |
 |---|---|---|
 | **Premiere Pro** | needs the Adobe SDKs | needs the Adobe SDKs (untested in Premiere) |
-| **DaVinci Resolve** (preview) | no Adobe SDK needed | no Adobe SDK needed |
+| **DaVinci Resolve** (preview) | no Adobe SDK needed | no Adobe SDK needed (working on an M4, [#2](https://github.com/Kemerd/OpenOSV/issues/2)) |
 
 Adobe's SDKs may not be redistributed, so they are never committed:
 [`docs/BUILDING.md`](docs/BUILDING.md) (Windows) and
@@ -515,25 +517,37 @@ cmake --build --preset windows-msvc-cuda-release
 scripts\install_ofx.ps1            # into C:\Program Files\Common Files\OFX\Plugins
 ```
 
-**Premiere Pro on macOS (untested).** You need macOS 13.3+ on Apple Silicon,
-the Xcode command line tools, CMake 3.28+, Ninja and vcpkg, plus the Adobe
-SDKs:
+**DaVinci Resolve on macOS.** You need macOS 13.3+ on Apple Silicon, the
+Xcode command line tools and [Homebrew](https://brew.sh). One script does
+the lot: it installs CMake, Ninja and pkg-config with brew, clones vcpkg
+into `~/vcpkg` (unless `VCPKG_ROOT` points at one), builds, and installs the
+bundle into `/Library/OFX/Plugins`:
 
 ```sh
-export VCPKG_ROOT=~/vcpkg
+scripts/build_mac.sh --install-ofx
+```
+
+Or by hand, the steps [@arkanos](https://github.com/arkanos) confirmed on an
+M4 ([issue #2](https://github.com/Kemerd/OpenOSV/issues/2)):
+
+```sh
+brew install cmake ninja pkg-config    # vcpkg's FFmpeg needs pkg-config
+git clone https://github.com/microsoft/vcpkg "$HOME/vcpkg"
+"$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+export VCPKG_ROOT="$HOME/vcpkg"
+cmake --preset macos-release
+cmake --build --preset macos-release
+scripts/install_ofx.sh                 # into /Library/OFX/Plugins
+```
+
+**Premiere Pro on macOS (untested).** Same tools, plus the Adobe SDKs:
+
+```sh
+export VCPKG_ROOT="$HOME/vcpkg"
 cmake --preset macos-premiere-release
 cmake --build --preset macos-premiere-release
 ctest --preset macos-premiere
 scripts/install_plugins.sh         # plug-ins, LUTs, sequence presets and the OpenOSV panel
-```
-
-**DaVinci Resolve on macOS (untested).** Same tools, no Adobe SDK:
-
-```sh
-export VCPKG_ROOT=~/vcpkg
-cmake --preset macos-release
-cmake --build --preset macos-release
-scripts/install_ofx.sh             # into /Library/OFX/Plugins
 ```
 
 On a Mac, Metal replaces CUDA. How to use the Resolve plug-ins, and exactly
