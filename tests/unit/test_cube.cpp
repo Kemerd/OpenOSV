@@ -507,7 +507,8 @@ constexpr ShippedLut kShippedLuts[] = {
 ///
 ///   * every header line (TITLE, LUT_3D_SIZE, DOMAIN_*) must be IDENTICAL, so
 ///     a title or formatting drift still fails;
-///   * every value must agree within 2e-5.
+///   * no value may differ by more than 1e-4 (a tenth of a 10-bit code);
+///   * and fewer than 1% of the values may differ by more than 1e-5.
 ///
 /// Values are not compared byte for byte, on any platform.  The transcendental
 /// functions behind the curves (powf, exp2f, logf) come from the platform's
@@ -515,9 +516,13 @@ constexpr ShippedLut kShippedLuts[] = {
 /// Apple's does, and so does Windows' own - ucrtbase.dll ships with the
 /// operating system and picks FMA code paths by CPU, so a CI runner on Windows
 /// Server printed a different last decimal than the Windows 11 machine that
-/// generated the set.  The PQ encode raises to the 78.84th power, which turns
-/// one ulp into dozens; 7e-6 was the largest difference measured.  A real
-/// pipeline change moves thousands of entries by far more than 2e-5.
+/// generated the set.  The values are printed with six decimals, so such a
+/// difference usually flips the last one (1e-6); where the curve is steep it
+/// is amplified - the PQ encode raises to the 78.84th power - and a handful
+/// of entries move further: 7e-6 measured on macOS, 2.4e-5 on the Windows
+/// runner.  A real pipeline change is the opposite shape: it moves most of
+/// the table, by far more than 1e-5, which the 1% rule catches even when each
+/// step is small.
 TEST_CASE("The committed LUTs match the current pipeline", "[color][cube]") {
     const std::filesystem::path dir = osvtest::lutsDir();
     // The folder holds the set and nothing else: a renamed or retired table
@@ -552,10 +557,13 @@ TEST_CASE("The committed LUTs match the current pipeline", "[color][cube]") {
         INFO((st.ok() ? std::string("ok") : st.error().toString()));
         REQUIRE(st.ok());
 
-        // Headers equal, values within 2e-5: see the comment above the test
-        // for why the values are compared as numbers on every platform.
+        // Headers equal, values close: see the comment above the test for why
+        // the values are compared as numbers on every platform, and how.
         {
-            constexpr double kTolerance = 2e-5;
+            constexpr double kMaxDifference = 1e-4;
+            constexpr double kLooseDifference = 1e-5;
+            std::size_t values = 0;
+            std::size_t loose = 0;
             std::ifstream ta(committed);
             std::ifstream tb(fresh);
             REQUIRE(ta.good());
@@ -587,6 +595,8 @@ TEST_CASE("The committed LUTs match the current pipeline", "[color][cube]") {
                 REQUIRE(std::sscanf(lb.c_str(), "%lf %lf %lf", &vb[0], &vb[1], &vb[2]) == 3);
                 for (int c = 0; c < 3; ++c) {
                     const double d = std::fabs(va[c] - vb[c]);
+                    ++values;
+                    loose += (d > kLooseDifference) ? 1u : 0u;
                     if (d > worst) {
                         worst = d;
                         worstLine = lineNo;
@@ -594,8 +604,10 @@ TEST_CASE("The committed LUTs match the current pipeline", "[color][cube]") {
                 }
             }
             INFO("largest difference " << worst << " on line " << worstLine);
+            INFO(loose << " of " << values << " values differ by more than " << kLooseDifference);
             INFO("re-run scripts/gen_luts.ps1 and commit the result");
-            REQUIRE(worst <= kTolerance);
+            REQUIRE(worst <= kMaxDifference);
+            REQUIRE(loose * 100u <= values);
         }
     }
 }
