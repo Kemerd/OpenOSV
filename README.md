@@ -574,50 +574,130 @@ against the footage.
 
 ## The command-line tool
 
-`osvtool` does everything without Premiere: inspect a clip, render stills or
-HDR video, export LUTs.
+`osvtool` renders without an editor: 360 videos ready for YouTube, reframed
+flat videos, stills, LUTs. It runs the Premiere and Resolve plug-ins' own
+engine, so a render is the frame Premiere shows.
+
+### Set it up once
+
+1. **Get it.** It's the `cli` folder of either release zip:
+   `cli\osvtool.exe`. Unzip it somewhere permanent, like `C:\OpenOSV`.
+2. **Install FFmpeg** for video output. Stills need nothing extra.
+
+   ```powershell
+   winget install Gyan.FFmpeg
+   ```
+
+   Open a new terminal afterwards so it's on your `PATH`, or point
+   `--ffmpeg` at any `ffmpeg.exe`.
+3. **Open a terminal in your footage folder.** In Explorer, right-click the
+   folder and choose **Open in Terminal**. The examples below write
+   `osvtool`; type the full path the first time
+   (`C:\OpenOSV\cli\osvtool.exe`), or add the `cli` folder to your `PATH`.
+
+It needs the Microsoft Visual C++ 2015-2022 Redistributable (x64), which
+Premiere Pro and Resolve already install.
+
+### Recipes
+
+**What's in this clip?** Camera, resolution, frame rate, colour mode,
+calibration, gyro:
 
 ```powershell
-# What's in this clip? (camera, mode, colour, calibration, gyro)
-osvtool probe CAM_XXXX.OSV --json probe.json
+osvtool probe CAM_0001.OSV
+```
 
-# The stitched 360 video, stitched exactly as Premiere stitches it
-osvtool render CAM_XXXX.OSV --all --mode equirect --size 3840x1920 --stab horizon --color 709 --out CAM_XXXX_360.mp4
+**A 360 video for YouTube or a VR headset.** The whole clip, stitched,
+horizon-levelled, in Rec.709, tagged as 360 so YouTube shows it as a sphere:
 
-# A reframed, horizon-levelled Rec.2100 PQ video
-osvtool render CAM_XXXX.OSV --all --preset wide --stab horizon --color pq --out out.mp4
+```powershell
+osvtool render CAM_0001.OSV --all --mode equirect --size 3840x1920 --stab horizon --color 709 --out CAM_0001_360.mp4
+```
 
-# A D-Log M -> Rec.2100 PQ LUT for any editor
-osvtool lut --fit dji --out-transfer pq --size 65 dlogm_to_pq.cube
+Use `--size 7680x3840` to keep all of an 8K clip.
 
-# Tag a Premiere or Resolve equirect export as 360 video
+**The same in HDR.** Swap `--color 709` for `--color pq` (Rec.2100 PQ) or
+`--color hlg`.
+
+**A flat, reframed video.** Aim a virtual camera into the sphere. `--yaw`
+turns it left and right, `--pitch` tilts it up and down, `--fov` zooms
+(degrees):
+
+```powershell
+osvtool render CAM_0001.OSV --all --yaw 90 --pitch -10 --fov 100 --size 1920x1080 --stab full --color 709 --out CAM_0001_side.mp4
+```
+
+Or start from a look with `--preset wide | ultra-wide | asteroid |
+crystal-ball | dewarping`.
+
+**Try the settings on a few seconds first.** `--range 0-299` renders the
+first 300 frames (five seconds at 59.94 fps). `--frame 120 --out test.png`
+renders a single still.
+
+**A whole folder.** In PowerShell:
+
+```powershell
+Get-ChildItem *.OSV | ForEach-Object { osvtool render $_.FullName --all --mode equirect --size 3840x1920 --stab horizon --color 709 --out "$($_.BaseName)_360.mp4" }
+```
+
+In `cmd`:
+
+```bat
+for %f in (*.OSV) do osvtool render "%f" --all --mode equirect --size 3840x1920 --stab horizon --color 709 --out "%~nf_360.mp4"
+```
+
+**Tag an export as 360 video.** Rendered the sphere from Premiere or
+Resolve? This makes YouTube and VR players see it as 360, in place:
+
+```powershell
 osvtool spherical my_export_360.mp4
 ```
 
-A whole folder, in `cmd`:
+**Pull out the audio**, for a Resolve generator, which has none:
 
-```bat
-for %f in (*.OSV) do cli\osvtool.exe render "%f" --all --mode equirect --size 3840x1920 --stab horizon --color 709 --out "%~nf_360.mp4"
+```powershell
+osvtool extract CAM_0001.OSV --audio CAM_0001.aac
 ```
 
-* **Same engine as the plug-ins.** `render` runs the Premiere and Resolve
-  plug-ins' own clip engine: parallax correction, carved seam, sky seam fix,
-  lens shading, sun ghost removal, stabilisation. Anything you don't set
-  starts at the Source Settings defaults, and `--use-user-defaults` takes the
-  ones you saved in Premiere. It uses the GPU when there is one: NVDEC and
-  CUDA on NVIDIA, hardware decoding and OpenCL on AMD and Intel.
-* **Stabilisation.** `--stab off | horizon | full | smooth | smooth-horizon`.
-  `full` is DJI Studio's direction lock: the view keeps the first frame's
-  heading.
-* **Video** goes through the `ffmpeg` on your `PATH` (or `--ffmpeg`). Pick the
-  encoder for your GPU: `--codec hevc_nvenc` (NVIDIA, the default),
-  `hevc_amf` (AMD), `hevc_qsv` (Intel), `libx265` (any CPU).
+**A D-Log M to Rec.2100 PQ LUT** for any editor:
+
+```powershell
+osvtool lut --fit dji --out-transfer pq --size 65 dlogm_to_pq.cube
+```
+
+### The options you'll actually use
+
+| Option | What it does |
+|---|---|
+| `--all`, `--range a-b`, `--frame N` | Every frame, a frame range, or one frame |
+| `--mode equirect` | The whole sphere (2:1). The default, `reframe`, is a flat view |
+| `--size WxH` | Output size, e.g. `3840x1920` for 360, `1920x1080` for flat |
+| `--color 709 \| pq \| hlg \| dlogm` | Rec.709 SDR, Rec.2100 PQ or HLG HDR, or the untouched D-Log M to grade yourself |
+| `--stab off \| horizon \| full \| smooth \| smooth-horizon` | Stabilisation. `horizon` levels it, `full` is DJI Studio's direction lock (the view keeps the first frame's heading) |
+| `--yaw`, `--pitch`, `--roll`, `--fov` | Aim and zoom a reframe, in degrees |
+| `--codec` | The encoder for your GPU: `hevc_nvenc` (NVIDIA, the default), `hevc_amf` (AMD), `hevc_qsv` (Intel), `libx265` (any CPU) |
+| `--crf N` | Quality; lower is better and bigger (default 18) |
+| `--exposure N` | Exposure offset in stops |
+| `--fit avata360` | Colour for DJI Avata 360 clips |
+| `--no-audio` | Leave the audio out |
+| `--no-spherical-metadata` | Don't tag an equirect video as 360 |
+| `--use-user-defaults` | Start from the Source Settings you saved in Premiere |
+| `--device cpu \| cuda \| opencl` | Force a renderer (default: the best GPU there is) |
+
+`osvtool --help` lists the commands, and `osvtool render --help` every
+render option.
+
+### What else to know
+
+* **Same engine as the plug-ins.** `render` runs the plug-ins' own clip
+  engine: parallax correction, carved seam, sky seam fix, lens shading, sun
+  ghost removal, stabilisation. Anything you don't set starts at the Source
+  Settings defaults. It uses the GPU when there is one: NVDEC and CUDA on
+  NVIDIA, hardware decoding and OpenCL on AMD and Intel.
 * **360 metadata.** An `--mode equirect` `.mp4` / `.mov` comes out tagged as
   360 video (Spherical Video V1 and V2), so YouTube, VR players and 360
   editors open it as a sphere. No Spatial Media Metadata Injector needed.
-  `--no-spherical-metadata` leaves it untagged. `osvtool spherical file.mp4`
-  tags any equirect video, Premiere and Resolve exports included: in place,
-  or into `--out`.
+  Reframes stay flat.
 * **Not in the CLI yet:** animated reframes (a render uses one fixed angle).
 * `--engine classic` is the older research pipeline, with the
   geometry-convention and blend options the plug-ins take from the clip.
