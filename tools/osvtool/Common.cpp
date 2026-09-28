@@ -44,6 +44,7 @@ void registerAllCommands(CLI::App& app, CommandContext& ctx) {
 #endif
 #if defined(OSV_HAVE_IO)
     registerSelfcheckCommand(app, ctx);
+    registerSphericalCommand(app, ctx);
 #endif
     (void)app;
     (void)ctx;

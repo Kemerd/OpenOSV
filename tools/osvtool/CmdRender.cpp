@@ -39,6 +39,7 @@
 #include "osv/geom/VirtualCamera.h"
 #include "osv/io/FfmpegPipe.h"
 #include "osv/io/ImageWriter.h"
+#include "osv/io/SphericalMetadata.h"
 #include "osv/render/LensShading.h"
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"
@@ -125,6 +126,15 @@ struct RenderOptions {
     std::string codec = "hevc_nvenc";
     int crf = 18;
     bool noAudio = false;
+    // ---- 360 metadata ---------------------------------------------------------
+    /// Tag an equirect .mp4 / .mov as 360 video (Spherical Video V1 + V2) once
+    /// ffmpeg has finished it.  On by default; --no-spherical-metadata turns
+    /// it off.  Flat outputs (--mode reframe, equirect-polar, stills) never
+    /// get it.
+    bool sphericalMetadata = true;
+    /// True when --spherical-metadata or --no-spherical-metadata was given,
+    /// so an explicit request on a flat output can be reported, not ignored.
+    bool sphericalMetadataGiven = false;
     // ---- [WP-DEFAULTS] render --use-user-defaults ----------------------------
     /// Start from the Source Settings defaults saved in Premiere (see
     /// applyUserDefaults); off unless asked, so a plain render is the same
@@ -510,6 +520,21 @@ public:
             }
             m_pipe.emplace(std::move(pw).value());
         }
+        // 360 metadata: only a standard equirect is a 360 video a player can
+        // map as it is.  The polar layout puts the lens axes at the poles
+        // (neither V1 nor V2 'equi' describes that), a reframe is flat, and
+        // stills are not MP4s.  An explicit request that cannot apply is
+        // reported; --no-spherical-metadata is always accepted quietly.
+        m_spherical = toVideo && o.sphericalMetadata && o.mode == "equirect";
+        if (o.sphericalMetadataGiven && o.sphericalMetadata && !m_spherical) {
+            const char* why = "--mode equirect-polar is not a standard 360 layout";
+            if (!toVideo) {
+                why = "only an .mp4 / .mov output carries it";
+            } else if (o.mode == "reframe") {
+                why = "--mode reframe writes flat video";
+            }
+            log::warn("--spherical-metadata ignored: {}", why);
+        }
         m_imageFormat = io::formatFromExtension(o.out);
         if (!toVideo && m_imageFormat == io::ImageFormat::Exr && transfer != color::OutputTransfer::Linear) {
             log::warn("writing non-linear values into an EXR; use --color linear for scene-referred output");
@@ -524,14 +549,16 @@ public:
     /// True once the writer has failed; the render loop stops feeding it.
     [[nodiscard]] bool failed() const noexcept { return m_failed.load(); }
 
-    /// Drain the queue, stop the writer and close the pipe.  Returns
-    /// `exitCode`, or kExitRuntime (after the message) when writing failed.
+    /// Drain the queue, stop the writer and close the pipe, then tag a
+    /// finished equirect video as 360 video.  Returns `exitCode`, or
+    /// kExitRuntime (after the message) when writing or tagging failed.
     int finish(int exitCode) {
         stopWriter();
         if (m_failed) {
             std::fprintf(stderr, "error: writer: %s\n", log::safe(m_error).c_str());
             exitCode = kExitRuntime;
         }
+        const bool hadPipe = m_pipe.has_value();
         if (m_pipe) {
             Status st = m_pipe->close();
             if (!st.ok()) {
@@ -539,6 +566,22 @@ public:
                 exitCode = kExitRuntime;
             }
             m_pipe.reset();
+        }
+        // ---- 360 metadata, once ffmpeg has written the whole file ------------
+        // Only a render that succeeded is tagged.  The rewrite goes through a
+        // temporary file, so a failure leaves the finished video untouched.
+        if (hadPipe && m_spherical && exitCode == kExitOk) {
+            const Result<io::SphericalInjectReport> tagged = io::injectSphericalMetadata(m_out);
+            if (!tagged.ok()) {
+                std::fprintf(stderr,
+                             "error: 360 metadata: %s (the video itself is complete; osvtool spherical retries the "
+                             "tag)\n",
+                             log::safe(tagged.error().toString()).c_str());
+                exitCode = kExitRuntime;
+            } else {
+                log::info("360 metadata: {} tagged as equirectangular 360 video (Spherical Video V1 + V2)",
+                          log::safe(m_out));
+            }
         }
         return exitCode;
     }
@@ -573,6 +616,7 @@ private:
 
     std::string m_out;
     bool m_multi = false;
+    bool m_spherical = false;  ///< Tag the finished video as 360 video (see open()).
     io::ImageTag m_tag;
     io::ImageFormat m_imageFormat = io::ImageFormat::Png16;
     std::optional<io::FfmpegPipeWriter> m_pipe;
@@ -1531,6 +1575,11 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
     outGeom->add_option("--codec", opt->codec, "Video encoder (hevc_nvenc, libx265, ...)")->default_str("hevc_nvenc");
     outGeom->add_option("--crf", opt->crf, "Quality (crf / cq)")->default_val(18);
     outGeom->add_flag("--no-audio", opt->noAudio, "Do not copy the source audio into the .mp4");
+    // On by default: an equirect video without the tag plays as a flat
+    // 2:1 picture on YouTube and in VR players.
+    outGeom->add_flag("--spherical-metadata,!--no-spherical-metadata", opt->sphericalMetadata,
+                      "Tag an --mode equirect .mp4 / .mov as 360 video (Spherical Video V1 + V2) for YouTube, VR "
+                      "players and 360 editors (default: on; no effect on flat outputs)");
 
     // [WP-DEFAULTS] Opt-in only, so osvtool stays deterministic: a render
     // without this flag never reads the Premiere defaults file.
@@ -1542,6 +1591,8 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
         // A lookup or an allocation failing here must end the command with a
         // message, not escape through CLI11's parse().
         try {
+            // Either spelling counts, as for the other negatable flags.
+            opt->sphericalMetadataGiven = sub->count("--spherical-metadata") > 0;
             if (opt->engine == "plugin") {
                 // The plug-ins' engine reads --use-user-defaults itself, as a
                 // whole Source Settings blob (enginePrefs).

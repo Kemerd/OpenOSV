@@ -162,6 +162,73 @@ TEST_CASE("osvtool lut writes a cube", "[cli]") {
     REQUIRE(dataLines == 33u * 33u * 33u);
 }
 
+TEST_CASE("osvtool spherical tags an MP4 in place or into --out, and refuses a broken one", "[cli][spherical]") {
+    if (std::string(kToolPath).empty() || !std::filesystem::exists(kToolPath)) {
+        SKIP("osvtool not built");
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path fixture = osvtest::fixtureDir() / "fx_largesize.mp4";
+    const fs::path truncatedFixture = osvtest::fixtureDir() / "fx_truncated_moov.mp4";
+    REQUIRE(fs::exists(fixture, ec));
+    REQUIRE(fs::exists(truncatedFixture, ec));
+
+    // Work on copies only: nothing here may ever write into the source tree.
+    const fs::path source = osvtest::tempDir() / "cli_spherical_source.mp4";
+    const fs::path file = osvtest::tempDir() / "cli_spherical.mp4";
+    const fs::path out = osvtest::tempDir() / "cli_spherical_out.mp4";
+    const fs::path broken = osvtest::tempDir() / "cli_spherical_truncated.mp4";
+    fs::copy_file(fixture, source, fs::copy_options::overwrite_existing, ec);
+    REQUIRE_FALSE(ec);
+    fs::copy_file(fixture, file, fs::copy_options::overwrite_existing, ec);
+    REQUIRE_FALSE(ec);
+    fs::copy_file(truncatedFixture, broken, fs::copy_options::overwrite_existing, ec);
+    REQUIRE_FALSE(ec);
+    fs::remove(out, ec);
+    const auto sourceSize = fs::file_size(source);
+
+    // ---- in place: tagged, then already tagged -------------------------------
+    const RunResult first = runTool("spherical " + quoted(file));
+    INFO(first.output);
+    REQUIRE(first.exitCode == 0);
+    CHECK(first.output.find("tagged") != std::string::npos);
+    CHECK(asciiOnly(first.output));
+    const auto taggedSize = fs::file_size(file);
+    CHECK(taggedSize > sourceSize);
+    const RunResult second = runTool("spherical " + quoted(file));
+    REQUIRE(second.exitCode == 0);
+    CHECK(second.output.find("already tagged") != std::string::npos);
+    CHECK(fs::file_size(file) == taggedSize);
+
+    // The V1 document and the V2 boxes are in the file.
+    std::ifstream in(file, std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    CHECK(bytes.find("<GSpherical:ProjectionType>equirectangular</GSpherical:ProjectionType>") != std::string::npos);
+    CHECK(bytes.find("st3d") != std::string::npos);
+    CHECK(bytes.find("sv3d") != std::string::npos);
+    CHECK(bytes.find("equi") != std::string::npos);
+
+    // ---- --out: a tagged copy, the input untouched ------------------------------
+    const RunResult copy = runTool("spherical " + quoted(source) + " --out " + quoted(out));
+    REQUIRE(copy.exitCode == 0);
+    CHECK(fs::file_size(out) == taggedSize);
+    CHECK(fs::file_size(source) == sourceSize);
+
+    // ---- input errors (exit 2) leave the file as it was; no file is a usage error
+    const auto brokenSize = fs::file_size(broken);
+    const RunResult refused = runTool("spherical " + quoted(broken));
+    CHECK(refused.exitCode == 2);
+    CHECK(refused.output.find("error:") != std::string::npos);
+    CHECK(fs::file_size(broken) == brokenSize);
+    CHECK(runTool("spherical " + quoted(osvtest::tempDir() / "no-such-file.mp4")).exitCode == 2);
+    CHECK(runTool("spherical").exitCode == 1);
+
+    // ---- render takes the flag and its negation (--no-spherical-metadata) ------
+    const RunResult help = runTool("render --help");
+    CHECK(help.output.find("--spherical-metadata") != std::string::npos);
+    CHECK(help.output.find("--no-spherical-metadata") != std::string::npos);
+}
+
 TEST_CASE("osvtool probe/render/seam/selfcheck on the sample clip", "[cli][sample]") {
     OSV_REQUIRE_SAMPLE();
     if (std::string(kToolPath).empty() || !std::filesystem::exists(kToolPath)) {

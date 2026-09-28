@@ -6,6 +6,23 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+* **360 video metadata.** `osvtool render --mode equirect` now tags its `.mp4`
+  / `.mov` as 360 video: Spherical Video V1 (the `uuid` box YouTube reads)
+  and V2 (`st3d` + `sv3d`, what FFmpeg, VR players and 360 editors read).
+  Upload it as it is; Google's Spatial Media Metadata Injector is no longer
+  needed. On by default, `--no-spherical-metadata` turns it off. Reframes
+  stay flat.
+* **`osvtool spherical`** tags an existing equirectangular video the same
+  way, such as a Premiere Pro or DaVinci Resolve export:
+  `osvtool spherical export.mp4` in place, or `--out tagged.mp4`. Only the
+  `moov` box is rebuilt; the media data is streamed to a temporary file that
+  replaces the original once complete, so a 50 GB file needs no 50 GB of
+  RAM and a failure leaves it untouched. Chunk offsets move with the `moov`.
+  A file already tagged is left alone, an older tag is replaced rather than
+  doubled, and truncated, malformed or fragmented files are refused.
+
 ### Fixed
 
 * **An attached `.LRF` proxy played back glitchy.** Premiere requires an
