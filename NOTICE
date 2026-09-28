@@ -153,6 +153,11 @@ Third-party components
 * spdlog                            MIT                https://github.com/gabime/spdlog
 * fmt                               MIT                https://github.com/fmtlib/fmt
 * tinyexr                           BSD-3-Clause       https://github.com/syoyo/tinyexr
+* Dear ImGui (statically linked in osvgui, OpenOSV Studio; with the
+  stb_truetype / stb_rect_pack / stb_textedit it embeds)
+                                    MIT                https://github.com/ocornut/imgui
+* GLFW (linked by osvgui; glfw3.dll beside it on Windows)
+                                    Zlib               https://www.glfw.org
 * aces-core (ACES 2.0 tonescale)    Apache-2.0         https://github.com/aces-aswf/aces-core
   Copyright Contributors to the ACES Project.  The HDR tone scale
   (Michaelis-Menten with flare) is based on the ACES 2.0 tonescale in

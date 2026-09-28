@@ -8,6 +8,17 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ### Added
 
+* **OpenOSV Studio (`osvgui`), a batch app for `osvtool`.** Drop `.OSV`
+  files or whole folders on it, pick the output, press Start. 360 equirect
+  or a reframed view, size, colour, HDR style, stabilisation, sun ghost
+  removal, encoder, quality, audio and the 360 tag are each an `osvtool
+  render` option, and the window shows the exact command it runs next (or a
+  whole-folder loop to copy). The queue renders one clip at a time with
+  progress, time left, pause after the current clip and stop; folders are
+  searched all the way down and `.LRF` proxies skipped. It picks the fastest
+  HEVC encoder that works on the machine, points to FFmpeg when it's
+  missing, and remembers every setting. Windows and macOS; `cli\osvgui.exe`
+  in both release zips. See `docs/STUDIO.md`.
 * **360 video metadata.** `osvtool render --mode equirect` now tags its `.mp4`
   / `.mov` as 360 video: Spherical Video V1 (the `uuid` box YouTube reads)
   and V2 (`st3d` + `sv3d`, what FFmpeg, VR players and 360 editors read).
