@@ -121,3 +121,116 @@ WP-REOPEN, WP-IMPORTER, WP-CALIB, WP-SETTINGS, WP-LOOK, WP-CAMERA, WP-FLARE,
 WP-SEAM, WP-PHOTO, WP-E2E (WP-NEURAL's research is already on main) - full build and full ctest after
 each merge, then a continuity pass over the whole tree (ABI version, shared
 structs, duplicated helpers, docs), then install for the user to test.
+
+---
+
+# Round 2 - VEGAS Pro (branch `vegas_pro`)
+
+**Status (2026-09-29): in progress.** Six agents bring OpenOSV to VEGAS Pro.
+Each works in its own git worktree, on a branch cut from `vegas_pro`. The
+ground rules, build recipe and final report of round 1 above still apply;
+this section adds what is different. Once `docs/VEGAS.md` exists it
+describes the result; until then this section is the reference.
+
+## Why VEGAS needs more than the Resolve bundle
+
+VEGAS Pro is an OpenFX host, so `OpenOSV.ofx` is the base, but:
+
+1. **Pixel formats.** VEGAS hands BYTE images (8-bit projects) or FLOAT
+   images (32-bit projects), in R G B A - or in B G R A to a plug-in that
+   lists the Sony extension depths `OfxBitDepthByteBGR` /
+   `OfxBitDepthFloatBGR`, each image then saying its order in
+   `OfxImageEffectPropPixelOrder`. Both effects accept only float RGBA today.
+2. **Levels.** "Video levels" projects (8-bit, and 32-bit video levels) work
+   in studio RGB, and VEGAS never level-converts a generator's output.
+3. **Generators.** An OpenFX generator cannot declare its length and has no
+   audio. VEGAS's C# scripting API can do both from outside: create the
+   generator's media, set its length, frame size and parameters, add the
+   audio and group it.
+4. **CPU images only.** VEGAS never hands CUDA images. The effects keep
+   everything on the GPU themselves - decode, stitch, frame, levels, pack -
+   and read back only the finished view.
+5. **Host quirks.** While it scans, VEGAS loads every `*.dll` / `*.ofx`
+   under a bundle's `Contents\Win64` (recursively); it turns every declared
+   context into a separate FX entry; it clones Instance- / Fully-safe
+   plug-ins once per render thread (a clone of OpenOSV Source would open its
+   own decoder).
+
+**Resolve must not regress.** Under any non-VEGAS host (Resolve, the mock
+host's default profile, anything unknown) the descriptors, defaults and
+output of both effects stay exactly what they are on `main`. Every VEGAS
+difference keys on `osv::ofx::hostProfile()` (`plugins/ofx/OfxHost.h`) and
+on nothing else - no other code compares host names.
+
+## Contracts fixed before the agents start (Phase 0, on `vegas_pro`)
+
+| Contract | Where | What |
+|---|---|---|
+| Host profile | `OfxHost.h` | `HostProfile {Generic, Resolve, Vegas}`, `classifyHost(name)`, `hostProfile()` (cached), `hostProfileName()` |
+| Host image formats | `OfxHostImage.h` | `HostDepth {Byte, Float}`, `HostOrder {Rgba, Bgra}`, `OutputLevels {Full, Studio}`, `HostImageView`, the Sony extension strings, and `studioFromFull` / `applyLevels` / `toByte`: the ONE levels and quantisation definition (the CUDA kernels repeat it with the same constants) |
+| GPU hooks | `OfxGpuView.h/.cpp` | `renderSourceViewGpu`, `renderSourceEquirectGpu`, `renderReframeFromHostGpu`. True = the whole window written; false + empty error = "not mine", the caller runs its CPU path; false + error = tried and failed, logged once, CPU path. Phase 0 ships them answering "not mine" |
+| Hook call sites | `OfxSource.cpp`, `OfxReframe.cpp` | `// [WP-V-GPU] begin/end` regions. The `gpuTarget` / `sourceImage` descriptions just before them belong to WP-V-OFX, which replaces the hard-coded Float / Rgba / Full with the real image format and the `outputLevels` value |
+| Generator levels control | WP-V-OFX | parameter `outputLevels`, choice `Full range (0-255)` / `Studio RGB (16-235)`, 0-based, **defined only under a VEGAS host**, default 1 (Studio), not animated |
+| Bundle layout | WP-V-BUNDLE | `OpenOSV.ofx.bundle\Contents\Win64\OpenOSV.ofx` alone; its dependency closure (FFmpeg, fmt, spdlog, OpenCL, z) plus `osvtool.exe` and ITS closure in `OpenOSV.ofx.bundle\Contents\Libraries\Win64\` |
+| osvtool for the extension | WP-V-CLI | `osvtool probe <file> --json -` writes the JSON to stdout (a path still writes a file). `osvtool extract <file> --audio <out>.wav` writes 32-bit float WAV through the importer's AudioDecoder (priming discarded, Premiere's sync); `.aac` keeps writing ADTS |
+| Extension | WP-V-EXT | `OpenOSV.Vegas.dll` + `OpenOSV.Vegas.Core.dll`, installed to `%ProgramData%\VEGAS Pro\Application Extensions\`; it finds osvtool at `%CommonProgramFiles%\OFX\Plugins\OpenOSV.ofx.bundle\Contents\Libraries\Win64\osvtool.exe`, then on PATH |
+| Generator in VEGAS scripts | - | `vegas.Generators.GetChildByUniqueID("{Svfx:org.openosv.OSVSource}")`; the parameter names are the permanent ones in `OfxSource.h`, `OfxSourceParams.h` and `OfxCamera.h` |
+
+## Packages and file ownership
+
+| Package | Model | Branch | Owns |
+|---|---|---|---|
+| **WP-V-OFX** - the VEGAS host profile in both effects | Opus | `vegas/wp-ofx` | `plugins/ofx/Ofx{Host,Main,Render,Reframe,Source,SourceParams,Camera,FileDialog}.*` except the `[WP-V-GPU]` regions; `OfxHostImage.h` (append only); `tests/ofx/*` except `test_ofx_cuda.cpp` |
+| **WP-V-GPU** - everything on the GPU for CPU-image hosts | Opus | `vegas/wp-gpu` | `OfxGpuView.*`, `OfxCuda.*`, `OfxKernelAbi.h`, `OfxReframeKernel.cu` and new `.cu` files, the `[WP-V-GPU]` regions, new functions in `ImporterInstance` / `ImporterGpuFrame` (new functions only), `tests/ofx/test_ofx_cuda.cpp` and new `[cuda]` tests, `plugins/ofx/CMakeLists.txt` (append sources and kernels) |
+| **WP-V-EXT** - the VEGAS Application Extension (C#) | Opus | `vegas/wp-ext` | new `plugins/vegas/**`, new `scripts/vegas/**`, one `add_subdirectory` appended to `plugins/CMakeLists.txt` |
+| **WP-V-CLI** - osvtool for the extension | Sonnet | `vegas/wp-cli` | `tools/osvtool/CmdProbe.cpp`, `CmdExtract.cpp`, a new WAV writer in `src/osv/io/` + `include/osv/io/`, CLI / io tests (append) |
+| **WP-V-BUNDLE** - a bundle VEGAS can scan safely | Sonnet | `vegas/wp-bundle` | `plugins/common/DelayLoad.*` (opt-in subfolder), the post-build staging and delay-load audit in `plugins/ofx/CMakeLists.txt`, `cmake/OsvCopyRuntimeDlls.cmake` / `OsvCheckDelayLoad.cmake` (OFX destination only), `Copy-OfxBundle` in `scripts/package_release.ps1`, `scripts/install_ofx.ps1` |
+| **WP-V-PKG** - install, release, docs | Sonnet | `vegas/wp-pkg` | new `scripts/install_vegas.ps1`, `scripts/package_release.ps1` (a VEGAS zip: new functions + the editor lists; not `Copy-OfxBundle`), new `docs/VEGAS.md`, `README.md`, `docs/LEGAL.md`, `CHANGELOG.md`, `docs/RELEASING.md` |
+
+### Shared-file protocol (round 2)
+
+* `plugins/ofx/CMakeLists.txt`: WP-V-GPU and WP-V-OFX append to the existing
+  source lists; WP-V-BUNDLE edits only the post-build staging and the
+  delay-load audit. Nobody reorganises.
+* `OfxSource.cpp` / `OfxReframe.cpp`: WP-V-OFX owns the files; WP-V-GPU
+  edits only inside `[WP-V-GPU]` regions. WP-V-OFX may move a region as a
+  whole (to keep it after the format checks) but never edits inside it.
+* `scripts/package_release.ps1`: WP-V-BUNDLE owns `Copy-OfxBundle`; WP-V-PKG
+  owns everything it adds and the editor switches (`Get-RequirementLines`,
+  the zip loop). Neither touches the other's part.
+* `ImporterInstance.*`: new functions only, in a `[WP-V-GPU]` block.
+
+## Rules that differ from round 1
+
+1. **No GPU tests.** The user is working on this machine and its GPU is
+   busy. Build as much as you like (compilers are CPU-only), but never run
+   tests tagged `[cuda]`, `[opencl]`, `[gpu]`, `[metal]` or `[hwaccel]`, nor
+   any `[sample]` test that renders (NVDEC / CUDA). Run CPU-only tests at
+   `-j 4`. Write the GPU tests anyway and list them in the report as unrun.
+2. **Never launch VEGAS, Resolve or Premiere. Never install** anything into
+   `C:\Program Files`, `Common Files` or `ProgramData`, and never delete
+   VEGAS caches on this machine. VEGAS Pro 17 is installed at
+   `C:\Program Files\VEGAS\VEGAS Pro 17.0`: its `ScriptPortal.Vegas.dll`
+   may be referenced and reflected and its OpenFX logs in
+   `%LOCALAPPDATA%\VEGAS Pro\17.0\` read - nothing else.
+3. **Builds.** Junction `vcpkg_installed`, `third_party`,
+   `Premiere Pro 26.0 C++ SDK` and `models` from `L:\Dev\premiere_360_reframe`
+   into the worktree (`New-Item -ItemType Junction`), hardlink the sample
+   `.OSV` / `.LRF` if a test needs them, configure the
+   `windows-msvc-premiere-release` preset with `-DVCPKG_MANIFEST_INSTALL=OFF`
+   inside `scripts\vsdev.cmd`, and build with `-j 8`. Logs go to your
+   scratchpad. Do not run clang-format (the VS copy disagrees with the repo
+   style); wrap long lines by hand.
+4. **Public repository hygiene.** Never mention reverse engineering,
+   decompiling, disassembly, strings pulled from binaries or DJI internals in
+   code, comments, docs or commit messages. Cite VEGAS facts as "VEGAS's
+   OpenFX extension header (ofxSonyVegas.h)", "the VEGAS scripting API" or
+   "observed in VEGAS".
+
+## Merge order (the lead)
+
+WP-V-CLI, WP-V-BUNDLE, WP-V-OFX, WP-V-GPU, WP-V-EXT, WP-V-PKG - a full build
+and the CPU ctest subset after each merge; the GPU tests and the full ctest
+wait for the user's go-ahead. Then a continuity pass (hook regions folded,
+docs matched to the real behaviour, the OFX `kVersionMinor` bumped so hosts
+re-describe the plug-in) and a staged - not installed - release.

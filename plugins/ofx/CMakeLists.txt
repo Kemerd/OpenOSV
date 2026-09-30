@@ -75,6 +75,9 @@ set(_osv_ofx_sources
   OfxHost.h
   OfxCamera.cpp
   OfxCamera.h
+  OfxGpuView.cpp
+  OfxGpuView.h
+  OfxHostImage.h
   OfxRender.cpp
   OfxRender.h
   OfxReframe.cpp

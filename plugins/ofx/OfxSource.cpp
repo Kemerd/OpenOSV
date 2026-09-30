@@ -8,6 +8,8 @@
 #include "OfxCamera.h"
 #include "OfxCuda.h"
 #include "OfxFileDialog.h"
+#include "OfxGpuView.h"
+#include "OfxHostImage.h"
 #include "OfxRender.h"
 #include "OfxSourceParams.h"
 
@@ -476,6 +478,15 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     const int frameW = frame.x2 - frame.x1;
     const int frameH = frame.y2 - frame.y1;
 
+    // Where the GPU path (OfxGpuView.h) writes when it takes the frame: the
+    // host's output image as it really is, the render window, the camera
+    // frame and the levels the output is packed in.
+    gpu::HostTarget gpuTarget;
+    gpuTarget.image = HostImageView{output.data, output.rowBytes, output.bounds, HostDepth::Float, HostOrder::Rgba};
+    gpuTarget.window = window;
+    gpuTarget.frame = frame;
+    gpuTarget.levels = OutputLevels::Full;
+
     // ---- the clip ---------------------------------------------------------------
     const std::string pathText = cleanPath(stringAt(params, kFile, time));
     const PrefsBlob prefs = prefsAt(params, time);
@@ -540,6 +551,21 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
 
     if (mode == kOutputEquirect) {
         // ---- the whole sphere, straight at the frame's size -----------------
+        // [WP-V-GPU] begin - stitched and packed on the GPU; only the finished
+        // pixels cross the bus.  "Not mine" (no GPU path) falls through to
+        // the CPU copy below, as does a GPU failure, logged once.
+        {
+            std::string gpuError;
+            if (gpu::renderSourceEquirectGpu(*clip, static_cast<std::uint32_t>(index), draft, purpose, gpuTarget,
+                                             gpuError)) {
+                return kOfxStatOK;
+            }
+            if (!gpuError.empty()) {
+                PluginLog::oncef("ofx/source/gpu-equirect", PluginLog::Level::Warn,
+                                 "ofx source: GPU sphere path failed, using the CPU copy: {}", gpuError);
+            }
+        }
+        // [WP-V-GPU] end
         const OutputGeometry geometry{frameW, frameH};
         auto rendered = clip->renderFrame(static_cast<std::uint32_t>(index), geometry, draft, purpose);
         if (!rendered.ok() || !rendered.value()) {
@@ -558,6 +584,22 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
         clearCpu(output, window);
         return kOfxStatFailed;
     }
+    // [WP-V-GPU] begin - the sphere stays in VRAM, the camera frames it on
+    // the GPU, and only the view is read back.  "Not mine" (no GPU path)
+    // falls through to the CPU framing below, as does a GPU failure, logged
+    // once.
+    {
+        std::string gpuError;
+        if (gpu::renderSourceViewGpu(*clip, static_cast<std::uint32_t>(index), sphere, draft, purpose,
+                                     camera::read(params, time), camera::projectSize(effect), gpuTarget, gpuError)) {
+            return kOfxStatOK;
+        }
+        if (!gpuError.empty()) {
+            PluginLog::oncef("ofx/source/gpu-view", PluginLog::Level::Warn,
+                             "ofx source: GPU view path failed, framing on the CPU: {}", gpuError);
+        }
+    }
+    // [WP-V-GPU] end
     auto rendered = clip->renderFrame(static_cast<std::uint32_t>(index), sphere, draft, purpose);
     if (!rendered.ok() || !rendered.value()) {
         reportOnce(effect, *inst, "OpenOSV Source could not stitch frame " + std::to_string(index) + ": " +

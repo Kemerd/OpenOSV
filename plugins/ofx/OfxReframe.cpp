@@ -7,6 +7,8 @@
 
 #include "OfxCamera.h"
 #include "OfxCuda.h"
+#include "OfxGpuView.h"
+#include "OfxHostImage.h"
 #include "OfxRender.h"
 
 #include "HostContext.h"
@@ -229,6 +231,30 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) noexc
         }
         return kOfxStatOK;
     }
+
+    // ---- [WP-V-GPU] begin - CPU images framed on our own GPU ----------------------
+    // A host that hands CPU images (VEGAS always does) still gets the view
+    // framed on the GPU: upload, frame, pack, read back.  "Not mine" (no GPU
+    // path) falls through to the CPU loop below, as does a GPU failure,
+    // logged once.  The filter keeps the host's levels: it only moves pixels.
+    {
+        gpu::HostTarget gpuTarget;
+        gpuTarget.image = HostImageView{output.data, output.rowBytes, output.bounds, HostDepth::Float, HostOrder::Rgba};
+        gpuTarget.window = window;
+        gpuTarget.frame = frame;
+        gpuTarget.levels = OutputLevels::Full;
+        const HostImageView sourceImage{source.data, source.rowBytes, source.bounds, HostDepth::Float,
+                                        HostOrder::Rgba};
+        std::string gpuError;
+        if (gpu::renderReframeFromHostGpu(setup, sourceImage, gpuTarget, gpuError)) {
+            return kOfxStatOK;
+        }
+        if (!gpuError.empty()) {
+            PluginLog::oncef("ofx/reframe/gpu-host", PluginLog::Level::Warn,
+                             "ofx reframe: GPU path for CPU images failed, framing on the CPU: {}", gpuError);
+        }
+    }
+    // [WP-V-GPU] end
 
     // ---- the CPU path -------------------------------------------------------------
     std::shared_ptr<ThreadPool> pool = HostContext::instance().threadPoolShared();

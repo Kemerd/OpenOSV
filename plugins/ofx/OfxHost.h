@@ -80,6 +80,41 @@ void clearSuites() noexcept;
 /// "DaVinciResolveLite"), or an empty string when it cannot be read.
 [[nodiscard]] std::string hostName() noexcept;
 
+// ---------------------------------------------------------------------------
+//  Host profiles
+// ---------------------------------------------------------------------------
+// OpenFX leaves a lot to the host, and the two hosts the effects ship for
+// fill the gaps differently (docs/RESOLVE.md, docs/VEGAS.md).  Every
+// host-specific decision - which pixel depths to declare, which contexts,
+// how thread-safe the generator claims to be - keys on ONE classification of
+// the host's name, made here, so no other file ever compares host strings.
+//
+// The Generic profile is today's behaviour, unchanged: an unknown host is
+// treated exactly like DaVinci Resolve was before VEGAS support existed.
+
+/// The host families whose behaviour the effects adapt to.
+enum class HostProfile : std::uint8_t {
+    Generic = 0,  ///< Any other host (and the test harness): Resolve's behaviour.
+    Resolve = 1,  ///< DaVinci Resolve / Resolve Studio ("DaVinciResolve", "DaVinciResolveLite").
+    Vegas = 2,    ///< VEGAS Pro / Movie Studio (com.vegascreativesoftware.vegas, com.sonycreativesoftware.vegas...).
+};
+
+/// Classify a host name (kOfxPropName) - a pure function, so the tests can
+/// feed it every name seen in the field.  Case-insensitive substring match:
+/// "vegas" or "sonycreativesoftware" -> Vegas (the VEGAS Pro 2026 name is not
+/// documented, and every known one contains "vegas"); "davinci" or
+/// "resolve" -> Resolve; anything else, including "", -> Generic.
+[[nodiscard]] HostProfile classifyHost(std::string_view name) noexcept;
+
+/// The profile of the host that loaded the module: classifyHost(hostName()),
+/// computed on first use after the suites are fetched and cached for the
+/// rest of the module's life (a host never changes its name).  Generic while
+/// the host cannot be asked yet.
+[[nodiscard]] HostProfile hostProfile() noexcept;
+
+/// A short name for logs ("generic", "resolve", "vegas").
+[[nodiscard]] const char* hostProfileName(HostProfile profile) noexcept;
+
 // ===========================================================================
 //  Property sets
 // ===========================================================================

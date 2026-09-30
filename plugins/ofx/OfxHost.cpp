@@ -136,6 +136,83 @@ std::string hostName() noexcept {
     return getString(host->host, kOfxPropName);
 }
 
+// ---------------------------------------------------------------------------
+//  Host profiles
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// The cached profile of the loading host: -1 until a non-empty host name
+/// has been classified.  Relaxed ordering is enough - every thread that
+/// races the first classification computes the same value.
+std::atomic<int> g_hostProfile{-1};
+
+/// True when `haystack` contains `needle`, ignoring ASCII case.  Host names
+/// are ASCII identifiers; anything else simply never matches.
+[[nodiscard]] bool containsNoCase(std::string_view haystack, std::string_view needle) noexcept {
+    if (needle.empty() || haystack.size() < needle.size()) {
+        return false;
+    }
+    const auto lower = [](char c) noexcept -> char {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+    for (std::size_t start = 0; start + needle.size() <= haystack.size(); ++start) {
+        bool same = true;
+        for (std::size_t i = 0; i < needle.size(); ++i) {
+            if (lower(haystack[start + i]) != lower(needle[i])) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+HostProfile classifyHost(std::string_view name) noexcept {
+    // VEGAS first: its Sony-era names ("com.sonycreativesoftware.vegas",
+    // "...vegas.moviestudio.hd") and MAGIX-era name
+    // ("com.vegascreativesoftware.vegas") all contain "vegas"; the Sony
+    // vendor string alone still means a VEGAS-family host.
+    if (containsNoCase(name, "vegas") || containsNoCase(name, "sonycreativesoftware")) {
+        return HostProfile::Vegas;
+    }
+    // Blackmagic reports "DaVinciResolve" (Studio) / "DaVinciResolveLite".
+    if (containsNoCase(name, "davinci") || containsNoCase(name, "resolve")) {
+        return HostProfile::Resolve;
+    }
+    return HostProfile::Generic;
+}
+
+HostProfile hostProfile() noexcept {
+    const int cached = g_hostProfile.load(std::memory_order_relaxed);
+    if (cached >= 0) {
+        return static_cast<HostProfile>(cached);
+    }
+    // Not classified yet.  Only cache a real answer: before kOfxActionLoad
+    // the property suite is missing and the name reads as empty, which must
+    // not pin the module to Generic for good.
+    const std::string name = hostName();
+    const HostProfile profile = classifyHost(name);
+    if (!name.empty()) {
+        g_hostProfile.store(static_cast<int>(profile), std::memory_order_relaxed);
+    }
+    return profile;
+}
+
+const char* hostProfileName(HostProfile profile) noexcept {
+    switch (profile) {
+        case HostProfile::Resolve: return "resolve";
+        case HostProfile::Vegas: return "vegas";
+        case HostProfile::Generic: break;
+    }
+    return "generic";
+}
+
 // ===========================================================================
 //  Property sets
 // ===========================================================================
