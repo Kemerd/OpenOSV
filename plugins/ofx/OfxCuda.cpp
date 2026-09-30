@@ -5,6 +5,8 @@
 
 #include "OfxCuda.h"
 
+#include "OfxGpuPipeline.h"  // [WP-V-GPU] releaseDevicePools()
+
 #include "PluginLog.h"
 
 #if defined(_WIN32)
@@ -67,6 +69,26 @@ bool driverPresent() noexcept {
 
 #if defined(OSV_OFX_HAVE_CUDA)
 
+bool driverInitialised(std::string* why) noexcept {
+    if (!driverPresent()) {
+        if (why) {
+            *why = "no NVIDIA driver (nvcuda.dll)";
+        }
+        return false;
+    }
+    // Idempotent and cheap after the first call.
+    const CUresult r = cuInit(0);
+    if (r != CUDA_SUCCESS) {
+        if (why) {
+            const char* name = nullptr;
+            (void)cuGetErrorName(r, &name);
+            *why = std::string("cuInit failed: ") + (name ? name : "CUDA_ERROR_UNKNOWN");
+        }
+        return false;
+    }
+    return true;
+}
+
 namespace {
 
 /// One loaded copy of the fatbin, in one context.
@@ -75,6 +97,10 @@ struct ContextModule {
     unsigned long long contextId = 0;  ///< cuCtxGetId, 0 when the driver cannot say.
     CUmodule module = nullptr;
     CUfunction kernel = nullptr;
+    // [WP-V-GPU] the own-GPU path's kernels, from the same module.
+    CUfunction viewFloat = nullptr;  ///< OSV_OFX_VIEW_KERNEL_NAME.
+    CUfunction viewByte = nullptr;   ///< OSV_OFX_VIEW_BYTE_KERNEL_NAME.
+    CUfunction equirect = nullptr;   ///< OSV_OFX_EQUIRECT_KERNEL_NAME.
 };
 
 /// The driver's unique id of a context (cuCtxGetId, CUDA 12.0+), or 0.
@@ -126,9 +152,13 @@ std::string cudaMessage(const char* what, CUresult result) {
     return s;
 }
 
-/// The kernel for `context` (current on this thread), loading the module on
-/// first use.  Null with `error` set on failure.
-CUfunction kernelFor(CUcontext context, std::string& error) {
+/// The module for `context` (current on this thread) - every kernel of the
+/// fatbin - loading it on first use.  False with `error` set on failure.
+bool moduleFor(CUcontext context, ContextModule& out, std::string& error) {
+    if (!context) {
+        error = "no CUDA context to load the kernels into";
+        return false;
+    }
     const unsigned long long id = contextIdOf(context);
     std::lock_guard<std::mutex> lock(g_moduleMutex);
     for (auto it = g_modules.begin(); it != g_modules.end(); ++it) {
@@ -136,7 +166,8 @@ CUfunction kernelFor(CUcontext context, std::string& error) {
             continue;
         }
         if (it->contextId == id && it->kernel) {
-            return it->kernel;
+            out = *it;
+            return true;
         }
         // Same address, different context: the old one was destroyed and its
         // module went with it.  Forget it (never unload into a dead context).
@@ -145,7 +176,7 @@ CUfunction kernelFor(CUcontext context, std::string& error) {
     }
     if (kOsvOfxReframeFatbin_size == 0) {
         error = "the embedded fatbin is empty (the build did not run nvcc)";
-        return nullptr;
+        return false;
     }
     // cuModuleLoadFatBinary loads into the CURRENT context, which is the
     // host's: exactly where its images live.
@@ -153,24 +184,45 @@ CUfunction kernelFor(CUcontext context, std::string& error) {
     CUresult r = cuModuleLoadFatBinary(&module, kOsvOfxReframeFatbin);
     if (r != CUDA_SUCCESS || !module) {
         error = cudaMessage("cuModuleLoadFatBinary", r);
-        return nullptr;
+        return false;
     }
-    CUfunction kernel = nullptr;
-    r = cuModuleGetFunction(&kernel, module, OSV_OFX_REFRAME_KERNEL_NAME);
-    if (r != CUDA_SUCCESS || !kernel) {
-        error = cudaMessage("cuModuleGetFunction", r);
-        cuModuleUnload(module);
-        return nullptr;
+    // Every kernel of the fatbin, looked up once: a module that lacks one is
+    // a build mismatch, refused as a whole rather than half used.
+    ContextModule loaded{context, id, module};
+    const struct {
+        CUfunction* slot;
+        const char* name;
+    } wanted[] = {
+        {&loaded.kernel, OSV_OFX_REFRAME_KERNEL_NAME},
+        {&loaded.viewFloat, OSV_OFX_VIEW_KERNEL_NAME},       // [WP-V-GPU]
+        {&loaded.viewByte, OSV_OFX_VIEW_BYTE_KERNEL_NAME},   // [WP-V-GPU]
+        {&loaded.equirect, OSV_OFX_EQUIRECT_KERNEL_NAME},    // [WP-V-GPU]
+    };
+    for (const auto& w : wanted) {
+        r = cuModuleGetFunction(w.slot, module, w.name);
+        if (r != CUDA_SUCCESS || !*w.slot) {
+            error = cudaMessage("cuModuleGetFunction", r) + " for " + w.name;
+            cuModuleUnload(module);
+            return false;
+        }
     }
     if (g_modules.size() >= kMaxContexts) {
         // Oldest first; its context is almost certainly gone, so it is
         // forgotten rather than unloaded (see releaseModules()).
         g_modules.erase(g_modules.begin());
     }
-    g_modules.push_back(ContextModule{context, id, module, kernel});
-    PluginLog::info("ofx/cuda: loaded the reframe kernel into context {} ({} bytes of fatbin)",
+    g_modules.push_back(loaded);
+    PluginLog::info("ofx/cuda: loaded the reframe kernels into context {} ({} bytes of fatbin)",
                     static_cast<const void*>(context), kOsvOfxReframeFatbin_size);
-    return kernel;
+    out = loaded;
+    return true;
+}
+
+/// The reframe kernel for `context` (current on this thread), loading the
+/// module on first use.  Null with `error` set on failure.
+CUfunction kernelFor(CUcontext context, std::string& error) {
+    ContextModule module;
+    return moduleFor(context, module, error) ? module.kernel : nullptr;
 }
 
 }  // namespace
@@ -269,8 +321,57 @@ bool launchReframe(const OsvReframeParams& params, const OsvRgbaSource& source, 
 }
 
 void releaseModules() noexcept {
+    // [WP-V-GPU] The own-GPU path's pools first: they unload what they loaded
+    // into their own (retained, so certainly alive) primary contexts, which
+    // takes g_moduleMutex - so it is not held here yet.
+    gpu::releaseDevicePools();
     std::lock_guard<std::mutex> lock(g_moduleMutex);
     g_modules.clear();
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-V-GPU] The own-GPU path's kernels
+// ---------------------------------------------------------------------------
+
+bool ownKernels(void* context, OwnKernels& out, std::string& error) noexcept {
+    try {
+        out = OwnKernels{};
+        ContextModule module;
+        if (!moduleFor(static_cast<CUcontext>(context), module, error)) {
+            return false;
+        }
+        out.viewFloat = module.viewFloat;
+        out.viewByte = module.viewByte;
+        out.equirect = module.equirect;
+        return true;
+    } catch (...) {
+        // std::vector growth in the cache is the only thing that can throw.
+        error = "exception while loading the own-GPU kernels";
+        out = OwnKernels{};
+        return false;
+    }
+}
+
+void unloadModulesIn(void* context) noexcept {
+    if (!context) {
+        return;
+    }
+    const CUcontext target = static_cast<CUcontext>(context);
+    const unsigned long long id = contextIdOf(target);
+    std::lock_guard<std::mutex> lock(g_moduleMutex);
+    for (auto it = g_modules.begin(); it != g_modules.end();) {
+        if (it->context != target) {
+            ++it;
+            continue;
+        }
+        // Only a module of THIS context (same id) is unloaded; an entry for a
+        // dead context that happened to have the same address is merely
+        // forgotten, as everywhere else in this cache.
+        if (it->contextId == id && it->module) {
+            (void)cuModuleUnload(it->module);
+        }
+        it = g_modules.erase(it);
+    }
 }
 
 CurrentContextGuard::CurrentContextGuard() noexcept {
@@ -300,6 +401,13 @@ CurrentContextGuard::~CurrentContextGuard() {
 
 #else  // !OSV_OFX_HAVE_CUDA
 
+bool driverInitialised(std::string* why) noexcept {
+    if (why) {
+        *why = "this build of OpenOSV.ofx has no CUDA kernel";
+    }
+    return false;
+}
+
 bool launchReframe(const OsvReframeParams&, const OsvRgbaSource&, const void*, void*, const OsvOfxTarget&, void*,
                    std::string& error) noexcept {
     error = "this build of OpenOSV.ofx has no CUDA kernel";
@@ -307,6 +415,14 @@ bool launchReframe(const OsvReframeParams&, const OsvRgbaSource&, const void*, v
 }
 
 void releaseModules() noexcept {}
+
+bool ownKernels(void*, OwnKernels& out, std::string& error) noexcept {
+    out = OwnKernels{};
+    error = "this build of OpenOSV.ofx has no CUDA kernel";
+    return false;
+}
+
+void unloadModulesIn(void*) noexcept {}
 
 CurrentContextGuard::CurrentContextGuard() noexcept = default;
 CurrentContextGuard::~CurrentContextGuard() = default;

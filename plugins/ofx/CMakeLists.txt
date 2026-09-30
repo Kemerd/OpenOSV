@@ -77,6 +77,8 @@ set(_osv_ofx_sources
   OfxCamera.h
   OfxGpuView.cpp
   OfxGpuView.h
+  OfxGpuPipeline.cpp  # [WP-V-GPU] pools, upload, pack kernels, banded readback
+  OfxGpuPipeline.h
   OfxHostImage.h
   OfxRender.cpp
   OfxRender.h
@@ -335,3 +337,13 @@ message(STATUS "OpenOSV.ofx")
 message(STATUS "  Bundle        : ${OSV_OFX_BUNDLE_DIR}")
 message(STATUS "  Kernel archs  : ${_osv_ofx_kernel_report}")
 message(STATUS "  Delay-loaded  : ${_osv_ofx_delayload}")
+
+# -----------------------------------------------------------------------------
+#  6. [WP-V-GPU] The own-GPU path's direct tests (tests/ofx_gpu): the pipeline
+#     under the three hooks, compiled into its own test executable and driven
+#     with every pixel format, level, window and pitch a CPU-image host hands
+#     out.  Only where the module has the kernel (Windows with CUDA).
+# -----------------------------------------------------------------------------
+if(OSV_BUILD_TESTS AND _osv_ofx_fatbin_cpp)
+  add_subdirectory("${CMAKE_SOURCE_DIR}/tests/ofx_gpu" "${CMAKE_BINARY_DIR}/tests/ofx_gpu")
+endif()

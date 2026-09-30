@@ -604,8 +604,11 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
             std::string gpuError;
             if (gpu::renderSourceEquirectGpu(*clip, static_cast<std::uint32_t>(index), draft, purpose, gpuTarget,
                                              gpuError)) {
+                gpu::notePath(effect, gpu::Hook::SourceEquirect, true, gpuError);
                 return kOfxStatOK;
             }
+            // Once per instance: which path took its first frame, and why.
+            gpu::notePath(effect, gpu::Hook::SourceEquirect, false, gpuError);
             if (!gpuError.empty()) {
                 PluginLog::oncef("ofx/source/gpu-equirect", PluginLog::Level::Warn,
                                  "ofx source: GPU sphere path failed, using the CPU copy: {}", gpuError);
@@ -646,8 +649,11 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
         std::string gpuError;
         if (gpu::renderSourceViewGpu(*clip, static_cast<std::uint32_t>(index), sphere, draft, purpose,
                                      camera::read(params, time), camera::projectSize(effect), gpuTarget, gpuError)) {
+            gpu::notePath(effect, gpu::Hook::SourceView, true, gpuError);
             return kOfxStatOK;
         }
+        // Once per instance: which path took its first frame, and why.
+        gpu::notePath(effect, gpu::Hook::SourceView, false, gpuError);
         if (!gpuError.empty()) {
             PluginLog::oncef("ofx/source/gpu-view", PluginLog::Level::Warn,
                              "ofx source: GPU view path failed, framing on the CPU: {}", gpuError);

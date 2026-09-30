@@ -10,10 +10,13 @@
 //     VEGAS support existed (tests/ofx/golden pins the descriptors);
 //   * VEGAS Pro: 8-bit or float images in R G B A or B G R A, the Filter
 //     context only (VEGAS lists every declared context as a separate FX),
-//     always in host memory.  An 8-bit source is promoted to float once per
-//     frame for the shared sampler; the output is written in the host's own
-//     format.  Levels are never touched: the filter only moves pixels the
-//     host has already levelled.
+//     always in host memory.  The view is framed on the plug-in's own GPU
+//     when there is one (OfxGpuView.h: the source uploaded in its own
+//     depth, the view packed on the device); on the CPU otherwise, where an
+//     8-bit source is promoted to float once per frame for the shared
+//     sampler.  The output is written in the host's own format.  Levels are
+//     never touched: the filter only moves pixels the host has already
+//     levelled.
 //
 // Every difference keys on hostProfile() (OfxHost.h) and on nothing else.
 
@@ -58,9 +61,9 @@ namespace {
     return text;
 }
 
-/// True for a 32-bit float R G B A view: the only format the CUDA kernel
-/// (and the host-image descriptions inside the [WP-V-GPU] region below)
-/// know.  Resolve's images always are; VEGAS's may not be.
+/// True for a 32-bit float R G B A view: the only format the kernel on the
+/// host's CUDA images knows.  Resolve's images always are; VEGAS's may not
+/// be (the own GPU path in the [WP-V-GPU] region takes every format).
 [[nodiscard]] bool isFloatRgbaView(const HostImageView& view) noexcept {
     return view.depth == HostDepth::Float && view.order == HostOrder::Rgba;
 }
@@ -241,10 +244,63 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) noexc
         return kOfxStatOK;
     }
 
+    // ---- the camera ---------------------------------------------------------------
+    OfxParamSetHandle params = effectParams(effect);
+    const reframe::Settings settings = camera::read(params, time);
+    const double par = getDouble(effectProps(effect), kOfxImageEffectPropProjectPixelAspectRatio, 0, 1.0);
+    const OfxRectI frame = cameraFrame(outputClip, time, sx, sy, par, output.bounds);
+
+    // ---- [WP-V-GPU] begin - CPU images framed on our own GPU ----------------------
+    // A host that hands CPU images (VEGAS always does) still gets the view
+    // framed on the GPU: the source uploaded in its OWN depth (an 8-bit
+    // source crosses the bus at 4 bytes a pixel - no float copy is made for
+    // this path), framed, packed in the output's own depth and order, read
+    // back.  "Not mine" (no GPU path) falls through to the CPU loop below, as
+    // does a GPU failure, logged once.  The filter keeps the host's levels:
+    // it only moves pixels.  A host's CUDA images never come here.
+    if (!cudaEnabled) {
+        // The camera half of buildParams() - buildView(), bit for bit the
+        // params buildParams() would return - with the source described by its
+        // size and order: the GPU reads the source as the host holds it, so
+        // it needs neither the promotion nor a sampler pointer into it.
+        const reframe::ViewSetup gpuView =
+            reframe::buildView(settings, frame.x2 - frame.x1, frame.y2 - frame.y1, camera::projectSize(effect));
+        if (gpuView.valid) {
+            reframe::KernelSetup gpuSetup;
+            gpuSetup.params = gpuView.params;
+            gpuSetup.source.w = sourceImageView->width();
+            gpuSetup.source.h = sourceImageView->height();
+            gpuSetup.source.isBgra = sourceImageView->order == HostOrder::Bgra ? 1 : 0;
+            gpuSetup.valid = true;
+            gpuSetup.reject = reframe::SetupReject::None;
+            gpu::HostTarget gpuTarget;
+            gpuTarget.image = *outputView;
+            gpuTarget.window = window;
+            gpuTarget.frame = frame;
+            gpuTarget.levels = OutputLevels::Full;
+            std::string gpuError;
+            if (gpu::renderReframeFromHostGpu(gpuSetup, *sourceImageView, gpuTarget, gpuError)) {
+                gpu::notePath(effect, gpu::Hook::ReframeFilter, true, gpuError);
+                return kOfxStatOK;
+            }
+            // Once per instance: which path took its first frame, and why.
+            gpu::notePath(effect, gpu::Hook::ReframeFilter, false, gpuError);
+            if (!gpuError.empty()) {
+                PluginLog::oncef("ofx/reframe/gpu-host", PluginLog::Level::Warn,
+                                 "ofx reframe: GPU path for CPU images failed, framing on the CPU: {}", gpuError);
+            }
+        }
+        // No camera for this frame: the setup below refuses it and says why,
+        // exactly as before the GPU path existed.
+    }
+    // [WP-V-GPU] end
+
     // ---- the source as the shared sampler reads it -----------------------------
     // The sampler reads float (or half) only.  An 8-bit source - VEGAS's
     // 8-bit projects - is promoted to a float copy once per frame, in the
     // same channel order, on all cores; a float source is read in place.
+    // Only the CPU loop and the host-CUDA path get here: the own GPU path
+    // above samples 8-bit codes directly.
     reframe::ConstFrameView samplerSource = sourceView(*sourceImageView);
     std::vector<float> promoted;
     if (reframe::layoutNeedsPromotion(samplerSource.layout)) {
@@ -258,11 +314,7 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) noexc
         }
     }
 
-    // ---- the camera ---------------------------------------------------------------
-    OfxParamSetHandle params = effectParams(effect);
-    const reframe::Settings settings = camera::read(params, time);
-    const double par = getDouble(effectProps(effect), kOfxImageEffectPropProjectPixelAspectRatio, 0, 1.0);
-    const OfxRectI frame = cameraFrame(outputClip, time, sx, sy, par, output.bounds);
+    // ---- the sampler's setup --------------------------------------------------------
     reframe::KernelSetup setup = reframe::buildParams(settings, samplerSource, frame.x2 - frame.x1,
                                                       frame.y2 - frame.y1, camera::projectSize(effect));
     if (!setup.valid) {
@@ -305,38 +357,6 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) noexc
         }
         return kOfxStatOK;
     }
-
-    // The GPU hook below describes both images to itself as 32-bit float
-    // R, G, B, A.  Until it describes them from `outputView` and
-    // `sourceImageView` - the real depth and order, both ready here - it may
-    // only run when that description is the truth, so an 8-bit or B, G, R, A
-    // image (VEGAS) goes straight to the CPU loop.  The condition governs
-    // the region's block as a whole; nothing inside the region is changed.
-    const bool gpuHookFormatsTrue = isFloatRgbaView(*outputView) && isFloatRgbaView(*sourceImageView);
-    if (gpuHookFormatsTrue)
-    // ---- [WP-V-GPU] begin - CPU images framed on our own GPU ----------------------
-    // A host that hands CPU images (VEGAS always does) still gets the view
-    // framed on the GPU: upload, frame, pack, read back.  "Not mine" (no GPU
-    // path) falls through to the CPU loop below, as does a GPU failure,
-    // logged once.  The filter keeps the host's levels: it only moves pixels.
-    {
-        gpu::HostTarget gpuTarget;
-        gpuTarget.image = HostImageView{output.data, output.rowBytes, output.bounds, HostDepth::Float, HostOrder::Rgba};
-        gpuTarget.window = window;
-        gpuTarget.frame = frame;
-        gpuTarget.levels = OutputLevels::Full;
-        const HostImageView sourceImage{source.data, source.rowBytes, source.bounds, HostDepth::Float,
-                                        HostOrder::Rgba};
-        std::string gpuError;
-        if (gpu::renderReframeFromHostGpu(setup, sourceImage, gpuTarget, gpuError)) {
-            return kOfxStatOK;
-        }
-        if (!gpuError.empty()) {
-            PluginLog::oncef("ofx/reframe/gpu-host", PluginLog::Level::Warn,
-                             "ofx reframe: GPU path for CPU images failed, framing on the CPU: {}", gpuError);
-        }
-    }
-    // [WP-V-GPU] end
 
     // ---- the CPU path -------------------------------------------------------------
     // Written in the output's own depth and order; full levels, because the
