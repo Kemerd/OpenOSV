@@ -52,6 +52,14 @@
 // through the mock host).  It is read on every call, so a test - or a user
 // chasing a problem - can flip it without reloading the module.
 //
+// The generator hooks serve a clip whose renderer is the engine's CUDA
+// renderer (NVDEC decode when the clip allows it, host decode and upload
+// otherwise).  A clip on the OpenCL or CPU renderer - and every Mac - gets
+// "not mine": the OpenCL renderer hands back host images only, so framing
+// its sphere on the device would first need a device-output entry point in
+// src/osv/render/opencl, and the CPU framing is what it would read back into
+// anyway.
+//
 // Every pixel written - the view, and the transparent black outside the
 // camera frame alike - is packed by OfxHostImage.h's storeHostPixel() rule:
 // levels on R, G and B (never alpha), then the depth, then the order.  So
