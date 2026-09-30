@@ -710,7 +710,16 @@ namespace OpenOSV.Vegas.UI
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
-            Step(e.Delta > 0 ? 1 : -1);
+            // The wheel changes the number only while the stepper has focus:
+            // scrolling the panel past it must never edit a clip.
+            if (ContainsFocus)
+            {
+                Step(e.Delta > 0 ? 1 : -1);
+                if (e is HandledMouseEventArgs handled)
+                {
+                    handled.Handled = true;
+                }
+            }
             base.OnMouseWheel(e);
         }
 

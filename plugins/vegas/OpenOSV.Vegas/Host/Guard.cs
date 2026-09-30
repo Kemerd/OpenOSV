@@ -110,6 +110,10 @@ namespace OpenOSV.Vegas.Host
                 return;
             }
             Notifier.Status(result.Summary, result.Kind);
+            // Whatever the action did - or declined to do - the panel re-reads
+            // the project, so no control keeps showing a choice that did not
+            // take (a proxy switch with no .LRF beside the clips, say).
+            Notifier.RaiseClipsChanged();
             if (result.ShowDialog)
             {
                 try

@@ -120,35 +120,6 @@ namespace OpenOSV.Vegas.UI
         }
     }
 
-    /// <summary>
-    /// The one native piece the panel keeps - the scroll bar - in the theme's
-    /// appearance: Windows 10 1809+ draws a window's scroll bars dark under
-    /// the "DarkMode_Explorer" visual style.  Older Windows ignores the name
-    /// and keeps its light bar, which is merely less pretty.
-    /// </summary>
-    internal static class NativeTheme
-    {
-        [System.Runtime.InteropServices.DllImport("uxtheme.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
-        private static extern int SetWindowTheme(IntPtr hwnd, string appName, string idList);
-
-        /// <summary>Apply the dark or light scroll bars to a control's window.  Never throws.</summary>
-        public static void Apply(Control c, bool dark)
-        {
-            try
-            {
-                if (c is not null && !c.IsDisposed && c.IsHandleCreated)
-                {
-                    SetWindowTheme(c.Handle, dark ? "DarkMode_Explorer" : "Explorer", null);
-                    c.Invalidate(true);
-                }
-            }
-            catch (Exception)
-            {
-                // No uxtheme: the stock scroll bar.
-            }
-        }
-    }
-
     /// <summary>Drawing helpers.</summary>
     internal static class Draw
     {

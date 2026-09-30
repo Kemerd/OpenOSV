@@ -82,7 +82,7 @@ namespace OpenOSV.Vegas.UI
     internal sealed class OpenOsvPanel : UserControl
     {
         // ---- structure -------------------------------------------------------------------
-        private readonly Panel _scroll;
+        private readonly ScrollHost _scroll;
         private readonly Panel _content;
         private readonly HeaderView _header;
         private readonly Banner _banner;
@@ -149,9 +149,8 @@ namespace OpenOSV.Vegas.UI
 
             // ---- the scroller, the content, the fixed status bar -------------------------------
             _status = new StatusBar { Dock = DockStyle.Bottom };
-            _scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Theme.Current.Background };
             _content = new Panel { Location = Point.Empty, BackColor = Theme.Current.Background };
-            _scroll.Controls.Add(_content);
+            _scroll = new ScrollHost(_content) { Dock = DockStyle.Fill };
             Controls.Add(_scroll);
             Controls.Add(_status);
 
@@ -255,7 +254,7 @@ namespace OpenOSV.Vegas.UI
             // ---- Tools --------------------------------------------------------------------------------------------------
             _toolsCard = AddCard("Tools");
             AddTool("360 project setup", Icons.Globe, "A 2:1 frame, VEGAS's 360 output on, OSV clips as full spheres.",
-                    () => Guard.Report(ProjectActions.Setup360(SelectedMedia())));
+                    () => Guard.Report(ProjectActions.Setup360()));
             AddTool("Apply 360 Reframe", Icons.Filter, "OpenOSV 360 Reframe on the selected non-OSV events, stretched to fill the frame.",
                     () => Guard.Report(ProjectActions.ApplyReframeFilter()));
             AddTool("Make framing unique", Icons.Copy, "Give each selected OSV event its own camera. Events cut from one clip share one otherwise.",
@@ -289,8 +288,6 @@ namespace OpenOSV.Vegas.UI
                 Guard.Quietly("refreshing the OpenOSV panel", RefreshAll);
             };
             _scroll.Resize += (s, e) => Relayout();
-            // Dark scroll bars in a dark skin, from the moment the window exists.
-            _scroll.HandleCreated += (s, e) => NativeTheme.Apply(_scroll, Theme.Current.Dark);
             Theme.Changed += OnThemeChanged;
             Notifier.StatusChanged += OnStatus;
             Notifier.ClipsChanged += ScheduleRefresh;
@@ -420,8 +417,7 @@ namespace OpenOSV.Vegas.UI
             Guard.Quietly("applying the theme", () =>
             {
                 BackColor = Theme.Current.Background;
-                _scroll.BackColor = Theme.Current.Background;
-                NativeTheme.Apply(_scroll, Theme.Current.Dark);
+                _scroll.Invalidate(true);
                 _content.BackColor = Theme.Current.Background;
                 foreach (Control c in _content.Controls)
                 {
@@ -443,6 +439,7 @@ namespace OpenOSV.Vegas.UI
 
             // ---- the clip list ------------------------------------------------------------------
             List<OsvMedia> media = OsvMedia.AllIn(project);
+            Dictionary<string, int> eventCounts = Timeline.EventCountsByMediaKey(project);
             var rows = new List<ClipRow>(media.Count);
             foreach (OsvMedia m in media)
             {
@@ -457,7 +454,7 @@ namespace OpenOSV.Vegas.UI
                     Proxy = m.OnProxy,
                     Offline = m.IsOffline,
                     Equirect = equirect,
-                    EventCount = m.Events(project).Count,
+                    EventCount = eventCounts.TryGetValue(m.Key, out int events) ? events : 0,
                 });
             }
             _list.SetRows(rows);
@@ -782,14 +779,9 @@ namespace OpenOSV.Vegas.UI
                 SuspendLayout();
                 int margin = Px(12);
                 int gap = Px(16);
-                int available = _scroll.ClientSize.Width;
-                // Leave room for the vertical scroll bar so the width never
-                // changes under it (no horizontal scroll bar, ever).
-                if (!_scroll.VerticalScroll.Visible)
-                {
-                    available -= SystemInformation.VerticalScrollBarWidth;
-                }
-                int width = Math.Max(Px(200), available);
+                // The overlay scroller takes no width: the cards use all of it
+                // (and there is never a horizontal scroll bar).
+                int width = Math.Max(Px(200), _scroll.ClientSize.Width);
                 int inner = width - 2 * margin;
                 int y = margin;
 
@@ -819,7 +811,8 @@ namespace OpenOSV.Vegas.UI
                     y = PlaceColumn(left, margin, y, inner, gap);
                     y = PlaceColumn(right, margin, y, inner, gap);
                 }
-                _content.SetBounds(0, 0, width, y + margin);
+                _content.SetBounds(0, _content.Top, width, y + margin);
+                _scroll.UpdateExtent();
                 _status.Height = _status.PreferredHeight;
                 ResumeLayout(true);
             }

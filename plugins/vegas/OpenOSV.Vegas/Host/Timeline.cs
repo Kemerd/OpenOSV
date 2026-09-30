@@ -46,6 +46,45 @@ namespace OpenOSV.Vegas.Host
             return list;
         }
 
+        /// <summary>
+        /// How many video events play each media, by the media's pool key -
+        /// one walk of the timeline for every media at once (each access is a
+        /// call into VEGAS, so a per-media walk would be quadratic).
+        /// </summary>
+        public static Dictionary<string, int> EventCountsByMediaKey(Project project)
+        {
+            var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+            if (project is null)
+            {
+                return counts;
+            }
+            try
+            {
+                foreach (Track track in project.Tracks)
+                {
+                    if (!(track is VideoTrack))
+                    {
+                        continue;
+                    }
+                    foreach (TrackEvent evt in track.Events)
+                    {
+                        string key = VegasHost.SafeString(() => evt.ActiveTake?.Media?.KeyString);
+                        if (string.IsNullOrEmpty(key))
+                        {
+                            continue;
+                        }
+                        counts.TryGetValue(key, out int n);
+                        counts[key] = n + 1;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("timeline: counting events per media failed", ex);
+            }
+            return counts;
+        }
+
         /// <summary>The first selected track of a kind, or null.</summary>
         public static T FirstSelectedTrack<T>(Project project) where T : Track
         {

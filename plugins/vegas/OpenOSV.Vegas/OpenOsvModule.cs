@@ -79,7 +79,7 @@ namespace OpenOSV.Vegas
                 root.AddChild(Command("OpenOSV.Import", "Import OSV...", () => ImportAction.RunWithDialog()));
                 root.AddChild(Command("OpenOSV.Proxies", "Edit with LRF proxies", () => Guard.Report(ProxyAction.Run(true))));
                 root.AddChild(Command("OpenOSV.FullQuality", "Full quality", () => Guard.Report(ProxyAction.Run(false))));
-                root.AddChild(Command("OpenOSV.Setup360", "360 project setup", () => Guard.Report(ProjectActions.Setup360(null))));
+                root.AddChild(Command("OpenOSV.Setup360", "360 project setup", () => Guard.Report(ProjectActions.Setup360())));
                 root.AddChild(Command("OpenOSV.Reframe", "Apply 360 Reframe to selected events", () => Guard.Report(ProjectActions.ApplyReframeFilter())));
 
                 var looks = new CustomCommand(CommandCategory.Tools, "OpenOSV.Looks") { DisplayName = "Framing look" };

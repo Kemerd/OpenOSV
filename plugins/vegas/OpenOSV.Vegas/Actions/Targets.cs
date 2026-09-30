@@ -54,6 +54,7 @@ namespace OpenOSV.Vegas.Actions
             var seen = new HashSet<string>(StringComparer.Ordinal);
             VegasHost.FrameSize(project, out int projectW, out int projectH);
             List<VideoEvent> selected = Timeline.SelectedVideoEvents(project);
+            Dictionary<string, int> counts = Timeline.EventCountsByMediaKey(project);
 
             foreach (VideoEvent evt in selected)
             {
@@ -65,7 +66,7 @@ namespace OpenOSV.Vegas.Actions
                     {
                         continue;
                     }
-                    list.Add(ForMedia(project, media, evt));
+                    list.Add(ForMedia(media, evt, counts));
                     continue;
                 }
                 ++otherEvents;
@@ -91,7 +92,7 @@ namespace OpenOSV.Vegas.Actions
             // ---- nothing selected: the clip chosen in the panel ------------------------------
             if (selected.Count == 0 && fallback is not null)
             {
-                list.Add(ForMedia(project, fallback, null));
+                list.Add(ForMedia(fallback, null, counts));
             }
             return list;
         }
@@ -117,7 +118,7 @@ namespace OpenOSV.Vegas.Actions
             return list;
         }
 
-        private static CameraTarget ForMedia(Project project, OsvMedia media, VideoEvent evt)
+        private static CameraTarget ForMedia(OsvMedia media, VideoEvent evt, Dictionary<string, int> eventCounts)
         {
             System.Drawing.Size size = media.FrameSize;
             return new CameraTarget
@@ -128,7 +129,7 @@ namespace OpenOSV.Vegas.Actions
                 KeyTime = evt is not null ? Timeline.MediaTimeAtCursor(evt) : null,
                 FrameWidth = size.Width,
                 FrameHeight = size.Height,
-                Shared = media.Events(project).Count > 1,
+                Shared = eventCounts.TryGetValue(media.Key, out int events) && events > 1,
             };
         }
     }

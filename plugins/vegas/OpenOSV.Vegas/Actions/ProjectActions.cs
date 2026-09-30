@@ -23,7 +23,7 @@ namespace OpenOSV.Vegas.Actions
         /// every OSV clip when nothing is selected - switched to 360 equirect
         /// at exactly the project's size.
         /// </summary>
-        public static ActionResult Setup360(OsvMedia fallback)
+        public static ActionResult Setup360()
         {
             const string title = "360 project setup";
             Project project = VegasHost.Project;
