@@ -6,6 +6,44 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-30
+
+VEGAS Pro 17.0 works: import, the camera and playback, live in VEGAS. Still
+experimental.
+
+### Fixed
+
+* **VEGAS Pro: creating OpenOSV Source media no longer crashes VEGAS 17**
+  (the 0.4.0 known issue). Right after creating an instance, VEGAS replays
+  every parameter as a change. Answering those, the camera opened an undo
+  group, which VEGAS 17 can't take at that point. Under VEGAS the camera's
+  edits now go without an undo group.
+* **VEGAS Pro: the camera starts where it should.** VEGAS's replay after
+  creation reads like a user edit, twice. OpenOSV now tells the replay (many
+  parameters in one change bracket) from a real edit (one), so it no longer
+  switched the lens to Classic or re-applied the preset over new media.
+* **VEGAS Pro: imported clips play every frame.** Media made by Import OSV...
+  runs on a millisecond clock (frame rate 1000). OpenOSV read that as a frame
+  number, so a clip froze on its last frame a few frames in. The time now
+  maps to the clip's frame through seconds, at any rate up to 1000, with
+  half a millisecond of slack for VEGAS's rounding.
+* **The VEGAS extension rebuilds when the version changes,** so its assembly
+  version always matches the release.
+
+### Changed
+
+* **VEGAS Pro 17.0 is experimental, not untested.** README Tutorial 4 walks
+  through it step by step; `docs/VEGAS.md` has the live-test checklist.
+  DaVinci Resolve stays a preview.
+* At `OSV_PLUGIN_LOG_LEVEL=debug` the OpenFX trace also names each changed
+  parameter and the reason, the time of each render, and the clip frame it
+  maps to.
+
+### Known issues
+
+* **VEGAS Pro HDR and ACES projects:** the picture doesn't match the project's
+  output colour space yet. Stay on Rec. 709.
+
 ## [0.4.0] - 2026-09-30
 
 ### Added

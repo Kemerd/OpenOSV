@@ -403,6 +403,9 @@ OfxStatus destroyInstance(OfxImageEffectHandle effect) noexcept {
 }
 
 OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
+    // Counted first, whatever the change: VEGAS's roll-call of every
+    // parameter is not an edit (OfxHost.h, "Change brackets").
+    const bool rollCall = isHostRollCall(effect);
     // Only parameters: VEGAS also reports its clip "Output" changing, which
     // is nothing this generator supervises.
     if (getString(inArgs, kOfxPropType) != kOfxTypeParameter) {
@@ -419,7 +422,9 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
         refreshClipInfo(effect, time);
         return kOfxStatOK;
     }
-    if (reason != kOfxChangeUserEdited) {
+    // The file's read-out above follows even a roll-call (it only reads);
+    // nothing below may act on one.
+    if (rollCall || reason != kOfxChangeUserEdited) {
         return kOfxStatReplyDefault;
     }
     if (name == kChooseFile) {
@@ -554,6 +559,10 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     }
     const long long startFrame = intAt(params, kStartFrame, time, 0);
     const long long index = frameForTime(time, haveRange ? range[0] : 0.0, hostFps, clip->fps(), startFrame);
+    // Every frame's mapping, at debug level: the first-render line below
+    // only shows one, and a host's timebase shows in the sequence.
+    PluginLog::logf(PluginLog::Level::Debug, "ofx source: time {} (range {} [{}, {}], host fps {}) -> clip frame {}",
+                    time, haveRange ? "known" : "unknown", range[0], range[1], hostFps, index);
     {
         std::lock_guard<std::mutex> lock(inst->mutex);
         if (!inst->loggedTiming) {
@@ -722,7 +731,18 @@ OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySetHandle
             return createInstance(effect);
         }
         if (isAction(action, kOfxActionDestroyInstance)) {
+            changeBracketEnd(effect);
             return destroyInstance(effect);
+        }
+        // The brackets around a host's batch of changes (OfxHost.h): counted
+        // for VEGAS's sake, answered with the default as before.
+        if (isAction(action, kOfxActionBeginInstanceChanged)) {
+            changeBracketBegin(effect);
+            return kOfxStatReplyDefault;
+        }
+        if (isAction(action, kOfxActionEndInstanceChanged)) {
+            changeBracketEnd(effect);
+            return kOfxStatReplyDefault;
         }
         if (isAction(action, kOfxActionDescribe)) {
             return describe(effect);

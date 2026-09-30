@@ -96,6 +96,11 @@ file(GLOB_RECURSE _osv_vegas_ext_sources CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/OpenOSV.Vegas/*.csproj")
 set(_osv_vegas_props "${CMAKE_CURRENT_SOURCE_DIR}/Directory.Build.props")
 set(_osv_vegas_common_args -c Release -nologo -v minimal "-p:OsvVegasOut=${OSV_VEGAS_DOTNET_DIR}" "-p:Version=${PROJECT_VERSION}")
+# The version the assemblies are stamped with, as a file the builds depend
+# on: file(CONFIGURE) rewrites it only when the version changes, so a version
+# bump rebuilds both assemblies and nothing else does.
+set(_osv_vegas_version_stamp "${OSV_VEGAS_DOTNET_DIR}version.txt")
+file(CONFIGURE OUTPUT "${_osv_vegas_version_stamp}" CONTENT "${PROJECT_VERSION}\n")
 
 # -----------------------------------------------------------------------------
 #  Core + tests (always)
@@ -105,7 +110,7 @@ add_custom_command(
   COMMAND "${OSV_DOTNET_EXECUTABLE}" build "${CMAKE_CURRENT_SOURCE_DIR}/OpenOSV.Vegas.Tests/OpenOSV.Vegas.Tests.csproj"
           ${_osv_vegas_common_args}
   COMMAND "${CMAKE_COMMAND}" -E touch "${OSV_VEGAS_DOTNET_DIR}core-tests.stamp"
-  DEPENDS ${_osv_vegas_core_sources} ${_osv_vegas_test_sources} "${_osv_vegas_props}"
+  DEPENDS ${_osv_vegas_core_sources} ${_osv_vegas_test_sources} "${_osv_vegas_props}" "${_osv_vegas_version_stamp}"
   COMMENT "VEGAS: building OpenOSV.Vegas.Core and its tests (dotnet)"
   VERBATIM)
 add_custom_target(osv_vegas_core ALL DEPENDS "${OSV_VEGAS_DOTNET_DIR}core-tests.stamp")
@@ -148,7 +153,7 @@ add_custom_command(
   COMMAND "${CMAKE_COMMAND}" -E touch "${OSV_VEGAS_DOTNET_DIR}extension.stamp"
   # After Core + tests: two dotnet builds of Core at once would fight over
   # its obj folder.
-  DEPENDS ${_osv_vegas_ext_sources} ${_osv_vegas_core_sources} "${_osv_vegas_props}"
+  DEPENDS ${_osv_vegas_ext_sources} ${_osv_vegas_core_sources} "${_osv_vegas_props}" "${_osv_vegas_version_stamp}"
           "${OSV_VEGAS_DOTNET_DIR}core-tests.stamp"
   COMMENT "VEGAS: building the OpenOSV.Vegas extension against ${_osv_scriptportal}"
   VERBATIM)

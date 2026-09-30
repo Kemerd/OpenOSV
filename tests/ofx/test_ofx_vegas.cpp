@@ -648,3 +648,74 @@ TEST_CASE("VEGAS: a field render at x.5 shows the frame x shows", "[ofx][.vegas]
     REQUIRE(whole.render(7.5, kOfxImageFieldUpper) == kOfxStatOK);
     CHECK(maxDifference(first, whole.output, whole.frame) == 0.0);
 }
+
+// ===========================================================================
+//  VEGAS's parameter roll-call
+// ===========================================================================
+// Right after it creates an instance, VEGAS 17 sends one bracket announcing
+// every parameter in definition order, each as kOfxChangeUserEdited, and
+// sends it twice (observed live).  Taken as edits, it re-applied the preset,
+// switched the lens to Classic and re-derived the DJI lens from Zoom; the
+// undo group those edits opened is also what crashed VEGAS.  Only a bracket's
+// first change may count as the user's.
+
+namespace {
+
+/// Begin, one user-edited change per parameter in definition order, End.
+void vegasRollCall(PluginHarness& harness, Effect& effect) {
+    PropertySet in;
+    PropertySet out;
+    REQUIRE(harness.action(kOfxActionBeginInstanceChanged, effect.handle(), &in, &out) == kOfxStatReplyDefault);
+    for (const auto& p : effect.params.params) {
+        (void)harness.instanceChanged(effect, p->name, kOfxChangeUserEdited, 0.0);
+    }
+    REQUIRE(harness.action(kOfxActionEndInstanceChanged, effect.handle(), &in, &out) == kOfxStatReplyDefault);
+}
+
+/// The plug-in's own writes to every parameter but `except`.
+int writesExcept(const Effect& effect, const std::string& except) {
+    int writes = 0;
+    for (const auto& p : effect.params.params) {
+        if (p->name != except) {
+            writes += p->pluginWrites;
+        }
+    }
+    return writes;
+}
+
+}  // namespace
+
+TEST_CASE("VEGAS: the roll-call after CreateInstance edits nothing; one change per bracket still does",
+          "[ofx][.vegas]") {
+    REQUIRE_VEGAS_PROFILE();
+    PluginHarness& reframe = Fixture::get().reframe;
+
+    // ---- the filter: two roll-calls, not a single write ------------------------
+    VegasReframeRig filter(kFormats[0], kFormats[0]);
+    const int lensBefore = filter.param(cam::kLens).i;
+    const int presetBefore = filter.param(cam::kPreset).i;
+    vegasRollCall(reframe, *filter.effect);
+    vegasRollCall(reframe, *filter.effect);
+    CHECK(writesExcept(*filter.effect, std::string()) == 0);
+    CHECK(filter.param(cam::kLens).i == lensBefore);
+    CHECK(filter.param(cam::kPreset).i == presetBefore);
+
+    // ---- a real edit, alone in its bracket, still drives the camera -------------
+    filter.param(cam::kLens).i = 1;  // "DJI|Classic": Classic
+    {
+        PropertySet in;
+        PropertySet out;
+        REQUIRE(reframe.action(kOfxActionBeginInstanceChanged, filter.effect->handle(), &in, &out) ==
+                kOfxStatReplyDefault);
+        CHECK(reframe.instanceChanged(*filter.effect, cam::kLens, kOfxChangeUserEdited, 0.0) == kOfxStatOK);
+        REQUIRE(reframe.action(kOfxActionEndInstanceChanged, filter.effect->handle(), &in, &out) ==
+                kOfxStatReplyDefault);
+    }
+    CHECK(filter.param(cam::kLensMirror).pluginWrites > 0);  // the switch was carried out
+
+    // ---- the generator: only the file's read-out may refresh ---------------------
+    VegasSourceRig generator(kFormats[1]);
+    vegasRollCall(Fixture::get().source, *generator.effect);
+    vegasRollCall(Fixture::get().source, *generator.effect);
+    CHECK(writesExcept(*generator.effect, src::kClipInfo) == 0);
+}

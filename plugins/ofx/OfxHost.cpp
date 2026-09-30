@@ -13,6 +13,7 @@
 #include <cmath>
 #include <format>
 #include <mutex>
+#include <unordered_map>
 
 namespace osv::ofx {
 
@@ -205,6 +206,61 @@ HostProfile hostProfile() noexcept {
         g_hostProfile.store(static_cast<int>(profile), std::memory_order_relaxed);
     }
     return profile;
+}
+
+// ---------------------------------------------------------------------------
+//  Change brackets
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Open brackets: instance -> how many InstanceChanged actions it has seen.
+/// Guarded by its own mutex: hosts may bracket different instances on
+/// different threads.
+std::mutex g_bracketMutex;
+std::unordered_map<const void*, int> g_brackets;
+
+}  // namespace
+
+void changeBracketBegin(const void* instance) noexcept {
+    if (!instance) {
+        return;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(g_bracketMutex);
+        g_brackets[instance] = 0;
+    } catch (...) {
+        // Bookkeeping only: without it every change counts as an edit.
+    }
+}
+
+void changeBracketEnd(const void* instance) noexcept {
+    if (!instance) {
+        return;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(g_bracketMutex);
+        g_brackets.erase(instance);
+    } catch (...) {
+    }
+}
+
+bool isHostRollCall(const void* instance) noexcept {
+    if (!instance) {
+        return false;
+    }
+    int position = 0;
+    try {
+        std::lock_guard<std::mutex> lock(g_bracketMutex);
+        const auto it = g_brackets.find(instance);
+        if (it == g_brackets.end()) {
+            return false;  // no bracket open: a lone change is an edit
+        }
+        position = ++it->second;
+    } catch (...) {
+        return false;
+    }
+    return position > 1 && hostProfile() == HostProfile::Vegas;
 }
 
 const char* hostProfileName(HostProfile profile) noexcept {
@@ -811,6 +867,11 @@ void setParamVisible(OfxParamSetHandle set, const char* name, bool visible) noex
 EditGroup::EditGroup(OfxParamSetHandle set, const char* label) noexcept : m_set(set) {
     const OfxParameterSuiteV1* ps = paramSuite();
     if (!ps || !m_set || !ps->paramEditBegin) {
+        return;
+    }
+    // VEGAS: no undo group (see OfxHost.h).  m_open stays false, so the
+    // destructor never calls paramEditEnd either.
+    if (hostProfile() == HostProfile::Vegas) {
         return;
     }
     m_open = ps->paramEditBegin(m_set, label ? label : "OpenOSV") == kOfxStatOK;

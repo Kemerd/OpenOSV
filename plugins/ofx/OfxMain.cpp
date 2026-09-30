@@ -110,11 +110,24 @@ bool isAction(const char* action, const char* name) noexcept {
 /// answered, flushed line by line.  Off by default (one level check per
 /// action), since render actions arrive once a frame.
 template <class Body>
-OfxStatus traced(const char* who, const char* action, const void* handle, Body&& body) {
+OfxStatus traced(const char* who, const char* action, const void* handle, OfxPropertySetHandle inArgs, Body&& body) {
     const bool trace = PluginLog::enabled(PluginLog::Level::Debug);
     if (trace) {
-        PluginLog::logf(PluginLog::Level::Debug, "ofx trace: {} <- {} (instance {})", who, action ? action : "(null)",
-                        handle);
+        if (isAction(action, kOfxActionInstanceChanged)) {
+            // What changed, of which kind, and why: the host's reason is what
+            // tells a user's edit from the host's own bookkeeping.
+            PluginLog::logf(PluginLog::Level::Debug, "ofx trace: {} <- {} (instance {}): {} '{}', reason {}", who,
+                            action, handle, osv::ofx::getString(inArgs, kOfxPropType),
+                            osv::ofx::getString(inArgs, kOfxPropName),
+                            osv::ofx::getString(inArgs, kOfxPropChangeReason));
+        } else if (isAction(action, kOfxImageEffectActionRender)) {
+            // The time the host asks for: what a generator maps to a frame.
+            PluginLog::logf(PluginLog::Level::Debug, "ofx trace: {} <- {} (instance {}) at time {}", who, action,
+                            handle, osv::ofx::getDouble(inArgs, kOfxPropTime));
+        } else {
+            PluginLog::logf(PluginLog::Level::Debug, "ofx trace: {} <- {} (instance {})", who,
+                            action ? action : "(null)", handle);
+        }
     }
     const OfxStatus status = body();
     if (trace) {
@@ -141,7 +154,7 @@ OfxStatus reframeEntry(const char* action, const void* handle, OfxPropertySetHan
         if (isAction(action, kOfxActionUnload)) {
             return moduleUnload();
         }
-        return traced("reframe", action, handle, [&] {
+        return traced("reframe", action, handle, inArgs, [&] {
             return osv::ofx::reframe_filter::mainEntry(action, handle, inArgs, outArgs);
         });
     } catch (...) {
@@ -159,7 +172,7 @@ OfxStatus sourceEntry(const char* action, const void* handle, OfxPropertySetHand
         if (isAction(action, kOfxActionUnload)) {
             return moduleUnload();
         }
-        return traced("source", action, handle, [&] {
+        return traced("source", action, handle, inArgs, [&] {
             return osv::ofx::source::mainEntry(action, handle, inArgs, outArgs);
         });
     } catch (...) {

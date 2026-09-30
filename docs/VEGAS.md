@@ -1,27 +1,27 @@
 # VEGAS Pro (OpenFX + extension)
 
-**Status: experimental.** Everything here is built and checked against a
-strict mock OpenFX host that plays VEGAS's part (`tests/ofx`), and the install
-script is exercised against scratch folders. The first live runs, in VEGAS
-Pro 17, went like this:
+**Status: experimental, working in VEGAS Pro 17.** Everything here is built
+and checked against a strict mock OpenFX host that plays VEGAS's part
+(`tests/ofx`), and 0.4.1 has run live in VEGAS Pro 17:
 
-- **Worked:** VEGAS found both effects and described them cleanly (the
+- **Works:** VEGAS finds both effects and describes them cleanly (the
   generator render-unsafe, the filter in the Filter context only, 8-bit and
-  float in both channel orders). It loaded the extension. It reported itself
-  as expected: `com.vegascreativesoftware.vegas`, OpenFX 1.1, 8-bit and float
-  images, no CUDA images.
-- **Known issue:** creating OpenOSV Source media from a script, which is what
-  **Import OSV...** does, **crashed VEGAS 17** in both automated attempts,
-  inside VEGAS right after the generator's Create Instance action. It is not
-  diagnosed yet. Nobody has tried inserting OpenOSV Source by hand from
-  Media Generators.
+  float in both channel orders), and loads the extension. **Import OSV...**
+  puts a clip on the timeline at its length and size with its audio, the
+  camera controls start where they should, a parameter set from a script
+  reaches the plug-in, and playback shows every frame, on the GPU.
+- **Fixed in 0.4.1:** creating OpenOSV Source media crashed VEGAS 17 in
+  0.4.0, and imported clips froze on their last frame after a few frames
+  (see the [changelog](../CHANGELOG.md)).
+- **Not verified yet:** HDR and ACES projects. Stay on **Rec. 709** for now
+  ([Levels and colour](#levels-and-colour)).
 
-**Save your project before you try it.** If you do, please report what
-happens, crash or not: see [Reporting a problem](#reporting-a-problem). With
+**Save your project before you try it,** and please report what happens:
+see [Reporting a problem](#reporting-a-problem). With
 `OSV_PLUGIN_LOG_LEVEL=debug` set before VEGAS starts, the effects' log traces
-every OpenFX action VEGAS sends, so the last line before a crash names it.
-What the rest of this page says VEGAS does is the design, and the
-[live-test checklist](#what-is-tested-and-what-isnt) is what confirms it.
+every OpenFX action VEGAS sends and the frame each render maps to. The
+[live-test checklist](#what-is-tested-and-what-isnt) says what has been
+confirmed in VEGAS and what is still the design.
 
 VEGAS Pro is an OpenFX host, so the same `OpenOSV.ofx.bundle` that serves
 DaVinci Resolve ([`RESOLVE.md`](RESOLVE.md)) loads in it: the generator
@@ -281,21 +281,23 @@ Written, and waiting for a GPU run: the GPU path against the CPU path in every
 format, levels and render window (`tests/ofx_gpu`, and the `[cuda]` tests of
 `tests/ofx`).
 
-**The live-test checklist**, everything below still to be run in VEGAS Pro.
-Start with the smoke-test script ([`scripts/vegas/README.md`](../scripts/vegas/README.md)):
-it checks most of the scripting-API items and writes
+**The live-test checklist**, run in VEGAS Pro 17; the open items are still to
+be run. The smoke-test script ([`scripts/vegas/README.md`](../scripts/vegas/README.md))
+checks most of the scripting-API items and writes
 `%LOCALAPPDATA%\OpenOSV\vegas-smoke-report.txt`.
 
 - [x] Install; VEGAS 17 finds both effects on its first scan; the describe
       logs are written and clean; the extension loads.
-- [ ] **Creating OpenOSV Source media** without a crash, from the Media
-      Generators window and from a script (the known issue above).
-- [ ] **Tools > Extensions > OpenOSV > Import OSV...** imports a clip at the
-      right length and size, with audio in sync; the float WAV opens.
-- [ ] A scripted parameter change reaches the plug-in (the **Clip** read-out
-      refreshes).
-- [ ] The **OpenOSV** submenus show under Tools > Extensions, and the dock
-      panel comes back with the layout.
+- [x] **Creating OpenOSV Source media** from a script without a crash (fixed
+      in 0.4.1), with the camera controls at their defaults afterwards.
+- [x] **Tools > Extensions > OpenOSV > Import OSV...** imports a clip at the
+      right length and size, with its audio grouped to it.
+- [x] Playback shows every frame of an imported clip (fixed in 0.4.1).
+- [x] A scripted parameter change reaches the plug-in (the **Clip** read-out
+      refreshes), and the lens controls show and hide with **Lens**.
+- [ ] Audio in sync by ear; the float WAV opens elsewhere.
+- [ ] Inserting OpenOSV Source by hand from the Media Generators window.
+- [ ] The dock panel comes back with the layout.
 - [ ] The LRF proxy toggle survives a save and reopen: Start Frame exact.
 - [ ] Output Levels: blacks and whites correct in an 8-bit project, a 32-bit
       video-levels project and a 32-bit full-range one.

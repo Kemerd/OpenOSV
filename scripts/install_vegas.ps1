@@ -482,7 +482,7 @@ try {
     # -- the summary ----------------------------------------------------------------
     Write-Line ''
     Write-Line '==============================================================='
-    Write-Line $(if ($DryRun) { ' Dry run done. Nothing was changed.' } else { ' OpenOSV is installed for VEGAS Pro (a preview).' })
+    Write-Line $(if ($DryRun) { ' Dry run done. Nothing was changed.' } else { ' OpenOSV is installed for VEGAS Pro (experimental).' })
     Write-Line ''
     Write-Line ' Start VEGAS. It rescans plug-ins on its first start, so that one'
     Write-Line ' takes a little longer. Then:'

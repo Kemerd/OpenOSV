@@ -1434,7 +1434,7 @@ exit /b %OSV_EXIT%
 
     $installDone = @'
 echo ==============================================================
-echo  OpenOSV for VEGAS Pro is installed (a preview).
+echo  OpenOSV for VEGAS Pro is installed (experimental).
 echo.
 echo  Start VEGAS. Tools ^> Extensions ^> OpenOSV ^> "Import OSV..." brings an
 echo  .OSV onto the timeline. OpenOSV Source (Media Generators) and
@@ -1476,7 +1476,7 @@ function Get-RequirementLines {
         # recommendation here rather than one option of three.
         return @(
             'Windows 10 or 11, 64-bit.',
-            'VEGAS Pro 17 or later is recommended; VEGAS Pro 14 to 16 on a best-effort basis. A preview: its first live test inside VEGAS is still pending.',
+            'VEGAS Pro 17 (tested) or later; VEGAS Pro 14 to 16 on a best-effort basis. Experimental: save your project before trying it.',
             'An NVIDIA GPU is recommended: CUDA on GeForce GTX 16 / RTX 20 (Turing), RTX 30 (Ampere), RTX 40 (Ada) and RTX 50 (Blackwell) cards and their RTX / Quadro workstation counterparts. VEGAS gives plug-ins CPU images only, so the plug-ins keep the stitch and framing on the GPU and bring back only the finished picture. Keep the driver current.',
             'Without a usable CUDA GPU the effects still run, on a slower path.',
             'Older NVIDIA cards (GTX 10 series and earlier) have no CUDA kernels in this build: set Render Device to OpenCL in OpenOSV Source > Advanced.',
@@ -1781,8 +1781,9 @@ function Write-VegasReadme {
 
 DJI Osmo 360 .OSV files in VEGAS Pro: stitched, converted and reframed by
 the same engine as OpenOSV's Premiere Pro plug-ins, as two OpenFX effects
-plus a VEGAS extension that does the setup for you. A preview: its first
-live test inside VEGAS is still pending. Please report what you see.
+plus a VEGAS extension that does the setup for you. Experimental: tested
+live in VEGAS Pro 17. Save your project first, and please report what you
+see.
 Free and open source (Apache-2.0): https://github.com/Kemerd/OpenOSV
 @OTHER@
 Built from commit @COMMIT@.
@@ -1830,7 +1831,8 @@ maintained, so the effect sees the whole sphere stretched to the frame.
 Levels: OpenOSV Source has an output-levels choice. VEGAS video-levels
 projects are studio RGB (16-235) and never convert a generator's output,
 so the extension picks it from your project. Colour Output defaults to
-Rec. 709; HDR / ACES projects are not verified yet.
+Rec. 709. HDR / ACES projects are not verified yet: stay on Rec. 709 for
+now.
 
 The full guide: https://github.com/Kemerd/OpenOSV/blob/main/docs/VEGAS.md
 
@@ -2849,7 +2851,7 @@ function Write-ReleaseNotes {
     foreach ($zip in $Zips) {
         $label = switch ($zip.Editor) {
             'Resolve' { 'DaVinci Resolve (preview)' }
-            'Vegas'   { 'VEGAS Pro (preview)' }
+            'Vegas'   { 'VEGAS Pro (experimental)' }
             default   { 'Premiere Pro' }
         }
         $downloads.Add("* **${label}: [``$($zip.Name)``]($url$($zip.Name))**")
@@ -2941,7 +2943,7 @@ The full list is in `CHANGELOG.md`, in each zip and in the repository.
 * **Unsigned binaries.** SmartScreen warns on first run; Windows 11's Smart App Control, when it is on, may block unsigned plug-ins like these.
 * **CUDA covers Turing and newer** (GTX 16 / RTX 20 and later). On an older NVIDIA card, set **Render Device** to OpenCL in Source Settings; that setup is untested.
 * **No neural optical flow in the download.** Its runtime is 1.4 GB, so Auto uses the classical flow, which is the one the stitch is tuned on. Building from source with ONNX Runtime adds it back.
-* **Windows x64 downloads.** Premiere Pro, a DaVinci Resolve preview (OpenFX, first run in Resolve 21 on Windows) and a VEGAS Pro preview (OpenFX plus an extension; its first live test is pending). macOS (Apple Silicon) builds from source and on CI, but is untested in Premiere and Resolve: see `docs/BUILDING_MAC.md`. No Final Cut plug-in; `osvtool` renders for any other editor.
+* **Windows x64 downloads.** Premiere Pro, a DaVinci Resolve preview (OpenFX, first run in Resolve 21 on Windows) and VEGAS Pro, experimental (OpenFX plus an extension; tested live in VEGAS Pro 17). macOS (Apple Silicon) builds from source and on CI, but is untested in Premiere and Resolve: see `docs/BUILDING_MAC.md`. No Final Cut plug-in; `osvtool` renders for any other editor.
 * Tested on Premiere Pro 2026 with Osmo 360 footage.
 
 ## Checksums

@@ -144,6 +144,30 @@ TEST_CASE("a field render's x.5 time shows the right clip frame", "[ofx][source]
     CHECK(src::frameForTime(12.5, 0.0, 30000.0 / 1001.0, 30000.0 / 1001.0, 100) == 112);
 }
 
+TEST_CASE("VEGAS script-made media counts in milliseconds", "[ofx][source]") {
+    // Rate 1000: the time is milliseconds from the event's start, not a
+    // frame number.  510 ms of a 59.94 fps clip is frame 30 (500.5 ms to
+    // 517.2 ms) ...
+    const double clipFps = 60000.0 / 1001.0;
+    CHECK(src::frameForTime(0.0, 0.0, 1000.0, clipFps, 0) == 0);
+    CHECK(src::frameForTime(510.0, 0.0, 1000.0, clipFps, 0) == 30);
+    // ... and the clip's last frame (64 of 65) is still inside its
+    // 1084.5 ms, while the end itself is past it.
+    CHECK(src::frameForTime(1075.0, 0.0, 1000.0, clipFps, 0) == 64);
+    CHECK(src::frameForTime(1084.5, 0.0, 1000.0, clipFps, 0) == 65);
+    // Every 59.94 timeline frame, its time rounded to half a millisecond
+    // either way, lands on its own clip frame: never a repeat, never a skip.
+    for (int k = 0; k < 65; ++k) {
+        const double exact = k * 1001.0 / 60.0;
+        const double down = std::floor(exact * 2.0) / 2.0;
+        const double up = std::ceil(exact * 2.0) / 2.0;
+        CHECK(src::frameForTime(down, 0.0, 1000.0, clipFps, 0) == k);
+        CHECK(src::frameForTime(up, 0.0, 1000.0, clipFps, 0) == k);
+    }
+    // Start Frame slides the clip underneath, as at any rate.
+    CHECK(src::frameForTime(510.0, 0.0, 1000.0, clipFps, 10) == 40);
+}
+
 // ===========================================================================
 //  Without a usable clip
 // ===========================================================================

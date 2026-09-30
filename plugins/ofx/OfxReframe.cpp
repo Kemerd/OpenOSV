@@ -183,9 +183,12 @@ OfxStatus regionsOfInterest(OfxImageEffectHandle effect, OfxPropertySetHandle in
 // ===========================================================================
 
 OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) noexcept {
+    // Counted first, whatever the change: VEGAS's roll-call of every
+    // parameter is not an edit (OfxHost.h, "Change brackets").
+    const bool rollCall = isHostRollCall(effect);
     // Only the user's own edits are supervised; our own writes come back as
     // kOfxChangePluginEdited and a time change is not an edit at all.
-    if (getString(inArgs, kOfxPropChangeReason) != kOfxChangeUserEdited) {
+    if (rollCall || getString(inArgs, kOfxPropChangeReason) != kOfxChangeUserEdited) {
         return kOfxStatReplyDefault;
     }
     // Parameters only: VEGAS also reports its clip "Output" changing.
@@ -387,6 +390,16 @@ OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySetHandle
         }
         if (isAction(action, kOfxActionInstanceChanged)) {
             return instanceChanged(effect, inArgs);
+        }
+        // The brackets around a host's batch of changes (OfxHost.h): counted
+        // for VEGAS's sake, answered with the default as before.
+        if (isAction(action, kOfxActionBeginInstanceChanged)) {
+            changeBracketBegin(effect);
+            return kOfxStatReplyDefault;
+        }
+        if (isAction(action, kOfxActionEndInstanceChanged) || isAction(action, kOfxActionDestroyInstance)) {
+            changeBracketEnd(effect);
+            return kOfxStatReplyDefault;
         }
         if (isAction(action, kOfxActionCreateInstance)) {
             // One lens's controls on screen from the start (under VEGAS the

@@ -126,6 +126,32 @@ enum class HostProfile : std::uint8_t {
 /// A short name for logs ("generic", "resolve", "vegas").
 [[nodiscard]] const char* hostProfileName(HostProfile profile) noexcept;
 
+// ---------------------------------------------------------------------------
+//  Change brackets: an edit, or the host taking attendance
+// ---------------------------------------------------------------------------
+// OpenFX hosts wrap each batch of kOfxActionInstanceChanged calls in
+// kOfxActionBeginInstanceChanged / kOfxActionEndInstanceChanged.  An edit is
+// one change per bracket.  VEGAS also sends a roll-call: right after it
+// creates an instance (twice, observed live in VEGAS 17), one bracket
+// announces EVERY parameter in definition order, each labelled
+// kOfxChangeUserEdited although nobody touched anything.  Taken as edits,
+// that roll-call re-applies the preset, switches the lens to Classic
+// (because "fov" was "edited") and re-derives the DJI lens from Zoom.  So
+// under VEGAS only the first change of a bracket counts as the user's; the
+// rest of the bracket is the roll-call.  Other hosts are unaffected.
+
+/// kOfxActionBeginInstanceChanged for `instance`: a bracket opens.
+void changeBracketBegin(const void* instance) noexcept;
+
+/// kOfxActionEndInstanceChanged (or kOfxActionDestroyInstance) for
+/// `instance`: its bracket closes.
+void changeBracketEnd(const void* instance) noexcept;
+
+/// Count one kOfxActionInstanceChanged for `instance` (call it exactly once
+/// per action) and answer whether it belongs to a host roll-call: true only
+/// under VEGAS, for the second and later change of an open bracket.
+[[nodiscard]] bool isHostRollCall(const void* instance) noexcept;
+
 // ---- VEGAS's own OpenFX properties ------------------------------------------
 // VEGAS's OpenFX extension header (ofxSonyVegas.h) defines the first and the
 // last; the window handle is observed in VEGAS.  Every one of them may be
@@ -297,6 +323,12 @@ bool writeString(OfxParamSetHandle set, const char* name, const char* value) noe
 void setParamVisible(OfxParamSetHandle set, const char* name, bool visible) noexcept;
 
 /// Group the writes between begin and end into one undo step.
+///
+/// Under VEGAS the group is never opened: VEGAS Pro 17 crashes inside its
+/// own paramEditBegin when an effect calls it from the InstanceChanged
+/// actions VEGAS sends right after creating an instance (observed live: the
+/// fault is inside VEGAS, called from here, before any user edit).  The
+/// writes still happen; VEGAS just records them as separate undo steps.
 class EditGroup {
 public:
     EditGroup(OfxParamSetHandle set, const char* label) noexcept;

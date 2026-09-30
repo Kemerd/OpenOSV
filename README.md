@@ -12,7 +12,7 @@ DJI Avata 360 clips open too (new: not yet tested on Avata footage here).
 ![Platform: Windows | macOS (preview)](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20%7C%20macOS%20%28preview%29-0078D6.svg)
 ![Premiere Pro 2022+](https://img.shields.io/badge/Premiere%20Pro-2022%2B-9999FF.svg)
 ![DaVinci Resolve (preview)](https://img.shields.io/badge/DaVinci%20Resolve-preview-233A51.svg)
-![VEGAS Pro (experimental)](https://img.shields.io/badge/VEGAS%20Pro-experimental-3B3B3B.svg)
+![VEGAS Pro 17.0 (experimental)](https://img.shields.io/badge/VEGAS%20Pro%2017.0-experimental-3B3B3B.svg)
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg)
 ![GPU: CUDA | OpenCL | Metal](https://img.shields.io/badge/GPU-CUDA%20%7C%20OpenCL%20%7C%20Metal-76B900.svg)
 ![HDR: Rec.2100 PQ / HLG](https://img.shields.io/badge/HDR-Rec.2100%20PQ%20%7C%20HLG-orange.svg)
@@ -38,10 +38,11 @@ DJI Avata 360 clips open too (new: not yet tested on Avata footage here).
 > [file a bug report or a pull request](https://github.com/Kemerd/OpenOSV/issues)
 > for anything that goes wrong.
 >
-> **VEGAS Pro is experimental.** VEGAS Pro 17 finds and loads both effects and
-> the extension, but creating OpenOSV Source media crashed it in our first
-> live runs, and that isn't diagnosed yet. Save your project before trying it;
-> [`docs/VEGAS.md`](docs/VEGAS.md) has what is checked and what isn't.
+> **VEGAS Pro 17.0 is experimental.** Import, the camera and playback work
+> in VEGAS Pro 17 ([how to use it](#tutorial-4-editing-in-vegas-pro-170-experimental)).
+> HDR projects aren't verified yet, so stay on Rec. 709, and save your project
+> before trying it. [`docs/VEGAS.md`](docs/VEGAS.md) has what's been checked
+> and what hasn't.
 
 ---
 
@@ -79,7 +80,7 @@ you edit:
   `.OSV` and stitches it with the importer's own engine, and **OpenOSV 360
   Reframe** reframes any 360 clip, with CUDA on NVIDIA. See
   [`docs/RESOLVE.md`](docs/RESOLVE.md).
-* **VEGAS Pro too (experimental).** The same two effects, plus an extension that
+* **VEGAS Pro 17.0 too (experimental).** The same two effects, plus an extension that
   does what an OpenFX generator can't: **Tools > Extensions > OpenOSV > Import OSV...**
   puts a clip on the timeline at its exact length and size, audio included.
   See [`docs/VEGAS.md`](docs/VEGAS.md).
@@ -332,26 +333,48 @@ details and what's been checked.
 
 ---
 
-## Tutorial 4: editing in VEGAS Pro
+## Tutorial 4: editing in VEGAS Pro 17.0 (experimental)
 
 VEGAS gets the same two OpenFX effects as Resolve, plus an extension that does
-the setup an OpenFX generator can't. It's a preview;
+the setup an OpenFX generator can't: the clip's length, its size and its
+audio. Tested in VEGAS Pro 17.0; 14 to 16 and 2026 are best effort.
 [`docs/VEGAS.md`](docs/VEGAS.md) has the details and what's been checked.
+**Save your project before you start.**
 
-1. **Install** the VEGAS zip (see [Download](#download)) with VEGAS closed,
-   then start it. The first start scans plug-ins, so it takes a moment.
-2. **Import.** **Tools > Extensions > OpenOSV > Import OSV...**, pick the clip. It lands
-   on the timeline at its exact length and size, with the audio grouped to it.
-3. **Aim the camera** in the generator's controls: **Preset**, **Pan / Tilt /
-   Roll** and **Zoom**. They keyframe like any effect parameter, and **Keyframe
-   Easing** gives you DJI Studio's curves. **Output: 360 equirect** hands you
-   the whole sphere.
-4. **Levels and colour.** The extension sets **Output Levels** for your
-   project, and **Colour Output** starts at Rec. 709. Stay on Rec. 709 for now:
-   HDR projects in VEGAS aren't verified yet.
-5. **Any other 360 clip:** the extension's **Apply 360 Reframe**, or drop
-   **OpenOSV 360 Reframe** on it yourself, after Pan/Crop with the aspect
-   ratio not maintained.
+1. **Install.** Close VEGAS, unzip the VEGAS zip (see [Download](#download))
+   and double-click **`Install.cmd`**. The first start afterwards is slower:
+   VEGAS rescans its plug-ins.
+2. **Set up the project** as usual (**File > Properties**): the frame size and
+   rate you want to deliver. For 8-bit, leave it on 8-bit; OpenOSV matches its
+   levels to the project.
+3. **Import.** **Tools > Extensions > OpenOSV > Import OSV...** and pick one
+   clip or several. Each lands at the cursor at its exact length and at the
+   project's size, with its audio grouped to it. Or open the dock panel,
+   **View > Extensions > OpenOSV**, and drop `.OSV` files from Explorer on it.
+4. **Aim the camera.** Click the **Generated Media** button on the event to
+   open OpenOSV Source's controls: **Preset**, **Lens**, **Pan / Tilt / Roll**,
+   **FOV** and **Zoom**. Each one keyframes like any VEGAS effect parameter,
+   and **Keyframe Easing** gives you DJI Studio's curves. **Output: 360
+   equirect** hands you the whole sphere instead.
+5. **Colour.** **Colour Output** starts at Rec. 709 with DJI's look. Stay on
+   it for now: HDR and ACES projects in VEGAS aren't verified yet. **D-Log M**
+   gives you the log picture to grade with the LUTs in the zip's `LUTs` folder.
+6. **Cut faster.** The dock panel's **LRF proxy** switch swaps every clip to
+   the camera's small `.LRF` while you edit and back to the `.OSV` for the
+   render, cuts untouched. **Sphere Size** 4K or 2K in the controls also helps
+   on a slower card.
+7. **Two framings of one clip?** Every event cut from one import shares one
+   camera. **Tools > Extensions > OpenOSV > Make framing unique** gives the
+   selected events their own copy.
+8. **Any other 360 clip**, like an exported equirect: select it and run
+   **Apply 360 Reframe to selected events**, or drop **OpenOSV 360 Reframe**
+   (Video FX) on it yourself, after Pan/Crop with **Maintain aspect ratio**
+   off.
+9. **Render** as usual (**File > Render As**).
+
+Something off? `%LOCALAPPDATA%\OpenOSV\OpenOSVOfx.log` and
+`OpenOSVVegas.log` say what happened; attach them to an
+[issue](https://github.com/Kemerd/OpenOSV/issues).
 
 ---
 
@@ -499,13 +522,14 @@ in: **More info → Run anyway**. Either installer asks for admin rights once.
 3. Drag **OpenOSV Source** onto the timeline and click **Choose .OSV File...**
    in the Inspector. [`docs/RESOLVE.md`](docs/RESOLVE.md) has the rest.
 
-**VEGAS Pro (experimental):** `OpenOSV-x.y.z-vegas-windows-x64.zip`
+**VEGAS Pro 17.0 (experimental):** `OpenOSV-x.y.z-vegas-windows-x64.zip`
 
 1. Unzip it, close VEGAS and double-click **`Install.cmd`**. It installs the
    OpenFX bundle (Resolve shares it) and the VEGAS extension, and clears
    VEGAS's plug-in cache.
 2. Start VEGAS. **Tools > Extensions > OpenOSV > Import OSV...** brings a clip in.
-   [`docs/VEGAS.md`](docs/VEGAS.md) has the rest.
+   [Tutorial 4](#tutorial-4-editing-in-vegas-pro-170-experimental) has the
+   rest.
 
 `Uninstall.cmd`, in the same zip, takes it all back out.
 
@@ -514,8 +538,8 @@ and batch-render them without an editor
 ([below](#openosv-studio-the-batch-app)).
 
 **Needs** Windows 10/11 x64, and Premiere Pro 2022 or later (tested on 2026)
-DaVinci Resolve, free or Studio (first run on 21), or VEGAS Pro 17 or later
-(14 to 16 best effort; NVIDIA GPU recommended; first live test pending).
+DaVinci Resolve, free or Studio (first run on 21), or VEGAS Pro 17.0 or later
+(tested on 17.0; 14 to 16 best effort; NVIDIA GPU recommended).
 **GPU:** CUDA on NVIDIA GTX 16 / RTX 20 and newer (Turing, Ampere, Ada,
 Blackwell); OpenCL on AMD and Intel; the CPU when there's nothing else. On an
 older NVIDIA card, set **Render Device** to OpenCL (Source Settings in

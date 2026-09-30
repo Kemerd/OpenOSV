@@ -104,10 +104,23 @@ void shutdown() noexcept;
 /// clip frame x at the timeline's own rate, and on a clip shot at twice the
 /// timeline's rate picks the frame between x and x + 1 - the second field's
 /// own moment.
+///
+/// VEGAS MILLISECONDS
+///   Generated media made by a script (the OpenOSV extension's Import)
+///   reports a frame rate of 1000 and its duration in milliseconds, and
+///   asks for its frames in milliseconds too.  1000 is therefore a real
+///   rate, not garbage: 510 ms of a 59.94 fps clip is frame 30, where a
+///   frame-for-frame reading would ask for frame 510 - past the end of a
+///   short clip, which froze playback on its last frame.  VEGAS rounds such
+///   a time to half a millisecond (a 1084.42 ms clip lasts 1084.5), so a
+///   frame's moment can arrive a little early; when a host unit is far
+///   finer than a clip frame, half a unit of slack keeps it on its frame.
+///   At frame-sized units there is no slack: x.5 is a field's moment.
 [[nodiscard]] inline long long frameForTime(double time, double rangeStart, double hostFps, double clipFps,
                                             long long startFrame) noexcept {
-    // Unusable rates: 1:1 frame mapping is the only safe reading.
-    if (!(hostFps > 0.0) || !(hostFps < 1000.0)) {
+    // Unusable rates: 1:1 frame mapping is the only safe reading.  Up to and
+    // including VEGAS's millisecond timebase (1000) a host rate is real.
+    if (!(hostFps > 0.0) || !(hostFps <= 1000.0)) {
         hostFps = (clipFps > 0.0 && clipFps < 1000.0) ? clipFps : 30.0;
     }
     if (!(clipFps > 0.0) || !(clipFps < 1000.0)) {
@@ -120,8 +133,15 @@ void shutdown() noexcept;
     if (local < -0.5) {
         local = time;
     }
+    // Rounding slack: the tiny epsilon for exact frame boundaries, widened to
+    // half a host unit when that unit is under a quarter of a clip frame
+    // (VEGAS's milliseconds: 0.03 of a 59.94 fps frame).
+    double slack = 1e-4;
+    if (hostFps >= 4.0 * clipFps) {
+        slack = 0.5 * clipFps / hostFps;
+    }
     const double seconds = local / hostFps;
-    const double frame = seconds * clipFps + 1e-4;
+    const double frame = seconds * clipFps + slack;
     if (frame < 0.0) {
         return -1;
     }
