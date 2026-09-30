@@ -2,7 +2,7 @@
 
 <img src="img/banner.png" alt="OpenOSV for Adobe Premiere and DaVinci Resolve: natively import .OSV files into Premiere or Resolve, automatically grade D-Log M to HDR formats, better stitching with lens correction and sky banding removal, native Windows and Mac support with CUDA or GPU acceleration, completely customisable settings including stitching. Your hardware, your choice. Open source and completely free." width="100%">
 
-### DJI Osmo 360 footage, straight into Premiere Pro or DaVinci Resolve, with a better stitch and real HDR.
+### DJI Osmo 360 footage, straight into Premiere Pro, DaVinci Resolve or VEGAS Pro, with a better stitch and real HDR.
 
 Free and open source. Drop an `.OSV` on your timeline and it's stitched,
 converted to HDR and ready to reframe. No export step, no transcode.
@@ -12,6 +12,7 @@ DJI Avata 360 clips open too (new: not yet tested on Avata footage here).
 ![Platform: Windows | macOS (preview)](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20%7C%20macOS%20%28preview%29-0078D6.svg)
 ![Premiere Pro 2022+](https://img.shields.io/badge/Premiere%20Pro-2022%2B-9999FF.svg)
 ![DaVinci Resolve (preview)](https://img.shields.io/badge/DaVinci%20Resolve-preview-233A51.svg)
+![VEGAS Pro (preview)](https://img.shields.io/badge/VEGAS%20Pro-preview-3B3B3B.svg)
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg)
 ![GPU: CUDA | OpenCL | Metal](https://img.shields.io/badge/GPU-CUDA%20%7C%20OpenCL%20%7C%20Metal-76B900.svg)
 ![HDR: Rec.2100 PQ / HLG](https://img.shields.io/badge/HDR-Rec.2100%20PQ%20%7C%20HLG-orange.svg)
@@ -36,6 +37,10 @@ DJI Avata 360 clips open too (new: not yet tested on Avata footage here).
 > [build it](#build-from-source), try it, and
 > [file a bug report or a pull request](https://github.com/Kemerd/OpenOSV/issues)
 > for anything that goes wrong.
+>
+> **VEGAS Pro is a preview too, and has not had its first live run yet.** The
+> effects pass their tests against a mock VEGAS-style OpenFX host; see
+> [`docs/VEGAS.md`](docs/VEGAS.md) for what is checked and what isn't.
 
 ---
 
@@ -73,6 +78,10 @@ you edit:
   `.OSV` and stitches it with the importer's own engine, and **OpenOSV 360
   Reframe** reframes any 360 clip, with CUDA on NVIDIA. See
   [`docs/RESOLVE.md`](docs/RESOLVE.md).
+* **VEGAS Pro too (preview).** The same two effects, plus an extension that
+  does what an OpenFX generator can't: **Tools > Extensions > Import OSV...**
+  puts a clip on the timeline at its exact length and size, audio included.
+  See [`docs/VEGAS.md`](docs/VEGAS.md).
 
 Under all of that is a stitcher built to beat the stock one: it measures each
 clip, works out where the lenses disagree, and fixes it.
@@ -322,6 +331,29 @@ details and what's been checked.
 
 ---
 
+## Tutorial 4: editing in VEGAS Pro
+
+VEGAS gets the same two OpenFX effects as Resolve, plus an extension that does
+the setup an OpenFX generator can't. It's a preview;
+[`docs/VEGAS.md`](docs/VEGAS.md) has the details and what's been checked.
+
+1. **Install** the VEGAS zip (see [Download](#download)) with VEGAS closed,
+   then start it. The first start scans plug-ins, so it takes a moment.
+2. **Import.** **Tools > Extensions > Import OSV...**, pick the clip. It lands
+   on the timeline at its exact length and size, with the audio grouped to it.
+3. **Aim the camera** in the generator's controls: **Preset**, **Pan / Tilt /
+   Roll** and **Zoom**. They keyframe like any effect parameter, and **Keyframe
+   Easing** gives you DJI Studio's curves. **Output: 360 equirect** hands you
+   the whole sphere.
+4. **Levels and colour.** The extension sets **Output Levels** for your
+   project, and **Colour Output** starts at Rec. 709. Stay on Rec. 709 for now:
+   HDR projects in VEGAS aren't verified yet.
+5. **Any other 360 clip:** the extension's **Apply 360 Reframe**, or drop
+   **OpenOSV 360 Reframe** on it yourself, after Pan/Crop with the aspect
+   ratio not maintained.
+
+---
+
 ## Controls
 
 ### Program Monitor: drag the picture
@@ -466,18 +498,27 @@ in: **More info → Run anyway**. Either installer asks for admin rights once.
 3. Drag **OpenOSV Source** onto the timeline and click **Choose .OSV File...**
    in the Inspector. [`docs/RESOLVE.md`](docs/RESOLVE.md) has the rest.
 
+**VEGAS Pro (preview):** `OpenOSV-x.y.z-vegas-windows-x64.zip`
+
+1. Unzip it, close VEGAS and double-click **`Install.cmd`**. It installs the
+   OpenFX bundle (Resolve shares it) and the VEGAS extension, and clears
+   VEGAS's plug-in cache.
+2. Start VEGAS. **Tools > Extensions > Import OSV...** brings a clip in.
+   [`docs/VEGAS.md`](docs/VEGAS.md) has the rest.
+
 `Uninstall.cmd`, in the same zip, takes it all back out.
 
-Both zips also carry **`cli\osvgui.exe`, OpenOSV Studio**: drop clips on it
+All three zips also carry **`cli\osvgui.exe`, OpenOSV Studio**: drop clips on it
 and batch-render them without an editor
 ([below](#openosv-studio-the-batch-app)).
 
 **Needs** Windows 10/11 x64, and Premiere Pro 2022 or later (tested on 2026)
-or DaVinci Resolve, free or Studio (first run on 21).
+DaVinci Resolve, free or Studio (first run on 21), or VEGAS Pro 17 or later
+(14 to 16 best effort; NVIDIA GPU recommended; first live test pending).
 **GPU:** CUDA on NVIDIA GTX 16 / RTX 20 and newer (Turing, Ampere, Ada,
 Blackwell); OpenCL on AMD and Intel; the CPU when there's nothing else. On an
 older NVIDIA card, set **Render Device** to OpenCL (Source Settings in
-Premiere, OpenOSV Source > Advanced in Resolve).
+Premiere, OpenOSV Source > Advanced in Resolve and VEGAS).
 
 ### Build from source
 
@@ -488,6 +529,7 @@ the Premiere plug-ins come along when Adobe's SDKs are there:
 |---|---|---|
 | **Premiere Pro** | needs the Adobe SDKs | needs the Adobe SDKs (untested in Premiere) |
 | **DaVinci Resolve** (preview) | no Adobe SDK needed | no Adobe SDK needed (working on an M4, [#2](https://github.com/Kemerd/OpenOSV/issues/2)) |
+| **VEGAS Pro** (preview) | no Adobe SDK; the extension needs a VEGAS Pro install | not available |
 
 Adobe's SDKs may not be redistributed, so they are never committed:
 [`docs/BUILDING.md`](docs/BUILDING.md) (Windows) and
@@ -519,6 +561,17 @@ $env:VCPKG_ROOT = "C:\vcpkg"
 cmake --preset windows-msvc-cuda-release
 cmake --build --preset windows-msvc-cuda-release
 scripts\install_ofx.ps1            # into C:\Program Files\Common Files\OFX\Plugins
+```
+
+**VEGAS Pro on Windows.** The OpenFX bundle is the Resolve one, so any build
+above makes it. The extension (C#) compiles against `ScriptPortal.Vegas.dll`
+from a VEGAS Pro install on your machine, and is built and staged with the
+bundle when VEGAS is there. `install_vegas.ps1` installs both, clears VEGAS's
+plug-in cache, and takes them out again with `-Uninstall`
+([`docs/VEGAS.md`](docs/VEGAS.md)):
+
+```powershell
+scripts\install_vegas.ps1          # bundle, extension and a fresh plug-in scan
 ```
 
 **DaVinci Resolve on macOS.** You need macOS 13.3+ on Apple Silicon, the
@@ -809,10 +862,11 @@ under the LGPL and linked dynamically; no GPL components are enabled.
 ## Legal
 
 OpenOSV is an independent project. It is not affiliated with, endorsed by or
-sponsored by DJI, Adobe or Blackmagic Design. DJI, Osmo, Osmo 360, RockSteady
+sponsored by DJI, Adobe, Blackmagic Design or the owners of VEGAS Pro. DJI, Osmo, Osmo 360, RockSteady
 and DJI Studio are trademarks of SZ DJI Technology Co., Ltd.; Adobe, Premiere
 Pro and After Effects are trademarks of Adobe Inc.; DaVinci Resolve is a
-trademark of Blackmagic Design Pty. Ltd.; NVIDIA and CUDA are trademarks of
+trademark of Blackmagic Design Pty. Ltd.; VEGAS and VEGAS Pro are trademarks of
+their respective owners; NVIDIA and CUDA are trademarks of
 NVIDIA Corporation; Apple, macOS and Metal are trademarks of Apple Inc.;
 Windows is a trademark of Microsoft Corporation; OpenCL is a trademark of
 Apple Inc. used by permission by Khronos. All other trademarks belong to

@@ -6,6 +6,32 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+* **VEGAS Pro (preview).** OpenOSV Source and OpenOSV 360 Reframe load in
+  VEGAS Pro through OpenFX, from the same `OpenOSV.ofx.bundle` as DaVinci
+  Resolve (VEGAS scans `Common Files\OFX\Plugins` too), and a VEGAS
+  Application Extension does what an OpenFX generator can't:
+  **Tools > Extensions > Import OSV...** creates the generator media at the
+  clip's exact length and size, extracts the audio and groups it with the
+  video. The extension also applies 360 Reframe to equirect events, and has
+  framing looks, easing presets, stabilisation and an `.LRF` proxy toggle,
+  in a dock panel as well as the menu. OpenOSV Source gets an output-levels
+  choice under VEGAS (full range or studio RGB), because VEGAS never converts
+  a generator's levels. Not yet run inside VEGAS: see `docs/VEGAS.md` for
+  what is checked and the live-test checklist.
+* **`scripts/install_vegas.ps1`** installs the bundle (through
+  `install_ofx.ps1`), copies the extension into `%ProgramData%\VEGAS Pro\Application Extensions`
+  and unblocks it, and clears VEGAS's plug-in caches so the next start scans
+  afresh. It refuses while VEGAS runs, elevates once, offers `-Uninstall`,
+  `-SkipBundle` and `-DryRun`, and leaves every other file in VEGAS's
+  folders alone.
+* **A third release zip, `OpenOSV-x.y.z-vegas-windows-x64.zip`,** with its own
+  `Install.cmd` / `Uninstall.cmd`. `scripts/package_release.ps1` fails the
+  package when the VEGAS extension isn't built (it compiles against
+  `ScriptPortal.Vegas.dll` from a VEGAS Pro install); `-SkipVegas` leaves the
+  zip out on purpose.
+
 ## [0.3.0] - 2026-09-28
 
 ### Added

@@ -11,6 +11,8 @@
         dist\OpenOSV-<version>-premiere-windows-x64.zip   the same, zipped
         dist\OpenOSV-<version>-resolve-windows-x64\       DaVinci Resolve, unzipped
         dist\OpenOSV-<version>-resolve-windows-x64.zip    the same, zipped
+        dist\OpenOSV-<version>-vegas-windows-x64\         VEGAS Pro, unzipped
+        dist\OpenOSV-<version>-vegas-windows-x64.zip      the same, zipped
         dist\RELEASE_NOTES.md                             a draft for the release page
 
     Each zip carries only what its editor uses, with its own Install.cmd,
@@ -20,6 +22,12 @@
     README.txt; one set for the Osmo 360 and the Pocket 3).  The Resolve zip
     is made whenever the
     build made the OpenFX bundle (OSV_BUILD_OFX, on in the release preset).
+    The VEGAS Pro zip is made from the same bundle plus the VEGAS extension
+    (extension\OpenOSV.Vegas.dll and OpenOSV.Vegas.Core.dll, built into
+    <build>\plugins\vegas\extension by a machine with VEGAS Pro installed,
+    whose ScriptPortal.Vegas.dll the extension compiles against).  When the
+    build has the OpenFX bundle but not the extension, the package fails
+    loudly; -SkipVegas leaves the VEGAS zip out on purpose.
 
     <version> is the CMake project version (project(openosv VERSION ...)).
 
@@ -102,6 +110,11 @@
 .PARAMETER Jobs
     Parallel build jobs; 0 (the default) lets Ninja decide.
 
+.PARAMETER SkipVegas
+    Do not make the VEGAS Pro package.  Without it, a build that has the
+    OpenFX bundle but no VEGAS extension fails the package: the extension
+    needs ScriptPortal.Vegas.dll from a VEGAS Pro install to build.
+
 .PARAMETER PrivateRules
     A local text file of extra strings no shipped file may contain, kept
     OUTSIDE the repository because the strings themselves are private.
@@ -136,6 +149,7 @@ param(
     [string] $AeSdkDir,
     [ValidateRange(0, 256)]
     [int] $Jobs = 0,
+    [switch] $SkipVegas,
     [string] $PrivateRules = (Join-Path $env:LOCALAPPDATA 'OpenOSV\release-hygiene.txt')
 )
 
@@ -163,6 +177,13 @@ $script:PluginModules = @('OpenOSVImporter.prm', 'Open360Reframe.aex', 'OpenOSVS
 # on in the release preset).
 $script:OfxBundleName = 'OpenOSV.ofx.bundle'
 $script:OfxBinary = 'Contents\Win64\OpenOSV.ofx'
+
+# The VEGAS Application Extension (plugins/vegas, docs/VEGAS.md): the two
+# .NET assemblies the build stages in <build>\plugins\vegas\extension, and
+# that install_vegas.ps1 puts into VEGAS's Application Extensions folder.
+# They ship in the VEGAS zip, next to the same OpenFX bundle.
+$script:VegasExtensionRelative = 'plugins\vegas\extension'
+$script:VegasExtensionFiles = @('OpenOSV.Vegas.dll', 'OpenOSV.Vegas.Core.dll')
 
 # ---------------------------------------------------------------------------
 #  The CUDA architectures README.txt, the release notes and README.md
@@ -632,6 +653,35 @@ function Get-BuildInfo {
         }
     }
 
+    # The VEGAS extension: two managed assemblies the VEGAS package needs.
+    # They compile only where ScriptPortal.Vegas.dll (a VEGAS Pro install)
+    # can be referenced, so a maintainer without VEGAS gets a clear message
+    # instead of a package that quietly lacks the VEGAS zip.  -SkipVegas is
+    # the deliberate way out.
+    $vegasExtension = $null
+    if ($ofxBundle -and -not $SkipVegas) {
+        $folder = [System.IO.Path]::GetFullPath((Join-Path $Dir $script:VegasExtensionRelative))
+        $missing = @($script:VegasExtensionFiles | Where-Object { -not (Test-Path -LiteralPath (Join-Path $folder $_) -PathType Leaf) })
+        if ($missing.Count -gt 0) {
+            throw ("The VEGAS package needs $($missing -join ' and ') in '$folder', and the build has not made " +
+                   "them. The VEGAS extension compiles against ScriptPortal.Vegas.dll, which comes from a VEGAS Pro " +
+                   "install on this machine (docs/VEGAS.md, Where the code is): install VEGAS Pro and build the " +
+                   "$($script:Preset) preset completely, or pass -SkipVegas to package without the VEGAS zip.")
+        }
+        # A managed assembly has an assembly name; a stray native DLL or a
+        # truncated file throws here.  The file is read, never loaded.
+        foreach ($name in $script:VegasExtensionFiles) {
+            $assembly = Join-Path $folder $name
+            try {
+                [void][System.Reflection.AssemblyName]::GetAssemblyName($assembly)
+            }
+            catch {
+                throw "'$assembly' is not a .NET assembly: $($_.Exception.Message)"
+            }
+        }
+        $vegasExtension = $folder
+    }
+
     # dumpbin walks the import tables.  The plug-in build records the one
     # it used; the developer environment's is the fallback.
     $dumpbin = Get-CacheValue $cache 'OSV_DUMPBIN_EXE'
@@ -698,6 +748,7 @@ function Get-BuildInfo {
         Share        = $share
         Cuda         = $cuda
         OfxBundle    = $ofxBundle
+        VegasExtension = $vegasExtension
         FfmpegBanner = if ($ffmpegLine.Count -gt 0) { $ffmpegLine[0].Trim() } else { '' }
     }
 }
@@ -1263,16 +1314,175 @@ echo ==============================================================
 }
 
 # ---------------------------------------------------------------------------
+#  extension\: the VEGAS Application Extension, OpenOSV.Vegas.dll and
+#  OpenOSV.Vegas.Core.dll, copied from the build's plugins\vegas\extension
+#  (Get-BuildInfo has already checked both are there and are managed
+#  assemblies).  install_vegas.ps1 finds them at <package>\extension and
+#  puts them in VEGAS's Application Extensions folder.
+# ---------------------------------------------------------------------------
+function Copy-VegasExtension {
+    param($Build, [string] $Package)
+    if (-not $Build.VegasExtension) {
+        throw 'Copy-VegasExtension: the build has no VEGAS extension (Get-BuildInfo found none).'
+    }
+    $target = Join-Path $Package 'extension'
+    New-Directory $target
+    foreach ($name in $script:VegasExtensionFiles) {
+        $source = Join-Path $Build.VegasExtension $name
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Copy-VegasExtension: '$source' is missing."
+        }
+        Copy-Item -LiteralPath $source -Destination $target -Force
+    }
+    Write-Info ("extension: {0}" -f ($script:VegasExtensionFiles -join ', '))
+}
+
+# ---------------------------------------------------------------------------
+#  scripts\ of the VEGAS package: the installer Install.cmd runs, the OpenFX
+#  installer it calls, and scripts\vegas\ (the smoke-test script and its
+#  README, which the user runs from VEGAS's Tools > Scripting menu).  Only
+#  the files directly inside the source folder are taken.
+# ---------------------------------------------------------------------------
+function Copy-VegasScripts {
+    param([string] $Package, [string] $SourceDir = (Join-Path $PSScriptRoot 'vegas'))
+    $scripts = Join-Path $Package 'scripts'
+    New-Directory $scripts
+    foreach ($name in @('install_vegas.ps1', 'install_ofx.ps1')) {
+        $source = Join-Path $PSScriptRoot $name
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Copy-VegasScripts: '$source' is missing."
+        }
+        Copy-Item -LiteralPath $source -Destination $scripts -Force
+    }
+
+    if (-not (Test-Path -LiteralPath $SourceDir -PathType Container)) {
+        throw "Copy-VegasScripts: '$SourceDir' (the VEGAS smoke-test script) is missing."
+    }
+    $files = @(Get-ChildItem -LiteralPath $SourceDir -File)
+    if (@($files | Where-Object { $_.Extension -eq '.cs' }).Count -eq 0) {
+        throw "Copy-VegasScripts: '$SourceDir' holds no .cs script."
+    }
+    $target = Join-Path $scripts 'vegas'
+    New-Directory $target
+    foreach ($file in $files) {
+        Copy-Item -LiteralPath $file.FullName -Destination $target -Force
+    }
+    Write-Info ("scripts: install_vegas.ps1, install_ofx.ps1 and scripts\vegas ({0} files)" -f $files.Count)
+}
+
+# ---------------------------------------------------------------------------
+#  Install.cmd / Uninstall.cmd of the VEGAS Pro package: a wrapper around
+#  scripts\install_vegas.ps1, built like the Resolve pair.  VEGAS holds its
+#  plug-ins and caches open while it runs, so the wrapper refuses first, and
+#  lists the matching processes so the user sees which one.  The process is
+#  vegas<version>.exe (vegas170.exe for VEGAS Pro 17), so it matches vegas*.
+# ---------------------------------------------------------------------------
+function Write-VegasCommands {
+    param([string] $Package)
+
+    $common = @'
+@echo off
+rem ===========================================================================
+rem  OpenOSV - @TITLE@
+rem
+rem  Double-click it.  It runs scripts\install_vegas.ps1 from this folder with
+rem  "-ExecutionPolicy Bypass" for that one PowerShell process, which is what
+rem  lets a script that came out of a downloaded zip run.  The machine's
+rem  policy is not changed.  The OpenFX folder is under Program Files, so the
+rem  script asks Windows for administrator rights (a UAC prompt) once.
+rem ===========================================================================
+setlocal EnableExtensions DisableDelayedExpansion
+
+set "OSV_SCRIPT=%~dp0scripts\install_vegas.ps1"
+if not exist "%OSV_SCRIPT%" goto :missing
+
+rem Any vegas*.exe: the file name carries the version (vegas170.exe). The
+rem matching lines are printed, so the user sees which one to close.
+tasklist /NH /FI "IMAGENAME eq vegas*" 2>nul | find /I "vegas" && goto :hostopen
+
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%OSV_SCRIPT%" @SWITCH@%*
+set "OSV_EXIT=%ERRORLEVEL%"
+echo.
+if not "%OSV_EXIT%"=="0" goto :failed
+@DONE@
+goto :end
+
+:failed
+echo ==============================================================
+echo  That did not work (exit code %OSV_EXIT%). The lines above say why.
+echo ==============================================================
+goto :end
+
+:hostopen
+echo.
+echo Close VEGAS Pro first (the program above), then run @NAME@ again.
+echo It holds its plug-ins and its plug-in cache open while it runs.
+set "OSV_EXIT=1"
+goto :end
+
+:missing
+echo Cannot find "%OSV_SCRIPT%".
+echo Extract the WHOLE zip first, then run @NAME@ from the extracted folder.
+set "OSV_EXIT=1"
+goto :end
+
+:end
+echo.
+pause
+exit /b %OSV_EXIT%
+'@
+
+    $installDone = @'
+echo ==============================================================
+echo  OpenOSV for VEGAS Pro is installed (a preview).
+echo.
+echo  Start VEGAS. Tools ^> Extensions ^> "Import OSV..." brings an
+echo  .OSV onto the timeline. OpenOSV Source (Media Generators) and
+echo  OpenOSV 360 Reframe (Video FX) are there for doing it by hand.
+echo ==============================================================
+'@
+
+    $uninstallDone = @'
+echo ==============================================================
+echo  OpenOSV for VEGAS Pro is removed. The OpenFX bundle was shared
+echo  with DaVinci Resolve, so it is gone there too; "Uninstall.cmd
+echo  -SkipBundle" would have kept it.
+echo ==============================================================
+'@
+
+    $install = $common.Replace('@TITLE@', 'Install.cmd: install OpenOSV into VEGAS Pro from this folder.').
+        Replace('@NAME@', 'Install.cmd').Replace('@SWITCH@', '').Replace('@DONE@', $installDone.TrimEnd())
+    $uninstall = $common.Replace('@TITLE@', 'Uninstall.cmd: remove what Install.cmd put in place.').
+        Replace('@NAME@', 'Uninstall.cmd').Replace('@SWITCH@', '-Uninstall ').Replace('@DONE@', $uninstallDone.TrimEnd())
+    Write-AsciiFile -Path (Join-Path $Package 'Install.cmd') -Text $install -LineEnding CRLF
+    Write-AsciiFile -Path (Join-Path $Package 'Uninstall.cmd') -Text $uninstall -LineEnding CRLF
+}
+
+# ---------------------------------------------------------------------------
 #  The requirement lines README.txt and the release notes share, so the two
 #  can never disagree: one list per editor, the GPU lines common to both
 #  (the stitch runs on the same engine in either).  Plain ASCII.
 # ---------------------------------------------------------------------------
 function Get-RequirementLines {
-    param([ValidateSet('Premiere', 'Resolve')] [string] $Editor = 'Premiere')
+    param([ValidateSet('Premiere', 'Resolve', 'Vegas')] [string] $Editor = 'Premiere')
     $gpu = @(
         'NVIDIA: CUDA on GeForce GTX 16 / RTX 20 (Turing), RTX 30 (Ampere), RTX 40 (Ada) and RTX 50 (Blackwell) cards and their RTX / Quadro workstation counterparts: compute capability 7.5, 8.6, 8.9 and 12.0, plus PTX that later 12.x GPUs compile on first use. Keep the driver current.',
         'AMD and Intel: OpenCL, through the graphics driver. No usable GPU: the CPU renders, slower.'
     )
+    if ($Editor -eq 'Vegas') {
+        # VEGAS hands OpenFX plug-ins CPU images only, so the plug-ins keep
+        # decode, stitch, framing and packing on the GPU (CUDA) themselves
+        # and read back the finished view: that is why NVIDIA is the
+        # recommendation here rather than one option of three.
+        return @(
+            'Windows 10 or 11, 64-bit.',
+            'VEGAS Pro 17 or later is recommended; VEGAS Pro 14 to 16 on a best-effort basis. A preview: its first live test inside VEGAS is still pending.',
+            'An NVIDIA GPU is recommended: CUDA on GeForce GTX 16 / RTX 20 (Turing), RTX 30 (Ampere), RTX 40 (Ada) and RTX 50 (Blackwell) cards and their RTX / Quadro workstation counterparts. VEGAS gives plug-ins CPU images only, so the plug-ins keep the stitch and framing on the GPU and bring back only the finished picture. Keep the driver current.',
+            'Without a usable CUDA GPU the effects still run, on a slower path.',
+            'Older NVIDIA cards (GTX 10 series and earlier) have no CUDA kernels in this build: set Render Device to OpenCL in OpenOSV Source > Advanced.',
+            'VEGAS Pro closed while you install or uninstall.'
+        )
+    }
     if ($Editor -eq 'Resolve') {
         return @(
             'Windows 10 or 11, 64-bit.',
@@ -1556,6 +1766,140 @@ TROUBLE
     Write-AsciiFile -Path (Join-Path $Package 'README.txt') -Text $text -LineEnding CRLF
 }
 
+# ---------------------------------------------------------------------------
+#  README.txt of the VEGAS Pro package: what it is, requirements, install,
+#  how to bring an .OSV in, uninstall.  Notepad-friendly (ASCII, CRLF), like
+#  the other two.
+# ---------------------------------------------------------------------------
+function Write-VegasReadme {
+    param([string] $Package, [string] $Version, [string] $Commit, [string] $OtherDownloads = '')
+
+    $requirements = (Get-RequirementLines -Editor Vegas | ForEach-Object { Format-Wrapped -Text $_ -First '* ' -Rest '  ' }) -join "`n"
+
+    $text = @'
+@TITLE@
+
+DJI Osmo 360 .OSV files in VEGAS Pro: stitched, converted and reframed by
+the same engine as OpenOSV's Premiere Pro plug-ins, as two OpenFX effects
+plus a VEGAS extension that does the setup for you. A preview: its first
+live test inside VEGAS is still pending. Please report what you see.
+Free and open source (Apache-2.0): https://github.com/Kemerd/OpenOSV
+@OTHER@
+Built from commit @COMMIT@.
+
+
+REQUIREMENTS
+------------
+@REQUIREMENTS@
+
+
+INSTALL
+-------
+1. Close VEGAS Pro.
+2. Extract this whole zip, then double-click Install.cmd.
+   The files are not code-signed, so Windows SmartScreen may say it
+   protected your PC: click "More info", then "Run anyway". Windows then
+   asks for administrator rights once, because OpenFX plug-ins go under
+   Program Files.
+3. Start VEGAS. Its first start after the install takes a little longer:
+   it scans plug-ins again (Install.cmd clears VEGAS's plug-in cache so
+   it does).
+
+What goes where:
+  C:\Program Files\Common Files\OFX\Plugins\OpenOSV.ofx.bundle
+                     the two OpenFX effects. VEGAS scans this folder,
+                     and so does DaVinci Resolve: one bundle, both editors
+  %ProgramData%\VEGAS Pro\Application Extensions\
+                     OpenOSV.Vegas.dll and OpenOSV.Vegas.Core.dll
+  %LOCALAPPDATA%\VEGAS Pro\<version>\
+                     VEGAS's plug-in caches are deleted, nothing else
+
+USE
+---
+Tools > Extensions > "Import OSV..." picks an .OSV and puts it on the
+timeline at its exact length and size, with its audio grouped to it. The
+same commands are in the dock panel, View > Extensions > OpenOSV: framing
+looks, OpenOSV 360 Reframe for equirect clips, easing presets,
+stabilisation, the .LRF proxy switch.
+
+By hand, without the extension: Media Generators > OpenOSV Source, then
+choose the .OSV in its controls. OpenOSV 360 Reframe (Video FX) reframes
+any equirect clip: put it after Pan/Crop, with the aspect ratio NOT
+maintained, so the effect sees the whole sphere stretched to the frame.
+
+Levels: OpenOSV Source has an output-levels choice. VEGAS video-levels
+projects are studio RGB (16-235) and never convert a generator's output,
+so the extension picks it from your project. Colour Output defaults to
+Rec. 709; HDR / ACES projects are not verified yet.
+
+The full guide: https://github.com/Kemerd/OpenOSV/blob/main/docs/VEGAS.md
+
+scripts\vegas\ holds a smoke-test script; its README says how to run it.
+
+
+UNINSTALL
+---------
+Close VEGAS and double-click Uninstall.cmd. It removes the bundle, the two
+extension DLLs and VEGAS's plug-in caches. The bundle is shared with
+DaVinci Resolve: "Uninstall.cmd -SkipBundle" keeps it.
+
+
+COMMAND LINE AND BATCH APP
+--------------------------
+cli\osvtool.exe works on its own: inspect a clip, render stills or HDR
+video, write LUTs, extract audio. "cli\osvtool.exe --help" lists the
+commands. cli\osvgui.exe is OpenOSV Studio, the same renders without
+typing: drop .OSV files or whole folders on it, pick the output, press
+Start. Video needs FFmpeg ("winget install Gyan.FFmpeg", or
+https://ffmpeg.org/download.html).
+Both need the Microsoft Visual C++ 2015-2022 Redistributable (x64):
+https://aka.ms/vs/17/release/vc_redist.x64.exe
+
+
+IN THIS FOLDER
+--------------
+Install.cmd, Uninstall.cmd     double-click
+plugins\OpenOSV.ofx.bundle\    the OpenFX plug-ins and the DLLs they load
+extension\                     the VEGAS extension (two .NET assemblies)
+scripts\install_vegas.ps1      what Install.cmd and Uninstall.cmd run
+scripts\install_ofx.ps1        the bundle installer it calls
+scripts\vegas\                 the smoke-test script and its README
+LUTs\                          D-Log M LUTs (Osmo 360 and Pocket 3) for
+                               Rec.2100 PQ / HLG and Rec.709; its README.txt
+                               says which one to use
+cli\                           osvtool.exe, osvgui.exe (OpenOSV Studio)
+                               and their DLLs
+licenses\                      third-party licences (FFmpeg is LGPL-2.1)
+LICENSE, NOTICE                OpenOSV is Apache-2.0
+CHANGELOG.md                   what changed
+SHA256SUMS.txt                 SHA-256 of every file here
+
+
+TROUBLE
+-------
+* No OpenOSV in VEGAS: Install.cmd clears the plug-in cache, so start VEGAS
+  once and let it scan. Still nothing: close VEGAS and run Install.cmd again.
+* No "Import OSV..." under Tools > Extensions: the extension DLLs must sit
+  in %ProgramData%\VEGAS Pro\Application Extensions\ and be unblocked
+  (Install.cmd does both; right-click a DLL > Properties > Unblock does
+  the second by hand).
+* A black or empty picture: the logs say why. They are
+  %LOCALAPPDATA%\OpenOSV\OpenOSVOfx.log and OpenOSVVegas.log.
+* "Running scripts is disabled": your organisation sets PowerShell's
+  policy centrally, and it wins. Ask whoever runs your IT.
+* Anything else: https://github.com/Kemerd/OpenOSV/issues
+'@
+    # Where the other downloads are.
+    $other = ''
+    if ($OtherDownloads) {
+        $other = "`nEditing in Premiere Pro or DaVinci Resolve? Those are separate downloads on the`nsame release page: $OtherDownloads`n"
+    }
+    $title = "OpenOSV $Version for VEGAS Pro, Windows x64"
+    $text = $text.Replace('@TITLE@', ($title + "`n" + ('=' * $title.Length))).Replace('@COMMIT@', $Commit).
+        Replace('@REQUIREMENTS@', $requirements).Replace('@OTHER@', $other)
+    Write-AsciiFile -Path (Join-Path $Package 'README.txt') -Text $text -LineEnding CRLF
+}
+
 # LICENSE, NOTICE and CHANGELOG.md, as committed.
 function Copy-ProjectTexts {
     param([string] $Package)
@@ -1789,7 +2133,7 @@ OpenOSV's own source: https://github.com/Kemerd/OpenOSV
 function Write-Licenses {
     param(
         $Build, [string] $Package,
-        [ValidateSet('Premiere', 'Resolve')] [string] $Editor = 'Premiere',
+        [ValidateSet('Premiere', 'Resolve', 'Vegas')] [string] $Editor = 'Premiere',
         [string[]] $PluginDlls = @(), [string[]] $CliDlls = @(), [string[]] $OfxDlls = @()
     )
 
@@ -1938,7 +2282,12 @@ each comes under. Every text here is the component's own, verbatim.
 @RUNTIME@
 '@
     # Who provides what is not shipped.
-    $runtime = if ($Editor -eq 'Resolve') {
+    $runtime = if ($Editor -eq 'Vegas') {
+        "Windows' own DLLs and the Microsoft Visual C++ runtime are not shipped.`n" +
+        "Windows provides the first; the plug-ins and cli\osvtool.exe and`n" +
+        "cli\osvgui.exe use the Visual C++ Redistributable (x64)."
+    }
+    elseif ($Editor -eq 'Resolve') {
         "Windows' own DLLs and the Microsoft Visual C++ runtime are not shipped.`n" +
         "Windows provides the first; DaVinci Resolve ships the second for the`n" +
         "plug-ins, and cli\osvtool.exe and cli\osvgui.exe use the Visual C++`n" +
@@ -2486,6 +2835,7 @@ function Write-ReleaseNotes {
     }
     $premiere = @($Zips | Where-Object { $_.Editor -eq 'Premiere' } | Select-Object -First 1)
     $resolve = @($Zips | Where-Object { $_.Editor -eq 'Resolve' } | Select-Object -First 1)
+    $vegas = @($Zips | Where-Object { $_.Editor -eq 'Vegas' } | Select-Object -First 1)
     if ($premiere.Count -eq 0) {
         throw 'Write-ReleaseNotes: there is no Premiere Pro zip.'
     }
@@ -2497,7 +2847,11 @@ function Write-ReleaseNotes {
     $requirements = New-Object System.Collections.Generic.List[string]
     $checksums = New-Object System.Collections.Generic.List[string]
     foreach ($zip in $Zips) {
-        $label = if ($zip.Editor -eq 'Resolve') { 'DaVinci Resolve (preview)' } else { 'Premiere Pro' }
+        $label = switch ($zip.Editor) {
+            'Resolve' { 'DaVinci Resolve (preview)' }
+            'Vegas'   { 'VEGAS Pro (preview)' }
+            default   { 'Premiere Pro' }
+        }
         $downloads.Add("* **${label}: [``$($zip.Name)``]($url$($zip.Name))**")
         $requirements.Add("**$label**")
         $requirements.Add('')
@@ -2530,10 +2884,26 @@ function Write-ReleaseNotes {
         $resolveInstall = $resolveInstall.Replace('@RESOLVEZIP@', $resolve[0].Name)
     }
 
+    # The VEGAS Pro install steps, when there is a VEGAS zip.
+    $vegasInstall = ''
+    if ($vegas.Count -gt 0) {
+        $vegasInstall = @'
+
+### VEGAS Pro
+
+1. Close VEGAS Pro.
+2. Unzip `@VEGASZIP@` and double-click **`Install.cmd`** (the same SmartScreen step; admin rights once). It installs the OpenFX bundle and the VEGAS extension, and clears VEGAS's plug-in cache so the next start scans afresh.
+3. Start VEGAS (the first start scans plug-ins, so it takes a moment). **Tools > Extensions > Import OSV...** puts an `.OSV` on the timeline at its exact length and size, audio included. **OpenOSV Source** (Media Generators) and **OpenOSV 360 Reframe** (Video FX) are there for doing it by hand.
+
+**Uninstall:** close VEGAS and double-click `Uninstall.cmd` (`Uninstall.cmd -SkipBundle` keeps the OpenFX bundle, which DaVinci Resolve shares). Guide: [`docs/VEGAS.md`](https://github.com/Kemerd/OpenOSV/blob/@TAG@/docs/VEGAS.md).
+'@
+        $vegasInstall = $vegasInstall.Replace('@VEGASZIP@', $vegas[0].Name)
+    }
+
     $text = @'
 # OpenOSV @VERSION@ for Windows
 
-DJI Osmo 360 footage, straight into Premiere Pro or DaVinci Resolve on
+DJI Osmo 360 footage, straight into Premiere Pro, DaVinci Resolve or VEGAS Pro on
 Windows, with a better stitch and real HDR. Drop an `.OSV` on your timeline
 and it's stitched, converted to HDR and ready to reframe.
 
@@ -2565,13 +2935,13 @@ The full list is in `CHANGELOG.md`, in each zip and in the repository.
 5. Drop an `.OSV` on a timeline. **File > New > Sequence > OpenOSV** has the sequence presets.
 
 **Uninstall:** close Premiere, double-click `Uninstall.cmd`, then launch Premiere holding `Shift` once.
-@RESOLVEINSTALL@
+@RESOLVEINSTALL@@VEGASINSTALL@
 ## Known limits
 
 * **Unsigned binaries.** SmartScreen warns on first run; Windows 11's Smart App Control, when it is on, may block unsigned plug-ins like these.
 * **CUDA covers Turing and newer** (GTX 16 / RTX 20 and later). On an older NVIDIA card, set **Render Device** to OpenCL in Source Settings; that setup is untested.
 * **No neural optical flow in the download.** Its runtime is 1.4 GB, so Auto uses the classical flow, which is the one the stitch is tuned on. Building from source with ONNX Runtime adds it back.
-* **Windows x64 downloads.** Premiere Pro, and a DaVinci Resolve preview (OpenFX, first run in Resolve 21 on Windows). macOS (Apple Silicon) builds from source and on CI, but is untested in Premiere and Resolve: see `docs/BUILDING_MAC.md`. No Final Cut plug-in; `osvtool` renders for any other editor.
+* **Windows x64 downloads.** Premiere Pro, a DaVinci Resolve preview (OpenFX, first run in Resolve 21 on Windows) and a VEGAS Pro preview (OpenFX plus an extension; its first live test is pending). macOS (Apple Silicon) builds from source and on CI, but is untested in Premiere and Resolve: see `docs/BUILDING_MAC.md`. No Final Cut plug-in; `osvtool` renders for any other editor.
 * Tested on Premiere Pro 2026 with Osmo 360 footage.
 
 ## Checksums
@@ -2586,7 +2956,7 @@ OpenOSV is Apache-2.0. Each zip's `licenses` folder holds the licence of every t
 Built from @COMMIT@.
 '@
     # @RESOLVEINSTALL@ first: it carries an @TAG@ of its own.
-    $text = $text.Replace('@RESOLVEINSTALL@', $resolveInstall).
+    $text = $text.Replace('@RESOLVEINSTALL@', $resolveInstall).Replace('@VEGASINSTALL@', $vegasInstall).
         Replace('@VERSION@', $Version).Replace('@TAG@', $tag).Replace('@DOWNLOADS@', ($downloads -join "`n")).
         Replace('@HIGHLIGHTS@', $highlights).Replace('@DRAFTNOTE@', $draftNote).Replace('@CHANGES@', $changes.Markdown).
         Replace('@REQUIREMENTS@', ($requirements -join "`n")).Replace('@PREMIEREZIP@', $premiere[0].Name).
@@ -2623,6 +2993,7 @@ try {
     # user each install, and nothing of the other's.
     $premiereName = "OpenOSV-$version-premiere-windows-x64"
     $resolveName = "OpenOSV-$version-resolve-windows-x64"
+    $vegasName = "OpenOSV-$version-vegas-windows-x64"
     Write-Step "OpenOSV $version, Windows x64"
 
     # ---- 1. build ---------------------------------------------------------
@@ -2689,6 +3060,30 @@ try {
         Write-Warn 'The build made no OpenFX bundle (OSV_BUILD_OFX off): there is no DaVinci Resolve package.'
     }
 
+    # The VEGAS Pro package: the same OpenFX bundle, the extension that does
+    # the setup inside VEGAS, and the installer for both.  Get-BuildInfo has
+    # already failed the run when the extension is missing (unless -SkipVegas).
+    $vegas = $null
+    $vegasOfxDlls = @()
+    $vegasCliDlls = @()
+    if ($build.OfxBundle -and $build.VegasExtension) {
+        $vegas = New-EmptyPackage (Join-Path $OutDir $vegasName)
+        Write-Step "Assembling $vegas"
+        $vegasOfxDlls = Copy-OfxBundle -Build $build -Package $vegas
+        Copy-VegasExtension -Build $build -Package $vegas
+        $vegasCliDlls = Copy-CommandLineTool -Build $build -Package $vegas
+        Test-PackagedCli -Package $vegas -Version $version
+        Copy-VegasScripts -Package $vegas
+        Copy-Item -LiteralPath (Join-Path $premiere 'LUTs') -Destination $vegas -Recurse -Force
+        Write-Info 'LUTs: the set generated for the Premiere Pro package'
+    }
+    elseif ($SkipVegas) {
+        Write-Warn 'Skipping the VEGAS Pro package (-SkipVegas).'
+    }
+    else {
+        Write-Warn 'The build made no OpenFX bundle (OSV_BUILD_OFX off): there is no VEGAS Pro package.'
+    }
+
     # ---- 5. texts -----------------------------------------------------------
     Write-Step 'Writing the texts and licences'
     $resolveZipName = ''
@@ -2708,6 +3103,17 @@ try {
         Write-Licenses -Build $build -Package $resolve -Editor Resolve -CliDlls $resolveCliDlls -OfxDlls $ofxDlls
         Write-Checksums -Package $resolve
         $packages += $resolve
+    }
+    if ($vegas) {
+        # The other editors' downloads, named for the README's pointer.
+        $others = @("$premiereName.zip")
+        if ($resolve) { $others += "$resolveName.zip" }
+        Copy-ProjectTexts -Package $vegas
+        Write-VegasCommands -Package $vegas
+        Write-VegasReadme -Package $vegas -Version $version -Commit $commit -OtherDownloads ($others -join ', ')
+        Write-Licenses -Build $build -Package $vegas -Editor Vegas -CliDlls $vegasCliDlls -OfxDlls $vegasOfxDlls
+        Write-Checksums -Package $vegas
+        $packages += $vegas
     }
     $ffmpegVersion = Get-PortVersion -Share $build.Share -Port 'ffmpeg'
 
@@ -2739,6 +3145,9 @@ try {
         $editor = 'Premiere'
         if ($package -eq $resolve) {
             $editor = 'Resolve'
+        }
+        elseif ($package -eq $vegas) {
+            $editor = 'Vegas'
         }
         $zips += [pscustomobject]@{
             Editor = $editor
