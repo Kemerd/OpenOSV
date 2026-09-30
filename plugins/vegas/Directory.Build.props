@@ -19,6 +19,9 @@
     <!-- Where every intermediate and output file goes (trailing slash required). -->
     <OsvVegasOut Condition="'$(OsvVegasOut)' == ''">$(MSBuildThisFileDirectory)..\..\build\vegas-dotnet\</OsvVegasOut>
     <OsvVegasOut Condition="!HasTrailingSlash('$(OsvVegasOut)')">$(OsvVegasOut)\</OsvVegasOut>
+    <!-- One spelling (full path, backslashes) so the PathMap below matches the
+         paths the compiler records, whatever slashes the caller passed. -->
+    <OsvVegasOut>$([System.IO.Path]::GetFullPath('$(OsvVegasOut)'))</OsvVegasOut>
     <BaseIntermediateOutputPath>$(OsvVegasOut)obj\$(MSBuildProjectName)\</BaseIntermediateOutputPath>
     <BaseOutputPath>$(OsvVegasOut)bin\$(MSBuildProjectName)\</BaseOutputPath>
 
