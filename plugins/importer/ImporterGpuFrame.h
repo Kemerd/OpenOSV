@@ -179,6 +179,21 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+//  [WP-V-GPU] The renderer's context, for a caller that keeps its frame on
+//  the GPU (ImporterInstance::renderFrameToDevice)
+// ---------------------------------------------------------------------------
+
+/// Retain the PRIMARY context of CUDA device `deviceOrdinal` - the context
+/// the CUDA runtime, and so the shared CudaRenderer, renders in - for as long
+/// as the returned handle (or a copy of it) lives; its get() is the
+/// CUcontext.  Retaining only counts a reference: the context's flags stay
+/// whatever its first user set, and it is destroyed only when its last
+/// retainer lets go.  Errors: InvalidArgument (negative ordinal), Gpu (no
+/// driver, no such device, the retain failed).  Only in builds with CUDA,
+/// and only after the driver is loaded (a CUDA renderer exists).
+[[nodiscard]] Result<std::shared_ptr<void>> retainPrimaryContext(int deviceOrdinal) noexcept;
+
+// ---------------------------------------------------------------------------
 //  Switches
 // ---------------------------------------------------------------------------
 
