@@ -39,6 +39,19 @@
 // function inside this translation unit, so it is always the directory of
 // the module that contains this code (the .prm / .aex), never the host exe.
 //
+// Optional dependency subfolder
+// -----------------------------
+// A module may keep its dependency closure in a subfolder instead of beside
+// itself.  The OpenFX bundle does: VEGAS Pro's plug-in scan loads every DLL
+// it finds under a bundle's Contents\Win64 (subfolders included), so the
+// bundle keeps only OpenOSV.ofx there and its DLLs in Contents\Libraries
+// (Win64 below it), which is not scanned.  The layout is opt-in per module
+// through the compile definition OSV_DELAYLOAD_SUBDIR (a wide string
+// literal, relative to the module's own folder, e.g. L"../Libraries/Win64";
+// either slash works).  With it set, every name is resolved against "<module dir>\<subdir>\<name>" first, then
+// against the legacy "<module dir>\<name>" (an older install), then by the
+// default search.  Without it (the Premiere plug-ins) nothing changes.
+//
 // Contract for plug-in authors: call installHook() from
 // DllMain(DLL_PROCESS_ATTACH) and link delayimp through osv_add_delayload().
 // Referencing installHook() from DllMain is also what pulls this object
@@ -74,12 +87,20 @@ void uninstallHook() noexcept;
 /// backslash; empty when it could not be determined.  Computed once.
 [[nodiscard]] std::wstring moduleDirectory() noexcept;
 
+/// Directory the opt-in dependency subfolder (OSV_DELAYLOAD_SUBDIR)
+/// resolves to, canonical (no ".." left) with a trailing backslash; empty
+/// when the module did not opt in or the path could not be built.  Computed
+/// once.
+[[nodiscard]] std::wstring librariesDirectory() noexcept;
+
 /// The resolution step the hook performs, exposed for tests and for code
 /// that wants to pre-load a DLL explicitly: try
-/// "<moduleDirectory()>\<dllName>" with LOAD_WITH_ALTERED_SEARCH_PATH and
-/// return the module handle, or nullptr when the file is absent or cannot
-/// be loaded.  `dllName` is the bare file name ("avcodec-63.dll"); names
-/// containing a path separator are rejected (nullptr).
+/// "<librariesDirectory()>\<dllName>" when the module opted into a
+/// subfolder, then "<moduleDirectory()>\<dllName>", each with
+/// LOAD_WITH_ALTERED_SEARCH_PATH, and return the module handle, or nullptr
+/// when the file is absent or cannot be loaded.  `dllName` is the bare file
+/// name ("avcodec-63.dll"); names containing a path separator are rejected
+/// (nullptr).
 [[nodiscard]] HMODULE loadBesideModule(const char* dllName) noexcept;
 
 /// Counters for diagnostics and tests.

@@ -11,6 +11,36 @@
 //
 // Console output is a compact 7-bit ASCII summary; the JSON document is the
 // complete picture and is what the golden tests compare against.
+//
+// --json - writes the document to STDOUT instead of a file, and then stdout
+// carries nothing else: the console summary, the "wrote" line and the logs
+// all go to stderr.  The bytes are UTF-8 with no byte-order mark and plain
+// "\n" line endings on every platform (stdout is switched to binary mode for
+// the write, so the Windows C runtime does not turn them into "\r\n").  Exit
+// codes as everywhere: 0 ok, 1 usage, 2 unreadable input, 3 runtime failure;
+// on any non-zero exit stdout is empty.
+//
+// STABLE SUBSET (schema "openosv.probe/1").  These top-level keys are a
+// contract with the VEGAS extension and are never renamed or retyped; every
+// other key of the document may grow.  A value that cannot be determined is
+// null (numbers) rather than a missing key.
+//
+//   schema           "openosv.probe/1" (the djmd field numbering that used to
+//                    sit under this key is now "djmdSchema"; it is only
+//                    present when a metadata track loaded)
+//   path             the path as given on the command line
+//   frameCount       video frames (the metadata track's count when it loads,
+//                    else the video track's sample count)
+//   fps              { "num": int, "den": int, "value": double } - exact
+//                    rational from the video track's timescale and summed
+//                    sample durations, reduced (60000/1001, never 59.94)
+//   durationSeconds  the video track's duration in seconds
+//   streamW/streamH  size of one lens stream (the whole frame for an LRF)
+//   mode             recording mode name ("K6", ...) or null
+//   colorModeName    colour mode name ("DLogM", ...) or null
+//   hasAudio         true when the container has an audio track
+//   audio            { "sampleRate", "channels", "sampleCount" } or null
+//   isLrf            true for the side-by-side LRF proxy layout
 
 #include "Commands.h"
 
@@ -26,13 +56,22 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <vector>
+
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace osvtool {
 
@@ -40,6 +79,179 @@ namespace {
 
 using nlohmann::json;
 using osv::log::safe;
+
+/// Schema marker of the stable top-level subset (see the file comment).
+constexpr const char* kProbeSchema = "openosv.probe/1";
+
+/// Path from a UTF-8 command line argument.  main() decodes the Windows
+/// command line to UTF-8; a plain std::filesystem::path(std::string) would
+/// read those bytes in the ANSI code page and miss any non-ASCII file name.
+std::filesystem::path pathFromUtf8(const std::string& text) {
+    return std::filesystem::path(std::u8string(text.begin(), text.end()));
+}
+
+/// Keeps stdout clean for `--json -`.
+///
+/// The console summary is printed with printf all over this file, so instead
+/// of touching every call the C-level stdout descriptor is pointed at stderr
+/// for the lifetime of the object, and the JSON is written straight to the
+/// saved original descriptor.  Destruction restores stdout on every return
+/// path.  When the object is not active (a normal run) it does nothing.
+class StdoutJson {
+public:
+    explicit StdoutJson(bool active) {
+        if (!active) {
+            return;
+        }
+        std::fflush(stdout);
+        std::fflush(stderr);
+#if defined(_WIN32)
+        m_saved = _dup(_fileno(stdout));
+        if (m_saved >= 0) {
+            _setmode(m_saved, _O_BINARY);  // no "\n" -> "\r\n" translation for the JSON
+            _dup2(_fileno(stderr), _fileno(stdout));
+        }
+#else
+        m_saved = ::dup(STDOUT_FILENO);
+        if (m_saved >= 0) {
+            ::dup2(STDERR_FILENO, STDOUT_FILENO);
+        }
+#endif
+    }
+
+    ~StdoutJson() {
+        if (m_saved < 0) {
+            return;
+        }
+        std::fflush(stdout);
+#if defined(_WIN32)
+        _dup2(m_saved, _fileno(stdout));
+        _close(m_saved);
+#else
+        ::dup2(m_saved, STDOUT_FILENO);
+        ::close(m_saved);
+#endif
+    }
+
+    StdoutJson(const StdoutJson&) = delete;
+    StdoutJson& operator=(const StdoutJson&) = delete;
+
+    /// True while stdout is redirected (false for an inactive object or when dup failed).
+    [[nodiscard]] bool ready() const noexcept { return m_saved >= 0; }
+
+    /// Write all of `text` to the real stdout.  False on a short or failed write.
+    [[nodiscard]] bool emit(const std::string& text) const {
+        if (m_saved < 0) {
+            return false;
+        }
+        std::size_t done = 0;
+        while (done < text.size()) {
+            // Chunked so the int-sized count of _write can never overflow.
+            const std::size_t chunk = std::min<std::size_t>(text.size() - done, 1u << 20);
+#if defined(_WIN32)
+            const int n = _write(m_saved, text.data() + done, static_cast<unsigned>(chunk));
+#else
+            const ssize_t n = ::write(m_saved, text.data() + done, chunk);
+#endif
+            if (n <= 0) {
+                return false;
+            }
+            done += static_cast<std::size_t>(n);
+        }
+        return true;
+    }
+
+private:
+    int m_saved = -1;  ///< The original stdout descriptor while redirected, else -1.
+};
+
+/// Reduced rational frame rate of `t`: samples * timescale / total duration,
+/// which for constant-rate video is exactly timescale / sample delta
+/// (60000 / 1001).  Returns false when the track has no usable timing.
+bool exactFrameRate(const osv::TrackInfo& t, std::uint64_t& num, std::uint64_t& den) {
+    const std::uint64_t total = t.samples.totalDuration();
+    if (total == 0 || t.timescale == 0 || t.samples.count() == 0) {
+        return false;
+    }
+    num = static_cast<std::uint64_t>(t.samples.count()) * t.timescale;
+    den = total;
+    const std::uint64_t g = std::gcd(num, den);
+    if (g > 1) {
+        num /= g;
+        den /= g;
+    }
+    // The fields are emitted as 32-bit-safe integers.
+    return num <= 0x7FFFFFFFull && den <= 0x7FFFFFFFull;
+}
+
+/// Add the stable top-level subset (see the file comment) to `doc`.
+///
+/// `format` may be null (detection failed); `metaFrames` is the metadata
+/// track's frame count (0 without one).
+void addStableKeys(json& doc, const osv::MovieInfo& movie, const osv::meta::FormatInfo* format,
+                   std::uint32_t metaFrames, const std::filesystem::path& input) {
+    doc["schema"] = kProbeSchema;
+
+    // ---- the video track the numbers describe -------------------------------------------
+    const osv::TrackInfo* video = nullptr;
+    if (format) {
+        for (const std::uint32_t id : format->videoTrackIds) {
+            if (!video && id != 0) {
+                video = movie.track(id);
+            }
+        }
+    }
+    if (!video) {
+        const auto videos = movie.tracksOfKind(osv::TrackKind::Video);
+        video = videos.empty() ? nullptr : videos.front();
+    }
+
+    // ---- frame count, exact fps, duration -----------------------------------------------
+    doc["frameCount"] = metaFrames > 0 ? metaFrames : (video ? video->samples.count() : 0u);
+    std::uint64_t num = 0;
+    std::uint64_t den = 0;
+    if (video && exactFrameRate(*video, num, den)) {
+        doc["fps"] = json{{"num", num}, {"den", den}, {"value", static_cast<double>(num) / static_cast<double>(den)}};
+    } else {
+        doc["fps"] = nullptr;
+    }
+    doc["durationSeconds"] = video && video->durationSeconds() > 0.0 ? video->durationSeconds() : movie.durationSeconds();
+
+    // ---- detected format --------------------------------------------------------------------
+    if (format) {
+        doc["streamW"] = format->streamW;
+        doc["streamH"] = format->streamH;
+        doc["mode"] = osv::meta::modeName(format->mode);
+        doc["colorModeName"] = osv::meta::colorModeName(format->colorMode);
+    } else {
+        doc["streamW"] = nullptr;
+        doc["streamH"] = nullptr;
+        doc["mode"] = nullptr;
+        doc["colorModeName"] = nullptr;
+    }
+
+    // ---- audio -------------------------------------------------------------------------------
+    const auto audios = movie.tracksOfKind(osv::TrackKind::Audio);
+    const osv::TrackInfo* audio = audios.empty() ? nullptr : audios.front();
+    doc["hasAudio"] = audio != nullptr;
+    doc["audio"] = nullptr;
+    if (audio && audio->audio && audio->timescale > 0) {
+        // PCM sample frames: the media duration (mdhd) rescaled to the sample
+        // rate, which is what the decoder reports as the track length.
+        const std::uint64_t units = audio->duration > 0 ? audio->duration : audio->samples.totalDuration();
+        const double rate = audio->audio->sampleRate;
+        const auto sampleCount =
+            static_cast<std::uint64_t>(std::llround(static_cast<double>(units) * rate / audio->timescale));
+        doc["audio"] = json{{"sampleRate", static_cast<std::uint64_t>(std::llround(rate))},
+                            {"channels", audio->audio->channelCount},
+                            {"sampleCount", sampleCount}};
+    }
+
+    // ---- LRF proxy -------------------------------------------------------------------------------
+    std::string ext = input.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    doc["isLrf"] = (format && format->sideBySideProxy) || ext == ".lrf";
+}
 
 /// Options collected by CLI11 for the probe command.
 struct ProbeOptions {
@@ -311,8 +523,17 @@ int runProbe(const ProbeOptions& opt) {
         return kExitUsage;
     }
 
+    // `--json -`: from here on stdout belongs to the JSON document alone, so
+    // the console summary below is diverted to stderr for this run.
+    const bool jsonToStdout = (opt.jsonPath == "-");
+    StdoutJson stdoutJson(jsonToStdout);
+    if (jsonToStdout && !stdoutJson.ready()) {
+        std::fprintf(stderr, "error: cannot take over stdout for --json -\n");
+        return kExitRuntime;
+    }
+
     // ---- open ------------------------------------------------------------------
-    const std::filesystem::path inputPath(opt.inputPath);
+    const std::filesystem::path inputPath = pathFromUtf8(opt.inputPath);
     Result<OsvFile> opened = OsvFile::open(inputPath);
     if (!opened.ok()) {
         std::fprintf(stderr, "error: cannot open %s: %s\n", safe(opt.inputPath).c_str(),
@@ -328,7 +549,7 @@ int runProbe(const ProbeOptions& opt) {
 
     json doc;
     doc["file"] = safe(inputPath.filename().string());
-    doc["path"] = safe(inputPath.string());
+    doc["path"] = opt.inputPath;  // exact UTF-8, as given
     doc["size"] = file.size();
     json warnings = json::array();
     for (const std::string& w : movie.warnings) {
@@ -465,7 +686,7 @@ int runProbe(const ProbeOptions& opt) {
     if (meta) {
         // The schema says whose field numbering the file was read with; the
         // wrong one reads the wrong fields, so it is always printed.
-        doc["schema"] = djmdSchemaName(meta->schema());
+        doc["djmdSchema"] = djmdSchemaName(meta->schema());
         std::printf("metadata: djmd track %u, %u frames, %s schema\n", meta->trackId(), meta->frameCount(),
                     djmdSchemaName(meta->schema()));
         if (meta->hasClip()) {
@@ -628,20 +849,29 @@ int runProbe(const ProbeOptions& opt) {
 
     // ---- warnings + JSON --------------------------------------------------------------
     doc["warnings"] = warnings;
+    addStableKeys(doc, movie, format.ok() ? &format.value() : nullptr, meta ? meta->frameCount() : 0u, inputPath);
     if (!warnings.empty()) {
         std::printf("warnings (%u):\n", static_cast<unsigned>(warnings.size()));
         for (const json& w : warnings) {
             std::printf("  %s\n", w.get<std::string>().c_str());
         }
     }
-    if (!opt.jsonPath.empty()) {
+    if (jsonToStdout) {
+        // UTF-8, unescaped; bytes that are not valid UTF-8 (they can only come
+        // from a damaged file name) are replaced rather than aborting the dump.
+        const std::string text = doc.dump(2, ' ', false, json::error_handler_t::replace) + '\n';
+        if (!stdoutJson.emit(text)) {
+            std::fprintf(stderr, "error: write to stdout failed\n");
+            return kExitRuntime;
+        }
+    } else if (!opt.jsonPath.empty()) {
         std::ofstream out(std::filesystem::path(opt.jsonPath), std::ios::binary);
         if (!out.good()) {
             std::fprintf(stderr, "error: cannot create %s\n", safe(opt.jsonPath).c_str());
             return kExitRuntime;
         }
         // NaN / infinity cannot be represented in JSON; nlohmann writes null.
-        out << doc.dump(2) << '\n';
+        out << doc.dump(2, ' ', false, json::error_handler_t::replace) << '\n';
         if (!out.good()) {
             std::fprintf(stderr, "error: write failed for %s\n", safe(opt.jsonPath).c_str());
             return kExitRuntime;
@@ -657,7 +887,8 @@ void registerProbeCommand(CLI::App& app, CommandContext& ctx) {
     auto opt = std::make_shared<ProbeOptions>();
     CLI::App* sub = app.add_subcommand("probe", "Inspect an .OSV/.LRF file: tracks, format, metadata, calibration");
     sub->add_option("file", opt->inputPath, "Input .OSV or .LRF file")->required();
-    sub->add_option("--json", opt->jsonPath, "Write the full JSON document to this path");
+    sub->add_option("--json", opt->jsonPath,
+                    "Write the full JSON document to this path, or to stdout (and nothing else) for '-'");
     sub->add_option("--frames", opt->frames, "Frames to include: all, N or a-b (default 0)")->capture_default_str();
     sub->add_option("--covers", opt->coversDir, "Extract the embedded JPEG cover images into this directory");
     sub->add_flag("--raw", opt->raw, "Include the schema-less protobuf tree of the selected samples");

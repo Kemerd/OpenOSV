@@ -7,10 +7,23 @@
 //   osvtool extract <file> --hevc out.hevc [--stream 0|1]
 //   osvtool extract <file> --frame N --lens 0|1 --out raw.pgm|raw.ppm
 //                          [--hw none|d3d11va|cuda|auto] [--container-samples]
-//   osvtool extract <file> --audio out.aac
+//   osvtool extract <file> --audio out.aac|out.wav
 //   osvtool extract <file> --imu out.csv [--dense]
 //
 // Exactly one of --hevc / --frame / --audio / --imu is accepted per run.
+//
+// --audio has two forms, chosen by the output extension:
+//   * .aac (and anything that is not .wav): the AAC track as ADTS, untouched.
+//   * .wav: the track DECODED to a 32-bit float WAV (WAVE_FORMAT_IEEE_FLOAT
+//     plus a fact chunk, interleaved) at the track's own sample rate and
+//     channel count.  The decode is the Premiere importer's AudioDecoder, so
+//     encoder priming is discarded and sample 0 of the WAV lines up with
+//     video frame 0 exactly as it does in Premiere and in the OpenFX
+//     plug-ins.  The file holds the decoder's whole track (its
+//     durationSamples()); nothing is padded or trimmed.  A track that would
+//     need more than 4 GiB of samples is refused.  The WAV is written to
+//     "<out>.partial" and renamed on success, so an interrupted run never
+//     leaves a half file under the real name.
 //
 // Frame output format.  The io module (PNG / TIFF / EXR writers) is a later
 // layer than this tool, so --frame writes the decoded fisheye as a 16-bit
@@ -26,8 +39,11 @@
 
 #include "Commands.h"
 
+#include "ImporterAudio.h"
+
 #include "osv/container/OsvFile.h"
 #include "osv/core/Log.h"
+#include "osv/io/WavWriter.h"
 #include "osv/meta/FormatDetector.h"
 #include "osv/meta/FormatInfo.h"
 #include "osv/meta/MetadataTrack.h"
@@ -39,6 +55,7 @@
 #include "osv/video/StreamExtract.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -81,6 +98,13 @@ int exitCodeFor(const osv::Error& error) {
 int fail(const osv::Error& error) {
     std::fprintf(stderr, "error: %s\n", osv::log::safe(error.toString()).c_str());
     return exitCodeFor(error);
+}
+
+/// Path from a UTF-8 command line argument.  main() decodes the Windows
+/// command line to UTF-8; a plain std::filesystem::path(std::string) would
+/// read those bytes in the ANSI code page and miss any non-ASCII file name.
+std::filesystem::path pathFromUtf8(const std::string& text) {
+    return std::filesystem::path(std::u8string(text.begin(), text.end()));
 }
 
 /// Lower-case file extension including the dot ("" when there is none).
@@ -151,7 +175,85 @@ int runHevc(const ExtractOptions& opt) {
 // -----------------------------------------------------------------------------
 //  --audio
 // -----------------------------------------------------------------------------
+/// Sample frames decoded per block: 4096 frames is 16 KiB per channel, small
+/// enough to stay in cache and large enough that the per-call cost vanishes.
+constexpr std::uint32_t kWavBlockFrames = 4096;
+
+/// Decode the clip's audio through the importer's AudioDecoder and stream it
+/// into a 32-bit float WAV.  The whole track is never held in memory.
+int runAudioWav(const ExtractOptions& opt) {
+    // ---- open the decoder (its own demuxer, CPU-only FFmpeg AAC) ----------------------
+    auto decoder = osv::premiere::AudioDecoder::open(pathFromUtf8(opt.inputPath));
+    if (!decoder.ok()) {
+        return fail(decoder.error());
+    }
+    osv::premiere::AudioDecoder& dec = decoder.value();
+    const std::int32_t channels = dec.channels();
+    const double rate = dec.sampleRate();
+    const std::int64_t total = dec.durationSamples();
+    if (channels <= 0 || !(rate >= 1.0) || rate > 4294967295.0) {
+        return fail(osv::Error{osv::ErrorCode::Malformed, "the audio track reports no usable channel count or rate"});
+    }
+    if (total <= 0) {
+        return fail(osv::Error{osv::ErrorCode::Malformed, "the audio track does not report its length"});
+    }
+    const auto sampleRate = static_cast<std::uint32_t>(std::llround(rate));
+
+    // ---- open the writer; the 4 GiB guard fires here, before any decoding --------------
+    auto wav = osv::io::WavWriter::open(pathFromUtf8(opt.audioPath), sampleRate,
+                                        static_cast<std::uint32_t>(channels), static_cast<std::uint64_t>(total));
+    if (!wav.ok()) {
+        return fail(wav.error());
+    }
+    osv::io::WavWriter& writer = wav.value();
+
+    // ---- stream: planar decode -> interleave -> write ------------------------------------
+    const auto channelCount = static_cast<std::size_t>(channels);
+    std::vector<std::vector<float>> planes(channelCount, std::vector<float>(kWavBlockFrames));
+    std::vector<float*> planePtrs(channelCount);
+    for (std::size_t c = 0; c < channelCount; ++c) {
+        planePtrs[c] = planes[c].data();
+    }
+    std::vector<float> interleaved(static_cast<std::size_t>(kWavBlockFrames) * channelCount);
+    dec.resetSequential();
+    for (std::int64_t done = 0; done < total;) {
+        // Ask for exactly what is left, so the decoder's end-of-stream
+        // zero-fill never adds samples beyond the track length.
+        const auto want = static_cast<std::uint32_t>(std::min<std::int64_t>(kWavBlockFrames, total - done));
+        const osv::Status read = dec.readSequential(want, planePtrs.data());
+        if (!read.ok()) {
+            return fail(read.error());
+        }
+        for (std::uint32_t i = 0; i < want; ++i) {
+            for (std::size_t c = 0; c < channelCount; ++c) {
+                interleaved[static_cast<std::size_t>(i) * channelCount + c] = planes[c][i];
+            }
+        }
+        const osv::Status written = writer.write(interleaved.data(), want);
+        if (!written.ok()) {
+            return fail(written.error());
+        }
+        done += want;
+    }
+    const osv::Status finished = writer.finalize();
+    if (!finished.ok()) {
+        return fail(finished.error());
+    }
+
+    std::printf("wrote %s\n", osv::log::safe(opt.audioPath).c_str());
+    std::printf("  format          : 32-bit float WAV (IEEE float, interleaved)\n");
+    std::printf("  sample rate     : %u Hz\n", sampleRate);
+    std::printf("  channels        : %d\n", channels);
+    std::printf("  sample frames   : %lld (%.3f s)\n", static_cast<long long>(total), static_cast<double>(total) / rate);
+    return kExitOk;
+}
+
 int runAudio(const ExtractOptions& opt) {
+    // The extension picks the form: .wav is decoded PCM, anything else keeps
+    // the ADTS behaviour.
+    if (lowerExtension(std::filesystem::path(opt.audioPath)) == ".wav") {
+        return runAudioWav(opt);
+    }
     auto stats = osv::video::writeAdtsAudio(opt.inputPath, 0, opt.audioPath);
     if (!stats.ok()) {
         return fail(stats.error());
@@ -368,7 +470,8 @@ void registerExtractCommand(CLI::App& app, CommandContext& ctx) {
 #endif
     sub->add_flag("--container-samples", opt->containerSamples,
                   "Feed samples from the OpenOSV container parser instead of libavformat (--frame)");
-    sub->add_option("--audio", opt->audioPath, "Write the AAC track as an ADTS .aac file");
+    sub->add_option("--audio", opt->audioPath, "Write the audio: out.aac = the AAC track as ADTS, out.wav = decoded 32-bit float WAV "
+                   "(priming discarded, in sync with video frame 0)");
     sub->add_option("--imu", opt->imuPath, "Write per-frame camera / IMU metadata as CSV");
     sub->add_flag("--dense", opt->dense, "With --imu: one row per fused IMU sample instead of per frame");
     // The callback runs during parse; the exit code lands in the context.

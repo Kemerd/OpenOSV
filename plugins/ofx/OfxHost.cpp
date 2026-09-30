@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// OfxHost.cpp - the defensive wrappers declared in OfxHost.h.
+// OfxHost.cpp - the defensive wrappers declared in OfxHost.h: the suites,
+// the host's name and profile (Generic / Resolve / VEGAS), property and
+// parameter access, and the images with the formats each host hands out.
 
 #include "OfxHost.h"
 
@@ -9,6 +11,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <format>
 #include <mutex>
 
 namespace osv::ofx {
@@ -211,6 +214,172 @@ const char* hostProfileName(HostProfile profile) noexcept {
         case HostProfile::Generic: break;
     }
     return "generic";
+}
+
+OfxPropertySetHandle hostProperties() noexcept {
+    OfxHost* host = g_suites.host;
+    return host ? host->host : nullptr;
+}
+
+// ---------------------------------------------------------------------------
+//  The host's self-description, for the log
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Value `index` of a property as text, read as `kind`; empty when no read
+/// succeeds.  Only the documented type is ever read through a pointer (a
+/// string); the fallbacks copy plain values.
+[[nodiscard]] std::string propertyValue(OfxPropertySetHandle set, const char* name, int index, PropKind kind) {
+    const OfxPropertySuiteV1* ps = propSuite();
+    if (!ps || !set || !name || index < 0) {
+        return {};
+    }
+    // Reading an int or a double copies a value: safe whatever the host
+    // really stored, so both serve as the fallback of every kind.
+    const auto asInt = [&]() -> std::string {
+        int value = 0;
+        if (ps->propGetInt && ps->propGetInt(set, name, index, &value) == kOfxStatOK) {
+            return std::to_string(value);
+        }
+        return {};
+    };
+    const auto asDouble = [&]() -> std::string {
+        double value = 0.0;
+        if (ps->propGetDouble && ps->propGetDouble(set, name, index, &value) == kOfxStatOK) {
+            return std::format("{}", value);
+        }
+        return {};
+    };
+    switch (kind) {
+    case PropKind::String: {
+        char* value = nullptr;
+        if (ps->propGetString && ps->propGetString(set, name, index, &value) == kOfxStatOK && value) {
+            // Copied at once: the host owns the characters.
+            return "\"" + std::string(value) + "\"";
+        }
+        return asInt();
+    }
+    case PropKind::Int: {
+        std::string text = asInt();
+        return text.empty() ? asDouble() : text;
+    }
+    case PropKind::Pointer: {
+        void* value = nullptr;
+        if (ps->propGetPointer && ps->propGetPointer(set, name, index, &value) == kOfxStatOK) {
+            // An address, never followed: it only tells "set" from "null".
+            return value ? std::format("{}", value) : std::string("null");
+        }
+        return {};
+    }
+    }
+    return {};
+}
+
+}  // namespace
+
+std::string describeProperty(OfxPropertySetHandle set, const char* name, PropKind kind) noexcept {
+    try {
+        if (!set || !name) {
+            return "absent";
+        }
+        // A host without propGetDimension (or one that does not know the
+        // property) still gets asked for the first value, so a one-value
+        // property is not reported absent just because it cannot be counted.
+        const int count = dimension(set, name);
+        if (count == 0) {
+            return "(no values)";
+        }
+        constexpr int kMaxValues = 16;
+        const int shown = count < 0 ? 1 : (count < kMaxValues ? count : kMaxValues);
+        std::string text;
+        for (int i = 0; i < shown; ++i) {
+            std::string value = propertyValue(set, name, i, kind);
+            if (value.empty()) {
+                if (count < 0) {
+                    return "absent";
+                }
+                value = "?";  // present but unreadable as any value type
+            }
+            if (!text.empty()) {
+                text += ", ";
+            }
+            text += value;
+        }
+        if (count > shown) {
+            text += std::format(" (+{} more)", count - shown);
+        }
+        return text;
+    } catch (...) {
+        return "(unreadable)";
+    }
+}
+
+void logHostDescription() noexcept {
+    OfxPropertySetHandle host = hostProperties();
+    if (!host) {
+        PluginLog::warn("ofx host: no host property set to describe");
+        return;
+    }
+    // OpenFX cannot enumerate a property set, so this is the list that
+    // explains a host's behaviour after the fact: who it is, what it hands
+    // out, what it can render on, and VEGAS's own additions.
+    struct Entry {
+        const char* name;
+        PropKind kind;
+    };
+    static constexpr Entry kEntries[] = {
+        {kOfxPropName, PropKind::String},
+        {kOfxPropLabel, PropKind::String},
+        {kOfxPropVersion, PropKind::Int},
+        {kOfxPropVersionLabel, PropKind::String},
+        {kOfxPropAPIVersion, PropKind::Int},
+        {kOfxImageEffectPropSupportedContexts, PropKind::String},
+        {kOfxImageEffectPropSupportedPixelDepths, PropKind::String},
+        {kOfxImageEffectPropSupportedComponents, PropKind::String},
+        {kOfxImageEffectPropSupportsMultipleClipDepths, PropKind::Int},
+        {kOfxImageEffectPropSupportsTiles, PropKind::Int},
+        {kOfxImageEffectPropSupportsMultiResolution, PropKind::Int},
+        {kOfxImageEffectPropTemporalClipAccess, PropKind::Int},
+        {kOfxImageEffectPropSupportsOverlays, PropKind::Int},
+        {kOfxImageEffectPropCudaRenderSupported, PropKind::String},
+        {kOfxImageEffectPropCudaStreamSupported, PropKind::String},
+        {kOfxImageEffectPropOpenCLRenderSupported, PropKind::String},
+        {kOfxImageEffectPropOpenGLRenderSupported, PropKind::String},
+        {kPropVegasHostHWnd, PropKind::Pointer},
+        {kPropVegasHostAppDataDirectory, PropKind::String},
+    };
+    PluginLog::info("ofx host: profile '{}' for host '{}'", hostProfileName(hostProfile()), hostName());
+    for (const Entry& entry : kEntries) {
+        PluginLog::info("ofx host:   {} = {}", entry.name, describeProperty(host, entry.name, entry.kind));
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Pixel depths and formats per profile
+// ---------------------------------------------------------------------------
+
+void declarePixelDepths(OfxPropertySetHandle effectDescriptor, HostProfile profile) noexcept {
+    if (!effectDescriptor) {
+        return;
+    }
+    if (profile != HostProfile::Vegas) {
+        // 32-bit float only: the panorama is HDR (PQ / HLG / log) more often
+        // than not, and the sampler reads float.  Resolve always offers float.
+        setString(effectDescriptor, kOfxImageEffectPropSupportedPixelDepths, kOfxBitDepthFloat, 0);
+        return;
+    }
+    // VEGAS: 8-bit projects hand BYTE images, 32-bit projects FLOAT ones, and
+    // the two extension tokens let it hand either in its own B G R A order
+    // without a swizzle on its side.
+    setString(effectDescriptor, kOfxImageEffectPropSupportedPixelDepths, kOfxBitDepthByte, 0);
+    setString(effectDescriptor, kOfxImageEffectPropSupportedPixelDepths, kOfxBitDepthFloat, 1);
+    setString(effectDescriptor, kOfxImageEffectPropSupportedPixelDepths, kBitDepthByteBgr, 2);
+    setString(effectDescriptor, kOfxImageEffectPropSupportedPixelDepths, kBitDepthFloatBgr, 3);
+}
+
+const char* acceptedFormats(HostProfile profile) noexcept {
+    return profile == HostProfile::Vegas ? "8-bit or 32-bit float RGBA / BGRA" : "32-bit float RGBA";
 }
 
 // ===========================================================================
@@ -679,11 +848,27 @@ ClipImage::ClipImage(OfxImageClipHandle clip, OfxTime time) noexcept {
     rowBytesFromHost = rowBytes != 0;
     depth = getString(image, kOfxImageEffectPropPixelDepth);
     components = getString(image, kOfxImageEffectPropComponents);
+    // The channel order is VEGAS's extension, and only VEGAS is asked for it
+    // (a property Resolve never set stays unread there, as it always was).
+    // The header documents it on the clip; the image's own label, when a
+    // host sets one, is the more specific of the two.
+    if (hostProfile() == HostProfile::Vegas) {
+        order = getString(image, kPropPixelOrder);
+        if (order.empty() && es->clipGetPropertySet) {
+            OfxPropertySetHandle clipProps = nullptr;
+            if (es->clipGetPropertySet(clip, &clipProps) == kOfxStatOK && clipProps) {
+                order = getString(clipProps, kPropPixelOrder);
+            }
+        }
+    }
     // A host that reports no pitch at all hands out tightly packed rows (the
     // assumption every one of Blackmagic's own sample kernels makes), so an
-    // unset pitch means four floats per pixel rather than an unusable image.
+    // unset pitch means one packed row of the labelled depth - four floats
+    // per pixel, or four bytes for an 8-bit label - rather than an unusable
+    // image.
     if (rowBytes == 0 && width() > 0) {
-        rowBytes = width() * 16;
+        const bool byteLabel = depth == kOfxBitDepthByte || depth == kBitDepthByteBgr;
+        rowBytes = width() * (byteLabel ? bytesPerPixel(HostDepth::Byte) : bytesPerPixel(HostDepth::Float));
     }
 }
 
@@ -718,6 +903,72 @@ bool ClipImage::isFloatRgba(bool lenient) const noexcept {
                          depth, components, rowBytes, width());
     }
     return depthOk && componentsOk;
+}
+
+std::optional<HostImageView> ClipImage::view(HostProfile profile, bool lenient) const noexcept {
+    // ---- Resolve and every other host: float RGBA, exactly as always --------
+    if (profile != HostProfile::Vegas) {
+        if (!isFloatRgba(lenient)) {
+            return std::nullopt;
+        }
+        return HostImageView{data, rowBytes, bounds, HostDepth::Float, HostOrder::Rgba};
+    }
+
+    // ---- VEGAS: 8-bit or float, R G B A or B G R A ---------------------------
+    if (!valid() || width() <= 0 || height() <= 0 || rowBytes == 0) {
+        return std::nullopt;
+    }
+    // The depth.  The extension header defines the BGR tokens as labels of
+    // B G R A samples, so a host that labels an IMAGE with one says its
+    // order as well; the plain labels leave the order to the order label.
+    HostDepth pixelDepth = HostDepth::Float;
+    bool impliedBgra = false;
+    if (depth == kOfxBitDepthByte) {
+        pixelDepth = HostDepth::Byte;
+    } else if (depth == kOfxBitDepthFloat) {
+        pixelDepth = HostDepth::Float;
+    } else if (depth == kBitDepthByteBgr) {
+        pixelDepth = HostDepth::Byte;
+        impliedBgra = true;
+    } else if (depth == kBitDepthFloatBgr) {
+        pixelDepth = HostDepth::Float;
+        impliedBgra = true;
+    } else if (!(lenient && depth.empty())) {
+        // 16-bit, half, "none" or unknown: nothing the loops can read.
+        return std::nullopt;
+    }
+    // (An unlabelled generator output is taken as float, the Resolve rule;
+    // the pitch check below still has to prove four floats per pixel.)
+
+    // The order: an explicit label wins, then the depth token's implication.
+    HostOrder pixelOrder = impliedBgra ? HostOrder::Bgra : HostOrder::Rgba;
+    if (order == kPixelOrderBgra) {
+        pixelOrder = HostOrder::Bgra;
+    } else if (order == kPixelOrderRgba) {
+        pixelOrder = HostOrder::Rgba;
+    } else if (!order.empty()) {
+        return std::nullopt;  // an order this plug-in cannot name
+    }
+
+    // The components, with the same unlabelled leniency as isFloatRgba().
+    const bool unlabelled = components.empty() || (components == kOfxImageComponentNone && rowBytesFromHost);
+    if (!(components == kOfxImageComponentRGBA || (lenient && unlabelled))) {
+        return std::nullopt;
+    }
+
+    // The pitch must hold a whole row of the chosen depth, whatever the
+    // labels say, so every byte written is inside the host's allocation.
+    const long long pitch = rowBytes < 0 ? -static_cast<long long>(rowBytes) : static_cast<long long>(rowBytes);
+    if (pitch < static_cast<long long>(width()) * bytesPerPixel(pixelDepth)) {
+        return std::nullopt;
+    }
+    if (depth.empty() || components != kOfxImageComponentRGBA) {
+        PluginLog::oncef("ofx/image/unlabelled-vegas", PluginLog::Level::Warn,
+                         "ofx: the host labelled an image '{}' '{}' with {} bytes per row for {} pixels; treating it "
+                         "as {} {}",
+                         depth, components, rowBytes, width(), hostDepthName(pixelDepth), hostOrderName(pixelOrder));
+    }
+    return HostImageView{data, rowBytes, bounds, pixelDepth, pixelOrder};
 }
 
 OfxImageClipHandle clipHandle(OfxImageEffectHandle effect, const char* name) noexcept {

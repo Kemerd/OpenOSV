@@ -54,16 +54,47 @@ Fixture& Fixture::get() {
 //  HostImage
 // ===========================================================================
 
-float* HostImage::pixel(int x, int y) noexcept {
+unsigned char* HostImage::rawPixel(int x, int y) noexcept {
     if (x < bounds.x1 || x >= bounds.x2 || y < bounds.y1 || y >= bounds.y2) {
         return nullptr;
     }
-    char* row = reinterpret_cast<char*>(data()) + static_cast<std::ptrdiff_t>(y - bounds.y1) * rowBytes;
-    return reinterpret_cast<float*>(row) + static_cast<std::ptrdiff_t>(x - bounds.x1) * 4;
+    unsigned char* row =
+        reinterpret_cast<unsigned char*>(data()) + static_cast<std::ptrdiff_t>(y - bounds.y1) * rowBytes;
+    return row + static_cast<std::ptrdiff_t>(x - bounds.x1) * pixelBytes();
+}
+
+const unsigned char* HostImage::rawPixel(int x, int y) const noexcept {
+    return const_cast<HostImage*>(this)->rawPixel(x, y);
+}
+
+float* HostImage::pixel(int x, int y) noexcept {
+    // Float images only: an 8-bit pixel has no floats to point at.
+    if (depth != osv::ofx::HostDepth::Float) {
+        return nullptr;
+    }
+    return reinterpret_cast<float*>(rawPixel(x, y));
 }
 
 const float* HostImage::pixel(int x, int y) const noexcept {
     return const_cast<HostImage*>(this)->pixel(x, y);
+}
+
+bool HostImage::readRgba(int x, int y, float rgba[4]) const noexcept {
+    const unsigned char* p = rawPixel(x, y);
+    if (!p || !rgba) {
+        return false;
+    }
+    osv::ofx::loadHostPixel(p, depth, order, rgba);
+    return true;
+}
+
+bool HostImage::writeRgba(int x, int y, const float rgba[4]) noexcept {
+    unsigned char* p = rawPixel(x, y);
+    if (!p || !rgba) {
+        return false;
+    }
+    osv::ofx::storeHostPixel(p, depth, order, osv::ofx::OutputLevels::Full, rgba);
+    return true;
 }
 
 void HostImage::describe(PropertySet& image) noexcept {
@@ -71,22 +102,45 @@ void HostImage::describe(PropertySet& image) noexcept {
     image.setInts(kOfxImagePropBounds, {bounds.x1, bounds.y1, bounds.x2, bounds.y2});
     image.setInts(kOfxImagePropRegionOfDefinition, {bounds.x1, bounds.y1, bounds.x2, bounds.y2});
     image.setInt(kOfxImagePropRowBytes, rowBytes);
-    image.setString(kOfxImageEffectPropPixelDepth, kOfxBitDepthFloat);
+    // The depth's own label unless a test asked for another one.
+    const char* ownDepth = depth == osv::ofx::HostDepth::Byte ? kOfxBitDepthByte : kOfxBitDepthFloat;
+    image.setString(kOfxImageEffectPropPixelDepth, depthLabel.empty() ? std::string(ownDepth) : depthLabel);
     image.setString(kOfxImageEffectPropComponents, kOfxImageComponentRGBA);
     image.setString(kOfxImageEffectPropPreMultiplication, kOfxImageUnPreMultiplied);
     image.setDouble(kOfxImagePropPixelAspectRatio, 1.0);
     image.setString(kOfxImagePropField, kOfxImageFieldNone);
     image.setDoubles(kOfxImageEffectPropRenderScale, {1.0, 1.0});
+    if (labelOrder) {
+        image.setString(osv::ofx::kPropPixelOrder,
+                        order == osv::ofx::HostOrder::Bgra ? osv::ofx::kPixelOrderBgra : osv::ofx::kPixelOrderRgba);
+    }
 }
 
-void HostImage::fill(float value) noexcept { std::fill(storage.begin(), storage.end(), value); }
+void HostImage::fill(float value) noexcept {
+    if (depth == osv::ofx::HostDepth::Byte) {
+        fillBytes(kByteSentinel);
+        return;
+    }
+    std::fill(storage.begin(), storage.end(), value);
+}
 
-HostImage makeImage(const OfxRectI& bounds, bool negativePitch, int padFloats) {
+void HostImage::fillBytes(std::uint8_t code) noexcept {
+    if (!storage.empty()) {
+        std::memset(storage.data(), code, storage.size() * sizeof(float));
+    }
+}
+
+HostImage makeImage(const OfxRectI& bounds, bool negativePitch, int padFloats, osv::ofx::HostDepth depth,
+                    osv::ofx::HostOrder order) {
     HostImage img;
     img.bounds = bounds;
+    img.depth = depth;
+    img.order = order;
     const int w = std::max(0, bounds.x2 - bounds.x1);
     const int h = std::max(0, bounds.y2 - bounds.y1);
-    const int rowFloats = w * 4 + std::max(0, padFloats);
+    // One float of storage holds one 8-bit pixel, four hold a float pixel.
+    const int floatsPerPixel = depth == osv::ofx::HostDepth::Byte ? 1 : 4;
+    const int rowFloats = w * floatsPerPixel + std::max(0, padFloats);
     img.storage.assign(static_cast<std::size_t>(rowFloats) * static_cast<std::size_t>(h), 0.0f);
     if (negativePitch) {
         // Top row first in memory: the bottom row is the LAST one, and the
@@ -100,6 +154,20 @@ HostImage makeImage(const OfxRectI& bounds, bool negativePitch, int padFloats) {
     return img;
 }
 
+HostImage convertImage(const HostImage& source, osv::ofx::HostDepth depth, osv::ofx::HostOrder order,
+                       bool negativePitch, int padFloats) {
+    HostImage out = makeImage(source.bounds, negativePitch, padFloats, depth, order);
+    for (int y = source.bounds.y1; y < source.bounds.y2; ++y) {
+        for (int x = source.bounds.x1; x < source.bounds.x2; ++x) {
+            float rgba[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (source.readRgba(x, y, rgba)) {
+                out.writeRgba(x, y, rgba);
+            }
+        }
+    }
+    return out;
+}
+
 void paintPanorama(HostImage& image) {
     const int w = image.width();
     const int h = image.height();
@@ -110,13 +178,16 @@ void paintPanorama(HostImage& image) {
         const double lat = kPi / 2.0 - (rowFromTop + 0.5) / h * kPi;
         for (int x = image.bounds.x1; x < image.bounds.x2; ++x) {
             const double lon = (x - image.bounds.x1 + 0.5) / w * 2.0 * kPi - kPi;
-            float* p = image.pixel(x, y);
             // Three independent smooth fields: no mirror or rotation of the
             // sphere maps the picture onto itself.
-            p[0] = static_cast<float>(0.5 + 0.45 * std::sin(lon + 0.3) * std::cos(lat));
-            p[1] = static_cast<float>(0.5 + 0.45 * std::sin(lat * 1.3 + 0.2));
-            p[2] = static_cast<float>(0.5 + 0.35 * std::cos(2.0 * lon - 0.7) * std::cos(lat) + 0.1 * std::sin(lat));
-            p[3] = 1.0f;
+            const float p[4] = {
+                static_cast<float>(0.5 + 0.45 * std::sin(lon + 0.3) * std::cos(lat)),
+                static_cast<float>(0.5 + 0.45 * std::sin(lat * 1.3 + 0.2)),
+                static_cast<float>(0.5 + 0.35 * std::cos(2.0 * lon - 0.7) * std::cos(lat) + 0.1 * std::sin(lat)),
+                1.0f,
+            };
+            // Any format: a float image takes the values exactly as they are.
+            image.writeRgba(x, y, p);
         }
     }
 }
@@ -135,7 +206,10 @@ HostImage referenceRender(const reframe::Settings& settings, const HostImage& so
     for (int r = 0; r < sh; ++r) {
         const int y = source.bounds.y2 - 1 - r;  // row r from the top
         for (int x = 0; x < sw; ++x) {
-            const float* p = source.pixel(source.bounds.x1 + x, y);
+            // Any source format, read as the straight RGBA floats the
+            // plug-in's sampler sees (8-bit codes promoted by 1/255).
+            float p[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            (void)source.readRgba(source.bounds.x1 + x, y, p);
             float* q = bgra.data() + (static_cast<std::size_t>(r) * sw + x) * 4;
             q[0] = p[2];
             q[1] = p[1];
@@ -186,13 +260,49 @@ double maxDifference(const HostImage& a, const HostImage& b, const OfxRectI& win
     double worst = 0.0;
     for (int y = window.y1; y < window.y2; ++y) {
         for (int x = window.x1; x < window.x2; ++x) {
-            const float* p = a.pixel(x, y);
-            const float* q = b.pixel(x, y);
-            if (!p || !q) {
+            // RGBA floats whatever either image's format (a float RGBA
+            // image reads back exactly the floats it holds).
+            float p[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float q[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (!a.readRgba(x, y, p) || !b.readRgba(x, y, q)) {
                 return std::numeric_limits<double>::infinity();
             }
             for (int c = 0; c < 4; ++c) {
                 const double d = std::fabs(static_cast<double>(p[c]) - static_cast<double>(q[c]));
+                if (!(d == d)) {
+                    return std::numeric_limits<double>::infinity();
+                }
+                worst = std::max(worst, d);
+            }
+        }
+    }
+    return worst;
+}
+
+double maxPackedDifference(const HostImage& image, const HostImage& reference, const OfxRectI& window,
+                           osv::ofx::OutputLevels levels) {
+    double worst = 0.0;
+    for (int y = window.y1; y < window.y2; ++y) {
+        for (int x = window.x1; x < window.x2; ++x) {
+            const unsigned char* got = image.rawPixel(x, y);
+            float ref[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (!got || !reference.readRgba(x, y, ref)) {
+                return std::numeric_limits<double>::infinity();
+            }
+            // What the packing rule makes of the reference in this format.
+            alignas(16) unsigned char expected[16] = {};
+            osv::ofx::storeHostPixel(expected, image.depth, image.order, levels, ref);
+            for (int c = 0; c < 4; ++c) {
+                double d = 0.0;
+                if (image.depth == osv::ofx::HostDepth::Byte) {
+                    d = std::fabs(static_cast<double>(got[c]) - static_cast<double>(expected[c]));
+                } else {
+                    float a = 0.0f;
+                    float b = 0.0f;
+                    std::memcpy(&a, got + c * 4, sizeof(float));
+                    std::memcpy(&b, expected + c * 4, sizeof(float));
+                    d = std::fabs(static_cast<double>(a) - static_cast<double>(b));
+                }
                 if (!(d == d)) {
                     return std::numeric_limits<double>::infinity();
                 }

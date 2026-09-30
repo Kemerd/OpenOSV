@@ -13,6 +13,13 @@
 //            (plugins/common/PluginLogPosix.cpp), so HOME is pointed at a
 //            private folder instead - per process, like the Windows one, so
 //            parallel ctest workers never share a file.
+//
+// The host the mock plays is the process's (OSV_MOCK_OFX_PROFILE, see
+// MockOfxHost.h).  A VEGAS process started without a test spec runs the
+// [vegas] tests - the only ones written for that host - instead of the
+// Resolve-shaped rest of the suite.
+
+#include "MockOfxHost.h"
 
 #include <catch2/catch_session.hpp>
 
@@ -68,5 +75,16 @@ int main(int argc, char* argv[]) {
     // The module reads the level when kOfxActionLoad initialises its log.
     setEnv("OSV_PLUGIN_LOG_LEVEL", std::getenv("OSV_TEST_VERBOSE") ? "debug" : "error");
 
-    return Catch::Session().run(argc, argv);
+    Catch::Session session;
+    const int parsed = session.applyCommandLine(argc, argv);
+    if (parsed != 0) {
+        return parsed;
+    }
+    // A VEGAS process with no spec of its own runs the VEGAS tests (hidden
+    // from every other run), not the tests that expect Resolve's descriptors.
+    if (osv::ofxtest::MockHost::instance().isVegas() && session.configData().testsOrTags.empty()) {
+        session.configData().testsOrTags.push_back("[vegas]");
+        session.useConfigData(session.configData());
+    }
+    return session.run();
 }

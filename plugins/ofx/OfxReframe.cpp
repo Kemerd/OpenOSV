@@ -2,6 +2,20 @@
 // Copyright 2026 The OpenOSV Contributors
 //
 // OfxReframe.cpp - the OpenOSV 360 Reframe OpenFX filter (OfxReframe.h).
+//
+// One filter, two hosts:
+//
+//   * DaVinci Resolve (and any host but VEGAS): float RGBA images, Filter and
+//     General contexts, CUDA images on an NVIDIA machine - exactly as before
+//     VEGAS support existed (tests/ofx/golden pins the descriptors);
+//   * VEGAS Pro: 8-bit or float images in R G B A or B G R A, the Filter
+//     context only (VEGAS lists every declared context as a separate FX),
+//     always in host memory.  An 8-bit source is promoted to float once per
+//     frame for the shared sampler; the output is written in the host's own
+//     format.  Levels are never touched: the filter only moves pixels the
+//     host has already levelled.
+//
+// Every difference keys on hostProfile() (OfxHost.h) and on nothing else.
 
 #include "OfxReframe.h"
 
@@ -16,8 +30,11 @@
 #include "ReframeCpu.h"
 
 #include <cstring>
+#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace osv::ofx::reframe_filter {
 
@@ -29,6 +46,23 @@ namespace {
 /// True when two action names are the same string.
 [[nodiscard]] bool isAction(const char* action, const char* name) noexcept {
     return action && name && std::strcmp(action, name) == 0;
+}
+
+/// An image's labels for a log line: depth, components and - where the host
+/// sets one (VEGAS) - the pixel order.
+[[nodiscard]] std::string labels(const ClipImage& image) {
+    std::string text = image.depth + " " + image.components;
+    if (!image.order.empty()) {
+        text += " " + image.order;
+    }
+    return text;
+}
+
+/// True for a 32-bit float R G B A view: the only format the CUDA kernel
+/// (and the host-image descriptions inside the [WP-V-GPU] region below)
+/// know.  Resolve's images always are; VEGAS's may not be.
+[[nodiscard]] bool isFloatRgbaView(const HostImageView& view) noexcept {
+    return view.depth == HostDepth::Float && view.order == HostOrder::Rgba;
 }
 
 // ===========================================================================
@@ -50,18 +84,25 @@ OfxStatus describe(OfxImageEffectHandle effect) noexcept {
               "Point a keyframable virtual camera into any 360 equirectangular clip. DJI Studio's lens, presets "
               "and keyframe curves, frame for frame.");
 
+    const HostProfile profile = hostProfile();
+
     // Filter for the timeline and the Color page; General for hosts (Nuke,
     // Natron) that prefer it.  Both have exactly one input called Source.
+    // VEGAS turns every declared context into its own entry in the Video FX
+    // list, so there the filter is a Filter and nothing else.
     setString(props, kOfxImageEffectPropSupportedContexts, kOfxImageEffectContextFilter, 0);
-    setString(props, kOfxImageEffectPropSupportedContexts, kOfxImageEffectContextGeneral, 1);
+    if (profile != HostProfile::Vegas) {
+        setString(props, kOfxImageEffectPropSupportedContexts, kOfxImageEffectContextGeneral, 1);
+    }
 
-    // 32-bit float only: the panorama is HDR (PQ / HLG / log) more often than
-    // not, and the sampler reads float.  Resolve always offers float.
-    setString(props, kOfxImageEffectPropSupportedPixelDepths, kOfxBitDepthFloat, 0);
+    // Float only outside VEGAS; 8-bit and float, R G B A and B G R A in
+    // VEGAS (declarePixelDepths() in OfxHost.cpp has the reasons).
+    declarePixelDepths(props, profile);
 
     setInt(props, kOfxImageEffectPluginPropSingleInstance, 0);
     // Every render reads only its own arguments and the (read-only) images,
-    // so any number of renders may run at once, on any instance.
+    // so any number of renders may run at once, on any instance - VEGAS's
+    // clones included (one per render thread).
     setString(props, kOfxImageEffectPluginRenderThreadSafety, kOfxImageEffectRenderFullySafe);
     // We spread rows over our own pool; the host must not split the frame.
     setInt(props, kOfxImageEffectPluginPropHostFrameThreading, 0);
@@ -144,6 +185,7 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
     if (getString(inArgs, kOfxPropChangeReason) != kOfxChangeUserEdited) {
         return kOfxStatReplyDefault;
     }
+    // Parameters only: VEGAS also reports its clip "Output" changing.
     if (getString(inArgs, kOfxPropType) != kOfxTypeParameter) {
         return kOfxStatReplyDefault;
     }
@@ -169,29 +211,51 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) noexc
     renderScale(inArgs, sx, sy);
     const bool cudaEnabled = getInt(inArgs, kOfxImageEffectPropCudaEnabled, 0, 0) != 0;
     void* stream = getPointer(inArgs, kOfxImageEffectPropCudaStream);
+    const HostProfile profile = hostProfile();
 
     // ---- the two images ---------------------------------------------------------
+    // Each is reduced to a HostImageView - where the pixels are and how they
+    // are laid out - by the one rule for this host (ClipImage::view()).
     OfxImageClipHandle outputClip = clipHandle(effect, kOfxImageEffectOutputClipName);
     OfxImageClipHandle sourceClip = clipHandle(effect, kOfxImageEffectSimpleSourceClipName);
     ClipImage output(outputClip, time);
     if (!output.valid()) {
         return kOfxStatFailed;
     }
-    if (!output.isFloatRgba()) {
+    const std::optional<HostImageView> outputView = output.view(profile);
+    if (!outputView) {
         PluginLog::oncef("ofx/reframe/format", PluginLog::Level::Error,
-                         "ofx reframe: output image is {} {} - only 32-bit float RGBA is supported", output.depth,
-                         output.components);
+                         "ofx reframe: output image is {} - only {} is supported", labels(output),
+                         acceptedFormats(profile));
         return kOfxStatErrImageFormat;
     }
     ClipImage source(sourceClip, time);
-    if (!source.isFloatRgba()) {
+    const std::optional<HostImageView> sourceImageView = source.view(profile);
+    if (!sourceImageView) {
         // No picture to reframe (a gap, an unsupported format): transparent
         // black on the CPU, a refusal on the GPU, where we cannot clear.
         if (cudaEnabled) {
             return kOfxStatFailed;
         }
-        clearCpu(output, window);
+        clearCpu(*outputView, window);
         return kOfxStatOK;
+    }
+
+    // ---- the source as the shared sampler reads it -----------------------------
+    // The sampler reads float (or half) only.  An 8-bit source - VEGAS's
+    // 8-bit projects - is promoted to a float copy once per frame, in the
+    // same channel order, on all cores; a float source is read in place.
+    reframe::ConstFrameView samplerSource = sourceView(*sourceImageView);
+    std::vector<float> promoted;
+    if (reframe::layoutNeedsPromotion(samplerSource.layout)) {
+        std::shared_ptr<ThreadPool> promotePool = HostContext::instance().threadPoolShared();
+        samplerSource = reframe::promoteIntegerToFloat(samplerSource, promoted, promotePool.get());
+        if (!samplerSource.valid()) {
+            PluginLog::oncef("ofx/reframe/promote", PluginLog::Level::Error,
+                             "ofx reframe: could not make a float copy of a {}x{} 8-bit source",
+                             sourceImageView->width(), sourceImageView->height());
+            return kOfxStatErrMemory;
+        }
     }
 
     // ---- the camera ---------------------------------------------------------------
@@ -199,7 +263,7 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) noexc
     const reframe::Settings settings = camera::read(params, time);
     const double par = getDouble(effectProps(effect), kOfxImageEffectPropProjectPixelAspectRatio, 0, 1.0);
     const OfxRectI frame = cameraFrame(outputClip, time, sx, sy, par, output.bounds);
-    reframe::KernelSetup setup = reframe::buildParams(settings, sourceView(source), frame.x2 - frame.x1,
+    reframe::KernelSetup setup = reframe::buildParams(settings, samplerSource, frame.x2 - frame.x1,
                                                       frame.y2 - frame.y1, camera::projectSize(effect));
     if (!setup.valid) {
         PluginLog::oncef("ofx/reframe/setup", PluginLog::Level::Warn,
@@ -207,11 +271,21 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) noexc
                          frame.y2 - frame.y1, source.width(), source.height(), reframe::setupRejectName(setup.reject));
         return kOfxStatFailed;
     }
-    // OpenFX images are R, G, B, A; buildParams() described a Premiere frame.
-    setup.source.isBgra = 0;
+    // buildParams() described a Premiere frame (B, G, R, A); the host's image
+    // says its own order - R, G, B, A everywhere but in some VEGAS images.
+    setup.source.isBgra = sourceImageView->order == HostOrder::Bgra ? 1 : 0;
 
     // ---- the GPU path: the host's CUDA images, on the host's stream -------------
     if (cudaEnabled) {
+        // The kernel reads and writes 32-bit float R, G, B, A, the one format
+        // a CUDA host (Resolve) hands out; anything else is refused rather
+        // than misread on the device.
+        if (!isFloatRgbaView(*outputView) || !isFloatRgbaView(*sourceImageView)) {
+            PluginLog::oncef("ofx/reframe/cuda-format", PluginLog::Level::Error,
+                             "ofx reframe: CUDA images must be 32-bit float RGBA (output {}, source {})",
+                             labels(output), labels(source));
+            return kOfxStatErrImageFormat;
+        }
         const OfxRectI area = intersect(window, output.bounds);
         OsvOfxTarget target{};
         target.boundsX1 = output.bounds.x1;
@@ -232,6 +306,14 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) noexc
         return kOfxStatOK;
     }
 
+    // The GPU hook below describes both images to itself as 32-bit float
+    // R, G, B, A.  Until it describes them from `outputView` and
+    // `sourceImageView` - the real depth and order, both ready here - it may
+    // only run when that description is the truth, so an 8-bit or B, G, R, A
+    // image (VEGAS) goes straight to the CPU loop.  The condition governs
+    // the region's block as a whole; nothing inside the region is changed.
+    const bool gpuHookFormatsTrue = isFloatRgbaView(*outputView) && isFloatRgbaView(*sourceImageView);
+    if (gpuHookFormatsTrue)
     // ---- [WP-V-GPU] begin - CPU images framed on our own GPU ----------------------
     // A host that hands CPU images (VEGAS always does) still gets the view
     // framed on the GPU: upload, frame, pack, read back.  "Not mine" (no GPU
@@ -260,8 +342,10 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) noexc
     // [WP-V-GPU] end
 
     // ---- the CPU path -------------------------------------------------------------
+    // Written in the output's own depth and order; full levels, because the
+    // filter keeps whatever levels the host's source was in.
     std::shared_ptr<ThreadPool> pool = HostContext::instance().threadPoolShared();
-    if (!renderReframeCpu(setup, output, window, frame, pool.get())) {
+    if (!renderReframeCpu(setup, *outputView, window, frame, OutputLevels::Full, pool.get())) {
         return kOfxStatFailed;
     }
     return kOfxStatOK;
