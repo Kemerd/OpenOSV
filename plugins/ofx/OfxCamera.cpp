@@ -363,6 +363,33 @@ void describe(OfxParamSetHandle set) noexcept {
         OfxPropertySetHandle mirror =
             defineBool(set, kLensMirror, {"Lens (mirror)", nullptr, nullptr, false}, OSV_REFRAME_CAMERA_MODEL_DEFAULT != 0);
         setInt(mirror, kOfxParamPropSecret, 1);
+
+        // ---- VEGAS: the lens controls' first look, from the descriptor ----------
+        // VEGAS Pro crashes, inside VEGAS, when an effect writes parameter
+        // properties during kOfxActionCreateInstance (observed in VEGAS 17:
+        // the crash follows the "Create Instance" action in its plug-in log).
+        // So under VEGAS the instance never hides anything while it is being
+        // created (createInstance skips applyVisibility); the descriptor
+        // shows the default lens's controls and hides the other lens's, and
+        // InstanceChanged - where VEGAS takes the change - keeps them in step
+        // with the Lens popup.  Every other host keeps today's descriptor.
+        if (hostProfile() == HostProfile::Vegas) {
+            const bool dji = cameraModelFromCheckbox(OSV_REFRAME_CAMERA_MODEL_DEFAULT) == CameraModel::Dji;
+            const OfxParameterSuiteV1* ps = suites().param;
+            const auto hideAtStart = [set, ps](const char* name, bool hidden) noexcept {
+                OfxParamHandle handle = nullptr;
+                OfxPropertySetHandle props = nullptr;
+                if (ps && ps->paramGetHandle && ps->paramGetHandle(set, name, &handle, &props) == kOfxStatOK &&
+                    props) {
+                    setInt(props, kOfxParamPropSecret, hidden ? 1 : 0);
+                }
+            };
+            hideAtStart(kDjiFov, !dji);
+            hideAtStart(kCorrection, !dji);
+            hideAtStart(kZoom, !dji);
+            hideAtStart(kFov, dji);
+            hideAtStart(kDistortion, dji);
+        }
     } catch (...) {
         // defineChoice / resolutionItems allocate; an allocation failure
         // leaves a shorter parameter list, which read() survives (every read
@@ -489,6 +516,16 @@ void applyVisibility(OfxParamSetHandle set, OfxTime time) noexcept {
     setParamVisible(set, kFov, !dji);
     setParamVisible(set, kDistortion, !dji);
     setParamVisible(set, kLensMirror, false);
+}
+
+void applyVisibilityOnCreate(OfxParamSetHandle set) noexcept {
+    // VEGAS: nothing now.  describe() already hid the non-default lens's
+    // controls, and a parameter-property write during CreateInstance takes
+    // VEGAS Pro down (see describe()).
+    if (hostProfile() == HostProfile::Vegas) {
+        return;
+    }
+    applyVisibility(set, 0.0);
 }
 
 // ===========================================================================

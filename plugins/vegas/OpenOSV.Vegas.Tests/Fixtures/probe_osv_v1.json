@@ -1,0 +1,29 @@
+{
+  "_fixture": "osvtool probe --json - (schema openosv.probe/1) of the sample clip, trimmed to the stable flat keys and frame 0's timestamp; local paths removed",
+  "path": "example_footage_dlogm.OSV",
+  "schema": "openosv.probe/1",
+  "frameCount": 65,
+  "fps": {
+    "den": 1001,
+    "num": 60000,
+    "value": 59.94005994005994
+  },
+  "durationSeconds": 1.0844166666666666,
+  "streamW": 3000,
+  "streamH": 3000,
+  "mode": "K6",
+  "colorModeName": "DLogM",
+  "hasAudio": true,
+  "audio": {
+    "channels": 2,
+    "sampleCount": 52224,
+    "sampleRate": 48000
+  },
+  "isLrf": false,
+  "frames": [
+    {
+      "index": 0,
+      "timestampUs": 30669420766
+    }
+  ]
+}

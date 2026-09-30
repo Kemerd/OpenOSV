@@ -27,7 +27,9 @@ namespace osv::ofx {
 
 using osv::premiere::PluginLog;
 
-std::optional<std::string> chooseOsvFile(const std::string& startPath) noexcept {
+std::optional<std::string> chooseOsvFile(const std::string& startPath, void* /*ownerWindow*/) noexcept {
+    // The panel runs application-modal; a host window handle (a Windows
+    // concept) has no meaning here.
     @autoreleasepool {
         try {
             if (![NSThread isMainThread]) {

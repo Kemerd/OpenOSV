@@ -3096,6 +3096,233 @@ Result<bool> ImporterInstance::renderFrameOnGpu(std::uint32_t index, const Outpu
 }
 
 // ---------------------------------------------------------------------------
+//  [WP-V-GPU] The stitched frame, left on the GPU for a caller
+// ---------------------------------------------------------------------------
+
+Result<bool> ImporterInstance::renderFrameToDevice(std::uint32_t index, const OutputGeometry& geometry, bool draft,
+                                                   RenderPurpose purpose, int outputTransfer,
+                                                   const DeviceFrameConsumer& consume, std::string* whyNot) {
+    // "Not mine": the caller renders the frame its own way; the reason goes
+    // to its log.
+    const auto notMine = [whyNot](std::string reason) {
+        if (whyNot) {
+            *whyNot = std::move(reason);
+        }
+        return false;
+    };
+#if defined(OSV_HAVE_CUDA)
+    // The caller holds m_mutex (the header contract).
+    if (!m_parsed) {
+        return Error{ErrorCode::InvalidArgument, "renderFrameToDevice before the clip was opened"};
+    }
+    if (!geometry.valid() || geometry.view) {
+        return Error{ErrorCode::InvalidArgument, "renderFrameToDevice needs a non-empty equirect geometry"};
+    }
+    if (index >= m_frameCount) {
+        return Error{ErrorCode::InvalidArgument, "frame index " + std::to_string(index) + " beyond the clip"};
+    }
+    if (outputTransfer > OSV_TRANSFER_PASSTHROUGH) {
+        return Error{ErrorCode::InvalidArgument,
+                     "renderFrameToDevice: unknown output transfer " + std::to_string(outputTransfer)};
+    }
+    if (!consume) {
+        return Error{ErrorCode::InvalidArgument, "renderFrameToDevice without a consumer"};
+    }
+
+    // ---- the renderer: this path exists only for the CUDA backend -------------
+    // Asked for on every frame, exactly as renderFrame() asks, so a Source
+    // Settings change to CPU or OpenCL takes effect at once.
+    auto lease = HostContext::instance().acquireRenderer(toDevicePreference(m_prefs.device()));
+    if (!lease.ok()) {
+        return notMine("no renderer for the clip (" + lease.error().message + ")");
+    }
+    HostContext::RendererLease renderer = std::move(lease).value();
+    if (!renderer.renderer || !renderer.pool) {
+        return Error{ErrorCode::Internal, "HostContext returned an empty renderer lease"};
+    }
+    if (renderer.backend != "cuda") {
+        return notMine("the clip renders on the " + renderer.backend + " renderer");
+    }
+    auto* cuda = dynamic_cast<render::CudaRenderer*>(renderer.renderer.get());
+    if (!cuda) {
+        return notMine("the CUDA backend is not a CudaRenderer");
+    }
+    m_rendererName = renderer.backend;
+    // The same lazily built state renderFrame() makes sure of, and the GPU
+    // analyses a CUDA renderer switches on there too.
+    ensureGpuAnalyses();
+    if (!m_colorBuilt) {
+        rebuildColor();
+    }
+    if (!m_stabBuilt) {
+        rebuildStabilization();
+    }
+
+    // ---- the renderer's context, current for the whole frame ------------------
+    // The renderer's output buffer, the NVDEC frames and the consumer's work
+    // all live in the device's PRIMARY context.  Retained for the call (a
+    // reference count; the renderer's runtime keeps the context alive
+    // anyway) and pushed, so the caller's stack is restored on every return.
+    auto primary = retainPrimaryContext(cuda->deviceIndex());
+    if (!primary.ok()) {
+        return primary.error();
+    }
+    const std::shared_ptr<void> primaryRef = std::move(primary).value();
+    void* const context = primaryRef.get();
+    CudaContextScope scope(context);
+    if (!scope.ok()) {
+        return Error{ErrorCode::Gpu, "cannot make the renderer's primary context current"};
+    }
+
+    // ---- decode: NVDEC into VRAM, the importer frame path's decoder ----------
+    // One decoder per clip and context, shared with renderFrameToHost() (the
+    // same key, the same state machine): a clip NVDEC cannot serve is marked
+    // once and decodes on the host from then on.
+    const auto keepHostDecode = [this](const std::string& reason) {
+        m_gpuFrameState = GpuFrameState::Disabled;
+        PluginLog::info("video: '{}' GPU frames decode on the host and upload ({})", m_path.filename().string(),
+                        reason);
+    };
+    if (m_gpuFrameState == GpuFrameState::Untried) {
+        if (importerGpuDecodeDisabledByEnvironment()) {
+            keepHostDecode("OPENOSV_IMPORTER_NO_GPU_DECODE is set");
+        } else if (m_hwDecodeFailed) {
+            keepHostDecode("hardware decoding already failed on this clip");
+        }
+    }
+    video::GpuFrameLease frame;
+    bool onGpu = false;
+    if (m_gpuFrameState != GpuFrameState::Disabled) {
+        auto decoder = m_gpuDecoders.find(context);
+        if (decoder == m_gpuDecoders.end() || !decoder->second) {
+            video::GpuDecoderOptions options;
+            // No context supplied: the decoder retains the device's primary
+            // context itself - `context` - so its planes are read by the
+            // stitch kernel in place.
+            options.cuContext = nullptr;
+            options.cudaDevice = cuda->deviceIndex();
+            bool warm = false;
+            const auto t0 = std::chrono::steady_clock::now();
+            auto opened = takeOrOpenGpuDecoder(options, context, warm);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (!opened.ok()) {
+                // A stream NVDEC does not take (the LRF proxy, 8-bit), no
+                // NVIDIA decoder: one attempt per clip, as renderFrameToHost.
+                keepHostDecode("NVDEC decoder unavailable: " + opened.error().message);
+            } else if (!opened.value() || opened.value()->cuContext() != context) {
+                keepHostDecode("the NVDEC decoder did not open in the renderer's context");
+            } else {
+                PluginLog::info("video: '{}' GPU frames decode on NVDEC into VRAM ({} decoder in {:.0f} ms)",
+                                m_path.filename().string(), warm ? "warm" : "new", ms);
+                m_gpuFrameContext = context;
+                decoder = m_gpuDecoders.insert_or_assign(context, std::move(opened).value()).first;
+            }
+        }
+        if (m_gpuFrameState != GpuFrameState::Disabled && decoder != m_gpuDecoders.end() && decoder->second) {
+            auto acquired = decoder->second->acquire(index);
+            if (!acquired.ok()) {
+                return countDeviceFrameFailure(acquired.error());
+            }
+            frame = std::move(acquired).value();
+            if (!frame.valid() || !frame.pair().onDevice()) {
+                return countDeviceFrameFailure(Error{ErrorCode::Decoder, "the decoder returned no device frame"});
+            }
+            if (frame.pair().device[0].deviceIndex != cuda->deviceIndex()) {
+                return Error{ErrorCode::Internal, "the decoded frame lives on another device than the renderer"};
+            }
+            onGpu = true;
+        }
+    }
+
+    // ---- or on the host, uploaded by the renderer ---------------------------------
+    video::FramePair hostPair;
+    if (!onGpu) {
+        const Status readerStatus = ensureReader();
+        if (!readerStatus.ok()) {
+            return readerStatus.error();
+        }
+        auto read = readPair(index);
+        if (!read.ok()) {
+            return read.error();
+        }
+        hostPair = std::move(read).value();
+    }
+    const video::FramePair& pair = onGpu ? frame.pair() : hostPair;
+
+    // ---- the job: renderFrame()'s own assembly -----------------------------------
+    AnalysisOutcome analyses;
+    auto built = buildEquirectJob(index, pair, geometry, draft, purpose, *renderer.pool, analyses, outputTransfer);
+    if (!built.ok()) {
+        return onGpu ? countDeviceFrameFailure(built.error()) : Result<bool>(built.error());
+    }
+    render::RenderJob job = std::move(built).value();
+
+    // ---- stitch, and hand the frame over while it is in VRAM ---------------------
+    {
+        // The renderer's output buffer is shared by every clip: it stays ours
+        // until the consumer has read it.
+        std::lock_guard<std::mutex> outputLock(cudaRendererOutputMutex());
+        std::size_t pitch = 0;
+        auto device = cuda->renderToDevice(job, &pitch);
+        // renderToDevice synchronised its stream: the lenses have been read.
+        // The job's copy of the pair shares the NVDEC slot's pin, so it is
+        // emptied too - releasing only the lease would not unpin.
+        job = render::RenderJob{};
+        frame.release();
+        hostPair = video::FramePair{};
+        if (!device.ok()) {
+            return onGpu ? countDeviceFrameFailure(device.error()) : Result<bool>(device.error());
+        }
+        DeviceFrame out;
+        out.data = device.value();
+        out.pitchBytes = pitch;
+        out.width = static_cast<std::uint32_t>(geometry.width);
+        out.height = static_cast<std::uint32_t>(geometry.height);
+        out.deviceIndex = cuda->deviceIndex();
+        out.cuContext = context;
+        out.exact = analyses.exact;
+        out.decodedOnGpu = onGpu;
+        const Status consumed = consume(out);
+        if (!consumed.ok()) {
+            // The caller's own GPU work failed, not the decode or the stitch:
+            // no strike against NVDEC.
+            return consumed.error();
+        }
+    }
+    if (onGpu) {
+        m_gpuFrameFailures = 0;
+        m_gpuFrameState = GpuFrameState::Active;
+    }
+    return true;
+#else
+    (void)index;
+    (void)geometry;
+    (void)draft;
+    (void)purpose;
+    (void)outputTransfer;
+    (void)consume;
+    return notMine("this build has no CUDA renderer");
+#endif
+}
+
+Result<bool> ImporterInstance::countDeviceFrameFailure(const Error& error) {
+    // A failure of the NVDEC path on a clip it had accepted: a driver hiccup,
+    // a lost device, VRAM pressure.  This frame fails (the caller renders it
+    // its own way); three in a row move the clip to host decoding for good,
+    // and its VRAM goes back - exactly renderFrameToHost()'s rule.
+    ++m_gpuFrameFailures;
+    PluginLog::warn("video: NVDEC frame failed on '{}' ({}){}", m_path.filename().string(), error.message,
+                    m_gpuFrameFailures >= 3 ? " - three in a row, so this clip decodes on the host from now on" : "");
+    if (m_gpuFrameFailures >= 3) {
+        m_gpuFrameState = GpuFrameState::Disabled;
+        if (m_gpuFrameContext) {
+            m_gpuDecoders.erase(m_gpuFrameContext);
+        }
+    }
+    return error;
+}
+
+// ---------------------------------------------------------------------------
 //  Analysis text (File > Properties)
 // ---------------------------------------------------------------------------
 

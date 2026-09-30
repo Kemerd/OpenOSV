@@ -105,6 +105,13 @@ void describe(OfxParamSetHandle set) noexcept;
 /// effect's controlVisible() table), and keep the hidden mirror hidden.
 void applyVisibility(OfxParamSetHandle set, OfxTime time) noexcept;
 
+/// kOfxActionCreateInstance's share of applyVisibility().  Under VEGAS it
+/// writes nothing: VEGAS Pro crashes when an effect writes parameter
+/// properties while the instance is being created, so there the descriptor
+/// carries the first look (describe()) and InstanceChanged the rest.  Every
+/// other host gets applyVisibility() at time 0, as before.
+void applyVisibilityOnCreate(OfxParamSetHandle set) noexcept;
+
 /// kOfxActionInstanceChanged for a USER edit of `name` at `time`.  Returns
 /// true when `name` is a camera control (handled or deliberately ignored),
 /// false when it belongs to someone else.  `project` is projectSize().

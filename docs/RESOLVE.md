@@ -66,9 +66,11 @@ scripts/install_ofx.sh             # into /Library/OFX/Plugins
 ```
 
 `-Uninstall` / `--uninstall` removes it again. The bundle is self-contained.
-On Windows, its FFmpeg, OpenCL, fmt and spdlog DLLs sit next to
-`OpenOSV.ofx`, and the module loads them from there, never from Resolve's own
-folder. On a Mac, FFmpeg is embedded in `Contents/Frameworks` under
+On Windows, its FFmpeg, OpenCL, fmt and spdlog DLLs sit in
+`Contents\Libraries\Win64` (with `osvtool.exe`), beside `Contents\Win64`
+where `OpenOSV.ofx` lives alone, and the module loads them from there, never
+from Resolve's own folder. The split is for VEGAS Pro, whose plug-in scan
+loads every DLL it finds under `Contents\Win64`. On a Mac, FFmpeg is embedded in `Contents/Frameworks` under
 OpenOSV-prefixed names, and the installer clears the download quarantine and
 signs the bundle ad hoc. To install by hand, copy the whole
 `OpenOSV.ofx.bundle` folder from `<build>/plugins/ofx/` into the OpenFX
@@ -131,12 +133,16 @@ same defaults and meanings. The one exception is **Sphere Size** (Premiere's
 
 ### Audio
 
-A generator has no audio. Take the clip's AAC track out with the command-line
-tool and put it under the generator:
+A generator has no audio. Take the clip's track out with the command-line
+tool and put it under the generator. A `.wav` is decoded with the encoder's
+priming removed, so it starts exactly on the generator's first frame, as the
+audio does in Premiere:
 
 ```powershell
+osvtool extract CAM_0001.OSV --audio CAM_0001.wav
+# Or the camera's AAC track as it is; if your Resolve refuses a raw .aac,
+# remux it (no re-encode):
 osvtool extract CAM_0001.OSV --audio CAM_0001.aac
-# If your Resolve refuses a raw .aac, remux it (no re-encode):
 ffmpeg -i CAM_0001.aac -c copy CAM_0001.m4a
 ```
 

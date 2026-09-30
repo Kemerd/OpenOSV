@@ -23,7 +23,10 @@ inline constexpr const char* kPluginId = "org.openosv.Open360Reframe";
 /// version as a different plug-in, so it only moves if a project saved with
 /// the old one could no longer load.
 inline constexpr unsigned kVersionMajor = 1;
-inline constexpr unsigned kVersionMinor = 0;
+/// Minor 1: VEGAS Pro support (byte / BGRA images, the own-GPU path).  A new
+/// minor version makes hosts that cache descriptors
+/// (VEGAS keeps them per user) describe the plug-in again.
+inline constexpr unsigned kVersionMinor = 1;
 
 /// The OfxPlugin::mainEntry of the filter.  Never throws.
 OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySetHandle inArgs,

@@ -1,0 +1,25 @@
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  Copyright 2026 The OpenOSV Contributors
+
+  OpenOSV.Vegas.Tests - a console test runner for OpenOSV.Vegas.Core.
+
+  No test framework package on purpose (the build uses no NuGet): a small
+  [Test] attribute, an assertion helper and a runner that exits non-zero when
+  anything fails, which is all ctest needs.  Runs without VEGAS.
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>OpenOSV.Vegas.Tests</RootNamespace>
+    <AssemblyName>OpenOSV.Vegas.Tests</AssemblyName>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\OpenOSV.Vegas.Core\OpenOSV.Vegas.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Real osvtool probe output of the sample clip (trimmed, serial removed). -->
+    <None Include="Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" LinkBase="Fixtures" />
+  </ItemGroup>
+</Project>

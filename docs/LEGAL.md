@@ -26,7 +26,8 @@
 
 DJI, Osmo and Osmo 360 are trademarks of SZ DJI Technology Co., Ltd. Adobe,
 Premiere Pro and After Effects are trademarks of Adobe Inc. DaVinci Resolve
-is a trademark of Blackmagic Design Pty. Ltd. NVIDIA and CUDA are trademarks
+is a trademark of Blackmagic Design Pty. Ltd. VEGAS and VEGAS Pro are trademarks
+of their respective owners. NVIDIA and CUDA are trademarks
 of NVIDIA Corporation. Apple, macOS and Metal are trademarks of Apple Inc.
 Windows is a trademark of Microsoft Corporation. OpenCL is a trademark of
 Apple Inc. used by permission by Khronos. All other names belong to their
@@ -40,7 +41,8 @@ do not mean DJI made, supplied or approved it.
 ## 2. No affiliation or endorsement
 
 OpenOSV is not affiliated with, endorsed by, sponsored by or supported by
-SZ DJI Technology Co., Ltd., Adobe Inc., Blackmagic Design Pty. Ltd. or NVIDIA
+SZ DJI Technology Co., Ltd., Adobe Inc., Blackmagic Design Pty. Ltd., the owners of
+VEGAS and VEGAS Pro, or NVIDIA
 Corporation. Report problems with OpenOSV to OpenOSV, not to them.
 
 ## 3. Purpose: interoperability

@@ -2,12 +2,29 @@
 // Copyright 2026 The OpenOSV Contributors
 //
 // OfxSource.cpp - the OpenOSV Source generator (OfxSource.h).
+//
+// One generator, two hosts:
+//
+//   * DaVinci Resolve (and any host but VEGAS): a 32-bit float RGBA output,
+//     stated in the clip preferences, at full levels; instance-safe renders;
+//     the "Choose .OSV File..." button, because Resolve's file field has no
+//     Browse button - exactly as before VEGAS support existed;
+//   * VEGAS Pro: an 8-bit or float output in R G B A or B G R A, in the depth
+//     VEGAS picks for the project (the clip preferences leave it alone), at
+//     the levels the VEGAS-only Output Levels control names; unsafe renders,
+//     because VEGAS clones any safer plug-in once per render thread and every
+//     clone would open its own decoder; and no Choose button, because VEGAS
+//     gives the file field a Browse button of its own.
+//
+// Every difference keys on hostProfile() (OfxHost.h) and on nothing else.
 
 #include "OfxSource.h"
 
 #include "OfxCamera.h"
 #include "OfxCuda.h"
 #include "OfxFileDialog.h"
+#include "OfxGpuView.h"
+#include "OfxHostImage.h"
 #include "OfxRender.h"
 #include "OfxSourceParams.h"
 
@@ -263,12 +280,22 @@ OfxStatus describe(OfxImageEffectHandle effect) noexcept {
     setString(props, kOfxPropPluginDescription,
               "A DJI Osmo 360 .OSV clip, stitched by OpenOSV: the full sphere, or a keyframable reframed view "
               "straight from the camera's own sphere.");
+    const HostProfile profile = hostProfile();
     setString(props, kOfxImageEffectPropSupportedContexts, kOfxImageEffectContextGenerator, 0);
-    setString(props, kOfxImageEffectPropSupportedPixelDepths, kOfxBitDepthFloat, 0);
+    // Float only outside VEGAS; 8-bit and float, R G B A and B G R A in
+    // VEGAS (declarePixelDepths() in OfxHost.cpp has the reasons).
+    declarePixelDepths(props, profile);
     setInt(props, kOfxImageEffectPluginPropSingleInstance, 0);
     // One render at a time per instance: the engine behind an instance is
     // serialised anyway (one lock per clip), and its frame cache is too.
-    setString(props, kOfxImageEffectPluginRenderThreadSafety, kOfxImageEffectRenderInstanceSafe);
+    //
+    // VEGAS clones an instance- or fully-safe plug-in once per render
+    // thread, and a clone of this one would open its own decoder and engine
+    // for the same clip - several copies of the heaviest object in the
+    // module, each re-measuring the clip's analyses.  Unsafe keeps VEGAS on
+    // the one instance, whose engine already renders one frame at a time.
+    setString(props, kOfxImageEffectPluginRenderThreadSafety,
+              profile == HostProfile::Vegas ? kOfxImageEffectRenderUnsafe : kOfxImageEffectRenderInstanceSafe);
     setInt(props, kOfxImageEffectPluginPropHostFrameThreading, 0);
     setInt(props, kOfxImageEffectPropSupportsMultiResolution, 1);
     setInt(props, kOfxImageEffectPropSupportsTiles, 0);
@@ -295,12 +322,16 @@ OfxStatus describeInContext(OfxImageEffectHandle effect) noexcept {
     if (!params) {
         return kOfxStatErrBadHandle;
     }
+    const HostProfile profile = hostProfile();
 
     // ---- the clip ------------------------------------------------------------
-    defineString(params, kFile,
-                 {"OSV File", "The .OSV (or its .LRF proxy) to stitch. Paste a path, or use Choose .OSV File.",
-                  nullptr, false},
-                 kOfxParamStringIsFilePath, "");
+    // The hint names the file picker the host really shows: our Choose
+    // button, or - under VEGAS, where ours is hidden - VEGAS's own Browse
+    // button on the file field.
+    const char* fileHint = profile == HostProfile::Vegas
+                               ? "The .OSV (or its .LRF proxy) to stitch. Paste a path, or use Browse."
+                               : "The .OSV (or its .LRF proxy) to stitch. Paste a path, or use Choose .OSV File.";
+    defineString(params, kFile, {"OSV File", fileHint, nullptr, false}, kOfxParamStringIsFilePath, "");
     OfxPropertySetHandle button = nullptr;
     const OfxParameterSuiteV1* ps = suites().param;
     if (ps && ps->paramDefine &&
@@ -308,6 +339,12 @@ OfxStatus describeInContext(OfxImageEffectHandle effect) noexcept {
         setString(button, kOfxPropLabel, "Choose .OSV File...");
         setString(button, kOfxParamPropHint, "Opens the Windows file browser.");
         setString(button, kOfxParamPropScriptName, kChooseFile);
+        // VEGAS gives the file field a Browse button of its own, so ours
+        // would be a second button doing the same thing: defined (projects
+        // and scripts may name it) but hidden.
+        if (profile == HostProfile::Vegas) {
+            setInt(button, kOfxParamPropSecret, 1);
+        }
     }
     defineString(params, kClipInfo,
                  {"Clip", "The chosen clip's length and format. Trim the generator to this length.", nullptr, false},
@@ -323,9 +360,9 @@ OfxStatus describeInContext(OfxImageEffectHandle effect) noexcept {
                nullptr, false},
               0, 0, 10000000);
 
-    // ---- the camera, then the stitch ----------------------------------------
+    // ---- the camera, then the stitch (and, in VEGAS, the output levels) ------
     camera::describe(params);
-    source_params::describe(params);
+    source_params::describe(params, profile);
     return kOfxStatOK;
 }
 
@@ -346,7 +383,7 @@ OfxStatus createInstance(OfxImageEffectHandle effect) noexcept {
         delete inst;
         return kOfxStatFailed;
     }
-    camera::applyVisibility(effectParams(effect), 0.0);
+    camera::applyVisibilityOnCreate(effectParams(effect));
     // The Clip read-out is NOT refreshed here: OpenFX allows parameter writes
     // only from kOfxActionInstanceChanged (and interacts), and a reopened
     // project restores the read-out's saved text with everything else.
@@ -366,6 +403,8 @@ OfxStatus destroyInstance(OfxImageEffectHandle effect) noexcept {
 }
 
 OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
+    // Only parameters: VEGAS also reports its clip "Output" changing, which
+    // is nothing this generator supervises.
     if (getString(inArgs, kOfxPropType) != kOfxTypeParameter) {
         return kOfxStatReplyDefault;
     }
@@ -385,7 +424,10 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
     }
     if (name == kChooseFile) {
         const std::string current = stringAt(params, kFile, time);
-        if (const std::optional<std::string> chosen = chooseOsvFile(current)) {
+        // VEGAS names its main window; the dialog then belongs to it.  Other
+        // hosts leave the property unset and the active window owns it.
+        void* owner = getPointer(hostProperties(), kPropVegasHostHWnd);
+        if (const std::optional<std::string> chosen = chooseOsvFile(current, owner)) {
             EditGroup group(params, "Choose .OSV File");
             writeString(params, kFile, chosen->c_str());
             // Some hosts do not report our own write back as a change, so
@@ -404,38 +446,30 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
 //  Render
 // ===========================================================================
 
-/// Copy the rows of a top-down RGBA float equirect `image` (exactly the
-/// camera frame's size) into the OpenFX output over `window`.
-void copyEquirect(const render::ImageRGBAf& image, const ClipImage& output, const OfxRectI& window,
-                  const OfxRectI& frame, ThreadPool* pool) {
-    const OfxRectI area = intersect(intersect(window, output.bounds), frame);
-    // Output pixels outside the frame (a window wider than the RoD) are
-    // transparent black.
-    clearCpu(output, window);
-    if (empty(area)) {
-        return;
+/// A double pair property of `set` as "[a, b]", or "absent".
+[[nodiscard]] std::string rangeText(OfxPropertySetHandle set, const char* name) {
+    double values[2] = {0.0, 0.0};
+    if (!getDoubles(set, name, values, 2)) {
+        return "absent";
     }
-    const std::size_t bytes = static_cast<std::size_t>(area.x2 - area.x1) * 16u;
-    const auto copyRow = [&](std::size_t index) noexcept {
-        const int y = area.y1 + static_cast<int>(index);
-        const std::uint32_t imageRow = static_cast<std::uint32_t>(frame.y2 - 1 - y);
-        const float* src = image.row(imageRow);
-        if (!src) {
-            return;
-        }
-        char* dst = static_cast<char*>(output.data) +
-                    static_cast<std::ptrdiff_t>(y - output.bounds.y1) * static_cast<std::ptrdiff_t>(output.rowBytes) +
-                    static_cast<std::ptrdiff_t>(area.x1 - output.bounds.x1) * 16;
-        std::memcpy(dst, src + static_cast<std::ptrdiff_t>(area.x1 - frame.x1) * 4, bytes);
-    };
-    const std::size_t rows = static_cast<std::size_t>(area.y2 - area.y1);
-    if (pool) {
-        (void)pool->parallelRows(rows, 8, copyRow);
-        return;
+    return std::format("[{}, {}]", values[0], values[1]);
+}
+
+/// A double property of `set` as text, or "absent".
+[[nodiscard]] std::string doubleText(OfxPropertySetHandle set, const char* name) {
+    double value = 0.0;
+    if (!getDoubles(set, name, &value, 1)) {
+        return "absent";
     }
-    for (std::size_t r = 0; r < rows; ++r) {
-        copyRow(r);
+    return std::format("{}", value);
+}
+
+/// A string property of `set`, quoted, or "absent".
+[[nodiscard]] std::string stringText(OfxPropertySetHandle set, const char* name) {
+    if (dimension(set, name) < 1) {
+        return "absent";
     }
+    return "'" + getString(set, name) + "'";
 }
 
 OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
@@ -455,26 +489,43 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     renderScale(inArgs, sx, sy);
 
     // ---- the output image -------------------------------------------------------
+    const HostProfile profile = hostProfile();
     OfxImageClipHandle outputClip = clipHandle(effect, kOfxImageEffectOutputClipName);
     ClipImage output(outputClip, time);
     if (!output.valid()) {
         return kOfxStatFailed;
     }
-    if (!output.isFloatRgba(true)) {
-        // The pitch and bounds too: they tell a mislabelled float RGBA image
-        // apart from a genuinely different format.
+    // Lenient: a generator's output may arrive unlabelled (Resolve), and the
+    // host's own pitch then proves the format.
+    const std::optional<HostImageView> outputView = output.view(profile, true);
+    if (!outputView) {
+        // The pitch and bounds too: they tell a mislabelled image apart from
+        // a genuinely different format.
         PluginLog::oncef("ofx/source/format", PluginLog::Level::Error,
-                         "ofx source: output image is '{}' '{}' ({}x{}, {} bytes per row{}) - only 32-bit float "
-                         "RGBA is supported",
-                         output.depth, output.components, output.width(), output.height(), output.rowBytes,
-                         output.rowBytesFromHost ? "" : ", pitch not reported");
+                         "ofx source: output image is '{}' '{}'{} ({}x{}, {} bytes per row{}) - only {} is supported",
+                         output.depth, output.components, output.order.empty() ? "" : " '" + output.order + "'",
+                         output.width(), output.height(), output.rowBytes,
+                         output.rowBytesFromHost ? "" : ", pitch not reported", acceptedFormats(profile));
         return kOfxStatErrImageFormat;
     }
+    // The levels every pixel of this render is packed in: always full range
+    // outside VEGAS; the Output Levels control in VEGAS.
+    const OutputLevels levels = source_params::outputLevelsAt(params, time, profile);
     OfxPropertySetHandle effectPropSet = effectProps(effect);
     const double par = getDouble(effectPropSet, kOfxImageEffectPropProjectPixelAspectRatio, 0, 1.0);
     const OfxRectI frame = cameraFrame(outputClip, time, sx, sy, par, output.bounds);
     const int frameW = frame.x2 - frame.x1;
     const int frameH = frame.y2 - frame.y1;
+
+    // Where the GPU path (OfxGpuView.h) writes when it takes the frame: the
+    // host's output image as it really is - its depth and channel order -
+    // the render window, the camera frame and the levels the output is
+    // packed in.
+    gpu::HostTarget gpuTarget;
+    gpuTarget.image = *outputView;
+    gpuTarget.window = window;
+    gpuTarget.frame = frame;
+    gpuTarget.levels = levels;
 
     // ---- the clip ---------------------------------------------------------------
     const std::string pathText = cleanPath(stringAt(params, kFile, time));
@@ -482,7 +533,7 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     std::string problem;
     std::shared_ptr<ImporterInstance> clip = clipFor(*inst, pathText, prefs, problem);
     if (!clip) {
-        clearCpu(output, window);
+        clearCpu(*outputView, window, levels);
         if (!pathText.empty()) {
             reportOnce(effect, *inst, problem);
         }
@@ -510,16 +561,25 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
             // first render of every instance records it, so a wrong mapping
             // can be diagnosed from the log alone.
             inst->loggedTiming = true;
+            // Besides the timing: the output's format and levels, and what
+            // the host says about the generator's extent - the unmapped
+            // range, the effect's duration and, in VEGAS, where the instance
+            // lives.  VEGAS documents its generator timing no better than
+            // Resolve does.
             PluginLog::info("ofx source: first render of '{}': host '{}', time {}, output range {} [{}, {}], "
-                            "host fps {}, clip fps {:.3f}, start frame {} -> clip frame {} of {}; frame {}x{}, "
-                            "render scale {}x{}",
+                            "unmapped range {}, effect duration {}, host fps {}, clip fps {:.3f}, start frame {} -> "
+                            "clip frame {} of {}; frame {}x{}, render scale {}x{}; output {} {} at {} levels; "
+                            "VEGAS context {}",
                             clip->path().filename().string(), hostName(), time, haveRange ? "known" : "unknown",
-                            range[0], range[1], hostFps, clip->fps(), startFrame, index, clip->frameCount(), frameW,
-                            frameH, sx, sy);
+                            range[0], range[1], rangeText(outputProps, kOfxImageEffectPropUnmappedFrameRange),
+                            doubleText(effectPropSet, kOfxImageEffectInstancePropEffectDuration), hostFps,
+                            clip->fps(), startFrame, index, clip->frameCount(), frameW, frameH, sx, sy,
+                            hostDepthName(outputView->depth), hostOrderName(outputView->order),
+                            outputLevelsName(levels), stringText(effectPropSet, kPropVegasContext));
         }
     }
     if (index < 0 || index >= static_cast<long long>(clip->frameCount())) {
-        clearCpu(output, window);  // before or past the clip: nothing to show
+        clearCpu(*outputView, window, levels);  // before or past the clip: nothing to show
         return kOfxStatOK;
     }
 
@@ -540,29 +600,74 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
 
     if (mode == kOutputEquirect) {
         // ---- the whole sphere, straight at the frame's size -----------------
+        // [WP-V-GPU] begin - stitched and packed on the GPU; only the finished
+        // pixels cross the bus.  "Not mine" (no GPU path) falls through to
+        // the CPU copy below, as does a GPU failure, logged once.
+        {
+            std::string gpuError;
+            if (gpu::renderSourceEquirectGpu(*clip, static_cast<std::uint32_t>(index), draft, purpose, gpuTarget,
+                                             gpuError)) {
+                gpu::notePath(effect, gpu::Hook::SourceEquirect, true, gpuError);
+                return kOfxStatOK;
+            }
+            // Once per instance: which path took its first frame, and why.
+            gpu::notePath(effect, gpu::Hook::SourceEquirect, false, gpuError);
+            if (!gpuError.empty()) {
+                PluginLog::oncef("ofx/source/gpu-equirect", PluginLog::Level::Warn,
+                                 "ofx source: GPU sphere path failed, using the CPU copy: {}", gpuError);
+            }
+        }
+        // [WP-V-GPU] end
         const OutputGeometry geometry{frameW, frameH};
         auto rendered = clip->renderFrame(static_cast<std::uint32_t>(index), geometry, draft, purpose);
         if (!rendered.ok() || !rendered.value()) {
             reportOnce(effect, *inst, "OpenOSV Source could not stitch frame " + std::to_string(index) + ": " +
                                           (rendered.ok() ? std::string("no image") : rendered.error().message));
-            clearCpu(output, window);
+            clearCpu(*outputView, window, levels);
             return kOfxStatFailed;
         }
-        copyEquirect(*rendered.value(), output, window, frame, pool.get());
+        // The stitch is already at the frame's size: one copy into the
+        // host's format and levels.
+        if (!copyStitchedFrame(*rendered.value(), *outputView, window, frame, levels, pool.get())) {
+            PluginLog::oncef("ofx/source/copy", PluginLog::Level::Error,
+                             "ofx source: the stitched {}x{} frame does not fit a {}x{} frame", rendered.value()->w,
+                             rendered.value()->h, frameW, frameH);
+            clearCpu(*outputView, window, levels);
+            return kOfxStatFailed;
+        }
         return kOfxStatOK;
     }
 
     // ---- a camera into the native sphere ------------------------------------
     const OutputGeometry sphere = clip->geometryForLocked(prefs);
     if (!sphere.valid()) {
-        clearCpu(output, window);
+        clearCpu(*outputView, window, levels);
         return kOfxStatFailed;
     }
+    // [WP-V-GPU] begin - the sphere stays in VRAM, the camera frames it on
+    // the GPU, and only the view is read back.  "Not mine" (no GPU path)
+    // falls through to the CPU framing below, as does a GPU failure, logged
+    // once.
+    {
+        std::string gpuError;
+        if (gpu::renderSourceViewGpu(*clip, static_cast<std::uint32_t>(index), sphere, draft, purpose,
+                                     camera::read(params, time), camera::projectSize(effect), gpuTarget, gpuError)) {
+            gpu::notePath(effect, gpu::Hook::SourceView, true, gpuError);
+            return kOfxStatOK;
+        }
+        // Once per instance: which path took its first frame, and why.
+        gpu::notePath(effect, gpu::Hook::SourceView, false, gpuError);
+        if (!gpuError.empty()) {
+            PluginLog::oncef("ofx/source/gpu-view", PluginLog::Level::Warn,
+                             "ofx source: GPU view path failed, framing on the CPU: {}", gpuError);
+        }
+    }
+    // [WP-V-GPU] end
     auto rendered = clip->renderFrame(static_cast<std::uint32_t>(index), sphere, draft, purpose);
     if (!rendered.ok() || !rendered.value()) {
         reportOnce(effect, *inst, "OpenOSV Source could not stitch frame " + std::to_string(index) + ": " +
                                       (rendered.ok() ? std::string("no image") : rendered.error().message));
-        clearCpu(output, window);
+        clearCpu(*outputView, window, levels);
         return kOfxStatFailed;
     }
     const render::ImageRGBAf& image = *rendered.value();
@@ -580,11 +685,12 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     if (!setup.valid) {
         PluginLog::oncef("ofx/source/setup", PluginLog::Level::Warn, "ofx source: no camera for a {}x{} frame ({})",
                          frameW, frameH, reframe::setupRejectName(setup.reject));
-        clearCpu(output, window);
+        clearCpu(*outputView, window, levels);
         return kOfxStatFailed;
     }
     setup.source.isBgra = 0;  // the engine's image is R, G, B, A
-    if (!renderReframeCpu(setup, output, window, frame, pool.get())) {
+    // Framed straight into the host's format, packed in the output levels.
+    if (!renderReframeCpu(setup, *outputView, window, frame, levels, pool.get())) {
         return kOfxStatFailed;
     }
     return kOfxStatOK;
@@ -631,7 +737,13 @@ OfxStatus mainEntry(const char* action, const void* handle, OfxPropertySetHandle
             // labelled OfxImageComponentNone.  The property names are the
             // specification's "<property>_<clip name>" form.
             setString(outArgs, "OfxImageClipPropComponents_" kOfxImageEffectOutputClipName, kOfxImageComponentRGBA);
-            setString(outArgs, "OfxImageClipPropDepth_" kOfxImageEffectOutputClipName, kOfxBitDepthFloat);
+            // The depth, though, is VEGAS's to choose: it follows the
+            // project (8-bit or 32-bit float), the generator writes either,
+            // and a forced float would make an 8-bit project convert every
+            // frame.  Only other hosts are told float.
+            if (hostProfile() != HostProfile::Vegas) {
+                setString(outArgs, "OfxImageClipPropDepth_" kOfxImageEffectOutputClipName, kOfxBitDepthFloat);
+            }
             // Every frame differs (it is a movie), and the picture carries
             // straight coverage alpha - the importer's own declaration.
             setInt(outArgs, kOfxImageEffectFrameVarying, 1);

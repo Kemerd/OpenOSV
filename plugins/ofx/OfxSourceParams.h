@@ -20,16 +20,25 @@
 //
 // Item lists, ranges and defaults come from SourceSettingsParams.h.  The one
 // default that differs is Colour Output (see kColorOutputDefault0).
+//
+// One control exists in VEGAS Pro only: Output Levels (kOutputLevels).  It
+// is not a stitch setting - it never reaches the PrefsBlob - but the levels
+// the finished pixels are packed in, because VEGAS never level-converts a
+// generator's output and its "video levels" projects expect studio RGB.
+// Under Resolve and every other host it is not defined at all, so their
+// parameter list is exactly what it always was.
 #pragma once
 
 #include "OfxHost.h"
+#include "OfxHostImage.h"
 
 #include "SourceSettingsMapping.h"
 
 namespace osv::ofx::source_params {
 
 // ---------------------------------------------------------------------------
-//  Parameter names (permanent: Resolve stores them in its projects)
+//  Parameter names (permanent: Resolve and VEGAS store them in their projects,
+//  and the VEGAS extension sets them by name)
 // ---------------------------------------------------------------------------
 inline constexpr const char* kColourGroup = "colourGroup";
 inline constexpr const char* kColorOutput = "colorOutput";
@@ -61,7 +70,21 @@ inline constexpr const char* kExposure = "exposure";
 inline constexpr const char* kRenderDevice = "renderDevice";
 inline constexpr const char* kSphereSize = "sphereSize";
 
-/// Every parameter describe() defines, in definition order (for the tests).
+/// VEGAS only: "Output Levels", the levels the generator packs its RGB in
+/// (OutputLevels in OfxHostImage.h).  Defined right after Colour Output,
+/// in the Colour group, and ONLY under a VEGAS host - which is why it is not
+/// in kAllParams, the list every host shares.
+inline constexpr const char* kOutputLevels = "outputLevels";
+/// Output Levels items, 0-based in OutputLevels order (Full = 0, Studio = 1).
+inline constexpr const char* kOutputLevelsItems = "Full range (0-255)|Studio RGB (16-235)";
+/// Output Levels default, 0-based: Studio RGB, what VEGAS's 8-bit (and
+/// 32-bit video levels) projects - its defaults - work in.
+inline constexpr int kOutputLevelsDefault0 = static_cast<int>(OutputLevels::Studio);
+static_assert(static_cast<int>(OutputLevels::Full) == 0 && static_cast<int>(OutputLevels::Studio) == 1,
+              "Output Levels' items are numbered in OutputLevels order");
+
+/// Every parameter describe() defines under EVERY host, in definition order
+/// (for the tests).  kOutputLevels, VEGAS only, is not among them.
 inline constexpr const char* kAllParams[] = {
     kColourGroup,   kColorOutput,   kHdrTone /* [WP-HDRTONE] */, kLook, kHdrPeak, kStabilization, kStitchGroup,
     kSeamSearch,    kGainMatch,     kCalibration,  kFlareRemoval,    kSkySeamFix,    kSkySeamStrength,
@@ -83,14 +106,21 @@ inline constexpr int kColorOutputDefault0 = 2;
 static_assert(kColorOutputDefault0 >= 0 && kColorOutputDefault0 < OSV_SS_COLOR_COUNT,
               "the Colour Output default must be an item of the list");
 
-/// Define every control on `set`.
-void describe(OfxParamSetHandle set) noexcept;
+/// Define every control on `set` for a host of `profile`: the shared list,
+/// plus Output Levels right after Colour Output under VEGAS.
+void describe(OfxParamSetHandle set, HostProfile profile) noexcept;
 
 /// The controls at `time`, as the Source Settings effect's ControlValues
 /// (1-BASED popup values, which is what prefsFromControls() expects).
 [[nodiscard]] premiere::sourcesettings::ControlValues read(OfxParamSetHandle set, OfxTime time) noexcept;
 
-/// True when `name` is one of these controls.
+/// The levels the generator packs its output in at `time`.  Full outside
+/// VEGAS, always (no control exists there, and Resolve's output never
+/// changes); under VEGAS the Output Levels control, with its default
+/// (Studio) when the host cannot answer or answers with an unknown item.
+[[nodiscard]] OutputLevels outputLevelsAt(OfxParamSetHandle set, OfxTime time, HostProfile profile) noexcept;
+
+/// True when `name` is one of these controls (Output Levels included).
 [[nodiscard]] bool owns(const char* name) noexcept;
 
 }  // namespace osv::ofx::source_params

@@ -6,8 +6,8 @@
 // ===========================================================================
 //  What it is for
 // ===========================================================================
-// Nobody on the project runs DaVinci Resolve, so the OpenFX module is proven
-// the way the Premiere plug-ins are: the tests load the bundle this
+// The tests cannot drive DaVinci Resolve or VEGAS Pro, so the OpenFX module
+// is proven the way the Premiere plug-ins are: the tests load the bundle this
 // build produced and drive it through the C API exactly as a host does -
 // OfxSetHost, OfxGetPlugin, Load, Describe, DescribeInContext, CreateInstance,
 // InstanceChanged, GetRegionsOfInterest, Render, DestroyInstance, Unload -
@@ -22,6 +22,30 @@
 //
 // Parameters keep keyframes (linear between them, held outside), so the
 // easing and smoothing paths run against real keyframe queries.
+//
+// ===========================================================================
+//  Which host it plays
+// ===========================================================================
+// The module classifies its host ONCE, by name, when it is loaded
+// (osv::ofx::hostProfile()), and a test process loads it once.  So the host
+// the mock plays is chosen per PROCESS, by the environment variable
+//
+//     OSV_MOCK_OFX_PROFILE = vegas | resolve | (unset: the generic mock)
+//
+//   * unset   - "OpenOSV.MockOfxHost", which the module treats as it treats
+//               any unknown host: exactly like DaVinci Resolve;
+//   * resolve - "DaVinciResolveLite", Resolve's own name;
+//   * vegas   - "com.vegascreativesoftware.vegas", with VEGAS's host
+//               properties: 8-bit and float depths plus its B G R A tokens,
+//               its window and app data properties, the instance's VEGAS
+//               context, and frame-local generator time.
+//
+// ctest runs the [vegas] tests (hidden from a plain run) in a process of
+// their own with the variable set - see tests/ofx/CMakeLists.txt.
+//
+// Everything the plug-in can reach from several render threads at once -
+// the image counters and the message list - is thread-safe, so tests can
+// render cloned instances concurrently the way VEGAS does.
 #pragma once
 
 #include "ofxCore.h"
@@ -31,10 +55,12 @@
 #include "ofxParam.h"
 #include "ofxProperty.h"
 
+#include <atomic>
 #include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -155,19 +181,35 @@ struct Effect {
 
 class MockHost {
 public:
+    /// The host families the mock can play (see "Which host it plays").
+    enum class Profile { Generic, Resolve, Vegas };
+
     /// The process-wide host (the suites are plain C functions).
     static MockHost& instance();
 
     [[nodiscard]] OfxHost* ofxHost() noexcept { return &m_host; }
 
-    PropertySet hostProps;                 ///< kOfxPropName etc.
-    std::vector<std::string> messages;     ///< Everything posted through the message suite.
-    int imagesOut = 0;                     ///< Images handed out and not yet released.
-    int imagesTotal = 0;                   ///< Images handed out in total.
+    /// The host this process plays, from OSV_MOCK_OFX_PROFILE.
+    [[nodiscard]] Profile profile() const noexcept { return m_profile; }
+    /// True when this process plays VEGAS Pro.
+    [[nodiscard]] bool isVegas() const noexcept { return m_profile == Profile::Vegas; }
+    /// "generic", "resolve" or "vegas".
+    [[nodiscard]] static const char* profileName(Profile profile) noexcept;
+
+    /// kOfxPropName, the supported depths and the rest of what the host
+    /// says about itself (filled for the profile at construction).
+    PropertySet hostProps;
+    /// Everything posted through the message suite.  The suite appends under
+    /// `messagesMutex`; tests read it between renders.
+    std::vector<std::string> messages;
+    std::mutex messagesMutex;
+    std::atomic<int> imagesOut{0};    ///< Images handed out and not yet released.
+    std::atomic<int> imagesTotal{0};  ///< Images handed out in total.
 
 private:
     MockHost();
     OfxHost m_host{};
+    Profile m_profile = Profile::Generic;
 };
 
 // ===========================================================================
@@ -219,8 +261,16 @@ public:
 
     OfxStatus instanceChanged(Effect& effect, const std::string& param, const std::string& reason, double time);
 
+    /// kOfxActionInstanceChanged for a CLIP (kOfxPropType = kOfxTypeClip):
+    /// what VEGAS sends for its clip "Output" alongside parameter changes.
+    OfxStatus instanceChangedClip(Effect& effect, const std::string& clip, const std::string& reason, double time);
+
+    /// kOfxImageEffectActionGetClipPreferences on `effect`, with `prefs`
+    /// pre-filled by the caller the way a host fills them.
+    OfxStatus clipPreferences(Effect& effect, PropertySet& prefs);
+
     struct RenderArgs {
-        double time = 0.0;
+        double time = 0.0;  ///< Frames; a field render passes x.5 for the second field.
         OfxRectI window{0, 0, 0, 0};
         double scaleX = 1.0;
         double scaleY = 1.0;
@@ -229,6 +279,7 @@ public:
         bool setCudaProps = false;  ///< Only a CUDA-capable host sets the CUDA inArgs at all.
         bool interactive = false;
         bool draft = false;
+        std::string field = kOfxImageFieldNone;  ///< kOfxImageEffectPropFieldToRender.
     };
     OfxStatus render(Effect& effect, const RenderArgs& args);
 

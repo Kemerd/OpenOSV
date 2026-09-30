@@ -433,6 +433,38 @@ Status GpuReadback::copyToHost(const void* deviceRgba, std::size_t devicePitchBy
     }
     return result;
 }
+
+// ===========================================================================
+//  [WP-V-GPU] retainPrimaryContext
+// ===========================================================================
+
+Result<std::shared_ptr<void>> retainPrimaryContext(int deviceOrdinal) noexcept {
+    if (deviceOrdinal < 0) {
+        return Error{ErrorCode::InvalidArgument, "retainPrimaryContext: negative device ordinal"};
+    }
+    CUresult r = cuInit(0);
+    if (r != CUDA_SUCCESS) {
+        return Error{ErrorCode::Gpu, cudaText("cuInit", r)};
+    }
+    CUdevice device = 0;
+    r = cuDeviceGet(&device, deviceOrdinal);
+    if (r != CUDA_SUCCESS) {
+        return Error{ErrorCode::Gpu, cudaText("cuDeviceGet", r)};
+    }
+    CUcontext context = nullptr;
+    r = cuDevicePrimaryCtxRetain(&context, device);
+    if (r != CUDA_SUCCESS || !context) {
+        return Error{ErrorCode::Gpu, cudaText("cuDevicePrimaryCtxRetain", r)};
+    }
+    try {
+        // The deleter releases exactly the reference taken above.  Should the
+        // control block's allocation throw, shared_ptr calls it itself.
+        return std::shared_ptr<void>(static_cast<void*>(context),
+                                     [device](void*) noexcept { (void)cuDevicePrimaryCtxRelease(device); });
+    } catch (...) {
+        return Error{ErrorCode::Internal, "retainPrimaryContext: out of memory"};
+    }
+}
 #endif  // OSV_HAVE_CUDA
 
 // ===========================================================================

@@ -467,6 +467,60 @@ public:
     /// keep showing it after the real analysis landed.
     [[nodiscard]] bool lastRenderExact() const noexcept { return m_lastRenderExact; }
 
+    // ---- [WP-V-GPU] the stitched frame, left on the GPU for a caller -------
+    //
+    // An OpenFX host that hands only CPU images (VEGAS Pro) would otherwise
+    // get the sphere through renderFrame(): stitched on the GPU, all of it
+    // read back (288 MB at 6K), then framed on the CPU.  renderFrameToDevice
+    // stitches exactly what renderFrame() stitches and hands the result to
+    // the caller WHILE IT IS STILL IN VRAM, so the caller frames, levels and
+    // packs it there and reads back only the finished view
+    // (plugins/ofx/OfxGpuView.h).
+
+    /// The shared CUDA renderer's output for one frame, valid only during the
+    /// DeviceFrameConsumer call it is handed to.
+    struct DeviceFrame {
+        const void* data = nullptr;   ///< Device address of the TOP-left pixel: float R,G,B,A rows, top-down.
+        std::size_t pitchBytes = 0;   ///< Byte distance between two rows.
+        std::uint32_t width = 0;      ///< geometry.width.
+        std::uint32_t height = 0;     ///< geometry.height.
+        int deviceIndex = -1;         ///< CUDA ordinal of the renderer; the memory is in its PRIMARY context.
+        void* cuContext = nullptr;    ///< That primary context (CUcontext), current during the call.
+        bool exact = true;            ///< False when an Interactive request was served a stand-in analysis.
+        bool decodedOnGpu = false;    ///< True: NVDEC into VRAM; false: decoded on the host and uploaded.
+    };
+
+    /// Receives the stitched frame.  It runs with the renderer's output lock
+    /// held (cudaRendererOutputMutex()), so it should only queue its GPU work
+    /// and wait until that work has READ the frame - no readback, no host
+    /// work it could do afterwards.  Its Status is returned as the render's.
+    using DeviceFrameConsumer = std::function<Status(const DeviceFrame&)>;
+
+    /// Decode + stitch frame `index` at `geometry` (an equirect: `view` must
+    /// be unset) on the shared CUDA renderer and hand the device result to
+    /// `consume`, without reading a pixel back.
+    ///
+    /// The job is built by the same function renderFrame() uses
+    /// (buildEquirectJob), from the same analysis caches, so the frame is the
+    /// one renderFrame() returns for the same arguments.  The lenses decode
+    /// on NVDEC into VRAM (the importer frame path's decoder and state, see
+    /// renderFrameToHost) or, when NVDEC cannot serve the clip (the LRF
+    /// proxy, a clip whose NVDEC path was disabled), on the host and are
+    /// uploaded by the renderer - either way the stitch and everything after
+    /// it stay on the GPU.
+    ///
+    /// Returns true when `consume` ran and succeeded; false - with the reason
+    /// in `whyNot` when given - when this path does not apply (the clip's
+    /// renderer is not CUDA, a build without CUDA); an Error when it was
+    /// tried and failed (three NVDEC failures in a row move the clip to host
+    /// decoding, as renderFrameToHost does).  The caller MUST hold lock() for
+    /// the whole call.  `draft`, `purpose` and `outputTransfer` mean exactly
+    /// what they mean for renderFrame().
+    [[nodiscard]] Result<bool> renderFrameToDevice(std::uint32_t index, const OutputGeometry& geometry, bool draft,
+                                                   RenderPurpose purpose, int outputTransfer,
+                                                   const DeviceFrameConsumer& consume, std::string* whyNot = nullptr);
+    // ---- [/WP-V-GPU] ----------------------------------------------------------
+
     // ---- the direct GPU path (docs/DIRECT_GPU.md) --------------------------
     /// One frame for the direct renderer: both lenses decoded on NVDEC into a
     /// caller's CUDA context and the stitch state that goes with them.
@@ -998,6 +1052,11 @@ private:
     [[nodiscard]] Result<bool> renderFrameOnGpu(std::uint32_t index, const OutputGeometry& geometry, bool draft,
                                                 RenderPurpose purpose, const pixelcopy::HostFrame& dst,
                                                 pixelcopy::HostPixelFormat format, int outputTransfer);
+
+    /// [WP-V-GPU] Count one failure of renderFrameToDevice()'s NVDEC path -
+    /// three in a row move the clip to host decoding (renderFrameToHost()'s
+    /// rule, on the same state) - and hand `error` back.  Caller holds m_mutex.
+    [[nodiscard]] Result<bool> countDeviceFrameFailure(const Error& error);
 
     /// Where the GPU path stands for this clip.
     enum class GpuFrameState : std::uint8_t {

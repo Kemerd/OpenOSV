@@ -27,7 +27,7 @@ if(CMAKE_HOST_APPLE)
 endif()
 
 project(openosv
-        VERSION 0.3.0
+        VERSION 0.4.0
         DESCRIPTION "Independent open-source DJI Osmo 360 .OSV parser, stitcher, reframer and HDR colour pipeline"
         HOMEPAGE_URL "https://github.com/Kemerd/OpenOSV"
         LANGUAGES C CXX)
@@ -159,6 +159,15 @@ if(OSV_BUILD_OFX)
   add_subdirectory(plugins/ofx)
   if(OSV_BUILD_TESTS)
     add_subdirectory(tests/ofx)
+  endif()
+  # The VEGAS Pro Application Extension (plugins/vegas, docs/VEGAS.md) drives
+  # the bundle's generator through VEGAS's scripting API.  plugins/ adds it
+  # already when the Premiere plug-ins are built; a build without them (CI's
+  # ci-windows) adds it here, so its Core library and tests run everywhere.
+  # The global flag keeps the directory from being added twice.
+  get_property(_osv_vegas_added GLOBAL PROPERTY OSV_VEGAS_EXTENSION_ADDED)
+  if(WIN32 AND NOT _osv_vegas_added)
+    add_subdirectory(plugins/vegas)
   endif()
 endif()
 

@@ -7,8 +7,9 @@
 // ===========================================================================
 //  Why a generator
 // ===========================================================================
-// DaVinci Resolve cannot open an .OSV at all - two HEVC fisheye streams and a
-// protobuf metadata track in one container - and OpenFX has no importer API.
+// Neither DaVinci Resolve nor VEGAS Pro can open an .OSV - two HEVC fisheye
+// streams and a protobuf metadata track in one container - and OpenFX has no
+// importer API.
 // What OpenFX does have is the generator: an effect that makes pictures out
 // of nothing but its parameters.  So the clip becomes a parameter:
 //
@@ -30,7 +31,13 @@
 //
 // What an OpenFX generator cannot do: carry the clip's audio, or tell the
 // host how long it is.  The Clip read-out shows the duration to trim to, and
-// docs/RESOLVE.md shows how to bring the audio in.
+// docs/RESOLVE.md shows how to bring the audio in.  In VEGAS the OpenOSV
+// extension does both from outside, through VEGAS's scripting API, setting
+// the generator's parameters by the permanent names below.
+//
+// How the two hosts differ for this generator (pixel formats, levels, thread
+// safety, the Choose button) is in OfxSource.cpp's header comment; every
+// difference keys on hostProfile() (OfxHost.h).
 #pragma once
 
 #include "OfxHost.h"
@@ -42,7 +49,10 @@ inline constexpr const char* kPluginId = "org.openosv.OSVSource";
 
 /// Version reported to the host (see OfxReframe.h on when MAJOR moves).
 inline constexpr unsigned kVersionMajor = 1;
-inline constexpr unsigned kVersionMinor = 0;
+/// Minor 1: VEGAS Pro support (byte / BGRA output, Output Levels, the own-GPU
+/// path).  A new minor version makes hosts that cache descriptors
+/// (VEGAS keeps them per user) describe the plug-in again.
+inline constexpr unsigned kVersionMinor = 1;
 
 // ---- the generator's own parameters (permanent names) ------------------------
 inline constexpr const char* kFile = "file";
@@ -88,6 +98,12 @@ void shutdown() noexcept;
 /// reporting the range in timeline frames, so the time is taken as it is.
 /// A negative offset is never a real position inside a clip, so this cannot
 /// misplace a frame the plain formula would have placed correctly.
+///
+/// VEGAS Pro gives a generator frames local to its event, from 0, and a
+/// field render asks for the second field at x.5.  The floor keeps x.5 on
+/// clip frame x at the timeline's own rate, and on a clip shot at twice the
+/// timeline's rate picks the frame between x and x + 1 - the second field's
+/// own moment.
 [[nodiscard]] inline long long frameForTime(double time, double rangeStart, double hostFps, double clipFps,
                                             long long startFrame) noexcept {
     // Unusable rates: 1:1 frame mapping is the only safe reading.

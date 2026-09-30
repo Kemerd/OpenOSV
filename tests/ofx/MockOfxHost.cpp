@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// MockOfxHost.cpp - the strict OpenFX host of the tests (MockOfxHost.h).
+// MockOfxHost.cpp - the strict OpenFX host of the tests (MockOfxHost.h):
+// the generic mock, DaVinci Resolve or VEGAS Pro, per OSV_MOCK_OFX_PROFILE.
 
 #include "MockOfxHost.h"
+
+#include "OfxHostImage.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -645,7 +649,10 @@ OfxStatus message(void*, const char* type, const char*, const char* format, ...)
     va_start(ap, format);
     std::vsnprintf(buffer, sizeof(buffer), format ? format : "", ap);
     va_end(ap);
-    MockHost::instance().messages.push_back(std::string(type ? type : "?") + ": " + buffer);
+    // A render thread may post while another renders: append under the lock.
+    MockHost& host = MockHost::instance();
+    std::lock_guard<std::mutex> lock(host.messagesMutex);
+    host.messages.push_back(std::string(type ? type : "?") + ": " + buffer);
     return kOfxStatOK;
 }
 
@@ -672,11 +679,65 @@ MockHost& MockHost::instance() {
 }
 
 MockHost::MockHost() {
-    hostProps.setString(kOfxPropName, "OpenOSV.MockOfxHost");
-    hostProps.setString(kOfxPropLabel, "OpenOSV mock OpenFX host");
-    hostProps.setInts(kOfxPropAPIVersion, {1, 5});
+    // The profile comes from the environment, read once: the module
+    // classifies its host once per load, so one process plays one host.
+    const char* env = std::getenv("OSV_MOCK_OFX_PROFILE");
+    const std::string wanted = env ? env : "";
+    if (wanted == "vegas") {
+        m_profile = Profile::Vegas;
+    } else if (wanted == "resolve") {
+        m_profile = Profile::Resolve;
+    }
+
+    switch (m_profile) {
+    case Profile::Vegas:
+        // VEGAS's MAGIX-era name, and the capabilities VEGAS's OpenFX
+        // extension header (ofxSonyVegas.h) and VEGAS itself describe:
+        // 8-bit and float, each also in its own B G R A order.
+        hostProps.setString(kOfxPropName, "com.vegascreativesoftware.vegas");
+        hostProps.setString(kOfxPropLabel, "VEGAS Pro (OpenOSV mock)");
+        hostProps.setInts(kOfxPropVersion, {22, 0, 0});
+        hostProps.setString(kOfxPropVersionLabel, "22.0 (mock)");
+        hostProps.setInts(kOfxPropAPIVersion, {1, 4});
+        hostProps.setString(kOfxImageEffectPropSupportedPixelDepths, kOfxBitDepthByte, 0);
+        hostProps.setString(kOfxImageEffectPropSupportedPixelDepths, kOfxBitDepthFloat, 1);
+        hostProps.setString(kOfxImageEffectPropSupportedPixelDepths, osv::ofx::kBitDepthByteBgr, 2);
+        hostProps.setString(kOfxImageEffectPropSupportedPixelDepths, osv::ofx::kBitDepthFloatBgr, 3);
+        hostProps.setString(kOfxImageEffectPropSupportedContexts, kOfxImageEffectContextFilter, 0);
+        hostProps.setString(kOfxImageEffectPropSupportedContexts, kOfxImageEffectContextGenerator, 1);
+        hostProps.setString(kOfxImageEffectPropSupportedContexts, kOfxImageEffectContextTransition, 2);
+        hostProps.setString(kOfxImageEffectPropSupportedComponents, kOfxImageComponentRGBA);
+        hostProps.setInt(kOfxImageEffectPropSupportsMultipleClipDepths, 0);
+        hostProps.setInt(kOfxImageEffectPropSupportsTiles, 0);
+        hostProps.setInt(kOfxImageEffectPropSupportsMultiResolution, 1);
+        hostProps.setInt(kOfxImageEffectPropTemporalClipAccess, 1);
+        hostProps.setInt(kOfxImageEffectPropSupportsOverlays, 0);
+        // Present but null: no window to own a dialog in a test process.
+        hostProps.setPointer("OfxPropVegasHostHWnd", nullptr);
+        hostProps.setString("OfxPropVegasHostAppDataDirectory", "C:/Users/mock/AppData/Local/VEGAS Pro/22.0");
+        break;
+    case Profile::Resolve:
+        hostProps.setString(kOfxPropName, "DaVinciResolveLite");
+        hostProps.setString(kOfxPropLabel, "DaVinci Resolve (OpenOSV mock)");
+        hostProps.setInts(kOfxPropAPIVersion, {1, 5});
+        break;
+    case Profile::Generic:
+        hostProps.setString(kOfxPropName, "OpenOSV.MockOfxHost");
+        hostProps.setString(kOfxPropLabel, "OpenOSV mock OpenFX host");
+        hostProps.setInts(kOfxPropAPIVersion, {1, 5});
+        break;
+    }
     m_host.host = hostProps.handle();
     m_host.fetchSuite = &fetchSuite;
+}
+
+const char* MockHost::profileName(Profile profile) noexcept {
+    switch (profile) {
+    case Profile::Vegas: return "vegas";
+    case Profile::Resolve: return "resolve";
+    case Profile::Generic: break;
+    }
+    return "generic";
 }
 
 // ===========================================================================
@@ -792,6 +853,13 @@ std::unique_ptr<Effect> PluginHarness::createInstance(const std::string& context
     effect->props.setDouble(kOfxImageEffectPropFrameRate, fps);
     effect->props.setDouble(kOfxImageEffectInstancePropEffectDuration, 1000.0);
     effect->props.setInt(kOfxPropIsInteractive, 1);
+    const bool vegas = MockHost::instance().isVegas();
+    if (vegas) {
+        // Where VEGAS says the instance lives (VEGAS's OpenFX extension header).
+        effect->props.setString("OfxImageEffectPropVegasContext",
+                                context == kOfxImageEffectContextGenerator ? "OfxImageEffectPropVegasContextGenerator"
+                                                                           : "OfxImageEffectPropVegasContextEvent");
+    }
     effect->params.instantiateFrom(ctx->params);
     // Clips: the context descriptor's, as instances with a frame the size of
     // the project (the tests fill `provide` and `rod`).
@@ -802,7 +870,12 @@ std::unique_ptr<Effect> PluginHarness::createInstance(const std::string& context
         clip->props.setString(kOfxImageEffectPropPixelDepth, kOfxBitDepthFloat);
         clip->props.setString(kOfxImageEffectPropComponents, kOfxImageComponentRGBA);
         clip->props.setDouble(kOfxImageEffectPropFrameRate, fps);
+        // Frame-local time, as VEGAS gives a generator: its event's frames
+        // counted from 0 (the tests pass x.5 for a field render).
         clip->props.setDoubles(kOfxImageEffectPropFrameRange, {0.0, 999.0});
+        if (vegas) {
+            clip->props.setDoubles(kOfxImageEffectPropUnmappedFrameRange, {0.0, 999.0});
+        }
         clip->props.setInt(kOfxImageClipPropConnected, 1);
         clip->rod = OfxRectD{0.0, 0.0, static_cast<double>(projectW), static_cast<double>(projectH)};
         effect->clipOrder.push_back(name);
@@ -831,10 +904,26 @@ OfxStatus PluginHarness::instanceChanged(Effect& effect, const std::string& para
     return action(kOfxActionInstanceChanged, effect.handle(), &in, &out);
 }
 
+OfxStatus PluginHarness::instanceChangedClip(Effect& effect, const std::string& clip, const std::string& reason,
+                                             double time) {
+    PropertySet in;
+    in.setString(kOfxPropType, kOfxTypeClip);
+    in.setString(kOfxPropName, clip);
+    in.setString(kOfxPropChangeReason, reason);
+    in.setDouble(kOfxPropTime, time);
+    in.setDoubles(kOfxImageEffectPropRenderScale, {1.0, 1.0});
+    PropertySet out;
+    return action(kOfxActionInstanceChanged, effect.handle(), &in, &out);
+}
+
+OfxStatus PluginHarness::clipPreferences(Effect& effect, PropertySet& prefs) {
+    return action(kOfxImageEffectActionGetClipPreferences, effect.handle(), nullptr, &prefs);
+}
+
 OfxStatus PluginHarness::render(Effect& effect, const RenderArgs& args) {
     PropertySet in;
     in.setDouble(kOfxPropTime, args.time);
-    in.setString(kOfxImageEffectPropFieldToRender, kOfxImageFieldNone);
+    in.setString(kOfxImageEffectPropFieldToRender, args.field);
     in.setInts(kOfxImageEffectPropRenderWindow, {args.window.x1, args.window.y1, args.window.x2, args.window.y2});
     in.setDoubles(kOfxImageEffectPropRenderScale, {args.scaleX, args.scaleY});
     in.setInt(kOfxImageEffectPropSequentialRenderStatus, 0);

@@ -33,6 +33,20 @@
 #  illegal in a Windows path and has no meaning to cmd outside globbing, so
 #  it is safe on both counts.
 #    DUMPBIN      path of dumpbin.exe (may be empty: recursion disabled)
+#
+#  Optional arguments, used only by the OpenFX bundle (plugins/ofx), whose
+#  module lives in Contents\Win64 while its dependency closure lives in
+#  Contents\Libraries\Win64 (VEGAS Pro's plug-in scan loads every DLL under
+#  Contents\Win64, so only the module may be there).  Every other caller
+#  leaves them empty and gets the behaviour above unchanged:
+#    COPY_MODULE  ON = MODULE itself is copied to OUT_DIR as well.  Used to
+#                 stage an executable (osvtool.exe) beside its own closure.
+#                 The module is normally NOT copied: it was linked into place.
+#    PURGE_DIR    a directory from which stale *.dll / *.exe files are
+#                 deleted before staging (the module itself excepted), so a
+#                 build tree that once held the old layout cannot keep DLLs
+#                 where the scan would find them.
+#    DEST_DIR     is consumed by OsvCheckDelayLoad.cmake (see there).
 # =============================================================================
 cmake_minimum_required(VERSION 3.28)
 
@@ -43,6 +57,17 @@ if(NOT OUT_DIR)
   message(FATAL_ERROR "OsvCopyRuntimeDlls: OUT_DIR is required")
 endif()
 file(MAKE_DIRECTORY "${OUT_DIR}")
+
+# Remove what an older layout left in PURGE_DIR.  Only executables and DLLs go
+# (they are what a scanning host would load); the module just linked stays.
+if(PURGE_DIR AND IS_DIRECTORY "${PURGE_DIR}")
+  file(GLOB _stale_files LIST_DIRECTORIES false "${PURGE_DIR}/*.dll" "${PURGE_DIR}/*.exe")
+  foreach(_stale IN LISTS _stale_files)
+    if(NOT "${_stale}" STREQUAL "${MODULE}")
+      file(REMOVE "${_stale}")
+    endif()
+  endforeach()
+endif()
 
 string(REPLACE "?" ";" _search_dirs "${SEARCH_DIRS}")
 string(REPLACE "?" ";" _extra_dlls "${EXTRA_DLLS}")
@@ -112,8 +137,10 @@ while(_queue)
   endif()
   list(APPEND _visited "${_file_key}")
 
-  # Everything except the module itself is a DLL we ship: copy it.
-  if(NOT "${_file}" STREQUAL "${MODULE}")
+  # Everything except the module itself is a DLL we ship: copy it.  With
+  # COPY_MODULE the module is shipped too (an executable staged beside its
+  # closure).
+  if(COPY_MODULE OR NOT "${_file}" STREQUAL "${MODULE}")
     get_filename_component(_name "${_file}" NAME)
     execute_process(COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${_file}" "${OUT_DIR}/${_name}"
                     RESULT_VARIABLE _copy_rc)

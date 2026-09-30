@@ -3,6 +3,8 @@
 
 #include "DelayLoad.h"
 
+#include "PluginLog.h"
+
 #include <delayimp.h>
 
 #include <atomic>
@@ -44,6 +46,10 @@ struct HookState {
     /// The module's directory, including the trailing separator.  Written
     /// once, before `dirState` reaches 2; read-only afterwards.
     wchar_t dir[MAX_PATH * 4] = {};
+    /// The opt-in dependency folder (OSV_DELAYLOAD_SUBDIR), canonical, with
+    /// the trailing separator; empty when the module did not opt in.  Written
+    /// with `dir`, before `dirState` reaches 2.
+    wchar_t libDir[MAX_PATH * 4] = {};
     /// 0 = not computed, 1 = computing, 2 = ready (possibly empty on failure).
     std::atomic<int> dirState{0};
 };
@@ -98,6 +104,45 @@ void computeModuleDirectory() noexcept {
     }
     std::memcpy(s.dir, path.data(), dirLen * sizeof(wchar_t));
     s.dir[dirLen] = L'\0';
+
+#if defined(OSV_DELAYLOAD_SUBDIR)
+    // The module opted into a dependency subfolder.  Join it to the module
+    // directory and let GetFullPathNameW collapse any ".." - the string that
+    // reaches LoadLibrary must be canonical.  Everything lives in fixed
+    // buffers: this can run under the loader lock's shadow (see above).
+    constexpr wchar_t kSubdir[] = OSV_DELAYLOAD_SUBDIR;
+    constexpr std::size_t kSubdirLen = sizeof(kSubdir) / sizeof(kSubdir[0]) - 1u;
+    if (kSubdirLen == 0 || dirLen + kSubdirLen + 2u >= kCapacity) {
+        return;
+    }
+    wchar_t joined[MAX_PATH * 4] = {};
+    std::memcpy(joined, s.dir, dirLen * sizeof(wchar_t));
+    std::memcpy(joined + dirLen, kSubdir, kSubdirLen * sizeof(wchar_t));
+    std::size_t joinedLen = dirLen + kSubdirLen;
+    // A trailing separator, so "<libDir><name>" is a complete path.
+    if (joined[joinedLen - 1u] != L'\\' && joined[joinedLen - 1u] != L'/') {
+        joined[joinedLen++] = L'\\';
+    }
+    joined[joinedLen] = L'\0';
+
+    wchar_t canonical[MAX_PATH * 4] = {};
+    const DWORD n = GetFullPathNameW(joined, static_cast<DWORD>(kCapacity), canonical, nullptr);
+    // 0 = failure; n >= capacity - 1 = the buffer was too small.  Either way
+    // the subfolder stays unset and the module folder is the only candidate.
+    if (n == 0 || n >= kCapacity - 2u) {
+        return;
+    }
+    // Keep the trailing separator, and refuse a result that still has "..".
+    std::size_t canonicalLen = n;
+    if (canonical[canonicalLen - 1u] != L'\\') {
+        canonical[canonicalLen++] = L'\\';
+        canonical[canonicalLen] = L'\0';
+    }
+    if (::wcsstr(canonical, L"..") != nullptr) {
+        return;
+    }
+    std::memcpy(s.libDir, canonical, (canonicalLen + 1u) * sizeof(wchar_t));
+#endif
 }
 
 /// Compute the module directory at most once, then return a pointer to it.
@@ -183,35 +228,37 @@ std::wstring moduleDirectory() noexcept {
     }
 }
 
-HMODULE loadBesideModule(const char* dllName) noexcept {
-    if (!dllName || !*dllName) {
-        return nullptr;
+std::wstring librariesDirectory() noexcept {
+    try {
+        moduleDirectoryCached();  // computes libDir together with dir
+        return std::wstring(hookState().libDir);
+    } catch (...) {
+        return {};
     }
-    // Only bare file names are honoured; a path would defeat the purpose.
-    if (std::strchr(dllName, '\\') || std::strchr(dllName, '/') || std::strchr(dllName, ':')) {
-        return nullptr;
-    }
-    // The cached, non-allocating accessor: this function runs under the
-    // loader lock, where a heap allocation is a documented deadlock risk.
-    const wchar_t* dir = moduleDirectoryCached();
-    if (!dir || !*dir) {
-        return nullptr;
-    }
+}
 
-    // Build "<dir><name>" in a STACK buffer.  MultiByteToWideChar writes
-    // straight into it, so there is no intermediate std::wstring either.
-    wchar_t full[MAX_PATH * 4] = {};
-    constexpr int kFullCapacity = static_cast<int>(sizeof(full) / sizeof(full[0]));
+namespace {
 
-    const std::size_t dirLen = ::wcsnlen(dir, static_cast<std::size_t>(kFullCapacity));
+/// Try "<dir><dllName>" and load it.  `dir` is a directory with a trailing
+/// separator.  Returns nullptr when the directory is unusable, the file is
+/// absent or it cannot be loaded; on success `full` (capacity `fullCapacity`)
+/// holds the path that was loaded.  Never allocates: it may run under the
+/// loader lock.
+HMODULE loadFromDirectory(const wchar_t* dir, const char* dllName, wchar_t* full, int fullCapacity) noexcept {
+    if (!dir || !*dir || !dllName || !full || fullCapacity <= 2) {
+        return nullptr;
+    }
+    // Build "<dir><name>" in the caller's STACK buffer.  MultiByteToWideChar
+    // writes straight into it, so there is no intermediate std::wstring.
+    const std::size_t dirLen = ::wcsnlen(dir, static_cast<std::size_t>(fullCapacity));
     const int nameLen = static_cast<int>(std::strlen(dllName));
     // Leave room for the directory, the converted name and the NUL.
-    if (dirLen == 0 || dirLen >= static_cast<std::size_t>(kFullCapacity) - 2u) {
+    if (dirLen == 0 || dirLen >= static_cast<std::size_t>(fullCapacity) - 2u) {
         return nullptr;
     }
     std::memcpy(full, dir, dirLen * sizeof(wchar_t));
 
-    const int room = kFullCapacity - static_cast<int>(dirLen) - 1;
+    const int room = fullCapacity - static_cast<int>(dirLen) - 1;
     const int written = MultiByteToWideChar(CP_ACP, 0, dllName, nameLen, full + dirLen, room);
     if (written <= 0) {
         return nullptr;
@@ -227,22 +274,72 @@ HMODULE loadBesideModule(const char* dllName) noexcept {
 
     // LOAD_WITH_ALTERED_SEARCH_PATH: dependencies of the loaded DLL are
     // searched starting in its own directory, so avcodec finds our avutil.
-    const HMODULE h = LoadLibraryExW(full, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    return LoadLibraryExW(full, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+}
+
+/// Record that `full` served `dllName` and, for a module with a dependency
+/// subfolder, log which location did - once per DLL.  Best effort: this
+/// allocates, so it runs only after the library is already loaded, and a
+/// failure here loses a diagnostic, nothing more.
+void noteResolved(const char* dllName, const wchar_t* full, bool fromLibraries) noexcept {
+    try {
+        {
+            HookState& s = hookState();
+            std::lock_guard<std::mutex> lock(s.statsMutex);
+            ++s.stats.resolvedBeside;
+            s.stats.lastResolvedPath = full;
+        }
+#if defined(OSV_DELAYLOAD_SUBDIR)
+        // The audit trail: the dependency folder, or an older install's
+        // legacy layout (DLLs beside the module).
+        char utf8[MAX_PATH * 4] = {};
+        const int n = WideCharToMultiByte(CP_UTF8, 0, full, -1, utf8, static_cast<int>(sizeof(utf8)), nullptr, nullptr);
+        const char* where = n > 0 ? utf8 : "(path not representable)";
+        PluginLog::oncef(std::string("delayload:") + dllName, PluginLog::Level::Info, "delay-load: {} from the {} ({})",
+                         dllName, fromLibraries ? "dependency folder" : "legacy module folder", where);
+#else
+        (void)dllName;
+        (void)fromLibraries;
+#endif
+    } catch (...) {
+        // Statistics and logging are best effort.
+    }
+}
+
+}  // namespace
+
+HMODULE loadBesideModule(const char* dllName) noexcept {
+    if (!dllName || !*dllName) {
+        return nullptr;
+    }
+    // Only bare file names are honoured; a path would defeat the purpose.
+    if (std::strchr(dllName, '\\') || std::strchr(dllName, '/') || std::strchr(dllName, ':')) {
+        return nullptr;
+    }
+    // The cached, non-allocating accessor: this function runs under the
+    // loader lock, where a heap allocation is a documented deadlock risk.
+    const wchar_t* dir = moduleDirectoryCached();
+    if (!dir || !*dir) {
+        return nullptr;
+    }
+    const HookState& s = hookState();
+
+    wchar_t full[MAX_PATH * 4] = {};
+    constexpr int kFullCapacity = static_cast<int>(sizeof(full) / sizeof(full[0]));
+
+    // 1. The dependency subfolder, when the module opted in (libDir stays
+    //    empty otherwise and loadFromDirectory answers nullptr for it).
+    HMODULE h = loadFromDirectory(s.libDir, dllName, full, kFullCapacity);
+    const bool fromLibraries = h != nullptr;
+    // 2. The module's own folder: the only place for a module that did not
+    //    opt in, and the legacy layout of an older install for one that did.
+    if (!h) {
+        h = loadFromDirectory(dir, dllName, full, kFullCapacity);
+    }
     if (!h) {
         return nullptr;
     }
-    try {
-        HookState& s = hookState();
-        std::lock_guard<std::mutex> lock(s.statsMutex);
-        ++s.stats.resolvedBeside;
-        // This DOES allocate (assigning a std::wstring), so it is deliberately
-        // the very last thing done and only after the library is already
-        // loaded: by this point the loader lock is no longer held on our
-        // behalf, and a failure here loses a diagnostic, nothing more.
-        s.stats.lastResolvedPath = full;
-    } catch (...) {
-        // Statistics are best effort.
-    }
+    noteResolved(dllName, full, fromLibraries);
     return h;
 }
 
