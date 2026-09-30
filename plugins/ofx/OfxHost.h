@@ -95,8 +95,10 @@ void clearSuites() noexcept;
 // OpenFX leaves a lot to the host, and the two hosts the effects ship for
 // fill the gaps differently (docs/RESOLVE.md, docs/VEGAS.md).  Every
 // host-specific decision - which pixel depths to declare, which contexts,
-// how thread-safe the generator claims to be - keys on ONE classification of
-// the host's name, made here, so no other file ever compares host strings.
+// how thread-safe the generator claims to be, which images are accepted
+// (ClipImage::view()), whether the generator has an Output Levels control
+// and a Choose button - keys on ONE classification of the host's name, made
+// here, so no other file ever compares host strings.
 //
 // The Generic profile is today's behaviour, unchanged: an unknown host is
 // treated exactly like DaVinci Resolve was before VEGAS support existed.

@@ -69,7 +69,8 @@ void describe(OfxParamSetHandle set, HostProfile profile) noexcept {
                      kOutputLevelsItems, kOutputLevelsDefault0);
     }
     // [WP-HDRTONE] How D-Log M becomes PQ / HLG display light, right under
-    // the output it shapes, with the hint Premiere's panel cannot show.
+    // the output it shapes (under Output Levels in VEGAS), with the hint
+    // Premiere's panel cannot show.
     defineChoice(set, kHdrTone, {OSV_SS_HDR_TONE_NAME, OSV_SS_HDR_TONE_HINT, kColourGroup, kStatic},
                  OSV_SS_HDR_TONE_ITEMS, OSV_SS_HDR_TONE_DEFAULT - 1);
     defineChoice(set, kLook,
