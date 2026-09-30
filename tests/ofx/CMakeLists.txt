@@ -10,12 +10,25 @@
 #  The Premiere effect's camera sources (ReframeCpu.cpp, ReframeEasing.cpp)
 #  ARE compiled in: they produce the reference every OpenFX render is held
 #  to, which is exactly the claim under test - "the same frame Premiere
-#  shows".
+#  shows".  So are two of the module's own host-independent sources
+#  (OfxHost.cpp, OfxRender.cpp), for test_ofx_render.cpp: the host
+#  classification and the CPU pixel loops in every format, tested directly.
 #
 #  Like the module, the tests need no Adobe SDK, so they run wherever the
 #  bundle builds: Windows and macOS, CI included.  The [cuda] tests are
 #  Windows-only (and SKIP without a device); the [sample] tests SKIP without
 #  the sample clip.
+#
+#  THREE HOSTS, THREE REGISTRATIONS.  The module classifies its host once per
+#  load, and a test process loads it once, so the mock plays one host per
+#  process (OSV_MOCK_OFX_PROFILE, MockOfxHost.h):
+#
+#    <test name>           the generic mock (Resolve's behaviour): every test
+#                          but the hidden [vegas] ones;
+#    "vegas: <test name>"  VEGAS Pro: the [vegas] tests, with
+#                          OSV_MOCK_OFX_PROFILE=vegas;
+#    "resolve: <name>"     DaVinci Resolve by its own name: the descriptor
+#                          snapshot, which must equal the generic one.
 # =============================================================================
 if(NOT TARGET OpenOSV)
   message(STATUS "tests/ofx skipped: OSV_BUILD_OFX is OFF")
@@ -46,8 +59,13 @@ add_executable(osv_ofx_tests
   test_ofx_reframe.cpp
   test_ofx_source.cpp
   test_ofx_snapshot.cpp
+  test_ofx_render.cpp
+  test_ofx_vegas.cpp
   "${_osv_reframe_src}/ReframeCpu.cpp"
   "${_osv_reframe_src}/ReframeEasing.cpp"
+  # The module's host classification and CPU pixel loops, tested directly.
+  "${_osv_ofx_src}/OfxHost.cpp"
+  "${_osv_ofx_src}/OfxRender.cpp"
 )
 # ReframeCpu.cpp logs through PluginLog: the SDK-free implementation of
 # each platform, as the module itself compiles it.
@@ -119,5 +137,24 @@ add_dependencies(osv_ofx_tests OpenOSV)
 catch_discover_tests(osv_ofx_tests
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   PROPERTIES SKIP_RETURN_CODE 4
+  DISCOVERY_MODE PRE_TEST
+)
+
+# VEGAS Pro: the hidden [vegas] tests, each in a process whose mock host says
+# it is VEGAS (a different TEST_SPEC gives this registration files of its own).
+catch_discover_tests(osv_ofx_tests
+  TEST_SPEC "[vegas]"
+  TEST_PREFIX "vegas: "
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  PROPERTIES SKIP_RETURN_CODE 4 ENVIRONMENT "OSV_MOCK_OFX_PROFILE=vegas"
+  DISCOVERY_MODE PRE_TEST
+)
+
+# DaVinci Resolve by its own name: the descriptors must be the generic ones.
+catch_discover_tests(osv_ofx_tests
+  TEST_SPEC "[snapshot]"
+  TEST_PREFIX "resolve: "
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  PROPERTIES SKIP_RETURN_CODE 4 ENVIRONMENT "OSV_MOCK_OFX_PROFILE=resolve"
   DISCOVERY_MODE PRE_TEST
 )

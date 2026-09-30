@@ -31,7 +31,12 @@
 //     set OSV_OFX_UPDATE_GOLDEN=1
 //     osv_ofx_tests.exe "[snapshot]"
 //
-// and the diff of the golden file IS the review of that change.
+// and the diff of the golden file IS the review of that change.  VEGAS's
+// descriptors have a golden file of their own (ofx_descriptors_vegas.txt),
+// regenerated the same way in a VEGAS process:
+//
+//     set OSV_MOCK_OFX_PROFILE=vegas
+//     osv_ofx_tests.exe "VEGAS: the descriptors are exactly the VEGAS golden snapshot"
 
 #include "OfxTestSupport.h"
 
@@ -309,9 +314,32 @@ void checkGolden(const std::string& actual, const std::string& name) {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+//  Generic and Resolve: one golden file.  The module treats an unknown host
+//  exactly like Resolve, and ctest runs this test a second time as Resolve
+//  itself ("DaVinciResolveLite", OSV_MOCK_OFX_PROFILE=resolve) to prove it.
+// ---------------------------------------------------------------------------
 TEST_CASE("the descriptors are exactly the golden snapshot", "[ofx][module][snapshot]") {
+    if (MockHost::instance().isVegas()) {
+        SKIP("VEGAS has a snapshot of its own (the [vegas] tests)");
+    }
     Fixture& f = Fixture::get();
     REQUIRE(f.ready);
     checkGolden(snapshot(), "ofx_descriptors_generic.txt");
+    CHECK(MockHost::instance().imagesOut == 0);
+}
+
+// ---------------------------------------------------------------------------
+//  VEGAS: its own golden file, so every VEGAS-only descriptor - depths,
+//  contexts, thread safety, Output Levels, the hidden Choose button, the
+//  clip preferences without a depth - is pinned as completely as Resolve's.
+// ---------------------------------------------------------------------------
+TEST_CASE("VEGAS: the descriptors are exactly the VEGAS golden snapshot", "[ofx][module][.vegas]") {
+    if (!MockHost::instance().isVegas()) {
+        SKIP("needs OSV_MOCK_OFX_PROFILE=vegas (ctest runs it as 'vegas: ...')");
+    }
+    Fixture& f = Fixture::get();
+    REQUIRE(f.ready);
+    checkGolden(snapshot(), "ofx_descriptors_vegas.txt");
     CHECK(MockHost::instance().imagesOut == 0);
 }
