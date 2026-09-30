@@ -810,24 +810,56 @@ function Copy-PluginModules {
 }
 
 # ---------------------------------------------------------------------------
-#  plugins\OpenOSV.ofx.bundle: the OpenFX binary plus its import closure,
-#  taken from the bundle's own Contents\Win64 (the folder its delay-load
-#  hook loads them from), and the OpenFX licence under Contents\Resources.
-#  Anything else in the built bundle - a PDB, a stale DLL - stays out.
+#  plugins\OpenOSV.ofx.bundle, laid out so VEGAS Pro's plug-in scan can
+#  never load anything but the plug-in:
+#
+#    Contents\Win64\OpenOSV.ofx             the ONLY PE file the scan may see
+#    Contents\Libraries\Win64\*.dll         OpenOSV.ofx's import closure
+#    Contents\Libraries\Win64\osvtool.exe   plus osvtool and ITS closure
+#                                           (the VEGAS extension runs it)
+#    Contents\Resources\OpenFX-LICENSE.md
+#
+#  VEGAS loads every *.dll and *.ofx under a bundle's Contents\Win64,
+#  subfolders included; Libraries is a sibling of Win64, so it is not
+#  scanned, and the module's delay-load hook resolves from there
+#  (plugins\common\DelayLoad.h).  Both closures are walked from the built
+#  bundle's own Contents\Libraries\Win64, so a DLL the build did not stage
+#  fails the package here rather than on a user's machine.  Anything else in
+#  the built bundle - a PDB, a stale DLL - stays out.
 # ---------------------------------------------------------------------------
 function Copy-OfxBundle {
     param($Build, [string] $Package)
-    $sourceBin = Join-Path $Build.OfxBundle 'Contents\Win64'
+    $sourceLibs = Join-Path $Build.OfxBundle 'Contents\Libraries\Win64'
+    $sourceWin64 = Join-Path $Build.OfxBundle 'Contents\Win64'
     $target = Join-Path $Package "plugins\$($script:OfxBundleName)"
     $targetBin = Join-Path $target 'Contents\Win64'
+    $targetLibs = Join-Path $target 'Contents\Libraries\Win64'
     $targetRes = Join-Path $target 'Contents\Resources'
+
+    # What the build must have staged: the module, the Libraries folder and
+    # osvtool.exe (the bundle target builds it beside the DLLs).
+    $root = Join-Path $Build.OfxBundle $script:OfxBinary
+    $tool = Join-Path $sourceLibs 'osvtool.exe'
+    if (-not (Test-Path -LiteralPath $sourceLibs -PathType Container)) {
+        throw "The built bundle has no '$sourceLibs'. Build the $($script:Preset) preset completely first."
+    }
+    if (-not (Test-Path -LiteralPath $tool -PathType Leaf)) {
+        throw "The built bundle has no '$tool'. Build the $($script:Preset) preset completely first."
+    }
+
+    # One closure per binary, both searched in the Libraries folder; a DLL
+    # both need is shipped once.
+    $moduleDlls = @(Resolve-DllClosure -Roots @($root) -SearchDir $sourceLibs -Dumpbin $Build.Dumpbin)
+    $toolDlls = @(Resolve-DllClosure -Roots @($tool) -SearchDir $sourceLibs -Dumpbin $Build.Dumpbin)
+    $dlls = @((@($moduleDlls) + @($toolDlls)) | Sort-Object { (Split-Path -Leaf $_).ToLowerInvariant() } -Unique)
+
     New-Directory $targetBin
+    New-Directory $targetLibs
     New-Directory $targetRes
 
-    $root = Join-Path $Build.OfxBundle $script:OfxBinary
-    $dlls = Resolve-DllClosure -Roots @($root) -SearchDir $sourceBin -Dumpbin $Build.Dumpbin
-    foreach ($file in (@($root) + @($dlls))) {
-        Copy-Item -LiteralPath $file -Destination $targetBin -Force
+    Copy-Item -LiteralPath $root -Destination $targetBin -Force
+    foreach ($file in (@($tool) + @($dlls))) {
+        Copy-Item -LiteralPath $file -Destination $targetLibs -Force
     }
     $licence = Join-Path $Build.OfxBundle 'Contents\Resources\OpenFX-LICENSE.md'
     if (-not (Test-Path -LiteralPath $licence -PathType Leaf)) {
@@ -835,13 +867,27 @@ function Copy-OfxBundle {
     }
     Copy-Item -LiteralPath $licence -Destination $targetRes -Force
 
-    $shipped = @((@($root) + @($dlls)) | ForEach-Object { (Split-Path -Leaf $_).ToLowerInvariant() })
-    $left = @(Get-ChildItem -LiteralPath $sourceBin -File |
+    # The rule the whole layout exists for: Contents\Win64 holds exactly
+    # OpenOSV.ofx - no DLL, no PDB, no subfolder with anything in it.
+    $inWin64 = @(Get-ChildItem -LiteralPath $targetBin -Recurse -File | ForEach-Object { $_.Name })
+    if ($inWin64.Count -ne 1 -or $inWin64[0] -ne 'OpenOSV.ofx') {
+        throw "Contents\Win64 of the packaged bundle must hold exactly OpenOSV.ofx (VEGAS Pro loads everything there); it holds: $($inWin64 -join ', ')"
+    }
+
+    $shipped = @((@($tool) + @($dlls)) | ForEach-Object { (Split-Path -Leaf $_).ToLowerInvariant() })
+    $left = @(Get-ChildItem -LiteralPath $sourceLibs -File |
         Where-Object { $shipped -notcontains $_.Name.ToLowerInvariant() })
     foreach ($item in $left) {
-        Write-Info "left out of the bundle (not imported by OpenOSV.ofx): $($item.Name)"
+        Write-Info "left out of the bundle (not imported by OpenOSV.ofx or osvtool.exe): $($item.Name)"
     }
-    Write-Info ("plugins\{0}: OpenOSV.ofx, {1} DLLs" -f $script:OfxBundleName, $dlls.Count)
+    # A leftover in the built Win64 folder is a build-tree matter (the stage
+    # step removes it), but say so: it means the tree is not what was built.
+    $strays = @(Get-ChildItem -LiteralPath $sourceWin64 -File |
+        Where-Object { $_.Name -ne 'OpenOSV.ofx' -and @('.dll', '.exe', '.ofx') -contains $_.Extension.ToLowerInvariant() })
+    foreach ($item in $strays) {
+        Write-Info "left out of the bundle (stray in the build's Contents\Win64): $($item.Name)"
+    }
+    Write-Info ("plugins\{0}: OpenOSV.ofx, osvtool.exe and {1} DLLs in Contents\Libraries\Win64" -f $script:OfxBundleName, $dlls.Count)
     return @($dlls | ForEach-Object { Split-Path -Leaf $_ })
 }
 
@@ -1770,7 +1816,7 @@ function Write-Licenses {
 
     foreach ($dll in @($OfxDlls)) {
         $key = $dll.ToLowerInvariant()
-        $path = "plugins\$($script:OfxBundleName)\Contents\Win64\$dll"
+        $path = "plugins\$($script:OfxBundleName)\Contents\Libraries\Win64\$dll"
         if ($where.ContainsKey($key)) {
             $where[$key] += $path
         }
