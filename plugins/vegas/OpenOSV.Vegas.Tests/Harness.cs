@@ -118,6 +118,9 @@ namespace OpenOSV.Vegas.Tests
         /// <summary>A scratch folder, deleted at the end of the run.</summary>
         public static string Scratch { get; set; }
 
+        /// <summary>ScriptPortal.Vegas.dll to compile the smoke-test script against, or null.</summary>
+        public static string ScriptPortal { get; set; }
+
         /// <summary>A folder of built binaries to scan for local paths (vegas.hygiene), or null.</summary>
         public static string ScanDir { get; set; }
 

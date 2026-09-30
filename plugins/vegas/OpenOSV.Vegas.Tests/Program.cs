@@ -36,6 +36,7 @@ namespace OpenOSV.Vegas.Tests
                         case "--sample": TestContext.SampleOsv = next; ++i; break;
                         case "--filter": filter = next; ++i; break;
                         case "--scan-dir": TestContext.ScanDir = next; ++i; break;
+                        case "--scriptportal": TestContext.ScriptPortal = next; ++i; break;
                         case "--forbid":
                             if (!string.IsNullOrEmpty(next))
                             {
