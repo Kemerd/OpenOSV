@@ -101,6 +101,13 @@ namespace osv::ofx::gpu {
 /// already set) on the GPU, pack into the target's format and read back.
 /// The reframe filter keeps its levels (it moves pixels the host already
 /// levelled), so callers pass OutputLevels::Full in the target.
+///
+/// Only the camera half of `setup` (params, which must be built for the
+/// target's frame size) and the source size it records are read: the source
+/// is uploaded from `source` itself, in its own depth and order.  So an 8-bit
+/// source needs no float copy - buildParams() refuses one that is not
+/// promoted, and reframe::buildView() plus the source's size (buildParams()
+/// is exactly that plus a source description) is the setup to pass.
 [[nodiscard]] bool renderReframeFromHostGpu(const reframe::KernelSetup& setup, const HostImageView& source,
                                             const HostTarget& target, std::string& error) noexcept;
 
