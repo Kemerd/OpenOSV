@@ -33,6 +33,12 @@ namespace osv::ofx::cuda {
 /// the system, so a driver-API call cannot raise a delay-load exception.
 [[nodiscard]] bool driverPresent() noexcept;
 
+/// [WP-V-GPU] driverPresent() AND cuInit() succeeded, so the driver answers
+/// every call - a CurrentContextGuard built afterwards records the real
+/// current context even on the very first GPU frame of the process.
+/// `why` (may be null) receives the reason when false.
+[[nodiscard]] bool driverInitialised(std::string* why = nullptr) noexcept;
+
 /// Launch the reframe kernel on the context current on this thread.
 ///
 /// `sourceRow0` / `dstData` are device pointers (the OsvRgbaSource and the
@@ -47,7 +53,37 @@ namespace osv::ofx::cuda {
 /// modules themselves are NOT unloaded: by then the host may already have
 /// destroyed the contexts they live in, and unloading into a dead context is
 /// undefined behaviour.  Their memory goes with the context.
+///
+/// [WP-V-GPU] It first releases the own-GPU path's device pools
+/// (OfxGpuPipeline.h, releaseDevicePools): their streams, pinned bands and
+/// device buffers, and the modules loaded into the primary contexts they
+/// retain - contexts that are certainly alive, because the pools hold them.
 void releaseModules() noexcept;
+
+// ---------------------------------------------------------------------------
+//  [WP-V-GPU] The own-GPU path's kernels (OfxKernelAbi.h, OfxGpuPipeline.h)
+// ---------------------------------------------------------------------------
+
+/// The fatbin's own-GPU kernels as loaded into one context (CUfunction
+/// handles as void*, so this header needs no cuda.h).  All three are set, or
+/// none is.
+struct OwnKernels {
+    void* viewFloat = nullptr;  ///< OSV_OFX_VIEW_KERNEL_NAME.
+    void* viewByte = nullptr;   ///< OSV_OFX_VIEW_BYTE_KERNEL_NAME.
+    void* equirect = nullptr;   ///< OSV_OFX_EQUIRECT_KERNEL_NAME.
+};
+
+/// The own-GPU kernels for `context` (a CUcontext that is CURRENT on this
+/// thread), loading the embedded fatbin into it on first use - the same
+/// context-id-keyed module cache the reframe kernel uses.  False with
+/// `error` set when the context is null, the fatbin is missing or a kernel
+/// cannot be found.  Thread-safe.
+[[nodiscard]] bool ownKernels(void* context, OwnKernels& out, std::string& error) noexcept;
+
+/// Unload - and forget - every module this cache loaded into `context`.
+/// Only for a context the caller keeps alive (a primary context it retains)
+/// and has current; used when an own-GPU device pool is released.
+void unloadModulesIn(void* context) noexcept;
 
 /// Puts the host's CUDA context back on this thread after our own GPU work.
 ///
