@@ -1,0 +1,111 @@
+{
+  "_fixture": "osvtool probe --json of the sample clip, trimmed to the fields the VEGAS extension reads; camera serial number and local paths removed",
+  "file": "example_footage_dlogm.LRF",
+  "path": "example_footage_dlogm.LRF",
+  "size": 5499809,
+  "container": {
+    "timescale": 30000,
+    "duration": 124160,
+    "durationSeconds": 4.1386666666666665,
+    "tracks": [
+      {
+        "id": 1,
+        "kind": "Video",
+        "entry": "avc1",
+        "handler": "vide",
+        "timescale": 30000,
+        "duration": 124124,
+        "sampleCount": 124,
+        "fps": 29.97002997002997,
+        "width": 2048.0,
+        "height": 1024.0
+      },
+      {
+        "id": 2,
+        "kind": "Audio",
+        "entry": "mp4a",
+        "handler": "soun",
+        "timescale": 48000,
+        "duration": 198656,
+        "sampleCount": 194,
+        "fps": 46.875,
+        "audio": {
+          "channels": 2,
+          "sampleRate": 48000.0,
+          "sampleSize": 16
+        },
+        "width": 0.0,
+        "height": 0.0
+      },
+      {
+        "id": 3,
+        "kind": "Djmd",
+        "entry": "djmd",
+        "handler": "meta",
+        "timescale": 30000,
+        "duration": 124124,
+        "sampleCount": 124,
+        "fps": 29.97002997002997,
+        "width": 0.0,
+        "height": 0.0
+      },
+      {
+        "id": 4,
+        "kind": "Djmd",
+        "entry": "djmd",
+        "handler": "meta",
+        "timescale": 30000,
+        "duration": 124124,
+        "sampleCount": 124,
+        "fps": 29.97002997002997,
+        "width": 0.0,
+        "height": 0.0
+      }
+    ]
+  },
+  "format": {
+    "bitDepth": 8,
+    "cameraModel": "Osmo 360",
+    "colorMode": 19,
+    "colorModeFromMetadata": true,
+    "colorModeName": "DLogM",
+    "digitalFocalLength": 829.3612060546875,
+    "dualFisheye": true,
+    "fps": 29.97002997002997,
+    "lensMode": 0,
+    "lensModeName": "Native",
+    "metaTrackId": 3,
+    "mode": "Lrf",
+    "modeValue": 4,
+    "notes": [
+      "lens order: single 2048x1024 side-by-side track 1: left half = slave (stream 0), right half = master (stream 1); StreamMeta reports stream id 1 (\"video\")"
+    ],
+    "sensorH": 3840,
+    "sensorW": 3840,
+    "sideBySideProxy": true,
+    "streamH": 1024,
+    "streamW": 2048,
+    "videoTrackIds": [
+      1,
+      1
+    ]
+  },
+  "metaTrackId": 3,
+  "frameCount": 124,
+  "clip": {
+    "header": {
+      "clipTimestampUs": 30668353021,
+      "productName": "Osmo 360",
+      "serialNumber": "XXXXXXXXXXXXXX"
+    }
+  },
+  "frames": [
+    {
+      "index": 0,
+      "seq": 0,
+      "streamId": 1,
+      "timestampUs": 30668353021
+    }
+  ],
+  "warnings": []
+}

@@ -1,0 +1,47 @@
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  Copyright 2026 The OpenOSV Contributors
+
+  OpenOSV.Vegas - the VEGAS Pro Application Extension: commands under
+  Tools > Extensions and the "OpenOSV" dock panel under View > Extensions.
+
+  ScriptPortal.Vegas is referenced, never copied:
+    Private=false         VEGAS loads its own copy; shipping ours would pin a
+                          version and could shadow the host's.
+    SpecificVersion=false the reference binds to whatever ScriptPortal.Vegas
+                          the running VEGAS provides (an extension built
+                          against VEGAS 14 runs in 19; one binary serves 16
+                          through the Boris FX releases).
+  Pass -p:OsvVegasScriptPortal=<path to ScriptPortal.Vegas.dll>; CMake finds
+  it (OSV_VEGAS_SCRIPTPORTAL, then the VEGAS Pro and Boris FX install folders).
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>OpenOSV.Vegas</RootNamespace>
+    <AssemblyName>OpenOSV.Vegas</AssemblyName>
+    <!-- VEGAS Pro is 64-bit only. -->
+    <PlatformTarget>x64</PlatformTarget>
+    <OsvVegasScriptPortal Condition="'$(OsvVegasScriptPortal)' == ''">C:\Program Files\VEGAS\VEGAS Pro 17.0\ScriptPortal.Vegas.dll</OsvVegasScriptPortal>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="ScriptPortal.Vegas">
+      <HintPath>$(OsvVegasScriptPortal)</HintPath>
+      <Private>false</Private>
+      <SpecificVersion>false</SpecificVersion>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\OpenOSV.Vegas.Core\OpenOSV.Vegas.Core.csproj" />
+  </ItemGroup>
+
+  <!-- A missing VEGAS is a clear message, not a wall of "type not found". -->
+  <Target Name="OsvCheckScriptPortal" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="!Exists('$(OsvVegasScriptPortal)')"
+           Text="ScriptPortal.Vegas.dll not found at '$(OsvVegasScriptPortal)'. Install VEGAS Pro, or pass -p:OsvVegasScriptPortal=&lt;path&gt; (CMake: -DOSV_VEGAS_SCRIPTPORTAL=&lt;path&gt;)." />
+  </Target>
+</Project>

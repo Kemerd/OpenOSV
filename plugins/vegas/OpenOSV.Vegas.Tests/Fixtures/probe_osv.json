@@ -1,0 +1,147 @@
+{
+  "_fixture": "osvtool probe --json of the sample clip, trimmed to the fields the VEGAS extension reads; camera serial number and local paths removed",
+  "file": "example_footage_dlogm.OSV",
+  "path": "example_footage_dlogm.OSV",
+  "size": 32131999,
+  "container": {
+    "timescale": 60000,
+    "duration": 65280,
+    "durationSeconds": 1.088,
+    "tracks": [
+      {
+        "id": 1,
+        "kind": "Video",
+        "entry": "hvc1",
+        "handler": "vide",
+        "timescale": 60000,
+        "duration": 65065,
+        "sampleCount": 65,
+        "fps": 59.94005994005994,
+        "width": 3000.0,
+        "height": 3000.0
+      },
+      {
+        "id": 2,
+        "kind": "Video",
+        "entry": "hvc1",
+        "handler": "vide",
+        "timescale": 60000,
+        "duration": 65065,
+        "sampleCount": 65,
+        "fps": 59.94005994005994,
+        "width": 3000.0,
+        "height": 3000.0
+      },
+      {
+        "id": 3,
+        "kind": "Audio",
+        "entry": "mp4a",
+        "handler": "soun",
+        "timescale": 48000,
+        "duration": 52224,
+        "sampleCount": 51,
+        "fps": 46.875,
+        "audio": {
+          "channels": 2,
+          "sampleRate": 48000.0,
+          "sampleSize": 16
+        },
+        "width": 0.0,
+        "height": 0.0
+      },
+      {
+        "id": 4,
+        "kind": "Djmd",
+        "entry": "djmd",
+        "handler": "meta",
+        "timescale": 60000,
+        "duration": 65065,
+        "sampleCount": 65,
+        "fps": 59.94005994005994,
+        "width": 0.0,
+        "height": 0.0
+      },
+      {
+        "id": 5,
+        "kind": "Djmd",
+        "entry": "djmd",
+        "handler": "meta",
+        "timescale": 60000,
+        "duration": 65065,
+        "sampleCount": 65,
+        "fps": 59.94005994005994,
+        "width": 0.0,
+        "height": 0.0
+      },
+      {
+        "id": 6,
+        "kind": "Dbgi",
+        "entry": "dbgi",
+        "handler": "meta",
+        "timescale": 60000,
+        "duration": 65065,
+        "sampleCount": 65,
+        "fps": 59.94005994005994,
+        "width": 0.0,
+        "height": 0.0
+      },
+      {
+        "id": 7,
+        "kind": "Dbgi",
+        "entry": "dbgi",
+        "handler": "meta",
+        "timescale": 60000,
+        "duration": 65065,
+        "sampleCount": 65,
+        "fps": 59.94005994005994,
+        "width": 0.0,
+        "height": 0.0
+      }
+    ]
+  },
+  "format": {
+    "bitDepth": 10,
+    "cameraModel": "Osmo 360",
+    "colorMode": 19,
+    "colorModeFromMetadata": true,
+    "colorModeName": "DLogM",
+    "digitalFocalLength": 829.3612060546875,
+    "dualFisheye": true,
+    "fps": 59.94005994005994,
+    "lensMode": 0,
+    "lensModeName": "Native",
+    "metaTrackId": 4,
+    "mode": "K6",
+    "modeValue": 2,
+    "notes": [
+      "lens order: tkhd enabled flag: track 1 (flags 0x3) = slave, track 2 (flags 0x2) = master; StreamMeta reports stream id 0 (\"video\")"
+    ],
+    "sensorH": 3840,
+    "sensorW": 3840,
+    "sideBySideProxy": false,
+    "streamH": 3000,
+    "streamW": 3000,
+    "videoTrackIds": [
+      1,
+      2
+    ]
+  },
+  "metaTrackId": 4,
+  "frameCount": 65,
+  "clip": {
+    "header": {
+      "clipTimestampUs": 30669420766,
+      "productName": "Osmo 360",
+      "serialNumber": "XXXXXXXXXXXXXX"
+    }
+  },
+  "frames": [
+    {
+      "index": 0,
+      "seq": 0,
+      "streamId": 0,
+      "timestampUs": 30669420766
+    }
+  ],
+  "warnings": []
+}
