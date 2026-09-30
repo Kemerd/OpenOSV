@@ -221,11 +221,11 @@ on nothing else - no other code compares host names.
    inside `scripts\vsdev.cmd`, and build with `-j 8`. Logs go to your
    scratchpad. Do not run clang-format (the VS copy disagrees with the repo
    style); wrap long lines by hand.
-4. **Public repository hygiene.** Never mention reverse engineering,
-   decompiling, disassembly, strings pulled from binaries or DJI internals in
-   code, comments, docs or commit messages. Cite VEGAS facts as "VEGAS's
-   OpenFX extension header (ofxSonyVegas.h)", "the VEGAS scripting API" or
-   "observed in VEGAS".
+4. **Public repository hygiene.** Code, comments, docs and commit messages
+   say only what a fact is and where it is documented, never how a binary
+   was looked into. Cite VEGAS facts as "VEGAS's OpenFX extension header
+   (ofxSonyVegas.h)", "the VEGAS scripting API" or "observed in VEGAS"; the
+   maintainer's private release-hygiene list decides the rest.
 
 ## Merge order (the lead)
 
