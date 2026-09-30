@@ -45,6 +45,7 @@ add_executable(osv_ofx_tests
   test_ofx_module.cpp
   test_ofx_reframe.cpp
   test_ofx_source.cpp
+  test_ofx_snapshot.cpp
   "${_osv_reframe_src}/ReframeCpu.cpp"
   "${_osv_reframe_src}/ReframeEasing.cpp"
 )
@@ -107,6 +108,8 @@ if(WIN32)
 else()
   target_compile_definitions(osv_ofx_tests PRIVATE "OSV_OFX_MODULE_PATH=\"$<TARGET_FILE:OpenOSV>\"")
 endif()
+# The descriptor snapshot's golden file (test_ofx_snapshot.cpp).
+target_compile_definitions(osv_ofx_tests PRIVATE OSV_OFX_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden")
 if(OSV_SAMPLE_FILE AND EXISTS "${OSV_SAMPLE_FILE}")
   target_compile_definitions(osv_ofx_tests PRIVATE OSV_OFX_SAMPLE_CLIP="${OSV_SAMPLE_FILE}")
 endif()
