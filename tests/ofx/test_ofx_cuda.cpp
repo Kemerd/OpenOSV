@@ -18,19 +18,24 @@
 #include "OfxTestSupport.h"
 
 #include "OfxCamera.h"
-#include "OfxSource.h"  // [WP-V-GPU] the generator's parameter names
+#include "OfxHostImage.h"    // [WP-V-GPU] VEGAS's formats and levels
+#include "OfxSource.h"       // [WP-V-GPU] the generator's parameter names
+#include "OfxSourceParams.h" // [WP-V-GPU] Output Levels
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cuda.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace osv::ofxtest;
@@ -748,4 +753,293 @@ TEST_CASE("benchmark: the generator's view, CPU framing vs the own GPU path", "[
                       size.w, size.h, cpuMedian, gpuMedian, kFrames, gpuMedian > 0.0 ? cpuMedian / gpuMedian : 0.0);
         WARN(line);
     }
+}
+
+// ---------------------------------------------------------------------------
+//  [WP-V-GPU] ... and as VEGAS Pro drives it: every format, both levels
+//
+//  These need a process whose mock host IS VEGAS (the host profile is fixed
+//  per module load): ctest runs them as "vegas: ..." with
+//  OSV_MOCK_OFX_PROFILE=vegas - and OPENOSV_OFX_GPU=0 for the CPU tests of
+//  that registration, which each test here overrides for its GPU renders.
+//  Started in another process they SKIP.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+#define REQUIRE_VEGAS_AND_CUDA()                                                          \
+    do {                                                                                  \
+        if (!MockHost::instance().isVegas()) {                                            \
+            SKIP("needs OSV_MOCK_OFX_PROFILE=vegas (ctest runs these as 'vegas: ...')");  \
+        }                                                                                 \
+        REQUIRE(Fixture::get().ready);                                                    \
+        std::string whyNoCuda_;                                                           \
+        if (!cudaDeviceUsable(whyNoCuda_)) {                                              \
+            SKIP(whyNoCuda_);                                                             \
+        }                                                                                 \
+    } while (false)
+
+/// One of the four formats VEGAS hands an effect that lists its BGR tokens.
+struct VegasFormat {
+    osv::ofx::HostDepth depth;
+    osv::ofx::HostOrder order;
+};
+constexpr VegasFormat kVegasFormats[] = {
+    {osv::ofx::HostDepth::Byte, osv::ofx::HostOrder::Rgba},
+    {osv::ofx::HostDepth::Byte, osv::ofx::HostOrder::Bgra},
+    {osv::ofx::HostDepth::Float, osv::ofx::HostOrder::Rgba},
+    {osv::ofx::HostDepth::Float, osv::ofx::HostOrder::Bgra},
+};
+
+/// "byte BGRA", for INFO lines.
+std::string vegasFormatName(const VegasFormat& f) {
+    return std::string(osv::ofx::hostDepthName(f.depth)) + " " + osv::ofx::hostOrderName(f.order);
+}
+
+/// The GPU render against the CPU render of the same instance, over `area`:
+/// an 8-bit image within one code, a float one at 60 dB or better (the
+/// transcendental functions differ between the two in the last ulp).
+void checkGpuMatchesCpu(const HostImage& gpu, const HostImage& cpu, const OfxRectI& area) {
+    if (gpu.depth == osv::ofx::HostDepth::Byte) {
+        const double worst = maxDifference(gpu, cpu, area);
+        INFO("largest difference " << worst * 255.0 << " codes");
+        CHECK(worst <= 1.0 / 255.0 + 1.0e-6);
+    } else {
+        const double db = psnr(gpu, cpu, area);
+        INFO("own GPU vs CPU PSNR: " << db << " dB");
+        CHECK(db >= 60.0);
+    }
+}
+
+/// True when every byte of every pixel outside `area` is the same in the two
+/// images (both were filled with the same sentinel before rendering).
+bool sameOutside(const HostImage& a, const HostImage& b, const OfxRectI& area) {
+    for (int y = a.bounds.y1; y < a.bounds.y2; ++y) {
+        for (int x = a.bounds.x1; x < a.bounds.x2; ++x) {
+            if (x >= area.x1 && x < area.x2 && y >= area.y1 && y < area.y2) {
+                continue;
+            }
+            const unsigned char* p = a.rawPixel(x, y);
+            const unsigned char* q = b.rawPixel(x, y);
+            if (!p || !q || std::memcmp(p, q, static_cast<std::size_t>(a.pixelBytes())) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// One VEGAS filter instance: a panorama in `format` on its Source (order
+/// labelled on the image, as VEGAS does), a `format` Output.
+struct VegasFilter {
+    std::unique_ptr<Effect> effect;
+    HostImage source;
+
+    VegasFilter(const VegasFormat& format, bool negativeSource, int padSource, double pan) {
+        OfxStatus st = kOfxStatFailed;
+        effect = Fixture::get().reframe.createInstance(kOfxImageEffectContextFilter, kW, kH, 29.97, &st);
+        REQUIRE(st == kOfxStatOK);
+        effect->params.find(cam::kPan)->d = pan;
+        effect->params.find(cam::kTilt)->d = -14.0;
+        effect->params.find(cam::kDjiFov)->d = 84.0;
+        HostImage painted = makeImage(OfxRectI{0, 0, 512, 256});
+        paintPanorama(painted);
+        source = convertImage(painted, format.depth, format.order, negativeSource, padSource);
+        source.labelOrder = true;
+        Clip* in = effect->clip(kOfxImageEffectSimpleSourceClipName);
+        REQUIRE(in);
+        in->rod = OfxRectD{0, 0, 512, 256};
+        provideImage(*in, source);
+    }
+
+    /// Render `window` into `output` (its storage kept by the caller).
+    OfxStatus render(HostImage& output, const OfxRectI& window, double time = 0.0) {
+        Clip* out = effect->clip(kOfxImageEffectOutputClipName);
+        if (!out) {
+            return kOfxStatErrBadHandle;
+        }
+        provideImage(*out, output);
+        PluginHarness::RenderArgs args;
+        args.time = time;
+        args.window = window;
+        return Fixture::get().reframe.render(*effect, args);
+    }
+};
+
+}  // namespace
+
+TEST_CASE("VEGAS: the own GPU filter frames every format like the CPU path", "[ofx][.vegas][cuda][ofxgpu]") {
+    REQUIRE_VEGAS_AND_CUDA();
+    popAllContexts();
+    const bool primaryWasActive = primaryContextActive();
+    bool gpuRan = false;
+
+    const OfxRectI bounds{0, 0, kW, kH};
+    const OfxRectI windows[] = {bounds, OfxRectI{37, 21, kW - 53, kH - 17}, OfxRectI{-9, -5, kW + 11, kH + 7}};
+    int variant = 0;
+    for (const VegasFormat& format : kVegasFormats) {
+        for (const OfxRectI& window : windows) {
+            // Odd pitches and row orders along the way, source and output apart.
+            const bool negSource = (variant % 2) == 1;
+            const int padSource = (variant % 3) * 4;
+            const bool negOutput = (variant % 4) >= 2;
+            const int padOutput = (variant % 3 == 1) ? 3 : 0;
+            ++variant;
+            INFO(vegasFormatName(format) << ", window " << window.x1 << "," << window.y1 << " - " << window.x2 << ","
+                                         << window.y2 << ", variant " << variant);
+            VegasFilter filter(format, negSource, padSource, 52.0);
+
+            HostImage cpu = makeImage(bounds, negOutput, padOutput, format.depth, format.order);
+            cpu.labelOrder = true;
+            cpu.fill(-7.0f);
+            {
+                GpuSwitch off("0");
+                REQUIRE(filter.render(cpu, window) == kOfxStatOK);
+            }
+            if (!primaryWasActive && !gpuRan) {
+                CHECK_FALSE(primaryContextActive());  // the CPU path never touched the device
+            }
+            HostImage gpu = makeImage(bounds, negOutput, padOutput, format.depth, format.order);
+            gpu.labelOrder = true;
+            gpu.fill(-7.0f);
+            {
+                GpuSwitch on("1");
+                REQUIRE(filter.render(gpu, window) == kOfxStatOK);
+                gpuRan = true;
+            }
+            CHECK(primaryContextActive());
+            CHECK(currentContext() == nullptr);
+            const OfxRectI area = clipRect(window, bounds);
+            checkGpuMatchesCpu(gpu, cpu, area);
+            CHECK(sameOutside(gpu, cpu, area));
+        }
+    }
+    CHECK(MockHost::instance().imagesOut == 0);
+}
+
+TEST_CASE("VEGAS: cloned filter instances render on the GPU at the same time", "[ofx][.vegas][cuda][ofxgpu]") {
+    REQUIRE_VEGAS_AND_CUDA();
+    // VEGAS clones a fully-safe effect once per render thread and renders the
+    // clones concurrently.  More clones than the pipeline has GPU slots per
+    // device, each with its own camera and format, so a slot, stream or
+    // staging band shared by mistake shows up as a wrong picture.
+    constexpr int kClones = 6;
+    constexpr int kRounds = 3;
+    const OfxRectI bounds{0, 0, kW, kH};
+    std::vector<std::unique_ptr<VegasFilter>> clones;
+    std::vector<HostImage> references;
+    std::vector<HostImage> outputs;
+    for (int i = 0; i < kClones; ++i) {
+        const VegasFormat& format = kVegasFormats[i % 4];
+        clones.push_back(std::make_unique<VegasFilter>(format, i % 2 == 1, (i % 3) * 4, -90.0 + 37.0 * i));
+        // The CPU render of each clone first, on this thread.
+        HostImage ref = makeImage(bounds, false, 0, format.depth, format.order);
+        ref.labelOrder = true;
+        ref.fill(-7.0f);
+        {
+            GpuSwitch off("0");
+            REQUIRE(clones.back()->render(ref, bounds) == kOfxStatOK);
+        }
+        references.push_back(std::move(ref));
+        HostImage out = makeImage(bounds, false, 0, format.depth, format.order);
+        out.labelOrder = true;
+        outputs.push_back(std::move(out));
+    }
+
+    // Then every clone at once, on the GPU.  Catch2's assertions are not
+    // thread-safe: the threads only record.
+    std::vector<OfxStatus> statuses(static_cast<std::size_t>(kClones * kRounds), kOfxStatFailed);
+    {
+        GpuSwitch on("1");
+        std::atomic<bool> go{false};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < kClones; ++i) {
+            threads.emplace_back([&, i] {
+                while (!go.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                const std::size_t k = static_cast<std::size_t>(i);
+                for (int r = 0; r < kRounds; ++r) {
+                    outputs[k].fill(-7.0f);
+                    statuses[k * kRounds + static_cast<std::size_t>(r)] = clones[k]->render(outputs[k], bounds);
+                }
+            });
+        }
+        go.store(true, std::memory_order_release);
+        for (std::thread& t : threads) {
+            t.join();
+        }
+    }
+    for (std::size_t k = 0; k < statuses.size(); ++k) {
+        INFO("render " << k);
+        CHECK(statuses[k] == kOfxStatOK);
+    }
+    for (int i = 0; i < kClones; ++i) {
+        INFO("clone " << i << ", " << vegasFormatName(kVegasFormats[i % 4]));
+        const std::size_t k = static_cast<std::size_t>(i);
+        checkGpuMatchesCpu(outputs[k], references[k], bounds);
+    }
+    CHECK(MockHost::instance().imagesOut == 0);
+}
+
+TEST_CASE("VEGAS: the own GPU generator packs every format and level like the CPU path",
+          "[ofx][.vegas][sample][cuda][ofxgpu]") {
+    REQUIRE_VEGAS_AND_CUDA();
+    const std::string clip = sampleClipPath();
+    if (clip.empty()) {
+        SKIP("no sample clip");
+    }
+    // Draft on both sides: no seam search or measured corrections, so the
+    // two stitches are the same pixels (see the view test above).
+    const int modes[] = {osv::ofx::source::kOutputEquirect, osv::ofx::source::kOutputReframed};
+    const osv::ofx::OutputLevels allLevels[] = {osv::ofx::OutputLevels::Full, osv::ofx::OutputLevels::Studio};
+    // The output image larger than the camera frame (the clip's region of
+    // definition), and a window wider than both: the transparent black
+    // outside the frame - studio black under studio levels - is compared too.
+    const OfxRectI bounds{0, 0, 512, 256};
+    const OfxRectD rod{16.0, 8.0, 496.0, 248.0};
+    const OfxRectI window{-8, -4, 520, 260};
+    for (const int mode : modes) {
+        for (const VegasFormat& format : kVegasFormats) {
+            for (const osv::ofx::OutputLevels levels : allLevels) {
+                INFO("output " << mode << ", " << vegasFormatName(format) << " "
+                               << osv::ofx::outputLevelsName(levels));
+                HostImage outputs[2];
+                for (int onGpu = 0; onGpu < 2; ++onGpu) {
+                    OfxStatus st = kOfxStatFailed;
+                    auto effect = Fixture::get().source.createInstance(kOfxImageEffectContextGenerator, bounds.x2,
+                                                                       bounds.y2, 29.97, &st);
+                    REQUIRE(st == kOfxStatOK);
+                    const auto param = [&effect](const char* name) -> Param& {
+                        Param* p = effect->params.find(name);
+                        REQUIRE(p);
+                        return *p;
+                    };
+                    param(osv::ofx::source::kFile).s = clip;
+                    param(osv::ofx::source::kOutput).i = mode;
+                    param(cam::kPan).d = 25.0;
+                    param(osv::ofx::source_params::kOutputLevels).i = static_cast<int>(levels);
+                    Clip* outClip = effect->clip(kOfxImageEffectOutputClipName);
+                    REQUIRE(outClip);
+                    outClip->rod = rod;
+                    HostImage& out = outputs[onGpu];
+                    out = makeImage(bounds, onGpu == 1, onGpu == 1 ? 2 : 0, format.depth, format.order);
+                    out.labelOrder = true;
+                    out.fill(-7.0f);
+                    provideImage(*outClip, out);
+                    PluginHarness::RenderArgs args;
+                    args.time = 4.0;
+                    args.window = window;
+                    args.draft = true;
+                    {
+                        GpuSwitch sw(onGpu == 1 ? "1" : "0");
+                        REQUIRE(Fixture::get().source.render(*effect, args) == kOfxStatOK);
+                    }
+                    (void)Fixture::get().source.destroyInstance(*effect);
+                }
+                checkGpuMatchesCpu(outputs[1], outputs[0], bounds);
+            }
+        }
+    }
+    CHECK(MockHost::instance().imagesOut == 0);
 }

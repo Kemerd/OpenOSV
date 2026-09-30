@@ -177,11 +177,18 @@ endif()
 
 # VEGAS Pro: the hidden [vegas] tests, each in a process whose mock host says
 # it is VEGAS (a different TEST_SPEC gives this registration files of its own).
+# [WP-V-GPU] Under the VEGAS profile the effects frame CPU images on their own
+# GPU by default; these are the CPU paths' tests, so OPENOSV_OFX_GPU=0 keeps
+# them there on an NVIDIA machine too (the GPU path has its own [cuda] tests,
+# which switch it on).  A second property rather than a second ENVIRONMENT
+# entry: Catch's discovery flattens PROPERTIES into one list, which would
+# split an ENVIRONMENT value at its ';'.
 catch_discover_tests(osv_ofx_tests
   TEST_SPEC "[vegas]"
   TEST_PREFIX "vegas: "
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
   PROPERTIES SKIP_RETURN_CODE 4 ENVIRONMENT "OSV_MOCK_OFX_PROFILE=vegas"
+             ENVIRONMENT_MODIFICATION "OPENOSV_OFX_GPU=set:0"
   DISCOVERY_MODE PRE_TEST
 )
 

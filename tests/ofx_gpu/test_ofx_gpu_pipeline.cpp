@@ -11,8 +11,9 @@
 // The reference is what the CPU paths write, built from the SAME pieces they
 // use: an 8-bit source promoted to float exactly as
 // reframe::promoteIntegerToFloat() does (code * (1/255)), the one per-pixel
-// function osvReframeEquirectPixel(), then OfxHostImage.h's applyLevels() and
-// toByte() - the one levels and quantisation definition.  So:
+// function osvReframeEquirectPixel(), then OfxHostImage.h's storeHostPixel()
+// - the one packing rule (levels, depth, order), transparent black outside
+// the camera frame included.  So:
 //
 //   * 8-bit output within +-1 code of the reference (the GPU's atan2f /
 //     asinf differ from the CPU's in the last ulp, which can move a sample
@@ -129,33 +130,24 @@ TestImage makeImage(const OfxRectI& bounds, HostDepth depth, HostOrder order, bo
     return img;
 }
 
-/// Store straight R,G,B,A in the image's depth and order, NO levels (a
+/// Store straight R,G,B,A in the image's depth and order at full levels (a
 /// source image as a host would hold it).
 void storePlain(unsigned char* p, HostDepth depth, HostOrder order, const float rgba[4]) {
-    const float c0 = order == HostOrder::Bgra ? rgba[2] : rgba[0];
-    const float c2 = order == HostOrder::Bgra ? rgba[0] : rgba[2];
-    const float c[4] = {c0, rgba[1], c2, rgba[3]};
-    if (depth == HostDepth::Byte) {
-        for (int i = 0; i < 4; ++i) {
-            p[i] = toByte(c[i]);
-        }
-    } else {
-        std::memcpy(p, c, sizeof(c));
-    }
+    storeHostPixel(p, depth, order, OutputLevels::Full, rgba);
 }
 
-/// Store as the CPU paths store a rendered pixel: levels on R, G, B (alpha
-/// never), then the image's order and depth - OfxHostImage.h's definitions.
+/// Store as the CPU paths store a rendered pixel: OfxHostImage.h's one
+/// packing rule (levels on R, G, B, never alpha; then the depth; then the
+/// order).
 void storeLevelled(unsigned char* p, HostDepth depth, HostOrder order, const float rgba[4], OutputLevels levels) {
-    const float levelled[4] = {applyLevels(rgba[0], levels), applyLevels(rgba[1], levels),
-                               applyLevels(rgba[2], levels), rgba[3]};
-    storePlain(p, depth, order, levelled);
+    storeHostPixel(p, depth, order, levels, rgba);
 }
 
-/// All-zero bytes: the transparent black the contract writes outside the
-/// camera frame.
-void storeClear(unsigned char* p, HostDepth depth) {
-    std::memset(p, 0, static_cast<std::size_t>(bytesPerPixel(depth)));
+/// Transparent black as the CPU paths write it outside the camera frame:
+/// (0, 0, 0, 0) BEFORE levels, so RGB at studio black under studio levels.
+void storeClear(unsigned char* p, HostDepth depth, HostOrder order, OutputLevels levels) {
+    const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    storeHostPixel(p, depth, order, levels, transparent);
 }
 
 /// The test panorama (the same three independent smooth fields as
@@ -237,7 +229,7 @@ OfxRectI intersectRect(const OfxRectI& a, const OfxRectI& b) {
 [[nodiscard]] bool inside(const OfxRectI& r, int x, int y) { return x >= r.x1 && x < r.x2 && y >= r.y1 && y < r.y2; }
 
 /// The CPU view: every pixel of window x bounds, framed from `src` through
-/// osvReframeEquirectPixel(); all-zero outside the camera frame.
+/// osvReframeEquirectPixel(); transparent black outside the camera frame.
 void referenceView(const OsvReframeParams& params, const OsvRgbaSource& src, const void* row0,
                    const HostTarget& target, TestImage& out) {
     const OfxRectI area = intersectRect(target.window, out.bounds);
@@ -245,7 +237,7 @@ void referenceView(const OsvReframeParams& params, const OsvRgbaSource& src, con
         for (int x = area.x1; x < area.x2; ++x) {
             unsigned char* p = out.pixel(x, y);
             if (!inside(target.frame, x, y)) {
-                storeClear(p, out.depth);
+                storeClear(p, out.depth, out.order, target.levels);
                 continue;
             }
             float rgba[4];
@@ -264,7 +256,7 @@ void referenceEquirect(const std::vector<float>& image, int w, int h, const Host
             const int col = x - target.frame.x1;
             const int rowFromTop = target.frame.y2 - 1 - y;
             if (!inside(target.frame, x, y) || col >= w || rowFromTop >= h) {
-                storeClear(p, out.depth);
+                storeClear(p, out.depth, out.order, target.levels);
                 continue;
             }
             const float* texel = image.data() + (static_cast<std::size_t>(rowFromTop) * w + col) * 4u;
