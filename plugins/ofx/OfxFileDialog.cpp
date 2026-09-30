@@ -3,7 +3,9 @@
 //
 // OfxFileDialog.cpp - the Windows Open dialog behind "Choose .OSV File...",
 // and the path clean-up both platforms share.  The macOS panel is in
-// OfxFileDialogMac.mm.
+// OfxFileDialogMac.mm.  The dialog's owner is the host's own window when the
+// host names one (VEGAS Pro's "OfxPropVegasHostHWnd"), else the active
+// window (DaVinci Resolve).
 
 #include "OfxFileDialog.h"
 
@@ -89,7 +91,7 @@ std::string cleanPath(std::string text) {
 }
 
 #if defined(_WIN32)
-std::optional<std::string> chooseOsvFile(const std::string& startPath) noexcept {
+std::optional<std::string> chooseOsvFile(const std::string& startPath, void* ownerWindow) noexcept {
     try {
         // Room for any path Windows can hand back (long paths included).
         std::vector<wchar_t> buffer(32768, L'\0');
@@ -113,9 +115,19 @@ std::optional<std::string> chooseOsvFile(const std::string& startPath) noexcept 
 
         OPENFILENAMEW ofn{};
         ofn.lStructSize = sizeof(ofn);
-        // The host's active window owns the dialog, so it stays on top of
-        // the host and blocks it like any modal dialog.
-        ofn.hwndOwner = ::GetActiveWindow() ? ::GetActiveWindow() : ::GetForegroundWindow();
+        // The host's window owns the dialog, so it stays on top of the host
+        // and blocks it like any modal dialog: the one the host names, when
+        // it is still a live window, else the active one.
+        HWND owner = static_cast<HWND>(ownerWindow);
+        if (owner && !::IsWindow(owner)) {
+            PluginLog::warn("ofx source: the host's window handle is not a window; the active window owns the "
+                            "Open dialog instead");
+            owner = nullptr;
+        }
+        if (!owner) {
+            owner = ::GetActiveWindow() ? ::GetActiveWindow() : ::GetForegroundWindow();
+        }
+        ofn.hwndOwner = owner;
         ofn.lpstrFilter = kFilter;
         ofn.nFilterIndex = 1;
         ofn.lpstrFile = buffer.data();

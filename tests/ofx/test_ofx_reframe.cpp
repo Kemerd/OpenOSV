@@ -235,6 +235,34 @@ TEST_CASE("the filter asks for the whole source whatever it renders", "[ofx][ref
     CHECK(roi.y2 == 256.0);
 }
 
+TEST_CASE("outside VEGAS an 8-bit or B G R A image is refused, as it always was", "[ofx][reframe]") {
+    REQUIRE(Fixture::get().ready);
+    if (MockHost::instance().isVegas()) {
+        SKIP("VEGAS accepts these (the [vegas] tests)");
+    }
+    // An 8-bit output: the filter declares float only, so it refuses and
+    // writes nothing.
+    {
+        ReframeRig rig;
+        rig.output = makeImage(rig.frame, false, 0, osv::ofx::HostDepth::Byte, osv::ofx::HostOrder::Rgba);
+        rig.output.fill(-7.0f);
+        CHECK(rig.render() == kOfxStatErrImageFormat);
+        CHECK(rig.output.rawPixel(5, 5)[0] == HostImage::kByteSentinel);
+    }
+    // A pixel-order label is not even read: a float image that says B G R A
+    // is framed as the R G B A image every host but VEGAS hands out.
+    {
+        ReframeRig plain;
+        REQUIRE(plain.render() == kOfxStatOK);
+        ReframeRig labelled;
+        labelled.source.order = osv::ofx::HostOrder::Bgra;
+        labelled.source.labelOrder = true;
+        REQUIRE(labelled.render() == kOfxStatOK);
+        CHECK(maxDifference(plain.output, labelled.output, plain.frame) == 0.0);
+    }
+    CHECK(MockHost::instance().imagesOut == 0);
+}
+
 TEST_CASE("a source without a picture renders transparent black", "[ofx][reframe]") {
     REQUIRE(Fixture::get().ready);
     ReframeRig rig;

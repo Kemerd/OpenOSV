@@ -130,6 +130,20 @@ TEST_CASE("host time maps to clip frames through seconds", "[ofx][source]") {
     CHECK(src::frameForTime(std::nan(""), 0.0, 25.0, 25.0, 0) < 0);
 }
 
+TEST_CASE("a field render's x.5 time shows the right clip frame", "[ofx][source]") {
+    // VEGAS gives a generator frames local to its event, from 0, and asks
+    // for the second field of a field render at x.5.  At the timeline's own
+    // rate that is still frame x ...
+    CHECK(src::frameForTime(0.5, 0.0, 25.0, 25.0, 0) == 0);
+    CHECK(src::frameForTime(12.5, 0.0, 30000.0 / 1001.0, 30000.0 / 1001.0, 0) == 12);
+    // ... and on a clip shot at twice the timeline's rate it is the frame
+    // between x and x + 1: the second field's own moment.
+    CHECK(src::frameForTime(0.5, 0.0, 25.0, 50.0, 0) == 1);
+    CHECK(src::frameForTime(12.5, 0.0, 30000.0 / 1001.0, 60000.0 / 1001.0, 0) == 25);
+    // Start Frame still slides the clip underneath.
+    CHECK(src::frameForTime(12.5, 0.0, 30000.0 / 1001.0, 30000.0 / 1001.0, 100) == 112);
+}
+
 // ===========================================================================
 //  Without a usable clip
 // ===========================================================================

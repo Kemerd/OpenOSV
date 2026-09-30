@@ -172,4 +172,105 @@ inline constexpr float kStudioSpan = 219.0f / 255.0f;
     return static_cast<std::uint8_t>(value * 255.0f + 0.5f);
 }
 
+// ===========================================================================
+//  One pixel in and out of a host image - the packing rule every CPU writer
+//  shares (OfxRender.cpp), and the one the GPU pack kernels must reproduce
+// ===========================================================================
+// A render produces straight R, G, B, A floats at FULL range.  Storing one
+// in a host image is always the same three steps, in this order:
+//
+//   1. levels:  applyLevels() on R, G and B - never on alpha;
+//   2. depth:   Float keeps the floats as they are, Byte goes through
+//               toByte() (clamp, round to nearest, NaN -> 0);
+//   3. order:   Rgba stores R, G, B, A; Bgra stores B, G, R, A.
+//
+// Transparent black is no exception: it is (0, 0, 0, 0) BEFORE levels, so
+// a Studio-levels image stores it as (16/255, 16/255, 16/255, 0) - code 16
+// in a Byte image - wherever the effects write it (outside the camera frame,
+// before or after the clip, a missing source).  Alpha 0 keeps it invisible
+// wherever the host composites; the RGB stays at studio black for a host
+// that does not.
+//
+// Reading is the exact inverse of the depth step (codes * 1/255, the same
+// scale reframe::promoteIntegerToFloat() uses), without levels: the reframe
+// filter moves pixels the host has already levelled.
+
+/// Short name of a depth, for logs ("byte", "float").
+[[nodiscard]] constexpr const char* hostDepthName(HostDepth depth) noexcept {
+    return depth == HostDepth::Byte ? "byte" : "float";
+}
+
+/// Short name of a channel order, for logs ("RGBA", "BGRA").
+[[nodiscard]] constexpr const char* hostOrderName(HostOrder order) noexcept {
+    return order == HostOrder::Bgra ? "BGRA" : "RGBA";
+}
+
+/// Short name of an output levels choice, for logs ("full", "studio").
+[[nodiscard]] constexpr const char* outputLevelsName(OutputLevels levels) noexcept {
+    return levels == OutputLevels::Studio ? "studio" : "full";
+}
+
+/// Store the straight, full-range RGBA float quadruple `rgba` as one pixel
+/// of a `depth` / `order` host image at `dst`, in `levels` (see above).
+/// `dst` must address one whole pixel (bytesPerPixel(depth) bytes); a null
+/// `dst` or `rgba` writes nothing.  A Float pixel is stored as four floats,
+/// so `dst` must then be float-aligned, which every host image pixel is.
+inline void storeHostPixel(void* dst, HostDepth depth, HostOrder order, OutputLevels levels,
+                           const float rgba[4]) noexcept {
+    if (!dst || !rgba) {
+        return;
+    }
+    // Step 1: levels on colour, never on coverage.
+    const float r = applyLevels(rgba[0], levels);
+    const float g = applyLevels(rgba[1], levels);
+    const float b = applyLevels(rgba[2], levels);
+    const float a = rgba[3];
+    // Step 3's order decides which colour lands in slot 0 and which in slot 2.
+    const float first = (order == HostOrder::Bgra) ? b : r;
+    const float third = (order == HostOrder::Bgra) ? r : b;
+    // Step 2: the depth's own storage.
+    if (depth == HostDepth::Byte) {
+        std::uint8_t* out = static_cast<std::uint8_t*>(dst);
+        out[0] = toByte(first);
+        out[1] = toByte(g);
+        out[2] = toByte(third);
+        out[3] = toByte(a);
+        return;
+    }
+    float* out = static_cast<float*>(dst);
+    out[0] = first;
+    out[1] = g;
+    out[2] = third;
+    out[3] = a;
+}
+
+/// Read one pixel of a `depth` / `order` host image at `src` as straight RGBA
+/// floats (byte codes * 1/255, no levels: see above).  A null `src` or `rgba`
+/// reads nothing.
+inline void loadHostPixel(const void* src, HostDepth depth, HostOrder order, float rgba[4]) noexcept {
+    if (!src || !rgba) {
+        return;
+    }
+    float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (depth == HostDepth::Byte) {
+        // Multiplying by the reciprocal, exactly as the promotion does, so a
+        // test reference built here matches the promoted source bit for bit.
+        const std::uint8_t* in = static_cast<const std::uint8_t*>(src);
+        constexpr float kScale = 1.0f / 255.0f;
+        for (int i = 0; i < 4; ++i) {
+            c[i] = static_cast<float>(in[i]) * kScale;
+        }
+    } else {
+        const float* in = static_cast<const float*>(src);
+        for (int i = 0; i < 4; ++i) {
+            c[i] = in[i];
+        }
+    }
+    // Slot 0 holds blue in a BGRA image.
+    rgba[0] = (order == HostOrder::Bgra) ? c[2] : c[0];
+    rgba[1] = c[1];
+    rgba[2] = (order == HostOrder::Bgra) ? c[0] : c[2];
+    rgba[3] = c[3];
+}
+
 }  // namespace osv::ofx
