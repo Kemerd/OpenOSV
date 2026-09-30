@@ -160,6 +160,15 @@ if(OSV_BUILD_OFX)
   if(OSV_BUILD_TESTS)
     add_subdirectory(tests/ofx)
   endif()
+  # The VEGAS Pro Application Extension (plugins/vegas, docs/VEGAS.md) drives
+  # the bundle's generator through VEGAS's scripting API.  plugins/ adds it
+  # already when the Premiere plug-ins are built; a build without them (CI's
+  # ci-windows) adds it here, so its Core library and tests run everywhere.
+  # The global flag keeps the directory from being added twice.
+  get_property(_osv_vegas_added GLOBAL PROPERTY OSV_VEGAS_EXTENSION_ADDED)
+  if(WIN32 AND NOT _osv_vegas_added)
+    add_subdirectory(plugins/vegas)
+  endif()
 endif()
 
 # -----------------------------------------------------------------------------
