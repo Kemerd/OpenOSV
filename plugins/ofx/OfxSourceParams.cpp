@@ -2,7 +2,8 @@
 // Copyright 2026 The OpenOSV Contributors
 //
 // OfxSourceParams.cpp - the OpenOSV Source generator's stitching and colour
-// controls (OfxSourceParams.h).
+// controls (OfxSourceParams.h): the list every host shares, plus Output
+// Levels under VEGAS Pro.
 
 #include "OfxSourceParams.h"
 
@@ -41,7 +42,7 @@ constexpr bool kStatic = false;
 //  describe
 // ===========================================================================
 
-void describe(OfxParamSetHandle set) noexcept {
+void describe(OfxParamSetHandle set, HostProfile profile) noexcept {
     if (!set) {
         return;
     }
@@ -54,6 +55,19 @@ void describe(OfxParamSetHandle set) noexcept {
                   "for HDR, or D-Log M to grade from the camera's log with your own LUT.",
                   kColourGroup, kStatic},
                  OSV_SS_COLOR_ITEMS, kColorOutputDefault0);
+    // VEGAS only: the levels the finished pixels are packed in, right under
+    // the encoding it qualifies.  VEGAS never level-converts a generator's
+    // output, and no OpenFX property says which levels the project uses, so
+    // the choice is the user's - or the VEGAS extension's, which reads the
+    // project's pixel format and sets it by name.
+    if (profile == HostProfile::Vegas) {
+        defineChoice(set, kOutputLevels,
+                     {"Output Levels",
+                      "Studio RGB for 8-bit and 32-bit video-levels projects, Full range for 32-bit full-range "
+                      "projects. VEGAS never converts a generator's levels, so pick the one your project uses.",
+                      kColourGroup, kStatic},
+                     kOutputLevelsItems, kOutputLevelsDefault0);
+    }
     // [WP-HDRTONE] How D-Log M becomes PQ / HLG display light, right under
     // the output it shapes, with the hint Premiere's panel cannot show.
     defineChoice(set, kHdrTone, {OSV_SS_HDR_TONE_NAME, OSV_SS_HDR_TONE_HINT, kColourGroup, kStatic},
@@ -220,11 +234,34 @@ ControlValues read(OfxParamSetHandle set, OfxTime time) noexcept {
     return c;
 }
 
+OutputLevels outputLevelsAt(OfxParamSetHandle set, OfxTime time, HostProfile profile) noexcept {
+    // Outside VEGAS there is no control, and the output is what it always
+    // was: full range.
+    if (profile != HostProfile::Vegas) {
+        return OutputLevels::Full;
+    }
+    // The control is static, but a keyframe-capable host still answers per
+    // time; anything but a known item keeps the documented default.
+    const int item = intAt(set, kOutputLevels, time, kOutputLevelsDefault0);
+    if (item == static_cast<int>(OutputLevels::Full)) {
+        return OutputLevels::Full;
+    }
+    if (item == static_cast<int>(OutputLevels::Studio)) {
+        return OutputLevels::Studio;
+    }
+    PluginLog::oncef("ofx/source/levels-item", PluginLog::Level::Warn,
+                     "ofx source: Output Levels reads {}, not an item; using Studio RGB", item);
+    return static_cast<OutputLevels>(kOutputLevelsDefault0);
+}
+
 bool owns(const char* name) noexcept {
     if (!name) {
         return false;
     }
     const std::string_view n(name);
+    if (n == kOutputLevels) {
+        return true;  // VEGAS only, but ours wherever it exists
+    }
     for (const char* p : kAllParams) {
         if (n == p) {
             return true;

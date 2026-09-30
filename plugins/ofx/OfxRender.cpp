@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// OfxRender.cpp - camera frames and the CPU pixel loop (OfxRender.h).
+// OfxRender.cpp - camera frames and the CPU pixel loops (OfxRender.h).
+//
+// Each loop has two bodies: the "native" one for a float RGBA target at full
+// levels - Resolve's only format, written with exactly the stores it always
+// was - and the general one for everything VEGAS can hand out, which packs
+// every pixel through storeHostPixel() (OfxHostImage.h).  The format is
+// decided once per call, never per pixel.
 
 #include "OfxRender.h"
 
@@ -10,6 +16,31 @@
 #include <cstring>
 
 namespace osv::ofx {
+
+namespace {
+
+/// True when a target takes the effects' own pixels unchanged: 32-bit float
+/// R, G, B, A at full levels.  Such a target is written with plain float
+/// stores (or one memcpy per row), bit for bit what every build before VEGAS
+/// support wrote.
+[[nodiscard]] bool nativeTarget(const HostImageView& dst, OutputLevels levels) noexcept {
+    return dst.depth == HostDepth::Float && dst.order == HostOrder::Rgba && levels == OutputLevels::Full;
+}
+
+/// Run `body(row)` for `rows` rows on `pool`, or on this thread when there
+/// is no pool.  False when the pool reports a failure.
+template <class Body>
+bool forEachRow(std::size_t rows, std::size_t grain, ThreadPool* pool, const Body& body) noexcept {
+    if (pool) {
+        return pool->parallelRows(rows, grain, body).ok();
+    }
+    for (std::size_t r = 0; r < rows; ++r) {
+        body(r);
+    }
+    return true;
+}
+
+}  // namespace
 
 OfxRectI intersect(const OfxRectI& a, const OfxRectI& b) noexcept {
     OfxRectI r;
@@ -67,9 +98,9 @@ OfxRectI cameraFrame(OfxImageClipHandle clip, OfxTime time, double sx, double sy
     return frame;
 }
 
-reframe::ConstFrameView sourceView(const ClipImage& image) noexcept {
+reframe::ConstFrameView sourceView(const HostImageView& image) noexcept {
     reframe::ConstFrameView view;
-    if (!image.valid()) {
+    if (!image.usable()) {
         return view;
     }
     // The data pointer is the BOTTOM row (y up), so the frame is described
@@ -79,62 +110,132 @@ reframe::ConstFrameView sourceView(const ClipImage& image) noexcept {
     view.rowBytes = image.rowBytes;
     view.width = image.width();
     view.height = image.height();
-    // Four 32-bit floats per pixel; the channel ORDER is fixed up by the
-    // caller (isBgra = 0) once the setup is built.
-    view.layout = reframe::PixelLayout::Bgra32f;
+    // Four samples per pixel either way; the layout carries only the SAMPLE
+    // TYPE.  The channel ORDER is fixed up by the caller (isBgra) once the
+    // setup is built, and an 8-bit source is promoted to float first.
+    view.layout = image.depth == HostDepth::Byte ? reframe::PixelLayout::Bgra8u : reframe::PixelLayout::Bgra32f;
     view.topDown = false;
     return view;
 }
 
-bool renderReframeCpu(const reframe::KernelSetup& setup, const ClipImage& dst, const OfxRectI& window,
-                      const OfxRectI& frame, ThreadPool* pool) noexcept {
-    if (!setup.valid || !setup.sourceRow0 || !dst.isFloatRgba(true) || empty(frame)) {
+bool renderReframeCpu(const reframe::KernelSetup& setup, const HostImageView& dst, const OfxRectI& window,
+                      const OfxRectI& frame, OutputLevels levels, ThreadPool* pool) noexcept {
+    if (!setup.valid || !setup.sourceRow0 || !dst.usable() || empty(frame)) {
         return false;
     }
     const OfxRectI area = intersect(window, dst.bounds);
     if (empty(area)) {
         return true;  // nothing of the window lies inside the image
     }
+    const bool native = nativeTarget(dst, levels);
+    const int pixelBytes = dst.pixelBytes();
 
     // One row per task: a 4K row is thousands of kernel evaluations, far
     // more than the cost of taking a chunk from the pool's queue.
     const auto renderRow = [&](std::size_t index) noexcept {
         const int y = area.y1 + static_cast<int>(index);
         const int camY = frame.y2 - 1 - y;
-        char* row = static_cast<char*>(dst.data) +
-                    static_cast<std::ptrdiff_t>(y - dst.bounds.y1) * static_cast<std::ptrdiff_t>(dst.rowBytes);
-        float* texel = reinterpret_cast<float*>(row) + static_cast<std::ptrdiff_t>(area.x1 - dst.bounds.x1) * 4;
-        for (int x = area.x1; x < area.x2; ++x, texel += 4) {
-            // Straight RGBA from the shared per-pixel function; pixels off
-            // the camera frame come back transparent black.
-            osvReframeEquirectPixel(&setup.params, &setup.source, setup.sourceRow0, x - frame.x1, camY, texel);
+        char* pixel = dst.pixel(area.x1, y);
+        if (native) {
+            // Straight RGBA from the shared per-pixel function, straight into
+            // the host's floats; pixels off the camera frame come back
+            // transparent black.
+            float* texel = reinterpret_cast<float*>(pixel);
+            for (int x = area.x1; x < area.x2; ++x, texel += 4) {
+                osvReframeEquirectPixel(&setup.params, &setup.source, setup.sourceRow0, x - frame.x1, camY, texel);
+            }
+            return;
+        }
+        // Any other format: the same function into a register-sized
+        // quadruple, then the one packing rule (levels, depth, order).
+        float rgba[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int x = area.x1; x < area.x2; ++x, pixel += pixelBytes) {
+            osvReframeEquirectPixel(&setup.params, &setup.source, setup.sourceRow0, x - frame.x1, camY, rgba);
+            storeHostPixel(pixel, dst.depth, dst.order, levels, rgba);
         }
     };
 
     const std::size_t rows = static_cast<std::size_t>(area.y2 - area.y1);
-    if (pool) {
-        return pool->parallelRows(rows, 1, renderRow).ok();
+    return forEachRow(rows, 1, pool, renderRow);
+}
+
+bool copyStitchedFrame(const render::ImageRGBAf& image, const HostImageView& dst, const OfxRectI& window,
+                       const OfxRectI& frame, OutputLevels levels, ThreadPool* pool) noexcept {
+    if (!dst.usable() || empty(frame)) {
+        return false;
     }
-    for (std::size_t r = 0; r < rows; ++r) {
-        renderRow(r);
+    // The stitch was asked for at exactly the frame's size; anything else
+    // would make the row arithmetic below read outside the image.
+    const long long frameW = static_cast<long long>(frame.x2) - frame.x1;
+    const long long frameH = static_cast<long long>(frame.y2) - frame.y1;
+    if (static_cast<long long>(image.w) != frameW || static_cast<long long>(image.h) != frameH ||
+        image.data.size() < static_cast<std::size_t>(frameW) * static_cast<std::size_t>(frameH) * 4u) {
+        return false;
     }
+
+    // Output pixels outside the frame (a window wider than the RoD) are
+    // transparent black; the frame's own pixels are overwritten below.
+    clearCpu(dst, window, levels);
+    const OfxRectI area = intersect(intersect(window, dst.bounds), frame);
+    if (empty(area)) {
+        return true;
+    }
+    const bool native = nativeTarget(dst, levels);
+    const int pixelBytes = dst.pixelBytes();
+    const std::size_t nativeBytes = static_cast<std::size_t>(area.x2 - area.x1) * 16u;
+
+    const auto copyRow = [&](std::size_t index) noexcept {
+        const int y = area.y1 + static_cast<int>(index);
+        // The stitched image is top-down; OpenFX rows count up.
+        const std::uint32_t imageRow = static_cast<std::uint32_t>(frame.y2 - 1 - y);
+        const float* src = image.row(imageRow);
+        if (!src) {
+            return;
+        }
+        src += static_cast<std::ptrdiff_t>(area.x1 - frame.x1) * 4;
+        char* out = dst.pixel(area.x1, y);
+        if (native) {
+            std::memcpy(out, src, nativeBytes);  // the stitch IS the host format
+            return;
+        }
+        for (int x = area.x1; x < area.x2; ++x, src += 4, out += pixelBytes) {
+            storeHostPixel(out, dst.depth, dst.order, levels, src);
+        }
+    };
+    const std::size_t rows = static_cast<std::size_t>(area.y2 - area.y1);
+    (void)forEachRow(rows, 8, pool, copyRow);
     return true;
 }
 
-void clearCpu(const ClipImage& dst, const OfxRectI& window) noexcept {
-    if (!dst.isFloatRgba(true)) {
+void clearCpu(const HostImageView& dst, const OfxRectI& window, OutputLevels levels) noexcept {
+    if (!dst.usable()) {
         return;
     }
     const OfxRectI area = intersect(window, dst.bounds);
     if (empty(area)) {
         return;
     }
-    const std::size_t bytes = static_cast<std::size_t>(area.x2 - area.x1) * 16u;
+    const int pixelBytes = dst.pixelBytes();
+    const std::size_t rowBytes = static_cast<std::size_t>(area.x2 - area.x1) * static_cast<std::size_t>(pixelBytes);
+
+    // Full levels: transparent black is all-zero bytes in every depth and
+    // order, so each row is one memset.
+    if (levels == OutputLevels::Full) {
+        for (int y = area.y1; y < area.y2; ++y) {
+            std::memset(dst.pixel(area.x1, y), 0, rowBytes);
+        }
+        return;
+    }
+    // Studio levels: black sits at 16/255, so one packed pixel is built and
+    // repeated along the row.
+    alignas(16) unsigned char packed[16] = {};
+    const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    storeHostPixel(packed, dst.depth, dst.order, levels, transparent);
     for (int y = area.y1; y < area.y2; ++y) {
-        char* row = static_cast<char*>(dst.data) +
-                    static_cast<std::ptrdiff_t>(y - dst.bounds.y1) * static_cast<std::ptrdiff_t>(dst.rowBytes) +
-                    static_cast<std::ptrdiff_t>(area.x1 - dst.bounds.x1) * 16;
-        std::memset(row, 0, bytes);
+        char* out = dst.pixel(area.x1, y);
+        for (int x = area.x1; x < area.x2; ++x, out += pixelBytes) {
+            std::memcpy(out, packed, static_cast<std::size_t>(pixelBytes));
+        }
     }
 }
 

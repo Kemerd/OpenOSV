@@ -12,10 +12,12 @@
 //   0  "OpenOSV 360 Reframe"  (org.openosv.Open360Reframe) - a filter
 //   1  "OpenOSV Source"    (org.openosv.OSVSource)      - a generator
 //
-// The host sees two plug-ins and loads each separately (kOfxActionLoad per
-// plug-in), so the module-wide state - the log, the suites, the importer
-// engine's renderers and decoders - is reference counted: set up on the
-// first load, torn down on the last unload.
+// The host - DaVinci Resolve or VEGAS Pro - sees two plug-ins and loads each
+// separately (kOfxActionLoad per plug-in), so the module-wide state - the
+// log, the suites, the importer engine's renderers and decoders - is
+// reference counted: set up on the first load, torn down on the last
+// unload.  The first load also logs the host's self-description and the
+// host profile (OfxHost.h) every host-specific choice keys on.
 //
 // Every entry point is noexcept and catches everything: an exception
 // unwinding into the host's C call stack takes the host down with it, and a
@@ -67,6 +69,10 @@ OfxStatus moduleLoad() noexcept {
     }
     ++g_loadCount;
     PluginLog::info("OpenOSV {} OpenFX module loaded by '{}'", osv::Version::string(), osv::ofx::hostName());
+    // What the host says it can do, and the profile the effects adapt to:
+    // written once per module load, so a report from Resolve or VEGAS
+    // carries everything needed to explain a format or thread-safety choice.
+    osv::ofx::logHostDescription();
     return kOfxStatOK;
 }
 
