@@ -126,7 +126,10 @@ structs, duplicated helpers, docs), then install for the user to test.
 
 # Round 2 - VEGAS Pro (branch `vegas_pro`)
 
-**Status (2026-09-29): in progress.** Six agents bring OpenOSV to VEGAS Pro.
+**Status (2026-09-29): merged into `vegas_pro`.** All six packages are in,
+each merge followed by a build and the CPU test subsets; the GPU tests and
+the first live run in VEGAS Pro are still to come. Six agents brought
+OpenOSV to VEGAS Pro.
 Each works in its own git worktree, on a branch cut from `vegas_pro`. The
 ground rules, build recipe and final report of round 1 above still apply;
 this section adds what is different. Once `docs/VEGAS.md` exists it
