@@ -43,7 +43,7 @@ namespace OpenOSV.Vegas.Core
         public string SkipReason { get; internal set; }
 
         /// <summary>File name for messages.</summary>
-        public string Name => ProbeResult.SafeFileName(ChosenPath ?? string.Empty);
+        public string Name => ProbeResult.FileNameOf(ChosenPath ?? string.Empty);
     }
 
     /// <summary>The import rules.</summary>

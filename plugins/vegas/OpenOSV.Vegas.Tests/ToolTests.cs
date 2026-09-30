@@ -139,8 +139,17 @@ namespace OpenOSV.Vegas.Tests
                 Check.True(wav.IsWav, "a WAV");
                 Check.True(wav.Wav.IsFloat32, "32-bit float");
                 Check.True(wav.Wav.DurationSeconds > 0.5, "has length");
+                // Sample-exact: as many frames as the probe says the track holds.
+                ProbeResult probe = tool.Probe(TestContext.SampleOsv, CancellationToken.None, out _);
+                if (probe != null && probe.AudioSampleCount > 0)
+                {
+                    Check.Equal(probe.AudioSampleCount, wav.Wav.Frames, "WAV frames = the probe's audio sample count");
+                    Check.Equal(probe.AudioChannels, wav.Wav.Channels, "channels");
+                    Check.Equal(probe.AudioSampleRate, wav.Wav.SampleRate, "sample rate");
+                }
                 AudioExtraction again = tool.ExtractWav(TestContext.SampleOsv, cache, 2.0, CancellationToken.None);
                 Check.True(again.FromCache, "reused the second time");
+                Console.WriteLine("        note: WAV path (" + wav.Wav.Frames + " frames, " + wav.Wav.Channels + " ch, " + wav.Wav.SampleRate + " Hz)");
                 return;
             }
             Check.True(wav.WavUnsupported, "an osvtool without WAV support is recognised (" + wav.Error + ")");

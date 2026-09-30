@@ -119,33 +119,48 @@ namespace OpenOSV.Vegas.Tests
         }
 
         /// <summary>
-        /// The flat layout WP-V-CLI adds (docs/PARALLEL_WORK.md), filled with the
-        /// same clip's real numbers taken from the fixture above, and with a
-        /// fractional-looking fps to prove the rational wins over the double.
+        /// The flat stable subset of schema "openosv.probe/1" (WP-V-CLI's
+        /// `probe --json -`), real output trimmed to those keys alone: the
+        /// same clip must read exactly as it does from the older layout.
         /// </summary>
         [Test]
         public static void ReadsTheFlatSummaryLayout()
         {
-            ProbeResult real = ProbeResult.Parse(TestContext.Fixture("probe_osv.json"), null, out _);
-            var w = new JsonWriter();
-            w.BeginObject()
-             .Value("path", "example_footage_dlogm.OSV")
-             .Value("frameCount", real.FrameCount)
-             .BeginObject("fps").Value("num", real.Fps.Num).Value("den", real.Fps.Den).Value("value", real.Fps.Value).EndObject()
-             .Value("durationSeconds", real.DurationSeconds)
-             .Value("streamW", real.StreamWidth).Value("streamH", real.StreamHeight)
-             .Value("mode", real.Mode).Value("colorModeName", real.ColorModeName)
-             .Value("hasAudio", true)
-             .BeginObject("audio").Value("sampleRate", real.AudioSampleRate).Value("channels", real.AudioChannels).EndObject()
-             .Value("isLrf", false)
-             .EndObject();
-            ProbeResult p = ProbeResult.Parse("wrote -\n" + w, null, out string err);
-            Check.NotNull(p, "flat: " + err);
-            Check.Equal(real.Fps, p.Fps, "rational fps");
-            Check.Equal(real.FrameCount, p.FrameCount, "frames");
-            Check.Equal(real.SphereWidth, p.SphereWidth, "sphere");
-            Check.Equal(real.AudioChannels, p.AudioChannels, "channels");
-            Check.Near(real.DurationSeconds, p.DurationSeconds, 1e-12, "duration");
+            foreach (string pair in new[] { "osv", "lrf" })
+            {
+                ProbeResult nested = ProbeResult.Parse(TestContext.Fixture("probe_" + pair + ".json"), null, out _);
+                ProbeResult flat = ProbeResult.Parse(TestContext.Fixture("probe_" + pair + "_v1.json"), null, out string err);
+                Check.NotNull(flat, pair + " flat: " + err);
+                Check.Equal(nested.Fps, flat.Fps, pair + " rational fps");
+                Check.Equal(nested.FrameCount, flat.FrameCount, pair + " frames");
+                Check.Equal(nested.SphereWidth, flat.SphereWidth, pair + " sphere");
+                Check.Equal(nested.Mode, flat.Mode, pair + " mode");
+                Check.Equal(nested.ColorModeName, flat.ColorModeName, pair + " colour");
+                Check.Equal(nested.IsLrf, flat.IsLrf, pair + " proxy");
+                Check.Equal(nested.AudioChannels, flat.AudioChannels, pair + " channels");
+                Check.Equal(nested.AudioSampleRate, flat.AudioSampleRate, pair + " sample rate");
+                Check.Equal(nested.AudioSampleCount, flat.AudioSampleCount, pair + " audio samples");
+                Check.Equal(nested.FirstFrameTimestampUs, flat.FirstFrameTimestampUs, pair + " timestamp");
+                Check.Near(nested.DurationSeconds, flat.DurationSeconds, 2e-3, pair + " duration");
+            }
+            // The sample's audio: 52 224 samples at 48 kHz.
+            ProbeResult osv = ProbeResult.Parse(TestContext.Fixture("probe_osv_v1.json"), null, out _);
+            Check.Equal(52224L, osv.AudioSampleCount, "sample count");
+            Check.Near(1.088, osv.AudioDurationSeconds, 1e-9, "audio seconds");
+        }
+
+        /// <summary>osvtool states null for what it cannot tell; the parser falls back, never throws.</summary>
+        [Test]
+        public static void NullFieldsFallBack()
+        {
+            string text = TestContext.Fixture("probe_osv_v1.json")
+                .Replace("\"mode\": \"K6\"", "\"mode\": null")
+                .Replace("\"streamW\": 3000", "\"streamW\": null");
+            ProbeResult p = ProbeResult.Parse(text, null, out string err);
+            Check.NotNull(p, "still usable: " + err);
+            Check.Equal(string.Empty, p.Mode, "unknown mode");
+            Check.Equal(0, p.StreamWidth, "unknown width");
+            Check.Equal(6000, p.SphereWidth, "the sphere follows the lens height");
         }
 
         [Test]

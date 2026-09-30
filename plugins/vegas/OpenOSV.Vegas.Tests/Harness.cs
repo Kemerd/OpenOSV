@@ -118,6 +118,12 @@ namespace OpenOSV.Vegas.Tests
         /// <summary>A scratch folder, deleted at the end of the run.</summary>
         public static string Scratch { get; set; }
 
+        /// <summary>A folder of built binaries to scan for local paths (vegas.hygiene), or null.</summary>
+        public static string ScanDir { get; set; }
+
+        /// <summary>Paths that must not appear inside a scanned binary.</summary>
+        public static List<string> Forbidden { get; } = new List<string>();
+
         /// <summary>The Fixtures folder beside the runner.</summary>
         public static string Fixtures => Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Fixtures");
 

@@ -90,3 +90,8 @@ message(STATUS "  Importer (.prm) : ${_osv_importer_status}")
 message(STATUS "  Reframe (.aex)  : ${_osv_reframe_status}")
 message(STATUS "  SourceSet(.aex) : ${_osv_ss_status}")
 message(STATUS "  Mock-host tests : ${OSV_BUILD_TESTS}")
+
+# [WP-V-EXT] The VEGAS Pro Application Extension (C#): plugins/vegas.  Core
+# and its tests need only the dotnet SDK; the extension itself needs a VEGAS
+# install's ScriptPortal.Vegas.dll (see plugins/vegas/CMakeLists.txt).
+add_subdirectory(vegas)

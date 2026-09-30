@@ -28,6 +28,13 @@
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <Deterministic>true</Deterministic>
+    <!-- No local path may reach a shipped binary (the release scan rejects
+         them): the PDB is embedded, and every source and output path the
+         compiler records - the embedded PDB's own path included - is mapped
+         to a neutral prefix.  Stack traces in the log keep file names and
+         line numbers. -->
+    <DebugType>embedded</DebugType>
+    <PathMap>$(MSBuildThisFileDirectory)=/_/plugins/vegas/,$(OsvVegasOut)=/_/build/</PathMap>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <!-- Missing XML comments on internal plumbing are not worth a warning each. -->
     <NoWarn>$(NoWarn);CS1591</NoWarn>

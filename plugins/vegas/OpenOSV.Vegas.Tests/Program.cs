@@ -35,6 +35,14 @@ namespace OpenOSV.Vegas.Tests
                         case "--osvtool": TestContext.OsvTool = next; ++i; break;
                         case "--sample": TestContext.SampleOsv = next; ++i; break;
                         case "--filter": filter = next; ++i; break;
+                        case "--scan-dir": TestContext.ScanDir = next; ++i; break;
+                        case "--forbid":
+                            if (!string.IsNullOrEmpty(next))
+                            {
+                                TestContext.Forbidden.Add(next);
+                            }
+                            ++i;
+                            break;
                         default:
                             Console.Error.WriteLine("unknown argument: " + a);
                             return 100;

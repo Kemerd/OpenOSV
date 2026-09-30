@@ -175,39 +175,61 @@ namespace OpenOSV.Vegas.Tests
         }
 
         /// <summary>
-        /// outputLevels is WP-V-OFX's (defined only under VEGAS).  When a header
-        /// of plugins/ofx declares it, its name and items must be the ones the
-        /// extension writes; before that lands the test says so and passes.
+        /// outputLevels is WP-V-OFX's, defined only under a VEGAS host and
+        /// therefore NOT in kAllParams: the test finds it by itself.  Every C
+        /// string literal of plugins/ofx that holds "Studio RGB (16-235)" must
+        /// be exactly the item list the extension writes, and every integer
+        /// constant named like an Output Levels default must be its default.
+        /// Before WP-V-OFX lands (this branch's base) nothing declares it; the
+        /// test then says so and passes, because the extension skips a
+        /// parameter the generator does not define.
         /// </summary>
         [Test]
         public static void OutputLevelsMatchesWhereverTheOfxSideDeclaresIt()
         {
             string dir = Path.GetDirectoryName(TestContext.SourceFile("plugins/ofx/OfxSource.h"));
             bool nameFound = false;
-            foreach (string header in Directory.GetFiles(dir, "*.h").Concat(Directory.GetFiles(dir, "*.cpp")))
+            int itemLists = 0;
+            foreach (string file in Directory.GetFiles(dir, "*.h").Concat(Directory.GetFiles(dir, "*.cpp")))
             {
-                string text = File.ReadAllText(header);
-                foreach (KeyValuePair<string, string> kv in CppHeader.StringConstants(text))
-                {
-                    if (kv.Value == SourceParams.OutputLevels)
-                    {
-                        nameFound = true;
-                    }
-                    if (kv.Value.IndexOf("Studio RGB", StringComparison.Ordinal) >= 0 && kv.Value.IndexOf('|') >= 0)
-                    {
-                        Check.Equal(Choices.OutputLevels.Joined, kv.Value, Path.GetFileName(header) + " " + kv.Key);
-                    }
-                }
-                // A literal use ("outputLevels" passed straight to a define call) counts too.
+                string text = File.ReadAllText(file);
+                string shortName = Path.GetFileName(file);
+
+                // ---- the name, as a constant or a literal -------------------------------
                 if (text.IndexOf("\"" + SourceParams.OutputLevels + "\"", StringComparison.Ordinal) >= 0)
                 {
                     nameFound = true;
+                }
+
+                // ---- the items, wherever they are spelled ---------------------------------
+                foreach (Match literal in Regex.Matches(text, @"(?:""(?:[^""\\]|\\.)*""\s*)+"))
+                {
+                    string value = CppHeader.JoinLiterals(literal.Value);
+                    if (value.IndexOf("Studio RGB (16-235)", StringComparison.Ordinal) >= 0 && value.IndexOf('|') >= 0)
+                    {
+                        ++itemLists;
+                        Check.Equal(Choices.OutputLevels.Joined, value, shortName + " Output Levels items");
+                    }
+                }
+
+                // ---- the default, when it is a plain integer constant ------------------------
+                foreach (KeyValuePair<string, long> kv in CppHeader.IntConstants(text))
+                {
+                    if (kv.Key.IndexOf("OutputLevelsDefault", StringComparison.Ordinal) >= 0)
+                    {
+                        Check.Equal((long)Choices.OutputLevels.Default0, kv.Value, shortName + " " + kv.Key);
+                    }
                 }
             }
             if (!nameFound)
             {
                 Console.WriteLine("        note: no plugins/ofx file declares \"outputLevels\" yet (WP-V-OFX); the extension skips it when absent");
+                return;
             }
+            Check.True(itemLists > 0, "plugins/ofx names \"outputLevels\" but no item list with \"Studio RGB (16-235)\" was found");
+            // Studio is entry 1, Full entry 0: the extension's constants agree.
+            Check.Equal("Studio RGB (16-235)", Choices.OutputLevels[Choices.LevelsStudio], "LevelsStudio");
+            Check.Equal("Full range (0-255)", Choices.OutputLevels[Choices.LevelsFull], "LevelsFull");
         }
 
         [Test]

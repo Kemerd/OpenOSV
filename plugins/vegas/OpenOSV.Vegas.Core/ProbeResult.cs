@@ -12,6 +12,9 @@
 //   frameCount, fps {num, den, value}, durationSeconds, streamW, streamH,
 //   mode, colorModeName, hasAudio, audio {sampleRate, channels}, isLrf
 //
+//   (schema "openosv.probe/1"; audio also carries sampleCount; fps, mode,
+//   streamW / streamH and colorModeName may be null when unknown)
+//
 // Older osvtool builds - the one a user may still have on PATH - carry the
 // same facts deeper: frameCount at the top, format {fps, streamW, streamH,
 // mode, colorModeName, sideBySideProxy}, and container.tracks[] with each
@@ -37,7 +40,7 @@ namespace OpenOSV.Vegas.Core
         public string Path { get; private set; } = string.Empty;
 
         /// <summary>The file name, for messages.</summary>
-        public string FileName => string.IsNullOrEmpty(Path) ? string.Empty : SafeFileName(Path);
+        public string FileName => string.IsNullOrEmpty(Path) ? string.Empty : FileNameOf(Path);
 
         /// <summary>File size in bytes (0 when unknown).</summary>
         public long FileSize { get; private set; }
@@ -74,6 +77,15 @@ namespace OpenOSV.Vegas.Core
 
         /// <summary>Audio channel count (0 without audio).</summary>
         public int AudioChannels { get; private set; }
+
+        /// <summary>
+        /// Audio length in samples per channel when osvtool states it (0 when
+        /// unknown): the exact length the extracted WAV should have.
+        /// </summary>
+        public long AudioSampleCount { get; private set; }
+
+        /// <summary>Audio length in seconds (0 when unknown).</summary>
+        public double AudioDurationSeconds => (AudioSampleCount > 0 && AudioSampleRate > 0) ? (double)AudioSampleCount / AudioSampleRate : 0.0;
 
         /// <summary>True for an .LRF proxy.</summary>
         public bool IsLrf { get; private set; }
@@ -199,6 +211,19 @@ namespace OpenOSV.Vegas.Core
                 JsonValue trackAudio = audioTrack["audio"];
                 r.AudioSampleRate = FirstPositiveInt(audio["sampleRate"], trackAudio["sampleRate"]);
                 r.AudioChannels = FirstPositiveInt(audio["channels"], trackAudio["channels"]);
+                // The flat summary states the sample count; the older layout
+                // has the track's duration in its own timescale.
+                long samples = audio["sampleCount"].AsLong(0);
+                if (samples <= 0)
+                {
+                    long units = audioTrack["duration"].AsLong(0);
+                    long scale = audioTrack["timescale"].AsLong(0);
+                    if (units > 0 && scale > 0 && r.AudioSampleRate > 0)
+                    {
+                        samples = (long)Math.Round((double)units * r.AudioSampleRate / scale);
+                    }
+                }
+                r.AudioSampleCount = Math.Max(0L, samples);
             }
 
             // ---- the first frame's camera timestamp -----------------------------------------------
@@ -331,7 +356,7 @@ namespace OpenOSV.Vegas.Core
         }
 
         /// <summary>Path.GetFileName that never throws on odd characters.</summary>
-        internal static string SafeFileName(string path)
+        public static string FileNameOf(string path)
         {
             try
             {
