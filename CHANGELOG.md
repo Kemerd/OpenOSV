@@ -12,7 +12,7 @@ All notable changes to OpenOSV are documented here. The format follows
   VEGAS Pro through OpenFX, from the same `OpenOSV.ofx.bundle` as DaVinci
   Resolve (VEGAS scans `Common Files\OFX\Plugins` too), and a VEGAS
   Application Extension does what an OpenFX generator can't:
-  **Tools > Extensions > Import OSV...** creates the generator media at the
+  **Tools > Extensions > OpenOSV > Import OSV...** creates the generator media at the
   clip's exact length and size, extracts the audio and groups it with the
   video. The extension also applies 360 Reframe to equirect events, and has
   framing looks, easing presets, stabilisation and an `.LRF` proxy toggle,
@@ -31,6 +31,31 @@ All notable changes to OpenOSV are documented here. The format follows
   package when the VEGAS extension isn't built (it compiles against
   `ScriptPortal.Vegas.dll` from a VEGAS Pro install); `-SkipVegas` leaves the
   zip out on purpose.
+* **Everything on the GPU for hosts that hand OpenFX plug-ins CPU images**
+  (VEGAS always does). OpenOSV Source decodes, stitches, frames, levels and
+  packs on the GPU and reads back only the finished view - about 8 MB a frame
+  at 1080p 8-bit instead of the 288 MB 6K sphere. OpenOSV 360 Reframe uploads
+  VEGAS's image in its own depth and frames it on the GPU. On by default under
+  VEGAS only; `OPENOSV_OFX_GPU=0` / `1` switches it off / on for any host.
+* **`osvtool probe <clip> --json -`** prints the probe as JSON on stdout, with
+  a stable top-level subset (`schema: openosv.probe/1`: frame count, exact
+  rational frame rate, duration, stream size, mode, colour mode, audio,
+  LRF or not) for scripts and the VEGAS extension.
+* **`osvtool extract <clip> --audio out.wav`** writes the audio as 32-bit
+  float WAV, decoded exactly as the Premiere importer plays it (priming
+  removed, sample 0 on video frame 0). `.aac` still copies the AAC track.
+
+### Changed
+
+* **OpenFX bundle layout (Windows).** `Contents\Win64` now holds
+  `OpenOSV.ofx` alone; its DLLs, and `osvtool.exe`, moved to
+  `Contents\Libraries\Win64`. VEGAS's plug-in scan loads every DLL under
+  `Contents\Win64`. Resolve installs through `install_ofx.ps1` get the new
+  layout automatically; a copy made by hand must take the whole bundle.
+* **OpenFX plug-in versions 1.1**, so hosts that cache descriptors look again.
+* **`osvtool probe --json`:** the top-level `schema` key now names the JSON
+  layout (`openosv.probe/1`); the djmd field numbering it used to hold moved
+  to `djmdSchema`.
 
 ## [0.3.0] - 2026-09-28
 

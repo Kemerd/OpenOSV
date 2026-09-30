@@ -325,10 +325,13 @@ OfxStatus describeInContext(OfxImageEffectHandle effect) noexcept {
     const HostProfile profile = hostProfile();
 
     // ---- the clip ------------------------------------------------------------
-    defineString(params, kFile,
-                 {"OSV File", "The .OSV (or its .LRF proxy) to stitch. Paste a path, or use Choose .OSV File.",
-                  nullptr, false},
-                 kOfxParamStringIsFilePath, "");
+    // The hint names the file picker the host really shows: our Choose
+    // button, or - under VEGAS, where ours is hidden - VEGAS's own Browse
+    // button on the file field.
+    const char* fileHint = profile == HostProfile::Vegas
+                               ? "The .OSV (or its .LRF proxy) to stitch. Paste a path, or use Browse."
+                               : "The .OSV (or its .LRF proxy) to stitch. Paste a path, or use Choose .OSV File.";
+    defineString(params, kFile, {"OSV File", fileHint, nullptr, false}, kOfxParamStringIsFilePath, "");
     OfxPropertySetHandle button = nullptr;
     const OfxParameterSuiteV1* ps = suites().param;
     if (ps && ps->paramDefine &&

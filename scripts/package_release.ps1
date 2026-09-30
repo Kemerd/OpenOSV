@@ -2893,7 +2893,7 @@ function Write-ReleaseNotes {
 
 1. Close VEGAS Pro.
 2. Unzip `@VEGASZIP@` and double-click **`Install.cmd`** (the same SmartScreen step; admin rights once). It installs the OpenFX bundle and the VEGAS extension, and clears VEGAS's plug-in cache so the next start scans afresh.
-3. Start VEGAS (the first start scans plug-ins, so it takes a moment). **Tools > Extensions > Import OSV...** puts an `.OSV` on the timeline at its exact length and size, audio included. **OpenOSV Source** (Media Generators) and **OpenOSV 360 Reframe** (Video FX) are there for doing it by hand.
+3. Start VEGAS (the first start scans plug-ins, so it takes a moment). **Tools > Extensions > OpenOSV > Import OSV...** puts an `.OSV` on the timeline at its exact length and size, audio included. **OpenOSV Source** (Media Generators) and **OpenOSV 360 Reframe** (Video FX) are there for doing it by hand.
 
 **Uninstall:** close VEGAS and double-click `Uninstall.cmd` (`Uninstall.cmd -SkipBundle` keeps the OpenFX bundle, which DaVinci Resolve shares). Guide: [`docs/VEGAS.md`](https://github.com/Kemerd/OpenOSV/blob/@TAG@/docs/VEGAS.md).
 '@

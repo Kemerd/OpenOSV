@@ -355,7 +355,7 @@ plugin org.openosv.OSVSource
     param file (OfxParamTypeString)
       OfxParamPropAnimates : int = [0]
       OfxParamPropDefault : string = [""]
-      OfxParamPropHint : string = ["The .OSV (or its .LRF proxy) to stitch. Paste a path, or use Choose .OSV File."]
+      OfxParamPropHint : string = ["The .OSV (or its .LRF proxy) to stitch. Paste a path, or use Browse."]
       OfxParamPropScriptName : string = ["file"]
       OfxParamPropStringFilePathExists : int = [1]
       OfxParamPropStringMode : string = ["OfxParamStringIsFilePath"]

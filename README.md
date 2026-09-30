@@ -79,7 +79,7 @@ you edit:
   Reframe** reframes any 360 clip, with CUDA on NVIDIA. See
   [`docs/RESOLVE.md`](docs/RESOLVE.md).
 * **VEGAS Pro too (preview).** The same two effects, plus an extension that
-  does what an OpenFX generator can't: **Tools > Extensions > Import OSV...**
+  does what an OpenFX generator can't: **Tools > Extensions > OpenOSV > Import OSV...**
   puts a clip on the timeline at its exact length and size, audio included.
   See [`docs/VEGAS.md`](docs/VEGAS.md).
 
@@ -323,8 +323,8 @@ details and what's been checked.
    **Transfer Function (HDR)**: Bright for outdoor, Detailed for indoor), or
    **D-Log M** to grade it yourself with the LUTs in the zip's `LUTs` folder.
 8. **Audio.** A generator has none. `cli\osvtool.exe extract CAM_0001.OSV
-   --audio CAM_0001.aac` pulls the clip's track out; put it under the
-   generator.
+   --audio CAM_0001.wav` pulls the clip's track out, lined up with the first
+   frame; put it under the generator.
 9. **Any other 360 clip**, like an exported equirect: drop **OpenOSV 360
    Reframe** (Open FX > Filters) on it, and set the clip's **Scaling** to
    **Stretch** (Inspector > Retime and Scaling) so the sphere fills the frame.
@@ -339,7 +339,7 @@ the setup an OpenFX generator can't. It's a preview;
 
 1. **Install** the VEGAS zip (see [Download](#download)) with VEGAS closed,
    then start it. The first start scans plug-ins, so it takes a moment.
-2. **Import.** **Tools > Extensions > Import OSV...**, pick the clip. It lands
+2. **Import.** **Tools > Extensions > OpenOSV > Import OSV...**, pick the clip. It lands
    on the timeline at its exact length and size, with the audio grouped to it.
 3. **Aim the camera** in the generator's controls: **Preset**, **Pan / Tilt /
    Roll** and **Zoom**. They keyframe like any effect parameter, and **Keyframe
@@ -503,7 +503,7 @@ in: **More info → Run anyway**. Either installer asks for admin rights once.
 1. Unzip it, close VEGAS and double-click **`Install.cmd`**. It installs the
    OpenFX bundle (Resolve shares it) and the VEGAS extension, and clears
    VEGAS's plug-in cache.
-2. Start VEGAS. **Tools > Extensions > Import OSV...** brings a clip in.
+2. Start VEGAS. **Tools > Extensions > OpenOSV > Import OSV...** brings a clip in.
    [`docs/VEGAS.md`](docs/VEGAS.md) has the rest.
 
 `Uninstall.cmd`, in the same zip, takes it all back out.
@@ -699,6 +699,10 @@ calibration, gyro:
 osvtool probe CAM_0001.OSV
 ```
 
+For scripts, `--json -` prints it as JSON on stdout instead (the stable keys
+are listed at the top of `tools/osvtool/CmdProbe.cpp`; `--json file.json`
+writes the full document to a file).
+
 **A 360 video for YouTube or a VR headset.** The whole clip, stitched,
 horizon-levelled, in Rec.709, tagged as 360 so YouTube shows it as a sphere:
 
@@ -745,9 +749,13 @@ Resolve? This makes YouTube and VR players see it as 360, in place:
 osvtool spherical my_export_360.mp4
 ```
 
-**Pull out the audio**, for a Resolve generator, which has none:
+**Pull out the audio**, for a Resolve or VEGAS generator, which has none (the
+VEGAS extension does it for you). A `.wav` is decoded to 32-bit float with the
+encoder's priming removed, so it lines up with frame 0 exactly as Premiere
+plays it; a `.aac` is the camera's own track, untouched:
 
 ```powershell
+osvtool extract CAM_0001.OSV --audio CAM_0001.wav
 osvtool extract CAM_0001.OSV --audio CAM_0001.aac
 ```
 

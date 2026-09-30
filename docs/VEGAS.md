@@ -24,7 +24,7 @@ outside:
 |---|---|
 | **OpenOSV Source** | Generator (Media Generators). Opens a DJI Osmo 360 `.OSV` (or its `.LRF` proxy) and stitches it. Outputs a reframed view or the whole 360 sphere. |
 | **OpenOSV 360 Reframe** | Filter (Video FX). Points the virtual camera into any equirectangular clip. |
-| **The extension** | **Tools > Extensions > Import OSV...**, and a dock panel. Makes the generator media at the clip's exact length and size, sets its file and levels, extracts the audio and groups it with the video. Also applies 360 Reframe to equirect events, framing looks, easing presets and stabilisation. |
+| **The extension** | **Tools > Extensions > OpenOSV > Import OSV...**, and a dock panel. Makes the generator media at the clip's exact length and size, sets its file and levels, extracts the audio and groups it with the video. Also applies 360 Reframe to equirect events, framing looks, easing presets and stabilisation. |
 
 ## Install
 
@@ -88,8 +88,9 @@ finds it, and clears the cache folder that matches it.
 
 ## Editing an .OSV clip in VEGAS
 
-1. **Tools > Extensions > Import OSV...** and pick the clip. (The same
-   command is in the dock panel, **View > Extensions > OpenOSV**.)
+1. **Tools > Extensions > OpenOSV > Import OSV...** and pick one clip or
+   many. (The same command is in the dock panel, **View > Extensions >
+   OpenOSV**, which also takes `.OSV` files dropped on it from Explorer.)
 2. The extension reads the clip's length, frame rate and size with
    `osvtool probe`, creates **OpenOSV Source** media at exactly that length
    and size, sets the clip as its file, and sets **Output Levels** for your
@@ -103,8 +104,8 @@ finds it, and clears the cache folder that matches it.
 **Without the extension**, by hand:
 
 1. Drag **OpenOSV Source** from **Media Generators** onto the timeline.
-2. In its controls, choose the `.OSV` with **Choose .OSV File...** (or paste
-   the path).
+2. In its controls, pick the `.OSV` with the **Browse** button of **OSV
+   File** (or paste the path).
 3. **Clip** shows the clip's length. Set the event to that length: a generator
    can't declare one. Past the end of the clip it renders transparent black.
 4. Set **Output Levels** to match the project ([below](#levels-and-colour)).
@@ -157,8 +158,14 @@ plug-ins don't hand the pixels back and forth: decode, stitch, framing, the
 levels and the final packing all stay on the GPU (CUDA on NVIDIA), and only the
 finished view crosses back to VEGAS's memory. An NVIDIA card is the
 recommendation here, more than it is in Premiere; without a usable one the
-effects still run, on a slower path. Not measured inside VEGAS yet. If
-playback stutters:
+effects still run, on a slower path. Not measured inside VEGAS yet.
+
+The GPU path is on by default in VEGAS only. Set `OPENOSV_OFX_GPU=0` before
+starting VEGAS to switch it off (every frame then takes the CPU path), or
+`OPENOSV_OFX_GPU=1` to use it in other OpenFX hosts too. The first frame of
+every effect instance logs which path served it.
+
+If playback stutters:
 
 - set **Sphere Size** to 4K or 2K while cutting;
 - lower the Preview window's quality, or use VEGAS's proxies and RAM preview;
@@ -177,16 +184,45 @@ Source in Reframed view instead, which frames from the native sphere.
 
 ## The dock panel
 
-**View > Extensions > OpenOSV** holds the same commands as the **Tools >
-Extensions** menu: import, the LRF proxy toggle, 360 project setup, apply 360
-Reframe to equirect events, framing looks, easing presets, stabilisation, make
-framing unique, and relink.
+**View > Extensions > OpenOSV** docks like any VEGAS window and takes VEGAS's
+own skin colours. One primary action, **Import OSV...**, and a drop zone for
+`.OSV` / `.LRF` files dragged in from Explorer. Below them:
+
+- every OpenOSV clip of the project, each with its **Output**, **Colour**,
+  **Levels**, stabilisation and **Start Frame** editable in place;
+- the LRF proxy toggle;
+- DJI Studio's framing looks and keyframe easing presets, for the selected
+  clips;
+- a status line with the last action.
+
+It lays out in one column when docked narrow and two when wide.
+
+**Tools > Extensions > OpenOSV** has every command:
+
+| Command | What it does |
+|---|---|
+| Import OSV... | See [above](#editing-an-osv-clip-in-vegas) |
+| Edit with LRF proxies / Full quality | Switches every OpenOSV clip between its `.LRF` and its `.OSV` ([below](#lrf-proxies)) |
+| 360 project setup | 360 output on, a 2:1 project, the selected clips in 360 equirect |
+| Apply 360 Reframe to selected events | For other equirect footage ([above](#reframing-other-360-footage)) |
+| Framing look, Keyframe easing | DJI Studio's five looks and seven easing presets, on the selected clips |
+| Stabilisation | RockSteady and Horizon Leveling, together or apart, or off |
+| Make framing unique | Gives the selected events their own copy of the generator media (see below) |
+| Relink moved OSVs... | Finds moved clips by name under a folder you pick |
+| Match levels to project | Sets **Output Levels** on every clip from the project's pixel format |
+
+**One camera per media.** A generator's controls belong to its media, so every
+event cut from one imported clip shares one camera: keyframes over time frame
+each part. For two different framings of the same moment, **Make framing
+unique** gives the selected events a copy of the media, with every control and
+keyframe copied.
 
 ## LRF proxies
 
 The camera writes a small `.LRF` proxy beside each `.OSV`, and OpenOSV Source
 opens either. The extension's LRF proxy toggle switches the generators
-between the two: proxies while you cut, the `.OSV` for the final render.
+between the two: proxies while you cut, the `.OSV` for the final render. Start
+Frame is kept on the camera's clock, so the cuts stay where they are both ways.
 
 ## Reporting a problem
 
@@ -213,16 +249,38 @@ Checked on every build:
   descriptors, contexts, parameters, and images in VEGAS's formats (byte and
   float, RGBA and BGRA), compared with the Premiere effect's own render. The
   other hosts' descriptors are unchanged.
+- The extension's logic (`OpenOSV.Vegas.Tests`): the probe output, exact
+  rational timing, levels from the pixel format, the `.OSV` / `.LRF` pairing
+  and proxy timing, relinking, the WAV cache, and that every OpenFX name it
+  writes still exists in the plug-in's headers. The smoke-test script is
+  compiled the way VEGAS compiles it (C# 5), and the built DLLs are checked
+  for local paths.
+- `osvtool probe --json -` and `extract --audio .wav`: the JSON's stable keys,
+  and the WAV sample for sample against the importer's audio decoder.
+- The bundle's layout: `OpenOSV.ofx` alone in `Contents\Win64`, and every DLL
+  it and `osvtool.exe` need in `Contents\Libraries\Win64`.
 - `install_vegas.ps1` and the release script's VEGAS functions, against
   scratch folders: install, uninstall, dry run, cache clearing that leaves
   every other file alone.
 
-**The live-test checklist**, everything below still to be run in VEGAS Pro:
+Written, and waiting for a GPU run: the GPU path against the CPU path in every
+format, levels and render window (`tests/ofx_gpu`, and the `[cuda]` tests of
+`tests/ofx`).
+
+**The live-test checklist**, everything below still to be run in VEGAS Pro.
+Start with the smoke-test script ([`scripts/vegas/README.md`](../scripts/vegas/README.md)):
+it checks most of the scripting-API items and writes
+`%LOCALAPPDATA%\OpenOSVegas-smoke-report.txt`.
 
 - [ ] Install; the effects appear in Media Generators and Video FX after the
       first scan; the describe logs are written and clean.
-- [ ] **Tools > Extensions > Import OSV...** imports a clip at the right length
-      and size, with audio in sync.
+- [ ] **Tools > Extensions > OpenOSV > Import OSV...** imports a clip at the
+      right length and size, with audio in sync; the float WAV opens.
+- [ ] A scripted parameter change reaches the plug-in (the **Clip** read-out
+      refreshes).
+- [ ] The **OpenOSV** submenus show under Tools > Extensions, and the dock
+      panel comes back with the layout.
+- [ ] The LRF proxy toggle survives a save and reopen: Start Frame exact.
 - [ ] Output Levels: blacks and whites correct in an 8-bit project, a 32-bit
       video-levels project and a 32-bit full-range one.
 - [ ] OpenOSV 360 Reframe on equirect footage, after Pan/Crop.
@@ -231,8 +289,8 @@ Checked on every build:
 - [ ] VEGAS Pro 14 to 16, and VEGAS Pro 2026 (its data folder, presumably
       `%LOCALAPPDATA%\VEGAS Pro\2026.0`).
 - [ ] HDR / ACES projects and generated media.
-- [ ] The instances VEGAS clones per render thread: a clone of OpenOSV Source
-      must not open its own decoder.
+- [ ] OpenOSV Source is declared render-unsafe under VEGAS, so VEGAS should
+      not clone it per render thread: one decoder per clip in the log.
 
 ## Where the code is
 
@@ -242,7 +300,8 @@ Checked on every build:
 | `scripts/vegas/` | A smoke-test script and its README |
 | `plugins/ofx/OfxHost.h` | The host profile: every VEGAS difference keys on `hostProfile()` |
 | `plugins/ofx/OfxHostImage.h` | VEGAS's pixel formats and the one levels definition |
-| `plugins/ofx/OfxGpuView.*` | The GPU path for hosts that give CPU images |
+| `plugins/ofx/OfxGpuView.*`, `OfxGpuPipeline.*` | The GPU path for hosts that give CPU images: policy, device frames, framing / levels / pack kernels, pinned readback |
+| `tests/ofx/`, `tests/ofx_gpu/` | The mock host in its generic, Resolve and VEGAS profiles; the GPU pipeline in every format |
 | `tools/osvtool/CmdProbe.cpp`, `CmdExtract.cpp` | `probe --json -` and `extract --audio` for the extension |
 | `scripts/install_vegas.ps1` | Install / uninstall |
 | `scripts/package_release.ps1` | `Write-VegasCommands` and the VEGAS zip |

@@ -49,7 +49,10 @@ inline constexpr const char* kPluginId = "org.openosv.OSVSource";
 
 /// Version reported to the host (see OfxReframe.h on when MAJOR moves).
 inline constexpr unsigned kVersionMajor = 1;
-inline constexpr unsigned kVersionMinor = 0;
+/// Minor 1: VEGAS Pro support (byte / BGRA output, Output Levels, the own-GPU
+/// path).  A new minor version makes hosts that cache descriptors
+/// (VEGAS keeps them per user) describe the plug-in again.
+inline constexpr unsigned kVersionMinor = 1;
 
 // ---- the generator's own parameters (permanent names) ------------------------
 inline constexpr const char* kFile = "file";
