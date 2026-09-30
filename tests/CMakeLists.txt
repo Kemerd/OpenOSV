@@ -193,3 +193,55 @@ if(OSV_NODE_EXECUTABLE)
 else()
   message(STATUS "  Panel tests    : skipped (no Node.js on PATH)")
 endif()
+
+# -----------------------------------------------------------------------------
+#  osv_cli_tests - [WP-V-CLI] the osvtool contract the VEGAS extension uses:
+#  `probe --json -` (stdout carries only the JSON, stable top-level keys) and
+#  `extract --audio out.wav` (the importer AudioDecoder's samples, bit for bit).
+#
+#  A separate executable because the comparison needs the plug-in engine's
+#  AudioDecoder (plugins/importer/ImporterAudio.cpp), which osv_tests does not
+#  link.  CPU-only: AAC decoding is plain FFmpeg, nothing here opens NVDEC,
+#  CUDA or D3D11VA.
+# -----------------------------------------------------------------------------
+if(TARGET osvtool)
+  set(_osv_cli_importer "${CMAKE_SOURCE_DIR}/plugins/importer")
+  set(_osv_cli_common   "${CMAKE_SOURCE_DIR}/plugins/common")
+  if(WIN32)
+    set(_osv_cli_log "${_osv_cli_common}/PluginLog.cpp")
+  else()
+    set(_osv_cli_log "${_osv_cli_common}/PluginLogPosix.cpp")
+  endif()
+  add_executable(osv_cli_tests
+    cli/TestMain.cpp
+    cli/test_vegas_cli.cpp
+    "${_osv_cli_importer}/ImporterAudio.cpp"
+    "${_osv_cli_log}")
+  target_include_directories(osv_cli_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${_osv_cli_importer}"
+    "${_osv_cli_common}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/premiere/mockhost")   # TestLogIsolation.h
+  target_link_libraries(osv_cli_tests PRIVATE ${_osv_test_libs} Catch2::Catch2 nlohmann_json::nlohmann_json)
+  target_compile_definitions(osv_cli_tests PRIVATE
+    OSV_SAMPLE_FILE="${OSV_SAMPLE_FILE}"
+    OSV_SAMPLE_LRF_FILE="${OSV_SAMPLE_LRF_FILE}"
+    OSV_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden"       # TestSample.h names them all
+    OSV_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+    OSV_LUTS_DIR="${CMAKE_SOURCE_DIR}/luts"
+    OSV_TEST_OUTPUT_DIR="${CMAKE_BINARY_DIR}/test-output"
+    OSV_TOOL_PATH="$<TARGET_FILE:osvtool>")
+  add_dependencies(osv_cli_tests osvtool)
+  set_target_properties(osv_cli_tests PROPERTIES FOLDER "tests")
+  if(WIN32)
+    # FFmpeg and friends beside the executable, as osvtool does.
+    add_custom_command(TARGET osv_cli_tests POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:osv_cli_tests> $<TARGET_FILE_DIR:osv_cli_tests>
+      COMMAND_EXPAND_LISTS)
+  endif()
+  catch_discover_tests(osv_cli_tests
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    PROPERTIES SKIP_RETURN_CODE 4
+    DISCOVERY_MODE PRE_TEST
+  )
+endif()
