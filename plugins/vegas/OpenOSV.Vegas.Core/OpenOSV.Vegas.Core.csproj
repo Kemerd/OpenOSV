@@ -1,0 +1,25 @@
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  Copyright 2026 The OpenOSV Contributors
+
+  OpenOSV.Vegas.Core - everything the VEGAS extension decides that does not
+  need VEGAS: osvtool, the probe model, time maths, the OpenFX parameter
+  names, the DJI camera numbers, the audio cache, settings and the log.
+
+  No reference to ScriptPortal.Vegas on purpose: CI builds and tests this
+  library on machines that have never seen VEGAS.
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>OpenOSV.Vegas.Core</RootNamespace>
+    <AssemblyName>OpenOSV.Vegas.Core</AssemblyName>
+    <!-- Pure managed code: AnyCPU loads into VEGAS's x64 process and into the
+         test runner alike. -->
+    <PlatformTarget>AnyCPU</PlatformTarget>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The test runner reaches the few internals it checks directly. -->
+    <InternalsVisibleTo Include="OpenOSV.Vegas.Tests" />
+  </ItemGroup>
+</Project>

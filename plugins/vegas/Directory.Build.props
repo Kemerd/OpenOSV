@@ -1,0 +1,45 @@
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  Copyright 2026 The OpenOSV Contributors
+
+  Shared MSBuild settings for the three VEGAS projects (plugins/vegas).
+
+  Why this file exists
+  ====================
+  An SDK-style project writes obj\ and bin\ next to its .csproj by default,
+  which would litter the source tree on every build.  BaseIntermediateOutputPath
+  must be set BEFORE the SDK's props are imported, and Directory.Build.props is
+  the one place MSBuild reads that early.  Everything lands under
+  $(OsvVegasOut): CMake passes its own binary directory there; a plain
+  `dotnet build` from the source tree falls back to build\vegas-dotnet\, which
+  the repository's .gitignore already covers (build/).
+-->
+<Project>
+  <PropertyGroup>
+    <!-- Where every intermediate and output file goes (trailing slash required). -->
+    <OsvVegasOut Condition="'$(OsvVegasOut)' == ''">$(MSBuildThisFileDirectory)..\..\build\vegas-dotnet\</OsvVegasOut>
+    <OsvVegasOut Condition="!HasTrailingSlash('$(OsvVegasOut)')">$(OsvVegasOut)\</OsvVegasOut>
+    <BaseIntermediateOutputPath>$(OsvVegasOut)obj\$(MSBuildProjectName)\</BaseIntermediateOutputPath>
+    <BaseOutputPath>$(OsvVegasOut)bin\$(MSBuildProjectName)\</BaseOutputPath>
+
+    <!-- One language level and one framework for all three projects. -->
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Missing XML comments on internal plumbing are not worth a warning each. -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+
+    <!-- Product identity, stamped into every assembly. -->
+    <Company>The OpenOSV Contributors</Company>
+    <Product>OpenOSV for VEGAS Pro</Product>
+    <Copyright>Copyright 2026 The OpenOSV Contributors. Apache-2.0.</Copyright>
+    <Version Condition="'$(Version)' == ''">0.3.0</Version>
+    <!-- The SDK would otherwise try to find NuGet reference assemblies for
+         .NET Framework; the installed targeting pack is what we build with. -->
+    <AutomaticallyUseReferenceAssemblyPackages>false</AutomaticallyUseReferenceAssemblyPackages>
+  </PropertyGroup>
+</Project>
