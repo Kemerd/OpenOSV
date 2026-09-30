@@ -39,8 +39,27 @@
 //
 // None of the functions throws; none leaves a CUDA context current that was
 // not current on entry (the host's own GPU work must not notice us).
+//
+// ===========================================================================
+//  Who takes the frame (the policy)
+// ===========================================================================
+// By default the own-GPU path serves ONLY hostProfile() == HostProfile::Vegas;
+// under DaVinci Resolve and every other host the effects behave exactly as
+// before it existed (Resolve keeps its CUDA-image filter path and the CPU
+// framing).  The environment variable OPENOSV_OFX_GPU overrides that for
+// every host: "0" / "off" / "false" / "no" switch the path off everywhere,
+// "1" / "on" / "true" / "yes" switch it on everywhere (how the tests drive it
+// through the mock host).  It is read on every call, so a test - or a user
+// chasing a problem - can flip it without reloading the module.
+//
+// Every pixel written - the view, and the transparent black outside the
+// camera frame alike - is packed by OfxHostImage.h's storeHostPixel() rule:
+// levels on R, G and B (never alpha), then the depth, then the order.  So
+// transparent black under studio levels is RGB 16/255 with alpha 0, exactly
+// what the CPU paths write.
 #pragma once
 
+#include "OfxGpuPipeline.h"  // HostTarget, the pipeline under the three hooks
 #include "OfxHost.h"
 #include "OfxHostImage.h"
 
@@ -52,14 +71,8 @@
 
 namespace osv::ofx::gpu {
 
-/// Where a GPU render lands: the host's CPU output image, the part of it to
-/// fill, the camera frame the view is framed for, and the levels to pack in.
-struct HostTarget {
-    HostImageView image;                       ///< The host's output image (CPU memory).
-    OfxRectI window{0, 0, 0, 0};               ///< The render window, in pixels (clipped to image.bounds by the callee).
-    OfxRectI frame{0, 0, 0, 0};                ///< The camera frame (cameraFrame() in OfxRender.h).
-    OutputLevels levels = OutputLevels::Full;  ///< RGB levels of the packed output; alpha is never touched.
-};
+// HostTarget - where a GPU render lands - is declared in OfxGpuPipeline.h,
+// below the clip engine, so the pipeline and its tests can use it alone.
 
 /// OpenOSV Source, Reframed view: stitch frame `index` of `clip` into its
 /// native sphere (`sphere`, from geometryForLocked) without leaving the GPU,
@@ -90,5 +103,29 @@ struct HostTarget {
 /// levelled), so callers pass OutputLevels::Full in the target.
 [[nodiscard]] bool renderReframeFromHostGpu(const reframe::KernelSetup& setup, const HostImageView& source,
                                             const HostTarget& target, std::string& error) noexcept;
+
+// ===========================================================================
+//  [WP-V-GPU] Which path served an instance's first frame (the log)
+// ===========================================================================
+
+/// The three hooks above, for notePath().
+enum class Hook : std::uint8_t {
+    SourceView = 0,      ///< renderSourceViewGpu().
+    SourceEquirect = 1,  ///< renderSourceEquirectGpu().
+    ReframeFilter = 2,   ///< renderReframeFromHostGpu().
+};
+
+/// True when the own-GPU path may serve this host at all (the policy above),
+/// with the reason in `why` (may be null) when not.  What every hook asks
+/// first; exposed so a caller can say why nothing ran.
+[[nodiscard]] bool ownGpuWanted(std::string* why = nullptr) noexcept;
+
+/// Log - once per (instance, hook), at INFO - which path rendered the first
+/// frame an effect instance sent through `hook`: the own GPU path
+/// (`servedByGpu`), or the CPU path and why: `gpuError` when the GPU path was
+/// tried and failed, otherwise the reason the most recent hook call on THIS
+/// thread gave for "not mine".  `instance` is any pointer unique to the
+/// instance - the effect handle.  Never throws.
+void notePath(const void* instance, Hook hook, bool servedByGpu, const std::string& gpuError) noexcept;
 
 }  // namespace osv::ofx::gpu

@@ -247,8 +247,11 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) noexc
                                         HostOrder::Rgba};
         std::string gpuError;
         if (gpu::renderReframeFromHostGpu(setup, sourceImage, gpuTarget, gpuError)) {
+            gpu::notePath(effect, gpu::Hook::ReframeFilter, true, gpuError);
             return kOfxStatOK;
         }
+        // Once per instance: which path took its first frame, and why.
+        gpu::notePath(effect, gpu::Hook::ReframeFilter, false, gpuError);
         if (!gpuError.empty()) {
             PluginLog::oncef("ofx/reframe/gpu-host", PluginLog::Level::Warn,
                              "ofx reframe: GPU path for CPU images failed, framing on the CPU: {}", gpuError);
