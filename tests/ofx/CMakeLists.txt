@@ -45,6 +45,7 @@ add_executable(osv_ofx_tests
   test_ofx_module.cpp
   test_ofx_reframe.cpp
   test_ofx_source.cpp
+  test_ofx_bundle.cpp
   "${_osv_reframe_src}/ReframeCpu.cpp"
   "${_osv_reframe_src}/ReframeEasing.cpp"
 )
@@ -118,3 +119,37 @@ catch_discover_tests(osv_ofx_tests
   PROPERTIES SKIP_RETURN_CODE 4
   DISCOVERY_MODE PRE_TEST
 )
+
+# -----------------------------------------------------------------------------
+#  The bundle layout VEGAS Pro's plug-in scan needs (Windows).
+#
+#  VEGAS loads every DLL and .ofx under a bundle's Contents/Win64, so the
+#  bundle keeps OpenOSV.ofx alone there and the dependency closure - with
+#  osvtool.exe, which the VEGAS extension runs - in Contents/Libraries/Win64.
+#    * ofx_bundle_layout   the STAGED tree: Win64 holds only OpenOSV.ofx,
+#                          Libraries/Win64 holds osvtool.exe and every DLL the
+#                          module and osvtool import;
+#    * ofx_bundle_osvtool  osvtool.exe --help, started from Libraries/Win64
+#                          with a PATH of System32 only, so a DLL
+#                          missing from that folder cannot hide behind the
+#                          developer's PATH.
+#  (The delay-load half is the "[bundle]" test of osv_ofx_tests.)
+# -----------------------------------------------------------------------------
+if(WIN32 AND TARGET OpenOSVBundleTool AND OSV_DUMPBIN_EXE)
+  get_target_property(_osv_ofx_test_bundle OpenOSV OSV_OFX_BUNDLE_DIR)
+  add_test(NAME ofx_bundle_layout
+    COMMAND "${CMAKE_COMMAND}"
+            "-DBUNDLE_DIR=${_osv_ofx_test_bundle}"
+            "-DDUMPBIN=${OSV_DUMPBIN_EXE}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/CheckBundleLayout.cmake")
+  add_test(NAME ofx_bundle_osvtool
+    COMMAND "${_osv_ofx_test_bundle}/Contents/Libraries/Win64/osvtool.exe" --help
+    WORKING_DIRECTORY "${_osv_ofx_test_bundle}/Contents/Libraries/Win64")
+  # A PATH of System32 alone (ENVIRONMENT is a list, so no ';' inside).
+  set_tests_properties(ofx_bundle_osvtool PROPERTIES
+    ENVIRONMENT "PATH=$ENV{SystemRoot}/System32"
+    LABELS "ofx")
+  set_tests_properties(ofx_bundle_layout PROPERTIES LABELS "ofx")
+  # The bundle must be fully staged (module, Libraries, osvtool) first.
+  add_dependencies(osv_ofx_tests OpenOSVBundleTool)
+endif()

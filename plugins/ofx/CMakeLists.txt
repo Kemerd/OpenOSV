@@ -264,18 +264,57 @@ if(WIN32)
   # OsvCheckDelayLoad.cmake reads the list '?'-separated.
   string(REPLACE ";" "?" _osv_ofx_delayload_joined "${_osv_ofx_delayload}")
 
+  # The bundle keeps ONLY the module in Contents\Win64.  VEGAS Pro's plug-in
+  # scan loads every *.dll and *.ofx under a bundle's Contents\Win64 (and its
+  # subfolders), which would probe FFmpeg and could leave a private OpenCL.dll
+  # resident under the name VEGAS itself loads later.  The dependency closure
+  # therefore lives in Contents\Libraries\Win64, which is not scanned, and the
+  # module's delay-load hook resolves from there (OSV_DELAYLOAD_SUBDIR, relative
+  # to the module's folder; DelayLoad.h).
+  set(_osv_ofx_libs_dir "${OSV_OFX_BUNDLE_DIR}/Contents/Libraries/Win64")
+  file(MAKE_DIRECTORY "${_osv_ofx_libs_dir}")
+  target_compile_definitions(OpenOSV PRIVATE "OSV_DELAYLOAD_SUBDIR=L\"../Libraries/Win64\"")
+
+  # DEST_DIR / PURGE_DIR are the OpenFX-only parameters of the two scripts:
+  # stage into the Libraries folder, remove the DLLs an older layout left in
+  # Win64, and check every delay-loaded DLL really is in the Libraries folder.
   add_custom_command(TARGET OpenOSV POST_BUILD
     COMMAND "${CMAKE_COMMAND}"
             "-DMODULE=$<TARGET_FILE:OpenOSV>"
-            "-DOUT_DIR=${_osv_ofx_binary_dir}"
+            "-DOUT_DIR=${_osv_ofx_libs_dir}"
+            "-DDEST_DIR=${_osv_ofx_libs_dir}"
+            "-DPURGE_DIR=${_osv_ofx_binary_dir}"
             "-DSEARCH_DIRS=${_osv_ofx_search_joined}"
             "-DEXTRA_DLLS=$<JOIN:$<TARGET_RUNTIME_DLLS:OpenOSV>,?>"
             "-DDUMPBIN=${OSV_DUMPBIN_EXE}"
             "-DCHECK_DELAYLOAD=${CMAKE_SOURCE_DIR}/cmake/OsvCheckDelayLoad.cmake"
             "-DEXPECTED_DELAYLOAD=${_osv_ofx_delayload_joined}"
             -P "${CMAKE_SOURCE_DIR}/cmake/OsvCopyRuntimeDlls.cmake"
-    COMMENT "Staging the runtime DLLs of OpenOSV.ofx"
+    COMMENT "Staging the runtime DLLs of OpenOSV.ofx into Contents/Libraries/Win64"
     VERBATIM)
+
+  # osvtool.exe and ITS import closure go into the same folder: the VEGAS
+  # extension runs Contents\Libraries\Win64\osvtool.exe, and a Libraries
+  # folder that is not scanned is the one place its DLLs can sit safely.  The
+  # walk is the module's own (dumpbin, recursive), started from osvtool.exe,
+  # so libpng, tiff, OpenEXR and the rest arrive whatever osvtool links.  A
+  # separate target rather than a POST_BUILD of OpenOSV: it must run after
+  # osvtool is built, and the module has no business depending on a tool.
+  if(TARGET osvtool)
+    add_custom_target(OpenOSVBundleTool ALL
+      COMMAND "${CMAKE_COMMAND}"
+              "-DMODULE=$<TARGET_FILE:osvtool>"
+              "-DOUT_DIR=${_osv_ofx_libs_dir}"
+              "-DCOPY_MODULE=ON"
+              "-DSEARCH_DIRS=${_osv_ofx_search_joined}"
+              "-DEXTRA_DLLS=$<JOIN:$<TARGET_RUNTIME_DLLS:osvtool>,?>"
+              "-DDUMPBIN=${OSV_DUMPBIN_EXE}"
+              -P "${CMAKE_SOURCE_DIR}/cmake/OsvCopyRuntimeDlls.cmake"
+      COMMENT "Staging osvtool.exe and its DLLs into OpenOSV.ofx.bundle/Contents/Libraries/Win64"
+      VERBATIM)
+    set_target_properties(OpenOSVBundleTool PROPERTIES FOLDER "plugins")
+    add_dependencies(OpenOSVBundleTool osvtool OpenOSV)
+  endif()
 else()
   set(_osv_ofx_delayload "none (the bundle's own renamed dylibs)")
 endif()

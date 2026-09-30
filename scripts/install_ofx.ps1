@@ -1,23 +1,27 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Installs (or removes) OpenOSV's OpenFX plug-ins for DaVinci Resolve.
+    Installs (or removes) OpenOSV's OpenFX plug-ins for DaVinci Resolve and VEGAS Pro.
 
 .DESCRIPTION
-    Copies the OpenOSV.ofx.bundle folder the build assembled - OpenOSV.ofx and
-    the runtime DLLs beside it - into the folder every OpenFX host on Windows
-    scans:
+    Copies the OpenOSV.ofx.bundle folder the build assembled into the folder
+    every OpenFX host on Windows scans:
 
         C:\Program Files\Common Files\OFX\Plugins\OpenOSV.ofx.bundle\
 
-    DaVinci Resolve (free or Studio) lists its two effects in the Effects
-    Library's OpenFX section, group OpenOSV, after a restart:
+    The bundle keeps OpenOSV.ofx alone in Contents\Win64 - VEGAS Pro loads
+    every DLL it finds there - and the DLLs it needs, plus osvtool.exe, in
+    Contents\Libraries\Win64.
+
+    DaVinci Resolve (free or Studio) and VEGAS Pro list the two effects after
+    a restart (Resolve: the Effects Library's OpenFX section, group OpenOSV):
 
         OpenOSV Source      a generator: a .OSV clip, stitched
         OpenOSV 360 Reframe    a filter: reframes any 360 equirectangular clip
 
-    Resolve scans for plug-ins only when it starts, so close it before
-    running this script and start it again afterwards.  See docs\RESOLVE.md.
+    Hosts scan for plug-ins only when they start, so close Resolve / VEGAS
+    before running this script and start it again afterwards.  See
+    docs\RESOLVE.md.
 
     The folder is under Program Files, so this needs an elevated session;
     when the script is not elevated it relaunches itself through UAC with the
@@ -160,7 +164,7 @@ if ($Uninstall) {
     Write-Step "Removing $target"
     if (Test-Path -LiteralPath $target) {
         Remove-Item -LiteralPath $target -Recurse -Force
-        Write-Info 'Removed. Restart DaVinci Resolve to drop the effects from its list.'
+        Write-Info 'Removed. Restart DaVinci Resolve / VEGAS Pro to drop the effects from their lists.'
     } else {
         Write-Info 'Nothing installed there.'
     }
@@ -187,7 +191,7 @@ if (Test-Path -LiteralPath $target) {
     try {
         Remove-Item -LiteralPath $target -Recurse -Force
     } catch {
-        throw "Could not replace '$target' - is DaVinci Resolve still running? Close it and run this again."
+        throw "Could not replace '$target' - is DaVinci Resolve or VEGAS Pro still running? Close it and run this again."
     }
 }
 New-Item -ItemType Directory -Path $Destination -Force | Out-Null
@@ -201,9 +205,23 @@ foreach ($file in $leftovers) {
     Remove-Item -LiteralPath $file.FullName -Force
 }
 
+# Contents\Win64 must hold OpenOSV.ofx alone: VEGAS Pro's plug-in scan loads
+# every DLL and executable under it.  The clean copy above already dropped
+# whatever an older install left there; this catches a stage folder that
+# still carries the old layout.
+$strayBin = Join-Path $target 'Contents\Win64'
+if (Test-Path -LiteralPath $strayBin -PathType Container) {
+    $strays = @(Get-ChildItem -LiteralPath $strayBin -Recurse -File |
+                Where-Object { @('.dll', '.exe') -contains $_.Extension.ToLowerInvariant() })
+    foreach ($file in $strays) {
+        Write-Info "removing $($file.Name) from Contents\Win64 (VEGAS Pro would load it)"
+        Remove-Item -LiteralPath $file.FullName -Force
+    }
+}
+
 $files = @(Get-ChildItem -LiteralPath $target -Recurse -File)
 Write-Info ("Installed {0} files." -f $files.Count)
-Write-Info 'Start DaVinci Resolve. In the Edit page''s Effects panel, select Open FX and'
+Write-Info 'Start DaVinci Resolve or VEGAS Pro. In Resolve''s Edit page Effects panel, select Open FX and'
 Write-Info 'search for OpenOSV: OpenOSV Source (a generator) and OpenOSV 360 Reframe (a'
 Write-Info 'filter). The search looks only inside the category selected on its left.'
 exit 0

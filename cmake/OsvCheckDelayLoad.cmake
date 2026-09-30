@@ -19,6 +19,9 @@
 #    EXPECTED_DELAYLOAD  '?' separated list of DLLs that must be delay-loaded
 #                        ('?' rather than '|', which cmd.exe treats as a pipe
 #                        inside the nested POST_BUILD quoting)
+#    DEST_DIR            optional (OpenFX bundle only): the folder the module's
+#                        delay-load hook resolves from; every delay-loaded,
+#                        non-system DLL must exist there
 #
 #  System DLLs (anything under the Windows directory, plus the CRT and the
 #  well-known api-ms-* sets) are expected to be direct imports and ignored.
@@ -132,6 +135,33 @@ if(_unexpected)
     "Premiere Pro's application directory is searched before the plug-in's own folder, so a direct import can bind "
     "to Adobe's copy of the same DLL. Add each name to the osv_add_delayload() call in the plug-in's CMakeLists.txt "
     "(or to the system list in cmake/OsvCheckDelayLoad.cmake if it really is an OS component).")
+endif()
+
+# Optional, OpenFX bundle only: DEST_DIR is the folder the module's delay-load
+# hook resolves from (Contents\Libraries\Win64).  Every delay-loaded DLL that
+# is not an OS or driver component must be there, or the module would fail at
+# its first call into it - and the host's DLL search would be the fallback.
+if(DEST_DIR)
+  set(_missing "")
+  foreach(_dll IN LISTS _delayed)
+    set(_is_system FALSE)
+    foreach(_pattern IN LISTS _system_patterns)
+      if(_dll MATCHES "${_pattern}")
+        set(_is_system TRUE)
+        break()
+      endif()
+    endforeach()
+    if(NOT _is_system AND NOT EXISTS "${DEST_DIR}/${_dll}")
+      list(APPEND _missing "${_dll}")
+    endif()
+  endforeach()
+  get_filename_component(_module_name_dest "${MODULE}" NAME)
+  if(_missing)
+    string(REPLACE ";" ", " _missing_text "${_missing}")
+    message(FATAL_ERROR
+      "${_module_name_dest} delay-loads DLLs that are not staged in '${DEST_DIR}':\n"
+      "    ${_missing_text}")
+  endif()
 endif()
 
 # Report entries that were declared /DELAYLOAD but are not actually imported.
