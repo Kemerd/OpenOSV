@@ -127,8 +127,9 @@ finds it, and clears the cache folder that matches it.
 
 ## Output
 
-- **Reframed view** (the default) renders the camera's view straight from the
-  clip's native sphere, at the project's size.
+- **Reframed view** (the default) renders the camera's view at the project's
+  size, straight from the two fisheyes on an NVIDIA GPU (from the clip's
+  native sphere on the CPU path).
 - **360 equirect** renders the whole sphere at the project's size. Use it for a
   2:1 project, a 360 export, or to feed **OpenOSV 360 Reframe** yourself.
 
@@ -172,19 +173,42 @@ plug-ins don't hand the pixels back and forth: decode, stitch, framing, the
 levels and the final packing all stay on the GPU (CUDA on NVIDIA), and only the
 finished view crosses back to VEGAS's memory. An NVIDIA card is the
 recommendation here, more than it is in Premiere; without a usable one the
-effects still run, on a slower path. Not measured inside VEGAS yet.
+effects still run, on a slower path.
+
+**The Preview window's quality decides how hard OpenOSV Source works.** VEGAS
+names a quality with every frame it asks for, and OpenOSV reads it:
+
+| Quality | What OpenOSV Source renders |
+|---|---|
+| **Draft**, **Preview** (VEGAS's default) | Playback. The `.LRF` proxy beside the `.OSV` when **Playback Proxy** is on ([below](#lrf-proxies)). No waiting on analyses, no per-frame seam search, parallax or sun ghost fit |
+| **Good**, **Best** | The final picture: the `.OSV`, every analysis, exactly what a file render gets |
+
+**File > Render As** uses the template's rendering quality, Good by default,
+so a render always gets the full stitch. To judge the stitch itself while
+cutting, set the Preview window to Good or Best.
+
+**The reframed view comes straight from the fisheyes.** Only the pixels the
+camera shows are stitched: 2 MP for a 1080p view, not the 29.5 MP of an 8K
+sphere, and no 472 MB sphere in VRAM. They are resampled once instead of
+twice, so the view is sharper too. `OPENOSV_OFX_DIRECT=0` frames the view
+out of the stitched sphere instead, as 0.4.1 did.
 
 The GPU path is on by default in VEGAS only. Set `OPENOSV_OFX_GPU=0` before
 starting VEGAS to switch it off (every frame then takes the CPU path), or
 `OPENOSV_OFX_GPU=1` to use it in other OpenFX hosts too. The first frame of
-every effect instance logs which path served it.
+every effect instance logs which path served it. With
+`OSV_PLUGIN_LOG_LEVEL=debug`, every frame logs where its time went: the
+quality VEGAS asked for, then a `frame-cost path=device` line (decode,
+analyses, stitch, packing) and the readback.
 
-If playback stutters:
+If playback still stutters:
 
-- set **Sphere Size** to 4K or 2K while cutting;
-- lower the Preview window's quality, or use VEGAS's proxies and RAM preview;
-- use the `.LRF` proxy switch ([below](#lrf-proxies));
-- turn off **Seam Search** in Stitching.
+- check that **Playback Proxy** is on (Advanced) and the `.LRF` sits beside
+  the `.OSV` with the same name;
+- set the Preview window to Draft;
+- use VEGAS's own RAM preview;
+- with no NVIDIA GPU, set **Sphere Size** to 4K or 2K and turn off
+  **Seam Search** in Stitching.
 
 ## Reframing other 360 footage
 
@@ -194,7 +218,7 @@ effect **after Pan/Crop**, with **Maintain aspect ratio** off, so a 2:1
 equirect fills the project frame. The extension's **Apply 360 Reframe** command
 sets this up for the selected events. It costs some resolution, because the
 sphere is squeezed to the project's size first; for `.OSV` clips use OpenOSV
-Source in Reframed view instead, which frames from the native sphere.
+Source in Reframed view instead, which frames from the fisheyes themselves.
 
 ## The dock panel
 
@@ -234,9 +258,17 @@ keyframe copied.
 ## LRF proxies
 
 The camera writes a small `.LRF` proxy beside each `.OSV`, and OpenOSV Source
-opens either. The extension's LRF proxy toggle switches the generators
-between the two: proxies while you cut, the `.OSV` for the final render. Start
-Frame is kept on the camera's clock, so the cuts stay where they are both ways.
+opens either. Two ways to use it:
+
+- **Playback Proxy** (OpenOSV Source > Advanced, on by default). Frames VEGAS
+  plays at Draft or Preview quality are stitched from the `.LRF`, at the same
+  moment on the camera's clock; Good and Best stitch the `.OSV`. Nothing
+  about the clip changes, so there is nothing to switch back before a render.
+  Turn it off to play the `.OSV` at every quality.
+- **The extension's LRF proxy toggle** swaps the file itself: the `.LRF` at
+  every quality, renders included, until you switch back to full quality.
+  Start Frame is kept on the camera's clock, so the cuts stay where they are
+  both ways.
 
 ## Reporting a problem
 
@@ -279,7 +311,9 @@ Checked on every build:
 
 Written, and waiting for a GPU run: the GPU path against the CPU path in every
 format, levels and render window (`tests/ofx_gpu`, and the `[cuda]` tests of
-`tests/ofx`).
+`tests/ofx`); the direct view's framing and sharpness against the CPU framing;
+and Preview playback from the `.LRF` against Good from the `.OSV` (a `[sample]`
+test of the VEGAS profile).
 
 **The live-test checklist**, run in VEGAS Pro 17; the open items are still to
 be run. The smoke-test script ([`scripts/vegas/README.md`](../scripts/vegas/README.md))
@@ -303,6 +337,12 @@ checks most of the scripting-API items and writes
       video-levels project and a 32-bit full-range one.
 - [ ] OpenOSV 360 Reframe on equirect footage, after Pan/Crop.
 - [ ] Playback speed on an NVIDIA GPU, and the fallback without one.
+- [ ] VEGAS names its quality on every render: the first-render log line
+      reads `preview quality (interactive, draft)` in the Preview window and
+      `good quality (exact, full stitch)` in a file render.
+- [ ] Playback Proxy: at Preview quality the log says the clip `plays from its
+      proxy`, and the picture follows the `.OSV`'s cuts; at Good it stitches
+      the `.OSV`.
 - [ ] Rendering to a file: the same picture as the preview.
 - [ ] VEGAS Pro 14 to 16, and VEGAS Pro 2026 (its data folder, presumably
       `%LOCALAPPDATA%\VEGAS Pro\2026.0`).

@@ -22,8 +22,10 @@
 //
 //   * descriptors: 8-bit and float, each in R G B A and B G R A; the filter
 //     in the Filter context only; the generator render-unsafe; Output Levels
-//     in the Colour group; the Choose button hidden; no depth in the
-//     generator's clip preferences;
+//     in the Colour group and Playback Proxy in the Advanced group; the
+//     Choose button hidden; no depth in the generator's clip preferences;
+//   * playback: a Preview-quality frame comes from the .LRF proxy, a
+//     Good-quality one from the .OSV;
 //   * pixels: the filter in all four formats equals the Premiere effect's
 //     float render of the same (dequantised) source, within one 8-bit code;
 //     the generator's output in every format and both levels is its float
@@ -46,10 +48,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -244,12 +248,16 @@ struct VegasSourceRig {
         return *p;
     }
 
-    OfxStatus render(double time = 0.0, const std::string& field = kOfxImageFieldNone) {
+    /// Render `time`; `quality` is VEGAS's OfxImageEffectPropRenderQuality
+    /// value (empty: not set, as a VEGAS without it would leave it).
+    OfxStatus render(double time = 0.0, const std::string& field = kOfxImageFieldNone,
+                     const std::string& quality = {}) {
         output.fill(-7.0f);
         PluginHarness::RenderArgs args;
         args.time = time;
         args.window = frame;
         args.field = field;
+        args.quality = quality;
         return Fixture::get().source.render(*effect, args);
     }
 };
@@ -321,7 +329,8 @@ TEST_CASE("VEGAS: the generator is unsafe, with Output Levels and no Choose butt
     auto ctx = Fixture::get().source.describeInContext(kOfxImageEffectContextGenerator, &st);
     REQUIRE(st == kOfxStatOK);
 
-    // The shared list with Output Levels right after Colour Output.
+    // The shared list with Output Levels right after Colour Output and
+    // Playback Proxy right after Sphere Size.
     std::vector<std::string> expected = {src::kFile, src::kChooseFile, src::kClipInfo, src::kOutput, src::kStartFrame};
     expected.insert(expected.end(), std::begin(cam::kAllParams), std::end(cam::kAllParams));
     for (const char* name : sp::kAllParams) {
@@ -329,8 +338,21 @@ TEST_CASE("VEGAS: the generator is unsafe, with Output Levels and no Choose butt
         if (std::string(name) == sp::kColorOutput) {
             expected.emplace_back(sp::kOutputLevels);
         }
+        if (std::string(name) == sp::kSphereSize) {
+            expected.emplace_back(sp::kPlaybackProxy);
+        }
     }
     CHECK(names(ctx->params) == expected);
+
+    // Playback Proxy: a static checkbox in the Advanced group, on by default.
+    const Param* proxy = ctx->params.find(sp::kPlaybackProxy);
+    REQUIRE(proxy);
+    CHECK(proxy->type == kOfxParamTypeBoolean);
+    CHECK(proxy->props.getString(kOfxPropLabel) == "Playback Proxy");
+    CHECK(proxy->props.getInt(kOfxParamPropDefault) == 1);
+    CHECK(proxy->props.getInt(kOfxParamPropAnimates) == 0);
+    CHECK(proxy->props.getString(kOfxParamPropParent) == sp::kAdvancedGroup);
+    CHECK(proxy->props.getString(kOfxParamPropHint).find(".LRF") != std::string::npos);
 
     const Param* levels = ctx->params.find(sp::kOutputLevels);
     REQUIRE(levels);
@@ -647,6 +669,133 @@ TEST_CASE("VEGAS: a field render at x.5 shows the frame x shows", "[ofx][.vegas]
     const HostImage first = whole.output;
     REQUIRE(whole.render(7.5, kOfxImageFieldUpper) == kOfxStatOK);
     CHECK(maxDifference(first, whole.output, whole.frame) == 0.0);
+}
+
+// ===========================================================================
+//  VEGAS playback: the quality it names, and the .LRF proxy
+// ===========================================================================
+// VEGAS names a quality for every render (OfxHost.h, renderModeFor()): its
+// Preview window plays at Draft or Preview, a file render uses Good or Best.
+// With Playback Proxy on, the generator stitches a Draft / Preview frame from
+// the .LRF the camera recorded beside the .OSV, at the same moment; Good and
+// Best always stitch the .OSV.
+
+namespace {
+
+/// Mean luma and the luma correlation of two float renders over `area`,
+/// counting only pixels both cover (alpha > 0.99).
+struct LumaComparison {
+    double meanA = 0.0;
+    double meanB = 0.0;
+    double correlation = 0.0;
+    std::size_t pixels = 0;
+};
+
+LumaComparison compareLuma(const HostImage& a, const HostImage& b, const OfxRectI& area) {
+    std::vector<double> la;
+    std::vector<double> lb;
+    for (int y = area.y1; y < area.y2; ++y) {
+        for (int x = area.x1; x < area.x2; ++x) {
+            const float* p = a.pixel(x, y);
+            const float* q = b.pixel(x, y);
+            if (!p || !q || !(p[3] > 0.99f) || !(q[3] > 0.99f)) {
+                continue;
+            }
+            // Rec. 709 luma weights; the exact weights do not matter here.
+            la.push_back(0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]);
+            lb.push_back(0.2126 * q[0] + 0.7152 * q[1] + 0.0722 * q[2]);
+        }
+    }
+    LumaComparison c;
+    c.pixels = la.size();
+    if (c.pixels < 2) {
+        return c;
+    }
+    for (std::size_t i = 0; i < c.pixels; ++i) {
+        c.meanA += la[i];
+        c.meanB += lb[i];
+    }
+    c.meanA /= static_cast<double>(c.pixels);
+    c.meanB /= static_cast<double>(c.pixels);
+    double sab = 0.0;
+    double saa = 0.0;
+    double sbb = 0.0;
+    for (std::size_t i = 0; i < c.pixels; ++i) {
+        const double da = la[i] - c.meanA;
+        const double db = lb[i] - c.meanB;
+        sab += da * db;
+        saa += da * da;
+        sbb += db * db;
+    }
+    c.correlation = (saa > 0.0 && sbb > 0.0) ? sab / std::sqrt(saa * sbb) : 0.0;
+    return c;
+}
+
+/// True when the render wrote every pixel of `area` (no -7 sentinel left).
+bool everyPixelWritten(const HostImage& image, const OfxRectI& area) {
+    for (int y = area.y1; y < area.y2; ++y) {
+        for (int x = area.x1; x < area.x2; ++x) {
+            const float* p = image.pixel(x, y);
+            if (!p || p[3] == -7.0f) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST_CASE("VEGAS: Preview playback plays the .LRF proxy, Good and Playback Proxy off stitch the .OSV",
+          "[ofx][.vegas][sample]") {
+    REQUIRE_VEGAS_PROFILE();
+    const CpuPathOnly cpuPath;  // the engine's own render, no GPU framing
+    const std::string clip = sampleClip();
+    if (clip.empty()) {
+        SKIP("no sample clip");
+    }
+    // The camera's proxy beside the sample clip, in either spelling.
+    std::filesystem::path lrf = clip;
+    lrf.replace_extension(".LRF");
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(lrf, ec)) {
+        lrf.replace_extension(".lrf");
+        if (!std::filesystem::is_regular_file(lrf, ec)) {
+            SKIP("no .LRF beside the sample clip");
+        }
+    }
+
+    /// One float render of the same moment and camera at `quality`, with
+    /// Playback Proxy `proxyOn`, at full levels.
+    const auto renderAt = [&](const char* quality, bool proxyOn) {
+        VegasSourceRig rig(kFormats[2], 29.97, 192, 108);
+        rig.param(src::kFile).s = clip;
+        rig.param(cam::kPan).d = 30.0;
+        rig.param(cam::kTilt).d = -5.0;
+        rig.param(sp::kPlaybackProxy).i = proxyOn ? 1 : 0;
+        rig.param(sp::kOutputLevels).i = static_cast<int>(ofx::OutputLevels::Full);
+        REQUIRE(rig.render(10.0, kOfxImageFieldNone, quality) == kOfxStatOK);
+        CHECK(everyPixelWritten(rig.output, rig.frame));
+        return rig.output;
+    };
+    const OfxRectI frame{0, 0, 192, 108};
+
+    // ---- Good: a file render's quality stitches the .OSV, proxy or not ----------
+    const HostImage goodOn = renderAt(ofx::kVegasQualityGood, true);
+    const HostImage goodOff = renderAt(ofx::kVegasQualityGood, false);
+    CHECK(maxDifference(goodOn, goodOff, frame) == 0.0);
+
+    // ---- Preview: the proxy serves it - the same moment, other pixels ------------
+    const HostImage previewOff = renderAt(ofx::kVegasQualityPreview, false);
+    const HostImage previewOn = renderAt(ofx::kVegasQualityPreview, true);
+    CHECK(maxDifference(previewOn, previewOff, frame) > 0.0);
+    // The same moment through the same camera: the picture agrees in
+    // brightness and structure, up to the proxy's resolution and 8-bit H.264.
+    const LumaComparison c = compareLuma(previewOn, previewOff, frame);
+    INFO("covered " << c.pixels << ", luma " << c.meanA << " vs " << c.meanB << ", correlation " << c.correlation);
+    CHECK(c.pixels > static_cast<std::size_t>(192 * 108 * 9 / 10));
+    CHECK(std::fabs(c.meanA - c.meanB) < 0.08);
+    CHECK(c.correlation > 0.85);
 }
 
 // ===========================================================================

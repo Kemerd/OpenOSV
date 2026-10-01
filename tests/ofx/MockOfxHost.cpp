@@ -929,6 +929,11 @@ OfxStatus PluginHarness::render(Effect& effect, const RenderArgs& args) {
     in.setInt(kOfxImageEffectPropSequentialRenderStatus, 0);
     in.setInt(kOfxImageEffectPropInteractiveRenderStatus, args.interactive ? 1 : 0);
     in.setInt(kOfxImageEffectPropRenderQualityDraft, args.draft ? 1 : 0);
+    // VEGAS names its quality as a string of its own; only a test playing
+    // VEGAS sets it.
+    if (!args.quality.empty()) {
+        in.setString("OfxImageEffectPropRenderQuality", args.quality);
+    }
     if (args.setCudaProps) {
         in.setInt(kOfxImageEffectPropCudaEnabled, args.cuda ? 1 : 0);
         in.setPointer(kOfxImageEffectPropCudaStream, args.stream);

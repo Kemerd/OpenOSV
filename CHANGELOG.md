@@ -6,6 +6,40 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-01
+
+VEGAS Pro playback, rebuilt for speed.
+
+### Added
+
+* **VEGAS Pro: Playback Proxy** (OpenOSV Source > Advanced, on by default).
+  At Draft and Preview quality the generator plays the `.LRF` the camera
+  recorded beside the `.OSV`, at the same moment on the camera's clock. Good
+  and Best always stitch the `.OSV`, so renders never touch the proxy.
+* At `OSV_PLUGIN_LOG_LEVEL=debug`, every VEGAS frame logs where its time
+  went: the quality VEGAS asked for, decode, analyses, stitch and packing
+  (`frame-cost path=device`), and the readback.
+
+### Changed
+
+* **VEGAS Pro: playback is no longer a final render.** VEGAS names its
+  preview quality in a property of its own, which OpenOSV never read, so
+  every playback frame waited on every analysis and ran the full seam
+  search, parallax and sun ghost fit. Draft and Preview (the Preview
+  window's default) now render as playback; Good and Best, what File >
+  Render As uses, keep the full stitch.
+* **VEGAS Pro: the reframed view renders straight from the fisheyes on the
+  GPU.** Only the pixels the camera shows are stitched: 2 MP for a 1080p
+  view instead of the 29.5 MP of an 8K sphere, with 472 MB less VRAM. One
+  resampling instead of two, so the view is sharper too. `OPENOSV_OFX_DIRECT=0`
+  brings back the sphere path.
+
+### Fixed
+
+* A frame asked for twice in a row on the host-decode path (an `.LRF`
+  recorded at half the `.OSV`'s rate asks for each of its frames twice) no
+  longer seeks back and decodes its whole GOP again.
+
 ## [0.4.1] - 2026-09-30
 
 VEGAS Pro 17.0 works: import, the camera and playback, live in VEGAS. Still

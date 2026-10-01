@@ -320,6 +320,13 @@ public:
     /// the .OSV extension, when that file exists.  Empty for anything else.
     [[nodiscard]] static std::filesystem::path proxyOriginalFor(const std::filesystem::path& path);
 
+    /// The other direction: the .LRF the camera recorded beside an .OSV -
+    /// the same folder and name with the .LRF extension - when that file
+    /// exists.  Empty for anything else (an .LRF, a missing proxy, a path
+    /// the filesystem cannot handle).  Whether the .LRF really covers the
+    /// .OSV's moments is for the opened proxy to say (isProxy()).
+    [[nodiscard]] static std::filesystem::path proxyFileFor(const std::filesystem::path& path);
+
     /// Native equirect output size: 2 x decoded lens height by lens height.
     ///
     /// Takes m_mutex.  It has to: the answer depends on m_reader, which
@@ -496,6 +503,24 @@ public:
     /// work it could do afterwards.  Its Status is returned as the render's.
     using DeviceFrameConsumer = std::function<Status(const DeviceFrame&)>;
 
+    /// Turns the frame's stitch job into another OUTPUT before it is rendered.
+    ///
+    /// It receives the job exactly as renderFrame() would render the
+    /// equirect - rig, colour, blend, every analysis, the stabilisation in
+    /// Rout, the seam / warp / blend-seam / photo tables - and may rewrite
+    /// `job.params` so the renderer draws something else from the same
+    /// stitch: the OpenFX generator's camera view, traced straight from the
+    /// fisheyes in the kernel's reframe mode, so no sphere is stitched and
+    /// resampled on the way (plugins/ofx/OfxGpuView.cpp).  It must leave a
+    /// block whose tables still match `job` (it may only REPLACE the output
+    /// fields: size, mode, projection, camera, Rout); the DeviceFrame handed
+    /// to the consumer then has the block's outW x outH.
+    ///
+    /// Runs on the host, before any GPU lock is taken.  A failure is
+    /// returned as the render's Error - not counted against NVDEC - and
+    /// nothing is rendered.
+    using JobRetarget = std::function<Status(render::RenderJob&)>;
+
     /// Decode + stitch frame `index` at `geometry` (an equirect: `view` must
     /// be unset) on the shared CUDA renderer and hand the device result to
     /// `consume`, without reading a pixel back.
@@ -516,9 +541,20 @@ public:
     /// decoding, as renderFrameToHost does).  The caller MUST hold lock() for
     /// the whole call.  `draft`, `purpose` and `outputTransfer` mean exactly
     /// what they mean for renderFrame().
+    ///
+    /// `retarget`, when given, rewrites the job's output before the render
+    /// (see JobRetarget): `geometry` is then only the equirect the stitch is
+    /// planned for (its size is what the analyses' tables are built against),
+    /// and the consumer receives the retargeted output instead.
+    ///
+    /// A frame the host decoder already decoded for the previous call is
+    /// reused rather than decoded again: an .LRF proxy at half the .OSV's
+    /// rate is asked for each of its frames twice in a row, and the host
+    /// decoder can only answer a repeat with a seek and a GOP re-decode.
     [[nodiscard]] Result<bool> renderFrameToDevice(std::uint32_t index, const OutputGeometry& geometry, bool draft,
                                                    RenderPurpose purpose, int outputTransfer,
-                                                   const DeviceFrameConsumer& consume, std::string* whyNot = nullptr);
+                                                   const DeviceFrameConsumer& consume, std::string* whyNot = nullptr,
+                                                   const JobRetarget& retarget = {});
     // ---- [/WP-V-GPU] ----------------------------------------------------------
 
     // ---- the direct GPU path (docs/DIRECT_GPU.md) --------------------------
@@ -1075,6 +1111,15 @@ private:
     /// The shared pinned readback; held so it lives exactly as long as some
     /// clip may still use it (released with the instance).
     std::shared_ptr<GpuReadback> m_gpuReadback;
+    /// renderFrameToDevice()'s last HOST-decoded pair and its index, so a
+    /// repeat request for the same frame skips the decoder - which could
+    /// only answer it with a seek back to the sync frame and a GOP
+    /// re-decode.  Decoding depends on nothing but the file and the index,
+    /// so the pair stays valid until the reader is replaced: releaseHeavy()
+    /// drops it with the reader.  kNoHostPair when empty.  Guarded by m_mutex.
+    static constexpr std::uint32_t kNoHostPair = 0xFFFFFFFFu;
+    std::uint32_t m_deviceHostPairIndex = kNoHostPair;
+    video::FramePair m_deviceHostPair;
     /// FramePath of the last renderFrameToHost(), atomic for lastFramePath().
     std::atomic<int> m_lastFramePath{0};
 

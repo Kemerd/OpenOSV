@@ -278,6 +278,65 @@ OfxPropertySetHandle hostProperties() noexcept {
 }
 
 // ---------------------------------------------------------------------------
+//  How carefully a frame is rendered
+// ---------------------------------------------------------------------------
+
+HostQuality hostQualityFromName(std::string_view value) noexcept {
+    // Exact matches only: these are tokens out of VEGAS's header, not words
+    // a user typed, and a near miss is a value we know nothing about.
+    if (value == kVegasQualityDraft) {
+        return HostQuality::Draft;
+    }
+    if (value == kVegasQualityPreview) {
+        return HostQuality::Preview;
+    }
+    if (value == kVegasQualityGood) {
+        return HostQuality::Good;
+    }
+    if (value == kVegasQualityBest) {
+        return HostQuality::Best;
+    }
+    return HostQuality::Unknown;
+}
+
+const char* hostQualityName(HostQuality quality) noexcept {
+    switch (quality) {
+        case HostQuality::Draft: return "draft";
+        case HostQuality::Preview: return "preview";
+        case HostQuality::Good: return "good";
+        case HostQuality::Best: return "best";
+        case HostQuality::Unknown: break;
+    }
+    return "unnamed";
+}
+
+RenderMode renderModeFor(OfxPropertySetHandle inArgs, HostProfile profile) noexcept {
+    RenderMode mode;
+    // ---- the OpenFX 1.4 flags: every host, read as they always were --------
+    mode.interactive = getInt(inArgs, kOfxImageEffectPropInteractiveRenderStatus, 0, 0) != 0;
+    mode.draft = getInt(inArgs, kOfxImageEffectPropRenderQualityDraft, 0, 0) != 0;
+    if (profile != HostProfile::Vegas) {
+        return mode;  // Resolve and every other host: nothing else to read
+    }
+
+    // ---- VEGAS: the quality it names instead ---------------------------------
+    // Only a string with at least one value is read; a host that stored
+    // something else under the name reads as Unknown and changes nothing.
+    if (dimension(inArgs, kPropVegasRenderQuality) >= 1) {
+        mode.quality = hostQualityFromName(getString(inArgs, kPropVegasRenderQuality));
+    }
+    // Draft and Preview are what the Preview window plays at; a file render
+    // never asks for either unless the user chose it for the render itself,
+    // and then a draft is what they asked for.
+    if (mode.quality == HostQuality::Draft || mode.quality == HostQuality::Preview) {
+        mode.interactive = true;
+        mode.draft = true;
+        mode.playback = true;
+    }
+    return mode;
+}
+
+// ---------------------------------------------------------------------------
 //  The host's self-description, for the log
 // ---------------------------------------------------------------------------
 

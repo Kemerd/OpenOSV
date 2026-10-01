@@ -359,10 +359,12 @@ audio. Tested in VEGAS Pro 17.0; 14 to 16 and 2026 are best effort.
 5. **Colour.** **Colour Output** starts at Rec. 709 with DJI's look. Stay on
    it for now: HDR and ACES projects in VEGAS aren't verified yet. **D-Log M**
    gives you the log picture to grade with the LUTs in the zip's `LUTs` folder.
-6. **Cut faster.** The dock panel's **LRF proxy** switch swaps every clip to
-   the camera's small `.LRF` while you edit and back to the `.OSV` for the
-   render, cuts untouched. **Sphere Size** 4K or 2K in the controls also helps
-   on a slower card.
+6. **Cut faster.** It's on already: at the Preview window's **Draft** and
+   **Preview** quality, OpenOSV Source plays the camera's small `.LRF` from
+   beside the `.OSV` (**Playback Proxy**, under Advanced). **Good** and
+   **Best**, and every file render, stitch the `.OSV` in full. To keep the
+   `.LRF` at every quality, the dock panel's **LRF proxy** switch swaps every
+   clip to it and back, cuts untouched.
 7. **Two framings of one clip?** Every event cut from one import shares one
    camera. **Tools > Extensions > OpenOSV > Make framing unique** gives the
    selected events their own copy.

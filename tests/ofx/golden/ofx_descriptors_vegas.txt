@@ -1035,6 +1035,16 @@ plugin org.openosv.OSVSource
       OfxPropLabel : string = ["Sphere Size"]
       OfxPropName : string = ["sphereSize"]
       OfxPropType : string = ["OfxTypeParameter"]
+    param playbackProxy (OfxParamTypeBoolean)
+      OfxParamPropAnimates : int = [0]
+      OfxParamPropDefault : int = [1]
+      OfxParamPropHint : string = ["At Draft and Preview quality, plays the .LRF the camera recorded beside the .OSV: smooth on any machine. Good and Best always stitch the .OSV."]
+      OfxParamPropParent : string = ["advancedGroup"]
+      OfxParamPropScriptName : string = ["playbackProxy"]
+      OfxParamPropType : string = ["OfxParamTypeBoolean"]
+      OfxPropLabel : string = ["Playback Proxy"]
+      OfxPropName : string = ["playbackProxy"]
+      OfxPropType : string = ["OfxTypeParameter"]
   clip preferences (OfxImageEffectContextGenerator, create kOfxStatOK) -> kOfxStatOK
     OfxImageClipPropComponents_Output : string = ["OfxImageComponentRGBA"]
     OfxImageClipPropContinuousSamples : int = [0]

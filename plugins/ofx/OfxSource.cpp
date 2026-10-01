@@ -17,6 +17,14 @@
 //     gives the file field a Browse button of its own.
 //
 // Every difference keys on hostProfile() (OfxHost.h) and on nothing else.
+//
+// VEGAS playback.  VEGAS names a quality for every render (renderModeFor(),
+// OfxHost.h): Draft and Preview - what its Preview window plays at - render
+// as playback frames (no waiting for analyses, no seam search, parallax or
+// ghost fit), and with Playback Proxy on they are stitched from the .LRF
+// the camera recorded beside the .OSV.  Good and Best, the qualities a file
+// render uses, stitch the .OSV in full.  Under Resolve nothing of this
+// applies: it never names a quality, and has no Playback Proxy control.
 
 #include "OfxSource.h"
 
@@ -40,6 +48,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <cwctype>
@@ -178,6 +187,20 @@ struct Instance {
     PrefsBlob clipPrefs = PrefsBlob::defaults();///< The settings `clip` was opened with.
     std::string lastProblem;                    ///< The last message shown, so it is shown once.
     bool loggedTiming = false;                  ///< The first render's timing has been logged.
+
+    // ---- [VEGAS playback] the .LRF proxy that serves Draft / Preview frames ----
+    /// The proxy engine, or null when the .OSV has none worth using.  Held
+    /// here (strongly) for the same reason `clip` is: every cut of the clip
+    /// shares it through the clip cache, and it lives while any cut does.
+    std::shared_ptr<ImporterInstance> proxy;
+    /// The .OSV and settings `proxy` was looked up for.  The answer - a
+    /// proxy or none - is kept until either changes, so playback never asks
+    /// the disk again per frame.
+    std::filesystem::path proxyCheckedFor;
+    PrefsBlob proxyPrefs = PrefsBlob::defaults();
+    bool proxyChecked = false;
+    /// The first playback frame served from the proxy has been logged.
+    bool loggedProxy = false;
 };
 
 [[nodiscard]] Instance* instanceOf(OfxImageEffectHandle effect) noexcept {
@@ -217,6 +240,50 @@ struct Instance {
     inst.clipPath = path;
     inst.clipPrefs = prefs;
     return clip;
+}
+
+/// The .LRF proxy of the .OSV `osvPath` for `prefs`: the camera's own
+/// low-resolution recording beside it, opened as an engine of its own (and
+/// shared through the clip cache like any other).  Null when there is none
+/// worth using: no .LRF beside the .OSV, one that cannot be opened, or one
+/// that does not cover the .OSV's moments - the engine presents an .LRF on
+/// its .OSV's timeline only when it does (isProxy()).
+///
+/// The answer is cached per instance until the file or the settings change,
+/// so a playing timeline asks the disk once, not once per frame.
+[[nodiscard]] std::shared_ptr<ImporterInstance> proxyFor(Instance& inst, const std::filesystem::path& osvPath,
+                                                        const PrefsBlob& prefs) {
+    std::lock_guard<std::mutex> lock(inst.mutex);
+    if (inst.proxyChecked && inst.proxyCheckedFor == osvPath &&
+        std::memcmp(&inst.proxyPrefs, &prefs, PrefsBlob::kSize) == 0) {
+        return inst.proxy;  // possibly null: "no proxy" is an answer too
+    }
+
+    // ---- find and open it --------------------------------------------------------
+    // Under the instance lock, exactly as clipFor() opens the clip: the
+    // generator renders one frame at a time in VEGAS (render-unsafe), so the
+    // lock only keeps a concurrent InstanceChanged off half-written fields.
+    std::shared_ptr<ImporterInstance> proxy;
+    const std::filesystem::path lrf = ImporterInstance::proxyFileFor(osvPath);
+    if (!lrf.empty()) {
+        std::string error;
+        proxy = acquireClip(lrf, prefs, error);
+        if (!proxy) {
+            PluginLog::warn("ofx source: the proxy '{}' of '{}' cannot be opened ({}); playback stitches the .OSV",
+                            lrf.filename().string(), osvPath.filename().string(), error);
+        } else if (!proxy->isProxy()) {
+            // An .LRF that does not overlap its .OSV's moments would show the
+            // wrong part of the shot: never a stand-in for it.
+            PluginLog::info("ofx source: '{}' does not cover the moments of '{}'; playback stitches the .OSV",
+                            lrf.filename().string(), osvPath.filename().string());
+            proxy.reset();
+        }
+    }
+    inst.proxy = proxy;
+    inst.proxyCheckedFor = osvPath;
+    inst.proxyPrefs = prefs;
+    inst.proxyChecked = true;
+    return proxy;
 }
 
 /// The Clip read-out: what the user needs to trim the generator to.
@@ -559,10 +626,23 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     }
     const long long startFrame = intAt(params, kStartFrame, time, 0);
     const long long index = frameForTime(time, haveRange ? range[0] : 0.0, hostFps, clip->fps(), startFrame);
+
+    // ---- how carefully ----------------------------------------------------------
+    // Playback may not wait for a per-bucket analysis; a paused frame and a
+    // Deliver render must (the importer's RenderPurpose).  Draft quality skips
+    // the seam search and the parallax correction, as it does in Premiere.
+    // Resolve says so with the OpenFX 1.4 flags; VEGAS names its quality
+    // instead, and Draft / Preview - what its Preview window plays at - are
+    // playback (renderModeFor(), OfxHost.h).
+    const RenderMode renderMode = renderModeFor(inArgs, profile);
+
     // Every frame's mapping, at debug level: the first-render line below
     // only shows one, and a host's timebase shows in the sequence.
-    PluginLog::logf(PluginLog::Level::Debug, "ofx source: time {} (range {} [{}, {}], host fps {}) -> clip frame {}",
-                    time, haveRange ? "known" : "unknown", range[0], range[1], hostFps, index);
+    PluginLog::logf(PluginLog::Level::Debug,
+                    "ofx source: time {} (range {} [{}, {}], host fps {}) -> clip frame {} ({} quality{}{})", time,
+                    haveRange ? "known" : "unknown", range[0], range[1], hostFps, index,
+                    hostQualityName(renderMode.quality), renderMode.interactive ? ", interactive" : "",
+                    renderMode.draft ? ", draft" : "");
     {
         std::lock_guard<std::mutex> lock(inst->mutex);
         if (!inst->loggedTiming) {
@@ -578,13 +658,15 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
             PluginLog::info("ofx source: first render of '{}': host '{}', time {}, output range {} [{}, {}], "
                             "unmapped range {}, effect duration {}, host fps {}, clip fps {:.3f}, start frame {} -> "
                             "clip frame {} of {}; frame {}x{}, render scale {}x{}; output {} {} at {} levels; "
-                            "VEGAS context {}",
+                            "VEGAS context {}; {} quality ({}, {})",
                             clip->path().filename().string(), hostName(), time, haveRange ? "known" : "unknown",
                             range[0], range[1], rangeText(outputProps, kOfxImageEffectPropUnmappedFrameRange),
                             doubleText(effectPropSet, kOfxImageEffectInstancePropEffectDuration), hostFps,
                             clip->fps(), startFrame, index, clip->frameCount(), frameW, frameH, sx, sy,
                             hostDepthName(outputView->depth), hostOrderName(outputView->order),
-                            outputLevelsName(levels), stringText(effectPropSet, kPropVegasContext));
+                            outputLevelsName(levels), stringText(effectPropSet, kPropVegasContext),
+                            hostQualityName(renderMode.quality), renderMode.interactive ? "interactive" : "exact",
+                            renderMode.draft ? "draft" : "full stitch");
         }
     }
     if (index < 0 || index >= static_cast<long long>(clip->frameCount())) {
@@ -592,20 +674,68 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
         return kOfxStatOK;
     }
 
-    // ---- how carefully ----------------------------------------------------------
-    // Playback may not wait for a per-bucket analysis; a paused frame and a
-    // Deliver render must (the importer's RenderPurpose).  Draft quality skips
-    // the seam search and the parallax correction, as it does in Premiere.
-    const bool interactive = getInt(inArgs, kOfxImageEffectPropInteractiveRenderStatus, 0, 0) != 0;
-    const bool draft = getInt(inArgs, kOfxImageEffectPropRenderQualityDraft, 0, 0) != 0;
-    const RenderPurpose purpose = interactive ? RenderPurpose::Interactive : RenderPurpose::Exact;
+    const RenderPurpose purpose = renderMode.interactive ? RenderPurpose::Interactive : RenderPurpose::Exact;
+    const bool draft = renderMode.draft;
     const int mode = intAt(params, kOutput, time, kOutputReframed);
     std::shared_ptr<ThreadPool> pool = HostContext::instance().threadPoolShared();
+
+    // ---- which engine: the .OSV, or its .LRF proxy for a playback frame -------
+    // A VEGAS playback frame (Draft / Preview) is stitched from the .LRF the
+    // camera recorded beside the .OSV when Playback Proxy is on: 2048 x 1024
+    // of H.264 instead of two 10-bit HEVC fisheyes of up to 3840 x 3840, a
+    // decode any machine keeps up with.  The proxy engine presents
+    // the .LRF on the .OSV's timeline (ImporterInstance::sourceFrameFor), so
+    // the frame shown is the one recorded at the same moment and every cut
+    // stays where it is.  Good and Best - every file render - stitch the
+    // .OSV.  `engine` / `engineIndex` are what renders from here on.
+    ImporterInstance* engine = clip.get();
+    std::uint32_t engineIndex = static_cast<std::uint32_t>(index);
+    std::shared_ptr<ImporterInstance> proxy;  // keeps the proxy alive for this render
+    if (renderMode.playback && source_params::playbackProxyAt(params, time, profile)) {
+        proxy = proxyFor(*inst, clip->path(), prefs);
+        // The proxy's timeline IS the .OSV's; a mismatch means the two files
+        // disagree about the clip, and the .OSV is the one the user chose.
+        if (proxy && proxy->timelineFrameCount() == clip->frameCount()) {
+            engine = proxy.get();
+            engineIndex = proxy->sourceFrameFor(engineIndex);
+            std::lock_guard<std::mutex> lock(inst->mutex);
+            if (!inst->loggedProxy) {
+                inst->loggedProxy = true;
+                PluginLog::info("ofx source: '{}' plays from its proxy '{}' at {} quality (clip frame {} -> proxy "
+                                "frame {}); Good and Best stitch the .OSV",
+                                clip->path().filename().string(), proxy->path().filename().string(),
+                                hostQualityName(renderMode.quality), index, engineIndex);
+            }
+        } else if (proxy) {
+            PluginLog::oncef("ofx/source/proxy-timeline", PluginLog::Level::Warn,
+                             "ofx source: the proxy of '{}' presents {} frames, the .OSV has {}; playback stitches "
+                             "the .OSV",
+                             clip->path().filename().string(), proxy->timelineFrameCount(), clip->frameCount());
+        }
+    }
+
+    // One debug line per frame with its wall time, whichever return the
+    // render takes - with the engine's "frame-cost" line and the GPU path's
+    // readback line, a user's log says where every millisecond went.
+    struct FrameTimer {
+        long long frame;
+        HostQuality quality;
+        bool draft;
+        bool fromProxy;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~FrameTimer() {
+            PluginLog::logf(PluginLog::Level::Debug, "ofx source: frame {} rendered in {:.2f} ms ({} quality, {}{})",
+                            frame,
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+                            hostQualityName(quality), draft ? "draft" : "full stitch",
+                            fromProxy ? ", from the .LRF proxy" : "");
+        }
+    } frameTimer{index, renderMode.quality, renderMode.draft, engine != clip.get()};
 
     // Leave the host's CUDA context current on this thread whatever the
     // engine's own GPU renderer does to it.
     cuda::CurrentContextGuard cudaGuard;
-    std::lock_guard<std::mutex> clipLock(clip->lock());
+    std::lock_guard<std::mutex> clipLock(engine->lock());
 
     if (mode == kOutputEquirect) {
         // ---- the whole sphere, straight at the frame's size -----------------
@@ -614,8 +744,7 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
         // the CPU copy below, as does a GPU failure, logged once.
         {
             std::string gpuError;
-            if (gpu::renderSourceEquirectGpu(*clip, static_cast<std::uint32_t>(index), draft, purpose, gpuTarget,
-                                             gpuError)) {
+            if (gpu::renderSourceEquirectGpu(*engine, engineIndex, draft, purpose, gpuTarget, gpuError)) {
                 gpu::notePath(effect, gpu::Hook::SourceEquirect, true, gpuError);
                 return kOfxStatOK;
             }
@@ -628,7 +757,7 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
         }
         // [WP-V-GPU] end
         const OutputGeometry geometry{frameW, frameH};
-        auto rendered = clip->renderFrame(static_cast<std::uint32_t>(index), geometry, draft, purpose);
+        auto rendered = engine->renderFrame(engineIndex, geometry, draft, purpose);
         if (!rendered.ok() || !rendered.value()) {
             reportOnce(effect, *inst, "OpenOSV Source could not stitch frame " + std::to_string(index) + ": " +
                                           (rendered.ok() ? std::string("no image") : rendered.error().message));
@@ -648,18 +777,20 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     }
 
     // ---- a camera into the native sphere ------------------------------------
-    const OutputGeometry sphere = clip->geometryForLocked(prefs);
+    // The GPU path traces the camera straight from the fisheyes and only
+    // plans the stitch for this sphere; the CPU path below stitches it.
+    const OutputGeometry sphere = engine->geometryForLocked(prefs);
     if (!sphere.valid()) {
         clearCpu(*outputView, window, levels);
         return kOfxStatFailed;
     }
-    // [WP-V-GPU] begin - the sphere stays in VRAM, the camera frames it on
-    // the GPU, and only the view is read back.  "Not mine" (no GPU path)
-    // falls through to the CPU framing below, as does a GPU failure, logged
-    // once.
+    // [WP-V-GPU] begin - the view is rendered on the GPU (straight from the
+    // fisheyes, or framed out of the sphere in VRAM) and only the view is
+    // read back.  "Not mine" (no GPU path) falls through to the CPU framing
+    // below, as does a GPU failure, logged once.
     {
         std::string gpuError;
-        if (gpu::renderSourceViewGpu(*clip, static_cast<std::uint32_t>(index), sphere, draft, purpose,
+        if (gpu::renderSourceViewGpu(*engine, engineIndex, sphere, draft, purpose,
                                      camera::read(params, time), camera::projectSize(effect), gpuTarget, gpuError)) {
             gpu::notePath(effect, gpu::Hook::SourceView, true, gpuError);
             return kOfxStatOK;
@@ -672,7 +803,7 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
         }
     }
     // [WP-V-GPU] end
-    auto rendered = clip->renderFrame(static_cast<std::uint32_t>(index), sphere, draft, purpose);
+    auto rendered = engine->renderFrame(engineIndex, sphere, draft, purpose);
     if (!rendered.ok() || !rendered.value()) {
         reportOnce(effect, *inst, "OpenOSV Source could not stitch frame " + std::to_string(index) + ": " +
                                       (rendered.ok() ? std::string("no image") : rendered.error().message));

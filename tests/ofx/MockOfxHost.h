@@ -280,6 +280,10 @@ public:
         bool interactive = false;
         bool draft = false;
         std::string field = kOfxImageFieldNone;  ///< kOfxImageEffectPropFieldToRender.
+        /// VEGAS's "OfxImageEffectPropRenderQuality" (ofxSonyVegas.h), e.g.
+        /// "OfxImageEffectPropRenderQualityPreview"; empty = not set at all,
+        /// as every host but VEGAS leaves it.
+        std::string quality;
     };
     OfxStatus render(Effect& effect, const RenderArgs& args);
 

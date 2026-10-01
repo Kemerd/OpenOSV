@@ -14,25 +14,54 @@
 //  The generator's frame, end to end
 // ===========================================================================
 //
+// Reframed view - DIRECT, the default:
+//
 //   NVDEC -> VRAM (both lenses; host decode + upload when NVDEC cannot)
+//     -> CudaRenderer, reframe mode: the camera's view traced straight from
+//        the fisheyes, float RGBA at the camera frame's size [renderer lock]
+//     -> pack kernel: levels + pack -> the view in VRAM    [renderer lock]
+//     -> pinned bands -> the host's CPU image              [no lock]
+//
+// Reframed view through the sphere (OPENOSV_OFX_DIRECT=0, or a stitch block
+// buildDirectParams() refuses), and the 360 equirect output:
+//
+//   NVDEC -> VRAM
 //     -> CudaRenderer stitch -> the sphere, float RGBA in VRAM   [renderer lock]
 //     -> view kernel: camera + levels + pack -> the view in VRAM [renderer lock]
 //     -> pinned bands -> the host's CPU image                   [no lock]
 //
 // Only the finished view crosses the bus: at 1920 x 1080 8-bit that is 8 MB
-// a frame instead of the 288 MB 6K sphere the CPU framing reads back.
+// a frame instead of the 288 MB 6K sphere the CPU framing reads back.  And
+// the direct view stitches only the pixels it shows: 2 MP for 1080p, where
+// the native 8K sphere is 29.5 MP (472 MB of VRAM) - the stitch, its
+// buffer and the second resampling all go (docs/DIRECT_GPU.md, WP-C).
+//
+// ===========================================================================
+//  Why the direct view frames exactly like the sphere path
+// ===========================================================================
+// It is Premiere's direct path, reused: reframe::buildDirectParams() takes
+// the camera from buildView() - the very function the sphere path frames
+// with - and every stitch field from the engine's own equirect block for the
+// frame (analyses, stabilisation, colour), composing Rout = R_stab * Rout_view
+// (plugins/reframe/DirectRender.h has the derivation; test_direct.cpp
+// measured the framing within 0.0016 px).  What differs is that the fisheyes
+// are resampled once instead of twice, so the direct view is the sharper.
 
 #include "OfxGpuView.h"
 
 #include "OfxCuda.h"
 
+#include "DirectRender.h"
 #include "HostContext.h"
 #include "PluginLog.h"
+
+#include "osv/render/RenderJob.h"
 
 #if defined(OSV_HAVE_CUDA)
 #include "osv/render/CudaRenderer.h"
 #endif
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -58,18 +87,22 @@ enum class Switch : std::uint8_t {
     On,    ///< Every own-GPU path on, whatever the host.
 };
 
-/// OPENOSV_OFX_GPU, read on every call (a test flips it between renders).
-[[nodiscard]] Switch readSwitch() noexcept {
+/// An on / off switch variable (OPENOSV_OFX_GPU, OPENOSV_OFX_DIRECT), read
+/// on every call (a test flips it between renders).
+[[nodiscard]] Switch readSwitch(const char* name) noexcept {
     char value[16] = {};
+    if (!name) {
+        return Switch::Auto;
+    }
 #if defined(_WIN32)
     // getenv_s: the module is /MD and shares the CRT's environment with the
     // host process (and with a test's _putenv_s).
     std::size_t length = 0;
-    if (getenv_s(&length, value, sizeof(value), "OPENOSV_OFX_GPU") != 0 || length == 0) {
+    if (getenv_s(&length, value, sizeof(value), name) != 0 || length == 0) {
         return Switch::Auto;
     }
 #else
-    const char* env = std::getenv("OPENOSV_OFX_GPU");
+    const char* env = std::getenv(name);
     if (!env || env[0] == '\0') {
         return Switch::Auto;
     }
@@ -83,6 +116,15 @@ enum class Switch : std::uint8_t {
     const bool off = c == '0' || c == 'f' || c == 'F' || c == 'n' || c == 'N' ||
                      ((c == 'o' || c == 'O') && (d == 'f' || d == 'F'));
     return on ? Switch::On : (off ? Switch::Off : Switch::Auto);
+}
+
+/// True unless OPENOSV_OFX_DIRECT switches the direct view off ("0", "off",
+/// "false", "no"): then the reframed view is framed out of the stitched
+/// sphere, as before the direct view existed.  For the parity tests, which
+/// hold the GPU sphere path to the CPU framing pixel for pixel, and for a
+/// user comparing the two.
+[[nodiscard]] bool directViewWanted() noexcept {
+    return readSwitch("OPENOSV_OFX_DIRECT") != Switch::Off;
 }
 
 /// Everything below the policy that must hold before a frame is tried: a
@@ -157,13 +199,18 @@ thread_local std::string t_declined;
 [[nodiscard]] int frameHeight(const OfxRectI& r) noexcept { return r.y2 > r.y1 ? r.y2 - r.y1 : 0; }
 
 /// The generator hooks' shared body: render `geometry` on the clip's CUDA
-/// renderer into VRAM, let `phaseOne` frame or pack it there (under the
-/// renderer lock), then read the result back into the target (outside it).
+/// renderer into VRAM - or, with `retarget`, the output it turns the stitch
+/// job into (the direct view) - let `phaseOne` frame or pack it there (under
+/// the renderer lock), then read the result back into the target (outside
+/// it).
 template <class PhaseOne>
 [[nodiscard]] bool renderClipOnDevice(ImporterInstance& clip, std::uint32_t index,
                                       const premiere::OutputGeometry& geometry, bool draft,
                                       premiere::RenderPurpose purpose, FrameJob& job, const PhaseOne& phaseOne,
-                                      std::string& error) {
+                                      std::string& error, const ImporterInstance::JobRetarget& retarget = {}) {
+    // For the per-frame debug line: the engine's share and the readback's.
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point tStart = Clock::now();
     // Check a slot out on the engine's device BEFORE the renderer lock is
     // taken: a wait for a slot must not hold every other clip's stitch up.
     // Best effort - phase 1 reserves on the frame's real device anyway.
@@ -186,7 +233,7 @@ template <class PhaseOne>
         return okStatus();
     };
     // The clip's own output transfer (-1), as renderFrame() uses it here.
-    auto served = clip.renderFrameToDevice(index, geometry, draft, purpose, -1, consume, &whyNot);
+    auto served = clip.renderFrameToDevice(index, geometry, draft, purpose, -1, consume, &whyNot, retarget);
     if (!served.ok()) {
         error = served.error().message.empty() ? std::string("the GPU stitch failed") : served.error().message;
         return false;
@@ -195,6 +242,7 @@ template <class PhaseOne>
         return decline(whyNot.empty() ? std::string("the clip has no GPU frame path") : whyNot, error);
     }
     // Phase 2, outside every lock but the caller's clip lock.
+    const Clock::time_point tReadBack = Clock::now();
     std::shared_ptr<ThreadPool> pool = copyPool();
     if (!job.readBack(pool.get(), error)) {
         if (error.empty()) {
@@ -202,6 +250,14 @@ template <class PhaseOne>
         }
         return false;
     }
+    // The engine logs its own stages ("frame-cost path=device"); this line
+    // adds what VEGAS's frame cost on top: the trip back into its CPU image.
+    const Clock::time_point tEnd = Clock::now();
+    PluginLog::logf(PluginLog::Level::Debug, "ofx gpu: frame {} of '{}': engine {:.2f} ms, readback {:.2f} ms ({})",
+                    index, clip.path().filename().string(),
+                    std::chrono::duration<double, std::milli>(tReadBack - tStart).count(),
+                    std::chrono::duration<double, std::milli>(tEnd - tReadBack).count(),
+                    retarget ? "direct view" : "from the sphere");
     return true;
 }
 
@@ -234,7 +290,7 @@ constexpr std::size_t kMaxNoted = 4096;
 
 bool ownGpuWanted(std::string* why) noexcept {
     try {
-        switch (readSwitch()) {
+        switch (readSwitch("OPENOSV_OFX_GPU")) {
         case Switch::Off:
             if (why) {
                 *why = "OPENOSV_OFX_GPU switches the own-GPU path off";
@@ -293,6 +349,74 @@ bool renderSourceViewGpu(ImporterInstance& clip, std::uint32_t index, const prem
         // After cuInit (gpuReady), so the guard records the real current
         // context even on the process's first GPU frame.
         cuda::CurrentContextGuard guard;
+
+        // ---- the direct view: the camera straight from the fisheyes ------------
+        // The engine builds the frame's stitch job for `sphere` exactly as
+        // always (every analysis, the stabilisation, the colour), and the
+        // retarget below turns its output into the camera frame: the renderer
+        // then shades only the view's pixels, at the frame's size, and the
+        // pack kernel levels and packs that image as it is.
+        if (directViewWanted()) {
+            bool refused = false;
+            std::string refusal;
+            const ImporterInstance::JobRetarget retarget = [&](render::RenderJob& stitchJob) -> Status {
+                reframe::StitchState stitch;
+                stitch.equirect = stitchJob.params;
+                // The tables travel in the job itself and the renderer uploads
+                // them from there; the builder only needs to see that each
+                // enabled feature has one.  It never dereferences them.
+                stitch.seamTable = stitchJob.seamShiftDeg.empty() ? nullptr : stitchJob.seamShiftDeg.data();
+                stitch.warpGrid = stitchJob.warpGrid.empty() ? nullptr : stitchJob.warpGrid.data();
+                stitch.blendSeam = stitchJob.blendSeam.empty() ? nullptr : stitchJob.blendSeam.data();
+                stitch.photoField = stitchJob.photoField.empty() ? nullptr : stitchJob.photoField.data();
+                // The seam smoothing's low band is the one table no job
+                // carries: the CUDA renderer builds it on the device from the
+                // planes for whatever block it renders (CudaRenderer.cpp).  So
+                // "it will exist" is true by construction; any non-null
+                // address says so, and none is ever read through it.
+                static const float kRendererBuildsSeamLow = 0.0f;
+                stitch.seamLow = stitchJob.params.seamSmoothEnabled ? &kRendererBuildsSeamLow : nullptr;
+
+                const reframe::DirectSetup setup =
+                    reframe::buildDirectParams(settings, stitch, frameW, frameH, projectSize);
+                if (!setup.valid) {
+                    refused = true;
+                    refusal = reframe::directRejectName(setup.reject);
+                    if (setup.reject == reframe::DirectReject::View) {
+                        refusal += std::string(" (") + reframe::setupRejectName(setup.viewReject) + ")";
+                    }
+                    return failStatus(ErrorCode::InvalidArgument, "the direct view refused the frame: " + refusal);
+                }
+                // Only the output fields change; the tables still describe
+                // the job's own vectors, which the renderer uploads.
+                stitchJob.params = setup.params;
+                return okStatus();
+            };
+            {
+                FrameJob job;
+                if (renderClipOnDevice(
+                        clip, index, sphere, draft, purpose, job,
+                        [&](const DeviceRgba& image, std::string& phaseError) {
+                            return job.packDevice(image, target, phaseError);
+                        },
+                        error, retarget)) {
+                    return true;
+                }
+            }
+            // "Not mine" and real failures mean what they always meant: the
+            // caller frames on the CPU.  Only a refusal of the stitch block -
+            // something buildDirectParams() will not trace, not expected from
+            // a real clip - takes the sphere path below instead, said once.
+            if (!refused) {
+                return false;
+            }
+            PluginLog::oncef("ofx/gpu/direct-refused", PluginLog::Level::Warn,
+                             "ofx gpu: the direct view refused frame {} of '{}' ({}); framing it out of the sphere",
+                             index, clip.path().filename().string(), refusal);
+            error.clear();
+        }
+
+        // ---- the view framed out of the stitched sphere ---------------------------
         FrameJob job;
         return renderClipOnDevice(
             clip, index, sphere, draft, purpose, job,

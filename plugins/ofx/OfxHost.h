@@ -164,6 +164,83 @@ inline constexpr const char* kPropVegasHostHWnd = "OfxPropVegasHostHWnd";
 /// Effect instance property, string: where in VEGAS the instance lives
 /// ("OfxImageEffectPropVegasContextGenerator", "...Event", "...Track"...).
 inline constexpr const char* kPropVegasContext = "OfxImageEffectPropVegasContext";
+/// Render action inArg, string (ofxSonyVegas.h): the quality VEGAS renders
+/// the frame at - its Preview window's quality while playing, the render
+/// template's "Video rendering quality" for a file render.  One of the four
+/// values below.
+inline constexpr const char* kPropVegasRenderQuality = "OfxImageEffectPropRenderQuality";
+/// The four values of kPropVegasRenderQuality.
+///
+/// Beware the first: it is spelled exactly like OpenFX 1.4's INT property
+/// kOfxImageEffectPropRenderQualityDraft.  VEGAS uses the string as a VALUE
+/// of its own property and never sets the int one, so reading the 1.4 flag
+/// under VEGAS finds nothing (renderModeFor() below reads both).
+inline constexpr const char* kVegasQualityDraft = "OfxImageEffectPropRenderQualityDraft";
+inline constexpr const char* kVegasQualityPreview = "OfxImageEffectPropRenderQualityPreview";
+inline constexpr const char* kVegasQualityGood = "OfxImageEffectPropRenderQualityGood";
+inline constexpr const char* kVegasQualityBest = "OfxImageEffectPropRenderQualityBest";
+
+// ---------------------------------------------------------------------------
+//  How carefully a frame is rendered
+// ---------------------------------------------------------------------------
+// OpenFX 1.4 tells an effect two things per render: whether the user is
+// interacting (kOfxImageEffectPropInteractiveRenderStatus) and whether a
+// draft will do (kOfxImageEffectPropRenderQualityDraft).  Resolve sets them.
+//
+// VEGAS speaks OpenFX 1.1 and sets neither.  It NAMES the quality instead
+// (kPropVegasRenderQuality): Draft, Preview, Good or Best - the Preview
+// window's setting while the user plays or scrubs (Preview by default), the
+// render template's setting for File > Render As (Good by default).  Read as
+// the two 1.4 flags it is invisible, and every playback frame then ran as a
+// final render: the full seam search, parallax and ghost fit, and a wait for
+// every analysis, on every frame.
+//
+// So Draft and Preview are PLAYBACK: interactive and draft, the way Premiere
+// treats its own low-quality playback.  Good and Best - the two qualities a
+// file render uses - stay exact.
+
+/// The quality a host named for one render, in VEGAS's own order.
+enum class HostQuality : std::uint8_t {
+    Unknown = 0,  ///< Not named (every host but VEGAS), or a value VEGAS never documented.
+    Draft = 1,    ///< VEGAS "Draft".
+    Preview = 2,  ///< VEGAS "Preview" (its Preview window's default).
+    Good = 3,     ///< VEGAS "Good" (a file render's default).
+    Best = 4,     ///< VEGAS "Best".
+};
+
+/// A kPropVegasRenderQuality value as a HostQuality: exact, case-sensitive
+/// matches of the four documented values, Unknown for anything else (the
+/// empty string included).  Pure, so the tests can feed it every spelling.
+[[nodiscard]] HostQuality hostQualityFromName(std::string_view value) noexcept;
+
+/// A short name for logs ("draft", "preview", "good", "best", "unnamed").
+[[nodiscard]] const char* hostQualityName(HostQuality quality) noexcept;
+
+/// What one render action asks of the effect.
+struct RenderMode {
+    /// The user is playing or scrubbing: never block on an analysis (the
+    /// importer's RenderPurpose::Interactive).
+    bool interactive = false;
+    /// A draft will do: no seam search, parallax correction, ghost fit or
+    /// carved seam for this frame.
+    bool draft = false;
+    /// A VEGAS playback frame (Draft or Preview quality): the generator may
+    /// serve it from the camera's .LRF proxy (OfxSource.cpp).
+    bool playback = false;
+    /// What the host named, for the log.
+    HostQuality quality = HostQuality::Unknown;
+};
+
+/// The render mode a render action's `inArgs` ask for under `profile`.
+///
+///   * Every host: the two OpenFX 1.4 flags, read exactly as they always
+///     were - Resolve's renders are unchanged.
+///   * VEGAS, in addition: its named quality.  Draft and Preview make the
+///     frame playback (interactive and draft); Good, Best, an unknown value
+///     and an absent property leave the flags as they were.
+///
+/// A null `inArgs` reads as a final render.  Never fails, never throws.
+[[nodiscard]] RenderMode renderModeFor(OfxPropertySetHandle inArgs, HostProfile profile) noexcept;
 
 /// The host's own property set (OfxHost::host: its name, version and
 /// capabilities), or null before setHost().

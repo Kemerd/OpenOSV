@@ -52,6 +52,11 @@
 // through the mock host).  It is read on every call, so a test - or a user
 // chasing a problem - can flip it without reloading the module.
 //
+// A second switch, OPENOSV_OFX_DIRECT, decides HOW the generator's reframed
+// view is made on that path: unset (or anything but "0" / "off" / "false" /
+// "no"), straight from the fisheyes; switched off, framed out of the stitched
+// sphere (see renderSourceViewGpu()).  Also read on every call.
+//
 // The generator hooks serve a clip whose renderer is the engine's CUDA
 // renderer (NVDEC decode when the clip allows it, host decode and upload
 // otherwise).  A clip on the OpenCL or CPU renderer - and every Mac - gets
@@ -82,10 +87,17 @@ namespace osv::ofx::gpu {
 // HostTarget - where a GPU render lands - is declared in OfxGpuPipeline.h,
 // below the clip engine, so the pipeline and its tests can use it alone.
 
-/// OpenOSV Source, Reframed view: stitch frame `index` of `clip` into its
-/// native sphere (`sphere`, from geometryForLocked) without leaving the GPU,
-/// frame the camera `settings` from it on the GPU, pack the view into the
-/// target's format and levels, and read back only the view.
+/// OpenOSV Source, Reframed view: render the camera `settings`' view of frame
+/// `index` of `clip` without leaving the GPU, pack it into the target's
+/// format and levels, and read back only the view.
+///
+/// By default the view is traced STRAIGHT FROM THE FISHEYES (the engine's
+/// reframe mode, through reframe::buildDirectParams()): the stitch job is
+/// planned for `sphere` (from geometryForLocked) as always, but only the
+/// camera frame's pixels are shaded - no sphere is stitched, kept in VRAM or
+/// resampled.  With OPENOSV_OFX_DIRECT=0 (or a stitch block the direct
+/// builder refuses, logged once) the frame is stitched into `sphere` and the
+/// view framed out of it on the GPU, as before.
 ///
 /// `draft` and `purpose` mean what they mean for
 /// ImporterInstance::renderFrame(); `projectSize` is camera::projectSize().

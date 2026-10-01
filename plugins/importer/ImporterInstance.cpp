@@ -1009,6 +1009,10 @@ void ImporterInstance::releaseHeavy() noexcept {
     // they may reference.
     m_audio.reset();
     m_audioProbed = false;
+    // The device path's last host-decoded pair goes with the reader it came
+    // from: a quiet is when its memory should go back.
+    m_deviceHostPair = video::FramePair{};
+    m_deviceHostPairIndex = kNoHostPair;
     // The reader is parked rather than destroyed: the next unquiet of this
     // clip, or the next instance Premiere opens for it (every Source Settings
     // change does), takes it back warm from the process-wide pool instead of
@@ -1123,6 +1127,32 @@ std::filesystem::path ImporterInstance::proxyOriginalFor(const std::filesystem::
         }
     } catch (...) {
         // A path the filesystem library cannot handle has no original.
+    }
+    return {};
+}
+
+std::filesystem::path ImporterInstance::proxyFileFor(const std::filesystem::path& path) {
+    try {
+        // Only an .OSV has a proxy; the extension in any case.
+        std::wstring ext = path.extension().wstring();
+        for (wchar_t& c : ext) {
+            c = static_cast<wchar_t>(std::towlower(c));
+        }
+        if (ext != L".osv") {
+            return {};
+        }
+        // proxyOriginalFor()'s rule the other way round: the camera names the
+        // pair alike, and both spellings are tried for a case-sensitive volume.
+        for (const wchar_t* candidateExt : {L".LRF", L".lrf"}) {
+            std::filesystem::path candidate = path;
+            candidate.replace_extension(candidateExt);
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(candidate, ec) && !ec) {
+                return candidate;
+            }
+        }
+    } catch (...) {
+        // A path the filesystem library cannot handle has no proxy.
     }
     return {};
 }
@@ -3101,7 +3131,8 @@ Result<bool> ImporterInstance::renderFrameOnGpu(std::uint32_t index, const Outpu
 
 Result<bool> ImporterInstance::renderFrameToDevice(std::uint32_t index, const OutputGeometry& geometry, bool draft,
                                                    RenderPurpose purpose, int outputTransfer,
-                                                   const DeviceFrameConsumer& consume, std::string* whyNot) {
+                                                   const DeviceFrameConsumer& consume, std::string* whyNot,
+                                                   const JobRetarget& retarget) {
     // "Not mine": the caller renders the frame its own way; the reason goes
     // to its log.
     const auto notMine = [whyNot](std::string reason) {
@@ -3174,6 +3205,15 @@ Result<bool> ImporterInstance::renderFrameToDevice(std::uint32_t index, const Ou
         return Error{ErrorCode::Gpu, "cannot make the renderer's primary context current"};
     }
 
+    // Stage timings for the per-frame "frame-cost" debug line at the end -
+    // the same prefix and key=value style as renderFrameOnGpu()'s, so one
+    // grep collects every path's numbers from a user's log.
+    using StageClock = std::chrono::steady_clock;
+    const auto stageMs = [](StageClock::time_point a, StageClock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const StageClock::time_point tDecode = StageClock::now();
+
     // ---- decode: NVDEC into VRAM, the importer frame path's decoder ----------
     // One decoder per clip and context, shared with renderFrameToHost() (the
     // same key, the same state machine): a clip NVDEC cannot serve is marked
@@ -3235,19 +3275,34 @@ Result<bool> ImporterInstance::renderFrameToDevice(std::uint32_t index, const Ou
     }
 
     // ---- or on the host, uploaded by the renderer ---------------------------------
-    video::FramePair hostPair;
+    // A repeat of the frame the previous call decoded is served from
+    // m_deviceHostPair.  It is the common case for an .LRF proxy, recorded
+    // at half the .OSV's rate: each of its frames is asked for twice in a
+    // row, and the host decoder can only answer a step backwards with a seek
+    // and a GOP re-decode (the NVDEC path has its own VRAM cache for that).
+    bool hostRepeat = false;
     if (!onGpu) {
-        const Status readerStatus = ensureReader();
-        if (!readerStatus.ok()) {
-            return readerStatus.error();
+        if (m_deviceHostPairIndex == index && m_deviceHostPair.lens[0].valid() && m_deviceHostPair.lens[1].valid()) {
+            hostRepeat = true;
+        } else {
+            // Dropped FIRST: never two decoded pairs held at once (two 8K
+            // pairs on the host fallback are ~180 MB).
+            m_deviceHostPair = video::FramePair{};
+            m_deviceHostPairIndex = kNoHostPair;
+            const Status readerStatus = ensureReader();
+            if (!readerStatus.ok()) {
+                return readerStatus.error();
+            }
+            auto read = readPair(index);
+            if (!read.ok()) {
+                return read.error();
+            }
+            m_deviceHostPair = std::move(read).value();
+            m_deviceHostPairIndex = index;
         }
-        auto read = readPair(index);
-        if (!read.ok()) {
-            return read.error();
-        }
-        hostPair = std::move(read).value();
     }
-    const video::FramePair& pair = onGpu ? frame.pair() : hostPair;
+    const video::FramePair& pair = onGpu ? frame.pair() : m_deviceHostPair;
+    const StageClock::time_point tJob = StageClock::now();
 
     // ---- the job: renderFrame()'s own assembly -----------------------------------
     AnalysisOutcome analyses;
@@ -3257,27 +3312,50 @@ Result<bool> ImporterInstance::renderFrameToDevice(std::uint32_t index, const Ou
     }
     render::RenderJob job = std::move(built).value();
 
+    // ---- the caller's output, when it wants another one --------------------------
+    // The stitch above is untouched; only the output fields change (the
+    // OpenFX generator's camera view straight from the fisheyes).  A refusal
+    // is the caller's, not the decoder's: no strike against NVDEC.
+    if (retarget) {
+        const Status retargeted = retarget(job);
+        if (!retargeted.ok()) {
+            return retargeted.error();
+        }
+    }
+    // The size the consumer receives: the retargeted block's, or - exactly as
+    // before retargeting existed - the geometry's.
+    const std::int32_t outW = retarget ? job.params.outW : geometry.width;
+    const std::int32_t outH = retarget ? job.params.outH : geometry.height;
+    if (outW <= 0 || outH <= 0) {
+        return Error{ErrorCode::InvalidArgument, "renderFrameToDevice: the retargeted output is empty"};
+    }
+
     // ---- stitch, and hand the frame over while it is in VRAM ---------------------
+    StageClock::time_point tRender;
+    StageClock::time_point tConsume;
+    StageClock::time_point tEnd;
     {
         // The renderer's output buffer is shared by every clip: it stays ours
         // until the consumer has read it.
         std::lock_guard<std::mutex> outputLock(cudaRendererOutputMutex());
+        tRender = StageClock::now();
         std::size_t pitch = 0;
         auto device = cuda->renderToDevice(job, &pitch);
         // renderToDevice synchronised its stream: the lenses have been read.
         // The job's copy of the pair shares the NVDEC slot's pin, so it is
-        // emptied too - releasing only the lease would not unpin.
+        // emptied too - releasing only the lease would not unpin.  (A host
+        // pair stays in m_deviceHostPair for a repeat request.)
         job = render::RenderJob{};
         frame.release();
-        hostPair = video::FramePair{};
         if (!device.ok()) {
             return onGpu ? countDeviceFrameFailure(device.error()) : Result<bool>(device.error());
         }
+        tConsume = StageClock::now();
         DeviceFrame out;
         out.data = device.value();
         out.pitchBytes = pitch;
-        out.width = static_cast<std::uint32_t>(geometry.width);
-        out.height = static_cast<std::uint32_t>(geometry.height);
+        out.width = static_cast<std::uint32_t>(outW);
+        out.height = static_cast<std::uint32_t>(outH);
         out.deviceIndex = cuda->deviceIndex();
         out.cuContext = context;
         out.exact = analyses.exact;
@@ -3288,11 +3366,21 @@ Result<bool> ImporterInstance::renderFrameToDevice(std::uint32_t index, const Ou
             // no strike against NVDEC.
             return consumed.error();
         }
+        tEnd = StageClock::now();
     }
     if (onGpu) {
         m_gpuFrameFailures = 0;
         m_gpuFrameState = GpuFrameState::Active;
     }
+    // One line per frame, renderFrameOnGpu()'s "frame-cost" style: where a
+    // user's frame time goes - the decode (and from where), the analyses and
+    // job, the stitch, the caller's GPU work - straight from their log.
+    PluginLog::debug("frame-cost path=device frame={} size={}x{} source={} view={} exact={} total={:.2f} "
+                     "decode={:.2f} job={:.2f} render={:.2f} consume={:.2f}",
+                     index, outW, outH, onGpu ? "nvdec" : (hostRepeat ? "host-repeat" : "host"),
+                     retarget ? "direct" : "equirect", analyses.exact ? 1 : 0, stageMs(tDecode, tEnd),
+                     stageMs(tDecode, tJob), stageMs(tJob, tRender), stageMs(tRender, tConsume),
+                     stageMs(tConsume, tEnd));
     return true;
 #else
     (void)index;
@@ -3301,6 +3389,7 @@ Result<bool> ImporterInstance::renderFrameToDevice(std::uint32_t index, const Ou
     (void)purpose;
     (void)outputTransfer;
     (void)consume;
+    (void)retarget;
     return notMine("this build has no CUDA renderer");
 #endif
 }

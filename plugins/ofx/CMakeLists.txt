@@ -96,6 +96,10 @@ set(_osv_ofx_sources
   # ---- the camera, exactly the Premiere effect's ----
   "${_osv_ofx_reframe}/ReframeCpu.cpp"
   "${_osv_ofx_reframe}/ReframeEasing.cpp"
+  # The direct path's parameter builder (camera + the engine's stitch block
+  # -> one reframe-mode block): the generator's GPU view is traced straight
+  # from the fisheyes with it (OfxGpuView.cpp).  Host code only, no SDK.
+  "${_osv_ofx_reframe}/DirectRender.cpp"
   # ---- the Source Settings controls -> PrefsBlob ----
   "${_osv_ofx_settings}/SourceSettingsMapping.cpp"
   # ---- the importer's clip engine ----
@@ -105,9 +109,11 @@ set(_osv_ofx_sources
   "${_osv_ofx_importer}/ProtectorGuard.cpp"
   "${_osv_ofx_importer}/ImporterAudio.cpp"
   "${_osv_ofx_importer}/ImporterGpuFrame.cpp"
-  # The Engine.h answers for a build with no direct GPU path - which this
-  # module is on every platform: Premiere's direct path serves Open 360
-  # Reframe inside Premiere and has no counterpart in an OpenFX host.
+  # The Engine.h answers for a build with no direct-path ENGINE - which this
+  # module is on every platform: the OsvEngine_* ABI serves Open 360 Reframe
+  # inside Premiere and has no counterpart in an OpenFX host.  (The
+  # generator's own direct view goes through
+  # ImporterInstance::renderFrameToDevice and DirectRender.cpp above.)
   "${_osv_ofx_importer}/EngineNoDirect.cpp"
   # ---- the shared, SDK-free plug-in layer ----
   "${_osv_ofx_common}/HostContext.cpp"

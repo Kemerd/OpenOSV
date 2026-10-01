@@ -21,11 +21,16 @@
 // Item lists, ranges and defaults come from SourceSettingsParams.h.  The one
 // default that differs is Colour Output (see kColorOutputDefault0).
 //
-// One control exists in VEGAS Pro only: Output Levels (kOutputLevels).  It
-// is not a stitch setting - it never reaches the PrefsBlob - but the levels
-// the finished pixels are packed in, because VEGAS never level-converts a
-// generator's output and its "video levels" projects expect studio RGB.
-// Under Resolve and every other host it is not defined at all, so their
+// Two controls exist in VEGAS Pro only, and neither is a stitch setting -
+// neither reaches the PrefsBlob:
+//
+//   * Output Levels (kOutputLevels): the levels the finished pixels are
+//     packed in, because VEGAS never level-converts a generator's output
+//     and its "video levels" projects expect studio RGB;
+//   * Playback Proxy (kPlaybackProxy): whether VEGAS's Draft and Preview
+//     playback may stitch the camera's .LRF proxy instead of the .OSV.
+//
+// Under Resolve and every other host neither is defined at all, so their
 // parameter list is exactly what it always was.
 #pragma once
 
@@ -83,8 +88,20 @@ inline constexpr int kOutputLevelsDefault0 = static_cast<int>(OutputLevels::Stud
 static_assert(static_cast<int>(OutputLevels::Full) == 0 && static_cast<int>(OutputLevels::Studio) == 1,
               "Output Levels' items are numbered in OutputLevels order");
 
+/// VEGAS only: "Playback Proxy", a checkbox.  On (the default), a frame
+/// VEGAS plays at Draft or Preview quality is stitched from the .LRF proxy
+/// the camera recorded beside the .OSV - a fraction of the decode and stitch
+/// - while Good and Best, the qualities a file render uses, always stitch
+/// the .OSV (OfxSource.cpp).  Defined right after Sphere Size, in the
+/// Advanced group, and ONLY under a VEGAS host: like Output Levels it is not
+/// a stitch setting and never reaches the PrefsBlob.
+inline constexpr const char* kPlaybackProxy = "playbackProxy";
+/// Playback Proxy's default: on.
+inline constexpr bool kPlaybackProxyDefault = true;
+
 /// Every parameter describe() defines under EVERY host, in definition order
-/// (for the tests).  kOutputLevels, VEGAS only, is not among them.
+/// (for the tests).  kOutputLevels and kPlaybackProxy, VEGAS only, are not
+/// among them.
 inline constexpr const char* kAllParams[] = {
     kColourGroup,   kColorOutput,   kHdrTone /* [WP-HDRTONE] */, kLook, kHdrPeak, kStabilization, kStitchGroup,
     kSeamSearch,    kGainMatch,     kCalibration,  kFlareRemoval,    kSkySeamFix,    kSkySeamStrength,
@@ -107,7 +124,8 @@ static_assert(kColorOutputDefault0 >= 0 && kColorOutputDefault0 < OSV_SS_COLOR_C
               "the Colour Output default must be an item of the list");
 
 /// Define every control on `set` for a host of `profile`: the shared list,
-/// plus Output Levels right after Colour Output under VEGAS.
+/// plus, under VEGAS, Output Levels right after Colour Output and Playback
+/// Proxy right after Sphere Size.
 void describe(OfxParamSetHandle set, HostProfile profile) noexcept;
 
 /// The controls at `time`, as the Source Settings effect's ControlValues
@@ -120,7 +138,12 @@ void describe(OfxParamSetHandle set, HostProfile profile) noexcept;
 /// (Studio) when the host cannot answer or answers with an unknown item.
 [[nodiscard]] OutputLevels outputLevelsAt(OfxParamSetHandle set, OfxTime time, HostProfile profile) noexcept;
 
-/// True when `name` is one of these controls (Output Levels included).
+/// Whether VEGAS playback frames may come from the .LRF proxy at `time`.
+/// False outside VEGAS, always (no control exists there); under VEGAS the
+/// Playback Proxy control, with its default (on) when the host cannot answer.
+[[nodiscard]] bool playbackProxyAt(OfxParamSetHandle set, OfxTime time, HostProfile profile) noexcept;
+
+/// True when `name` is one of these controls (the VEGAS-only ones included).
 [[nodiscard]] bool owns(const char* name) noexcept;
 
 }  // namespace osv::ofx::source_params

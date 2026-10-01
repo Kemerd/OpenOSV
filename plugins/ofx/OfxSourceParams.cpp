@@ -186,6 +186,18 @@ void describe(OfxParamSetHandle set, HostProfile profile) noexcept {
                   "is faster.",
                   kAdvancedGroup, kStatic},
                  OSV_SS_SIZE_ITEMS, OSV_SS_SIZE_DEFAULT - 1);
+    // VEGAS only: let Draft / Preview playback stitch the camera's .LRF
+    // proxy.  VEGAS's Preview window plays at Preview quality by default and
+    // a file render uses Good or Best, so the switch costs a final render
+    // nothing; it is here for the user who wants the .OSV while cutting too.
+    if (profile == HostProfile::Vegas) {
+        defineBool(set, kPlaybackProxy,
+                   {"Playback Proxy",
+                    "At Draft and Preview quality, plays the .LRF the camera recorded beside the .OSV: smooth on "
+                    "any machine. Good and Best always stitch the .OSV.",
+                    kAdvancedGroup, kStatic},
+                   kPlaybackProxyDefault);
+    }
 }
 
 // ===========================================================================
@@ -255,13 +267,24 @@ OutputLevels outputLevelsAt(OfxParamSetHandle set, OfxTime time, HostProfile pro
     return static_cast<OutputLevels>(kOutputLevelsDefault0);
 }
 
+bool playbackProxyAt(OfxParamSetHandle set, OfxTime time, HostProfile profile) noexcept {
+    // Outside VEGAS there is no control and no playback frame to serve from
+    // a proxy: the file the user chose is the file that renders.
+    if (profile != HostProfile::Vegas) {
+        return false;
+    }
+    // A checkbox reads as an int; a host that cannot answer keeps the
+    // documented default.
+    return intAt(set, kPlaybackProxy, time, kPlaybackProxyDefault ? 1 : 0) != 0;
+}
+
 bool owns(const char* name) noexcept {
     if (!name) {
         return false;
     }
     const std::string_view n(name);
-    if (n == kOutputLevels) {
-        return true;  // VEGAS only, but ours wherever it exists
+    if (n == kOutputLevels || n == kPlaybackProxy) {
+        return true;  // VEGAS only, but ours wherever they exist
     }
     for (const char* p : kAllParams) {
         if (n == p) {

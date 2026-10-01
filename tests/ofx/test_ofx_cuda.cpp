@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -315,6 +316,30 @@ private:
     std::string m_old;
 };
 
+/// OPENOSV_OFX_DIRECT for one scope, restored afterwards: "0" makes the
+/// generator's own-GPU view frame out of the stitched sphere, as before the
+/// direct view existed - the path whose pixels match the CPU framing
+/// exactly.  Read by the module on every render, like OPENOSV_OFX_GPU.
+class DirectSwitch {
+public:
+    explicit DirectSwitch(const char* value) {
+        char old[32] = {};
+        std::size_t length = 0;
+        if (getenv_s(&length, old, sizeof(old), "OPENOSV_OFX_DIRECT") == 0 && length > 0) {
+            m_had = true;
+            m_old = old;
+        }
+        ::_putenv_s("OPENOSV_OFX_DIRECT", value);
+    }
+    ~DirectSwitch() { ::_putenv_s("OPENOSV_OFX_DIRECT", m_had ? m_old.c_str() : ""); }
+    DirectSwitch(const DirectSwitch&) = delete;
+    DirectSwitch& operator=(const DirectSwitch&) = delete;
+
+private:
+    bool m_had = false;
+    std::string m_old;
+};
+
 /// True when the driver loads and reports a device; the reason otherwise.
 bool cudaDeviceUsable(std::string& why) {
     if (!cudaDriverLoadable()) {
@@ -585,6 +610,11 @@ TEST_CASE("the own-GPU generator view matches the CPU framing of the clip", "[of
     // so the two stitches are the same pixels (the analyses shade their bands
     // from device frames on the GPU path and from host frames on the CPU one,
     // two shaders 108-111 dB apart - see test_importer_bitdepth.cpp).
+    //
+    // The GPU view framed out of the sphere: the path that resamples exactly
+    // as the CPU framing does.  The direct view (one resampling, sharper) has
+    // its own test below.
+    const DirectSwitch spherePath("0");
     struct Case {
         const char* name;
         bool negative;
@@ -618,6 +648,171 @@ TEST_CASE("the own-GPU generator view matches the CPU framing of the clip", "[of
         CHECK(db >= 60.0);
         CHECK(untouchedOutside(gpu.output, area, -7.0f));
     }
+    CHECK(MockHost::instance().imagesOut == 0);
+}
+
+namespace {
+
+/// Rec. 709 luma of a float render, with its coverage (alpha > 0.99).
+struct LumaPlane {
+    int w = 0;
+    int h = 0;
+    std::vector<double> value;
+    std::vector<unsigned char> covered;
+
+    [[nodiscard]] double at(int x, int y) const { return value[static_cast<std::size_t>(y) * w + x]; }
+    [[nodiscard]] bool in(int x, int y) const { return covered[static_cast<std::size_t>(y) * w + x] != 0; }
+};
+
+/// The luma of `image` over `frame`, top row first.
+LumaPlane lumaOf(const HostImage& image, const OfxRectI& frame) {
+    LumaPlane plane;
+    plane.w = frame.x2 - frame.x1;
+    plane.h = frame.y2 - frame.y1;
+    plane.value.assign(static_cast<std::size_t>(plane.w) * plane.h, 0.0);
+    plane.covered.assign(static_cast<std::size_t>(plane.w) * plane.h, 0);
+    for (int row = 0; row < plane.h; ++row) {
+        // OpenFX rows count up; the plane's count down.
+        const int y = frame.y2 - 1 - row;
+        for (int col = 0; col < plane.w; ++col) {
+            const float* p = image.pixel(frame.x1 + col, y);
+            if (!p) {
+                continue;
+            }
+            const std::size_t i = static_cast<std::size_t>(row) * plane.w + col;
+            plane.value[i] = 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+            plane.covered[i] = p[3] > 0.99f ? 1 : 0;
+        }
+    }
+    return plane;
+}
+
+/// Normalised cross-correlation of `a` shifted by (dx, dy) against `b`, over
+/// the pixels both cover, `margin` pixels in from every edge.
+double nccShifted(const LumaPlane& a, const LumaPlane& b, int dx, int dy, int margin) {
+    double sa = 0.0;
+    double sb = 0.0;
+    double saa = 0.0;
+    double sbb = 0.0;
+    double sab = 0.0;
+    double n = 0.0;
+    for (int y = margin; y < a.h - margin; ++y) {
+        for (int x = margin; x < a.w - margin; ++x) {
+            const int ax = x + dx;
+            const int ay = y + dy;
+            if (!a.in(ax, ay) || !b.in(x, y)) {
+                continue;
+            }
+            const double va = a.at(ax, ay);
+            const double vb = b.at(x, y);
+            sa += va;
+            sb += vb;
+            saa += va * va;
+            sbb += vb * vb;
+            sab += va * vb;
+            n += 1.0;
+        }
+    }
+    if (n < 2.0) {
+        return 0.0;
+    }
+    const double cov = sab - sa * sb / n;
+    const double va = saa - sa * sa / n;
+    const double vb = sbb - sb * sb / n;
+    return (va > 0.0 && vb > 0.0) ? cov / std::sqrt(va * vb) : 0.0;
+}
+
+/// Mean absolute horizontal + vertical luma gradient over covered pixels:
+/// the sharper of two renders of the same view has the larger.
+double meanGradient(const LumaPlane& p) {
+    double sum = 0.0;
+    double n = 0.0;
+    for (int y = 1; y < p.h; ++y) {
+        for (int x = 1; x < p.w; ++x) {
+            if (!p.in(x, y) || !p.in(x - 1, y) || !p.in(x, y - 1)) {
+                continue;
+            }
+            sum += std::fabs(p.at(x, y) - p.at(x - 1, y)) + std::fabs(p.at(x, y) - p.at(x, y - 1));
+            n += 1.0;
+        }
+    }
+    return n > 0.0 ? sum / n : 0.0;
+}
+
+}  // namespace
+
+TEST_CASE("the own-GPU generator's direct view frames like the CPU framing, and is no softer",
+          "[ofx][source][sample][cuda][ofxgpu]") {
+    REQUIRE(Fixture::get().ready);
+    const std::string clip = sampleClipPath();
+    if (clip.empty()) {
+        SKIP("no sample clip");
+    }
+    std::string why;
+    if (!cudaDeviceUsable(why)) {
+        SKIP(why);
+    }
+    // 1280 x 720 at 80 degrees samples about as densely as the fisheyes do,
+    // so neither path decimates: the comparison measures framing, not two
+    // different aliasing patterns.  Draft on both sides, so the stitch
+    // (blend, colour, stabilisation) is the same; what differs is only that
+    // the direct view resamples the fisheyes once, the CPU framing twice.
+    constexpr int kViewW = 1280;
+    constexpr int kViewH = 720;
+    GeneratorRig cpu(kViewW, kViewH);
+    aimAtSample(cpu, clip, osv::ofx::source::kOutputReframed);
+    {
+        GpuSwitch off("0");
+        REQUIRE(cpu.render(3.0, /*draft=*/true) == kOfxStatOK);
+    }
+    GeneratorRig gpu(kViewW, kViewH);
+    aimAtSample(gpu, clip, osv::ofx::source::kOutputReframed);
+    {
+        GpuSwitch on("1");
+        DirectSwitch direct("1");
+        REQUIRE(gpu.render(3.0, /*draft=*/true) == kOfxStatOK);
+    }
+    // Every pixel of the frame written.
+    for (int y = 0; y < kViewH; ++y) {
+        for (int x = 0; x < kViewW; ++x) {
+            REQUIRE(gpu.output.pixel(x, y)[3] != -7.0f);
+        }
+    }
+
+    const LumaPlane direct = lumaOf(gpu.output, gpu.frame);
+    const LumaPlane twoStep = lumaOf(cpu.output, cpu.frame);
+
+    // ---- framing: the correlation peaks at zero offset, and is high there -----
+    // A framing error of half a pixel or more would move the peak to a
+    // neighbour; the composition is proved within 0.0016 px on the Premiere
+    // side (test_direct.cpp), and this checks the OpenFX plumbing keeps it.
+    constexpr int kMargin = 8;
+    const double centre = nccShifted(direct, twoStep, 0, 0, kMargin);
+    INFO("direct vs CPU framing NCC at zero offset: " << centre);
+    CHECK(centre >= 0.99);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+            const double shifted = nccShifted(direct, twoStep, dx, dy, kMargin);
+            INFO("offset (" << dx << ", " << dy << "): " << shifted);
+            CHECK(centre >= shifted);
+        }
+    }
+
+    // ---- coverage: the same pixels are picture ----------------------------------
+    std::size_t disagree = 0;
+    for (std::size_t i = 0; i < direct.covered.size(); ++i) {
+        disagree += direct.covered[i] != twoStep.covered[i] ? 1u : 0u;
+    }
+    CHECK(disagree <= direct.covered.size() / 100u);
+
+    // ---- sharpness: one resampling instead of two ---------------------------------
+    const double gDirect = meanGradient(direct);
+    const double gTwoStep = meanGradient(twoStep);
+    INFO("mean gradient: direct " << gDirect << ", CPU framing " << gTwoStep);
+    CHECK(gDirect >= 0.98 * gTwoStep);
     CHECK(MockHost::instance().imagesOut == 0);
 }
 
@@ -990,7 +1185,10 @@ TEST_CASE("VEGAS: the own GPU generator packs every format and level like the CP
         SKIP("no sample clip");
     }
     // Draft on both sides: no seam search or measured corrections, so the
-    // two stitches are the same pixels (see the view test above).
+    // two stitches are the same pixels (see the view test above).  The view
+    // through the sphere, for the same reason as there: this test holds the
+    // packing to the CPU path's bytes, not the direct view's sharper pixels.
+    const DirectSwitch spherePath("0");
     const int modes[] = {osv::ofx::source::kOutputEquirect, osv::ofx::source::kOutputReframed};
     const osv::ofx::OutputLevels allLevels[] = {osv::ofx::OutputLevels::Full, osv::ofx::OutputLevels::Studio};
     // The output image larger than the camera frame (the clip's region of

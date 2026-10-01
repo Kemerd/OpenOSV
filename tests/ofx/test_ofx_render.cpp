@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -175,6 +176,89 @@ TEST_CASE("describeProperty reads what a host set, in the documented type, and s
 
     // The same copy logs the mock host's whole description without a fault.
     ofx::logHostDescription();
+    ofx::clearSuites();
+}
+
+TEST_CASE("VEGAS's named quality makes Draft and Preview playback, and nothing else does", "[ofx][host]") {
+    using ofx::HostQuality;
+    // ---- the four documented values, exactly, and nothing else ---------------
+    CHECK(ofx::hostQualityFromName("OfxImageEffectPropRenderQualityDraft") == HostQuality::Draft);
+    CHECK(ofx::hostQualityFromName("OfxImageEffectPropRenderQualityPreview") == HostQuality::Preview);
+    CHECK(ofx::hostQualityFromName("OfxImageEffectPropRenderQualityGood") == HostQuality::Good);
+    CHECK(ofx::hostQualityFromName("OfxImageEffectPropRenderQualityBest") == HostQuality::Best);
+    CHECK(ofx::hostQualityFromName("") == HostQuality::Unknown);
+    CHECK(ofx::hostQualityFromName("Preview") == HostQuality::Unknown);
+    CHECK(ofx::hostQualityFromName("ofximageeffectproprenderqualitypreview") == HostQuality::Unknown);
+    CHECK(ofx::hostQualityFromName("OfxImageEffectPropRenderQualityPreview ") == HostQuality::Unknown);
+    CHECK(std::string(ofx::hostQualityName(HostQuality::Draft)) == "draft");
+    CHECK(std::string(ofx::hostQualityName(HostQuality::Preview)) == "preview");
+    CHECK(std::string(ofx::hostQualityName(HostQuality::Good)) == "good");
+    CHECK(std::string(ofx::hostQualityName(HostQuality::Best)) == "best");
+    CHECK(std::string(ofx::hostQualityName(HostQuality::Unknown)) == "unnamed");
+
+    // ---- render modes, through this executable's own copy of OfxHost.cpp -----
+    ofx::setHost(MockHost::instance().ofxHost());
+    REQUIRE(ofx::fetchSuites());
+
+    /// The inArgs of one render: the two OpenFX 1.4 flags, and VEGAS's
+    /// quality string when `quality` is not empty.
+    const auto argsWith = [](int interactive, int draft, const char* quality) {
+        auto set = std::make_unique<PropertySet>();
+        set->setInt(kOfxImageEffectPropInteractiveRenderStatus, interactive);
+        set->setInt(kOfxImageEffectPropRenderQualityDraft, draft);
+        if (quality && quality[0] != '\0') {
+            set->setString(ofx::kPropVegasRenderQuality, quality);
+        }
+        return set;
+    };
+    struct Case {
+        const char* name;
+        ofx::HostProfile profile;
+        int interactive;
+        int draft;
+        const char* quality;
+        bool wantInteractive;
+        bool wantDraft;
+        bool wantPlayback;
+        HostQuality wantQuality;
+    };
+    const Case cases[] = {
+        // VEGAS: its Preview window's qualities are playback...
+        {"VEGAS Draft", ofx::HostProfile::Vegas, 0, 0, ofx::kVegasQualityDraft, true, true, true, HostQuality::Draft},
+        {"VEGAS Preview", ofx::HostProfile::Vegas, 0, 0, ofx::kVegasQualityPreview, true, true, true,
+         HostQuality::Preview},
+        // ...a file render's are final, unless the 1.4 flags say otherwise.
+        {"VEGAS Good", ofx::HostProfile::Vegas, 0, 0, ofx::kVegasQualityGood, false, false, false, HostQuality::Good},
+        {"VEGAS Best", ofx::HostProfile::Vegas, 0, 0, ofx::kVegasQualityBest, false, false, false, HostQuality::Best},
+        {"VEGAS Best, 1.4 flags set", ofx::HostProfile::Vegas, 1, 1, ofx::kVegasQualityBest, true, true, false,
+         HostQuality::Best},
+        // An absent or unknown quality changes nothing.
+        {"VEGAS, no quality", ofx::HostProfile::Vegas, 0, 0, "", false, false, false, HostQuality::Unknown},
+        {"VEGAS, unknown quality", ofx::HostProfile::Vegas, 0, 0, "Fastest", false, false, false,
+         HostQuality::Unknown},
+        // Resolve and every other host: the 1.4 flags, as always - a quality
+        // string some host might set is not read.
+        {"Resolve, flags off", ofx::HostProfile::Resolve, 0, 0, ofx::kVegasQualityPreview, false, false, false,
+         HostQuality::Unknown},
+        {"Resolve, flags on", ofx::HostProfile::Resolve, 1, 1, "", true, true, false, HostQuality::Unknown},
+        {"Generic, interactive only", ofx::HostProfile::Generic, 1, 0, ofx::kVegasQualityDraft, true, false, false,
+         HostQuality::Unknown},
+    };
+    for (const Case& c : cases) {
+        INFO(c.name);
+        const auto set = argsWith(c.interactive, c.draft, c.quality);
+        const ofx::RenderMode mode = ofx::renderModeFor(set->handle(), c.profile);
+        CHECK(mode.interactive == c.wantInteractive);
+        CHECK(mode.draft == c.wantDraft);
+        CHECK(mode.playback == c.wantPlayback);
+        CHECK(mode.quality == c.wantQuality);
+    }
+    // No inArgs at all: a final render, whatever the host.
+    const ofx::RenderMode none = ofx::renderModeFor(nullptr, ofx::HostProfile::Vegas);
+    CHECK_FALSE(none.interactive);
+    CHECK_FALSE(none.draft);
+    CHECK_FALSE(none.playback);
+    CHECK(none.quality == HostQuality::Unknown);
     ofx::clearSuites();
 }
 
