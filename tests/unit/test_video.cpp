@@ -23,14 +23,21 @@
 #include "osv/video/PlanarFrame.h"
 #include "osv/video/StreamExtract.h"
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace osv;
@@ -670,6 +677,519 @@ TEST_CASE("D3D11VA decode matches software within 50 dB", "[video][sample][hwacc
         REQUIRE(psnr >= 50.0);
     }
     REQUIRE_FALSE(hw.lastDeviceFrame().has_value());
+}
+
+// -----------------------------------------------------------------------------
+//  Random access on the proxy, the way Premiere reaches it
+// -----------------------------------------------------------------------------
+// Premiere reads an .LRF through the importer's reader: D3D11VA, four frame
+// threads, the container-sample feed and the process-wide shared device
+// (importerReaderOptions).  It lands anywhere, steps forward a few frames and
+// jumps again.  H.264 decoding is bit-exact by specification, so every frame
+// that path returns must equal the frame a software decoder returns for the
+// same index.  The clip is the sample's proxy, or OSV_SEEK_LRF when set: a
+// long recording reaches GOP layouts and seek distances the 124-frame sample
+// cannot.  OSV_SEEK_LANDINGS overrides the number of landings.
+TEST_CASE("D3D11VA random access on the LRF matches software frame for frame", "[video][hwaccel][.lrfstress][lrfseek]") {
+    // ---- the clip ---------------------------------------------------------------
+    std::filesystem::path path = osvtest::sampleLrf();
+    if (const char* env = std::getenv("OSV_SEEK_LRF"); env != nullptr && *env != '\0') {
+        path = env;
+    }
+    if (!std::filesystem::exists(path)) {
+        SKIP("LRF not available: " << path.string());
+    }
+    int landings = 60;
+    if (const char* env = std::getenv("OSV_SEEK_LANDINGS"); env != nullptr && *env != '\0') {
+        landings = std::max(1, std::atoi(env));
+    }
+
+    // ---- the importer's hardware reader, and a software reference ----------------
+    DecoderOptions hwOptions;
+    hwOptions.hw = HwAccel::D3D11VA;
+    hwOptions.threads = 4;
+    hwOptions.useContainerSamples = true;
+    hwOptions.shareHwDevice = true;
+    hwOptions.deferFirstFrame = true;
+    auto hwOpened = HevcStreamDecoder::open(path, 1, hwOptions);
+    if (!hwOpened.ok()) {
+        SKIP("d3d11va decoder unavailable: " << hwOpened.error().toString());
+    }
+    DecoderOptions swOptions;
+    swOptions.useContainerSamples = true;
+    auto swOpened = HevcStreamDecoder::open(path, 1, swOptions);
+    REQUIRE(swOpened.ok());
+    HevcStreamDecoder& hw = hwOpened.value();
+    HevcStreamDecoder& sw = swOpened.value();
+    const std::uint32_t frames = hw.frameCount();
+    REQUIRE(frames > 0);
+    REQUIRE(frames == sw.frameCount());
+
+    // ---- landings: a fixed pseudo-random walk, so a failure reproduces -----------
+    std::uint64_t state = 0x9E3779B97F4A7C15ull;
+    const auto draw = [&state](std::uint32_t n) {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        return static_cast<std::uint32_t>((state >> 33) % std::max<std::uint32_t>(1u, n));
+    };
+    int compared = 0;
+    int mismatched = 0;
+    double worstPsnr = std::numeric_limits<double>::infinity();
+    std::uint32_t worstIndex = 0;
+    for (int landing = 0; landing < landings; ++landing) {
+        const std::uint32_t start = draw(frames);
+        const std::uint32_t run = 1u + draw(8u);
+        for (std::uint32_t step = 0; step < run && start + step < frames; ++step) {
+            const std::uint32_t index = start + step;
+            auto a = hw.decodeFrame(index);
+            auto b = sw.decodeFrame(index);
+            INFO("landing " << landing << " frame " << index);
+            REQUIRE(a.ok());
+            REQUIRE(b.ok());
+            REQUIRE(a.value().frameIndex == index);
+            ++compared;
+            const double psnr = lumaPsnr(a.value(), b.value());
+            if (psnr < worstPsnr) {
+                worstPsnr = psnr;
+                worstIndex = index;
+            }
+            if (psnr < 60.0) {
+                ++mismatched;
+                WARN("d3d11va frame " << index << " (landing " << landing << ", step " << step << ") differs from "
+                                      << "software: luma PSNR " << psnr << " dB");
+            }
+        }
+    }
+    WARN("d3d11va random access: " << compared << " frames over " << landings << " landings, " << mismatched
+                                   << " mismatched, worst PSNR " << worstPsnr << " dB at frame " << worstIndex);
+    REQUIRE(mismatched == 0);
+}
+
+// -----------------------------------------------------------------------------
+//  The LRF under Premiere's threading: helpers
+// -----------------------------------------------------------------------------
+// The single-decoder walk above is clean, yet Premiere showed the proxy with
+// its lower half in macroblock garbage.  What Premiere adds is threads: its
+// render threads take turns on the importer's reader, the background stages
+// (steady, scene light, lens alignment) open short-lived D3D11VA readers of
+// their own on the SAME shared device, and a quiet parks the reader in the
+// pool for another thread to take back.  The tests below rebuild each of
+// those on the LRF named by OSV_SEEK_LRF and compare every picture with a
+// software decode of the same index.  Nothing here may use a Catch2 macro
+// off the main thread, so the workers only collect and the main thread judges.
+namespace {
+
+/// The proxy the threaded tests read: OSV_SEEK_LRF, else the sample's.
+std::filesystem::path stressLrfPath() {
+    std::filesystem::path path = osvtest::sampleLrf();
+    if (const char* env = std::getenv("OSV_SEEK_LRF"); env != nullptr && *env != '\0') {
+        path = env;
+    }
+    return path;
+}
+
+/// A positive integer from the environment, or `fallback`.
+int envCount(const char* name, int fallback) {
+    if (const char* env = std::getenv(name); env != nullptr && *env != '\0') {
+        return std::max(1, std::atoi(env));
+    }
+    return fallback;
+}
+
+/// The importer's reader options on D3D11VA (importerReaderOptions).
+DecoderOptions importerD3d11Options() {
+    DecoderOptions o;
+    o.hw = HwAccel::D3D11VA;
+    o.threads = 4;
+    o.keepOnDevice = false;
+    o.useContainerSamples = true;
+    o.shareHwDevice = true;
+    o.deferFirstFrame = true;
+    return o;
+}
+
+/// The background stages' reader options (SteadyStage / SceneLightStage
+/// JobReader): D3D11VA with two frame threads on the same shared device.
+DecoderOptions stageD3d11Options() {
+    DecoderOptions o = importerD3d11Options();
+    o.threads = 2;
+    return o;
+}
+
+/// The software reference: container samples, two frame threads (bounded so
+/// several references can run at once without taking the whole machine).
+DecoderOptions softwareReferenceOptions() {
+    DecoderOptions o;
+    o.hw = HwAccel::None;
+    o.threads = 2;
+    o.useContainerSamples = true;
+    return o;
+}
+
+/// How one hardware picture differs from the software one, row by row.
+struct LumaDiff {
+    double psnr = std::numeric_limits<double>::infinity();  ///< Whole-picture luma PSNR (dB).
+    int firstBadRow = -1;   ///< First luma row below 60 dB on its own (-1 = none).
+    int badRows = 0;        ///< Rows below 60 dB.
+    int badRowsBottom = 0;  ///< Of those, rows in the lower half of the picture.
+    bool sizeMismatch = false;
+};
+
+/// Compare two decoded pictures without any Catch2 macro (worker-thread safe).
+LumaDiff compareLuma(const PlanarFrame16& a, const PlanarFrame16& b) noexcept {
+    LumaDiff d;
+    if (a.width != b.width || a.height != b.height || a.width == 0 || a.height == 0) {
+        d.sizeMismatch = true;
+        d.psnr = 0.0;
+        return d;
+    }
+    // A row is "bad" when its own mean squared error is above the 60 dB
+    // threshold the whole-picture check uses.
+    const double rowLimit = 1023.0 * 1023.0 / std::pow(10.0, 6.0);
+    double sse = 0.0;
+    for (std::uint32_t y = 0; y < a.height; ++y) {
+        double rowSse = 0.0;
+        for (std::uint32_t x = 0; x < a.width; ++x) {
+            const double diff = static_cast<double>(a.luma(x, y)) - static_cast<double>(b.luma(x, y));
+            rowSse += diff * diff;
+        }
+        sse += rowSse;
+        if (rowSse / static_cast<double>(a.width) > rowLimit) {
+            if (d.firstBadRow < 0) {
+                d.firstBadRow = static_cast<int>(y);
+            }
+            ++d.badRows;
+            if (y >= a.height / 2) {
+                ++d.badRowsBottom;
+            }
+        }
+    }
+    const double mse = sse / (static_cast<double>(a.width) * static_cast<double>(a.height));
+    d.psnr = mse <= 0.0 ? std::numeric_limits<double>::infinity() : 10.0 * std::log10(1023.0 * 1023.0 / mse);
+    return d;
+}
+
+/// One picture that did not match, kept for the main thread to report.
+struct LrfMismatch {
+    int worker = 0;
+    int request = 0;
+    std::uint32_t index = 0;
+    LumaDiff diff;
+    std::string error;  ///< Non-empty when a decode failed instead.
+};
+
+/// What one worker saw.
+struct LrfWorkerReport {
+    int compared = 0;
+    double worstPsnr = std::numeric_limits<double>::infinity();
+    std::uint32_t worstIndex = 0;
+    std::vector<LrfMismatch> mismatches;
+    std::string openError;  ///< Non-empty when the worker could not start.
+    HwAccel activeHw = HwAccel::None;  ///< What the hardware decoder really ran on (getFormat may drop to software).
+    bool hardwareWorker = false;       ///< True when the worker's decoder was meant to be D3D11VA.
+};
+
+/// The fixed pseudo-random walk of the single-decoder test, seedable.
+class LandingWalk {
+public:
+    explicit LandingWalk(std::uint64_t seed) noexcept : m_state(seed) {}
+    std::uint32_t draw(std::uint32_t n) noexcept {
+        m_state = m_state * 6364136223846793005ull + 1442695040888963407ull;
+        return static_cast<std::uint32_t>((m_state >> 33) % std::max<std::uint32_t>(1u, n));
+    }
+
+private:
+    std::uint64_t m_state;
+};
+
+/// Decode `index` on both decoders and record the comparison in `report`.
+void compareOne(HevcStreamDecoder& hw, HevcStreamDecoder& sw, std::uint32_t index, int worker, int request,
+                LrfWorkerReport& report) {
+    auto a = hw.decodeFrame(index);
+    auto b = sw.decodeFrame(index);
+    if (!a.ok() || !b.ok()) {
+        LrfMismatch m;
+        m.worker = worker;
+        m.request = request;
+        m.index = index;
+        m.error = !a.ok() ? "hw: " + a.error().toString() : "sw: " + b.error().toString();
+        report.mismatches.push_back(std::move(m));
+        return;
+    }
+    ++report.compared;
+    const LumaDiff diff = compareLuma(a.value(), b.value());
+    if (diff.psnr < report.worstPsnr) {
+        report.worstPsnr = diff.psnr;
+        report.worstIndex = index;
+    }
+    if (diff.psnr < 60.0 || a.value().frameIndex != index) {
+        LrfMismatch m;
+        m.worker = worker;
+        m.request = request;
+        m.index = index;
+        m.diff = diff;
+        report.mismatches.push_back(std::move(m));
+    }
+}
+
+/// Report every worker on the main thread and fail on any mismatch.
+void judgeWorkers(const std::vector<LrfWorkerReport>& reports, const char* what) {
+    int compared = 0;
+    int mismatched = 0;
+    double worst = std::numeric_limits<double>::infinity();
+    for (std::size_t w = 0; w < reports.size(); ++w) {
+        const LrfWorkerReport& r = reports[w];
+        if (!r.openError.empty()) {
+            WARN(what << ": worker " << w << " could not start: " << r.openError);
+        }
+        // A decoder whose get_format dropped to software would compare
+        // software with software and prove nothing: it must still be D3D11VA.
+        if (r.hardwareWorker) {
+            INFO(what << ": worker " << w << " decoded on " << hwAccelName(r.activeHw));
+            CHECK(r.activeHw == HwAccel::D3D11VA);
+        }
+        compared += r.compared;
+        worst = std::min(worst, r.worstPsnr);
+        for (const LrfMismatch& m : r.mismatches) {
+            ++mismatched;
+            if (!m.error.empty()) {
+                WARN(what << ": worker " << m.worker << " request " << m.request << " frame " << m.index
+                          << " failed: " << m.error);
+            } else {
+                WARN(what << ": worker " << m.worker << " request " << m.request << " frame " << m.index
+                          << " differs from software: luma PSNR " << m.diff.psnr << " dB, first bad row "
+                          << m.diff.firstBadRow << ", " << m.diff.badRows << " bad rows (" << m.diff.badRowsBottom
+                          << " in the lower half)");
+            }
+        }
+    }
+    WARN(what << ": " << compared << " frames compared on " << reports.size() << " workers, " << mismatched
+              << " mismatched, worst PSNR " << worst << " dB");
+    REQUIRE(compared > 0);
+    REQUIRE(mismatched == 0);
+}
+
+}  // namespace
+
+// -----------------------------------------------------------------------------
+//  Several readers of one LRF decoding at the same moment
+// -----------------------------------------------------------------------------
+// Premiere can hold several importer instances of one clip (thumbnail, Source
+// Monitor, Program Monitor), each with its own reader, and every reader's
+// D3D11VA decoder sits on the one shared device.  OSV_SEEK_THREADS readers
+// (default 3) each walk OSV_SEEK_LANDINGS landings (default 60) at the same
+// time, every one opened on its own thread after a start barrier.
+TEST_CASE("D3D11VA readers of one LRF decoding on three threads at once match software",
+          "[video][hwaccel][.lrfstress][lrfseek][lrfconcurrent]") {
+    const std::filesystem::path path = stressLrfPath();
+    if (!std::filesystem::exists(path)) {
+        SKIP("LRF not available: " << path.string());
+    }
+    const int workers = envCount("OSV_SEEK_THREADS", 3);
+    const int landings = envCount("OSV_SEEK_LANDINGS", 60);
+
+    std::vector<LrfWorkerReport> reports(static_cast<std::size_t>(workers));
+    std::atomic<int> opened{0};
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(workers));
+    for (int w = 0; w < workers; ++w) {
+        threads.emplace_back([&, w]() noexcept {
+            LrfWorkerReport& report = reports[static_cast<std::size_t>(w)];
+            try {
+                // ---- each worker opens its own pair ----------------------------------
+                auto hw = HevcStreamDecoder::open(path, 1, importerD3d11Options());
+                auto sw = HevcStreamDecoder::open(path, 1, softwareReferenceOptions());
+                opened.fetch_add(1);
+                if (!hw.ok() || !sw.ok()) {
+                    report.openError = !hw.ok() ? hw.error().toString() : sw.error().toString();
+                    return;
+                }
+                // ---- start together so the decodes overlap ---------------------------
+                while (opened.load() < workers) {
+                    std::this_thread::yield();
+                }
+                const std::uint32_t frames = hw.value().frameCount();
+                LandingWalk walk(0x9E3779B97F4A7C15ull + 0x1000193ull * static_cast<std::uint64_t>(w + 1));
+                int request = 0;
+                for (int landing = 0; landing < landings; ++landing) {
+                    const std::uint32_t start = walk.draw(frames);
+                    const std::uint32_t run = 1u + walk.draw(8u);
+                    for (std::uint32_t step = 0; step < run && start + step < frames; ++step) {
+                        compareOne(hw.value(), sw.value(), start + step, w, request++, report);
+                    }
+                }
+                report.hardwareWorker = true;
+                report.activeHw = hw.value().activeHw();
+            } catch (const std::exception& e) {
+                report.openError = std::string("exception: ") + e.what();
+            } catch (...) {
+                report.openError = "unknown exception";
+            }
+        });
+    }
+    for (std::thread& t : threads) {
+        t.join();
+    }
+    judgeWorkers(reports, "concurrent readers");
+}
+
+// -----------------------------------------------------------------------------
+//  One reader taken in turns by render threads, parked, and beside stages
+// -----------------------------------------------------------------------------
+// The importer's own reader is used under the instance mutex by whichever
+// render thread Premiere calls on, parked in the pool on a quiet and taken
+// back by the next instance; meanwhile the background stages open, use and
+// destroy short-lived D3D11VA readers of the same clip on the same shared
+// device.  Four "render threads" take turns on one importer-equivalent
+// decoder (every OSV_SEEK_PARK_EVERY requests, default 7, the decoder is
+// moved out to a parking slot and back); two "stage" threads keep opening a
+// two-thread decoder, reading three scattered frames and destroying it.
+TEST_CASE("A D3D11VA LRF reader taken in turns, parked and run beside stage readers matches software",
+          "[video][hwaccel][.lrfstress][lrfseek][lrfhandoff]") {
+    const std::filesystem::path path = stressLrfPath();
+    if (!std::filesystem::exists(path)) {
+        SKIP("LRF not available: " << path.string());
+    }
+    const int requests = envCount("OSV_SEEK_LANDINGS", 60) * 4;
+    const int parkEvery = envCount("OSV_SEEK_PARK_EVERY", 7);
+    const int stageRounds = envCount("OSV_SEEK_STAGE_ROUNDS", 12);
+
+    // ---- the instance's reader, its reference, and the instance mutex ----------
+    auto hwOpened = HevcStreamDecoder::open(path, 1, importerD3d11Options());
+    if (!hwOpened.ok()) {
+        SKIP("d3d11va decoder unavailable: " << hwOpened.error().toString());
+    }
+    auto swOpened = HevcStreamDecoder::open(path, 1, softwareReferenceOptions());
+    REQUIRE(swOpened.ok());
+    auto reader = std::make_unique<HevcStreamDecoder>(std::move(hwOpened).value());
+    HevcStreamDecoder reference = std::move(swOpened).value();
+    const std::uint32_t frames = reader->frameCount();
+    REQUIRE(frames > 0);
+    std::unique_ptr<HevcStreamDecoder> parked;  // the pool's slot
+    std::mutex instanceMutex;
+    int nextRequest = 0;
+    std::uint32_t runLeft = 0;
+    std::uint32_t cursor = 0;
+    LandingWalk walk(0xC2B2AE3D27D4EB4Full);
+
+    // ---- render threads -------------------------------------------------------
+    constexpr int kRenderThreads = 4;
+    constexpr int kStageThreads = 2;
+    std::vector<LrfWorkerReport> reports(kRenderThreads + kStageThreads);
+    std::vector<std::thread> threads;
+    for (int w = 0; w < kRenderThreads; ++w) {
+        threads.emplace_back([&, w]() noexcept {
+            LrfWorkerReport& report = reports[static_cast<std::size_t>(w)];
+            try {
+                for (;;) {
+                    std::lock_guard<std::mutex> lock(instanceMutex);
+                    if (nextRequest >= requests) {
+                        return;
+                    }
+                    const int request = nextRequest++;
+                    // A quiet: the reader goes to the pool and the next request
+                    // takes it back, on whatever thread that request runs.
+                    if (request > 0 && request % parkEvery == 0) {
+                        parked = std::move(reader);
+                        reader = std::move(parked);
+                    }
+                    // The next frame: continue the current run or land anew.
+                    if (runLeft == 0) {
+                        cursor = walk.draw(frames);
+                        runLeft = 1u + walk.draw(8u);
+                    } else {
+                        cursor = std::min(cursor + 1u, frames - 1u);
+                    }
+                    --runLeft;
+                    compareOne(*reader, reference, cursor, w, request, report);
+                    report.hardwareWorker = true;
+                    report.activeHw = reader->activeHw();
+                }
+            } catch (...) {
+                report.openError = "exception in a render thread";
+            }
+        });
+    }
+    // ---- stage threads: short-lived readers on the same shared device ----------
+    for (int s = 0; s < kStageThreads; ++s) {
+        const int w = kRenderThreads + s;
+        threads.emplace_back([&, w, s]() noexcept {
+            LrfWorkerReport& report = reports[static_cast<std::size_t>(w)];
+            try {
+                LandingWalk stageWalk(0x165667B19E3779F9ull + static_cast<std::uint64_t>(s));
+                auto swStage = HevcStreamDecoder::open(path, 1, softwareReferenceOptions());
+                if (!swStage.ok()) {
+                    report.openError = swStage.error().toString();
+                    return;
+                }
+                for (int round = 0; round < stageRounds; ++round) {
+                    auto hwStage = HevcStreamDecoder::open(path, 1, stageD3d11Options());
+                    if (!hwStage.ok()) {
+                        report.openError = hwStage.error().toString();
+                        return;
+                    }
+                    for (int k = 0; k < 3; ++k) {
+                        compareOne(hwStage.value(), swStage.value(), stageWalk.draw(frames), w, round * 3 + k,
+                                   report);
+                    }
+                    report.hardwareWorker = true;
+                    report.activeHw = hwStage.value().activeHw();
+                    // hwStage is destroyed here, its surfaces and decoder with it,
+                    // while the render threads keep decoding on the same device.
+                }
+            } catch (...) {
+                report.openError = "exception in a stage thread";
+            }
+        });
+    }
+    for (std::thread& t : threads) {
+        t.join();
+    }
+    judgeWorkers(reports, "handed-off reader");
+}
+
+// -----------------------------------------------------------------------------
+//  Replay of a recorded request order
+// -----------------------------------------------------------------------------
+// OSV_SEEK_SEQUENCE names a text file of frame indices, one per line, in the
+// order a host session decoded them (taken from the importer log).  One
+// importer-equivalent reader decodes them in that order and each picture is
+// compared with a software decode.  SKIPs without the variable.
+TEST_CASE("D3D11VA replay of a recorded LRF request order matches software", "[video][hwaccel][.lrfstress][lrfseek][lrfreplay]") {
+    const std::filesystem::path path = stressLrfPath();
+    const char* sequenceEnv = std::getenv("OSV_SEEK_SEQUENCE");
+    if (sequenceEnv == nullptr || *sequenceEnv == '\0' || !std::filesystem::exists(path)) {
+        SKIP("OSV_SEEK_SEQUENCE or the LRF is not available");
+    }
+    std::vector<std::uint32_t> order;
+    {
+        std::ifstream in(sequenceEnv);
+        REQUIRE(in.good());
+        long long v = 0;
+        while (in >> v) {
+            if (v >= 0) {
+                order.push_back(static_cast<std::uint32_t>(v));
+            }
+        }
+    }
+    REQUIRE_FALSE(order.empty());
+    auto hwOpened = HevcStreamDecoder::open(path, 1, importerD3d11Options());
+    if (!hwOpened.ok()) {
+        SKIP("d3d11va decoder unavailable: " << hwOpened.error().toString());
+    }
+    auto swOpened = HevcStreamDecoder::open(path, 1, softwareReferenceOptions());
+    REQUIRE(swOpened.ok());
+    std::vector<LrfWorkerReport> reports(1);
+    const std::uint32_t frames = hwOpened.value().frameCount();
+    int request = 0;
+    for (const std::uint32_t index : order) {
+        if (index < frames) {
+            compareOne(hwOpened.value(), swOpened.value(), index, 0, request, reports[0]);
+        }
+        ++request;
+    }
+    reports[0].hardwareWorker = true;
+    reports[0].activeHw = hwOpened.value().activeHw();
+    judgeWorkers(reports, "replayed order");
 }
 
 TEST_CASE("CUDA decode matches software within 50 dB", "[video][sample][hwaccel][cuda]") {
