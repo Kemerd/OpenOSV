@@ -2371,14 +2371,18 @@ What the plug-in log says (`%LOCALAPPDATA%\OpenOSV\OpenOSVImporter.log`):
   requested WxH <format>, delivered W'xH' (...)` - a WARNING, once per clip:
   the importer sampled 64 columns of every row of a frame it had just
   delivered and found a run of rows whose alpha averaged below 0.5, or whose
-  colour was exactly zero everywhere. It checks the first eight rendered
-  frames of each clip; with `OSV_PLUGIN_LOG_LEVEL=debug` set before Premiere
-  starts it checks every frame and writes one `row check` line per frame, so
-  the log shows that the check ran and found nothing. (The check reads
-  64 x height pixels, about 3 ms on an 8K frame.)
+  colour was exactly zero everywhere. It checks the first three rendered
+  frames of every size, format and quality (draft or full) it delivers for a
+  clip, so the sequence or export frames are checked even when thumbnails and
+  the Source Monitor came first. With `OSV_PLUGIN_LOG_LEVEL=debug` set before Premiere starts, each
+  checked frame also writes one `row check` line, so the log shows that the
+  check ran and found nothing; with `OSV_PLUGIN_LOG_LEVEL=trace` every frame
+  is checked. (The check reads 64 x height pixels, about 3 ms on an 8K
+  frame.)
 
-No `came out` warning, with `row check` lines for the frames in question,
-means the importer delivered complete frames and the band was added later.
+No `came out` warning, with `row check` lines for the frames in question
+(`trace` checks every frame), means the importer delivered those frames
+complete and the band was added later.
 
 `osvtool render ... --alpha` writes the same coverage alpha into `.exr`,
 `.tif` and `.png` stills as a fourth channel (off by default; videos carry no

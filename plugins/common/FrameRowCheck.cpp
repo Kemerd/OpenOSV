@@ -231,4 +231,77 @@ std::string describeRun(const RowScan& scan) noexcept {
     }
 }
 
+bool FrameBudget::admit(std::uint32_t width, std::uint32_t height, pixelcopy::HostPixelFormat format,
+                        bool draft) noexcept {
+    // ---- nothing that could be scanned ---------------------------------------
+    // An empty size is also the unused-slot marker, so it must never be
+    // stored; a layout outside the enum would be refused by the scan anyway.
+    if (width == 0 || height == 0 || pixelcopy::bytesPerPixel(format) == 0) {
+        return false;
+    }
+
+    // ---- a geometry seen before: its own count --------------------------------
+    // At most kBudgetGeometries compares of four small fields - the whole
+    // cost of a frame past its budget.
+    for (Slot& slot : m_slots) {
+        if (slot.width == width && slot.height == height && slot.format == format && slot.draft == draft) {
+            if (slot.frames >= kFramesPerGeometry) {
+                return false;
+            }
+            ++slot.frames;
+            return true;
+        }
+    }
+
+    // ---- a new geometry: the next slot, the oldest one once all are used ------
+    // m_next only ever walks forward and wraps, so slots fill in order and,
+    // once full, the geometry remembered longest is the one given up.
+    Slot& slot = m_slots[m_next % m_slots.size()];
+    m_next = (m_next + 1u) % m_slots.size();
+    slot.width = width;
+    slot.height = height;
+    slot.format = format;
+    slot.draft = draft;
+    slot.frames = 1;
+    return true;
+}
+
+bool SeenSizes::firstTime(std::int32_t width, std::int32_t height) noexcept {
+    // ---- pack the size into one word -------------------------------------------
+    // Both dimensions as their 32-bit patterns, so a negative (garbled) size
+    // is still a distinct key; only (0, 0) packs to the empty marker.
+    const std::uint64_t key = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(width)) << 32u) |
+                              static_cast<std::uint64_t>(static_cast<std::uint32_t>(height));
+    if (key == 0) {
+        return false;
+    }
+
+    // ---- remembered already, or claim the first empty slot --------------------
+    // Relaxed throughout: each slot changes once (empty -> a size) and
+    // nothing else is published through it, so coherence on the one word is
+    // all the argument needs.
+    for (std::atomic<std::uint64_t>& slot : m_sizes) {
+        std::uint64_t seen = slot.load(std::memory_order_relaxed);
+        if (seen == key) {
+            return false;
+        }
+        if (seen != 0) {
+            continue;
+        }
+        if (slot.compare_exchange_strong(seen, key, std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return true;
+        }
+        // Another thread filled the slot first; `seen` now holds its size.
+        // The same size means this one is no longer the first.
+        if (seen == key) {
+            return false;
+        }
+    }
+
+    // ---- every slot holds another size ------------------------------------------
+    // Say "first" and let the caller's once-key deduplicate: more work for a
+    // clip asked at more than kSeenSizeSlots sizes, never a lost line.
+    return true;
+}
+
 }  // namespace osv::premiere::rowcheck

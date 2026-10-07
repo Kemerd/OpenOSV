@@ -15,7 +15,11 @@
 //   * a black band, a transparent band and an all-zero band (an unwritten,
 //     zero-filled PPix) are each found, with the right PICTURE rows (row 0 =
 //     top), the right kind and the right share of the height;
-//   * frames that cannot be read safely are refused, never read.
+//   * frames that cannot be read safely are refused, never read;
+//   * the two memos that decide WHICH frames and requests the importer looks
+//     at give every delivered size and format its own budget (so a size the
+//     host asks for late is still checked) and tell a repeated request size
+//     apart from a new one, also under concurrent callers.
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -25,10 +29,13 @@
 
 #include "osv/render/ImageRGBAf.h"
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace pc = osv::premiere::pixelcopy;
@@ -318,4 +325,142 @@ TEST_CASE("the row self-check refuses a frame it cannot read safely", "[common][
     // ...and, all zero, every row of it is empty.
     CHECK(eightBit.runLength == 8u);
     CHECK(std::string(rc::runKindName(eightBit)) == "transparent and black");
+}
+
+TEST_CASE("the row-check budget restarts for every delivered size, format and quality", "[common][rowcheck]") {
+    rc::FrameBudget budget;
+    // ---- one geometry: its first kFramesPerGeometry frames, then none --------
+    for (std::uint32_t i = 0; i < rc::kFramesPerGeometry; ++i) {
+        CHECK(budget.admit(512, 256, pc::HostPixelFormat::Bgra8u, false));
+    }
+    for (int i = 0; i < 20; ++i) {
+        CHECK_FALSE(budget.admit(512, 256, pc::HostPixelFormat::Bgra8u, false));
+    }
+
+    // ---- a size or a format first asked for late still gets its own -----------
+    // The shape the budget exists for: thumbnails first, the sequence size
+    // (and its format) long after.
+    for (std::uint32_t i = 0; i < rc::kFramesPerGeometry; ++i) {
+        CHECK(budget.admit(2048, 1024, pc::HostPixelFormat::Bgra8u, false));
+        CHECK(budget.admit(512, 256, pc::HostPixelFormat::Bgra32f, false));
+        CHECK(budget.admit(512, 1024, pc::HostPixelFormat::Bgra8u, false));
+    }
+    CHECK_FALSE(budget.admit(2048, 1024, pc::HostPixelFormat::Bgra8u, false));
+    CHECK_FALSE(budget.admit(512, 256, pc::HostPixelFormat::Bgra32f, false));
+    CHECK_FALSE(budget.admit(512, 1024, pc::HostPixelFormat::Bgra8u, false));
+    // ...and the first geometry is still spent.
+    CHECK_FALSE(budget.admit(512, 256, pc::HostPixelFormat::Bgra8u, false));
+
+    // ---- drafts and full frames of one size are budgeted apart -----------------
+    // Draft thumbnails or scrubbing at the export size must not spend the
+    // budget of the first full-quality frames there (a draft skips the seam
+    // search: a different render of the same size).
+    for (std::uint32_t i = 0; i < rc::kFramesPerGeometry; ++i) {
+        CHECK(budget.admit(1024, 512, pc::HostPixelFormat::Bgra32f, true));
+    }
+    CHECK_FALSE(budget.admit(1024, 512, pc::HostPixelFormat::Bgra32f, true));
+    for (std::uint32_t i = 0; i < rc::kFramesPerGeometry; ++i) {
+        CHECK(budget.admit(1024, 512, pc::HostPixelFormat::Bgra32f, false));
+    }
+    CHECK_FALSE(budget.admit(1024, 512, pc::HostPixelFormat::Bgra32f, false));
+    // And the other way round: a spent full-quality geometry leaves the
+    // drafts of that size and format their own budget.
+    CHECK(budget.admit(512, 256, pc::HostPixelFormat::Bgra8u, true));
+
+    // ---- nothing that could be scanned is never admitted ------------------------
+    CHECK_FALSE(budget.admit(0, 256, pc::HostPixelFormat::Bgra8u, false));
+    CHECK_FALSE(budget.admit(512, 0, pc::HostPixelFormat::Bgra8u, false));
+    CHECK_FALSE(budget.admit(512, 256, static_cast<pc::HostPixelFormat>(7), false));
+
+    // ---- a full table recycles its oldest slot, and keeps admitting new sizes ---
+    // Geometry g is (64 + 2g) x (32 + g); the first one's budget is spent
+    // outright, every other one has had a single frame.
+    rc::FrameBudget full;
+    for (std::uint32_t i = 0; i < rc::kFramesPerGeometry; ++i) {
+        CHECK(full.admit(64, 32, pc::HostPixelFormat::Bgra16u, false));
+    }
+    CHECK_FALSE(full.admit(64, 32, pc::HostPixelFormat::Bgra16u, false));
+    for (std::uint32_t g = 1; g < rc::kBudgetGeometries; ++g) {
+        CHECK(full.admit(64 + 2 * g, 32 + g, pc::HostPixelFormat::Bgra16u, false));
+    }
+    // One more geometry than there are slots: admitted, at the cost of the
+    // geometry remembered longest (the first) ...
+    CHECK(full.admit(4096, 2048, pc::HostPixelFormat::Bgra16u, false));
+    // ... which therefore starts afresh when it comes back, spent as it was
+    // (taking the next-oldest slot, the second geometry's) ...
+    CHECK(full.admit(64, 32, pc::HostPixelFormat::Bgra16u, false));
+    // ... while the third is still remembered with its one frame counted.
+    for (std::uint32_t i = 1; i < rc::kFramesPerGeometry; ++i) {
+        CHECK(full.admit(68, 34, pc::HostPixelFormat::Bgra16u, false));
+    }
+    CHECK_FALSE(full.admit(68, 34, pc::HostPixelFormat::Bgra16u, false));
+}
+
+TEST_CASE("the logged-request-size memo says 'first' once per size, also under concurrent callers",
+          "[common][rowcheck]") {
+    SECTION("one caller") {
+        rc::SeenSizes seen;
+        CHECK(seen.firstTime(6000, 3000));
+        CHECK_FALSE(seen.firstTime(6000, 3000));
+        // Only one dimension given ("any" for the other) is a size of its own.
+        CHECK(seen.firstTime(1920, 0));
+        CHECK(seen.firstTime(0, 1080));
+        CHECK_FALSE(seen.firstTime(1920, 0));
+        CHECK_FALSE(seen.firstTime(0, 1080));
+        // Width and height are not interchangeable.
+        CHECK(seen.firstTime(3000, 6000));
+        // A garbled negative size is still a distinct key, never a crash.
+        CHECK(seen.firstTime(-1, 1000));
+        CHECK_FALSE(seen.firstTime(-1, 1000));
+        // "Any size" is the empty marker and is never first.
+        CHECK_FALSE(seen.firstTime(0, 0));
+    }
+    SECTION("more sizes than slots: the overflow keeps answering 'first' and leaves the dedupe to the log") {
+        rc::SeenSizes seen;
+        for (std::int32_t i = 0; i < static_cast<std::int32_t>(rc::kSeenSizeSlots); ++i) {
+            CHECK(seen.firstTime(1000 + 2 * i, 500 + i));
+        }
+        // Every remembered size stays remembered ...
+        for (std::int32_t i = 0; i < static_cast<std::int32_t>(rc::kSeenSizeSlots); ++i) {
+            CHECK_FALSE(seen.firstTime(1000 + 2 * i, 500 + i));
+        }
+        // ... and a size past the table is never lost: "first" every time.
+        CHECK(seen.firstTime(7680, 3840));
+        CHECK(seen.firstTime(7680, 3840));
+    }
+    SECTION("racing threads: exactly one 'first' per size") {
+        // Eight threads offer the same four sizes many times over, the way
+        // Premiere's decode threads hit one clip; each size may be claimed
+        // only once in all.
+        rc::SeenSizes seen;
+        constexpr int kThreads = 8;
+        constexpr int kRounds = 2000;
+        constexpr std::int32_t kSizes[4][2] = {{6000, 3000}, {1920, 1080}, {3840, 2160}, {960, 480}};
+        std::array<std::atomic<int>, 4> firsts{};
+        std::atomic<bool> go{false};
+        std::vector<std::thread> threads;
+        threads.reserve(kThreads);
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&, t] {
+                // Spin until every thread is up, so the first calls overlap.
+                while (!go.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                for (int r = 0; r < kRounds; ++r) {
+                    const std::size_t k = static_cast<std::size_t>((r + t) % 4);
+                    if (seen.firstTime(kSizes[k][0], kSizes[k][1])) {
+                        firsts[k].fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+        go.store(true, std::memory_order_release);
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
+        for (std::size_t k = 0; k < 4; ++k) {
+            INFO("size " << kSizes[k][0] << "x" << kSizes[k][1]);
+            CHECK(firsts[k].load() == 1);
+        }
+    }
 }

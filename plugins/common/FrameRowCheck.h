@@ -17,8 +17,9 @@
 //
 // What counts.  kSampleColumns evenly spaced columns of EVERY row are read
 // (64 x 3840 = 245 760 reads for an 8K frame, a few milliseconds at most, so
-// the importer runs it on a clip's first frames and on every frame at Debug
-// level).  A row is
+// the importer runs it on the first kFramesPerGeometry frames of every size,
+// format and render quality it delivers - FrameBudget - and on every frame
+// only at Trace level).  A row is
 //
 //   * transparent  when the mean of its sampled alphas is below 0.5 - the
 //                  coverage alpha a straight-alpha host composites over
@@ -31,12 +32,29 @@
 // = the top of the frame), whatever the layout's own row order is, so "rows
 // 640..1023 of 1024" reads as "the bottom 37.5 %" without any arithmetic.
 //
+// Which frames and requests.  Two small, allocation-free memos decide what
+// the importer looks at, so the diagnostics cost nothing in steady playback:
+//
+//   * FrameBudget - the first kFramesPerGeometry rendered frames of every
+//                   delivered size, layout and quality (draft or full).  A
+//                   host asks one clip at several sizes and for several
+//                   purposes (bin thumbnail, Source Monitor, sequence,
+//                   export), and the frame a band would appear in is often
+//                   the LAST kind it asks for, so one budget per clip would
+//                   be spent on thumbnails before the frame that matters;
+//   * SeenSizes   - the requested sizes whose "delivering the nearest size"
+//                   line was already offered to the log, so a repeat of the
+//                   same mismatched request costs a few loads and no string.
+//
 // SDK-free on purpose: the three host layouts are pixelcopy::HostPixelFormat,
 // so the unit tests can hand it a buffer they built themselves.
 #pragma once
 
 #include "PixelCopy.h"
 
+#include <array>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -119,5 +137,87 @@ struct RowScan {
 /// black".  Empty when the scan found nothing (or was refused), and when the
 /// text cannot be built (an allocation failure never escapes).
 [[nodiscard]] std::string describeRun(const RowScan& scan) noexcept;
+
+// ---------------------------------------------------------------------------
+//  Which frames to check, which request sizes to log
+// ---------------------------------------------------------------------------
+
+/// Rendered frames self-checked per delivered geometry (width, height, host
+/// layout and draft or full quality) when the log is below Trace level.
+/// Three covers the first landing of a size plus the first frames played or
+/// exported at it.
+inline constexpr std::uint32_t kFramesPerGeometry = 3;
+
+/// Delivered geometries one FrameBudget tells apart.  A clip advertises
+/// three sizes (native, half, quarter); a host uses one or two of the three
+/// layouts, in drafts and full frames - a dozen at most, and a change of
+/// Output Size mid-session brings new ones, which a full table still admits.
+inline constexpr std::size_t kBudgetGeometries = 16;
+
+/// Request sizes one SeenSizes remembers.  A host asks a clip at a handful of
+/// sizes at most (thumbnail, Source Monitor, sequence, export).
+inline constexpr std::size_t kSeenSizeSlots = 8;
+
+static_assert(kFramesPerGeometry >= 1, "every new geometry must get at least one checked frame");
+static_assert(kBudgetGeometries >= 1 && kSeenSizeSlots >= 1, "the memos need at least one slot");
+
+/// Which of one clip's rendered frames to self-check: the first
+/// kFramesPerGeometry of EVERY delivered geometry, not of the clip.
+///
+/// The budget restarts for each new (width, height, layout, draft), so a
+/// size the host first asks for late - the sequence or export size, after the
+/// bin thumbnail and the Source Monitor have been served - is still checked,
+/// and so is the first full-quality frame at a size whose budget draft
+/// thumbnails or scrubbing already spent (a draft skips the seam search, so
+/// it is a different render of the same size).  Steady playback at a
+/// geometry already checked pays one short table walk.  Once all
+/// kBudgetGeometries slots are in use a new geometry takes the oldest slot
+/// (round robin), so the memo never stops admitting new geometries; one
+/// evicted that way gets a fresh budget if it returns.
+///
+/// No allocation, no lock of its own and NOT thread-safe: the importer keeps
+/// one per clip and calls it under that clip's instance lock.
+class FrameBudget {
+public:
+    /// True when this frame is within its geometry's budget, and count it.
+    /// `draft` is the request's quality (the importer's isDraftRequest()).
+    /// False for a geometry already checked kFramesPerGeometry times, an
+    /// empty size, or a layout outside the enum (nothing could be scanned).
+    [[nodiscard]] bool admit(std::uint32_t width, std::uint32_t height, pixelcopy::HostPixelFormat format,
+                             bool draft) noexcept;
+
+private:
+    /// One remembered geometry and the frames of it admitted so far.
+    struct Slot {
+        std::uint32_t width = 0;   ///< 0 marks an unused slot (admit() never stores an empty size).
+        std::uint32_t height = 0;  ///< Delivered height in pixels.
+        pixelcopy::HostPixelFormat format = pixelcopy::HostPixelFormat::Bgra32f;  ///< Delivered layout.
+        bool draft = false;        ///< Draft (no seam search) or full-quality frames.
+        std::uint32_t frames = 0;  ///< Frames of this geometry admitted so far (<= kFramesPerGeometry).
+    };
+    std::array<Slot, kBudgetGeometries> m_slots{};  ///< The remembered geometries, oldest first until they wrap.
+    std::size_t m_next = 0;                         ///< Slot the next new geometry takes.
+};
+
+/// The request sizes already offered to a once-per-size log line, remembered
+/// without a lock or an allocation, so a repeat costs a few relaxed loads.
+///
+/// Thread-safe: Premiere calls imGetSourceVideo for one clip from several
+/// threads, and the importer consults this BEFORE it takes the instance lock.
+/// A size is claimed with one compare-exchange on the first empty slot, and
+/// slots only ever go from empty to full, so of two threads racing with the
+/// same new size exactly one is told "first".  Once all kSeenSizeSlots are
+/// taken, every size not among them answers "first" each time and the dedupe
+/// falls back to PluginLog::once() - slower, never wrong.
+class SeenSizes {
+public:
+    /// True the first time (width, height) is offered - the caller then
+    /// writes its line - and false for a size already remembered.  (0, 0),
+    /// the empty-slot marker and the host's "any size", is never "first".
+    [[nodiscard]] bool firstTime(std::int32_t width, std::int32_t height) noexcept;
+
+private:
+    std::array<std::atomic<std::uint64_t>, kSeenSizeSlots> m_sizes{};  ///< Packed (width << 32 | height); 0 = empty.
+};
 
 }  // namespace osv::premiere::rowcheck

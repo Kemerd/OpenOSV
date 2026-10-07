@@ -21,10 +21,17 @@
 //   * every row opaque (alpha >= 0.5) over at least 95 % of its columns -
 //     ALL columns, read independently of the importer's own self-check;
 //   * no row whose B, G and R are zero in every column;
-//   * the importer's self-check (FrameRowCheck.h, run at Debug level on
-//     every frame) agreeing, and its log saying so: one row-check line per
+//   * the importer's self-check (FrameRowCheck.h, run on every frame at
+//     Trace level) agreeing, and its log saying so: one row-check line per
 //     rendered frame, no "came out" warning, and the requested-vs-delivered
 //     size on record for every size the host was not given as asked.
+//
+// A second case runs at Debug, where the self-check is NOT every frame: it
+// proves the check's budget restarts for each delivered size, format and
+// quality (full frames after draft thumbnails of the same size, and a size
+// first asked for late, are still checked; an exhausted one is not checked
+// again), and that a mismatched request size repeated many times, across
+// more sizes than the importer's memo holds, is logged exactly once.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -49,6 +56,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -64,13 +72,15 @@ using namespace osv::premiere::test;
 
 namespace {
 
-/// Raise the plug-in log to DEBUG for the lifetime of the object, so the
-/// importer self-checks EVERY rendered frame (not only a clip's first few)
-/// and writes a summary line for each.  Must exist BEFORE the harness: the
-/// module reads the level once, when its log initialises.
-class DebugLogLevel {
+/// Set the plug-in log's level for the lifetime of the object, restoring the
+/// previous value afterwards.  "trace" makes the importer self-check EVERY
+/// rendered frame; "debug" keeps the default level's budget (the first
+/// frames of each delivered size, format and quality) but writes a summary
+/// line for each frame it checks.  Must exist BEFORE the harness: the module reads
+/// the level once, when its log initialises.
+class LogLevel {
 public:
-    DebugLogLevel() {
+    explicit LogLevel(const char* level) {
         char* old = nullptr;
         std::size_t length = 0;
         if (::_dupenv_s(&old, &length, "OSV_PLUGIN_LOG_LEVEL") == 0 && old) {
@@ -78,11 +88,11 @@ public:
             m_hadPrevious = true;
         }
         std::free(old);
-        ::_putenv_s("OSV_PLUGIN_LOG_LEVEL", "debug");
+        ::_putenv_s("OSV_PLUGIN_LOG_LEVEL", level ? level : "");
     }
-    ~DebugLogLevel() { ::_putenv_s("OSV_PLUGIN_LOG_LEVEL", m_hadPrevious ? m_previous.c_str() : ""); }
-    DebugLogLevel(const DebugLogLevel&) = delete;
-    DebugLogLevel& operator=(const DebugLogLevel&) = delete;
+    ~LogLevel() { ::_putenv_s("OSV_PLUGIN_LOG_LEVEL", m_hadPrevious ? m_previous.c_str() : ""); }
+    LogLevel(const LogLevel&) = delete;
+    LogLevel& operator=(const LogLevel&) = delete;
 
 private:
     std::string m_previous;
@@ -132,6 +142,27 @@ private:
     std::error_code ec;
     const std::filesystem::path path = importerLogPath();
     return std::filesystem::exists(path, ec) ? std::filesystem::file_size(path, ec) : 0u;
+}
+
+/// Lines of `log` that contain `needle`, and of those, how many also contain
+/// `also` (the row-check line ends in ", draft" for a draft frame).
+void countLines(const std::string& log, const std::string& needle, const std::string& also, std::size_t& withNeedle,
+                std::size_t& withBoth) {
+    withNeedle = 0;
+    withBoth = 0;
+    std::size_t start = 0;
+    while (start < log.size()) {
+        std::size_t end = log.find('\n', start);
+        if (end == std::string::npos) {
+            end = log.size();
+        }
+        const std::string_view line(log.data() + start, end - start);
+        if (line.find(needle) != std::string_view::npos) {
+            ++withNeedle;
+            withBoth += line.find(also) != std::string_view::npos ? 1u : 0u;
+        }
+        start = end + 1;
+    }
 }
 
 /// Occurrences of `needle` in `hay`.
@@ -307,6 +338,32 @@ void requestAndCheck(ImporterHarness& harness, ImporterHarness::ClipHandle& clip
     }
 }
 
+/// One request of `frame` at `width` x `height` in `format`, the host cache
+/// cleared first or not; true when a frame came back (it is disposed).  The
+/// budget case below only reads the log, so nothing else is checked here.
+[[nodiscard]] bool requestOnly(ImporterHarness& harness, ImporterHarness::ClipHandle& clip, const imFileInfoRec8& info,
+                               const PrSDKPPixSuite* ppix, std::int64_t frame, std::int32_t width, std::int32_t height,
+                               PrPixelFormat format, imRenderIntent intent, bool clearCache, const PrefsBlob& prefs) {
+    if (clearCache) {
+        harness.host().clearCache();
+    }
+    ImporterHarness::SourceVideoRequest source;
+    source.frameTime = static_cast<PrTime>(frame) * info.vidInfo.frameRate;
+    source.format = format;
+    source.width = width;
+    source.height = height;
+    source.intent = intent;
+    PPixHand hand = nullptr;
+    const csSDK_int32 result = harness.getSourceVideo(clip, source, prefs, hand);
+    if (result != imNoErr || !hand) {
+        return false;
+    }
+    if (ppix && ppix->Dispose) {
+        ppix->Dispose(hand);
+    }
+    return true;
+}
+
 /// The requests a host makes of a clip that advertises `baseW` x `baseH`:
 /// the advertised size, the sizes the diagnosis named, a 16:9 sequence size,
 /// 8-bit playback, a half-ratio scrub draft and an any-size thumbnail.
@@ -370,7 +427,7 @@ std::string runClip(const std::filesystem::path& path, bool proxy, const std::ve
 /// The log of a clip run holds what the diagnostics promise.
 void checkLog(const std::string& log, std::size_t rendered) {
     INFO("importer log of the run:\n" << log.substr(0, std::min<std::size_t>(log.size(), 6000u)));
-    // Every rendered frame was self-checked (Debug level: every frame) ...
+    // Every rendered frame was self-checked (Trace level: every frame) ...
     CHECK(countOf(log, " row check ") >= rendered);
     // ... and none came out with an empty band.
     CHECK(log.find("came out") == std::string::npos);
@@ -394,7 +451,9 @@ TEST_CASE("an .LRF delivers every row at host-style mismatched sizes, as its .OS
     if (!std::filesystem::exists(original, ec)) {
         SKIP("the sample .LRF is not beside its .OSV: " << original.string());
     }
-    const DebugLogLevel debugLog;
+    // Trace: every rendered frame is self-checked, not only the first few of
+    // each size, format and quality.
+    const LogLevel traceLog("trace");
 
     SECTION("as the proxy of its .OSV") {
         // 65 timeline frames at 59.94 (the original's): first, middle, last.
@@ -431,5 +490,104 @@ TEST_CASE("an .LRF delivers every row at host-style mismatched sizes, as its .OS
         CHECK(log.find("requested 2000x1000, chose 2048x1024") != std::string::npos);
         // The harness (and with it the clip) is gone, so the copy can go.
         std::filesystem::remove_all(alone.parent_path(), ec);
+    }
+}
+
+TEST_CASE("at Debug the row self-check covers the first frames of every delivered size and quality, and a "
+          "repeated mismatched size is logged once",
+          "[importer][lrf][proxy][rowcheck][sample]") {
+    const std::filesystem::path proxyPath = sampleProxyPath();
+    std::error_code ec;
+    if (proxyPath.empty() || !std::filesystem::exists(proxyPath, ec)) {
+        SKIP("the .LRF proxy is not present at " << proxyPath.string());
+    }
+    std::filesystem::path original = proxyPath;
+    original.replace_extension(".OSV");
+    if (!std::filesystem::exists(original, ec)) {
+        SKIP("the sample .LRF is not beside its .OSV: " << original.string());
+    }
+    // Debug, the level the benchmarks run at: the summary line for each
+    // checked frame, but the default level's budget, not every frame.
+    const LogLevel debugLog("debug");
+
+    const std::uintmax_t logStart = logSize();
+    {
+        ImporterHarness harness;
+        REQUIRE(harness.loaded());
+        auto clip = harness.openClip(proxyPath);
+        INFO("open result " << clip.openResult());
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info) == imNoErr);
+        // The proxy of the 6K original advertises 2000 x 1000 (and half,
+        // quarter).
+        REQUIRE(info.vidInfo.imageWidth == 2000);
+        REQUIRE(info.vidInfo.imageHeight == 1000);
+        REQUIRE(info.vidInfo.frameRate > 0);
+        REQUIRE(info.vidDurationInFrames > 8);
+
+        const void* suite = nullptr;
+        REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) ==
+                kSPNoError);
+        const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+        const PrefsBlob prefs = PrefsBlob::defaults();
+
+        // ---- draft thumbnails at the advertised size come first ---------------
+        // As in a bin: four of them, of which the budget checks the first few
+        // - and those must not spend the full-quality frames' budget below.
+        for (std::int64_t frame = 10; frame < 14; ++frame) {
+            INFO("2000 x 1000 32f thumbnail, frame " << frame);
+            CHECK(requestOnly(harness, clip, info, ppix, frame, 2000, 1000, PrPixelFormat_BGRA_4444_32f,
+                              imRenderIntent_Thumbnail, true, prefs));
+        }
+        // ---- six frames at the advertised size: only the budget's first few ----
+        for (std::int64_t frame = 0; frame < 6; ++frame) {
+            INFO("2000 x 1000 32f, frame " << frame);
+            CHECK(requestOnly(harness, clip, info, ppix, frame, 2000, 1000, PrPixelFormat_BGRA_4444_32f,
+                              imRenderIntent_Export, true, prefs));
+        }
+        // ---- a size and format first asked for after that: its own budget ------
+        for (std::int64_t frame = 6; frame < 8; ++frame) {
+            INFO("1000 x 500 16u, frame " << frame);
+            CHECK(requestOnly(harness, clip, info, ppix, frame, 1000, 500, PrPixelFormat_BGRA_4444_16u,
+                              imRenderIntent_Stopped, true, prefs));
+        }
+        // ---- ten mismatched sizes, three times each, interleaved -----------------
+        // More sizes than the importer's memo holds (rowcheck::kSeenSizeSlots),
+        // all delivered at 2000 x 1000 32f - a geometry whose budget is spent -
+        // and the host cache left alone, as Premiere does.
+        for (int round = 0; round < 3; ++round) {
+            for (std::int32_t k = 1; k <= 10; ++k) {
+                INFO("round " << round << ", requested " << 2 * (1000 + k) << "x" << 1000 + k);
+                CHECK(requestOnly(harness, clip, info, ppix, 0, 2 * (1000 + k), 1000 + k,
+                                  PrPixelFormat_BGRA_4444_32f, imRenderIntent_Export, false, prefs));
+            }
+        }
+        harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+    }
+    const std::string log = logSince(logStart);
+    INFO("importer log of the run:\n" << log.substr(0, std::min<std::size_t>(log.size(), 6000u)));
+
+    // The advertised size: checked for the first rowcheck::kFramesPerGeometry
+    // drafts (four thumbnails) and, separately, the first as many full frames
+    // (six rendered, thirty more requested) - so the thumbnails did not spend
+    // the export's budget, and Debug never scans a frame the default level
+    // would not.
+    std::size_t advertised = 0;
+    std::size_t advertisedDrafts = 0;
+    countLines(log, " row check 2000x1000 32f:", ", draft", advertised, advertisedDrafts);
+    CHECK(advertisedDrafts == rowcheck::kFramesPerGeometry);
+    CHECK(advertised - advertisedDrafts == rowcheck::kFramesPerGeometry);
+    // The size and format asked for late: still checked, every frame of its
+    // (smaller than the budget) run.
+    CHECK(countOf(log, " row check 1000x500 16u:") == 2u);
+    CHECK(log.find("came out") == std::string::npos);
+    // Every mismatched size on record exactly once, the two past the memo's
+    // slots included.
+    for (std::int32_t k = 1; k <= 10; ++k) {
+        const std::string line = "requested " + std::to_string(2 * (1000 + k)) + "x" + std::to_string(1000 + k) +
+                                 " BGRA 32f; delivering 2000x1000";
+        INFO(line);
+        CHECK(countOf(log, line) == 1u);
     }
 }

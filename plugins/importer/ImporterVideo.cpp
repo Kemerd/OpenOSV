@@ -446,15 +446,13 @@ struct FormatChoice {
 // Two facts a support log could not show before, and the only two host
 // interactions a frame with a band of empty rows can come from: whether the
 // host and the importer disagreed about the frame size, and whether the
-// pixels the importer handed over were complete.  Both are written once per
-// clip at the default log level, so a user's log answers the question
-// without anybody having to switch logging up first.
-
-/// Rendered frames per clip whose delivered rows are self-checked at the
-/// default log level; at Debug level every rendered frame is.  Eight covers a
-/// clip's thumbnail plus the first frames of a play or an export, and keeps
-/// the check (~64 reads per row) away from steady-state playback.
-constexpr std::uint64_t kRowCheckFrames = 8;
+// pixels the importer handed over were complete.  Both are written at the
+// default log level - the size once per clip and requested size, the rows
+// for the first frames of every size, format and quality delivered - so a
+// user's log answers the question without anybody having to switch logging
+// up first.  Neither costs anything in steady playback: each asks a small
+// per-clip memo (rowcheck::SeenSizes, rowcheck::FrameBudget) before it
+// builds or reads anything.
 
 /// The clip's file name, UTF-8, for a log line.  Never throws: a name the
 /// conversion refuses (a lone surrogate) logs as "?".
@@ -493,7 +491,11 @@ constexpr std::uint64_t kRowCheckFrames = 8;
 /// requested size too, because the host asks one clip at several sizes
 /// (thumbnails, the Source Monitor, the sequence) and the first of them is
 /// rarely the one a user is looking at.
-void noteSizeMismatch(const ImporterInstance& instance, const FormatChoice& choice,
+///
+/// Called on EVERY request, cache hits included, so a size already logged
+/// for this instance returns after a few relaxed loads of the instance's
+/// rowcheck::SeenSizes - before any string is built or the log's lock taken.
+void noteSizeMismatch(ImporterInstance& instance, const FormatChoice& choice,
                       const OutputGeometry& geometry) noexcept {
     try {
         // ---- does the delivered size answer the request? -------------------
@@ -502,7 +504,16 @@ void noteSizeMismatch(const ImporterInstance& instance, const FormatChoice& choi
         if (!widthDiffers && !heightDiffers) {
             return;
         }
+        // ---- already said for this instance: nothing to build --------------
+        // The level test first, so a size is only remembered once it could
+        // actually have been written.
+        if (!PluginLog::enabled(PluginLog::Level::Info) ||
+            !instance.loggedRequestSizes().firstTime(choice.width, choice.height)) {
+            return;
+        }
         // ---- once per clip and requested size -------------------------------
+        // Still keyed by the clip's path: a reopened clip (a new instance,
+        // with an empty memo) must not repeat what the log already holds.
         const std::string key = "srcvideo-size/" + clipLogKey(instance) + "/" + std::to_string(choice.width) + "x" +
                                 std::to_string(choice.height);
         PluginLog::oncef(key, PluginLog::Level::Info,
@@ -517,31 +528,36 @@ void noteSizeMismatch(const ImporterInstance& instance, const FormatChoice& choi
 
 /// Self-check the rows of a frame just rendered into the host's PPix.
 ///
-/// Runs on the clip's first kRowCheckFrames rendered frames, and on every
-/// frame at Debug level.  Samples rowcheck::kSampleColumns pixels of every
-/// row (rowcheck::scanHostFrame) and, when a run of rows came out
-/// transparent or black, warns once per clip with the rows, the share of the
-/// height, the size the host asked for and the size delivered.  At Debug
-/// level each checked frame also gets a one-line summary, so a log can prove
-/// the check ran and found nothing.
+/// Runs on the first rowcheck::kFramesPerGeometry rendered frames of every
+/// delivered size, format and quality (`draft`, the request's) - the
+/// instance's rowcheck::FrameBudget - and on every frame only at Trace level,
+/// so Debug logging, which the benchmarks use for their frame-cost lines,
+/// never adds the scan to frames the default level would not scan.  Samples
+/// rowcheck::kSampleColumns pixels of every row (rowcheck::scanHostFrame)
+/// and, when a run of rows came out transparent or black, warns once per
+/// clip with the rows, the share of the height, the size the host asked for
+/// and the size delivered.  At Debug level each checked frame also gets a
+/// one-line summary, so a log can prove the check ran and found nothing.
 ///
-/// Read-only on the pixels, and called under the instance lock after the
-/// render and BEFORE the frame goes into the host's cache, so the frame
-/// checked is exactly the frame cached and delivered.  Never throws and
-/// never fails the frame: the result is a log line and nothing else.
+/// Read-only on the pixels, and called under the instance lock (which the
+/// frame budget relies on) after the render and BEFORE the frame goes into
+/// the host's cache, so the frame checked is exactly the frame cached and
+/// delivered.  Never throws and never fails the frame: the result is a log
+/// line and nothing else.
 void checkDeliveredRows(ImporterInstance& instance, const pixelcopy::HostFrame& frame,
-                        pixelcopy::HostPixelFormat layout, const FormatChoice& choice,
-                        std::uint32_t frameIndex) noexcept {
+                        pixelcopy::HostPixelFormat layout, const FormatChoice& choice, std::uint32_t frameIndex,
+                        bool draft) noexcept {
     try {
         // ---- is this frame one to check? -----------------------------------
         // Nothing to say when even the warning would be dropped; otherwise
-        // the first few frames per clip, or every frame at Debug.
+        // the first few frames of this delivered size, format and quality,
+        // or every frame at Trace.  The budget is counted only below Trace,
+        // so a run at Trace never spends it.
         if (!PluginLog::enabled(PluginLog::Level::Warn)) {
             return;
         }
-        const bool everyFrame = PluginLog::enabled(PluginLog::Level::Debug);
-        const std::uint64_t checkedBefore = instance.noteRowCheck();
-        if (!everyFrame && checkedBefore >= kRowCheckFrames) {
+        const bool everyFrame = PluginLog::enabled(PluginLog::Level::Trace);
+        if (!everyFrame && !instance.rowCheckBudgetLocked().admit(frame.width, frame.height, layout, draft)) {
             return;
         }
 
@@ -556,10 +572,10 @@ void checkDeliveredRows(ImporterInstance& instance, const pixelcopy::HostFrame& 
             return;
         }
         PluginLog::debug("imGetSourceVideo: frame {} row check {}x{} {}: {} transparent / {} black rows of {}, "
-                         "worst row {} opaque on {}/{} samples, {} non-finite samples",
+                         "worst row {} opaque on {}/{} samples, {} non-finite samples{}",
                          frameIndex, scan.width, scan.height, pixelcopy::hostPixelFormatName(layout),
                          scan.transparentRows, scan.blackRows, scan.height, scan.worstRow, scan.worstRowOpaque,
-                         scan.columns, scan.nonFiniteSamples);
+                         scan.columns, scan.nonFiniteSamples, draft ? ", draft" : "");
         if (!scan.defective()) {
             return;
         }
@@ -1206,11 +1222,12 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
 
     // ---- self-check of the delivered rows -----------------------------------
     // Every frame path writes every row or fails the frame (handled above),
-    // and this proves it on the user's machine: the clip's first frames, or
-    // every frame at Debug level, are sampled for rows that came out
-    // transparent or black, and a hit is logged with the size the host asked
-    // for.  Read-only, under the lock, before the frame is cached.
-    checkDeliveredRows(*instance, dst, layout, choice, frameIndex);
+    // and this proves it on the user's machine: the first frames of every
+    // size, format and quality delivered, or every frame at Trace, are sampled
+    // for rows that came out transparent or black, and a hit is logged with
+    // the size the host asked for.  Read-only, under the lock, before the
+    // frame is cached.
+    checkDeliveredRows(*instance, dst, layout, choice, frameIndex, draft);
 
     // ---- cache + hand over -------------------------------------------------
     // [WP-STEADY] Only a frame with its final pixels is cached.  An
