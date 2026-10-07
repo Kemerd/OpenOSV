@@ -2612,6 +2612,7 @@ TEST_CASE("an interactive request never waits for the parallax measurement, and 
 
     const PrefsBlob off = parallaxOnlyPrefs(false);
     const PrefsBlob on = parallaxOnlyPrefs(true);
+    const DecodedFrame off0 = renderFrame(harness, clip, ppix, requestFor(0, imRenderIntent_Export), off);
     const DecodedFrame off1 = renderFrame(harness, clip, ppix, requestFor(1, imRenderIntent_Export), off);
     const DecodedFrame off2 = renderFrame(harness, clip, ppix, requestFor(2, imRenderIntent_Export), off);
     harness.host().clearCache();
@@ -2619,9 +2620,12 @@ TEST_CASE("an interactive request never waits for the parallax measurement, and 
     // The first interactive request finds nothing measured - not its own
     // bucket, not a neighbour - so it must come back UNCORRECTED, bit for
     // bit.  Anything else means it waited for the ~220 ms flow solve, which
-    // is exactly what made scrubbing unusable.
-    const DecodedFrame first = renderFrame(harness, clip, ppix, requestFor(1, imRenderIntent_Playing), on);
-    const BandDifference firstDiff = bandDifference(off1, first);
+    // is exactly what made scrubbing unusable.  [WP-TEMPORAL] It is the
+    // bucket's anchor (frame 0): an Interactive request hands the worker a
+    // bucket's flow only from its anchor, so the bucket is measured on the
+    // same frame whichever of its frames is played first.
+    const DecodedFrame first = renderFrame(harness, clip, ppix, requestFor(0, imRenderIntent_Playing), on);
+    const BandDifference firstDiff = bandDifference(off0, first);
     INFO("first interactive frame differs from uncorrected in " << firstDiff.inside << " / " << firstDiff.outside
                                                                 << " pixels (inside / outside the overlap)");
     REQUIRE(firstDiff.inside == 0);

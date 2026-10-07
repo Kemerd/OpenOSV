@@ -230,6 +230,80 @@ TEST_CASE("a steady frame is the same whatever was asked for first and whichever
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }
 
+// ---- [WP-TEMPORAL] the per-moment schedule (Follows scene) -------------------
+
+/// steadyOnlyPrefs on the per-moment schedule: every frame takes its bucket's
+/// grid / table / carve, glided from the bucket before.
+[[nodiscard]] static PrefsBlob followsPrefs() {
+    PrefsBlob p = steadyOnlyPrefs();
+    p.parallaxGrid = static_cast<std::uint8_t>(PrefsParallaxGrid::FollowsScene);
+    REQUIRE(p.sanitise());
+    return p;
+}
+
+TEST_CASE("per moment, an exact frame is the same rendered alone, mid-export or after a jump",
+          "[importer][steady][temporal][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+    const PrefsBlob prefs = followsPrefs();
+
+    // A: an export from the start of the clip, through frame 21 (buckets 0-2).
+    std::vector<Pixels> a;
+    {
+        auto clip = harness.openClip(sampleClipPath(), 3201);
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+        harness.host().clearCache();
+        for (std::uint32_t f = 0; f <= 21; ++f) {
+            Pixels p = render(harness, clip, ppix, requestFor(f, imRenderIntent_Export), prefs);
+            if (f >= 19) {
+                a.push_back(std::move(p));
+            }
+        }
+    }
+    // B: an export whose in-point is in the middle of bucket 2 (frame 19):
+    // the bucket is measured on its anchor (16), its partner on 8.
+    std::vector<Pixels> b;
+    {
+        auto clip = harness.openClip(sampleClipPath(), 3202);
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+        harness.host().clearCache();
+        for (std::uint32_t f = 19; f <= 21; ++f) {
+            b.push_back(render(harness, clip, ppix, requestFor(f, imRenderIntent_Export), prefs));
+        }
+    }
+    // C: frame 21 alone, after scrubbing somewhere else entirely.
+    Pixels c;
+    {
+        auto clip = harness.openClip(sampleClipPath(), 3203);
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+        harness.host().clearCache();
+        (void)render(harness, clip, ppix, requestFor(50, imRenderIntent_Scrubbing), prefs);
+        (void)render(harness, clip, ppix, requestFor(45, imRenderIntent_Export), prefs);
+        harness.host().clearCache();
+        c = render(harness, clip, ppix, requestFor(21, imRenderIntent_Export), prefs);
+    }
+    REQUIRE(a.size() == 3u);
+    REQUIRE(b.size() == 3u);
+    for (std::size_t i = 0; i < 3; ++i) {
+        INFO("frame " << (19 + i) << ": " << differing(a[i], b[i]) << " pixels differ");
+        CHECK(a[i] == b[i]);
+    }
+    INFO("frame 21 alone: " << differing(a[2], c) << " pixels differ");
+    CHECK(a[2] == c);
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
 TEST_CASE("a project saved before the steady corrections renders exactly as it did",
           "[importer][steady][legacy][sample]") {
     REQUIRE_SAMPLE_CLIP();
