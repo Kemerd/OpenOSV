@@ -442,6 +442,68 @@ inline constexpr std::uint32_t kParallaxBucketFrames = 8;
 [[nodiscard]] Result<ParallaxWarpGrid> blendParallaxGrids(const ParallaxWarpGrid& from, const ParallaxWarpGrid& to,
                                                           double t);
 
+/// A grid of `like`'s layout (size, latitude span, diagnostics) that corrects
+/// nothing: every (dLon, dLat) is 0.  A refused bucket stands for it when a
+/// neighbour's grid glides into or out of it, since blendParallaxGrids needs
+/// one layout on both sides.  An invalid `like` gives an invalid copy.
+[[nodiscard]] ParallaxWarpGrid zeroParallaxGridLike(const ParallaxWarpGrid& like);
+
+// ---------------------------------------------------------------------------
+//  The seam table's glide between two buckets
+// ---------------------------------------------------------------------------
+//
+// Two buckets' seam tables (SeamProfile::shiftDeg, one disparity per column)
+// glide like the grids do - but a column glides only while the two tables
+// AGREE.  The glide exists to hide measurement noise at a bucket edge; where
+// the scene at the seam has changed between the two anchors (a near object
+// came or went), the older table is simply wrong for the new content, and
+// gliding keeps it on screen for most of the bucket.
+//
+// Measured on consecutive anchors (8 frames apart), |change| per column:
+//     the maintainer's aerial sample   median 0.03 deg, 90th pct 0.24-0.52 deg
+//     a user's car-mounted day clip    median 0.12-0.25 deg, 10-25 % of columns over 1 deg
+//     the night driving clip           median 0.38-0.68 deg, 22-40 % of columns over 1 deg
+// On the night clip a traffic-light pole crossed the seam right after an
+// anchor: gliding from the previous table showed it twice for three frames,
+// where stepping (the behaviour before the glide) showed it once.
+//
+// So per column the glide weight t rises to 1 between kSeamTableGlideNoiseDeg
+// (below it the change is noise: a pure glide) and kSeamTableStepDeg (above
+// it the column steps to the new table at the anchor, as before the glide):
+//     t' = t + (1 - t) * smoothstep(noise, step, |to - from|)
+// A table changes smoothly along longitude (SeamSearchParams::smoothSigmaCols),
+// so t' does too, and the stepped and glided columns meet without a seam of
+// their own.  0.5 deg (2.8 px of a 2048 px equirect) is the top of the aerial
+// sample's bucket-to-bucket noise, so its tables glide as before; 1.5 deg
+// (8.5 px) of stale shift is what doubled the pole.  Measured with the step
+// metric (mean frame-to-frame change at bucket edges over the other frames,
+// seam band) with parallax off, plain glide -> this rule -> stepping:
+//     day clip 3000-3095     1.25 -> 1.77 -> 2.70
+//     night clip 1200-1295   0.88 (the pole doubled) -> 1.03 -> 1.12
+// and the pole and a lamp arm are single again from the anchor on.  A
+// narrower band (0.25 / 0.75 deg) stepped more of the day clip (2.11) for no
+// visible gain on the night one.
+
+/// Below this per-column change (degrees) two buckets' tables glide fully.
+inline constexpr double kSeamTableGlideNoiseDeg = 0.5;
+/// Above this per-column change (degrees) the column steps to the new table.
+inline constexpr double kSeamTableStepDeg = 1.5;
+
+/// Glide two seam tables for one frame into `out` (its capacity is reused).
+///
+/// Per column: from + (to - from) * t', with t' the agreement-weighted glide
+/// weight above (`t` clamped to [0, 1]; a non-finite t counts as 1, the
+/// newer table).  A missing (null or empty) side is an all-zero table - no
+/// shift - so a table fades in from, or out to, the uncorrected geometry, and
+/// a large column of it steps instead.  Tables of two lengths cannot be mixed
+/// column by column: `to` alone then, as if `from` were missing.  Non-finite
+/// entries of either side count as 0, and the output is always finite.
+/// `out` is left empty when neither side has a table.  `noiseDeg` >=
+/// `stepDeg` (or a non-finite threshold) disables the agreement test: a plain
+/// linear glide.
+void blendSeamTables(const std::vector<float>* from, const std::vector<float>* to, double t, std::vector<float>& out,
+                     double noiseDeg = kSeamTableGlideNoiseDeg, double stepDeg = kSeamTableStepDeg);
+
 /// Convert a band flow field into the angular grid, without rendering.
 ///
 /// Split out from buildParallaxWarp so the geometry - band rows to latitude,

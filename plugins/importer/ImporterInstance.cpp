@@ -109,44 +109,11 @@ void trimAnalysisCache(MapT& cache, std::size_t limit, const typename MapT::key_
 }
 
 // ---------------------------------------------------------------------------
-//  [WP-TEMPORAL] the glide between two buckets' corrections
+//  [WP-TEMPORAL] helpers for the anchored per-bucket analyses
 // ---------------------------------------------------------------------------
-
-/// A grid of `like`'s layout that corrects nothing: the uncorrected geometry
-/// a refused bucket stands for when a neighbour's grid glides into or out of
-/// it (blendParallaxGrids needs one layout on both sides).
-[[nodiscard]] render::ParallaxWarpGrid zeroGridLike(const render::ParallaxWarpGrid& like) {
-    render::ParallaxWarpGrid zero = like;
-    std::fill(zero.uv.begin(), zero.uv.end(), 0.0f);
-    return zero;
-}
-
-/// `from` + (`to` - `from`) * t per column, written into `out` (reusing its
-/// capacity).  A missing side counts as an all-zero table - no shift - so a
-/// table fades in from, or out to, the uncorrected geometry.  Tables of two
-/// lengths cannot be mixed column by column: `to` alone then, scaled by t.
-/// Non-finite entries become 0 rather than reaching the kernel.
-void blendSeamTables(const std::vector<float>* from, const std::vector<float>* to, double t, std::vector<float>& out) {
-    out.clear();
-    t = std::isfinite(t) ? std::clamp(t, 0.0, 1.0) : 1.0;
-    bool hasFrom = from != nullptr && !from->empty();
-    const bool hasTo = to != nullptr && !to->empty();
-    if (hasFrom && hasTo && from->size() != to->size()) {
-        hasFrom = false;  // two widths: `to` alone, faded in
-    }
-    if (!hasFrom && !hasTo) {
-        return;  // nothing on either side
-    }
-    const std::size_t n = hasTo ? to->size() : from->size();
-    out.resize(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        // Each side's shift at this column; a missing side shifts nothing.
-        const double a = hasFrom ? static_cast<double>((*from)[i]) : 0.0;
-        const double b = hasTo ? static_cast<double>((*to)[i]) : 0.0;
-        const double v = a + (b - a) * t;
-        out[i] = std::isfinite(v) ? static_cast<float>(v) : 0.0f;
-    }
-}
+// (The glide's own pieces - the zero grid a refused bucket stands for and the
+// seam tables' agreement-weighted glide - live in render/ParallaxWarp.h,
+// where they are unit tested.)
 
 /// Clears a pointer member when a scope ends (the analysis GPU decoder is
 /// only valid while its caller's frame is being analysed).
@@ -460,17 +427,25 @@ void ImporterInstance::parallaxWorkerLoop() noexcept {
             // A result measured under settings that have since changed (or a
             // clip that has since been quieted) describes nothing current.
             if (job.generation == m_parallaxGeneration && !m_parallaxStop) {
-                m_parallaxGrids[job.bucket] = result;  // nullptr records a refusal
-                trimAnalysisCache(m_parallaxGrids, kMaxParallaxCache, job.bucket);
+                // [WP-TEMPORAL] Bands cut from a frame other than the bucket's
+                // anchor make a stand-in: only Interactive requests read it.
+                if (job.standIn) {
+                    m_standInGrids[job.bucket] = result;  // nullptr records a refusal
+                    trimAnalysisCache(m_standInGrids, kMaxStandInCache, job.bucket);
+                } else {
+                    m_parallaxGrids[job.bucket] = result;  // nullptr records a refusal
+                    trimAnalysisCache(m_parallaxGrids, kMaxParallaxCache, job.bucket);
+                }
                 stored = true;
             }
         }
+        const char* lane = job.standIn ? " (stand-in)" : "";
         if (result) {
-            PluginLog::debug("parallax bucket {} measured in the background in {:.0f} ms (flow {:.0f}){}", job.bucket,
-                             ms, result->flowMs, stored ? "" : " - discarded, settings changed");
+            PluginLog::debug("parallax bucket {}{} measured in the background in {:.0f} ms (flow {:.0f}){}", job.bucket,
+                             lane, ms, result->flowMs, stored ? "" : " - discarded, settings changed");
         } else {
-            PluginLog::debug("parallax bucket {} refused in the background after {:.0f} ms ({})", job.bucket, ms,
-                             refusal);
+            PluginLog::debug("parallax bucket {}{} refused in the background after {:.0f} ms ({})", job.bucket, lane,
+                             ms, refusal);
         }
     }
 }
@@ -501,8 +476,16 @@ void ImporterInstance::stopParallaxWorker() noexcept {
 }
 
 void ImporterInstance::resetParallaxLocked() noexcept {
+    // [WP-TEMPORAL] The stand-in lane goes with the anchored caches it
+    // stands in for (all callers hold m_mutex, which guards most of it).
+    m_standInSeams.clear();
+    m_standInTables.clear();
+    m_standInGains.clear();
+    m_photoStandIns.clear();
+    m_shadingStandIns.clear();
     std::lock_guard<std::mutex> lock(m_parallaxMutex);
     m_parallaxGrids.clear();
+    m_standInGrids.clear();
     m_blendSeams.clear();  // [WP-SEAM] carved through the corrections just dropped
     m_parallaxPending.reset();
     ++m_parallaxGeneration;
@@ -1817,16 +1800,28 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
         const video::FramePair* anchor = anchorPairLocked(bucket, index, pair, decode);
         return (anchor == nullptr && now && ownBucket) ? &pair : anchor;
     };
+    // Interactive requests read the stand-in lane after the anchored caches;
+    // the own bucket of one without a free anchor is measured into it, on
+    // the frame itself.  An Exact request (Now, Cached) never touches it.
+    const bool readStandIns = how == AnchorMeasure::IfFree || how == AnchorMeasure::LookUp;
+    const bool measureStandIn = how == AnchorMeasure::IfFree && ownBucket;
 
     // ---- the grid ------------------------------------------------------------------
     bool gridKnown = !wantParallax;
     if (wantParallax) {
         bool queued = false;
+        bool standInKnown = false;
+        std::shared_ptr<const render::ParallaxWarpGrid> standInGrid;
         {
             std::lock_guard<std::mutex> lock(m_parallaxMutex);
             if (const auto it = m_parallaxGrids.find(bucket); it != m_parallaxGrids.end()) {
                 gridKnown = true;
                 out.grid = it->second;  // nullptr: refused
+            } else if (readStandIns) {
+                if (const auto si = m_standInGrids.find(bucket); si != m_standInGrids.end()) {
+                    standInKnown = true;
+                    standInGrid = si->second;  // nullptr: refused
+                }
             }
             queued = (m_parallaxBusyBucket && *m_parallaxBusyBucket == bucket) ||
                      (m_parallaxPending && m_parallaxPending->bucket == bucket);
@@ -1836,10 +1831,14 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
         // solve - ~95 % of the cost - runs here only for an Exact request.
         if (!gridKnown && (now || (how == AnchorMeasure::IfFree && !queued))) {
             const video::FramePair* anchor = measuredOn(now);
-            if (anchor != nullptr) {
+            // [WP-TEMPORAL] No free anchor: the frame's own bands, for the
+            // stand-in lane - unless that already holds the bucket.
+            const bool standInJob = anchor == nullptr && measureStandIn && !standInKnown;
+            const video::FramePair* source = standInJob ? &pair : anchor;
+            if (source != nullptr) {
                 const render::ParallaxWarpParams pw = parallaxParamsLocked();
                 const auto tBand = std::chrono::steady_clock::now();
-                auto bands = render::measureParallaxBands(m_rig, *anchor, m_blend, pw, nullptr, pool);
+                auto bands = render::measureParallaxBands(m_rig, *source, m_blend, pw, nullptr, pool);
                 const double bandMs =
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tBand).count();
                 if (!bands.ok()) {
@@ -1855,13 +1854,13 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
                         const render::ParallaxWarpGrid& g = grid.value();
                         PluginLog::debug("frame {} (bucket {}, anchor {}): parallax {} in {:.0f} ms (flow {:.0f}), "
                                          "consistent {:.0f}%, gated {}/{}, disparity mean {:.2f} / max {:.2f} deg",
-                                         index, bucket, anchor->index, render::flowBackendName(g.usedBackend), ms,
+                                         index, bucket, source->index, render::flowBackendName(g.usedBackend), ms,
                                          g.flowMs, 100.0 * g.consistentFraction(), g.gatedCells, g.measuredCells,
                                          g.meanAbsCorrectionDeg, g.maxAbsCorrectionDeg);
                         out.grid = std::make_shared<const render::ParallaxWarpGrid>(std::move(grid).value());
                     } else {
                         PluginLog::debug("frame {} (bucket {}, anchor {}): parallax refused after {:.0f} ms ({}); {}",
-                                         index, bucket, anchor->index, ms, grid.error().message,
+                                         index, bucket, source->index, ms, grid.error().message,
                                          wantSeam ? "using the seam table instead" : "rendering without it");
                         out.grid = nullptr;  // a stored nullptr records the refusal
                     }
@@ -1870,9 +1869,9 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
                     m_parallaxGrids[bucket] = out.grid;
                     trimAnalysisCache(m_parallaxGrids, kMaxParallaxCache, bucket);
                 } else {
-                    // Interactive: hand the anchor's bands to the worker and move
-                    // on.  A single slot, latest wins - while scrubbing only the
-                    // frame the user stops on matters.
+                    // Interactive: hand the bands to the worker and move on.  A
+                    // single slot, latest wins - while scrubbing only the frame
+                    // the user stops on matters.
                     {
                         std::lock_guard<std::mutex> lock(m_parallaxMutex);
                         ParallaxJob job;
@@ -1881,6 +1880,7 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
                         job.bands = std::move(bands).value();
                         job.params = pw;
                         job.bandMs = bandMs;
+                        job.standIn = standInJob;  // [WP-TEMPORAL] the lane the result goes to
                         m_parallaxPending = std::move(job);
                     }
                     // Started lazily and under m_mutex, which is also what
@@ -1901,6 +1901,12 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
                 }
             }
         }
+        // [WP-TEMPORAL] Not anchored (yet): the stand-in lane's grid, if any.
+        if (!gridKnown && standInKnown) {
+            gridKnown = true;
+            out.grid = std::move(standInGrid);
+            out.standIn = true;
+        }
     }
     if (!gridKnown) {
         return out;  // not measured yet: unknown
@@ -1909,25 +1915,41 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
     // ---- the seam table where there is no grid ------------------------------------------
     // The refused bucket's fallback, and the whole correction with parallax off.
     if (out.grid == nullptr && wantSeam) {
+        // The anchored table first: cached, or measured now (Exact) or from a
+        // free anchor (Interactive).
+        std::map<std::uint32_t, std::vector<float>>* lane = &m_seamTables;
         auto cached = m_seamTables.find(bucket);
+        const video::FramePair* source = nullptr;
         if (cached == m_seamTables.end()) {
-            const video::FramePair* anchor = how == AnchorMeasure::LookUp ? nullptr : measuredOn(now);
-            if (anchor == nullptr) {
-                return out;  // the table is not known yet: neither is the correction
-            }
-            render::SeamSearchParams sp;
-            auto profile = render::searchSeam(m_rig, *anchor, m_blend, sp, pool);
-            if (profile.ok()) {
-                cached = m_seamTables.emplace(bucket, std::move(profile).value().shiftDeg).first;
-                trimAnalysisCache(m_seamTables, kMaxAnalysisCache, bucket);
-            } else {
-                PluginLog::debug("frame {} (bucket {}): seam search failed ({}); rendering without a seam table", index,
-                                 bucket, profile.error().message);
+            const bool measure = now || how == AnchorMeasure::IfFree;
+            source = measure ? measuredOn(now) : nullptr;
+            if (source == nullptr && readStandIns) {
+                // [WP-TEMPORAL] Interactive without a free anchor: the stand-in
+                // lane's table, searched on the frame itself when it has none.
+                lane = &m_standInTables;
+                cached = m_standInTables.find(bucket);
+                source = (cached == m_standInTables.end() && measureStandIn) ? &pair : nullptr;
             }
         }
-        if (cached != m_seamTables.end()) {
+        if (cached == lane->end() && source != nullptr) {
+            render::SeamSearchParams sp;
+            auto profile = render::searchSeam(m_rig, *source, m_blend, sp, pool);
+            if (profile.ok()) {
+                cached = lane->emplace(bucket, std::move(profile).value().shiftDeg).first;
+                trimAnalysisCache(*lane, lane == &m_seamTables ? kMaxAnalysisCache : kMaxStandInCache, bucket);
+            } else {
+                // Searched and failed: the bucket renders without a table.
+                PluginLog::debug("frame {} (bucket {}): seam search failed ({}); rendering without a seam table",
+                                 index, bucket, profile.error().message);
+            }
+        }
+        if (cached == lane->end() && source == nullptr) {
+            return out;  // the table is not known yet: neither is the correction
+        }
+        if (cached != lane->end()) {
             out.table = cached->second;
         }
+        out.standIn = out.standIn || lane == &m_standInTables;
     }
     out.known = true;
     return out;
@@ -2027,8 +2049,8 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
         // Each bucket's correction is its grid when the flow was accepted, else
         // its seam table (or nothing), measured on the bucket's ANCHOR.  An
         // Exact frame measures both buckets now; an Interactive one measures
-        // its own only from a free anchor (the flow in the background) and
-        // takes its partner from the cache.
+        // its own from a free anchor (the flow in the background), else on
+        // itself into the stand-in lane, and takes its partner from the caches.
         const AnchorMeasure ownHow = exactWanted ? AnchorMeasure::Now : AnchorMeasure::IfFree;
         const BucketCorrection own =
             bucketCorrectionLocked(bucket, index, pair, wantParallax, wantSeam, ownHow, pool);
@@ -2037,6 +2059,10 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
         if (hasPartner) {
             partner = bucketCorrectionLocked(bucket - 1, index, pair, wantParallax, wantSeam,
                                              exactWanted ? AnchorMeasure::Now : AnchorMeasure::LookUp, pool);
+        }
+        // A stand-in on either side (Interactive only) makes the frame non-final.
+        if ((own.known && own.standIn) || (partner.known && partner.standIn)) {
+            frameExact = false;
         }
 
         // ---- choose what to glide between ----------------------------------------
@@ -2083,7 +2109,7 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
             } else if (gFrom != nullptr || gTo != nullptr) {
                 // One side refused (or measured nothing): it stands for a zero
                 // warp of the other's layout.
-                const render::ParallaxWarpGrid zero = zeroGridLike(gFrom != nullptr ? *gFrom : *gTo);
+                const render::ParallaxWarpGrid zero = render::zeroParallaxGridLike(gFrom != nullptr ? *gFrom : *gTo);
                 auto blended = render::blendParallaxGrids(gFrom != nullptr ? *gFrom : zero,
                                                           gTo != nullptr ? *gTo : zero, w);
                 if (blended.ok()) {
@@ -2102,7 +2128,12 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
             }
 
             // ---- the seam table: only on the side(s) without a grid ---------------
-            // Faded by the same weight, so it comes in as the grid goes out.
+            // Faded by the same weight, so it comes in as the grid goes out -
+            // column by column, only while the two sides agree: where they
+            // differ by more than measurement noise (a near object came or
+            // went between the anchors) the column steps to the newer side at
+            // the anchor instead of keeping the stale table on screen for most
+            // of the bucket (render::blendSeamTables).
             const std::vector<float>* tFrom =
                 (from != nullptr && from->grid == nullptr && !from->table.empty()) ? &from->table : nullptr;
             const std::vector<float>* tTo = (to->grid == nullptr && !to->table.empty()) ? &to->table : nullptr;
@@ -2112,7 +2143,7 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
                         builder.seam(*tTo);  // no glide: the table exactly
                     }
                 } else {
-                    blendSeamTables(tFrom, tTo, w, m_seamTableFrame);
+                    render::blendSeamTables(tFrom, tTo, w, m_seamTableFrame);
                     if (!m_seamTableFrame.empty()) {
                         builder.seam(m_seamTableFrame);
                     }
@@ -2152,31 +2183,62 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     applySeamTools(index, carvedSeam.get(), appliedGrid.get(), builder);
 
     if (m_prefs.gainMatch != 0) {
-        auto cached = m_gains.find(bucket);
-        // [WP-TEMPORAL] measured on the bucket's anchor, through the anchor's shading model
-        const video::FramePair* gainPair = cached == m_gains.end() ? anchorPairLocked(bucket, index, pair, exactWanted)
-                                                                   : nullptr;
-        if (cached == m_gains.end() && gainPair == nullptr) {
-            frameExact = exactWanted && frameExact;  // Interactive: no free anchor, no gain yet (a stand-in)
-            gainPair = exactWanted ? &pair : nullptr;  // Exact: an anchor that cannot be decoded - the frame itself
-        }
-        if (cached == m_gains.end() && gainPair != nullptr) {
+        // [WP-TEMPORAL] The bucket's gains are measured on its anchor, through
+        // the anchor's shading model, into m_gains - by a non-draft request
+        // only: a draft never decodes an anchor (a thumbnail or a prefetch
+        // must stay cheap) and never measures the lens shading, so what it
+        // measured could differ from what an Exact frame of the bucket
+        // measures.  A draft, or an Interactive frame without a free anchor,
+        // measures on itself through the shading it renders with, into the
+        // stand-in lane, and is not final.
+        const std::array<Vec3d, 2>* gains = nullptr;
+        if (const auto cached = m_gains.find(bucket); cached != m_gains.end()) {
+            gains = &cached->second;
+        } else {
+            const video::FramePair* gainPair = draft ? nullptr : anchorPairLocked(bucket, index, pair, exactWanted);
+            if (gainPair == nullptr && exactWanted && !draft) {
+                gainPair = &pair;  // Exact: an anchor that cannot be decoded - the frame itself
+            }
             render::BandParams band;
-            const std::shared_ptr<const render::LensShadingModel> gainShading =
-                shadingModelForLocked(bucket * render::kParallaxBucketFrames);
-            auto g = render::estimateGain(m_rig, *gainPair, m_blend, band, pool, gainShading.get());  // [WP-VIGNETTE]
-            if (g.ok()) {
-                std::array<Vec3d, 2> gains{g.value().gain[0], g.value().gain[1]};
-                cached = m_gains.emplace(bucket, gains).first;
-                trimAnalysisCache(m_gains, kMaxAnalysisCache, bucket);
+            if (gainPair != nullptr) {
+                // [WP-VIGNETTE] on the lenses as the anchor's frames render them
+                const std::shared_ptr<const render::LensShadingModel> gainShading =
+                    shadingModelForLocked(bucket * render::kParallaxBucketFrames);
+                auto g = render::estimateGain(m_rig, *gainPair, m_blend, band, pool, gainShading.get());
+                if (g.ok()) {
+                    std::array<Vec3d, 2> measured{g.value().gain[0], g.value().gain[1]};
+                    const auto stored = m_gains.emplace(bucket, measured).first;
+                    trimAnalysisCache(m_gains, kMaxAnalysisCache, bucket);
+                    gains = &stored->second;
+                } else {
+                    PluginLog::debug("frame {} (bucket {}): gain estimation failed ({}); rendering without exposure "
+                                     "matching",
+                                     index, bucket, g.error().message);
+                }
             } else {
-                PluginLog::debug("frame {} (bucket {}): gain estimation failed ({}); rendering without exposure "
-                                 "matching",
-                                 index, bucket, g.error().message);
+                // The stand-in: measured once per bucket, on the first frame
+                // that needs it, with the shading this frame renders with.
+                frameExact = false;
+                auto standIn = m_standInGains.find(bucket);
+                if (standIn == m_standInGains.end()) {
+                    auto g = render::estimateGain(m_rig, pair, m_blend, band, pool, m_shadingFrame.get());
+                    if (g.ok()) {
+                        std::array<Vec3d, 2> measured{g.value().gain[0], g.value().gain[1]};
+                        standIn = m_standInGains.emplace(bucket, measured).first;
+                        trimAnalysisCache(m_standInGains, kMaxStandInCache, bucket);
+                    } else {
+                        PluginLog::debug("frame {} (bucket {}): stand-in gain estimation failed ({}); rendering "
+                                         "without exposure matching",
+                                         index, bucket, g.error().message);
+                    }
+                }
+                if (standIn != m_standInGains.end()) {
+                    gains = &standIn->second;
+                }
             }
         }
-        if (cached != m_gains.end()) {
-            builder.gain(cached->second[0], cached->second[1]);
+        if (gains != nullptr) {
+            builder.gain((*gains)[0], (*gains)[1]);
         }
     }
 
@@ -2238,6 +2300,7 @@ render::PhotoRimPenaltyScope ImporterInstance::preparePhotoSeam(std::uint32_t in
         std::vector<double> key = photoRigKey(m_rig);
         if (key != m_photoRigKey) {
             m_photo.clear();
+            m_photoStandIns.clear();  // [WP-TEMPORAL] measured with the old rig too
             m_photoLast.reset();
             m_photoRigKey = std::move(key);
         }
@@ -2247,6 +2310,31 @@ render::PhotoRimPenaltyScope ImporterInstance::preparePhotoSeam(std::uint32_t in
         // (GPU from device frames, CPU from host frames) plus a few ms of
         // statistics per bucket of eight frames.
         const std::uint32_t bucket = render::parallaxBucket(index);
+        // One measurement of bucket `b` on `on`, through `shading`, stored in
+        // `history` (the anchored one, or the stand-in lane).
+        const auto measureInto = [&](render::PhotoSeamHistory& history, std::uint32_t b, const video::FramePair& on,
+                                     const render::LensShadingModel* shading, const char* lane) {
+            auto field = render::measurePhotoSeam(m_rig, on, m_blend, params, pool, shading);
+            if (field.ok()) {
+                const render::PhotoSeamField& f = field.value();
+                PluginLog::debug("frame {} (bucket {}{}): photometric seam field in {:.1f} ms (bands {:.1f}, stats "
+                                 "{:.1f}), trusted {:.1f}%, usable rim {:.2f} / {:.2f} deg, median gain "
+                                 "{:+.3f} / {:+.3f} / {:+.3f} stops",
+                                 on.index, b, lane, f.bandMs + f.statsMs, f.bandMs, f.statsMs,
+                                 f.bandPixels ? 100.0 * static_cast<double>(f.trustedPixels) /
+                                                    static_cast<double>(f.bandPixels)
+                                              : 0.0,
+                                 f.rimMedianDeg[0], f.rimMedianDeg[1], f.medianLog2Gain[0], f.medianLog2Gain[1],
+                                 f.medianLog2Gain[2]);
+                history.store(b, std::make_shared<const render::PhotoSeamField>(std::move(field).value()), params);
+            } else {
+                PluginLog::debug("frame {} (bucket {}{}): photometric seam field refused ({}); keeping the seam edge "
+                                 "inset and the global gain",
+                                 on.index, b, lane, field.error().message);
+                history.store(b, nullptr, params);  // not measured again
+            }
+            history.trim(&history == &m_photo ? kMaxAnalysisCache : kMaxStandInCache, b);
+        };
         // [WP-TEMPORAL] One bucket's field, measured on its anchor through the
         // anchor's shading model - exactly what a sequential render measures,
         // whichever frame asks.  False when the anchor is not available (an
@@ -2262,26 +2350,7 @@ render::PhotoRimPenaltyScope ImporterInstance::preparePhotoSeam(std::uint32_t in
             // [WP-VIGNETTE] on the lenses as the kernel will blend them
             const std::shared_ptr<const render::LensShadingModel> shading =
                 shadingModelForLocked(b * render::kParallaxBucketFrames);
-            auto field = render::measurePhotoSeam(m_rig, *anchor, m_blend, params, pool, shading.get());
-            if (field.ok()) {
-                const render::PhotoSeamField& f = field.value();
-                PluginLog::debug("frame {} (bucket {}): photometric seam field in {:.1f} ms (bands {:.1f}, stats "
-                                 "{:.1f}), trusted {:.1f}%, usable rim {:.2f} / {:.2f} deg, median gain "
-                                 "{:+.3f} / {:+.3f} / {:+.3f} stops",
-                                 anchor->index, b, f.bandMs + f.statsMs, f.bandMs, f.statsMs,
-                                 f.bandPixels ? 100.0 * static_cast<double>(f.trustedPixels) /
-                                                    static_cast<double>(f.bandPixels)
-                                              : 0.0,
-                                 f.rimMedianDeg[0], f.rimMedianDeg[1], f.medianLog2Gain[0], f.medianLog2Gain[1],
-                                 f.medianLog2Gain[2]);
-                m_photo.store(b, std::make_shared<const render::PhotoSeamField>(std::move(field).value()), params);
-            } else {
-                PluginLog::debug("frame {} (bucket {}): photometric seam field refused ({}); keeping the seam edge "
-                                 "inset and the global gain",
-                                 anchor->index, b, field.error().message);
-                m_photo.store(b, nullptr, params);  // not measured again
-            }
-            m_photo.trim(kMaxAnalysisCache, b);
+            measureInto(m_photo, b, *anchor, shading.get(), "");
             return true;
         };
         bool standIn = false;
@@ -2292,22 +2361,31 @@ render::PhotoRimPenaltyScope ImporterInstance::preparePhotoSeam(std::uint32_t in
                 (void)measureBucket(bucket - 1, true);
             }
             standIn = !measureBucket(bucket, exact);
+            // [WP-TEMPORAL] No free anchor (Interactive): measured on the frame
+            // itself, through the shading it renders with, into the stand-in
+            // lane - once per bucket, with that lane's own EMA and glide - as
+            // every frame was measured before the anchoring.
+            if (standIn && !m_photoStandIns.measured(bucket)) {
+                measureInto(m_photoStandIns, bucket, pair, m_shadingFrame.get(), ", stand-in");
+            }
         }
 
         // ---- the field this frame renders with --------------------------------
-        std::shared_ptr<const render::PhotoSeamField> field = m_photo.fieldFor(index, params);
+        std::shared_ptr<const render::PhotoSeamField> field =
+            standIn ? m_photoStandIns.fieldFor(index, params) : m_photo.fieldFor(index, params);
+        if (standIn) {
+            m_photoFrameExact = false;  // a stand-in, whatever it renders with
+        }
         if (field) {
             if (!draft) {
                 m_photoLast = field;
             }
         } else if ((draft || standIn) && m_photoLast) {
-            // A draft never measures, nor does an Interactive frame without a
-            // free anchor; the last accepted field stands in, and the frame is
+            // A draft never measures; the last accepted field stands in (and
+            // where the stand-in lane refused the bucket), and the frame is
             // not final.
             field = m_photoLast;
             m_photoFrameExact = false;
-        } else if (standIn) {
-            m_photoFrameExact = false;  // nothing to stand in: not final either
         }
         m_photoFrame = field;
         // The usable rim as the carved seam's Rim cost, for this thread, for
@@ -2389,6 +2467,7 @@ void ImporterInstance::prepareLensShading(std::uint32_t index, const video::Fram
         if (photoKey != m_shadingPhotoKey) {
             if (!m_shadingPhotoKey.empty()) {
                 m_photo.clear();
+                m_photoStandIns.clear();  // [WP-TEMPORAL] measured under the old shading too
                 m_photoLast.reset();
             }
             m_shadingPhotoKey = std::move(photoKey);
@@ -2401,12 +2480,35 @@ void ImporterInstance::prepareLensShading(std::uint32_t index, const video::Fram
         std::vector<double> rigKey = photoRigKey(m_rig);
         if (rigKey != m_shadingRigKey) {
             m_shading.clear();
+            m_shadingStandIns.clear();  // [WP-TEMPORAL] measured with the old rig too
             m_shadingLast.reset();
             m_shadingRigKey = std::move(rigKey);
         }
 
         // ---- measure this bucket (never for a draft) ------------------------
         const std::uint32_t bucket = render::parallaxBucket(index);
+        // One measurement of bucket `b` on `on`, stored in `history` (the
+        // anchored one, or the stand-in lane).
+        const auto measureInto = [&](render::LensShadingHistory& history, std::uint32_t b, const video::FramePair& on,
+                                     const char* lane) {
+            auto model = render::measureLensShading(m_rig, on, m_blend, params, pool);
+            if (model.ok()) {
+                const render::LensShadingModel& m = model.value();
+                PluginLog::debug("frame {} (bucket {}{}): lens shading in {:.1f} ms (bands {:.1f}); slave {} sectors, "
+                                 "peak {:+.4f} ({:+.3f} stop at {:.1f} deg); master {} sectors, peak {:+.4f} "
+                                 "({:+.3f} stop at {:.1f} deg)",
+                                 on.index, b, lane, m.bandMs + m.statsMs, m.bandMs, m.lens[0].measuredSectors,
+                                 m.lens[0].peakAmount, m.lens[0].peakStops, m.lens[0].peakThetaDeg,
+                                 m.lens[1].measuredSectors, m.lens[1].peakAmount, m.lens[1].peakStops,
+                                 m.lens[1].peakThetaDeg);
+                history.store(b, std::make_shared<const render::LensShadingModel>(std::move(model).value()), params);
+            } else {
+                PluginLog::debug("frame {} (bucket {}{}): lens shading refused ({}); rendering without it", on.index,
+                                 b, lane, model.error().message);
+                history.store(b, nullptr, params);  // not measured again
+            }
+            history.trim(&history == &m_shading ? kMaxAnalysisCache : kMaxStandInCache, b);
+        };
         // [WP-TEMPORAL] One bucket's model, measured on its anchor; false when
         // the anchor is not available (an Interactive frame, not free).
         const auto measureBucket = [&](std::uint32_t b, bool decode) -> bool {
@@ -2417,24 +2519,7 @@ void ImporterInstance::prepareLensShading(std::uint32_t index, const video::Fram
                 }
                 anchor = &pair;  // an Exact frame never loses its own bucket's model
             }
-            auto model = render::measureLensShading(m_rig, *anchor, m_blend, params, pool);
-            if (model.ok()) {
-                const render::LensShadingModel& m = model.value();
-                PluginLog::debug("frame {} (bucket {}): lens shading in {:.1f} ms (bands {:.1f}); slave {} sectors, "
-                                 "peak {:+.4f} ({:+.3f} stop at {:.1f} deg); master {} sectors, peak {:+.4f} "
-                                 "({:+.3f} stop at {:.1f} deg)",
-                                 anchor->index, b, m.bandMs + m.statsMs, m.bandMs, m.lens[0].measuredSectors,
-                                 m.lens[0].peakAmount, m.lens[0].peakStops, m.lens[0].peakThetaDeg,
-                                 m.lens[1].measuredSectors, m.lens[1].peakAmount, m.lens[1].peakStops,
-                                 m.lens[1].peakThetaDeg);
-                m_shading.store(b, std::make_shared<const render::LensShadingModel>(std::move(model).value()),
-                                params);
-            } else {
-                PluginLog::debug("frame {} (bucket {}): lens shading refused ({}); rendering without it",
-                                 anchor->index, b, model.error().message);
-                m_shading.store(b, nullptr, params);  // not measured again
-            }
-            m_shading.trim(kMaxAnalysisCache, b);
+            measureInto(m_shading, b, *anchor, "");
             return true;
         };
         bool standIn = false;
@@ -2444,22 +2529,29 @@ void ImporterInstance::prepareLensShading(std::uint32_t index, const video::Fram
                 (void)measureBucket(bucket - 1, true);
             }
             standIn = !measureBucket(bucket, exact);
+            // [WP-TEMPORAL] No free anchor: measured on the frame itself into
+            // the stand-in lane, once per bucket (see preparePhotoSeam).
+            if (standIn && !m_shadingStandIns.measured(bucket)) {
+                measureInto(m_shadingStandIns, bucket, pair, ", stand-in");
+            }
         }
 
         // ---- the model this frame renders with ------------------------------
-        std::shared_ptr<const render::LensShadingModel> model = m_shading.modelFor(index, params);
+        std::shared_ptr<const render::LensShadingModel> model =
+            standIn ? m_shadingStandIns.modelFor(index, params) : m_shading.modelFor(index, params);
+        if (standIn) {
+            m_shadingFrameExact = false;  // a stand-in, whatever it renders with
+        }
         if (model) {
             if (!draft) {
                 m_shadingLast = model;
             }
         } else if ((draft || standIn) && m_shadingLast) {
-            // A draft never measures, nor does an Interactive frame without a
-            // free anchor; the last accepted model stands in, and the frame is
+            // A draft never measures; the last accepted model stands in (and
+            // where the stand-in lane refused the bucket), and the frame is
             // not final.
             model = m_shadingLast;
             m_shadingFrameExact = false;
-        } else if (standIn) {
-            m_shadingFrameExact = false;  // nothing to stand in: not final either
         }
         if (model && model->active()) {
             // The strength is applied once, here, so the analyses and the
@@ -2499,6 +2591,8 @@ std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::
                                                                            bool& frameExact) {
     const std::uint32_t bucket = render::parallaxBucket(index);
     const bool exact = purpose == RenderPurpose::Exact;
+    // Set when the frame renders a seam from the stand-in lane (Interactive).
+    bool usedStandIn = false;
 
     // ---- [WP-TEMPORAL] one bucket's seam, carved on its anchor -----------------
     // Through the bucket's own correction (its grid, else its table), steered
@@ -2508,8 +2602,12 @@ std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::
     // temporal smoothing, between two seams that each depend on their own
     // bucket alone.  Without the prior the seam is also free to route around
     // a near object that crosses it faster than the old per-bucket clamp
-    // (2 deg per bucket) allowed.  `how` as for the corrections; null when
-    // the bucket cannot be carved (yet).
+    // (2 deg per bucket) allowed.  An Interactive frame whose anchor is not
+    // free (or whose correction is itself a stand-in) carves on ITSELF,
+    // through that correction and with its own rim, into the stand-in lane -
+    // on the first frame after its grid lands, as before the anchoring.
+    // `how` as for the corrections; null when the bucket cannot be carved
+    // (yet).
     const auto seamFor = [&](std::uint32_t b, AnchorMeasure how) -> std::shared_ptr<const render::BlendSeam> {
         {
             std::lock_guard<std::mutex> lock(m_parallaxMutex);
@@ -2517,21 +2615,46 @@ std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::
                 return it->second;
             }
         }
+        // Interactive: the stand-in lane's seam after the anchored one.
+        const bool interactive = how == AnchorMeasure::IfFree || how == AnchorMeasure::LookUp;
+        std::shared_ptr<const render::BlendSeam> standIn;
+        if (interactive) {
+            if (const auto it = m_standInSeams.find(b); it != m_standInSeams.end()) {
+                standIn = it->second;
+            }
+        }
+        const auto useStandIn = [&]() {
+            usedStandIn = usedStandIn || standIn != nullptr;
+            return standIn;
+        };
         if (how == AnchorMeasure::LookUp) {
-            return nullptr;
+            return useStandIn();
         }
         // The correction must be settled before the seam can be carved through
         // it; applyAnalyses has just measured it as far as `how` allows.
-        const BucketCorrection c = bucketCorrectionLocked(b, index, pair, wantParallax, true, AnchorMeasure::LookUp, pool);
+        const BucketCorrection c = bucketCorrectionLocked(b, index, pair, wantParallax, true,
+                                                          interactive ? AnchorMeasure::LookUp : AnchorMeasure::Cached,
+                                                          pool);
         if (!c.known) {
-            return nullptr;
+            return useStandIn();
         }
-        const video::FramePair* anchor = anchorPairLocked(b, index, pair, how == AnchorMeasure::Now);
+        // The anchored seam needs the anchored correction AND the anchor
+        // (decoded for an Exact request, free for an Interactive one).
+        const video::FramePair* anchor =
+            c.standIn ? nullptr : anchorPairLocked(b, index, pair, how == AnchorMeasure::Now);
+        bool intoStandIns = false;
         if (anchor == nullptr) {
-            if (!(how == AnchorMeasure::Now && b == bucket)) {
+            if (how == AnchorMeasure::Now && b == bucket) {
+                anchor = &pair;  // an Exact frame never loses its own bucket's seam
+            } else if (how == AnchorMeasure::IfFree && b == bucket) {
+                if (standIn) {
+                    return useStandIn();  // carved on an earlier frame of the bucket
+                }
+                anchor = &pair;  // the stand-in lane: carved on the frame itself
+                intoStandIns = true;
+            } else {
                 return nullptr;
             }
-            anchor = &pair;  // an Exact frame never loses its own bucket's seam
         }
         render::WarpGridView warpView;
         render::SeamCorrection correction;
@@ -2547,15 +2670,24 @@ std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::
         }
         // [WP-PHOTO] The usable rim of the ANCHOR as the Rim cost - what a
         // sequential render carves with - not the field of whichever frame
-        // asked; a scope nests over the frame's own.
-        const render::PhotoSeamParams photoParams = photoParamsLocked();
-        std::shared_ptr<const render::PhotoSeamField> rim;
-        if (photoParams.mode != render::PhotoSeamMode::Off) {
-            rim = m_photo.fieldFor(b * render::kParallaxBucketFrames, photoParams);
+        // asked; a scope nests over the frame's own.  A stand-in carve keeps
+        // the frame's own (the scope preparePhotoSeam installed).
+        std::optional<render::PhotoRimPenaltyScope> rimScope;
+        if (!intoStandIns) {
+            const render::PhotoSeamParams photoParams = photoParamsLocked();
+            std::shared_ptr<const render::PhotoSeamField> rim;
+            if (photoParams.mode != render::PhotoSeamMode::Off) {
+                rim = m_photo.fieldFor(b * render::kParallaxBucketFrames, photoParams);
+            }
+            rimScope.emplace(rim ? &m_rig : nullptr, rim);
         }
-        const render::PhotoRimPenaltyScope rimScope(rim ? &m_rig : nullptr, rim);
         render::SeamCarveParams params;
-        params.penalty = m_flare.seamPenalty();  // [WP-FLARE] steer away from this frame's ghosts
+        // [WP-FLARE] Steer away from this frame's ghosts - in its own bucket
+        // only: a glide partner carved now is cached for that bucket's frames,
+        // and must not keep another bucket's ghosts.
+        if (b == bucket) {
+            params.penalty = m_flare.seamPenalty();
+        }
         // [WP-SEAMTOOLS] Seam Blend / Parallax Blend: the feather widths only
         // (the seam's path is measured over its own window).  Default prefs
         // leave the parameters exactly at their defaults.
@@ -2568,13 +2700,19 @@ std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::
             return nullptr;
         }
         const render::BlendSeam& s = carved.value();
-        PluginLog::debug("frame {} (bucket {}, anchor {}): seam carved in {:.1f} ms through {}, latitude mean {:+.2f} / "
+        PluginLog::debug("frame {} (bucket {}, {} {}): seam carved in {:.1f} ms through {}, latitude mean {:+.2f} / "
                          "max {:.2f} deg, feather {:.2f} deg mean, {} narrow / {} forced columns",
-                         index, b, anchor->index, s.carveMs,
+                         index, b, intoStandIns ? "stand-in on" : "anchor", anchor->index, s.carveMs,
                          correction.warp ? "the parallax grid"
                                          : (correction.seamShiftDeg ? "the seam table" : "no correction"),
                          s.meanLatDeg, s.maxAbsLatDeg, s.meanHalfWidthDeg, s.narrowColumns, s.forcedColumns);
         auto stored = std::make_shared<const render::BlendSeam>(std::move(carved).value());
+        if (intoStandIns) {
+            m_standInSeams[b] = stored;
+            trimAnalysisCache(m_standInSeams, kMaxStandInCache, b);
+            usedStandIn = true;
+            return stored;
+        }
         std::lock_guard<std::mutex> lock(m_parallaxMutex);
         m_blendSeams[b] = stored;
         trimAnalysisCache(m_blendSeams, kMaxAnalysisCache, b);
@@ -2588,6 +2726,9 @@ std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::
         seamFor(bucket, exact ? AnchorMeasure::Now : AnchorMeasure::IfFree);
     const std::shared_ptr<const render::BlendSeam> previous =
         bucket > 0 ? seamFor(bucket - 1, exact ? AnchorMeasure::Now : AnchorMeasure::LookUp) : nullptr;
+    if (usedStandIn) {
+        frameExact = false;  // a seam measured on another frame than its anchor
+    }
 
     // ---- choose what to apply ------------------------------------------------
     std::shared_ptr<const render::BlendSeam> apply;

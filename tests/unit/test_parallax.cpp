@@ -27,6 +27,7 @@
 //     is not applied - the sample clip's wingtip, where the two lenses see
 //     different objects, is the real-world case and has its own test.
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include "TestSample.h"
@@ -1487,5 +1488,181 @@ TEST_CASE("the applied correction glides across bucket edges instead of stepping
         INFO("frame " << f << " bucket " << b << " applied " << value << " previous " << previous);
         CHECK(std::fabs(value - previous) <= maxNeighbourGap / static_cast<float>(n) + 1e-6f);
         previous = value;
+    }
+}
+
+// ---- [WP-TEMPORAL] the glide through refused buckets, and the seam table's --
+
+TEST_CASE("zeroParallaxGridLike keeps the layout and corrects nothing", "[parallax][schedule][temporal]") {
+    render::ParallaxWarpGrid like = constantGrid(0.7f);
+    like.gatedCells = 9;
+    const render::ParallaxWarpGrid zero = render::zeroParallaxGridLike(like);
+    REQUIRE(zero.valid());
+    CHECK(zero.w == like.w);
+    CHECK(zero.h == like.h);
+    CHECK(zero.latMinRad == like.latMinRad);
+    CHECK(zero.latMaxRad == like.latMaxRad);
+    for (const float v : zero.uv) {
+        CHECK(v == 0.0f);
+    }
+    // It glides with its model: a refused bucket fades the grid out, a 1/N
+    // step at a time, instead of switching it off in one frame.
+    const auto half = render::blendParallaxGrids(like, zero, 0.5);
+    REQUIRE(half.ok());
+    CHECK(half.value().uv.front() == 0.35f);
+    // An invalid model stays invalid (the caller then has nothing to blend).
+    CHECK_FALSE(render::zeroParallaxGridLike(render::ParallaxWarpGrid{}).valid());
+}
+
+TEST_CASE("blendSeamTables glides where two tables agree and steps where the scene changed",
+          "[parallax][schedule][temporal]") {
+    using render::blendSeamTables;
+    const double noise = render::kSeamTableGlideNoiseDeg;
+    const double step = render::kSeamTableStepDeg;
+    REQUIRE(noise < step);
+    // The cases below call a change of <= 0.2 deg noise and one of >= 2 deg
+    // a scene change; the band must keep them on those sides.
+    REQUIRE(noise > 0.2);
+    REQUIRE(step < 2.0);
+    std::vector<float> out;
+
+    SECTION("columns that agree within the noise glide linearly, by t exactly") {
+        const std::vector<float> from{1.0f, 2.0f, -1.0f};
+        const std::vector<float> to{1.1f, 1.9f, -1.2f};  // all within the noise
+        blendSeamTables(&from, &to, 0.25, out);
+        REQUIRE(out.size() == 3u);
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            CHECK(out[i] == Catch::Approx(from[i] + (to[i] - from[i]) * 0.25).margin(1e-6));
+        }
+    }
+    SECTION("a column that changed by more than the step band takes the new table at once") {
+        const std::vector<float> from{0.0f, 0.0f};
+        const std::vector<float> to{0.1f, 2.0f};  // agrees / a near object arrived
+        blendSeamTables(&from, &to, 1.0 / 8.0, out);
+        REQUIRE(out.size() == 2u);
+        CHECK(out[0] == Catch::Approx(0.1 / 8.0).margin(1e-6));
+        CHECK(out[1] == 2.0f);
+    }
+    SECTION("the weight rises smoothly and monotonically across the band") {
+        const std::vector<float> from(64, 0.0f);
+        std::vector<float> to(64);
+        for (std::size_t i = 0; i < to.size(); ++i) {
+            to[i] = static_cast<float>(i) * 0.04f;  // 0 .. 2.52 deg, across the whole band
+        }
+        blendSeamTables(&from, &to, 0.25, out);
+        REQUIRE(out.size() == to.size());
+        double previousK = 0.0;
+        for (std::size_t i = 1; i < to.size(); ++i) {
+            const double k = static_cast<double>(out[i]) / static_cast<double>(to[i]);
+            CHECK(k >= 0.25 - 1e-6);
+            CHECK(k <= 1.0 + 1e-6);
+            CHECK(k >= previousK - 1e-6);
+            previousK = k;
+        }
+        CHECK(previousK == Catch::Approx(1.0));
+    }
+    SECTION("a missing side is no shift: small columns fade, large ones step") {
+        const std::vector<float> table{0.1f, 3.0f};
+        blendSeamTables(&table, nullptr, 0.5, out);  // a table fading out into a grid
+        REQUIRE(out.size() == 2u);
+        CHECK(out[0] == Catch::Approx(0.05).margin(1e-6));
+        CHECK(out[1] == 0.0f);
+        blendSeamTables(nullptr, &table, 0.5, out);  // fading in
+        REQUIRE(out.size() == 2u);
+        CHECK(out[0] == Catch::Approx(0.05).margin(1e-6));
+        CHECK(out[1] == 3.0f);
+        const std::vector<float> empty;
+        blendSeamTables(&empty, nullptr, 0.5, out);
+        CHECK(out.empty());
+        blendSeamTables(nullptr, nullptr, 0.5, out);
+        CHECK(out.empty());
+    }
+    SECTION("two lengths cannot mix: the newer table alone, as if the older were missing") {
+        const std::vector<float> from{0.0f, 0.0f, 0.0f};
+        const std::vector<float> to{0.1f, 0.1f};
+        blendSeamTables(&from, &to, 0.5, out);
+        REQUIRE(out.size() == 2u);
+        CHECK(out[0] == Catch::Approx(0.05).margin(1e-6));
+    }
+    SECTION("non-finite inputs never reach the kernel") {
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const float inf = std::numeric_limits<float>::infinity();
+        const std::vector<float> from{nan, 1.0f, inf};
+        const std::vector<float> to{0.5f, nan, -inf};
+        blendSeamTables(&from, &to, std::nan(""), out);  // a non-finite t: the newer side
+        REQUIRE(out.size() == 3u);
+        for (const float v : out) {
+            CHECK(std::isfinite(v));
+        }
+        CHECK(out[0] == 0.5f);
+        CHECK(out[1] == 0.0f);
+    }
+    SECTION("an unusable band is a plain linear glide") {
+        const std::vector<float> from{0.0f};
+        const std::vector<float> to{4.0f};
+        blendSeamTables(&from, &to, 0.25, out, 1.0, 0.5);  // inverted
+        CHECK(out[0] == 1.0f);
+        blendSeamTables(&from, &to, 0.25, out, std::nan(""), step);
+        CHECK(out[0] == 1.0f);
+        blendSeamTables(&from, &to, 0.25, out, noise, step);  // the real band: a step
+        CHECK(out[0] == 4.0f);
+    }
+    SECTION("the output reuses its capacity") {
+        out.reserve(4096);
+        const auto* data = out.data();
+        const std::vector<float> table(2048, 0.1f);
+        blendSeamTables(&table, &table, 0.5, out);
+        CHECK(out.data() == data);
+        CHECK(out.size() == 2048u);
+    }
+}
+
+TEST_CASE("a refused bucket is glided through, and only a large table change steps at the anchor",
+          "[parallax][schedule][temporal]") {
+    // What applyAnalyses applies to frame f of bucket b, glided from b - 1:
+    //   warp  = blend(grid(b - 1) or a zero grid, grid(b) or a zero grid, w)
+    //   table = blendSeamTables(table of a refused b - 1, table of a refused b, w)
+    // Buckets: accepted, refused, refused, accepted.  The warp must never move
+    // by more than 1/N of the gap between neighbouring corrections per frame,
+    // whatever is refused; a table within the noise must glide the same way,
+    // and one that changes by a scene's worth must step at the anchor only.
+    const std::uint32_t n = render::kParallaxBucketFrames;
+    const float gridValue[] = {0.8f, 0.0f, 0.0f, -0.4f};
+    const bool accepted[] = {true, false, false, true};
+    for (const float tableDelta : {0.2f, 3.0f}) {
+        INFO("second refused bucket's table differs from the first's by " << tableDelta << " deg");
+        const std::vector<std::vector<float>> tables{{}, {0.1f}, {0.1f + tableDelta}, {}};
+        // The table each bucket stands for: none where its grid was accepted.
+        const float level[] = {0.0f, 0.1f, 0.1f + tableDelta, 0.0f};
+        float previousWarp = gridValue[0];
+        float previousTable = 0.0f;
+        std::vector<float> table;
+        for (std::uint32_t f = n; f < 4 * n; ++f) {
+            const std::uint32_t b = render::parallaxBucket(f);
+            const double w = render::parallaxCrossfadeWeight(f);
+            // ---- the warp, a refused side standing for a zero grid ----
+            const render::ParallaxWarpGrid from = constantGrid(accepted[b - 1] ? gridValue[b - 1] : 0.0f);
+            const render::ParallaxWarpGrid to = constantGrid(accepted[b] ? gridValue[b] : 0.0f);
+            const auto warp = render::blendParallaxGrids(from, to, w);
+            REQUIRE(warp.ok());
+            const float warpValue = warp.value().uv.front();
+            CHECK(std::fabs(warpValue - previousWarp) <= 0.8f / static_cast<float>(n) + 1e-6f);
+            previousWarp = warpValue;
+            // ---- the table, on the refused sides only ----
+            render::blendSeamTables(accepted[b - 1] ? nullptr : &tables[b - 1], accepted[b] ? nullptr : &tables[b],
+                                    w, table);
+            const float tableValue = table.empty() ? 0.0f : table.front();
+            const float gap = std::fabs(level[b] - level[b - 1]);
+            INFO("frame " << f << " table " << tableValue << " previous " << previousTable << " gap " << gap);
+            if (gap >= render::kSeamTableStepDeg) {
+                // The scene changed: the newer side from the anchor on.
+                CHECK(tableValue == Catch::Approx(level[b]).margin(1e-6));
+            } else {
+                // Within the noise: a glide, 1/N of the gap per frame.
+                REQUIRE(gap <= render::kSeamTableGlideNoiseDeg);
+                CHECK(std::fabs(tableValue - previousTable) <= gap / static_cast<float>(n) + 1e-6f);
+            }
+            previousTable = tableValue;
+        }
     }
 }
