@@ -594,6 +594,72 @@ TEST_CASE("the gate turns the sun search off only for a scene known to be too da
     REQUIRE_FALSE(render::flareSceneTooDark(2.0, off));
 }
 
+TEST_CASE("with the frame's exposure known, the sun detector also asks for daylight in the image", "[flare]") {
+    SECTION("median-referenced luminance: metered grey at 2^EV / 8 cd/m^2") {
+        REQUIRE_THAT(render::flareSceneLuminance(0.18, 3.0), WithinAbs(1.0, 1e-12));
+        REQUIRE_THAT(render::flareSceneLuminance(0.09, 3.0), WithinAbs(0.5, 1e-12));
+        REQUIRE_THAT(render::flareSceneLuminance(0.18, 9.05), WithinRel(66.27, 1e-3));
+        REQUIRE_THAT(render::flareSceneLuminance(0.0, 9.0), WithinAbs(0.0, 1e-12));
+        REQUIRE(std::isnan(render::flareSceneLuminance(-0.1, 9.0)));
+        REQUIRE(std::isnan(render::flareSceneLuminance(std::nan(""), 9.0)));
+        REQUIRE(std::isnan(render::flareSceneLuminance(0.18, std::nan(""))));
+        REQUIRE(std::isnan(render::flareSceneLuminance(0.18, std::numeric_limits<double>::infinity())));
+        REQUIRE(std::isnan(render::flareSceneLuminance(0.18, 5000.0)));  // overflows: not a number we trust
+    }
+
+    // The synthetic sky's median luma is ~0.11, so it reads (0.11 / 0.18) *
+    // 2^EV / 8: ~5.6 cd/m^2 at EV 6.2, ~12 at EV 8, ~40 at the sample's 9.05.
+    const render::FlareImage img = makeScene(SceneOptions{});
+    const auto withEv = [](double ev) {
+        render::FlareParams fp;
+        fp.sceneEv100 = ev;
+        return fp;
+    };
+
+    SECTION("unknown exposure: found exactly as before") {
+        const render::FlareParams plain;
+        REQUIRE(std::isnan(plain.sceneEv100));
+        const render::FlareSunFix a = render::locateSun(img, syntheticLens(), plain);
+        const render::FlareSunFix b = render::locateSun(img, syntheticLens(), withEv(std::nan("")));
+        REQUIRE(a.found);
+        REQUIRE(b.found);
+        REQUIRE(a.x == b.x);
+        REQUIRE(a.y == b.y);
+    }
+
+    SECTION("daylight on the image: the sun is found") {
+        REQUIRE(render::locateSun(img, syntheticLens(), withEv(8.0)).found);
+        REQUIRE(render::locateSun(img, syntheticLens(), withEv(9.05)).found);
+        auto res = render::analyseLensFlare(img, syntheticLens(), withEv(9.05));
+        REQUIRE(res.ok());
+        REQUIRE(res.value().sunFound);
+        REQUIRE_FALSE(res.value().ghosts.empty());
+    }
+
+    SECTION("an exposure set for daylight on a dim image (manual exposure): no sun, no ghosts") {
+        // EV 6.2 passes the EV gate, but the image's median says the scene
+        // gave ~5.6 cd/m^2, under the 8 a sunlit scene has.
+        REQUIRE_FALSE(render::flareSceneTooDark(6.2, render::FlareParams{}));
+        REQUIRE_FALSE(render::locateSun(img, syntheticLens(), withEv(6.2)).found);
+        auto res = render::analyseLensFlare(img, syntheticLens(), withEv(6.2));
+        REQUIRE(res.ok());
+        REQUIRE_FALSE(res.value().sunFound);
+        REQUIRE(res.value().ghosts.empty());
+        // With the luminance check switched off, the same frame finds it.
+        render::FlareParams off = withEv(6.2);
+        off.minSceneLuminance = std::nan("");
+        REQUIRE(render::locateSun(img, syntheticLens(), off).found);
+    }
+
+    SECTION("a scene metered too dark: the detector refuses it too") {
+        REQUIRE_FALSE(render::locateSun(img, syntheticLens(), withEv(3.3)).found);
+        auto res = render::analyseLensFlare(img, syntheticLens(), withEv(3.3));
+        REQUIRE(res.ok());
+        REQUIRE_FALSE(res.value().sunFound);
+        REQUIRE(res.value().ghosts.empty());
+    }
+}
+
 TEST_CASE("two lenses cannot see two different suns", "[flare]") {
     auto rigRes = makeSampleRig(3000);
     REQUIRE(rigRes.ok());

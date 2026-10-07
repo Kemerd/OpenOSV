@@ -715,6 +715,19 @@ SunBlob detectSun(const Gray& luma, const std::vector<std::uint8_t>& inside, con
     if (!(maxY > 0.0) || !(med > 0.0) || maxY < fp.sunMinRatioToMedian * med) {
         return sun;
     }
+    // Relative tests cannot tell the sun from a clipped lamp (both sit at the
+    // clip level); the scene's absolute light can.  Only with the frame's
+    // exposure known: a scene metered too dark, or one whose own median on
+    // that exposure is too dim (locked or manual exposure), holds no sun.
+    if (std::isfinite(fp.sceneEv100)) {
+        if (flareSceneTooDark(fp.sceneEv100, fp)) {
+            return sun;
+        }
+        const double nits = flareSceneLuminance(med, fp.sceneEv100);
+        if (std::isfinite(fp.minSceneLuminance) && std::isfinite(nits) && nits < fp.minSceneLuminance) {
+            return sun;
+        }
+    }
     // Candidate pixels: within sunLevelFraction of the maximum.
     const double level = fp.sunLevelFraction * maxY;
     std::vector<std::uint8_t> mask(luma.v.size(), 0);
@@ -1677,6 +1690,19 @@ bool flareSceneTooDark(double sceneEv100, const FlareParams& params) noexcept {
         return false;
     }
     return sceneEv100 < params.minSceneEv100;
+}
+
+double flareSceneLuminance(double medianLinear, double sceneEv100) noexcept {
+    constexpr double kUnknown = std::numeric_limits<double>::quiet_NaN();
+    // A median below zero is not light, and an unknown exposure says nothing.
+    if (!allFinite(medianLinear, sceneEv100) || medianLinear < 0.0) {
+        return kUnknown;
+    }
+    // The camera renders the metered mid grey - 2^EV100 / 8 cd/m^2 for a
+    // reflected-light meter with K = 12.5 at ISO 100 - at 0.18 scene-linear.
+    constexpr double kMeteredGrey = 0.18;
+    const double nits = (medianLinear / kMeteredGrey) * std::exp2(sceneEv100) / 8.0;
+    return std::isfinite(nits) ? nits : kUnknown;
 }
 
 bool flareSunsMatch(const FlareSunFixes& a, const FlareSunFixes& b, double tolerancePx) noexcept {

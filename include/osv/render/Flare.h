@@ -76,6 +76,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -222,6 +223,20 @@ struct FlareParams {
     /// stops of margin over the night and 3 under the filtered sun.  NaN
     /// switches the gate off.
     double minSceneEv100 = 6.0;
+    /// Lowest median-referenced scene luminance (cd/m^2, see
+    /// flareSceneLuminance) a frame with the sun in view can have.  The
+    /// EV100 alone reflects the camera's SETTINGS, which with locked or
+    /// manual exposure need not follow the scene; the image's own median
+    /// placed on that exposure does.  Measured: a night street 0.1 - 2.1,
+    /// the sample's sun through an ND filter 59 - 68, a sunset 310 - 1200.
+    /// Applies only while sceneEv100 is known; NaN switches it off.
+    double minSceneLuminance = 8.0;
+    /// The analysed frame's own EV100 (flareSceneEv100) when the caller
+    /// knows it, NaN otherwise.  Per frame, not tuning: with it, the sun
+    /// detector itself refuses a frame flareSceneTooDark() calls dark or
+    /// whose median-referenced luminance is under minSceneLuminance - so the
+    /// per-frame sun check and the full analysis judge a frame alike.
+    double sceneEv100 = std::numeric_limits<double>::quiet_NaN();
 
     // ---- one sun ------------------------------------------------------------
     /// Two lenses that each report a sun must agree on its direction within
@@ -389,6 +404,20 @@ using FlareSunFixes = std::array<FlareSunFix, 2>;
 /// the frame is too dark for the sun to be in view.  An unknown value or a
 /// NaN threshold never gates.
 [[nodiscard]] bool flareSceneTooDark(double sceneEv100, const FlareParams& params) noexcept;
+
+/// Median-referenced scene luminance (cd/m^2) of a frame exposed for
+/// `sceneEv100` whose working image has the scene-linear median luma
+/// `medianLinear`:
+///
+///     L = (median / 0.18) * 2^EV100 / 8
+///
+/// A reflected-light meter (calibration constant K = 12.5) sets EV100 for
+/// a mid grey of 2^EV100 / 8 cd/m^2, and the camera renders that grey at
+/// 0.18 scene-linear, so the median stands for median / 0.18 times it.
+/// Where the EV100 only says what the exposure was SET to (locked or manual
+/// exposure), the median says what the scene then gave.  NaN for a
+/// non-finite or negative median or a non-finite EV100.
+[[nodiscard]] double flareSceneLuminance(double medianLinear, double sceneEv100) noexcept;
 
 // ===========================================================================
 //  Veil (OFF by default - read before enabling)

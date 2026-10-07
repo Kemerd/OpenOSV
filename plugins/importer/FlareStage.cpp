@@ -277,7 +277,14 @@ FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePai
                                       clip));
             return out;
         }
-        const render::FlareParams params;
+        // The frame's exposure travels with the parameters, so the sun check
+        // and the fits (here or on the worker) also hold the image's own
+        // median to it (FlareParams::minSceneLuminance).
+        const render::FlareParams params = [sceneEv100] {
+            render::FlareParams p;
+            p.sceneEv100 = sceneEv100;
+            return p;
+        }();
 
         // ---- can the sun be in view at all? ------------------------------------
         // The camera's exposure says how much light the scene had; a night
