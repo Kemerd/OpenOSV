@@ -21,6 +21,9 @@
 //         -video_track_timescale 25000 -an -use_editlist 0 -map_metadata -1
 //         -fflags +bitexact -flags:v +bitexact fx_vfr_h264.mp4
 //     (keyframes at 0 / 12 / 24 / 36, no B-frames so no composition offsets).
+//   * Errors: a picture that is not the frame asked for fails with
+//     ErrorCode::Timing (a patched copy of the fixture with an all-zero
+//     composition-offset table, which only the average-rate formula indexes).
 //   * [vfr-sample]: a real variable-frame-rate clip named by the environment
 //     variable OSV_VFR_SAMPLE (an .OSV or .LRF); SKIPs without it.
 
@@ -42,6 +45,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -98,6 +102,101 @@ constexpr std::uint32_t kFixtureTimescale = 25000;
     const std::size_t x = f.width / 2u;
     const std::size_t y = f.height / 2u;
     return f.plane[0][y * f.strideElems[0] + x];
+}
+
+/// Big-endian 32-bit field at `o` of a file image (the caller checked the bounds).
+[[nodiscard]] std::uint32_t readU32(const std::vector<char>& b, std::size_t o) {
+    return (static_cast<std::uint32_t>(static_cast<std::uint8_t>(b[o])) << 24) |
+           (static_cast<std::uint32_t>(static_cast<std::uint8_t>(b[o + 1])) << 16) |
+           (static_cast<std::uint32_t>(static_cast<std::uint8_t>(b[o + 2])) << 8) |
+           static_cast<std::uint32_t>(static_cast<std::uint8_t>(b[o + 3]));
+}
+
+/// Store a big-endian 32-bit field at `o` (the caller checked the bounds).
+void writeU32(std::vector<char>& b, std::size_t o, std::uint32_t v) {
+    b[o] = static_cast<char>((v >> 24) & 0xFFu);
+    b[o + 1] = static_cast<char>((v >> 16) & 0xFFu);
+    b[o + 2] = static_cast<char>((v >> 8) & 0xFFu);
+    b[o + 3] = static_cast<char>(v & 0xFFu);
+}
+
+/// Offset of the first box of type `tag` among the boxes laid out in
+/// [begin, end), or std::string::npos.  32-bit box sizes only, which is all
+/// the committed fixture uses; anything that does not parse is "not found".
+[[nodiscard]] std::size_t findBox(const std::vector<char>& b, std::size_t begin, std::size_t end, const char* tag) {
+    std::size_t pos = begin;
+    while (pos + 8u <= end && end <= b.size()) {
+        const std::uint32_t size = readU32(b, pos);
+        if (size < 8u || pos + size > end) {
+            return std::string::npos;
+        }
+        if (std::memcmp(b.data() + pos + 4, tag, 4) == 0) {
+            return pos;
+        }
+        pos += size;
+    }
+    return std::string::npos;
+}
+
+/// Give the fixture's only track an all-zero composition-offset table (every
+/// presentation time unchanged): a 24-byte ctts at the end of its stbl, every
+/// enclosing box grown by as much, and every chunk offset past the insertion
+/// moved with its data (the fixture writes its moov before the mdat).
+[[nodiscard]] bool insertZeroCompositionOffsets(std::vector<char>& b, std::uint32_t samples) {
+    constexpr std::size_t npos = std::string::npos;
+    constexpr std::uint32_t kCttsBytes = 24;
+    // ---- moov / trak / mdia / minf / stbl, each the parent of the next ----------
+    const std::size_t moov = findBox(b, 0, b.size(), "moov");
+    if (moov == npos) {
+        return false;
+    }
+    const std::size_t trak = findBox(b, moov + 8u, moov + readU32(b, moov), "trak");
+    if (trak == npos) {
+        return false;
+    }
+    const std::size_t mdia = findBox(b, trak + 8u, trak + readU32(b, trak), "mdia");
+    if (mdia == npos) {
+        return false;
+    }
+    const std::size_t minf = findBox(b, mdia + 8u, mdia + readU32(b, mdia), "minf");
+    if (minf == npos) {
+        return false;
+    }
+    const std::size_t stbl = findBox(b, minf + 8u, minf + readU32(b, minf), "stbl");
+    if (stbl == npos) {
+        return false;
+    }
+    const std::size_t stblEnd = stbl + readU32(b, stbl);
+    const std::size_t stco = findBox(b, stbl + 8u, stblEnd, "stco");
+    if (stco == npos || findBox(b, stbl + 8u, stblEnd, "ctts") != npos) {
+        return false;
+    }
+
+    // ---- the chunk offsets behind the insertion move with their data ------------
+    const std::uint32_t chunks = readU32(b, stco + 12u);
+    if (stco + 16u + 4u * static_cast<std::size_t>(chunks) > stblEnd) {
+        return false;
+    }
+    for (std::uint32_t i = 0; i < chunks; ++i) {
+        const std::size_t at = stco + 16u + 4u * static_cast<std::size_t>(i);
+        const std::uint32_t offset = readU32(b, at);
+        if (offset >= stblEnd) {
+            writeU32(b, at, offset + kCttsBytes);
+        }
+    }
+    // ---- the enclosing boxes grow by the inserted bytes -------------------------
+    for (const std::size_t box : {moov, trak, mdia, minf, stbl}) {
+        writeU32(b, box, readU32(b, box) + kCttsBytes);
+    }
+    // ---- ctts: size, type, version + flags, one run (every sample, offset 0) ----
+    std::vector<char> ctts(kCttsBytes, '\0');
+    writeU32(ctts, 0, kCttsBytes);
+    std::memcpy(ctts.data() + 4, "ctts", 4);
+    writeU32(ctts, 12, 1u);
+    writeU32(ctts, 16, samples);
+    writeU32(ctts, 20, 0u);
+    b.insert(b.begin() + static_cast<std::ptrdiff_t>(stblEnd), ctts.begin(), ctts.end());
+    return true;
 }
 
 /// The environment's real variable-frame-rate clip, or empty.
@@ -481,6 +580,74 @@ TEST_CASE("a stream-timing failure carries its own error code", "[video][vfr][de
     // The code exists, has a stable name, and is not the decoder's.
     CHECK(std::string(errorCodeName(ErrorCode::Timing)) == "Timing");
     CHECK(ErrorCode::Timing != ErrorCode::Decoder);
+}
+
+TEST_CASE("a picture that is not the frame asked for fails with Timing, and the decoder recovers",
+          "[video][vfr][decoder]") {
+    // A track the sample table cannot index (it has composition offsets - here
+    // all zero, so every presentation time stays exactly as it was) is matched
+    // by the average-rate formula, the fallback for such files.  On the
+    // fixture's long samples that formula takes sample 1 (3 periods in, 2.6
+    // average frames) for frame 3, so a request for frame 1 sees the stream
+    // "skip" it: the deterministic stream-timing failure ErrorCode::Timing is
+    // for, which the importer must never blame on a hardware decoder.
+    REQUIRE(std::filesystem::exists(vfrFixture()));
+    std::vector<char> bytes;
+    {
+        std::ifstream in(vfrFixture(), std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    REQUIRE(insertZeroCompositionOffsets(bytes, kFixtureFrames));
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "openosv-vfr-timing";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::filesystem::path patched = dir / "fx_vfr_ctts_h264.mp4";
+    {
+        std::ofstream out(patched, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        REQUIRE(out.good());
+    }
+
+    // The patch is what it claims: same samples, same times, offsets present.
+    {
+        auto opened = OsvFile::open(patched);
+        REQUIRE(opened.ok());
+        const auto videos = opened.value().movie().tracksOfKind(TrackKind::Video);
+        REQUIRE(videos.size() == 1u);
+        const SampleTable& table = videos.front()->samples;
+        REQUIRE(table.count() == kFixtureFrames);
+        CHECK(table.hasCompositionOffsets());
+        for (std::uint32_t n = 0; n < kFixtureFrames; ++n) {
+            CHECK(static_cast<std::int64_t>(table.sampleDts(n)) + table.compositionOffset(n) == fixturePts(n));
+        }
+    }
+
+    for (const bool containerSamples : {false, true}) {
+        INFO("container samples " << containerSamples);
+        DecoderOptions opt;
+        opt.hw = HwAccel::None;
+        opt.useContainerSamples = containerSamples;
+        auto opened = HevcStreamDecoder::open(patched, 1, opt);
+        INFO((opened.ok() ? std::string("ok") : opened.error().toString()));
+        REQUIRE(opened.ok());
+        HevcStreamDecoder& dec = opened.value();
+
+        // Frame 1: the stream produced another frame's picture.  Timing, not
+        // Decoder - nothing about the codec failed.
+        auto skipped = dec.decodeFrame(1);
+        REQUIRE_FALSE(skipped.ok());
+        INFO(skipped.error().toString());
+        CHECK(skipped.error().code == ErrorCode::Timing);
+        CHECK(skipped.error().message.find("presentation time mismatch") != std::string::npos);
+
+        // The failure forgot the position; the next request seeks afresh and
+        // gets its picture.
+        auto first = dec.decodeFrame(0);
+        INFO((first.ok() ? std::string("ok") : first.error().toString()));
+        REQUIRE(first.ok());
+        CHECK(centreLuma(first.value()) == fixtureLuma10(0));
+    }
+    std::filesystem::remove_all(dir, ec);
 }
 
 // =============================================================================
