@@ -11,6 +11,9 @@
 #  which defines the linker-level delay-load hook.
 # =============================================================================
 add_library(osv_premiere_common STATIC
+  # The importer's self-check of a delivered frame's rows (SDK-free, unit-tested).
+  FrameRowCheck.cpp
+  FrameRowCheck.h
   HostContext.cpp
   HostContext.h
   HostSuites.cpp

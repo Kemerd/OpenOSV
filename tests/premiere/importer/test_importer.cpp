@@ -2007,6 +2007,59 @@ TEST_CASE("the .LRF proxy opens and describes itself", "[importer][open][lrf][sa
     if (ppix->Dispose) {
         ppix->Dispose(hand);
     }
+
+    // ---- the coverage holds over the clip, with the clip's default settings ----
+    // Everything above is frame 0 with stabilisation off.  A new clip renders
+    // with Smooth + Horizon Lock, parallax, the photometric seam and lens
+    // shading on, and the stabilising rotation moves the picture on later
+    // frames - so the coverage, and the absence of any empty row (the shape
+    // of a field report whose bottom 37.5 % was black), is checked again on
+    // the middle and last timeline frames with PrefsBlob::defaults().  The
+    // host-style mismatched sizes are test_lrf_coverage.cpp's job.
+    const PrefsBlob defaults = PrefsBlob::defaults();
+    for (const csSDK_int64 timelineFrame : {csSDK_int64{0}, info.vidDurationInFrames / 2, info.vidDurationInFrames - 1}) {
+        INFO("timeline frame " << timelineFrame << " with the default Source Settings");
+        ImporterHarness::SourceVideoRequest later;
+        later.frameTime = static_cast<PrTime>(timelineFrame) * info.vidInfo.frameRate;
+        later.width = info.vidInfo.imageWidth;
+        later.height = info.vidInfo.imageHeight;
+        PPixHand laterHand = nullptr;
+        REQUIRE(harness.getSourceVideo(clip, later, defaults, laterHand) == imNoErr);
+        REQUIRE(laterHand != nullptr);
+        const DecodedFrame laterFrame = readPPix(harness.host(), ppix, laterHand);
+        // Per row: the share of opaque columns, and whether every column is
+        // black.  Every row must be opaque over at least 95 % of its width.
+        double worstRowOpaque = 1.0;
+        std::uint32_t worstRow = 0;
+        std::uint32_t blackRows = 0;
+        std::size_t opaqueTotal = 0;
+        for (std::uint32_t y = 0; y < laterFrame.height; ++y) {
+            std::uint32_t rowOpaque = 0;
+            bool rowBlack = true;
+            for (std::uint32_t x = 0; x < laterFrame.width; ++x) {
+                const float* p = laterFrame.pixel(x, y);
+                rowOpaque += p[3] >= 0.5f ? 1u : 0u;
+                rowBlack = rowBlack && p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f;
+            }
+            opaqueTotal += rowOpaque;
+            const double share = static_cast<double>(rowOpaque) / static_cast<double>(laterFrame.width);
+            if (share < worstRowOpaque) {
+                worstRowOpaque = share;
+                worstRow = y;
+            }
+            blackRows += rowBlack ? 1u : 0u;
+        }
+        const double laterCoverage = static_cast<double>(opaqueTotal) /
+                                     (static_cast<double>(laterFrame.width) * static_cast<double>(laterFrame.height));
+        INFO("coverage " << laterCoverage << "; worst row " << worstRow << " opaque over " << 100.0 * worstRowOpaque
+                         << "% of its columns; " << blackRows << " all-black rows");
+        CHECK(laterCoverage > 0.90);
+        CHECK(worstRowOpaque >= 0.95);
+        CHECK(blackRows == 0u);
+        if (ppix->Dispose) {
+            ppix->Dispose(laterHand);
+        }
+    }
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }
 

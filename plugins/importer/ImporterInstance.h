@@ -651,6 +651,13 @@ public:
     }
     void noteVideoRequest() noexcept { m_videoRequests.fetch_add(1, std::memory_order_relaxed); }
 
+    /// Count one rendered frame offered to imGetSourceVideo's delivered-row
+    /// self-check and return how many were counted BEFORE it, so the handler
+    /// can check a clip's first few frames (and every frame at Debug level).
+    /// Atomic and relaxed for the same reasons as the request counter; 64
+    /// bits, so the count can never wrap back into "first frames".
+    [[nodiscard]] std::uint64_t noteRowCheck() noexcept { return m_rowChecks.fetch_add(1, std::memory_order_relaxed); }
+
     /// The importer id Premiere assigns this instance (imFileOpenRec8 ::
     /// inImporterID, mirrored into imImageInfoRec::importerID).  It keys
     /// every PPix cache entry, so a zero id means "do not use the cache".
@@ -1060,6 +1067,7 @@ private:
     // Neither participates in an invariant with the rest of the instance, so
     // an atomic is sufficient - see the accessors above.
     std::atomic<std::uint64_t> m_videoRequests{0};
+    std::atomic<std::uint64_t> m_rowChecks{0};  ///< Rendered frames offered to the row self-check (noteRowCheck()).
     std::atomic<std::uint32_t> m_importerId{0};
 
     // ---- [WP-IMPORTER] the importer's own frame on the GPU -----------------
