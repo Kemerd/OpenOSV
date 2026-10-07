@@ -918,6 +918,16 @@ analysed lenses' finer suns are not held to one sun again.
 | sunset `.LRF` (17 frames from 0 to 14000) and 8K frame 10000 | sun found (12-83 deg off axis) | sun found, byte-identical |
 | sunset seam crossings: `.LRF` 5940, 5960, 8K 11880 | sun in both lenses (85-89 deg off axis) | the same, byte-identical (a bare 3 deg rule had dropped both) |
 | sunset `.LRF` 5700-6100, every frame (1024 x 512) | - | 401 of 401 byte-identical |
+| sunset `.LRF`, the whole clip, every frame (512 x 256, no parallax) | - | 14453 of 14458 byte-identical; 13275-13279 differ (below) |
+
+On the whole sunset clip only frames 13275-13279 differ, and there the
+previous build was wrong. A 2-3 px glint 115-162 deg from the sun in the
+slave lens changed the raw sun check, which forced a fresh measurement at
+13275. That measurement accepted a "ghost" in clear sky above the sun
+(+39 %, which its neighbours reject) and cut a dark grey patch into the sky
+for 5 frames (0.2 s). The resolved check drops the glint (200-500x smaller
+than the sun), still matches the neighbours' model and reuses it, so the sky
+stays clean.
 
 The frame rates are the quieter of two rounds of two runs each on a shared
 GPU; in the noisier round the previous build read 4.2-4.5 fps with removal
@@ -935,3 +945,7 @@ on, this one 5.6-9.9.
   would need tracking across frames and several light sources.
 * **No user override** for heavy-ND sunset footage below EV100 6; failing
   safe leaves the ghost in.
+* **An isolated false ghost** can still be accepted when a frame is measured
+  on its own: an export that starts at the sunset clip's frame 13275 cuts
+  the same dark patch the previous build blinked in a playthrough. That is
+  an acceptance problem (the clipped-taps item above), not a sun problem.
