@@ -366,7 +366,7 @@ TEST_CASE("StreamScaling other rules and error handling", "[geom][scaling]") {
     REQUIRE(full.value().scale == 1.0);
     REQUIRE(full.value().verified);
 
-    // LRF half: 1024 / 3776, flagged unverified.
+    // LRF half without focal lengths: 1024 / 3776, flagged unverified.
     std::vector<std::string> notes;
     auto lrf = StreamScaling::derive(1024, 1024, 3840, 3840, 0.0, 0.0, std::nullopt, &notes);
     REQUIRE(lrf.ok());
@@ -374,6 +374,30 @@ TEST_CASE("StreamScaling other rules and error handling", "[geom][scaling]") {
     REQUIRE_FALSE(lrf.value().verified);
     REQUIRE(notes.size() == 1);
     REQUIRE(notes[0].find("unverified") != std::string::npos);
+
+    // LRF half of a 6K-mode clip (its ClipMeta repeats the 6K
+    // digital_focal_length): the 3776 px crop, where the 6K sample's LRF
+    // overlap NCC peaks.
+    auto lrf6k = StreamScaling::derive(1024, 1024, 3840, 3840, kDigitalFocal, 1043.445);
+    REQUIRE(lrf6k.ok());
+    REQUIRE_THAT(lrf6k.value().scale, Catch::Matchers::WithinAbs(1024.0 / 3776.0, 1e-12));
+    // LRF half of an 8K-mode clip (digital_focal_length 1061.5823 against a
+    // mean calibration fx of 1040.68): the whole 3840 px frame, where the
+    // overlap NCC of two such LRFs peaks (0.92-0.96 against 0.80-0.87).
+    std::vector<std::string> notes8k;
+    auto lrf8k = StreamScaling::derive(1024, 1024, 3840, 3840, 1061.5823, 1040.6721, std::nullopt, &notes8k);
+    REQUIRE(lrf8k.ok());
+    REQUIRE_THAT(lrf8k.value().scale, Catch::Matchers::WithinAbs(1024.0 / 3840.0, 1e-12));
+    REQUIRE_FALSE(lrf8k.value().verified);
+    REQUIRE(notes8k.size() == 1);
+    REQUIRE(notes8k[0].find("8K") != std::string::npos);
+    // The centre maps to the centre either way.
+    REQUIRE(lrf8k.value().dstCx == 512.0);
+    REQUIRE(lrf8k.value().srcCx == 1920.0);
+    // A ratio outside both families keeps the 6K crop.
+    auto lrfOdd = StreamScaling::derive(1024, 1024, 3840, 3840, 600.0, 1040.0);
+    REQUIRE(lrfOdd.ok());
+    REQUIRE_THAT(lrfOdd.value().scale, Catch::Matchers::WithinAbs(1024.0 / 3776.0, 1e-12));
 
     // Generic fallback: digital focal / calibration focal, unverified.
     auto fourK = StreamScaling::derive(1920, 1920, 3840, 3840, 520.0, 1040.0);
@@ -484,6 +508,10 @@ TEST_CASE("LensRig: stream-space intrinsics and build failures", "[geom][rig]") 
     }
     REQUIRE_FALSE(rig.notes.empty());
 
+    // On the 6K sample digital_focal_length sits within 0.1 % of both lenses'
+    // calibration * scale, so both lenses take it (the verified behaviour).
+    REQUIRE_THAT(rig.lens[kMasterLens].fx, Catch::Matchers::WithinAbs(kDigitalFocal, 1e-9));
+
     // ScaledCalibration focal source.
     auto scaled = LensRig::build(sampleCalibration(), sampleScaling(), FocalSource::ScaledCalibration, 0.0,
                                  ExtrinsicConvention{});
@@ -517,6 +545,48 @@ TEST_CASE("LensRig: stream-space intrinsics and build failures", "[geom][rig]") 
     REQUIRE_FALSE(LensRig::build(sampleCalibration(), badScale, FocalSource::DigitalFocalLength, kDigitalFocal,
                                  ExtrinsicConvention{})
                       .ok());
+}
+
+TEST_CASE("LensRig: an 8K-mode digital_focal_length that misses the lenses' calibration is not used",
+          "[geom][rig]") {
+    // An 8K-mode camera (stream = the whole 3840 px frame, scale 1.0): its
+    // digital_focal_length of 1061.5823 px is 2.7 % and 1.3 % longer than the
+    // two lenses' calibrated focals.  Taking it misregistered every depth in
+    // the overlap by 3-4 deg; the per-lens calibration aligns it.
+    meta::CalibrationSet set = sampleCalibration();
+    set.slave.fx = 1033.4852f;
+    set.slave.fy = 1033.3813f;
+    set.master.fx = 1047.9333f;
+    set.master.fy = 1047.8409f;
+    constexpr double kDigitalFocal8K = 1061.5823;
+    auto scaling = StreamScaling::derive(3840, 3840, 3840, 3840, kDigitalFocal8K,
+                                         0.5 * (set.slave.fx + set.master.fx));
+    REQUIRE(scaling.ok());
+    REQUIRE(scaling.value().scale == 1.0);
+    auto rig = LensRig::build(set, scaling.value(), FocalSource::DigitalFocalLength, kDigitalFocal8K,
+                              ExtrinsicConvention{});
+    REQUIRE(rig.ok());
+    // Each lens keeps its own calibrated focal (records are floats).
+    REQUIRE_THAT(rig.value().lens[kSlaveLens].fx, Catch::Matchers::WithinAbs(static_cast<double>(set.slave.fx), 1e-9));
+    REQUIRE_THAT(rig.value().lens[kSlaveLens].fy, Catch::Matchers::WithinAbs(static_cast<double>(set.slave.fy), 1e-9));
+    REQUIRE_THAT(rig.value().lens[kMasterLens].fx,
+                 Catch::Matchers::WithinAbs(static_cast<double>(set.master.fx), 1e-9));
+    // The notes say why.
+    bool explained = false;
+    for (const std::string& note : rig.value().notes) {
+        explained = explained || note.find("using the calibrated focal") != std::string::npos;
+    }
+    REQUIRE(explained);
+
+    // A value within half a percent of a lens is still taken for that lens.
+    const double nearSlave = 0.5 * (static_cast<double>(set.slave.fx) + set.slave.fy) * 1.004;
+    auto near = LensRig::build(set, scaling.value(), FocalSource::DigitalFocalLength, nearSlave,
+                               ExtrinsicConvention{});
+    REQUIRE(near.ok());
+    REQUIRE_THAT(near.value().lens[kSlaveLens].fx, Catch::Matchers::WithinAbs(nearSlave, 1e-9));
+    // ...while the master, 1.0 % away from that value, keeps its calibration.
+    REQUIRE_THAT(near.value().lens[kMasterLens].fx,
+                 Catch::Matchers::WithinAbs(static_cast<double>(set.master.fx), 1e-9));
 }
 
 // -----------------------------------------------------------------------------

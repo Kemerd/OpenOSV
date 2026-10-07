@@ -117,13 +117,45 @@ Result<StreamScaling> StreamScaling::derive(int streamW, int streamH, int sensor
         return s;
     }
 
-    // Rule 3: LRF proxy halves (1024 px each) - assumed to use the same crop.
+    // Rule 3: LRF proxy halves (1024 px each).  The proxy shows the same
+    // field of view as the clip it was recorded beside, and the LRF repeats
+    // that clip's digital_focal_length, so the ratio to the calibration names
+    // the mode the proxy was cut from:
+    //
+    //   * ~0.7945 (the verified 6K crop scale): the 3776 px crop.  On the 6K
+    //     sample's LRF the overlap NCC peaks at 1024/3776 (0.924 vs 0.878 at
+    //     1024/3840).
+    //   * ~1.0-1.03 (8K mode, where the stream is the whole 3840 px frame):
+    //     the full frame.  On eleven frames of two 8K-mode LRFs the NCC peaks
+    //     at 1024/3840 (0.92-0.96 vs 0.80-0.87 at 1024/3776).
+    //
+    // Anything else keeps the 6K crop, as before.
     if (streamW == kLrfHalfSide && streamH == kLrfHalfSide && sensorW == kOsmo360SensorSide &&
         sensorH == kOsmo360SensorSide) {
-        s.scale = static_cast<double>(kLrfHalfSide) / kVerifiedCropWidth6K;
+        const bool haveRatio = std::isfinite(digitalFocalLength) && digitalFocalLength > 0.0 &&
+                               std::isfinite(calFxMean) && calFxMean > 0.0;
+        const double ratio = haveRatio ? digitalFocalLength / calFxMean : 0.0;
+        // Window widths: the two families sit 0.23 apart, the per-camera
+        // spread seen so far is 2 %.
+        constexpr double kFullFrameMin = 0.97;
+        constexpr double kFullFrameMax = 1.05;
+        const bool fullFrame = haveRatio && ratio >= kFullFrameMin && ratio <= kFullFrameMax;
+        s.scale = static_cast<double>(kLrfHalfSide) /
+                  static_cast<double>(fullFrame ? kOsmo360SensorSide : kVerifiedCropWidth6K);
         s.verified = false;
-        addNote(notes, std::format("stream scale {:.6f}: LRF half assumed to be the 3776 px crop (unverified)",
-                                   s.scale));
+        if (fullFrame) {
+            addNote(notes, std::format("stream scale {:.6f}: LRF half of an 8K-mode clip, the full 3840 px frame "
+                                       "(digital_focal_length / fx {:.4f})",
+                                       s.scale, ratio));
+        } else if (haveRatio) {
+            addNote(notes, std::format("stream scale {:.6f}: LRF half of the 3776 px crop (digital_focal_length / "
+                                       "fx {:.4f})",
+                                       s.scale, ratio));
+        } else {
+            addNote(notes, std::format("stream scale {:.6f}: LRF half assumed to be the 3776 px crop (unverified: "
+                                       "no usable focal lengths to tell the mode)",
+                                       s.scale));
+        }
         return s;
     }
 

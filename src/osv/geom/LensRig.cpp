@@ -66,25 +66,46 @@ Result<KannalaBrandt5> buildLens(const meta::DewarpParams& params, const char* n
     // a correct rig for the proxy and cannot change the verified modes,
     // where the two agree to a fraction of a percent.
     //
-    // The tolerance is deliberately loose (a factor of 1.2 either way).  It
-    // is a staleness detector, not a precision check: real per-lens
-    // manufacturing spread against the shared digital_focal_length is well
-    // under a percent, while a wrong-resolution value is off by the ratio of
-    // the two stream sizes.
+    // The tolerance is a precision check, per lens, not only a staleness
+    // detector.  The field is ONE number for both lenses, while the
+    // calibration measures each lens on its own:
+    //
+    //   * 6K mode (the verified sample): digital_focal_length matches each
+    //     lens's calibration * scale to 0.01 % and 0.09 %, and it measured the
+    //     better overlap NCC there (0.826 vs 0.810), so it stays in use.
+    //   * 8K mode (fov_type 2, firmware 10.00.25): the field is 2.7 % and
+    //     1.3 % longer than the two lenses' calibrations.  A 2 % radial error
+    //     puts each lens's view of a seam ray 1.5-2 deg off in opposite
+    //     directions, so every depth in the overlap disagreed by 3-4 deg and
+    //     lamp posts doubled; with the calibrated focal the uncorrected
+    //     overlap NCC rose from 0.72-0.83 to 0.92-0.95.
+    //
+    // So digital_focal_length is taken only when it agrees with THIS lens's
+    // calibration within half a percent; anything further off - a 1-3 %
+    // mode difference or a wrong-resolution value off by the ratio of two
+    // stream sizes - falls back to the calibration, which is mapped to this
+    // exact stream through `scaling`.
     const double calFocalScaled = 0.5 * (params.fx + params.fy) * scaling.scale;
-    constexpr double kFocalAgreementTolerance = 1.2;
+    constexpr double kFocalAgreementTolerance = 1.005;
+    /// Beyond this factor the field describes another stream size entirely
+    /// (the LRF proxy repeats its full-size clip's value), which is worth a
+    /// warning; between the two it is a known mode difference, noted only.
+    constexpr double kFocalStaleFactor = 1.2;
     const bool dflUsable = std::isfinite(digitalFocalLength) && digitalFocalLength > 0.0;
-    const bool dflAgreesWithCalibration =
-        dflUsable && std::isfinite(calFocalScaled) && calFocalScaled > 0.0 &&
-        digitalFocalLength <= calFocalScaled * kFocalAgreementTolerance &&
-        digitalFocalLength >= calFocalScaled / kFocalAgreementTolerance;
+    const bool calUsable = std::isfinite(calFocalScaled) && calFocalScaled > 0.0;
+    const bool dflAgreesWithCalibration = dflUsable && calUsable &&
+                                          digitalFocalLength <= calFocalScaled * kFocalAgreementTolerance &&
+                                          digitalFocalLength >= calFocalScaled / kFocalAgreementTolerance;
+    const bool dflStale = dflUsable && calUsable &&
+                          (digitalFocalLength > calFocalScaled * kFocalStaleFactor ||
+                           digitalFocalLength < calFocalScaled / kFocalStaleFactor);
 
     if (focalSource == FocalSource::DigitalFocalLength && dflUsable && dflAgreesWithCalibration) {
         lens.fx = digitalFocalLength;
         lens.fy = digitalFocalLength;
         notes.push_back(std::format("{}: focal {:.4f} px from digital_focal_length (calibration * scale = {:.4f})",
                                     name, digitalFocalLength, calFocalScaled));
-    } else if (focalSource == FocalSource::DigitalFocalLength && dflUsable && !dflAgreesWithCalibration) {
+    } else if (focalSource == FocalSource::DigitalFocalLength && dflUsable && dflStale) {
         // Stale or mis-scaled metadata: say so loudly (once per lens) and use
         // the calibration, which is tied to this stream through `scaling`.
         lens.fx *= scaling.scale;
@@ -96,6 +117,19 @@ Result<KannalaBrandt5> buildLens(const meta::DewarpParams& params, const char* n
         log::warn("LensRig: {} digital_focal_length {:.4f} does not match this stream (calibration * scale {:.4f}); "
                   "using the scaled calibration focal",
                   name, digitalFocalLength, calFocalScaled);
+    } else if (focalSource == FocalSource::DigitalFocalLength && dflUsable && calUsable) {
+        // Same stream, but the shared value is further from this lens's own
+        // measurement than the verified mode ever is (8K: 1.3-2.7 %).  The
+        // per-lens calibration is the better model of this lens.
+        lens.fx *= scaling.scale;
+        lens.fy *= scaling.scale;
+        notes.push_back(std::format(
+            "{}: digital_focal_length {:.4f} px is {:+.2f} % from this lens's calibration * scale {:.4f} px "
+            "(more than the {:.1f} % the verified 6K mode shows); using the calibrated focal {:.4f}/{:.4f} px",
+            name, digitalFocalLength, 100.0 * (digitalFocalLength / calFocalScaled - 1.0), calFocalScaled,
+            100.0 * (kFocalAgreementTolerance - 1.0), lens.fx, lens.fy));
+        log::info("LensRig: {} focal from the calibration ({:.4f} px): digital_focal_length {:.4f} is {:+.2f} % off",
+                  name, lens.fx, digitalFocalLength, 100.0 * (digitalFocalLength / calFocalScaled - 1.0));
     } else {
         if (focalSource == FocalSource::DigitalFocalLength) {
             notes.push_back(std::format("{}: digital_focal_length unusable ({}), using scaled calibration focal",
