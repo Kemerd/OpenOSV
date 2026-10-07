@@ -37,6 +37,7 @@ set(_osvtool_common   "${CMAKE_SOURCE_DIR}/plugins/common")
 target_sources(osvtool PRIVATE
   "${_osvtool_importer}/ImporterInstance.cpp"
   "${_osvtool_importer}/SteadyStage.cpp"
+  "${_osvtool_importer}/SceneLightStage.cpp"
   "${_osvtool_importer}/FlareStage.cpp"
   "${_osvtool_importer}/ProtectorGuard.cpp"
   "${_osvtool_importer}/ImporterAudio.cpp"

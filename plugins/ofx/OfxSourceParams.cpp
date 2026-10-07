@@ -155,6 +155,12 @@ void describe(OfxParamSetHandle set, HostProfile profile) noexcept {
                  {"Lens Alignment", "Fits the small rotation between the two lenses once per clip.", kStitchGroup,
                   kStatic},
                  OSV_SS_LENS_ALIGN_ITEMS, OSV_SS_LENS_ALIGN_DEFAULT - 1);
+    // Scene Light and Lens Focal: the same items and hints as the Source
+    // Settings effect and the importer's dialog (SourceSettingsParams.h).
+    defineChoice(set, kSceneLight, {"Scene Light", OSV_SS_SCENE_LIGHT_HINT, kStitchGroup, kStatic},
+                 OSV_SS_SCENE_LIGHT_ITEMS, OSV_SS_SCENE_LIGHT_DEFAULT - 1);
+    defineChoice(set, kLensFocal, {"Lens Focal", OSV_SS_LENS_FOCAL_HINT, kStitchGroup, kStatic},
+                 OSV_SS_LENS_FOCAL_ITEMS, OSV_SS_LENS_FOCAL_DEFAULT - 1);
 
     // ---- Advanced (collapsed) ---------------------------------------------------
     defineGroup(set, kAdvancedGroup, {"Advanced", nullptr, nullptr, true}, false);
@@ -237,6 +243,8 @@ ControlValues read(OfxParamSetHandle set, OfxTime time) noexcept {
     c.shadingStrengthPercent = doubleAt(set, kShadingStrength, time, c.shadingStrengthPercent);
     c.parallaxGrid = popup(kParallaxGrid, c.parallaxGrid);
     c.lensAlign = popup(kLensAlignment, c.lensAlign);
+    c.sceneLight = popup(kSceneLight, c.sceneLight);
+    c.lensFocal = popup(kLensFocal, c.lensFocal);
 
     c.dlogmFit = popup(kDlogmCurve, c.dlogmFit);
     c.exposureStops = doubleAt(set, kExposure, time, c.exposureStops);

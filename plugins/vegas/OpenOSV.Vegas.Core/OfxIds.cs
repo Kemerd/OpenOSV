@@ -101,6 +101,8 @@ namespace OpenOSV.Vegas.Core
         public const string ShadingStrength = "shadingStrength";
         public const string ParallaxGrid = "parallaxGrid";
         public const string LensAlignment = "lensAlignment";
+        public const string SceneLight = "sceneLight";
+        public const string LensFocal = "lensFocal";
         public const string AdvancedGroup = "advancedGroup";
         public const string DlogmCurve = "dlogmCurve";
         public const string Exposure = "exposure";
@@ -113,8 +115,8 @@ namespace OpenOSV.Vegas.Core
             ColourGroup, ColorOutput, HdrTone, Look, HdrPeak, Stabilization, StitchGroup,
             SeamSearch, GainMatch, Calibration, FlareRemoval, SkySeamFix, SkySeamStrength,
             SeamEdgeInset, SeamBlend, ParallaxBlend, SeamSmoothing, NearOffset, FarOffset,
-            LensShading, ShadingStrength, ParallaxGrid, LensAlignment, AdvancedGroup, DlogmCurve,
-            Exposure, RenderDevice, SphereSize,
+            LensShading, ShadingStrength, ParallaxGrid, LensAlignment, SceneLight, LensFocal,
+            AdvancedGroup, DlogmCurve, Exposure, RenderDevice, SphereSize,
         };
     }
 
@@ -270,6 +272,10 @@ namespace OpenOSV.Vegas.Core
         public static readonly ChoiceList LensShading = new ChoiceList("Off|Auto", 1);
         public static readonly ChoiceList ParallaxGrid = new ChoiceList("Auto|Steady (per clip)|Follows scene (per moment)", 0);
         public static readonly ChoiceList LensAlignment = new ChoiceList("Auto (fit per clip)|Off (calibration only)", 0);
+        /// <summary>Scene Light; default Auto (the camera's metered light, confirmed by the sky).</summary>
+        public static readonly ChoiceList SceneLight = new ChoiceList("Auto|Day|Night", 0);
+        /// <summary>Lens Focal; default Auto.</summary>
+        public static readonly ChoiceList LensFocal = new ChoiceList("Auto|Camera (recorded focal)|Calibration (each lens)", 0);
         public static readonly ChoiceList DlogmCurve = new ChoiceList("DJI Refit|Pocket 3|Osmo 360|Avata 360", 2);
         /// <summary>Render Device, as the Windows build lists it.</summary>
         public static readonly ChoiceList RenderDevice = new ChoiceList("Auto|CPU|CUDA|OpenCL", 0);

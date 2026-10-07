@@ -262,6 +262,7 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
             {kIndexFarOffset, PF_Param_FLOAT_SLIDER},
             {kIndexLensShading, PF_Param_POPUP},     {kIndexShadingStrength, PF_Param_FLOAT_SLIDER},  // [WP-VIGNETTE]
             {kIndexParallaxGrid, PF_Param_POPUP},    {kIndexLensAlign, PF_Param_POPUP},  // [WP-STEADY]
+            {kIndexSceneLight, PF_Param_POPUP},      {kIndexLensFocal, PF_Param_POPUP},
             {kIndexStitchTopicEnd, PF_Param_GROUP_END},
             {kIndexAdvancedTopic, PF_Param_GROUP_START}, {kIndexDlogmFit, PF_Param_POPUP},
             {kIndexExposure, PF_Param_FLOAT_SLIDER}, {kIndexRenderDevice, PF_Param_POPUP},
@@ -296,6 +297,7 @@ TEST_CASE("every value-carrying control refuses to vary over time", "[sourcesett
         kIndexSeamBlend, kIndexParallaxBlend, kIndexSeamSmoothing, kIndexNearOffset, kIndexFarOffset,  // [WP-SEAMTOOLS]
         kIndexLensShading, kIndexShadingStrength,  // [WP-VIGNETTE]
         kIndexParallaxGrid, kIndexLensAlign,       // [WP-STEADY]
+        kIndexSceneLight, kIndexLensFocal,         // Scene Light, Lens Focal
     };
     for (const int index : valueIndices) {
         REQUIRE(index >= 1);  // a short initialiser list would leave zeros behind
@@ -360,6 +362,7 @@ TEST_CASE("the two groups are balanced and every control is inside the intended 
                             kIndexPhotoStrength, kIndexSeamInset, kIndexSeamBlend, kIndexParallaxBlend,
                             kIndexSeamSmoothing, kIndexNearOffset, kIndexFarOffset, kIndexLensShading,
                             kIndexShadingStrength, kIndexParallaxGrid, kIndexLensAlign,  // [WP-STEADY]
+                            kIndexSceneLight, kIndexLensFocal,
                             kIndexDlogmFit, kIndexExposure, kIndexRenderDevice, kIndexDirectColour}) {
         INFO("grouped index " << index);
         CHECK(depthAt[static_cast<std::size_t>(index)] == 1);
@@ -387,6 +390,8 @@ TEST_CASE("the popup item lists are the documented ones", "[sourcesettings][para
         {kIndexLensShading, OSV_SS_LENS_SHADING_ITEMS},  // [WP-VIGNETTE]
         {kIndexParallaxGrid, OSV_SS_PARALLAX_GRID_ITEMS},  // [WP-STEADY]
         {kIndexLensAlign, OSV_SS_LENS_ALIGN_ITEMS},        // [WP-STEADY]
+        {kIndexSceneLight, OSV_SS_SCENE_LIGHT_ITEMS},
+        {kIndexLensFocal, OSV_SS_LENS_FOCAL_ITEMS},
     };
     for (const auto& [index, items] : expected) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");
@@ -498,6 +503,8 @@ TEST_CASE("the popups list every value of their prefs enum", "[sourcesettings][p
         {kIndexLensShading, static_cast<int>(PrefsLensShading::Count)},  // [WP-VIGNETTE]
         {kIndexParallaxGrid, static_cast<int>(PrefsParallaxGrid::Count)},  // [WP-STEADY]
         {kIndexLensAlign, static_cast<int>(PrefsLensAlign::Count)},        // [WP-STEADY]
+        {kIndexSceneLight, static_cast<int>(PrefsSceneLight::Count)},
+        {kIndexLensFocal, static_cast<int>(PrefsLensFocal::Count)},
     };
     for (const auto& [index, count] : expected) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");

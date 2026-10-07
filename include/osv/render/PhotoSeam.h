@@ -268,7 +268,10 @@ struct PhotoSeamParams {
 
     // ---- application ------------------------------------------------------------
     double decayDeg = 20.0;          ///< Luma correction: raised cosine to 0 over this beyond the overlap.
-    double chromaDecayScale = 0.5;   ///< Chroma ratios decay over this fraction of decayDeg.
+    /// Chroma ratios decay over this fraction of decayDeg BEYOND the overlap;
+    /// inside it they always apply in full, so 0 is not "no chroma" but a
+    /// hard chroma edge at the overlap's border.
+    double chromaDecayScale = 0.5;
     double strength = 1.0;           ///< User strength 0..1 (the gain only; the rim is all or nothing).
     double temporalAlpha = 0.35;     ///< EMA weight of a new bucket's measurement.
 };

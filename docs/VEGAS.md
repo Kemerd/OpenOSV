@@ -27,7 +27,9 @@ VEGAS Pro is an OpenFX host, so the same `OpenOSV.ofx.bundle` that serves
 DaVinci Resolve ([`RESOLVE.md`](RESOLVE.md)) loads in it: the generator
 **OpenOSV Source** and the filter **OpenOSV 360 Reframe**, both compiled from
 the Premiere plug-ins' own source. Stitch, seam, parallax, sky seam fix, lens
-shading, colour and the camera are the Premiere ones.
+shading, scene light, lens focal, colour and the camera are the Premiere ones
+(the Stitching group lists them; [`PREMIERE.md`](PREMIERE.md) says what each
+does).
 
 An OpenFX generator can't say how long it is and has no audio, and VEGAS
 won't do that part for you. So VEGAS gets one more piece, an **Application

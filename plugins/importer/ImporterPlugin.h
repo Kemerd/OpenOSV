@@ -281,6 +281,11 @@ struct DialogControls {
     /// 1 ACES 2 Detailed, 2 BT.2408 Natural, 3 BT.2408 Punchy, 4 BT.2408
     /// Neutral.  Only D-Log M to the PQ and HLG outputs uses it.
     int hdrTone = 0;
+    /// Combo index = PrefsSceneLight: 0 Auto (default), 1 Day, 2 Night.  The
+    /// enum lists Auto first, so the index is the stored value.
+    int sceneLight = 0;
+    /// Combo index = PrefsLensFocal: 0 Auto (default), 1 Camera, 2 Calibration.
+    int lensFocal = 0;
 };
 
 /// [WP-STEADY] The Parallax Grid choice of each dialog combo index (the

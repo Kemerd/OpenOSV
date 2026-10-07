@@ -16,6 +16,7 @@
 // kernel, frames 0 / 32 / 64.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include "SynthFisheye.h"
@@ -38,6 +39,7 @@
 #include "osv/render/PhotoSeam.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/Renderer.h"
+#include "osv/render/SceneLight.h"
 #include "osv/render/SeamAnalysis.h"
 #include "osv/render/SeamCarve.h"
 #include "osv/video/DualStreamReader.h"
@@ -523,7 +525,15 @@ TEST_CASE("the applied correction is continuous across the span edge and the lon
     REQUIRE(rig.ok());
     const render::PhotoSeamField f = syntheticField(64, 8, 1.0f);
     REQUIRE(f.valid());
+    // The day defaults and the Scene Light night profile: a short decay must
+    // still end the correction smoothly, chroma included (a chroma decay of 0
+    // would keep the full chroma inside the span and cut it off at its edge).
+    const bool night = GENERATE(false, true);
+    INFO((night ? "night profile" : "day profile"));
     render::PhotoSeamParams P;
+    if (night) {
+        render::applyNightPhotoProfile(P);
+    }
     geom::BlendParams blend;
     render::RenderParamsBuilder b;
     b.rig(rig.value()).equirect(polarMap(512)).blend(blend, true).color(

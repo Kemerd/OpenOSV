@@ -127,8 +127,12 @@ right straight away. For the other outputs:
   `README.txt` says which) or DJI's own LUT.
 
 The stitching controls (Seam Search, Sky Seam Fix, Lens Shading, Parallax
-Grid, Lens Alignment and the rest) are Premiere's Source Settings, with the
-same defaults and meanings. The one exception is **Sphere Size** (Premiere's
+Grid, Lens Alignment, Scene Light, Lens Focal and the rest) are Premiere's
+Source Settings, with the same defaults and meanings. **Scene Light** (Auto,
+Day, Night) reads the camera's exposure and the sky; Night calms the seam's
+colour matching for dark skies and street lights. **Lens Focal** (Auto,
+Camera, Calibration) is there for a recording mode Auto gets wrong: change it
+only if the seam doubles straight lines. The one exception is **Sphere Size** (Premiere's
 "Output Size"): the size of the sphere the camera looks into in Reframed view.
 
 ### Audio

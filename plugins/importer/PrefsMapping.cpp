@@ -162,6 +162,10 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     c.hdrPeak = static_cast<int>(prefs.hdrPeakChoice());  // [WP-HDRPEAK]
     steadyControlsFromPrefs(prefs, c);  // [WP-STEADY]
     c.hdrTone = static_cast<int>(prefs.hdrToneChoice());  // [WP-HDRTONE]
+    // Scene Light and Lens Focal: Auto is both enums' first value, so the
+    // combo index is the choice.
+    c.sceneLight = static_cast<int>(prefs.sceneLightChoice());
+    c.lensFocal = static_cast<int>(prefs.lensFocalChoice());
     return c;
 }
 
@@ -231,6 +235,12 @@ PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& bas
     // [WP-HDRTONE] An out-of-range index lands on ACES 2 Bright, the default.
     blob.hdrTone = pick(controls.hdrTone, static_cast<int>(PrefsHdrTone::Count),
                         static_cast<std::uint8_t>(PrefsHdrTone::Aces2Bright));
+    // Scene Light and Lens Focal: an out-of-range index lands on Auto, the
+    // default of both.
+    blob.sceneLight = pick(controls.sceneLight, static_cast<int>(PrefsSceneLight::Count),
+                           static_cast<std::uint8_t>(PrefsSceneLight::Auto));
+    blob.lensFocal = pick(controls.lensFocal, static_cast<int>(PrefsLensFocal::Count),
+                          static_cast<std::uint8_t>(PrefsLensFocal::Auto));
 
     blob.sanitise();
     return blob;
