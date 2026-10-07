@@ -635,6 +635,78 @@ TEST_CASE("a zero-copy NVDEC frame renders like the software-decoded one", "[ren
     INFO("host-decoded vs NVDEC zero-copy: PSNR " << stats.psnrDb << " dB, max " << stats.maxAbsCode << " codes");
     CHECK(stats.maxAbsCode <= 1);
 }
+
+TEST_CASE("the CUDA renderer takes planar chroma after interleaved chroma", "[render][cuda]") {
+    // A clip that falls back from hardware to software decoding mid-session
+    // hands the renderer interleaved (P010-style) chroma first and planar
+    // chroma after.  The upload buffers only grow, so Cb kept its wider
+    // interleaved allocation while Cr was allocated fresh at the planar
+    // width - two different pitches for a descriptor that carries one - and
+    // every later frame failed with "chroma pitches differ".
+    std::string reason;
+    if (!render::CudaRenderer::available(&reason)) {
+        SKIP("CUDA unavailable: " << reason);
+    }
+    const int W = 600;
+    auto rig = makeSampleRig(W);
+    REQUIRE(rig.ok());
+    const std::uint16_t lumaCode = static_cast<std::uint16_t>(std::lround(64.0 + 0.40 * 876.0));
+
+    // ---- the same constant frame, planar and interleaved ---------------------------
+    auto planar = makeConstantFrame(W, W, lumaCode, 470, 560);
+    SyntheticFrame interleaved;
+    {
+        const std::uint32_t cw = planar.frame.chromaW, ch = planar.frame.chromaH;
+        const std::size_t lumaN = static_cast<std::size_t>(W) * W;
+        const std::size_t chromaN = static_cast<std::size_t>(cw) * ch;
+        interleaved.storage = std::make_shared<std::vector<std::uint16_t>>(lumaN + 2 * chromaN);
+        std::uint16_t* base = interleaved.storage->data();
+        std::fill(base, base + lumaN, lumaCode);
+        // One CbCr plane: Cb, Cr, Cb, Cr ... two samples per chroma pixel.
+        for (std::size_t i = 0; i < chromaN; ++i) {
+            base[lumaN + 2 * i] = 470;
+            base[lumaN + 2 * i + 1] = 560;
+        }
+        interleaved.frame = planar.frame;
+        interleaved.frame.plane = {base, base + lumaN, base + lumaN + 1};
+        interleaved.frame.strideElems = {static_cast<std::size_t>(W), 2 * static_cast<std::size_t>(cw),
+                                         2 * static_cast<std::size_t>(cw)};
+        interleaved.frame.chromaInterleaved = true;
+        interleaved.frame.owner = interleaved.storage;
+    }
+    video::FramePair planarPair;
+    planarPair.lens = {planar.frame, planar.frame};
+    video::FramePair interleavedPair;
+    interleavedPair.lens = {interleaved.frame, interleaved.frame};
+
+    geom::VirtualCamera cam;
+    cam.w = 160;
+    cam.h = 90;
+    cam.hfovDeg = 100;
+    cam.yawDeg = 80;  // across the seam, so both lenses are sampled
+    const OsvColorParams cp = color::makeColorParams(color::DlogMFit::DjiRefit, color::OutputTransfer::PQ, 0.0f);
+    auto interleavedJob = render::RenderParamsBuilder().rig(rig.value()).camera(cam).color(cp).build(interleavedPair);
+    auto planarJob = render::RenderParamsBuilder().rig(rig.value()).camera(cam).color(cp).build(planarPair);
+    REQUIRE(interleavedJob.ok());
+    REQUIRE(planarJob.ok());
+
+    // ---- interleaved, then planar, then interleaved again, on one renderer -----------
+    auto gpu = render::CudaRenderer::create(0);
+    REQUIRE(gpu.ok());
+    auto first = gpu.value()->render(interleavedJob.value());
+    REQUIRE(first.ok());
+    auto second = gpu.value()->render(planarJob.value());
+    INFO((second.ok() ? std::string("ok") : second.error().message));
+    REQUIRE(second.ok());
+    auto third = gpu.value()->render(interleavedJob.value());
+    REQUIRE(third.ok());
+
+    // Same samples either way: the pictures must agree.
+    const render::ImageDiffStats planarVsInterleaved = render::compareImages16(first.value(), second.value());
+    CHECK(planarVsInterleaved.maxAbsCode <= 1);
+    const render::ImageDiffStats repeat = render::compareImages16(first.value(), third.value());
+    CHECK(repeat.maxAbsCode == 0);
+}
 #endif
 
 #if defined(OSV_HAVE_OPENCL)

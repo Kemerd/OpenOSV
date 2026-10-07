@@ -167,8 +167,19 @@ struct CudaRenderer::Impl {
             dev.strideC = static_cast<int>(u[lens].pitch / sizeof(osv_u16));
         } else {
             const std::size_t chromaBytes = static_cast<std::size_t>(host.cw) * sizeof(osv_u16);
-            OSV_TRY(u[lens].ensure(chromaBytes, static_cast<std::size_t>(host.ch)));
-            OSV_TRY(v[lens].ensure(chromaBytes, static_cast<std::size_t>(host.ch)));
+            // The descriptor carries ONE chroma stride, so Cb and Cr must share
+            // a pitch.  A buffer only grows, and Cb may still hold the wider
+            // allocation of an earlier interleaved frame (a clip that went
+            // from hardware to software decoding mid-session): asking both
+            // for the same request would leave Cb at that width and give Cr
+            // a fresh, narrower pitch.  Size both to the widest and tallest
+            // either already holds, so whichever is reallocated lands on the
+            // same width - and cudaMallocPitch's pitch depends on the width.
+            const std::size_t chromaRows = static_cast<std::size_t>(host.ch);
+            const std::size_t sharedWidth = std::max({chromaBytes, u[lens].widthBytes, v[lens].widthBytes});
+            const std::size_t sharedRows = std::max({chromaRows, u[lens].height, v[lens].height});
+            OSV_TRY(u[lens].ensure(sharedWidth, sharedRows));
+            OSV_TRY(v[lens].ensure(sharedWidth, sharedRows));
             err = cudaMemcpy2DAsync(u[lens].ptr, u[lens].pitch, host.u,
                                     static_cast<std::size_t>(host.strideC) * sizeof(osv_u16), chromaBytes,
                                     static_cast<std::size_t>(host.ch), cudaMemcpyHostToDevice, stream);
