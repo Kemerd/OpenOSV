@@ -997,4 +997,51 @@ Result<ParallaxWarpGrid> blendParallaxGrids(const ParallaxWarpGrid& from, const 
     return out;
 }
 
+ParallaxWarpGrid zeroParallaxGridLike(const ParallaxWarpGrid& like) {
+    // A copy keeps the layout and the diagnostics; only the correction goes.
+    ParallaxWarpGrid zero = like;
+    std::fill(zero.uv.begin(), zero.uv.end(), 0.0f);
+    return zero;
+}
+
+void blendSeamTables(const std::vector<float>* from, const std::vector<float>* to, double t, std::vector<float>& out,
+                     double noiseDeg, double stepDeg) {
+    out.clear();
+    // ---- inputs: the weight, which sides exist, the agreement band -----------
+    t = std::isfinite(t) ? std::clamp(t, 0.0, 1.0) : 1.0;
+    bool hasFrom = from != nullptr && !from->empty();
+    const bool hasTo = to != nullptr && !to->empty();
+    if (hasFrom && hasTo && from->size() != to->size()) {
+        hasFrom = false;  // two widths: `to` alone, faded in
+    }
+    if (!hasFrom && !hasTo) {
+        return;  // nothing on either side
+    }
+    // A malformed band (inverted, non-finite) means "always glide": the
+    // plain linear blend, which is never worse than the glide before this.
+    const bool agreementTest =
+        std::isfinite(noiseDeg) && std::isfinite(stepDeg) && noiseDeg >= 0.0 && stepDeg > noiseDeg;
+
+    // ---- per column ------------------------------------------------------------
+    const std::size_t n = hasTo ? to->size() : from->size();
+    out.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        // Each side's shift at this column; a missing or non-finite side
+        // shifts nothing.
+        double a = hasFrom ? static_cast<double>((*from)[i]) : 0.0;
+        double b = hasTo ? static_cast<double>((*to)[i]) : 0.0;
+        a = std::isfinite(a) ? a : 0.0;
+        b = std::isfinite(b) ? b : 0.0;
+        // Where the two disagree by more than measurement noise the scene at
+        // the seam has changed: the newer table takes over (smoothstep).
+        double k = t;
+        if (agreementTest) {
+            const double x = std::clamp((std::abs(b - a) - noiseDeg) / (stepDeg - noiseDeg), 0.0, 1.0);
+            k = t + (1.0 - t) * (x * x * (3.0 - 2.0 * x));
+        }
+        const double v = a + (b - a) * k;
+        out[i] = std::isfinite(v) ? static_cast<float>(v) : 0.0f;
+    }
+}
+
 }  // namespace osv::render

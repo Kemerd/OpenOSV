@@ -1239,6 +1239,146 @@ clip waits for both: 0.9-1.2 s instead of 0.15-0.19 s.
   recording) gets one verdict for the whole clip; Auto only sees the nine
   samples.
 
+### 5.7 The seam over time on driving footage (WP-TEMPORAL)
+
+A user's car-mounted 8K clips (a day clip, and a night clip with a variable
+frame rate) showed what the per-moment schedule does on footage it was never
+tuned on. Once the 8K focal fix was in, the remaining problems were all
+temporal: which frames a bucket is measured on, what a refused bucket glides
+through, and a per-clip measurement that one bad frame could abort.
+
+**A sample frame the decoder refuses** (`render::clipSampleAlternates`,
+`ClipSteady.h`). The night clip lost its clip correction to one of nine
+samples (LRF frame 7080, a dropped-frame gap), so Steady silently rendered
+per moment. A refused sample is now replaced by its neighbouring sync frame
+(or plain neighbour on a short clip) strictly between the neighbouring
+samples, or skipped; a measurement fails only with fewer than 5 of 9 (2 of 3
+for the rotation) decoded. The night clip now measures (7100 replaces 7080,
+3 of 9 grids accepted). Results carry `frames` (what was measured) and
+`sampleNotes`; a rotation measured on substitutes is cached for the session
+only, never in `lens-alignment.tsv`, whose key names the planned frames.
+
+**Auto's tolerance** (`render::steadyWithinTolerance`). "Steady only when no
+judged sector fails" became: at most 5 % of the judged sectors fail (rounded
+down) AND none of them loses more than 0.10 NCC, the largest loss the keep
+test already passes on the sample (0.093). Measured with the focal fix:
+
+| clip | judged | failed | largest failed loss | verdict |
+|---|---|---|---|---|
+| sample (plug-in engine, neural) | 42 | 1 | 0.404 | follows scene (unchanged) |
+| sample (osvtool seam --steady, classical) | 23 | 0 | - | steady (unchanged) |
+| day LRF | 77 | 6 | 0.152 | follows scene |
+| day 8K OSV | 105 | 11 | 0.663 | follows scene |
+| night LRF | 56 | 14 | 0.875 | follows scene |
+
+So the tolerance changes no verdict measured here: with the right focal these
+clips really do have near objects the clip correction misaligns (up to 0.66
+NCC lost). The earlier 3.1 % / 2.4 % failure rates were measured through the
+wrong focal.
+
+**Glide through a refused bucket.** A bucket's correction is its grid when
+the flow was accepted, else its seam table, else nothing; every frame glides
+from the previous bucket's correction to its own on parallaxCrossfadeWeight,
+whatever each one holds. A refused side is a zero warp of the other side's
+layout (`render::zeroParallaxGridLike`), and its table fades in or out on the
+same weight, so the grid and the table never switch in one frame. Two refused
+buckets cross-fade their tables.
+
+A table glides only where the two sides agree (`render::blendSeamTables`).
+The first version glided every column, and on the night clip a traffic-light
+pole that crossed the seam right after an anchor (1200) was shown twice on
+1201-1202: the previous bucket's table, measured on 1192 while the pole was
+elsewhere, still carried 75 % of the weight. Consecutive anchors' tables
+differ per column by a median 0.03 deg on the aerial sample (90th percentile
+0.24-0.52), 0.12-0.25 deg on the day clip and 0.38-0.68 deg on the night
+clip, where 22-40 % of the columns change by more than 1 deg in 8 frames. So
+per column the weight rises from t to 1 between 0.5 deg (the sample's noise:
+a pure glide) and 1.5 deg (a near object came or went: the column steps to
+the newer table at the anchor, as before the glide), on a smoothstep. A
+table is smooth along longitude, so the stepped and glided columns meet
+without an edge. The pole and a lamp arm (1208) are single again from the
+anchor on, as in the stepped render; 0.25 / 0.75 deg stepped more of the day
+clip for no visible gain.
+
+Step metric (mean |dG| at bucket edges over other frames, seam band, 2048 x
+1024 equirect, stab off), f6f5187 -> plain glide -> agreement-weighted glide:
+
+| range | variant | stepped | plain glide | agreement |
+|---|---|---|---|---|
+| day LRF 3000-3095 | default | 1.30 | 1.27 | 1.27 |
+| day LRF 3000-3095 | no parallax (tables) | 2.70 | 1.25 | 1.77 |
+| day OSV 6000-6047 | default | 0.98 | 0.97 | 0.97 |
+| night LRF 1200-1295 | default | 1.16 | 0.86 | 1.07 |
+| night LRF 1200-1295 | no parallax (tables) | 1.12 | 0.88 | 1.03 |
+
+The plain glide's low night ratios came from moving the change into the
+bucket, not from removing it: frame 1202 changed by 28.8 (x 1e-3) against
+11.5 stepped, and the mean over all frames rose from 5.57 to 5.85. With the
+agreement rule it is 10.9 at 1202 and 5.52 overall. The seam residual
+(tmetric) is 0.0061-0.0062 on the night clip and 0.0009 on the day clip in
+every variant. (The grid on/off pops at 3080/3088/6032/6040 the investigation
+saw were already gone with the focal fix, which keeps those buckets accepted;
+the table steps were not.)
+
+**Anchored, order-independent analyses.** Every per-bucket analysis - grid,
+seam table, carved seam, exposure gain, photometric field, lens shading - is
+measured on its bucket's anchor (its first frame), decoded when another frame
+of the bucket was asked for first (the same decoder: host reader, or the
+NVDEC decoder for device frames). An Exact request also measures the glide
+partner (bucket - 1) when it is missing, instead of skipping the glide, and
+the photometric and shading partner is stored before the bucket so its EMA
+sees it. The carve has no prior any more: a prior is a chain back to the
+first bucket carved, so a seam depended on where playback started; the glide
+between two independent carves is the smoothing. The photometric field, gain
+and carve are measured through the anchor's shading model and rim. Day 8K
+OSV, defaults: frames 6003-6047 rendered from 6003 and from 6000 were 0 of 45
+bit-identical (seam-band difference 3.8 x 1e-3 at 6003, decaying over 40
+frames) and are now 45 of 45.
+
+**The stand-in lane.** An Interactive frame measures on its anchor only when
+that is free (the frame itself, or one already in the NVDEC cache). The first
+version otherwise measured nothing, which on the host decode path (LRF
+proxies, non-NVIDIA and macOS machines, the OFX host path) meant playback
+never carved a seam - the grid lands from the worker after the anchor has
+gone - and playback that never meets an anchor (a 59.94 clip on a 29.97
+timeline asks for odd frames only) got no grid, table, gain or photometric
+field at all. Such a frame now measures on ITSELF, as every frame did before
+the anchoring, into a twin of each cache (grid, table, carve, gain,
+photometric field and lens shading, the last two with their own EMA) that
+only Interactive requests read, after the anchored entry, and renders as
+non-exact. An Exact request never reads it. A draft (thumbnail, prefetch)
+never decodes an anchor and measures its gain the same way: before, a
+thumbnail of a non-anchor frame decoded the anchor (2.2x the cost with the
+exposure match on; now 470-499 ms for 8 against 422-426 ms with it off) and
+cached a gain measured without the lens shading for the bucket's exact frames.
+
+**Interactive borrowing** is limited to bucket - 1 (what the frames before
+ended on); beyond it the frame renders uncorrected, never a correction from
+up to 32 frames away at full weight.
+
+Still open:
+
+* The causal glide's lag is unchanged: the applied correction is on average
+  7 frames old (280 ms on a 25 fps LRF, 140 ms at 50 fps). The investigation
+  measured seam content moving 5-10 px per frame (p90) on these clips, so a
+  correction measured on a passing pole lands 37-69 px from it; centring the
+  schedule (one bucket of lookahead) and a per-cell Kalman filter of the grid
+  are the next steps.
+* The binary consistency refusal (minConsistentFraction 0.25) is unchanged.
+* A single exact frame equals the same frame of a sequential run when the
+  photometric field, the lens shading and sun-ghost removal are off: the
+  seam geometry (grid, table, carve: two buckets deep) and the gain are then
+  fixed by the two anchors. With the defaults they are not fully: the
+  photometric field and lens shading keep their EMA and rim-median chains
+  (up to 60 buckets), the sun ghost models (FlareStage) are measured on the
+  first frame of a bucket asked for, and the carve (its rim cost and ghost
+  penalty) and the gain (measured through the shading) inherit that history.
+  Measured: the day 8K clip (no sun) is bit-identical from 6000 and from
+  6003; the sample (sun in view) is not (0.74 x 1e-3 in the seam band on
+  19-23). A glide partner carved during another bucket's render takes no
+  ghost penalty, so a cached seam is never steered by another bucket's
+  ghosts.
+
 ---
 
 ## Reproducing

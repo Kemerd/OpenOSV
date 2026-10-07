@@ -143,6 +143,77 @@ struct SectorScore {
     return (c.warp != nullptr && c.warp->valid()) || (c.seamShiftDeg != nullptr && !c.seamShiftDeg->empty());
 }
 
+/// One decoded sample: the frame actually measured and its pair.
+struct DecodedSample {
+    std::uint32_t frame = 0;
+    video::FramePair pair;
+};
+
+/// Decode planned sample `frame`, or - when the decoder refuses it - the first
+/// of `alternates(frame)` that decodes.  Every refusal and the substitution
+/// (or the skip) is appended to `notes` as one line; `decodeMs` accumulates
+/// the time spent in `source`.  nullopt when nothing decoded (the caller
+/// skips the sample).  `cancelled` is polled before every substitute; a
+/// cancellation sets `stop` and returns nullopt at once, so it still ends the
+/// measurement promptly.
+[[nodiscard]] std::optional<DecodedSample> decodeSample(std::uint32_t frame, const ClipFrameSource& source,
+                                                        const ClipFrameAlternates& alternates,
+                                                        std::vector<std::string>& notes, double& decodeMs,
+                                                        const ClipCancel& cancelled, bool& stop) {
+    stop = false;
+    // ---- the planned frame first ------------------------------------------------
+    const auto t0 = Clock::now();
+    auto pair = source(frame);
+    decodeMs += msSince(t0);
+    if (pair.ok()) {
+        return DecodedSample{frame, std::move(pair).value()};
+    }
+    const std::string why = pair.error().message;
+
+    // ---- then its substitutes, nearest first ---------------------------------------
+    std::vector<std::uint32_t> candidates;
+    if (alternates) {
+        try {
+            candidates = alternates(frame);
+        } catch (...) {
+            candidates.clear();  // a throwing callback only costs the substitutes
+        }
+    }
+    std::string tried;
+    for (const std::uint32_t alt : candidates) {
+        if (alt == frame) {
+            continue;  // never the refused frame again
+        }
+        if (cancelled && cancelled()) {
+            stop = true;
+            return std::nullopt;
+        }
+        const auto t1 = Clock::now();
+        auto altPair = source(alt);
+        decodeMs += msSince(t1);
+        if (altPair.ok()) {
+            notes.push_back(std::format("frame {} could not be decoded ({}); measured frame {} in its place", frame,
+                                        why, alt));
+            return DecodedSample{alt, std::move(altPair).value()};
+        }
+        tried += std::format("{}{} ({})", tried.empty() ? "" : ", ", alt, altPair.error().message);
+    }
+    notes.push_back(tried.empty()
+                        ? std::format("frame {} could not be decoded ({}); skipped", frame, why)
+                        : std::format("frame {} could not be decoded ({}); skipped - its substitutes failed too: {}",
+                                      frame, why, tried));
+    return std::nullopt;
+}
+
+/// "frame 7080 ...; frame 8082 ..." - the notes as one log phrase.
+[[nodiscard]] std::string joinNotes(const std::vector<std::string>& notes) {
+    std::string s;
+    for (const std::string& n : notes) {
+        s += (s.empty() ? "" : "; ") + n;
+    }
+    return s;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -209,6 +280,74 @@ std::vector<std::uint32_t> clipSampleFrames(std::uint32_t frameCount, const std:
     return targets;
 }
 
+std::vector<std::uint32_t> clipSampleAlternates(std::uint32_t frame, std::uint32_t frameCount,
+                                                const std::vector<std::uint32_t>& syncFrames,
+                                                const std::vector<std::uint32_t>& samples,
+                                                std::uint32_t maxAlternates, std::uint32_t sequentialFrames) {
+    std::vector<std::uint32_t> out;
+    if (frame >= frameCount || maxAlternates == 0) {
+        return out;
+    }
+    // ---- the open interval between the neighbouring samples ---------------------------
+    // A substitute must stay strictly between them, so the measured set stays
+    // ascending and distinct (each sample keeps its own stretch of the clip).
+    std::vector<std::uint32_t> sorted(samples);
+    std::sort(sorted.begin(), sorted.end());
+    sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+    const auto self = std::lower_bound(sorted.begin(), sorted.end(), frame);
+    if (self == sorted.end() || *self != frame) {
+        return out;  // not one of the samples: nothing to substitute
+    }
+    // lo / hi are exclusive bounds; -1 and frameCount stand for "the clip's ends".
+    const std::int64_t lo = self == sorted.begin() ? -1 : static_cast<std::int64_t>(*(self - 1));
+    const std::int64_t hi = (self + 1) == sorted.end() ? static_cast<std::int64_t>(frameCount)
+                                                       : static_cast<std::int64_t>(*(self + 1));
+
+    // ---- the candidates: sync frames of a long clip, else plain neighbours --------------
+    std::vector<std::uint32_t> after, before;  // nearest first on each side
+    std::vector<std::uint32_t> sync;
+    for (const std::uint32_t s : syncFrames) {
+        if (s < frameCount) {
+            sync.push_back(s);
+        }
+    }
+    std::sort(sync.begin(), sync.end());
+    sync.erase(std::unique(sync.begin(), sync.end()), sync.end());
+    if (frameCount > sequentialFrames && !sync.empty()) {
+        // The sync frames on each side, nearest first.
+        const auto at = std::upper_bound(sync.begin(), sync.end(), frame);
+        for (auto it = at; it != sync.end() && static_cast<std::int64_t>(*it) < hi && after.size() < maxAlternates;
+             ++it) {
+            after.push_back(*it);
+        }
+        auto it = std::lower_bound(sync.begin(), sync.end(), frame);
+        while (it != sync.begin() && before.size() < maxAlternates) {
+            --it;
+            if (static_cast<std::int64_t>(*it) <= lo) {
+                break;
+            }
+            before.push_back(*it);
+        }
+    } else {
+        // Every frame is a candidate: the plain neighbours.
+        for (std::int64_t f = static_cast<std::int64_t>(frame) + 1; f < hi && after.size() < maxAlternates; ++f) {
+            after.push_back(static_cast<std::uint32_t>(f));
+        }
+        for (std::int64_t f = static_cast<std::int64_t>(frame) - 1; f > lo && before.size() < maxAlternates; --f) {
+            before.push_back(static_cast<std::uint32_t>(f));
+        }
+    }
+
+    // ---- interleaved by distance, the later one first on a tie ---------------------------
+    std::size_t a = 0, b = 0;
+    while (out.size() < maxAlternates && (a < after.size() || b < before.size())) {
+        const bool takeAfter =
+            b >= before.size() || (a < after.size() && after[a] - frame <= frame - before[b]);
+        out.push_back(takeAfter ? after[a++] : before[b++]);
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 //  Lens rotation over several frames
 // ---------------------------------------------------------------------------
@@ -216,33 +355,37 @@ Result<LensRotationMeasurement> measureLensRotation(const geom::LensRig& rig, co
                                                     const std::vector<std::uint32_t>& frames,
                                                     const ClipFrameSource& source, const ParallaxWarpParams& parallax,
                                                     const LensRotationParams& params, ThreadPool& pool,
-                                                    const ClipCancel& cancelled) {
+                                                    const ClipCancel& cancelled, const ClipFrameAlternates& alternates,
+                                                    std::uint32_t minSamples) {
     if (!source) {
         return Error{ErrorCode::InvalidArgument, "measureLensRotation: no frame source"};
     }
     LensRotationMeasurement m;
-    m.frames = frames;
     if (frames.empty()) {
         m.reason = "the clip has no frame to measure";
         return m;
     }
-    for (const std::uint32_t frame : frames) {
+    m.frames.reserve(frames.size());
+    for (const std::uint32_t planned : frames) {
         if (cancelled && cancelled()) {
             return Error{ErrorCode::Unsupported, "lens rotation measurement cancelled"};
         }
-        // ---- decode ----------------------------------------------------------
-        const auto tDecode = Clock::now();
-        auto pair = source(frame);
-        m.decodeMs += msSince(tDecode);
-        if (!pair.ok()) {
-            return Error{pair.error().code,
-                         std::format("measureLensRotation: frame {} could not be decoded ({})", frame,
-                                     pair.error().message)};
+        // ---- decode: the planned frame, a substitute, or nothing ------------------
+        bool stop = false;
+        std::optional<DecodedSample> sample =
+            decodeSample(planned, source, alternates, m.sampleNotes, m.decodeMs, cancelled, stop);
+        if (stop) {
+            return Error{ErrorCode::Unsupported, "lens rotation measurement cancelled"};
         }
+        if (!sample) {
+            continue;  // skipped (noted); the minimum is checked after the pass
+        }
+        const std::uint32_t frame = sample->frame;
+        m.frames.push_back(frame);
         // ---- bands, flow, raw cells, fit ------------------------------------------
         const auto tWork = Clock::now();
         const auto tBand = Clock::now();
-        OSV_TRY_ASSIGN(LensBands bands, measureParallaxBands(rig, pair.value(), blend, parallax, nullptr, pool));
+        OSV_TRY_ASSIGN(LensBands bands, measureParallaxBands(rig, sample->pair, blend, parallax, nullptr, pool));
         const double bandMs = msSince(tBand);
         ParallaxCellStats cells;
         auto grid = parallaxFromBands(bands, parallax, &pool, bandMs, &cells);
@@ -259,6 +402,16 @@ Result<LensRotationMeasurement> measureLensRotation(const geom::LensRig& rig, co
             }
         }
         m.analysisMs += msSince(tWork);
+    }
+
+    // ---- enough samples decoded? ---------------------------------------------------
+    // Capped at the planned count, so a one-frame request still means "that
+    // frame must decode".
+    const std::size_t needed = std::min<std::size_t>(std::max<std::uint32_t>(minSamples, 1u), frames.size());
+    if (m.frames.size() < needed) {
+        return Error{ErrorCode::Decoder, std::format("measureLensRotation: only {} of {} sample frames could be "
+                                                     "decoded ({} needed): {}",
+                                                     m.frames.size(), frames.size(), needed, joinNotes(m.sampleNotes))};
     }
 
     // ---- one rigid rotation for the clip, or none ------------------------------
@@ -454,10 +607,13 @@ Result<SteadyDecision> decideSteady(const std::vector<SteadySample>& samples, co
                                     const SteadyDecisionParams& params, ThreadPool* pool) {
     // ---- the tuning, once ---------------------------------------------------------
     const auto finite01 = [](double v) { return std::isfinite(v) && v >= 0.0 && v <= 1.0; };
+    // NCC losses live in [-2, 2]; the tolerated loss is a non-negative part of that.
+    const bool lossOk = std::isfinite(params.maxFailedLoss) && params.maxFailedLoss >= 0.0 &&
+                        params.maxFailedLoss <= 2.0;
     if (params.sectors == 0 || params.sectors > 4096 || !(params.latHalfDeg > 0.0) ||
         !std::isfinite(params.latHalfDeg) || !finite01(params.maxLoss) || !finite01(params.minStd) ||
         !(params.minOwnNcc >= -1.0 && params.minOwnNcc <= 1.0) || !finite01(params.minGain) ||
-        !finite01(params.minKeep)) {
+        !finite01(params.minKeep) || !finite01(params.maxFailedFraction) || !lossOk) {
         return Error{ErrorCode::InvalidArgument, "decideSteady: parameters out of range"};
     }
     SteadyDecision d;
@@ -513,6 +669,7 @@ Result<SteadyDecision> decideSteady(const std::vector<SteadySample>& samples, co
             const double keep = (rec.clip - rec.none) / gain;
             if (loss > params.maxLoss && keep < params.minKeep) {
                 ++d.failed;
+                d.worstFailedLoss = std::max(d.worstFailedLoss, loss);
             }
             if (keep < d.worstKeep) {
                 d.worstKeep = keep;
@@ -527,10 +684,31 @@ Result<SteadyDecision> decideSteady(const std::vector<SteadySample>& samples, co
         }
     }
     d.meanLoss = d.textured ? sumLoss / static_cast<double>(d.textured) : 0.0;
+    // ---- the verdict, with its tolerance (see the header) ------------------------------
     // Nothing judged means no own correction aligned anything the clip
     // correction could lose: holding still costs nothing anyone could see.
-    d.steady = d.failed == 0;
+    d.steady = steadyWithinTolerance(d.judged, d.failed, d.worstFailedLoss, params);
     return d;
+}
+
+bool steadyWithinTolerance(std::uint32_t judged, std::uint32_t failed, double worstFailedLoss,
+                           const SteadyDecisionParams& params) noexcept {
+    if (failed == 0) {
+        return true;  // the rule before the tolerance existed, unchanged
+    }
+    // Garbage in the tuning or the loss tolerates nothing.
+    if (!std::isfinite(params.maxFailedFraction) || !std::isfinite(params.maxFailedLoss) ||
+        !std::isfinite(worstFailedLoss) || failed > judged) {
+        return false;
+    }
+    // A few small failures are transients (a car passing one sample), not a
+    // scene that moves: rare (at most maxFailedFraction of the judged pairs,
+    // rounded down, so 19 judged tolerate none and 20 tolerate one) AND small
+    // (none losing more than maxFailedLoss).  The epsilon keeps 0.05 x 20
+    // from rounding down to 0.
+    const double fraction = std::clamp(params.maxFailedFraction, 0.0, 1.0);
+    const auto tolerated = static_cast<std::uint32_t>(std::floor(fraction * static_cast<double>(judged) + 1e-9));
+    return failed <= tolerated && worstFailedLoss <= params.maxFailedLoss;
 }
 
 std::string describeSteadyDecision(const SteadyDecision& d) {
@@ -538,11 +716,17 @@ std::string describeSteadyDecision(const SteadyDecision& d) {
         return std::format("{}: no sector where one frame's own correction aligns anything ({} textured scored)",
                            d.steady ? "steady" : "follows scene", d.textured);
     }
-    return std::format("{}: {} of {} judged sectors lose their alignment to the clip correction; the worst keeps {:.0f}% "
-                       "of its own gain (frame {}, lon {:+.0f} deg, NCC none {:.3f} / own {:.3f} / clip {:.3f}); mean "
-                       "loss {:+.4f} over {} textured",
-                       d.steady ? "steady" : "follows scene", d.failed, d.judged, 100.0 * d.worstKeep, d.worstFrame,
-                       d.worstLonDeg, d.worstNoneNcc, d.worstOwnNcc, d.worstClipNcc, d.meanLoss, d.textured);
+    // A steady verdict over failures says they were within the tolerance.
+    const std::string tolerance =
+        d.failed > 0 ? std::format(" (largest failed loss {:.3f}{})", d.worstFailedLoss,
+                                   d.steady ? ", within the tolerance" : "")
+                     : std::string();
+    return std::format("{}: {} of {} judged sectors lose their alignment to the clip correction{}; the worst keeps "
+                       "{:.0f}% of its own gain (frame {}, lon {:+.0f} deg, NCC none {:.3f} / own {:.3f} / clip "
+                       "{:.3f}); mean loss {:+.4f} over {} textured",
+                       d.steady ? "steady" : "follows scene", d.failed, d.judged, tolerance, 100.0 * d.worstKeep,
+                       d.worstFrame, d.worstLonDeg, d.worstNoneNcc, d.worstOwnNcc, d.worstClipNcc, d.meanLoss,
+                       d.textured);
 }
 
 // ---------------------------------------------------------------------------
@@ -551,15 +735,17 @@ std::string describeSteadyDecision(const SteadyDecision& d) {
 Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::BlendParams& blend,
                                      const std::vector<std::uint32_t>& frames, const ClipFrameSource& source,
                                      const ClipSteadyParams& params, ThreadPool& pool,
-                                     const ClipSampleGridFn& onSampleGrid, const ClipCancel& cancelled) {
+                                     const ClipSampleGridFn& onSampleGrid, const ClipCancel& cancelled,
+                                     const ClipFrameAlternates& alternates) {
     if (!source) {
         return Error{ErrorCode::InvalidArgument, "measureClipSteady: no frame source"};
     }
     ClipSteady out;
-    out.frames = frames;
     if (frames.empty() || (!params.parallaxOn && !params.seamOn)) {
+        out.frames = frames;
         return out;  // nothing to measure: every piece stays null
     }
+    out.frames.reserve(frames.size());
 
     // ---- one pass over the samples ------------------------------------------------
     // Per sample: its uncorrected bands (kept for the carve and the verdict),
@@ -574,24 +760,30 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
     };
     std::vector<Sample> samples;
     samples.reserve(frames.size());
-    for (const std::uint32_t frame : frames) {
+    for (const std::uint32_t planned : frames) {
         if (cancelled && cancelled()) {
             return Error{ErrorCode::Unsupported, "clip analysis cancelled"};
         }
-        const auto tDecode = Clock::now();
-        auto pair = source(frame);
-        out.decodeMs += msSince(tDecode);
-        if (!pair.ok()) {
-            return Error{pair.error().code, std::format("measureClipSteady: frame {} could not be decoded ({})",
-                                                        frame, pair.error().message)};
+        // ---- decode: the planned frame, a substitute, or nothing ------------------
+        bool stop = false;
+        std::optional<DecodedSample> decoded =
+            decodeSample(planned, source, alternates, out.sampleNotes, out.decodeMs, cancelled, stop);
+        if (stop) {
+            return Error{ErrorCode::Unsupported, "clip analysis cancelled"};
         }
+        if (!decoded) {
+            continue;  // skipped (noted); the minimum is checked after the pass
+        }
+        const std::uint32_t frame = decoded->frame;
+        const video::FramePair& pair = decoded->pair;
+        out.frames.push_back(frame);
         const auto tWork = Clock::now();
         Sample s;
         s.frame = frame;
         // The parallax band (2048 x +-6 deg) is also the carve's band, so one
         // render serves both (SeamCarve.cpp renders exactly this for a carve).
         const auto tBand = Clock::now();
-        OSV_TRY_ASSIGN(s.bands, measureParallaxBands(rig, pair.value(), blend, params.parallax, nullptr, pool));
+        OSV_TRY_ASSIGN(s.bands, measureParallaxBands(rig, pair, blend, params.parallax, nullptr, pool));
         const double bandMs = msSince(tBand);
         if (params.parallaxOn) {
             auto grid = parallaxFromBands(s.bands, params.parallax, &pool, bandMs);
@@ -605,7 +797,7 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
         if (params.seamOn && !s.grid) {
             // The seam table is the correction of a sample without a grid,
             // exactly as the importer falls back to it.
-            auto profile = searchSeam(rig, pair.value(), blend, params.seamSearch, pool);
+            auto profile = searchSeam(rig, pair, blend, params.seamSearch, pool);
             if (profile.ok() && !profile.value().shiftDeg.empty()) {
                 s.table = std::make_shared<const std::vector<float>>(std::move(profile).value().shiftDeg);
             }
@@ -616,14 +808,14 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
             // importer's per-bucket field is measured.
             std::optional<LensShadingModel> shading;
             if (params.shadingOn && params.shading.mode == LensShadingMode::Auto) {
-                auto model = measureLensShading(rig, pair.value(), blend, params.shading, pool);
+                auto model = measureLensShading(rig, pair, blend, params.shading, pool);
                 if (model.ok() && model.value().active()) {
                     shading = params.shading.strength >= 1.0
                                   ? std::move(model).value()
                                   : scaledLensShadingModel(model.value(), params.shading.strength);
                 }
             }
-            auto field = measurePhotoSeam(rig, pair.value(), blend, params.photo, pool,
+            auto field = measurePhotoSeam(rig, pair, blend, params.photo, pool,
                                           shading ? &*shading : nullptr);
             if (field.ok()) {
                 s.rim = std::make_shared<const PhotoSeamField>(std::move(field).value());
@@ -631,6 +823,16 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
         }
         out.measureMs += msSince(tWork);
         samples.push_back(std::move(s));
+    }
+
+    // ---- enough samples decoded? ---------------------------------------------------
+    // Capped at the planned count, so a short request still means "every one".
+    const std::size_t needed = std::min<std::size_t>(std::max<std::uint32_t>(params.minSamples, 1u), frames.size());
+    if (samples.size() < needed) {
+        return Error{ErrorCode::Decoder, std::format("measureClipSteady: only {} of {} sample frames could be "
+                                                     "decoded ({} needed): {}",
+                                                     samples.size(), frames.size(), needed,
+                                                     joinNotes(out.sampleNotes))};
     }
 
     const auto tFinish = Clock::now();

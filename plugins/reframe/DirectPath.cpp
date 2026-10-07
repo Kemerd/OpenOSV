@@ -539,8 +539,13 @@ bool renderDirect(const DirectRequest& request, std::string& reason) noexcept {
 
         // ---- the frame from the engine --------------------------------------------
         // Always EXACT: with the analyses on the GPU a fresh bucket measures in
-        // ~2-3 ms, so there is no reason to show a stand-in, and an exact
-        // frame is identical whatever was rendered before it.
+        // ~2-3 ms, so there is no reason to show a stand-in.  An exact frame's
+        // seam corrections are measured on fixed bucket anchors, the glide
+        // partner included (ImporterInstance, [WP-TEMPORAL]): with the
+        // photometric field, lens shading and sun-ghost removal off, its seam
+        // and gain are the same whatever was rendered before it.  With them on
+        // (the defaults) those three keep some history of their own (EMA, rim
+        // median, ghost models), and the carve and the gain inherit it.
         OsvEngineFrameRequest req{};
         req.structSize = sizeof(OsvEngineFrameRequest);
         req.path = request.source->path.c_str();

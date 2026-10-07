@@ -77,6 +77,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -778,6 +779,110 @@ private:
                                                 RenderPurpose purpose, ThreadPool& pool,
                                                 render::RenderParamsBuilder& builder);
 
+    // ---- [WP-TEMPORAL] anchored, order-independent per-bucket analyses --------
+    //
+    // Every per-bucket analysis (parallax grid, seam table, carved seam, gains,
+    // photometric field, lens shading) is measured on its bucket's ANCHOR, the
+    // bucket's first frame, whatever frame of the bucket was asked for first.
+    // An Exact request decodes the anchor when it is another frame, and also
+    // measures the previous bucket (the glide partner) when that is missing,
+    // so an exact frame is the same whether it was rendered alone, after a
+    // jump, or in the middle of an export.  An Interactive request measures
+    // on the anchor only when it costs nothing (it is the frame itself, or
+    // already in the NVDEC cache).  Otherwise it measures on ITSELF, as every
+    // request did before the anchoring, into the STAND-IN LANE below - a twin
+    // of each cache that only Interactive requests read - and is non-exact.
+    // Playback that never meets an anchor (a 59.94 clip on a 29.97 timeline
+    // asks for odd frames only), starts mid-bucket, or runs on the host decode
+    // path (where an anchor is never free, and the grid lands after it has
+    // gone) is therefore corrected exactly as before, and an Exact frame never
+    // sees a measurement taken on another frame of its bucket.
+
+    /// One decoded anchor frame, and the lease that pins it in VRAM when it
+    /// came from the NVDEC decoder.
+    struct AnalysisFrame {
+        video::FramePair pair;
+        video::GpuFrameLease lease;
+    };
+
+    /// The decoded frames of bucket `bucket`'s anchor for this applyAnalyses
+    /// call: `pair` itself when `index` IS the anchor, else the anchor decoded
+    /// the way `pair` was (the analysis GPU decoder for device frames, the
+    /// host reader otherwise) and kept in m_analysisFrames until the call
+    /// ends.  With `decode` false only a free anchor is returned (the frame
+    /// itself, or one already in the NVDEC cache).  nullptr when the anchor
+    /// is not available that cheaply or cannot be decoded (logged once per
+    /// bucket).  Caller holds m_mutex.
+    [[nodiscard]] const video::FramePair* anchorPairLocked(std::uint32_t bucket, std::uint32_t index,
+                                                           const video::FramePair& pair, bool decode);
+
+    /// One bucket's seam correction: its grid when accepted, else its seam
+    /// table (or nothing).  `known` is false while the grid (or, without
+    /// parallax, the table) has not been measured.
+    struct BucketCorrection {
+        bool known = false;
+        /// Part of it comes from the stand-in lane (measured on a frame other
+        /// than the anchor): an Interactive frame that renders it is not final.
+        bool standIn = false;
+        std::shared_ptr<const render::ParallaxWarpGrid> grid;  ///< Accepted grid; null when refused / off.
+        /// The bucket's seam table where it has no grid (empty: none).  A copy
+        /// (~8 KB), so a cache trim can never pull it from under the render.
+        std::vector<float> table;
+    };
+
+    /// How far a per-bucket lookup may go to fill a missing measurement.
+    enum class AnchorMeasure {
+        Now,     ///< Exact: decode the anchor if needed and measure synchronously.
+        /// Interactive, own bucket: measure from a free anchor (the grid in the
+        /// background); without one, measure on the frame itself into the
+        /// stand-in lane.
+        IfFree,
+        LookUp,  ///< Interactive glide partner: what is cached, the stand-in lane included.
+        Cached,  ///< Exact, already measured: what the anchored caches hold, nothing more.
+    };
+
+    /// Measure (as `how` allows) and return bucket `bucket`'s correction for
+    /// frame `index`'s render: the grid on the anchor, and the seam table
+    /// where the grid is refused or off.  With Now and an anchor that cannot
+    /// be decoded, the bucket of the frame itself (`bucket` holding `index`)
+    /// is measured on `pair` instead, so it never loses its correction.
+    /// Caller holds m_mutex.
+    [[nodiscard]] BucketCorrection bucketCorrectionLocked(std::uint32_t bucket, std::uint32_t index,
+                                                          const video::FramePair& pair, bool wantParallax,
+                                                          bool wantSeam, AnchorMeasure how, ThreadPool& pool);
+
+    /// The NVDEC decoder the frame being analysed came from (directFrame and
+    /// the GPU frame path set it around their applyAnalyses call), so an
+    /// anchor of a device frame is decoded the same way.  Null on the host
+    /// path.  Guarded by m_mutex.
+    video::GpuClipDecoder* m_analysisGpuDecoder = nullptr;
+    /// Anchors decoded during the current applyAnalyses call, by frame index;
+    /// cleared when it returns (an 8K pair is ~180 MB on the host).
+    std::map<std::uint32_t, AnalysisFrame> m_analysisFrames;
+    /// Buckets whose anchor could not be decoded (logged once each).
+    std::set<std::uint32_t> m_anchorFailures;
+    /// The glided seam table of the frame being built (its capacity is reused
+    /// from frame to frame).
+    std::vector<float> m_seamTableFrame;
+
+    // ---- [WP-TEMPORAL] the stand-in lane ------------------------------------
+    // What an Interactive frame without a free anchor measured on itself, per
+    // bucket, beside the anchored caches (m_parallaxGrids, m_seamTables,
+    // m_blendSeams, m_gains, m_photo, m_shading).  Read only by Interactive
+    // requests, after the anchored entry; never by an Exact one.  Small:
+    // playback needs the bucket on screen and the one before it.  Cleared with
+    // the anchored caches (resetParallaxLocked, and the rig / shading keys).
+    /// Grids measured from a frame's own bands (nullptr: refused).  Written
+    /// by the worker, so guarded by m_parallaxMutex.
+    std::map<std::uint32_t, std::shared_ptr<const render::ParallaxWarpGrid>> m_standInGrids;
+    /// Seams carved on a frame, or through a stand-in correction.  m_mutex.
+    std::map<std::uint32_t, std::shared_ptr<const render::BlendSeam>> m_standInSeams;
+    /// Seam tables searched on a frame.  m_mutex.
+    std::map<std::uint32_t, std::vector<float>> m_standInTables;
+    /// Exposure gains measured on a frame (Interactive, or a draft).  m_mutex.
+    std::map<std::uint32_t, std::array<Vec3d, 2>> m_standInGains;
+    static constexpr std::size_t kMaxStandInCache = 16;
+
     std::filesystem::path m_path;
     ClipFileHandle m_fileHandle = invalidClipFileHandle();
 
@@ -929,6 +1034,9 @@ private:
         render::LensBands bands;
         render::ParallaxWarpParams params;
         double bandMs = 0.0;
+        /// [WP-TEMPORAL] Cut from a frame other than the bucket's anchor: the
+        /// result goes to the stand-in lane (m_standInGrids), not m_parallaxGrids.
+        bool standIn = false;
     };
 
     /// Measured parallax per bucket.  A PRESENT entry holding nullptr records
@@ -940,10 +1048,12 @@ private:
     std::map<std::uint32_t, std::shared_ptr<const render::ParallaxWarpGrid>> m_parallaxGrids;
     static constexpr std::size_t kMaxParallaxCache = 64;
     /// An Interactive frame whose own bucket is not measured yet may borrow
-    /// the nearest measured grid up to this many buckets away (32 frames,
-    /// ~0.5 s at 60 fps).  Further than that the scene near the seam may
-    /// have changed, and the seam table is the safer fallback.
-    static constexpr std::uint32_t kParallaxBorrowBuckets = 4;
+    /// the correction of the bucket right before it - exactly what the frames
+    /// before it ended on, so playback does not jump - and nothing further:
+    /// a correction 4 buckets (32 frames, 1.3 s at 25 fps) away was applied at
+    /// full weight to content that had long moved on (a user's night driving
+    /// clip).  Without it the frame renders uncorrected (the cheap fallback).
+    static constexpr std::uint32_t kParallaxBorrowBuckets = 1;
 
     mutable std::mutex m_parallaxMutex;
     std::condition_variable m_parallaxCv;
@@ -980,10 +1090,11 @@ private:
 
     /// Carve (or fetch) the blend seam for frame `index` and hand it to
     /// `builder`: glided from the previous bucket's seam like the parallax
-    /// grid, steered by a neighbouring bucket's seam when one is cached.  An
-    /// Interactive request whose bucket cannot be carved yet (its parallax
-    /// grid is still being measured) borrows a nearby bucket's seam and
-    /// clears `frameExact`.  Called by applyAnalyses with m_mutex held;
+    /// grid.  [WP-TEMPORAL] Each bucket is carved on its anchor with no prior;
+    /// an Interactive request without a free anchor carves on itself into the
+    /// stand-in lane, and one whose bucket cannot be carved yet (its parallax
+    /// grid is still being measured) borrows the previous bucket's seam; both
+    /// clear `frameExact`.  Called by applyAnalyses with m_mutex held;
     /// takes m_parallaxMutex itself.  Failures are logged and leave the frame
     /// on the ordinary feather.  [WP-SEAMTOOLS] Carves with the Source
     /// Settings Seam Blend / Parallax Blend, and returns the seam it applied
@@ -1037,6 +1148,10 @@ private:
     bool m_photoFrameExact = true;
     /// The last field a non-draft frame used: what a draft renders with.
     std::shared_ptr<const render::PhotoSeamField> m_photoLast;
+    /// [WP-TEMPORAL] The stand-in lane's fields: measured on an Interactive
+    /// frame without a free anchor, with their own EMA and glide.  Never read
+    /// by an Exact request; cleared with m_photo.
+    render::PhotoSeamHistory m_photoStandIns;
 
     /// The analysis parameters for the current prefs (mode, strength).
     [[nodiscard]] render::PhotoSeamParams photoParamsLocked() const noexcept;
@@ -1047,8 +1162,14 @@ private:
     /// makes its usable rim the carved seam's Rim cost on this thread for
     /// the rest of applyAnalyses.  Failures are logged and leave the frame
     /// on the stage-1 inset and the global gain.
+    /// [WP-TEMPORAL] The bucket is measured on its anchor (anchorPairLocked):
+    /// an `exact` frame decodes it when needed, and first measures the
+    /// previous bucket when that is missing (its EMA and glide partner); an
+    /// Interactive frame measures from a free anchor, and otherwise on itself
+    /// into m_photoStandIns, rendering that (or, when that is refused, the
+    /// last field) as a non-exact stand-in.
     [[nodiscard]] render::PhotoRimPenaltyScope preparePhotoSeam(std::uint32_t index, const video::FramePair& pair,
-                                                                bool draft, ThreadPool& pool);
+                                                                bool draft, bool exact, ThreadPool& pool);
 
     /// Second half, the last line of applyAnalyses: hand the chosen field to
     /// `builder` - its rim replaces the stage-1 inset (the analysis blend is
@@ -1079,6 +1200,8 @@ private:
     bool m_shadingFrameExact = true;
     /// The last model a non-draft frame used: what a draft renders with.
     std::shared_ptr<const render::LensShadingModel> m_shadingLast;
+    /// [WP-TEMPORAL] The stand-in lane's models (see m_photoStandIns).
+    render::LensShadingHistory m_shadingStandIns;
 
     /// The analysis parameters for the current prefs (mode, strength).
     [[nodiscard]] render::LensShadingParams shadingParamsLocked() const noexcept;
@@ -1088,7 +1211,15 @@ private:
     /// frame renders with.  The photometric field and the exposure match
     /// are then measured on lenses corrected by it (m_shadingFrame).
     /// Failures are logged and leave the frame uncorrected.
-    void prepareLensShading(std::uint32_t index, const video::FramePair& pair, bool draft, ThreadPool& pool);
+    /// [WP-TEMPORAL] Anchored and partnered exactly like preparePhotoSeam.
+    void prepareLensShading(std::uint32_t index, const video::FramePair& pair, bool draft, bool exact,
+                            ThreadPool& pool);
+
+    /// [WP-TEMPORAL] The shading model frame `frame` renders with, scaled by
+    /// the strength (null when there is none, or it is inactive): what the
+    /// analyses of that frame's bucket are measured through, whichever frame
+    /// asked for them.
+    [[nodiscard]] std::shared_ptr<const render::LensShadingModel> shadingModelForLocked(std::uint32_t frame) const;
 
     /// Second half, the last line of applyAnalyses: hand the chosen model to
     /// `builder`.  Returns false when the frame used a stand-in model.

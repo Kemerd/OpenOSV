@@ -18,6 +18,12 @@
 //      the clip, through the rig with the rotation folded in - the steady
 //      grid, seam table and carved seam, and the Auto verdict.
 //
+// A sample frame the decoder refuses is replaced by its neighbouring sync
+// frame (render::clipSampleAlternates) or skipped, and logged; only fewer
+// than 5 of 9 (2 of 3 for the rotation) decoded samples fail a measurement.
+// A rotation measured on substitutes is cached for the session, never on
+// disk (the disk key names the planned frames).
+//
 // Interactive frames never wait: until a piece is ready they render with what
 // exists (the calibration rig, the nearest sample grid measured so far) and
 // are marked non-exact.  Exact frames (export, a paused frame, every frame of

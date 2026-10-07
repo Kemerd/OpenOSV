@@ -43,6 +43,7 @@
 #include <thread>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -2649,6 +2650,126 @@ TEST_CASE("an interactive request never waits for the parallax measurement, and 
     }
     INFO("interactive requests until the background measurement arrived: " << attempts);
     REQUIRE(corrected);
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
+namespace {
+
+/// [WP-TEMPORAL] OPENOSV_IMPORTER_NO_GPU_DECODE for the lifetime of the
+/// object: the importer's host frame path, where a bucket's anchor is never
+/// free for an Interactive request.  The .prm shares this process's CRT
+/// (both /MD), so _putenv_s reaches its getenv_s.
+struct HostDecodePathOnly {
+    HostDecodePathOnly() { set("1"); }
+    ~HostDecodePathOnly() { set(""); }
+    HostDecodePathOnly(const HostDecodePathOnly&) = delete;
+    HostDecodePathOnly& operator=(const HostDecodePathOnly&) = delete;
+
+private:
+    static void set(const char* value) {
+#if defined(_WIN32)
+        ::_putenv_s("OPENOSV_IMPORTER_NO_GPU_DECODE", value);
+#else
+        ::setenv("OPENOSV_IMPORTER_NO_GPU_DECODE", value, 1);
+#endif
+    }
+};
+
+}  // namespace
+
+TEST_CASE("host-path playback that never meets an anchor still gets its grid, its carved seam and its gain",
+          "[importer][video][parallax][async][temporal][sample]") {
+    // Odd frames only - a 59.94 clip on a 29.97 timeline - so no bucket's
+    // anchor (a multiple of 8) is ever requested, on the host frame path,
+    // where an anchor is never free.  Every Interactive frame must then
+    // measure on ITSELF into the stand-in lane, as it did before the
+    // analyses were anchored: a version that waited for anchors rendered this
+    // playback without a grid, a carved seam or an exposure match at all.
+    REQUIRE_SAMPLE_CLIP();
+    const HostDecodePathOnly hostPath;
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+
+    // ---- playback with the grid on: frame 1 hands its bands to the worker,
+    // and frames 3 / 5 pick the stand-in grid up once it lands.  Each run
+    // first exports its own uncorrected references (no grid, no seam search,
+    // no gain) on the same clip, as the test above does ----
+    // Nothing else that touches the seam or the exposure: the photometric
+    // field (RimAndGain replaces the global gain) and the lens shading off.
+    const auto isolated = [](PrefsBlob p) {
+        p.photoSeam = static_cast<std::uint8_t>(PrefsPhotoSeam::Off);
+        p.lensShading = static_cast<std::uint8_t>(PrefsLensShading::Off);
+        REQUIRE(p.sanitise());
+        return p;
+    };
+    const PrefsBlob plain = isolated(parallaxOnlyPrefs(false));
+    std::vector<DecodedFrame> reference;  // frames 3, 5, 7 of the latest run
+    const auto referenceFor = [&](std::uint32_t f) -> const DecodedFrame& { return reference.at((f - 3u) / 2u); };
+    const auto play = [&](const PrefsBlob& prefs, int id) -> DecodedFrame {
+        auto clip = harness.openClip(sampleClipPath(), id);
+        REQUIRE(clip.open());
+        reference.clear();
+        for (const std::uint32_t f : {3u, 5u, 7u}) {
+            reference.push_back(renderFrame(harness, clip, ppix, requestFor(f, imRenderIntent_Export), plain));
+        }
+        harness.host().clearCache();
+        (void)renderFrame(harness, clip, ppix, requestFor(1, imRenderIntent_Playing), prefs);
+        bool corrected = false;
+        std::uint32_t frame = 3;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (!corrected && std::chrono::steady_clock::now() < deadline) {
+            // Alternating, or the one-frame cache hands back the stand-in.
+            harness.host().clearCache();
+            const DecodedFrame f = renderFrame(harness, clip, ppix, requestFor(frame, imRenderIntent_Playing), prefs);
+            corrected = bandDifference(referenceFor(frame), f).inside > kCorrectedPixels;
+            frame = frame == 3 ? 5 : 3;
+            if (!corrected) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        }
+        INFO("the stand-in grid never reached an odd frame on the host path");
+        REQUIRE(corrected);
+        harness.host().clearCache();
+        return renderFrame(harness, clip, ppix, requestFor(7, imRenderIntent_Playing), prefs);
+    };
+    const PrefsBlob gridOnly = isolated(parallaxOnlyPrefs(true));
+    PrefsBlob withSeam = gridOnly;
+    withSeam.seamSearch = 1;
+    REQUIRE(withSeam.sanitise());
+    const DecodedFrame warped = play(gridOnly, 3302);
+    const DecodedFrame carved = play(withSeam, 3303);
+
+    // Both measured the same grid on frame 1's bands, so what the seam
+    // search adds - the carved seam, where the two lenses meet - is all that
+    // differs, and only along the seam.
+    const BandDifference seamDiff = bandDifference(warped, carved);
+    INFO("seam search on vs off, frame 7: " << seamDiff.inside << " / " << seamDiff.outside
+                                            << " pixels differ (inside / outside the overlap)");
+    CHECK(seamDiff.inside > 1000);
+
+    // ---- the exposure match on the same playback: never the raw lenses ----
+    PrefsBlob gain = plain;
+    gain.gainMatch = 1;
+    REQUIRE(gain.sanitise());
+    {
+        auto clip = harness.openClip(sampleClipPath(), 3304);
+        REQUIRE(clip.open());
+        reference.clear();
+        for (const std::uint32_t f : {3u, 5u, 7u}) {
+            reference.push_back(renderFrame(harness, clip, ppix, requestFor(f, imRenderIntent_Export), plain));
+        }
+        for (const std::uint32_t f : {3u, 5u, 7u}) {
+            harness.host().clearCache();
+            const DecodedFrame matched = renderFrame(harness, clip, ppix, requestFor(f, imRenderIntent_Playing), gain);
+            const BandDifference d = bandDifference(referenceFor(f), matched);
+            INFO("frame " << f << ": " << (d.inside + d.outside) << " pixels changed by the exposure match");
+            CHECK(d.inside + d.outside > 0);
+        }
+    }
 
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }
