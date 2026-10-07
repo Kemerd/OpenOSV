@@ -6,6 +6,108 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-07
+
+8K and night footage, fixed at the cause. Built on a user's car-mounted 8K
+clips, a sunset drive and a night drive, which DJI Studio stitched cleanly
+and OpenOSV did not.
+
+### Added
+
+* **Scene Light** (Source Settings: Auto, Day, Night). Auto reads the
+  camera's own exposure meter. Only when that says dark does it look at the
+  sky above the levelled horizon, and Night needs both. Night keeps the Sky
+  Seam Fix on the seam itself (it fades out over 6° instead of 20°, and
+  clamps at 0.75 stop) and switches off Exposure Match and Lens Shading,
+  which street lights fool. Auto decides a daylight clip from its metadata
+  alone, without decoding a pixel, and renders it exactly as before.
+* **Lens Focal** (Source Settings: Auto, Camera, Calibration): where each
+  lens's focal length comes from. Leave it on Auto. The other two are there
+  in case a recording mode's focal is wrong for your camera, which shows up
+  as doubled straight lines at the seam.
+* osvtool `render --scene-light auto|day|night` and `--lens-focal
+  auto|camera|calibration`.
+* osvtool `render --alpha` writes the coverage alpha into `.exr`, `.tif` and
+  `.png` stills. Off by default; videos carry no alpha.
+* **A self-check on delivered frames.** The importer checks the first three
+  frames of every size it delivers. If a band of rows comes out transparent
+  or black, it logs a warning naming the size Premiere asked for and the
+  size it got. The log also records every requested size next to the
+  delivered one. `docs/PREMIERE.md` has a new Troubleshooting section.
+
+### Fixed
+
+* **8K clips no longer double at the seam.** In 8K mode the focal length
+  the camera records is 1.3-2.7 % longer than each lens's own calibration.
+  That put every depth in the overlap 3-4° out: doubled lamp posts, stepped
+  overpass lines, and S-bends where the parallax warp tried to absorb an
+  error it was never built for. Each lens now uses its own calibrated
+  focal, unless the recorded one agrees within 0.5 % (6K mode, unchanged).
+  The `.LRF` of an 8K clip is now mapped as the full 3840 px frame, not the
+  6K crop. The lens overlap's match goes from 0.72-0.87 to 0.92-0.96 (NCC).
+* **Horizon Lock levels on the gravity the camera measured.** On a clip
+  whose accelerometer reads a clean 1 g (a car or tripod mount), the old
+  automatic reading could roll the horizon a quarter turn. And the camera's
+  attitude frame is not level: the measured gravity sits about 9° and 29°
+  off it on the two 8K clips, so the horizon leaned by that much. Airborne clips, whose accelerometer
+  swings, level as before.
+* **The night sky halo is gone.** The Sky Seam Fix's brightness field
+  reached 20° into the sky, and was measured on a noisy black one. On the
+  night drive, the correction 10-30° from the seam drops by about 90 %, and
+  its frame-to-frame flicker from about ±4 codes to under 1 (Scene Light,
+  above).
+* **Clips that dropped frames stay in step with their sound.** Long night
+  recordings at high ISO can drop frames. OpenOSV mapped each frame's time
+  at the clip's average rate, so it decoded the wrong frame, or none.
+  Every frame now decodes as itself. The clip is presented at its recorded
+  rate (50 fps, for example), with the previous picture held over each
+  dropped frame, timed by the camera's own clock. A 5.5-minute night clip
+  that ended 3.4 s before its audio now ends with it, in Premiere, Resolve,
+  VEGAS and osvtool. This also ends "presentation time mismatch" failures,
+  and a whole clip dropping to software decoding after one bad frame.
+* **Sun Ghost Removal no longer takes street lamps for the sun.** On about
+  3 % of a night drive's frames it cut dark patches into door reflections,
+  lane markings and headlights. A scene the camera metered too dark for the
+  sun (EV100 below 6, from the clip's own ISO, shutter and aperture) is now
+  left exactly as recorded, and the log says why. The two lenses can no
+  longer report two different suns. 8K night clips don't slow down with
+  removal on anymore. Daylight footage is unchanged: the sample clip
+  renders byte-identically, and a sunset clip's sun is still found on
+  every frame.
+* **Seam corrections no longer pop when a moment's parallax measurement is
+  refused.** The parallax grid fades out while the seam table fades in, and
+  seam tables glide between moments where the two agree. A passing pole no
+  longer doubles on the frames after a refused moment.
+* **An exported or paused frame has the same seam geometry and exposure
+  gain wherever playback, scrubbing or the export started.** Each moment's
+  analyses are now measured on fixed frames. The Sky Seam Fix, Lens Shading
+  and Sun Ghost Removal still carry some history from frame to frame.
+* **Parallax Grid Steady and Auto survive a frame the decoder can't read.**
+  The clip-wide measurement replaces that frame with a neighbour, or skips
+  it, and the log says which. Before, it quietly fell back to per-moment
+  corrections.
+* **CUDA rendering keeps going after a clip falls back to software
+  decoding.** Before, every later frame of that clip failed with "chroma
+  pitches differ".
+
+### Changed
+
+* **A clip that dropped frames gets slightly longer.** The night clip went
+  from 16157 to 16328 frames. In a project edited in 0.4.2, cuts after the
+  clip's first dropped frame move. Clips that dropped nothing are
+  byte-identical. osvtool `probe` reports the presented frame count and
+  rate, and `render --frame/--range/--all` count presented frames, so an
+  `.mp4` stays in step with its audio. `extract --frame` still addresses
+  recorded frames.
+* **Parallax Grid Auto lets a few small misses through.** A clip-wide
+  correction is no longer vetoed by a single misaligned sector. It is kept
+  when at most 5 % of the judged sectors fail, and none by more than 0.10
+  NCC.
+* **Playback borrows only the moment right before.** It used to reach up
+  to 32 frames back. Without one, it measures on the frame itself.
+* The per-moment schedule's renders differ slightly from 0.4.2. On the
+  sample clip, 0.3 % of pixels move by more than one 8-bit code.
+
 ## [0.4.2] - 2026-10-01
 
 VEGAS Pro playback, rebuilt for speed.

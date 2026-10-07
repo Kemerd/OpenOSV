@@ -437,6 +437,8 @@ same settings are in the right-click **Source Settings** dialog.
 | | **Lens Shading**, **Strength** | The sky banding correction. |
 | | **Parallax Grid** | Auto, Steady (measured once per clip, no ripple) or Follows scene. |
 | | **Lens Alignment** | Auto (measured per clip) or Off (factory calibration only). |
+| | **Scene Light** | Auto (the camera's meter, confirmed by the sky), Day or Night. Night keeps the sky seam fix on the seam and skips exposure match and lens shading, which street lights fool. |
+| | **Lens Focal** | Auto, Camera or Calibration: where each lens's focal length comes from. Leave it on Auto unless straight lines double at the seam. |
 | Advanced | **D-Log M Curve**, **Exposure**, **Render Device**, **Program Monitor Colour** | For the curious. |
 | Defaults | **Save as Default for New Clips**, **Restore Built-in Defaults** | Your settings, on every clip you import from now on. |
 
