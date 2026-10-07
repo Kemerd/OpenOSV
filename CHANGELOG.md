@@ -6,6 +6,30 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## 0.5.1 (unreleased)
+
+### Fixed
+
+* **VEGAS and Resolve: non-square projects are no longer stretched.** In an
+  HDV 1440 x 1080 project (pixel aspect 4:3), a DV project or an anamorphic
+  one, the reframed view came out stretched sideways by the pixel aspect:
+  the camera took every pixel as square. It is now built for the picture the
+  host displays, in OpenOSV Source and OpenOSV 360 Reframe, on the CPU and
+  on the GPU. The Zoom read-out and the presets use the displayed shape too.
+  Square-pixel projects render exactly as before.
+* **The playback proxy smooths over the same time as the clip.** With Smooth
+  or Smooth + Horizon Lock, the `.LRF` proxy (VEGAS Draft and Preview
+  playback, an `.LRF` beside its `.OSV` in Premiere) smoothed over twice the
+  time the `.OSV` did, so the preview's framing drifted up to 1.2° (day
+  drive) and 1.9° (night drive) from the final render. It now smooths over
+  the same seconds: at most 0.11° apart. The `.OSV` render is unchanged.
+
+### Added
+
+* The OpenFX generator's log records each instance's output bounds against
+  its region of definition, the project's pixel aspect and field order, and
+  the first single-field render of an interlaced project.
+
 ## [0.5.0] - 2026-10-07
 
 8K and night footage, fixed at the cause. Built on a user's car-mounted 8K

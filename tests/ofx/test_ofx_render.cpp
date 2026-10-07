@@ -24,10 +24,14 @@
 #include "OfxHostImage.h"
 #include "OfxRender.h"
 
+#include "DirectRender.h"  // [WP-PAR] the direct view's builder
 #include "ReframeCpu.h"
+
+#include "osv/color/ColorParams.h"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -496,4 +500,179 @@ TEST_CASE("an unusable target or a stitch of the wrong size writes nothing", "[o
     CHECK_FALSE(ofx::renderReframeCpu(invalid, ok, frame, frame, ofx::OutputLevels::Full, nullptr));
 
     CHECK(std::memcmp(image.storage.data(), untouched.data(), untouched.size() * sizeof(float)) == 0);
+}
+
+// ===========================================================================
+//  [WP-PAR] The direct view takes the pixel aspect too
+// ===========================================================================
+// The generator's GPU path traces the camera straight from the fisheyes
+// (reframe::buildDirectParams() and the kernel's osvRayForPixel) instead of
+// framing the stitched sphere (osvReframeEquirectPixel).  In a non-square
+// project both must see the same direction through every pixel.  Held here on
+// the CPU, with the shared kernel functions themselves: the sphere path's ray
+// read back from a coordinate panorama (R = longitude, G = latitude, which the
+// bilinear sampler reproduces exactly), the direct path's ray from the block
+// buildDirectParams() composes.
+
+namespace {
+
+/// A stitch block the direct builder accepts: a Standard-layout equirect, no
+/// stabilisation, one plain enabled lens and the default colour.  Nothing in
+/// it is ever sampled here - only the composed camera is.
+OsvRenderParams plainStitchBlock() {
+    OsvRenderParams eq{};
+    eq.outW = 2048;
+    eq.outH = 1024;
+    eq.mode = OSV_MODE_EQUIRECT;
+    eq.layout = OSV_LAYOUT_STANDARD;
+    for (int i = 0; i < 9; ++i) {
+        eq.Rout[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+    }
+    OsvLens& lens = eq.lens[1];
+    lens.fx = 1000.0f;
+    lens.fy = 1000.0f;
+    lens.cx = 1920.0f;
+    lens.cy = 1920.0f;
+    for (int i = 0; i < 9; ++i) {
+        lens.R[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+    }
+    lens.thetaMax = 1.7f;
+    lens.featherRad = 0.05f;
+    lens.gain[0] = lens.gain[1] = lens.gain[2] = 1.0f;
+    lens.width = 3840;
+    lens.height = 3840;
+    lens.enabled = 1;
+    eq.color = osv::color::makeColorParams(osv::color::kDefaultDlogMFit, osv::color::OutputTransfer::PQ, 0.0f);
+    return eq;
+}
+
+/// The body direction the sphere path sees through output pixel (x, y) of
+/// `view` (top-down pixel indices), read back from a coordinate panorama
+/// `w` x `h` (R G B A floats, top row first).  False when no picture.
+bool spherePathDirection(const OsvReframeParams& view, const std::vector<float>& pano, int w, int h, int x, int y,
+                         double dir[3]) {
+    OsvRgbaSource src{};
+    src.w = w;
+    src.h = h;
+    src.pitchBytes = w * 16;
+    src.isHalf = 0;
+    src.isBgra = 0;
+    src.flipY = 0;
+    float rgba[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    osvReframeEquirectPixel(&view, &src, pano.data(), x, y, rgba);
+    if (!(rgba[3] > 0.5f)) {
+        return false;
+    }
+    // The coordinate panorama's two ramps back to angles, then the Standard
+    // layout's direction: X right, Y forward (the centre column), Z up.
+    const double lon = (static_cast<double>(rgba[0]) * 2.0 - 1.0) * 3.14159265358979323846;
+    const double lat = (static_cast<double>(rgba[1]) - 0.5) * 3.14159265358979323846;
+    dir[0] = std::sin(lon) * std::cos(lat);
+    dir[1] = std::cos(lon) * std::cos(lat);
+    dir[2] = std::sin(lat);
+    return true;
+}
+
+/// The body direction the direct path traces through output pixel (x, y).
+bool directPathDirection(const OsvRenderParams& block, int x, int y, double dir[3]) {
+    float view[3] = {0.0f, 0.0f, 0.0f};
+    if (!osvRayForPixel(&block, static_cast<float>(x), static_cast<float>(y), view)) {
+        return false;
+    }
+    float body[3] = {0.0f, 0.0f, 0.0f};
+    osvMat3MulVec(block.Rout, view, body);
+    const double n = std::sqrt(static_cast<double>(body[0]) * body[0] + static_cast<double>(body[1]) * body[1] +
+                               static_cast<double>(body[2]) * body[2]);
+    if (!(n > 0.0)) {
+        return false;
+    }
+    for (int i = 0; i < 3; ++i) {
+        dir[i] = static_cast<double>(body[i]) / n;
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST_CASE("the direct view and the sphere path see the same ray through every pixel at any pixel aspect",
+          "[ofx][render][par]") {
+    // The coordinate panorama: texel centres' longitude and latitude.
+    constexpr int kPanoW = 2048;
+    constexpr int kPanoH = 1024;
+    std::vector<float> pano(static_cast<std::size_t>(kPanoW) * kPanoH * 4);
+    for (int r = 0; r < kPanoH; ++r) {
+        for (int c = 0; c < kPanoW; ++c) {
+            float* p = pano.data() + (static_cast<std::size_t>(r) * kPanoW + c) * 4;
+            p[0] = (static_cast<float>(c) + 0.5f) / kPanoW;         // (lon + 180) / 360
+            p[1] = 1.0f - (static_cast<float>(r) + 0.5f) / kPanoH;  // (lat + 90) / 180
+            p[2] = 0.5f;
+            p[3] = 1.0f;
+        }
+    }
+
+    rf::StitchState stitch;
+    stitch.equirect = plainStitchBlock();
+
+    struct Case {
+        const char* lens;
+        int w;
+        double pixelAspect;
+    };
+    const Case kCases[] = {
+        {"DJI", 1920, 1.0}, {"DJI", 1440, 4.0 / 3.0}, {"DJI", 3840, 0.5},
+        {"Classic", 1920, 1.0}, {"Classic", 1440, 4.0 / 3.0}, {"Classic", 960, 2.0},
+    };
+    for (const Case& c : kCases) {
+        INFO(c.lens << " lens, " << c.w << " x 1080 at pixel aspect " << c.pixelAspect);
+        rf::Settings s = defaultSettings();
+        if (std::string_view(c.lens) == "Classic") {
+            s.cameraModel = rf::CameraModel::Classic;
+            s.fovDeg = 100.0;
+            s.distortion = 30.0;
+        } else {
+            s.djiFovDeg = 70.0;
+            s.correction = 0.5;
+        }
+        s.panDeg = 20.0;
+        s.tiltDeg = 6.0;
+        const rf::SizePx project{c.w, 1080};
+
+        // ---- both cameras carry the pixel aspect ------------------------------------
+        const rf::ViewSetup view = rf::buildView(s, c.w, 1080, project, c.pixelAspect);
+        REQUIRE(view.valid);
+        const rf::DirectSetup direct = rf::buildDirectParams(s, stitch, c.w, 1080, project, c.pixelAspect);
+        INFO("direct refusal: " << rf::directRejectName(direct.reject));
+        REQUIRE(direct.valid);
+        CHECK(view.params.pixelAspect == static_cast<float>(c.pixelAspect));
+        CHECK(direct.params.pixelAspect == view.params.pixelAspect);
+
+        // ---- a square project builds exactly the block the default builds -------------
+        if (c.pixelAspect == 1.0) {
+            const rf::DirectSetup byDefault = rf::buildDirectParams(s, stitch, c.w, 1080, project);
+            REQUIRE(byDefault.valid);
+            CHECK(std::memcmp(&byDefault.params, &direct.params, sizeof(OsvRenderParams)) == 0);
+        }
+
+        // ---- ray for ray, over a grid of pixels -------------------------------------
+        double worstRad = 0.0;
+        int compared = 0;
+        for (int y = 0; y < 1080; y += 53) {
+            for (int x = 0; x < c.w; x += 61) {
+                double a[3] = {0.0, 0.0, 0.0};
+                double b[3] = {0.0, 0.0, 0.0};
+                if (!spherePathDirection(view.params, pano, kPanoW, kPanoH, x, y, a) ||
+                    !directPathDirection(direct.params, x, y, b)) {
+                    continue;
+                }
+                const double dot = std::clamp(a[0] * b[0] + a[1] * b[1] + a[2] * b[2], -1.0, 1.0);
+                worstRad = std::max(worstRad, std::acos(dot));
+                ++compared;
+            }
+        }
+        INFO("compared " << compared << " pixels, worst " << worstRad * 180.0 / 3.14159265358979323846 << " deg");
+        CHECK(compared > 300);
+        // A tenth of a texel of the 2048-wide panorama: float sampling noise,
+        // where a missing pixel aspect is tens of degrees off at the edges.
+        CHECK(worstRad < 0.1 * 2.0 * 3.14159265358979323846 / kPanoW);
+    }
 }

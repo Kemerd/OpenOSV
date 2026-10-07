@@ -199,7 +199,22 @@ struct ViewSetup {
 ///     length for DJI FOV across the requested picture's HEIGHT (cover-fitted
 ///     like Classic), eyeOffset is the Correction Angle as typed (it may
 ///     exceed 1: the eye outside the sphere), no automatic ramp.
-[[nodiscard]] ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenceSize) noexcept;
+///
+/// [WP-PAR] `pixelAspect` is the displayed width of one output pixel in units
+/// of its height - an OpenFX host's project pixel aspect ratio (1.333 for HDV
+/// 1440 x 1080, 0.909 for NTSC DV).  The camera is then built for the picture
+/// as the host DISPLAYS it: focalPx is the vertical focal length fy, the
+/// horizontal one is fx = fy / pixelAspect (the kernel multiplies a pixel's
+/// centred x offset by `params.pixelAspect`), and a named Output Resolution -
+/// a square-pixel size - is compared with the frame in display units, so
+/// "1920 x 1080" in an HDV project is the frame's own 16:9 shape.  The FOV a
+/// lens measures across the width (Classic) or the height (DJI) is unchanged.
+/// The default 1.0 - every Premiere caller - computes exactly what this
+/// function computed before the argument existed; a non-finite value or one
+/// outside [OSV_PIXEL_ASPECT_MIN, OSV_PIXEL_ASPECT_MAX] is logged once and
+/// rendered as square pixels.
+[[nodiscard]] ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenceSize,
+                                  double pixelAspect = 1.0) noexcept;
 
 /// Store one straight-RGBA float quadruple as a BGRA pixel of `layout`.
 ///
@@ -251,10 +266,11 @@ void storePixel(void* dst, PixelLayout layout, const float rgba[4]) noexcept;
 /// to the kernel as `pixels` and `source.pitchBytes` is positive.
 ///
 /// The camera half comes from buildView(); `params` is bit-for-bit
-/// buildView(settings, outW, outH, sequenceSize).params whenever the setup
-/// is valid.
+/// buildView(settings, outW, outH, sequenceSize, pixelAspect).params whenever
+/// the setup is valid.  `pixelAspect` is buildView()'s [WP-PAR] argument
+/// (1.0, the default, for square pixels).
 [[nodiscard]] KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int outW, int outH,
-                                      SizePx sequenceSize) noexcept;
+                                      SizePx sequenceSize, double pixelAspect = 1.0) noexcept;
 
 /// Render one frame on the CPU.
 ///

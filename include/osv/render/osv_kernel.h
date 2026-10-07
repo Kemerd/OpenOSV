@@ -442,6 +442,18 @@ typedef struct OsvRenderParams {
     float shadeStrength;     /* user strength, 0..1                            */
     OsvShadeLens shade[2];   /* per lens, indexed like lens[]                  */
     /* ---- [/WP-VIGNETTE] ------------------------------------------------------ */
+
+    /* ---- [WP-PAR] non-square output pixels (OSV_MODE_REFRAME only) ---------
+     * The displayed width of one output pixel in units of its height: the
+     * host project's pixel aspect ratio (1.333 for HDV 1440 x 1080, 0.909 for
+     * NTSC DV).  The camera (focalPx, tanHalfH / V) is built in square DISPLAY
+     * units, and a pixel's centred x offset is multiplied by this before its
+     * ray is formed (osvApplyPixelAspect), so the horizontal angle per pixel
+     * is pixelAspect times the vertical one - the picture is not stretched.
+     * 0 (the builder's default) and 1 both mean square pixels: nothing is
+     * multiplied and every render is exactly what it was without it. */
+    float pixelAspect;
+    /* ---- [/WP-PAR] ----------------------------------------------------------- */
 } OsvRenderParams;
 
 /* ------------------------------------------------------------------------- */
@@ -484,6 +496,10 @@ typedef struct OsvReframeParams {
     float tanHalfH, tanHalfV;       /* rectilinear helpers (viewport aspect)    */
     float Rout[9];                  /* body <- view rotation, row-major         */
     int fillAlphaOne;               /* 1 = opaque output inside the viewport    */
+    /* [WP-PAR] Displayed width of one output pixel in units of its height
+     * (the host project's pixel aspect ratio); OsvRenderParams::pixelAspect
+     * documents it.  0 and 1 both mean square pixels, bit for bit as before. */
+    float pixelAspect;
 } OsvReframeParams;
 
 /* Reinterpretation helper for the half-float decoder below.  A union is the
@@ -652,6 +668,32 @@ OSV_HD int osvViewRay(int projection, float focalPx, float eyeOffset, float tanH
     return 1;
 }
 
+/* ---- [WP-PAR] non-square output pixels ------------------------------------
+ * The pixel aspect ratios a reframe block may carry.  Every real format sits
+ * well inside (0.909 NTSC DV, 1.333 HDV, 1.5 DVCPRO HD, 2.0 anamorphic); a
+ * value outside, a NaN and 0 (a block filled before the field existed) all
+ * render square pixels. */
+#define OSV_PIXEL_ASPECT_MIN 0.1f
+#define OSV_PIXEL_ASPECT_MAX 10.0f
+
+/* Bring a centred pixel offset `*nx` of a `*W`-pixel-wide viewport into the
+ * square display units the camera is built in: both are multiplied by the
+ * pixel aspect, so osvViewRay sees the picture as the host displays it (the
+ * rectilinear helpers keep their meaning, because nx / W is unchanged).
+ * Square pixels - 1, 0 or anything unusable - multiply NOTHING, which keeps
+ * every square-pixel render bit for bit what it was before the field
+ * existed.  Every comparison is written so a NaN fails it. */
+OSV_HD void osvApplyPixelAspect(float pixelAspect, OSV_PRIVATE float* nx, OSV_PRIVATE float* W) {
+    if (!nx || !W) {
+        return;
+    }
+    if (pixelAspect >= OSV_PIXEL_ASPECT_MIN && pixelAspect <= OSV_PIXEL_ASPECT_MAX && pixelAspect != 1.0f) {
+        *nx *= pixelAspect;
+        *W *= pixelAspect;
+    }
+}
+/* ---- [/WP-PAR] ------------------------------------------------------------ */
+
 /* Direction (unit vector, view frame) seen through output pixel (px, py).
  * Returns 0 when the pixel maps to no direction (outside a fisheye circle). */
 OSV_HD int osvRayForPixel(OSV_PRIVATE const OsvRenderParams* p, float px, float py, OSV_PRIVATE float* d) {
@@ -680,9 +722,12 @@ OSV_HD int osvRayForPixel(OSV_PRIVATE const OsvRenderParams* p, float px, float 
     }
 
     /* Virtual camera.  nx/ny are centred pixel offsets with +ny = up. */
-    const float nx = sx - 0.5f * W;
+    float nx = sx - 0.5f * W;
     const float ny = 0.5f * H - sy;
-    return osvViewRay(p->projection, p->focalPx, p->eyeOffset, p->tanHalfH, p->tanHalfV, W, H, nx, ny, d);
+    /* [WP-PAR] A non-square pixel is pixelAspect display units wide. */
+    float viewW = W;
+    osvApplyPixelAspect(p->pixelAspect, &nx, &viewW);
+    return osvViewRay(p->projection, p->focalPx, p->eyeOffset, p->tanHalfH, p->tanHalfV, viewW, H, nx, ny, d);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2479,10 +2524,12 @@ OSV_FN void osvReframeEquirectPixel(OSV_PRIVATE const OsvReframeParams* p, OSV_P
         return;
     }
     /* Centred pixel offsets inside the viewport, +ny = up. */
-    const float W = (float)p->viewW;
+    float W = (float)p->viewW;
     const float H = (float)p->viewH;
-    const float nx = ((float)lx + 0.5f) - 0.5f * W;
+    float nx = ((float)lx + 0.5f) - 0.5f * W;
     const float ny = 0.5f * H - ((float)ly + 0.5f);
+    /* [WP-PAR] A non-square pixel is pixelAspect display units wide. */
+    osvApplyPixelAspect(p->pixelAspect, &nx, &W);
     float dView[3];
     if (!osvViewRay(p->projection, p->focalPx, p->eyeOffset, p->tanHalfH, p->tanHalfV, W, H, nx, ny, dView)) {
         return;

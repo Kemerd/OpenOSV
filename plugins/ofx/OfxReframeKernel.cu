@@ -263,10 +263,13 @@ __device__ __forceinline__ void osvOfxReframeBytePixel(const OsvReframeParams* p
         return;
     }
     // Centred pixel offsets inside the viewport, +ny = up.
-    const float W = (float)p->viewW;
+    float W = (float)p->viewW;
     const float H = (float)p->viewH;
-    const float nx = ((float)lx + 0.5f) - 0.5f * W;
+    float nx = ((float)lx + 0.5f) - 0.5f * W;
     const float ny = 0.5f * H - ((float)ly + 0.5f);
+    // [WP-PAR] A non-square pixel is pixelAspect display units wide - the
+    // same step osvReframeEquirectPixel() takes, so the two stay twins.
+    osvApplyPixelAspect(p->pixelAspect, &nx, &W);
     float dView[3];
     if (!osvViewRay(p->projection, p->focalPx, p->eyeOffset, p->tanHalfH, p->tanHalfV, W, H, nx, ny, dView)) {
         return;

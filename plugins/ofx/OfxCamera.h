@@ -95,6 +95,15 @@ void describe(OfxParamSetHandle set) noexcept;
 /// for and the shape the DJI conversions are computed on.
 [[nodiscard]] reframe::SizePx projectSize(OfxImageEffectHandle effect) noexcept;
 
+/// [WP-PAR] The project's pixel aspect ratio (kOfxImageEffectPropProjectPixelAspectRatio):
+/// the displayed width of one pixel in units of its height - 1.333 for an
+/// HDV 1440 x 1080 project, 0.909 for NTSC DV, 1.0 for every square-pixel
+/// one.  1.0 when the host does not say or says something unusable (zero,
+/// negative, not finite).  The render paths hand it to reframe::buildView()
+/// so the camera frames the picture the host displays instead of stretching
+/// it by this ratio; projectSize() divides the canonical width by it.
+[[nodiscard]] double projectPixelAspect(OfxImageEffectHandle effect) noexcept;
+
 /// Every camera control at `time`, resolved exactly as the Premiere effect's
 /// CPU path resolves them (ReframeParams.h `Settings`): popups sanitised,
 /// Keyframe Easing applied to Pan / Tilt / Roll and the selected lens's two
@@ -114,7 +123,11 @@ void applyVisibilityOnCreate(OfxParamSetHandle set) noexcept;
 
 /// kOfxActionInstanceChanged for a USER edit of `name` at `time`.  Returns
 /// true when `name` is a camera control (handled or deliberately ignored),
-/// false when it belongs to someone else.  `project` is projectSize().
-bool instanceChanged(OfxParamSetHandle set, const char* name, OfxTime time, reframe::SizePx project) noexcept;
+/// false when it belongs to someone else.  `project` is projectSize() and
+/// [WP-PAR] `pixelAspect` projectPixelAspect(): the DJI conversions (preset
+/// FOVs, the Zoom read-out, a lens switch) are computed for the shape the
+/// picture is DISPLAYED in, as the render frames it.
+bool instanceChanged(OfxParamSetHandle set, const char* name, OfxTime time, reframe::SizePx project,
+                     double pixelAspect) noexcept;
 
 }  // namespace osv::ofx::camera

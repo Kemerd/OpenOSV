@@ -685,9 +685,31 @@ constexpr double kDefaultFramingAspect = 16.0 / 9.0;
     return sourceCamera.rotation() * camera.rotation();
 }
 
+/// [WP-PAR] The pixel aspect a camera may be built for: `pixelAspect` itself
+/// when it is a finite value inside [OSV_PIXEL_ASPECT_MIN,
+/// OSV_PIXEL_ASPECT_MAX] (the range the kernel honours), else 1.0 - square
+/// pixels, the picture every build before the argument existed rendered -
+/// with one log line, because a host reporting such a ratio is worth knowing
+/// about but never worth a black frame.
+[[nodiscard]] double sanitisePixelAspect(double pixelAspect) noexcept {
+    if (std::isfinite(pixelAspect) && pixelAspect >= static_cast<double>(OSV_PIXEL_ASPECT_MIN) &&
+        pixelAspect <= static_cast<double>(OSV_PIXEL_ASPECT_MAX)) {
+        return pixelAspect;
+    }
+    osv::premiere::PluginLog::oncef("reframe/geometry/pixel-aspect", osv::premiere::PluginLog::Level::Warn,
+                                    "reframe: pixel aspect ratio {} is outside [{}, {}]; rendering square pixels",
+                                    pixelAspect, static_cast<double>(OSV_PIXEL_ASPECT_MIN),
+                                    static_cast<double>(OSV_PIXEL_ASPECT_MAX));
+    return 1.0;
+}
+
 /// buildView()'s DJI half: the frame checks and the requested size are
-/// already done by the caller, and `reqWxOutH` / `reqHxOutW` are its exact
-/// cover-fit cross products.
+/// already done by the caller, and `reqWxOutH` / `reqHxOutW` are its
+/// cover-fit cross products in output pixels (exact integers for square
+/// pixels).  [WP-PAR] `requestedWidthPx` is the requested picture's width in
+/// output pixels - requestedSize.w itself unless a named size meets
+/// non-square pixels - and `pixelAspect` the sanitised display width of one
+/// output pixel (1.0 for square pixels).
 ///
 /// DJI's field of view is VERTICAL and spans the HEIGHT of the requested
 /// picture (GLKMatrix4MakePerspective's fovy; DJI's plug-in renders into a
@@ -706,9 +728,11 @@ constexpr double kDefaultFramingAspect = 16.0 / 9.0;
 /// The eye distance is the Correction Angle as the user typed it (no ramp:
 /// DJI has none), and the kernel's OSV_PROJ_DJI_SPHERE does the rest.
 [[nodiscard]] ViewSetup buildDjiView(const Settings& settings, const Viewport& view, int outW, int outH,
-                                     std::int64_t reqWxOutH, std::int64_t reqHxOutW, SizePx requestedSize) noexcept {
+                                     double reqWxOutH, double reqHxOutW, SizePx requestedSize,
+                                     double requestedWidthPx, double pixelAspect) noexcept {
     ViewSetup setup;
-    if (view.w <= 0 || view.h <= 0 || !requestedSize.valid()) {
+    if (view.w <= 0 || view.h <= 0 || !requestedSize.valid() || !(requestedWidthPx > 0.0) ||
+        !std::isfinite(requestedWidthPx) || !(pixelAspect > 0.0) || !std::isfinite(pixelAspect)) {
         setup.reject = SetupReject::Viewport;
         return setup;
     }
@@ -717,10 +741,12 @@ constexpr double kDefaultFramingAspect = 16.0 / 9.0;
     const DjiLens lens = sanitiseDjiLens(DjiLens{settings.djiFovDeg, settings.correction});
 
     // ---- which edge of the requested picture meets the frame -----------------
+    // Both spans are in output ROWS, which are display units for square and
+    // non-square pixels alike: a pixel's height is the unit its width is
+    // measured in ([WP-PAR]).
     double halfSpanPx = 0.5 * static_cast<double>(outH);
     if (reqWxOutH < reqHxOutW) {
-        halfSpanPx = 0.5 * static_cast<double>(outW) * static_cast<double>(requestedSize.h) /
-                     static_cast<double>(requestedSize.w);
+        halfSpanPx = 0.5 * static_cast<double>(outW) * static_cast<double>(requestedSize.h) / requestedWidthPx;
     }
 
     // ---- the pinhole focal length --------------------------------------------
@@ -751,10 +777,19 @@ constexpr double kDefaultFramingAspect = 16.0 / 9.0;
     // The eye distance travels in the eye-offset slot; OSV_PROJ_DJI_SPHERE
     // documents that it may exceed 1 (the eye outside the sphere).
     p.eyeOffset = static_cast<float>(lens.correction);
+    // The focal length is the VERTICAL one, fy, in output rows; the kernel
+    // stretches each pixel's x offset by p.pixelAspect, so the horizontal
+    // focal is fx = fy / pixelAspect in output columns ([WP-PAR]).
     p.focalPx = static_cast<float>(focal);
     // The tangent-plane half extents of the frame through this pinhole - the
     // same meaning the rectilinear helpers have for every other projection.
-    p.tanHalfH = static_cast<float>(0.5 * static_cast<double>(view.w) / focal);
+    // [WP-PAR] The width is measured in display units; for square pixels the
+    // branch is skipped and the expression is exactly the one it always was.
+    double viewWidthDisplay = static_cast<double>(view.w);
+    if (pixelAspect != 1.0) {
+        viewWidthDisplay *= pixelAspect;
+    }
+    p.tanHalfH = static_cast<float>(0.5 * viewWidthDisplay / focal);
     p.tanHalfV = static_cast<float>(0.5 * static_cast<double>(view.h) / focal);
     for (int i = 0; i < 9; ++i) {
         p.Rout[i] = static_cast<float>(rout.m[i]);
@@ -762,6 +797,8 @@ constexpr double kDefaultFramingAspect = 16.0 / 9.0;
     // Rays that miss the sphere (eye outside it, Crystal Ball) come back
     // transparent, which on Premiere's black is DJI's black surround.
     p.fillAlphaOne = 0;
+    // [WP-PAR] The display width of one output pixel (1 = square).
+    p.pixelAspect = static_cast<float>(pixelAspect);
 
     setup.valid = true;
     setup.reject = SetupReject::None;
@@ -890,7 +927,7 @@ double framingAspect(Resolution resolution, SizePx sequenceSize) noexcept {
     return static_cast<double>(size.w) / static_cast<double>(size.h);
 }
 
-ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenceSize) noexcept {
+ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenceSize, double pixelAspect) noexcept {
     ViewSetup setup;
 
     // ---- defensive checks on everything that came from the host ----------
@@ -898,6 +935,18 @@ ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenc
         setup.reject = SetupReject::OutputSize;
         return setup;
     }
+
+    // ---- [WP-PAR] how wide one output pixel is displayed -----------------
+    // An OpenFX host (VEGAS, Resolve) may run a project with non-square
+    // pixels: an HDV 1440 x 1080 frame is shown 1920 x 1080, each pixel
+    // 1.333 times as wide as it is tall.  Everything below is computed in
+    // output pixels exactly as for square pixels; three places then take the
+    // pixel's display width into account (the named-size width, the focal
+    // length and the horizontal tangent extent), each behind a test that is
+    // false for square pixels, so a square-pixel camera - every Premiere
+    // frame - is bit for bit what this function always built.
+    const double pa = sanitisePixelAspect(pixelAspect);
+    const bool squarePixels = (pa == 1.0);
 
     // ---- the rectangle we paint ------------------------------------------
     // Always the whole frame: a virtual camera fills its sensor, so there is
@@ -943,8 +992,9 @@ ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenc
     //       the width binds: FOV spans the frame width exactly as before, the
     //       top and bottom (if any) are cropped, and the factor is 1.
     //
-    // The comparison is done in EXACT integer arithmetic (int64 cross
-    // products of two positive ints, which cannot overflow).  That matters: for "Match Sequence" and
+    // The comparison is done in EXACT arithmetic (cross products of two
+    // positive ints, exact integers in a double - see [WP-PAR] below - which
+    // cannot overflow or round).  That matters: for "Match Sequence" and
     // for every preview-scaled frame the shapes are identical, the factor is
     // exactly 1.0 and the render is bit-for-bit the full-frame render - a
     // floating-point ratio test would let a rounding error nudge the focal
@@ -953,11 +1003,29 @@ ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenc
     // A factor >= 1 only ever NARROWS the visible field of view, so the
     // eye-offset invertibility clamp VirtualCamera applies below (measured
     // across the frame width) remains a valid bound for what is shown.
-    const std::int64_t reqWxOutH = static_cast<std::int64_t>(requestedSize.w) * static_cast<std::int64_t>(outH);
-    const std::int64_t reqHxOutW = static_cast<std::int64_t>(requestedSize.h) * static_cast<std::int64_t>(outW);
+    //
+    // [WP-PAR] The products are formed in double: each is an int times a
+    // frame edge of at most kMaxEdge (2^16), so for square pixels it is an
+    // integer below 2^47 - exact in a double - and every comparison and the
+    // ratio below are exactly what the former int64 arithmetic gave.
+    //
+    // A NAMED Output Resolution is a square-pixel size, so with non-square
+    // pixels its width is first brought into output pixels (divided by the
+    // pixel aspect): "1920 x 1080" in an HDV project is 1440 x 1080 of its
+    // pixels, the frame's own shape, and nothing is cropped.  Match Sequence
+    // (the host's own size, already in pixels) and the frame fallback are
+    // never rescaled, so their shapes still cancel.  resolveOutputSize()
+    // answers a fixed table entry without any size given, and only a fixed
+    // entry - which is what tells the two apart.
+    double requestedWidthPx = static_cast<double>(requestedSize.w);
+    if (!squarePixels && resolveOutputSize(settings.resolution, SizePx{}, SizePx{}).valid()) {
+        requestedWidthPx /= pa;
+    }
+    const double reqWxOutH = requestedWidthPx * static_cast<double>(outH);
+    const double reqHxOutW = static_cast<double>(requestedSize.h) * static_cast<double>(outW);
     double coverScale = 1.0;
-    if (reqWxOutH > reqHxOutW && reqHxOutW > 0) {
-        coverScale = static_cast<double>(reqWxOutH) / static_cast<double>(reqHxOutW);
+    if (reqWxOutH > reqHxOutW && reqHxOutW > 0.0) {
+        coverScale = reqWxOutH / reqHxOutW;
     }
     if (!std::isfinite(coverScale) || !(coverScale >= 1.0)) {
         // Unreachable with validated sizes, but a non-finite factor would
@@ -972,7 +1040,7 @@ ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenc
     // viewRotation() with the same arithmetic), so a Classic render - every
     // old project - is bit for bit what it was.
     if (settings.cameraModel == CameraModel::Dji) {
-        return buildDjiView(settings, view, outW, outH, reqWxOutH, reqHxOutW, requestedSize);
+        return buildDjiView(settings, view, outW, outH, reqWxOutH, reqHxOutW, requestedSize, requestedWidthPx, pa);
     }
 
     // ---- the virtual camera ----------------------------------------------
@@ -1063,16 +1131,31 @@ ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenc
     // The cover-fit factor is applied HERE, after the fallback above, so the
     // degenerate-camera logic still reasons about the unscaled camera and a
     // factor of exactly 1.0 leaves the focal length untouched.
-    p.focalPx = static_cast<float>(focal * coverScale);
+    //
+    // [WP-PAR] `focal` is measured in output COLUMNS (the FOV spans view.w of
+    // them), which is fx.  The kernel works in display units - each column
+    // pixelAspect rows wide - so it is handed fy = fx * pixelAspect: the
+    // horizontal field of view is unchanged and the vertical one is no longer
+    // stretched.  Square pixels skip the multiply altogether.
+    double focalDisplay = focal * coverScale;
+    if (!squarePixels) {
+        focalDisplay *= pa;
+    }
+    p.focalPx = static_cast<float>(focalDisplay);
     // The rectilinear helpers are unused by the eye-offset branch but are
     // filled anyway so the struct never carries stale garbage into a device
     // buffer (and so a future projection switch needs no extra plumbing).
     // They are divided by the same cover factor so they keep describing the
     // same (cropped) picture the focal length does: tan(half fov) = (W/2) / f.
+    // [WP-PAR] The vertical one divides by the DISPLAY width of the view.
     const double halfFov = 0.5 * camera.effectiveHfovDeg() * kPi / 180.0;
     const double tanHalf = std::tan(std::min(halfFov, 1.55)) / coverScale;  // guard the pole
+    double viewWidthDisplay = static_cast<double>(view.w);
+    if (!squarePixels) {
+        viewWidthDisplay *= pa;
+    }
     p.tanHalfH = static_cast<float>(tanHalf);
-    p.tanHalfV = static_cast<float>(tanHalf * static_cast<double>(view.h) / static_cast<double>(view.w));
+    p.tanHalfV = static_cast<float>(tanHalf * static_cast<double>(view.h) / viewWidthDisplay);
     for (int i = 0; i < 9; ++i) {
         p.Rout[i] = static_cast<float>(rout.m[i]);
     }
@@ -1083,6 +1166,8 @@ ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenc
     // picture covers the whole frame - but a ray that misses the sphere
     // entirely still comes back transparent, which is correct.)
     p.fillAlphaOne = 0;
+    // [WP-PAR] The display width of one output pixel (1 = square).
+    p.pixelAspect = static_cast<float>(pa);
 
     setup.valid = true;
     setup.reject = SetupReject::None;
@@ -1090,7 +1175,7 @@ ViewSetup buildView(const Settings& settings, int outW, int outH, SizePx sequenc
 }
 
 KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int outW, int outH,
-                        SizePx sequenceSize) noexcept {
+                        SizePx sequenceSize, double pixelAspect) noexcept {
     KernelSetup setup;
 
     // ---- defensive checks on everything that came from the host ----------
@@ -1104,8 +1189,9 @@ KernelSetup buildParams(const Settings& settings, const ConstFrameView& src, int
 
     // ---- the camera ---------------------------------------------------------
     // One function builds it for every renderer; see buildView() for the
-    // cover-fit, the eye offset and the rotation order.
-    const ViewSetup view = buildView(settings, outW, outH, sequenceSize);
+    // cover-fit, the eye offset, the rotation order and [WP-PAR] the pixel
+    // aspect.
+    const ViewSetup view = buildView(settings, outW, outH, sequenceSize, pixelAspect);
     if (!view.valid) {
         setup.reject = view.reject;
         return setup;

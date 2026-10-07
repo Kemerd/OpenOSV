@@ -33,7 +33,13 @@
 //   * behaviour: cloned filter instances rendering at the same time, the
 //     InstanceChanged VEGAS sends for the clip "Output", frame-local
 //     generator time with field renders at x.5, formats VEGAS cannot hand out
-//     refused without a pixel written.
+//     refused without a pixel written;
+//   * [WP-PAR] geometry: a non-square project (HDV 4:3, 2:1, 1:2) framed as
+//     it is displayed - its grid lines where the square-pixel render has
+//     them - and a square one exactly as before;
+//   * stabilisation: Smooth + Horizon Lock reaches the reframed view exactly
+//     as the engine applies it to its own sphere, from the .OSV and from the
+//     .LRF proxy.
 
 #include "OfxTestSupport.h"
 
@@ -47,10 +53,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -867,4 +876,440 @@ TEST_CASE("VEGAS: the roll-call after CreateInstance edits nothing; one change p
     vegasRollCall(Fixture::get().source, *generator.effect);
     vegasRollCall(Fixture::get().source, *generator.effect);
     CHECK(writesExcept(*generator.effect, src::kClipInfo) == 0);
+}
+
+// ===========================================================================
+//  [WP-PAR] Non-square project pixels
+// ===========================================================================
+// A VEGAS project can have non-square pixels: HDV 1440 x 1080 is displayed
+// 1920 x 1080 (pixel aspect 4:3), anamorphic formats at 2:1, and so on.  The
+// host hands the effect an image of the PIXEL size and shows every pixel
+// `pixelAspect` times as wide as it is tall, so the camera must frame the
+// DISPLAYED picture - before 0.5.1 it framed the pixel grid as if square, and
+// the view came out stretched horizontally by the pixel aspect.
+//
+// Measured with a coordinate panorama: R is the longitude and G the latitude
+// of the equirect column / row, linear ramps the bilinear sampler reproduces
+// exactly, so a rendered pixel's R and G name the direction it sees and a
+// "grid line" (every 5 degrees) is where a channel crosses a level.  The
+// positions of those lines in DISPLAY units ((pixel index + 0.5) x pixel
+// aspect) must be those of the square-pixel 1920 x 1080 render.
+
+namespace {
+
+/// The display size every case frames: 1920 x 1080 square display units.
+constexpr int kDisplayW = 1920;
+constexpr int kDisplayH = 1080;
+
+/// The longest a grid line may sit from its square-pixel position, in
+/// display pixels (the brief's acceptance threshold).
+constexpr double kGridTolerancePx = 0.5;
+
+/// R = (longitude + 180) / 360 and G = (latitude + 90) / 180 of each texel's
+/// centre, B = 0.5, A = 1 - painted into an OpenFX-layout (bottom-up) image.
+void paintCoordinates(HostImage& image) {
+    const int w = image.width();
+    const int h = image.height();
+    for (int y = image.bounds.y1; y < image.bounds.y2; ++y) {
+        // Row counted from the TOP: row 0 is latitude +90.
+        const int rowFromTop = image.bounds.y2 - 1 - y;
+        const float g = 1.0f - (static_cast<float>(rowFromTop) + 0.5f) / static_cast<float>(h);
+        for (int x = image.bounds.x1; x < image.bounds.x2; ++x) {
+            const float r = (static_cast<float>(x - image.bounds.x1) + 0.5f) / static_cast<float>(w);
+            const float p[4] = {r, g, 0.5f, 1.0f};
+            image.writeRgba(x, y, p);
+        }
+    }
+}
+
+/// The R level of longitude `deg` and the G level of latitude `deg`.
+double longitudeLevel(double deg) { return (deg + 180.0) / 360.0; }
+double latitudeLevel(double deg) { return (deg + 90.0) / 180.0; }
+
+/// The grid every case measures: every 5 degrees from -`span` to +`span`.
+std::vector<double> gridDegrees(double span) {
+    std::vector<double> out;
+    for (double d = -span; d <= span + 1e-9; d += 5.0) {
+        out.push_back(d);
+    }
+    return out;
+}
+
+/// Channel `channel` of float image `image` at the fractional pixel-centre
+/// column `xf` of row `y`, linear between the two nearest columns; NaN off
+/// the image or where a pixel saw nothing (alpha 0).
+double channelAt(const HostImage& image, double xf, int y, int channel) {
+    if (!std::isfinite(xf) || channel < 0 || channel > 3) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const int x0 = static_cast<int>(std::floor(xf));
+    const double t = xf - static_cast<double>(x0);
+    const float* a = image.pixel(image.bounds.x1 + x0, y);
+    const float* b = image.pixel(image.bounds.x1 + std::min(x0 + 1, image.width() - 1), y);
+    if (!a || !b || !(a[3] > 0.5f) || !(b[3] > 0.5f)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return static_cast<double>(a[channel]) * (1.0 - t) + static_cast<double>(b[channel]) * t;
+}
+
+/// Where the increasing profile `values` (index = pixel-centre index) crosses
+/// each of `levels`, as a fractional index; NaN for a level it never crosses
+/// between two finite samples.
+std::vector<double> crossingsOf(const std::vector<double>& values, const std::vector<double>& levels) {
+    std::vector<double> out(levels.size(), std::numeric_limits<double>::quiet_NaN());
+    for (std::size_t k = 0; k < levels.size(); ++k) {
+        for (std::size_t i = 0; i + 1 < values.size(); ++i) {
+            const double v0 = values[i];
+            const double v1 = values[i + 1];
+            if (std::isfinite(v0) && std::isfinite(v1) && v0 <= levels[k] && levels[k] < v1) {
+                out[k] = static_cast<double>(i) + (levels[k] - v0) / (v1 - v0);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+/// The longitude lines crossing output row `y`, in DISPLAY units from the
+/// left edge: (fractional index + 0.5) x `pixelAspect`.
+std::vector<double> longitudeLines(const HostImage& image, int y, double pixelAspect, const std::vector<double>& deg) {
+    std::vector<double> profile(static_cast<std::size_t>(image.width()));
+    for (int x = 0; x < image.width(); ++x) {
+        profile[static_cast<std::size_t>(x)] = channelAt(image, static_cast<double>(x), y, 0);
+    }
+    std::vector<double> levels;
+    for (double d : deg) {
+        levels.push_back(longitudeLevel(d));
+    }
+    std::vector<double> lines = crossingsOf(profile, levels);
+    for (double& v : lines) {
+        v = (v + 0.5) * pixelAspect;
+    }
+    return lines;
+}
+
+/// The latitude lines crossing the output column at DISPLAY position
+/// `displayX` (interpolated between pixel columns), as fractional row
+/// indices counted from the image's first row (rows are square already).
+std::vector<double> latitudeLines(const HostImage& image, double displayX, double pixelAspect,
+                                  const std::vector<double>& deg) {
+    const double xf = displayX / pixelAspect - 0.5;
+    std::vector<double> profile(static_cast<std::size_t>(image.height()));
+    for (int y = 0; y < image.height(); ++y) {
+        profile[static_cast<std::size_t>(y)] = channelAt(image, xf, image.bounds.y1 + y, 1);
+    }
+    std::vector<double> levels;
+    for (double d : deg) {
+        levels.push_back(latitudeLevel(d));
+    }
+    return crossingsOf(profile, levels);
+}
+
+/// The largest distance between matching lines of `a` and `b` (both finite),
+/// and how many pairs were compared.
+struct LineError {
+    double worst = 0.0;
+    int pairs = 0;
+};
+LineError lineError(const std::vector<double>& a, const std::vector<double>& b) {
+    LineError e;
+    for (std::size_t k = 0; k < a.size() && k < b.size(); ++k) {
+        if (std::isfinite(a[k]) && std::isfinite(b[k])) {
+            e.worst = std::max(e.worst, std::fabs(a[k] - b[k]));
+            ++e.pairs;
+        }
+    }
+    return e;
+}
+
+/// One VEGAS filter instance in a `pixelW` x kDisplayH project of pixel
+/// aspect `pixelAspect`: float R G B A, the coordinate panorama on its Source.
+struct ParFilter {
+    std::unique_ptr<Effect> effect;
+    HostImage source;
+    HostImage output;
+    OfxRectI frame;
+    double pixelAspect;
+
+    ParFilter(int pixelW, double aspect) : frame{0, 0, pixelW, kDisplayH}, pixelAspect(aspect) {
+        OfxStatus st = kOfxStatFailed;
+        effect = Fixture::get().reframe.createInstance(kOfxImageEffectContextFilter, pixelW, kDisplayH, 29.97, &st,
+                                                       aspect);
+        REQUIRE(st == kOfxStatOK);
+        source = makeImage(OfxRectI{0, 0, 2048, 1024});
+        paintCoordinates(source);
+        output = makeImage(frame);
+        output.fill(-7.0f);
+        Clip* in = effect->clip(kOfxImageEffectSimpleSourceClipName);
+        Clip* out = effect->clip(kOfxImageEffectOutputClipName);
+        REQUIRE(in);
+        REQUIRE(out);
+        in->rod = OfxRectD{0, 0, 2048, 1024};
+        provideImage(*in, source);
+        provideImage(*out, output);
+    }
+
+    Param& param(const char* name) {
+        Param* p = effect->params.find(name);
+        REQUIRE(p);
+        return *p;
+    }
+
+    [[nodiscard]] OfxStatus render() const {
+        PluginHarness::RenderArgs args;
+        args.window = frame;
+        return Fixture::get().reframe.render(*effect, args);
+    }
+};
+
+/// One lens set-up, in the filter's controls and as the Premiere effect's
+/// Settings for the reference renders.
+struct LensCase {
+    const char* name;
+    bool classic;
+};
+constexpr LensCase kLensCases[] = {{"DJI", false}, {"Classic", true}};
+
+/// Apply `lens` to a filter's controls.
+void applyLens(ParFilter& filter, const LensCase& lens) {
+    if (lens.classic) {
+        filter.param(cam::kLens).i = 1;  // "DJI|Classic": Classic
+        filter.param(cam::kFov).d = 100.0;
+        filter.param(cam::kDistortion).d = 30.0;
+    } else {
+        filter.param(cam::kDjiFov).d = 70.0;
+        filter.param(cam::kCorrection).d = 0.5;
+    }
+    filter.param(cam::kTilt).d = 6.0;
+}
+
+/// The same look as Premiere's Settings.
+rf::Settings lensSettings(const LensCase& lens) {
+    rf::Settings s = defaultSettings();
+    if (lens.classic) {
+        s.cameraModel = rf::CameraModel::Classic;
+        s.fovDeg = 100.0;
+        s.distortion = 30.0;
+    } else {
+        s.djiFovDeg = 70.0;
+        s.correction = 0.5;
+    }
+    s.tiltDeg = 6.0;
+    return s;
+}
+
+/// Longitude lines on three rows and latitude lines on three display columns
+/// of `test` (pixel aspect `testAspect`) against `reference` (pixel aspect
+/// `referenceAspect`, 1.0 for the square-pixel render), both measured in
+/// display units: the worst distance between matching lines.
+LineError gridError(const HostImage& test, double testAspect, const HostImage& reference,
+                    double referenceAspect = 1.0) {
+    const std::vector<double> lon = gridDegrees(40.0);
+    const std::vector<double> lat = gridDegrees(25.0);
+    LineError total;
+    for (const int y : {kDisplayH / 5, kDisplayH / 2, (4 * kDisplayH) / 5}) {
+        const LineError e = lineError(longitudeLines(test, y, testAspect, lon),
+                                      longitudeLines(reference, y, referenceAspect, lon));
+        total.worst = std::max(total.worst, e.worst);
+        total.pairs += e.pairs;
+    }
+    for (const double x : {kDisplayW * 0.25, kDisplayW * 0.5, kDisplayW * 0.75}) {
+        const LineError e = lineError(latitudeLines(test, x, testAspect, lat),
+                                      latitudeLines(reference, x, referenceAspect, lat));
+        total.worst = std::max(total.worst, e.worst);
+        total.pairs += e.pairs;
+    }
+    return total;
+}
+
+}  // namespace
+
+TEST_CASE("VEGAS: a non-square project is framed as it is displayed, not stretched", "[ofx][.vegas][par]") {
+    REQUIRE_VEGAS_PROFILE();
+    const CpuPathOnly cpuPath;  // the CPU loop against the square-pixel render
+    // The pixel aspects of real formats whose display width is exactly 1920:
+    // HDV (1440 at 4:3), anamorphic 2:1 (960) and half-width pixels (3840).
+    struct ParCase {
+        int pixelW;
+        double pixelAspect;
+    };
+    const ParCase kCases[] = {{1440, 4.0 / 3.0}, {960, 2.0}, {3840, 0.5}};
+
+    for (const LensCase& lens : kLensCases) {
+        // ---- the square-pixel picture every case must reproduce ------------------
+        ParFilter square(kDisplayW, 1.0);
+        applyLens(square, lens);
+        REQUIRE(square.render() == kOfxStatOK);
+
+        // Square pixels are bit for bit the Premiere effect's render.
+        const HostImage squareRef =
+            referenceRender(lensSettings(lens), square.source, square.frame, {kDisplayW, kDisplayH});
+        CHECK(maxDifference(square.output, squareRef, square.frame) == 0.0);
+
+        for (const ParCase& c : kCases) {
+            INFO(lens.name << " lens, " << c.pixelW << " x " << kDisplayH << " at pixel aspect " << c.pixelAspect);
+            ParFilter filter(c.pixelW, c.pixelAspect);
+            applyLens(filter, lens);
+            REQUIRE(filter.render() == kOfxStatOK);
+
+            // ---- the grid in display units is the square-pixel grid --------------
+            const LineError now = gridError(filter.output, c.pixelAspect, square.output);
+            INFO("grid lines compared " << now.pairs << ", worst " << now.worst << " display px");
+            CHECK(now.pairs >= 60);
+            CHECK(now.worst < kGridTolerancePx);
+
+            // ---- and the square-pixel assumption (the camera every build before
+            // 0.5.1 used: the frame's pixels taken as square) misses it by far ----
+            const HostImage stretched =
+                referenceRender(lensSettings(lens), filter.source, filter.frame, {c.pixelW, kDisplayH});
+            const LineError before = gridError(stretched, c.pixelAspect, square.output);
+            INFO("square-pixel assumption: worst " << before.worst << " display px");
+            CHECK(before.worst > 20.0);
+        }
+
+        // ---- a named Output Resolution is a display shape ----------------------------
+        // "1920 x 1080" in an HDV project is the frame's own 16:9: nothing is
+        // cropped, so it frames exactly like Match Timeline.
+        ParFilter match(1440, 4.0 / 3.0);
+        applyLens(match, lens);
+        REQUIRE(match.render() == kOfxStatOK);
+        ParFilter named(1440, 4.0 / 3.0);
+        applyLens(named, lens);
+        named.param(cam::kOutputResolution).i = static_cast<int>(rf::Resolution::Fhd1920x1080) - 1;
+        REQUIRE(named.render() == kOfxStatOK);
+        const LineError shape = gridError(named.output, 4.0 / 3.0, match.output, 4.0 / 3.0);
+        INFO(lens.name << " lens: named 1920 x 1080 vs Match Timeline, worst " << shape.worst << " display px");
+        CHECK(shape.pairs >= 60);
+        CHECK(shape.worst < 0.01);
+    }
+    CHECK(MockHost::instance().imagesOut == 0);
+}
+
+TEST_CASE("VEGAS: the Zoom read-out and the presets use the shape a non-square project displays",
+          "[ofx][.vegas][par]") {
+    REQUIRE_VEGAS_PROFILE();
+    // An HDV project (1440 x 1080 pixels at 4:3) displays 16:9, so every DJI
+    // conversion must give what it gives in a square 1920 x 1080 project.
+    const auto edit = [](ParFilter& filter, const char* name) {
+        return Fixture::get().reframe.instanceChanged(*filter.effect, name, kOfxChangeUserEdited, 0.0);
+    };
+    const auto same = [](double a, double b) { return std::fabs(a - b) <= 1e-9 * std::max(1.0, std::fabs(b)); };
+
+    // ---- a typed Zoom moves FOV and Correction along the same path ----------------
+    ParFilter square(kDisplayW, 1.0);
+    ParFilter hdv(1440, 4.0 / 3.0);
+    square.param(cam::kZoom).d = 100.0;
+    hdv.param(cam::kZoom).d = 100.0;
+    REQUIRE(edit(square, cam::kZoom) == kOfxStatOK);
+    REQUIRE(edit(hdv, cam::kZoom) == kOfxStatOK);
+    INFO("square: DJI FOV " << square.param(cam::kDjiFov).d << ", correction " << square.param(cam::kCorrection).d
+                            << "; HDV: DJI FOV " << hdv.param(cam::kDjiFov).d << ", correction "
+                            << hdv.param(cam::kCorrection).d);
+    CHECK(same(hdv.param(cam::kDjiFov).d, square.param(cam::kDjiFov).d));
+    CHECK(same(hdv.param(cam::kCorrection).d, square.param(cam::kCorrection).d));
+    CHECK(same(hdv.param(cam::kZoom).d, square.param(cam::kZoom).d));
+    // And not what the 4:3 PIXEL shape would have given.
+    const rf::DjiLens pixelShape = rf::djiZoomTo(
+        100.0, rf::DjiLens{OSV_REFRAME_DJI_FOV_DEFAULT, OSV_REFRAME_CORRECTION_DEFAULT}, 1440.0 / 1080.0);
+    CHECK_FALSE(same(hdv.param(cam::kDjiFov).d, pixelShape.fovDeg));
+
+    // ---- a preset writes the same DJI look --------------------------------------
+    ParFilter squarePreset(kDisplayW, 1.0);
+    ParFilter hdvPreset(1440, 4.0 / 3.0);
+    squarePreset.param(cam::kPreset).i = static_cast<int>(rf::Preset::Asteroid) - 1;
+    hdvPreset.param(cam::kPreset).i = static_cast<int>(rf::Preset::Asteroid) - 1;
+    REQUIRE(edit(squarePreset, cam::kPreset) == kOfxStatOK);
+    REQUIRE(edit(hdvPreset, cam::kPreset) == kOfxStatOK);
+    CHECK(same(hdvPreset.param(cam::kDjiFov).d, squarePreset.param(cam::kDjiFov).d));
+    CHECK(same(hdvPreset.param(cam::kZoom).d, squarePreset.param(cam::kZoom).d));
+    CHECK(MockHost::instance().imagesOut == 0);
+}
+
+TEST_CASE("VEGAS: square pixels build exactly the camera they always did", "[ofx][.vegas][par]") {
+    REQUIRE_VEGAS_PROFILE();
+    const CpuPathOnly cpuPath;
+    // ---- the camera block: an explicit 1.0, and every unusable aspect, build
+    // the block the default builds, byte for byte -------------------------------------
+    for (const LensCase& lens : kLensCases) {
+        INFO(lens.name << " lens");
+        const rf::Settings s = lensSettings(lens);
+        for (const rf::SizePx project : {rf::SizePx{1920, 1080}, rf::SizePx{1080, 1920}, rf::SizePx{}}) {
+            const rf::ViewSetup reference = rf::buildView(s, 1920, 1080, project);
+            REQUIRE(reference.valid);
+            CHECK(reference.params.pixelAspect == 1.0f);
+            const double unusable[] = {1.0, 0.0, -1.0, 1000.0, std::numeric_limits<double>::quiet_NaN(),
+                                       std::numeric_limits<double>::infinity()};
+            for (const double pa : unusable) {
+                INFO("pixel aspect " << pa);
+                const rf::ViewSetup v = rf::buildView(s, 1920, 1080, project, pa);
+                REQUIRE(v.valid);
+                CHECK(std::memcmp(&v.params, &reference.params, sizeof(OsvReframeParams)) == 0);
+            }
+        }
+    }
+
+    // ---- the module: a square project renders the Premiere effect's pixels ----------
+    ParFilter square(640, 1.0);
+    square.param(cam::kPan).d = -35.0;
+    REQUIRE(square.render() == kOfxStatOK);
+    rf::Settings s = defaultSettings();
+    s.panDeg = -35.0;
+    const HostImage ref = referenceRender(s, square.source, square.frame, {640, kDisplayH});
+    CHECK(maxDifference(square.output, ref, square.frame) == 0.0);
+    CHECK(MockHost::instance().imagesOut == 0);
+}
+
+// ===========================================================================
+//  Stabilisation through the VEGAS profile (the sample clip)
+// ===========================================================================
+// Smooth + Horizon Lock - the default, DJI's RockSteady with Horizon Leveling
+// - must reach the reframed view exactly as the importer engine applies it to
+// its sphere: the generator's view is Open 360 Reframe's CPU framing of the
+// generator's own native sphere, pixel for pixel, at Good quality (the .OSV)
+// and at Preview quality with Playback Proxy on (the .LRF proxy, which
+// smooths over the .OSV's seconds).  NVDEC / GPU: not part of the CPU-only
+// runs.
+
+TEST_CASE("VEGAS: Smooth + Horizon Lock frames the view out of the engine's own stabilised sphere",
+          "[ofx][.vegas][sample]") {
+    REQUIRE_VEGAS_PROFILE();
+    const CpuPathOnly cpuPath;  // the engine's sphere and the CPU framing of it
+    const std::string clip = sampleClip();
+    if (clip.empty()) {
+        SKIP("no sample clip");
+    }
+    // The 0-based popup index of "Smooth + Horizon Lock" (OSV_SS_STAB_ITEMS).
+    constexpr int kSmoothHorizonLock = 4;
+    const char* const qualities[] = {ofx::kVegasQualityGood, ofx::kVegasQualityPreview};
+    for (const char* quality : qualities) {
+        INFO("quality " << quality);
+        // ---- the engine's native sphere, stabilised -------------------------------
+        VegasSourceRig sphere({ofx::HostDepth::Float, ofx::HostOrder::Rgba}, 29.97, 6000, 3000);
+        sphere.param(src::kFile).s = clip;
+        sphere.param(src::kOutput).i = src::kOutputEquirect;
+        sphere.param(sp::kStabilization).i = kSmoothHorizonLock;
+        sphere.param(sp::kPlaybackProxy).i = 1;
+        sphere.param(sp::kOutputLevels).i = static_cast<int>(ofx::OutputLevels::Full);
+        REQUIRE(sphere.render(6.0, kOfxImageFieldNone, quality) == kOfxStatOK);
+
+        // ---- the reframed view of the same moment ------------------------------
+        VegasSourceRig view({ofx::HostDepth::Float, ofx::HostOrder::Rgba}, 29.97, 640, 360);
+        view.param(src::kFile).s = clip;
+        view.param(sp::kStabilization).i = kSmoothHorizonLock;
+        view.param(sp::kPlaybackProxy).i = 1;
+        view.param(sp::kOutputLevels).i = static_cast<int>(ofx::OutputLevels::Full);
+        view.param(cam::kPan).d = 40.0;
+        view.param(cam::kTilt).d = -10.0;
+        view.param(cam::kDjiFov).d = 80.0;
+        REQUIRE(view.render(6.0, kOfxImageFieldNone, quality) == kOfxStatOK);
+
+        // ---- Premiere's two-step path on the generator's own sphere --------------
+        rf::Settings s = defaultSettings();
+        s.panDeg = 40.0;
+        s.tiltDeg = -10.0;
+        s.djiFovDeg = 80.0;
+        const HostImage ref = referenceRender(s, sphere.output, view.frame, {640, 360});
+        CHECK(maxDifference(view.output, ref, view.frame) == 0.0);
+    }
+    CHECK(MockHost::instance().imagesOut == 0);
 }
