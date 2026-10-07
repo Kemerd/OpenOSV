@@ -6,6 +6,8 @@
 // context, the GOP-aware VRAM cache (hits, LRU, leases, budget), stream-
 // ordered lease release, decode-ahead, destruction while the worker runs,
 // concurrent acquires, and the zero-copy render path the frames are for.
+// [vfr-sample]: where a cold landing restarts when the two lenses of a
+// dropped-frame recording (OSV_VFR_SAMPLE) start a GOP on different samples.
 //
 // Everything that decodes needs the sample clip, a CUDA driver and NVDEC;
 // each of those SKIPs cleanly when missing.  Timing assertions are generous
@@ -47,6 +49,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -953,6 +957,149 @@ TEST_CASE("GpuClipDecoder frames render zero-copy like the software-decoded pair
     const render::ImageDiffStats stats = render::compareImages16(a.value(), b.value());
     INFO("software pair vs GpuClipDecoder pair: PSNR " << stats.psnrDb << " dB, max " << stats.maxAbsCode << " codes");
     CHECK(stats.maxAbsCode <= 1);
+}
+
+// =============================================================================
+//  [VFR] A dropped-frame recording whose lenses start a GOP on different samples
+// =============================================================================
+//
+//  OSV_VFR_SAMPLE names an .OSV whose camera dropped frames (SKIPs without
+//  one, or when no GOP of it is shifted).  Both lens tracks share one sync
+//  table, but after a gap one lens's encoder can put its random access point
+//  a sample after the listed entry.  A cold landing inside such a GOP must
+//  restart where the LATER lens can (the other lens catches up by a frame on
+//  its own), never ask that lens for a frame from before its own start - its
+//  whole previous GOP of 8K pictures.
+TEST_CASE("GpuClipDecoder restarts a shifted GOP where the later lens can start",
+          "[video][gpu][vfr][vfr-sample][cuda][hwaccel]") {
+    const char* env = std::getenv("OSV_VFR_SAMPLE");
+    const std::filesystem::path clip = (env != nullptr && *env != '\0') ? std::filesystem::path(env)
+                                                                         : std::filesystem::path();
+    std::error_code ec;
+    if (clip.empty() || !std::filesystem::exists(clip, ec)) {
+        SKIP("OSV_VFR_SAMPLE does not name a variable-frame-rate clip");
+    }
+    std::string reason;
+    if (!GpuClipDecoder::available(&reason)) {
+        SKIP("CUDA unavailable: " << reason);
+    }
+
+    // ---- the clip's layout -------------------------------------------------------------
+    auto file = OsvFile::open(clip);
+    REQUIRE(file.ok());
+    auto track = meta::MetadataTrack::load(file.value());
+    REQUIRE(track.ok());
+    auto format = meta::FormatDetector::detect(file.value(), &track.value());
+    REQUIRE(format.ok());
+    const meta::FormatInfo& f = format.value();
+    if (!f.dualFisheye || f.videoTrackIds[1] == 0 || f.videoTrackIds[1] == f.videoTrackIds[0]) {
+        SKIP("OSV_VFR_SAMPLE is not a two-lens .OSV");
+    }
+    const TrackInfo* video = file.value().track(f.videoTrackIds[0]);
+    REQUIRE(video != nullptr);
+
+    // ---- each lens's own verified decode start (software decoders, no GPU) -----------
+    std::array<HevcStreamDecoder, 2> software;
+    for (std::size_t l = 0; l < 2; ++l) {
+        DecoderOptions options;
+        options.hw = HwAccel::None;
+        options.useContainerSamples = true;  // frame index == sample index, like the GPU decoder
+        options.deferFirstFrame = true;
+        auto opened = HevcStreamDecoder::open(clip, f.videoTrackIds[l], options);
+        INFO("lens " << l << ": " << (opened.ok() ? std::string("ok") : opened.error().toString()));
+        REQUIRE(opened.ok());
+        software[l] = std::move(opened).value();
+    }
+
+    // ---- the first listed GOP whose lenses start on different samples ----------------
+    const std::vector<std::uint32_t>& syncs = video->samples.syncSamples();
+    std::uint32_t early = 0;
+    std::uint32_t late = 0;
+    std::uint32_t gopEnd = 0;
+    bool found = false;
+    for (std::size_t g = 0; g + 1 < syncs.size() && !found; ++g) {
+        // A probe a few samples into the listed GOP, where both lenses are past
+        // their own random access point.
+        const std::uint32_t probe = syncs[g] + 4u;
+        if (probe >= syncs[g + 1]) {
+            continue;
+        }
+        const std::uint32_t a = software[0].previousSyncIndex(probe).value_or(0);
+        const std::uint32_t b = software[1].previousSyncIndex(probe).value_or(0);
+        if (a != b) {
+            early = std::min(a, b);
+            late = std::max(a, b);
+            gopEnd = syncs[g + 1];
+            found = true;
+        }
+    }
+    if (!found) {
+        SKIP("every GOP of OSV_VFR_SAMPLE starts on the same sample in both lenses");
+    }
+    const std::uint32_t target = late + 3u;
+    REQUIRE(target < gopEnd);
+    INFO("listed sync " << early << ", later lens starts at " << late << ", target " << target);
+
+    // ---- the GPU decoder, foreground only so its counters are exact -------------------
+    GpuDecoderOptions options;
+    options.decodeAhead = 0;
+    auto opened = GpuClipDecoder::open(clip, f, options);
+    if (!opened.ok() && opened.error().code == ErrorCode::Unsupported) {
+        SKIP("NVDEC unavailable: " << opened.error().message);
+    }
+    INFO("open: " << (opened.ok() ? std::string("ok") : opened.error().toString()));
+    REQUIRE(opened.ok());
+    std::unique_ptr<GpuClipDecoder> dec = std::move(opened).value();
+
+    // Compare one lens of a lease with a random-access software decode of the
+    // same frame: the picture and its presentation time.
+    const auto matchesSoftware = [&](const GpuFrameLease& lease, std::size_t l) {
+        auto frame = software[l].decodeFrame(lease.frameIndex());
+        INFO("software lens " << l << ": " << (frame.ok() ? std::string("ok") : frame.error().toString()));
+        REQUIRE(frame.ok());
+        HostLens host;
+        std::string error;
+        const bool downloaded = downloadLens(lease.pair().device[l], dec->cuContext(), host, error);
+        INFO(error);
+        REQUIRE(downloaded);
+        CHECK(lease.pair().lens[l].ptsUs == frame.value().ptsUs);
+        CHECK(pictureHash(host.view) == pictureHash(frame.value()));
+    };
+
+    // ---- a cold landing inside the shifted GOP --------------------------------------
+    // The pairs decoded are exactly late .. target: the restart is at the later
+    // lens's start, and the earlier lens skips the frames in between itself.
+    const GpuDecoderStats before = dec->stats();
+    auto t = std::chrono::steady_clock::now();
+    {
+        GpuFrameLease lease = acquireOk(*dec, target);
+        const double landingMs = msSince(t);
+        CHECK(lease.source() == LeaseSource::Decoded);
+        CHECK(lease.pair().index == target);
+        const GpuDecoderStats after = dec->stats();
+        CHECK(after.framesDecoded - before.framesDecoded == static_cast<std::uint64_t>(target - late + 1u));
+        CHECK(after.restarts - before.restarts == 1u);
+        CHECK(dec->isCached(late));
+        CHECK_FALSE(dec->isCached(early));
+        WARN("cold landing on " << target << " (lens starts " << early << " / " << late << "): " << landingMs
+                                << " ms");
+        matchesSoftware(lease, 0);
+        matchesSoftware(lease, 1);
+    }
+
+    // ---- a cold landing ON the listed sync sample --------------------------------------
+    // One lens starts there; the other can only reach it from its previous GOP.
+    // The restart is still that one frame (the later of the two starts, never
+    // past the target): one pair, the catching up stays inside that lens.
+    const GpuDecoderStats beforeSync = dec->stats();
+    {
+        GpuFrameLease lease = acquireOk(*dec, early);
+        CHECK(lease.source() == LeaseSource::Decoded);
+        const GpuDecoderStats after = dec->stats();
+        CHECK(after.framesDecoded - beforeSync.framesDecoded == 1u);
+        matchesSoftware(lease, 0);
+        matchesSoftware(lease, 1);
+    }
 }
 #endif  // OSV_HAVE_CUDA
 
