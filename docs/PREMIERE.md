@@ -576,7 +576,7 @@ absent, so that fact cannot be forgotten.
 
 As in the reframe effect, `PF_ADD_TOPIC` and `PF_END_TOPIC` each issue their
 own `PF_ADD_PARAM`, so a group occupies two real parameter slots and the
-`GROUP_END` slot sits in the MIDDLE of the list. There are 34 parameters: 26
+`GROUP_END` slot sits in the MIDDLE of the list. There are 36 parameters: 28
 value controls, 2 buttons and 6 group markers. `SourceSettingsParams.h`
 spells the index table out literally. Ids are permanent and only ever
 appended; indices moved when a control joined a group (the ids did not).
@@ -615,24 +615,27 @@ meaning; forcing the bare-lens set is new and therefore last.
 | 21 | 35 | Shading Strength | float slider | 0..100 %, whole percent | 100 | `shadingStrength` |
 | 22 | 40 | Parallax Grid | popup | Auto (steady unless the scene moves) \| Steady (per clip) \| Follows scene (per moment) | Auto | `parallaxGrid` |
 | 23 | 41 | Lens Alignment | popup | Auto (fit per clip) \| Off (calibration only) | Auto | `lensAlign` |
-| 24 | 8 | (closes Stitching) | GROUP_END | | | |
-| 25 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
-| 26 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 \| Osmo 360 | Osmo 360 | `dlogmFit` |
-| 27 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
-| 28 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
-| 29 | 14 | Program Monitor Colour | popup | Sequence space (fast) \| Match Source monitor | Sequence space | `directColour` |
-| 30 | 13 | (closes Advanced) | GROUP_END | | | |
-| 31 | 30 | Defaults | topic (GROUP_START, starts collapsed) | | | |
-| 32 | 31 | Save | button, `PF_ParamFlag_SUPERVISE` | "Save as Default for New Clips" | | writes the user defaults file |
-| 33 | 32 | Restore | button, `PF_ParamFlag_SUPERVISE` | "Restore Built-in Defaults" | | removes it |
-| 34 | 33 | (closes Defaults) | GROUP_END | | | |
+| 24 | 52 | Scene Light | popup | Auto \| Day \| Night | Auto | `sceneLight` |
+| 25 | 53 | Lens Focal | popup | Auto \| Camera (recorded focal) \| Calibration (each lens) | Auto | `lensFocal` |
+| 26 | 8 | (closes Stitching) | GROUP_END | | | |
+| 27 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
+| 28 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 \| Osmo 360 | Osmo 360 | `dlogmFit` |
+| 29 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
+| 30 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
+| 31 | 14 | Program Monitor Colour | popup | Sequence space (fast) \| Match Source monitor | Sequence space | `directColour` |
+| 32 | 13 | (closes Advanced) | GROUP_END | | | |
+| 33 | 30 | Defaults | topic (GROUP_START, starts collapsed) | | | |
+| 34 | 31 | Save | button, `PF_ParamFlag_SUPERVISE` | "Save as Default for New Clips" | | writes the user defaults file |
+| 35 | 32 | Restore | button, `PF_ParamFlag_SUPERVISE` | "Restore Built-in Defaults" | | removes it |
+| 36 | 33 | (closes Defaults) | GROUP_END | | | |
 
 The Defaults group is always last and its indices are defined relative to
 the Advanced terminator, so a control added to an earlier group moves them
 without renumbering; ids 20-29 are left to the Stitching group. The lens
 shading correction's ids (34-35) come after every id already shipped, the
-steady seam's (40-41) after those, the HDR peak's (46) after those, and the
-transfer function's (50) after those.
+steady seam's (40-41) after those, the HDR peak's (46) after those, the
+transfer function's (50) after those, and Scene Light and Lens Focal (52-53)
+after those.
 See "User defaults for new clips" below.
 
 An effect saved before ids 15-19 (or 34-35, or 40-41) existed has no stored
@@ -784,6 +787,29 @@ and a clip it does not suit falls back to the per-moment corrections by
 itself. Also in the importer dialog ("Parallax
 grid", "Lens alignment") and osvtool (`seam --lens-align`, `seam --steady`,
 `seam --regions` for the ground / sky / wing scores).
+
+#### Scene Light and Lens Focal (ids 52-53)
+
+Two choices that only matter when the clip says so. Both are Auto for new
+clips, and both read an older project's zero byte (`PrefsBlob` offsets 56-57)
+as Auto: Auto leaves every day clip and the sample clip bit-identical to the
+build before, so an old project of a night clip gets the fix with no visit
+to Source Settings.
+
+| Control | What it does | Measured |
+|---|---|---|
+| Scene Light | Picks the photometric profile (`include/osv/render/SceneLight.h`). **Auto** reads the camera's own metered light value (`aecLv`, median over the clip; EV100 from ISO, shutter and aperture on a firmware that does not record it). Only when that is dark (LV below 6) does it look at the sky: the zenith cap (elevation 45 deg and up, after levelling on the measured gravity) of three fixed frames at 10 / 50 / 90 % of the clip, robust median luminance on flat pixels away from lamps, against metered grey. Night needs both: LV below 6 AND a sky at least 1.5 stops below grey; a bright or blue sky (an ND filter) is Day. **Night**: the sky seam fix's gain field decays over 6 deg instead of 20, carries luma only and clamps at 0.75 stop per cell; Exposure Match and Lens Shading are off on every path. **Day**: today's profile. | The night driving clip: LV 3.7, sky -2.0 stops (LRF and 8K OSV alike), so Night. A user's day clip LV 13.3, the sample LV 9.9: Day, without decoding a pixel. On the night LRF the correction 10-30 deg from the seam - the halo band - falls from 0.36-0.44 to 0.05-0.06 codes (frame 1500), and its breathing over frames 1460-1619 from a -4.5..+3.3 code swing (frame-to-frame RMS 0.111) to -0.7..+0.3 (0.016); the field still evens the seam itself (sky step 0.81 codes against 0.85 with no correction). |
+| Lens Focal | Where each lens's focal length comes from. **Auto**: the camera's recorded `digital_focal_length` where it matches each lens's calibration within 0.5 % (the 6K mode), each lens's own calibration elsewhere (8K mode, whose recorded value is 1.3-2.7 % off). **Camera**: the recorded value whenever it fits the stream size (within 1.2x), the rule before the 8K mode was measured. **Calibration**: each lens's own, always. The LRF proxy takes the calibration under all three (its recorded value is the full-size clip's). | Auto is the rule the plug-ins stitch with by default, bit for bit. The lens alignment and steady seam caches key on the rig, so a change re-measures them. |
+
+The Properties panel shows the decision under the camera settings, for
+example "Scene light: Night (auto: LV 3.7, sky -2.0 stops)", and the log says
+how it was reached ("scene light: 'x.LRF': sky -1.99 stops against metered
+grey (B/G -0.15) from 3 of 3 sample frames in 184 ms"). A dark clip's sky is
+measured once per process on a background worker from its first non-draft
+frame: Exact frames wait for it (once per clip, up to 30 s), Interactive ones
+render with the day profile until it lands and are marked non-exact.
+`osvtool render --scene-light auto|day|night` and `--lens-focal
+auto|camera|calibration` set the same choices.
 
 #### Transfer Function (HDR) (id 50)
 
