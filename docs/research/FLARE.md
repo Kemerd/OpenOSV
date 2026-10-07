@@ -637,7 +637,7 @@ was removed or why nothing was. The first line is from a test run on the
 sample; the others show the formats of the other outcomes:
 
 ```
-flare: 'example_footage_dlogm.OSV' frame 3: master lens: sun 10.0 deg off axis, 2 ghosts removed (+23% at (1183, 1548), +7% at (833, 1290)); slave lens: no sun
+flare: 'example_footage_dlogm.OSV' frame 3: master lens: sun 10.0 deg off axis, 2 ghosts removed (+23% at (1183, 1548), +7% at (833, 1290)); slave lens: no sun; scene metered at EV100 9.0
 flare: 'CAM_0001.OSV': no sun in either lens at frame 12; nothing to remove
 flare: 'CAM_0001.OSV': sun ghost removal is off in Source Settings
 flare: 'CAM_0001.OSV': the D-Log M passthrough output is not treated (it blends in log code); rendering without ghost removal
@@ -832,7 +832,12 @@ line per clip:
     flare: '<clip>': scene metered at EV100 3.3 at frame 1771, too dark for
     the sun to be in view; nothing to remove
 
-An unknown EV100 (a field not recorded) keeps the old behaviour. Through an
+The once-per-clip model line ends with the brightness the frame was judged
+by ("scene metered at EV100 9.0", or "scene brightness not recorded"), so the
+log shows that the importer handed the stage the frame's exposure; the
+importer test "the importer hands the ghost stage the frame's metered
+exposure" reads it back for the sample. An unknown EV100 (a field not
+recorded) keeps the old behaviour. Through an
 ND filter EV100 reads darker, never brighter: removal is lost only past
 about 5 stops of ND at sunset or 8-9 at noon, and then the ghost stays -
 the safe failure. osvtool's classic engine has no flare path (`--flare` is

@@ -215,7 +215,8 @@ double FlareStage::sceneEv100(const meta::MetadataTrack& track, std::uint32_t in
     }
 }
 
-void FlareStage::logModelOnce(const std::string& clip, std::uint32_t frame, const render::FlareModel& model) noexcept {
+void FlareStage::logModelOnce(const std::string& clip, std::uint32_t frame, const render::FlareModel& model,
+                              double sceneEv100) noexcept {
     try {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -224,8 +225,12 @@ void FlareStage::logModelOnce(const std::string& clip, std::uint32_t frame, cons
             }
             m_loggedModel = true;
         }
-        PluginLog::info("flare: '{}' frame {}: {}; {}", clip, frame, describeLens(model.lens[1], 1),
-                        describeLens(model.lens[0], 0));
+        // The brightness last: the lens descriptions keep their place in the
+        // line, and an unknown value says so rather than printing "nan".
+        PluginLog::info("flare: '{}' frame {}: {}; {}; {}", clip, frame, describeLens(model.lens[1], 1),
+                        describeLens(model.lens[0], 0),
+                        std::isfinite(sceneEv100) ? std::format("scene metered at EV100 {:.1f}", sceneEv100)
+                                                  : std::string("scene brightness not recorded"));
     } catch (...) {
         // Formatting can only fail on allocation; the log line is optional.
     }
@@ -424,7 +429,7 @@ FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePai
                                      "images {:.1f}); {} + {} ghosts",
                                      index, bucket, ms + checkMs, checkMs, sampleMs,
                                      entry->model.lens[1].ghosts.size(), entry->model.lens[0].ghosts.size());
-                    logModelOnce(clip, index, entry->model);
+                    logModelOnce(clip, index, entry->model, params.sceneEv100);
                     own = entry;
                     std::lock_guard<std::mutex> lock(m_mutex);
                     storeLocked(bucket, own);
@@ -563,7 +568,7 @@ void FlareStage::workerLoop() noexcept {
             PluginLog::debug("flare: bucket {} (frame {}) measured in the background in {:.0f} ms{}", job.bucket,
                              job.frame, ms, stored ? "" : " - discarded, settings changed");
             if (stored) {
-                logModelOnce(job.clip, job.frame, entry->model);
+                logModelOnce(job.clip, job.frame, entry->model, job.params.sceneEv100);
             }
         } else {
             PluginLog::debug("flare: bucket {} (frame {}) failed in the background after {:.0f} ms ({})", job.bucket,

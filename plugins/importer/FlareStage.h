@@ -213,8 +213,12 @@ private:
                                                             const render::FlareSunFixes& suns,
                                                             const render::FlareParams& params, ThreadPool* pool);
 
-    /// Log the first measured model of the clip (once per reset).
-    void logModelOnce(const std::string& clip, std::uint32_t frame, const render::FlareModel& model) noexcept;
+    /// Log the first measured model of the clip (once per reset), with the
+    /// scene brightness the frame was judged by (`sceneEv100`, NaN when not
+    /// recorded) - the one place the log shows that the importer handed the
+    /// stage the frame's metered exposure.
+    void logModelOnce(const std::string& clip, std::uint32_t frame, const render::FlareModel& model,
+                      double sceneEv100) noexcept;
 
     /// Log why a frame has no removal (once per reason per reset).
     void logReasonOnce(int reason, const std::string& text) noexcept;
