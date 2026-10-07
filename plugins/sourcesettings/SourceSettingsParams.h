@@ -420,8 +420,8 @@
  * Which photometric profile the seam corrections run with
  * (osv/render/SceneLight.h).  "Auto" reads the camera's metered light and,
  * when that is dark, confirms it with the sky above the levelled horizon:
- * Night only when both are dark.  "Night" shortens the sky seam fix to a
- * luma-only band near the seam and drops the exposure match and the lens
+ * Night only when both are dark.  "Night" narrows the sky seam fix to a
+ * short band around the overlap and drops the exposure match and the lens
  * shading correction, which street lights and a noisy black sky mislead.
  * "Day" is the profile every clip had before.  Default 1 = Auto, which is
  * also what an older project's zero byte reads as (it changes no day clip). */

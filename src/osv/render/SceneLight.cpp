@@ -204,15 +204,22 @@ MeteredLight meteredLightOf(const meta::MetadataTrack& track, std::uint32_t fram
         if (n == 0) {
             return MeteredLight{};
         }
-        const std::uint32_t samples = std::clamp<std::uint32_t>(maxSamples, 2u, n);
+        // A one-frame clip (or a one-sample track) has exactly one frame to
+        // read.  It is handled before the clamp: std::clamp needs lo <= hi,
+        // and the spread below divides by samples - 1.
+        const std::uint32_t samples = n == 1u ? 1u : std::clamp<std::uint32_t>(maxSamples, 2u, n);
 
         // ---- evenly spread frames, first and last always included -----------------
         std::vector<meta::CameraFrame> cams;
         cams.reserve(samples);
         std::uint32_t previous = std::numeric_limits<std::uint32_t>::max();
         for (std::uint32_t k = 0; k < samples; ++k) {
-            const auto index = static_cast<std::uint32_t>(std::llround(
-                static_cast<double>(k) * static_cast<double>(n - 1u) / static_cast<double>(samples - 1u)));
+            // samples == 1 only for n == 1: the one frame is frame 0.
+            const auto index = samples == 1u
+                                   ? 0u
+                                   : static_cast<std::uint32_t>(std::llround(static_cast<double>(k) *
+                                                                             static_cast<double>(n - 1u) /
+                                                                             static_cast<double>(samples - 1u)));
             if (index == previous) {
                 continue;  // a short clip: the spacing rounds onto the same frame
             }
@@ -624,7 +631,8 @@ std::string sceneLightEvidence(const SceneLightVerdict& verdict) {
 // =============================================================================
 void applyNightPhotoProfile(PhotoSeamParams& params) noexcept {
     params.decayDeg = kNightPhotoDecayDeg;
-    params.chromaDecayScale = kNightPhotoChromaDecayScale;
+    // chromaDecayScale stays as it is: at decay 6 the chroma ramp is 3 deg,
+    // continuous with the full chroma inside the overlap (0 would be an edge).
     params.maxAbsLog2Gain = kNightPhotoMaxAbsLog2Gain;
 }
 

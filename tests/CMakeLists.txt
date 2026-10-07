@@ -201,8 +201,10 @@ endif()
 #
 #  A separate executable because the comparison needs the plug-in engine's
 #  AudioDecoder (plugins/importer/ImporterAudio.cpp), which osv_tests does not
-#  link.  CPU-only: AAC decoding is plain FFmpeg, nothing here opens NVDEC,
-#  CUDA or D3D11VA.
+#  link.  It also carries the importer's SceneLightStage for the same reason
+#  (its request identity and answer cache, on files no decoder opens).
+#  CPU-only: AAC decoding is plain FFmpeg, nothing here opens NVDEC, CUDA or
+#  D3D11VA.
 # -----------------------------------------------------------------------------
 if(TARGET osvtool)
   set(_osv_cli_importer "${CMAKE_SOURCE_DIR}/plugins/importer")
@@ -215,7 +217,9 @@ if(TARGET osvtool)
   add_executable(osv_cli_tests
     cli/TestMain.cpp
     cli/test_vegas_cli.cpp
+    cli/test_scene_light_stage.cpp   # the importer's Scene Light stage: request identity, answer cache
     "${_osv_cli_importer}/ImporterAudio.cpp"
+    "${_osv_cli_importer}/SceneLightStage.cpp"
     "${_osv_cli_log}")
   target_include_directories(osv_cli_tests PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"

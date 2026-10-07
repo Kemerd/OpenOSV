@@ -25,10 +25,17 @@
 // directions, rig, blend, colour decode), never on which frame a host asked
 // for first, so it is cached process-wide: the Source monitor's instance,
 // the new one Premiere opens on each Source Settings change and the engine's
-// instance for the direct path all share one measurement.  Measurements run
-// one at a time under a process-wide mutex, so two instances of the same
-// clip measure it once.  No disk cache: the measurement is a few hundred
-// milliseconds once per session, for night clips only.
+// instance for the direct path all share one measurement.  A request being
+// measured is marked in flight process-wide, so a second instance of the same
+// clip waits for that answer (polling its own cancellation) instead of
+// decoding the clip twice; different clips measure side by side, so one
+// stuck decode never holds up another clip.  Only real answers are cached: a
+// measured cap, or a sky that every sample frame showed to be unusable - a
+// frame that would not decode is measured again by the next request.  A file
+// whose size or write time cannot be read is still recognised as the same
+// request by its own instance, but shares nothing.  No disk cache: the
+// measurement is a few hundred milliseconds once per session, for night
+// clips only.
 //
 // LOCKS
 // -----
@@ -103,8 +110,10 @@ public:
     /// when settled.  Safe with the instance lock held.
     bool waitSettled(std::chrono::milliseconds timeout);
 
-    /// Stop and join the worker.  May wait for one sample frame's measurement.
-    /// Leaves the stage ready for a new request.
+    /// Stop and join the worker.  May wait for one sample frame's measurement
+    /// (a worker waiting on another instance's measurement leaves within
+    /// 50 ms).  Leaves the stage ready for a new request; called by the
+    /// destructor and by the instance's quiet (releaseHeavy).
     void stop() noexcept;
 
 private:

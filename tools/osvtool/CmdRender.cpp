@@ -851,10 +851,11 @@ int runRender(const RenderOptions& o) {
     }
     shadingParams.strength = o.shadingStrength;
     // ---- Scene Light: the night profile for this pipeline's own analyses ---------------
-    // Night shortens the gain field to a luma-only 6 deg decay clamped at 0.75
-    // stop (overriding --photo-decay), turns the lens shading correction off
-    // and leaves --gain's exposure match out on every frame, the field-refused
-    // fallback included - exactly the plug-ins' night profile.
+    // Night shortens the gain field's decay to 6 deg (chroma 3, full inside
+    // the overlap) and clamps it at 0.75 stop (overriding --photo-decay),
+    // turns the lens shading correction off and leaves --gain's exposure
+    // match out on every frame, the field-refused fallback included -
+    // exactly the plug-ins' night profile.
     render::SceneLight scene = render::SceneLight::Day;
     if (o.sceneLight == "night") {
         scene = render::SceneLight::Night;
@@ -1614,7 +1615,7 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
                        "plugin engine: auto (default; the recorded focal where it matches each lens's calibration) "
                        "| camera (the recorded focal whenever it fits the stream) | calibration (each lens's own)");
     engine->add_option("--scene-light", opt->sceneLight,
-                       "auto | day | night: the photometric profile (night: a short luma-only sky seam field, no "
+                       "auto | day | night: the photometric profile (night: a short, narrow sky seam field, no "
                        "exposure match, no lens shading).  Default: auto with the plugin engine (the camera's "
                        "metered light, confirmed by the sky); day with --engine classic");
 

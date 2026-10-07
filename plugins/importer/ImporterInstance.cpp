@@ -1033,6 +1033,11 @@ void ImporterInstance::releaseHeavy() noexcept {
     stopParallaxWorker();
     m_flare.stop();   // [WP-FLARE] the same rule: its worker never takes m_mutex
     m_steady.stop();  // [WP-STEADY] likewise; what it measured stays in the process-wide caches
+    // Scene Light: the sky measurement holds a decoder of its own on the clip
+    // file; its worker never takes m_mutex either.  A verdict already taken
+    // stays; an unfinished one is asked for again by the next non-draft frame
+    // (the process-wide answer cache usually has it by then).
+    m_sceneStage.stop();
 
     // Order matters: the audio decoder owns its own AVFormatContext and OS
     // handle, the reader owns two decoders; both must go before the mapping
@@ -2035,9 +2040,10 @@ render::PhotoSeamParams ImporterInstance::photoParamsLocked() const noexcept {
     default: params.mode = render::PhotoSeamMode::Off; break;
     }
     params.strength = m_prefs.photoStrengthPercent() / 100.0;
-    // Scene Light: at night a short, luma-only, gently clamped field - the
-    // 20 deg decay painted a halo band into a crushed black sky.  Day keeps
-    // every default, so a day clip renders exactly as before.
+    // Scene Light: at night a short, gently clamped field - the 20 deg decay
+    // painted a halo band into a crushed black sky.  Luma decays over 6 deg
+    // beyond the overlap, chroma (full inside it) over 3.  Day keeps every
+    // default, so a day clip renders exactly as before.
     if (nightProfileLocked()) {
         render::applyNightPhotoProfile(params);
     }

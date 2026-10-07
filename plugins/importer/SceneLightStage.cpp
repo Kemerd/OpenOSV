@@ -17,6 +17,7 @@
 #include <format>
 #include <map>
 #include <memory>
+#include <set>
 #include <system_error>
 #include <utility>
 
@@ -61,18 +62,33 @@ private:
     std::uint64_t m_h = 1469598103934665603ull;
 };
 
+/// A request's identity, and whether its answer may be shared.
+struct RequestKey {
+    /// Equal for the same request.  Empty only when hashing itself failed
+    /// (out of memory), and then every request counts as a new one.
+    std::string id;
+    /// The clip file was inspected (size and write time read): the answer may
+    /// go into the process-wide cache.  False: this instance still knows its
+    /// own request again, but nothing is shared - another file could sit
+    /// behind the same path tomorrow.
+    bool shareable = false;
+};
+
 /// The request's identity: the clip FILE (absolute path, size, write time -
 /// an edited file is another clip), the frames and their up directions, the
-/// rig, the blend, the colour decode and the cap parameters.  Empty when the
-/// file cannot be inspected (then nothing is cached and the job still runs).
-[[nodiscard]] std::string requestKey(const SceneLightRequest& r) noexcept {
+/// rig, the blend, the colour decode and the cap parameters.  A file that
+/// cannot be inspected still gets an identity (its path and everything else),
+/// just not a shareable one.
+[[nodiscard]] RequestKey requestKey(const SceneLightRequest& r) noexcept {
     try {
         Hasher h;
+        RequestKey key;
         // ---- the file ------------------------------------------------------------
         std::error_code ec;
-        const std::filesystem::path abs = std::filesystem::absolute(r.path, ec);
-        if (ec) {
-            return {};
+        std::filesystem::path abs = std::filesystem::absolute(r.path, ec);
+        const bool absolute = !ec;
+        if (!absolute) {
+            abs = r.path;  // the path as given still names this request
         }
         std::u8string u8 = abs.u8string();
         for (char8_t& c : u8) {
@@ -82,16 +98,21 @@ private:
             }
         }
         h.bytes(u8.data(), u8.size());
-        const std::uintmax_t size = std::filesystem::file_size(abs, ec);
-        if (ec) {
-            return {};
+        // Size and write time make the key a FILE's (an edited clip is another
+        // clip); without them it is only this instance's request.
+        std::uintmax_t size = 0;
+        std::filesystem::file_time_type mtime{};
+        if (absolute) {
+            size = std::filesystem::file_size(abs, ec);
+            if (!ec) {
+                mtime = std::filesystem::last_write_time(abs, ec);
+            }
+            key.shareable = !ec;
         }
-        const auto mtime = std::filesystem::last_write_time(abs, ec);
-        if (ec) {
-            return {};
+        if (key.shareable) {
+            h.u64(static_cast<std::uint64_t>(size));
+            h.u64(static_cast<std::uint64_t>(mtime.time_since_epoch().count()));
         }
-        h.u64(static_cast<std::uint64_t>(size));
-        h.u64(static_cast<std::uint64_t>(mtime.time_since_epoch().count()));
         h.u64(r.containerSamples ? 1u : 0u);
 
         // ---- the frames and how they are levelled -----------------------------------
@@ -137,7 +158,10 @@ private:
                                p.minAlpha}) {
             h.f64(v);
         }
-        return std::format("s1|{:016x}", h.value());
+        // The two kinds never collide: an unshareable id is never looked up
+        // in the process-wide cache anyway, but a log line can tell them apart.
+        key.id = std::format("{}|{:016x}", key.shareable ? "s1" : "s1-local", h.value());
+        return key;
     } catch (...) {
         return {};
     }
@@ -152,19 +176,63 @@ private:
 /// it forever.
 constexpr std::size_t kMaxCachedAnswers = 256;
 
-/// Everything shared between instances.  `measure` is held for a whole
-/// measurement, so two instances of the same clip decode it once (the second
-/// finds the first's answer when it gets the mutex).
+/// Everything shared between instances, behind `cacheMutex`.  `inFlight`
+/// holds the requests some worker is measuring right now: a second instance
+/// of the same clip waits on `cv` for that answer instead of decoding the
+/// clip twice (polling its own cancellation), while different clips measure
+/// side by side - one stuck decode never holds up another clip, and a
+/// cancelled job never waits behind someone else's measurement.
 struct Global {
     std::mutex cacheMutex;
+    std::condition_variable cv;
     std::map<std::string, SceneLightStage::Snapshot> answers;
-    std::mutex measure;
+    std::set<std::string> inFlight;
 };
 
 Global& global() {
     static Global g;
     return g;
 }
+
+/// How often a job waiting for another instance's measurement of the same
+/// request re-checks its own cancellation.
+constexpr std::chrono::milliseconds kInFlightPoll{50};
+
+/// A worker's claim on one request key in Global::inFlight: released (and
+/// the waiters woken) on every way out of the job - done, cancelled or
+/// thrown.
+class InFlightClaim {
+public:
+    InFlightClaim() = default;
+    InFlightClaim(const InFlightClaim&) = delete;
+    InFlightClaim& operator=(const InFlightClaim&) = delete;
+    ~InFlightClaim() { release(); }
+
+    /// Hold `key` (already inserted into inFlight by the caller).
+    void hold(std::string key) noexcept { m_key = std::move(key); }
+
+    /// Drop the claim and wake every waiter.  Idempotent.
+    void release() noexcept {
+        if (m_key.empty()) {
+            return;
+        }
+        Global& g = global();
+        try {
+            std::lock_guard<std::mutex> lock(g.cacheMutex);
+            g.inFlight.erase(m_key);
+        } catch (...) {
+            // std::mutex::lock only throws on a system error.  The claim then
+            // stays: a waiter for this request keeps polling until it is
+            // cancelled, and its Exact frames render the day profile after
+            // their bounded wait - never a hang, never a crash.
+        }
+        m_key.clear();
+        g.cv.notify_all();
+    }
+
+private:
+    std::string m_key;
+};
 
 /// The cached answer for `key`, if any.
 [[nodiscard]] std::optional<SceneLightStage::Snapshot> cachedAnswer(const std::string& key) {
@@ -286,19 +354,24 @@ void SceneLightStage::request(const SceneLightRequest& request, const std::strin
                             clipName);
             return;
         }
-        const std::string key = requestKey(request);
+        // Identity (is this the request already in force?) and cacheability
+        // (may the answer be shared?) are separate: a file whose size or write
+        // time cannot be read is still the same request frame after frame, it
+        // just never enters the process-wide cache (an empty cache key).
+        const RequestKey identity = requestKey(request);
+        const std::string key = identity.shareable ? identity.id : std::string();
 
         // ---- the same request: nothing to do ------------------------------------------
         std::thread previous;
         std::uint64_t gen = 0;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_state.active && !key.empty() && key == m_key) {
+            if (m_state.active && !identity.id.empty() && identity.id == m_key) {
                 return;
             }
             // A new request: the old job (if any) is abandoned between frames.
             gen = m_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
-            m_key = key;
+            m_key = identity.id;
             m_state = Snapshot{};
             m_state.active = true;
             previous = std::move(m_worker);
@@ -401,17 +474,40 @@ void SceneLightStage::runJob(SceneLightRequest job, std::string key, std::uint64
         const auto t0 = Clock::now();
         Snapshot result;
         {
-            // ---- one measurement at a time, process-wide ------------------------------------
-            std::unique_lock<std::mutex> measureLock(global().measure);
-            if (stale(gen)) {
-                return;
-            }
-            // Another instance of the clip may have measured it while this
-            // job waited for the mutex.
-            if (std::optional<Snapshot> hit = cachedAnswer(key)) {
-                measureLock.unlock();
-                publish(gen, *hit);
-                return;
+            // ---- one measurement per request, process-wide ------------------------------------
+            // A second instance of the same clip waits for the first's answer
+            // instead of decoding the clip again, re-checking its own
+            // cancellation every kInFlightPoll so a stop() or a new request
+            // never waits behind someone else's measurement.  Unshareable
+            // requests (empty key) skip all of it and simply measure.
+            InFlightClaim claim;
+            if (!key.empty()) {
+                std::optional<Snapshot> hit;
+                {
+                    Global& g = global();
+                    std::unique_lock<std::mutex> lock(g.cacheMutex);
+                    for (;;) {
+                        if (stale(gen)) {
+                            return;  // cancelled while waiting; nothing claimed
+                        }
+                        if (const auto it = g.answers.find(key); it != g.answers.end()) {
+                            hit = it->second;  // another instance just measured it
+                            break;
+                        }
+                        if (g.inFlight.count(key) == 0) {
+                            g.inFlight.insert(key);  // this job measures it
+                            claim.hold(key);
+                            break;
+                        }
+                        g.cv.wait_for(lock, kInFlightPoll);
+                    }
+                }
+                if (hit) {
+                    hit->fromCache = true;
+                    hit->millis = 0.0;
+                    publish(gen, *hit);
+                    return;
+                }
             }
 
             // ---- decode and measure each sample frame -----------------------------------------
@@ -420,13 +516,15 @@ void SceneLightStage::runJob(SceneLightRequest job, std::string key, std::uint64
             std::vector<render::SkyCap> caps;
             caps.reserve(job.frames.size());
             std::string lastFailure;
+            std::size_t undecoded = 0;
             for (std::size_t i = 0; i < job.frames.size(); ++i) {
                 if (stale(gen)) {
-                    return;  // abandoned between frames; nothing cached
+                    return;  // abandoned between frames; nothing cached, the claim goes
                 }
                 const std::uint32_t frame = job.frames[i];
                 auto pair = reader.read(frame);
                 if (!pair.ok()) {
+                    ++undecoded;
                     lastFailure = std::format("frame {} could not be decoded ({})", frame, pair.error().message);
                     PluginLog::debug("scene light: '{}': {}", clipName, lastFailure);
                     continue;
@@ -455,7 +553,20 @@ void SceneLightStage::runJob(SceneLightRequest job, std::string key, std::uint64
                 result.failure = lastFailure.empty() ? std::string("no sample frame could be measured") : lastFailure;
             }
             result.millis = msSince(t0);
-            storeAnswer(key, result);
+            // ---- remember only a real answer --------------------------------------------------
+            // A cap measured, or every frame decoded and the sky itself was
+            // unusable (too little of it): that is the clip's answer.  A frame
+            // that would not decode is a transient failure, NOT a verdict -
+            // caching it would serve Day to every later instance of the clip
+            // for the rest of the session, so the next request measures again.
+            if (combined.valid || undecoded == 0) {
+                storeAnswer(key, result);
+            } else {
+                PluginLog::debug("scene light: '{}': {} of {} sample frames could not be decoded; the answer is not "
+                                 "cached, a later request measures again",
+                                 clipName, undecoded, job.frames.size());
+            }
+            claim.release();  // waiters find the answer (or measure themselves)
         }
         if (result.cap && result.cap->valid) {
             PluginLog::info("scene light: '{}': sky {:+.2f} stops against metered grey (B/G {:+.2f}) from {} of {} "

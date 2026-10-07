@@ -9,8 +9,10 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include "SynthFisheye.h"
+#include "TestSample.h"
 
 #include "osv/color/ColorParams.h"
+#include "osv/container/OsvFile.h"
 #include "osv/core/Math.h"
 #include "osv/core/ThreadPool.h"
 #include "osv/geom/AttitudeTrack.h"
@@ -24,6 +26,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -187,6 +190,51 @@ TEST_CASE("the metered light is the camera's LV median, EV100 when most frames l
         const meta::MetadataTrack empty;
         CHECK_FALSE(render::meteredLightOf(empty, 1000).valid);
     }
+}
+
+TEST_CASE("the metered light of a one-frame clip reads that one frame", "[scenelight][sample]") {
+    // n = min(frameCount, track samples) == 1 is the case a std::clamp(.., 2, n)
+    // would get wrong (lo > hi); the sample clip's own track stands in for a
+    // one-frame clip by asking for its first frame only.
+    OSV_REQUIRE_SAMPLE();
+    // The track keeps a pointer to its file, so both live on the heap together.
+    struct Sample {
+        OsvFile file;
+        meta::MetadataTrack track;
+    };
+    auto s = std::make_unique<Sample>();
+    auto file = OsvFile::open(osvtest::sampleOsv());
+    REQUIRE(file.ok());
+    s->file = std::move(file).value();
+    auto track = meta::MetadataTrack::load(s->file);
+    REQUIRE(track.ok());
+    s->track = std::move(track).value();
+    REQUIRE(s->track.frameCount() > 1u);
+
+    // ---- one frame of video: exactly frame 0, whatever maxSamples says -----------
+    for (const std::uint32_t maxSamples : {0u, 1u, 2u, 256u}) {
+        INFO("maxSamples " << maxSamples);
+        const render::MeteredLight one = render::meteredLightOf(s->track, 1u, maxSamples);
+        REQUIRE(one.valid);
+        CHECK(one.frames == 1u);
+        CHECK(one.fromAecLv);
+        // The aerial sample meters LV 9.88-9.89 on every frame.
+        CHECK_THAT(one.median, WithinAbs(9.89, 0.05));
+        CHECK(one.p5 == one.median);
+        CHECK(one.p95 == one.median);
+    }
+
+    // ---- two frames: the first and the last, never a frame past the end --------------
+    const render::MeteredLight two = render::meteredLightOf(s->track, 2u, 1u);
+    REQUIRE(two.valid);
+    CHECK(two.frames == 2u);
+    CHECK_THAT(two.median, WithinAbs(9.89, 0.05));
+
+    // ---- the whole clip agrees ---------------------------------------------------------
+    const render::MeteredLight all = render::meteredLightOf(s->track, s->track.frameCount());
+    REQUIRE(all.valid);
+    CHECK(all.frames == s->track.frameCount());
+    CHECK_FALSE(render::meteredLightSaysDark(all));
 }
 
 // ===========================================================================
@@ -448,7 +496,10 @@ TEST_CASE("the night profile changes only the field's reach, never the user's mo
     const render::PhotoSeamParams day = p;
     render::applyNightPhotoProfile(p);
     CHECK(p.decayDeg == 6.0);
-    CHECK(p.chromaDecayScale == 0.0);
+    // The chroma decay keeps its ratio to the luma decay (3 deg at night):
+    // a scale of 0 would end the overlap's full chroma in a hard edge.
+    CHECK(p.chromaDecayScale == day.chromaDecayScale);
+    CHECK(p.decayDeg * p.chromaDecayScale == 3.0);
     CHECK(p.maxAbsLog2Gain == 0.75);
     CHECK(p.mode == day.mode);
     CHECK(p.strength == day.strength);

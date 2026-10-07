@@ -63,10 +63,24 @@
 // 85.7, maintainer 72.0 -> 86.0 millistops), which is why only the detector
 // switches profiles.
 //
-//     sky seam fix     luma decay 20 -> 6 deg, chroma field off (decay scale
-//                      0.5 -> 0), per-cell clamp 1.5 -> 0.75 stop
+//     sky seam fix     luma decay 20 -> 6 deg; the chroma ratios, which
+//                      apply in full inside the overlap, keep their half of
+//                      it (10 -> 3 deg beyond the overlap); per-cell clamp
+//                      1.5 -> 0.75 stop
 //     exposure match   off (identity) on every path
 //     lens shading     off
+//
+// Why the chroma stays inside the overlap: the lenses differ in colour at
+// night too.  Measured on the night driving clip (Rec.709 codes, sky seam
+// step with the field's chroma / without it): Cb 0.63 / 1.59 and Cr 0.97 /
+// 2.07 (LRF frame 3000), Cb 0.42 / 1.12 and Cr 0.69 / 1.81 (frame 6000), and
+// the luma step rises above the uncorrected one without it (3.12 against
+// 2.98 at frame 3000).  A chroma decay of 0 is no answer either: the kernel
+// applies the chroma in full inside the overlap regardless, so 0 only cuts
+// it off in a hard colour edge at the overlap's border (a jump of 0.4-1.0
+// codes on average, up to 3.1 at the 95th percentile).  The day ratio's
+// 3 deg ramp ends it smoothly (0.2-0.5, p95 0.6-1.6) and keeps every seam
+// result.
 #pragma once
 
 #include "osv/color/ColorMath.h"
@@ -98,7 +112,7 @@ namespace osv::render {
 /// Which photometric profile a clip renders with.
 enum class SceneLight : std::uint8_t {
     Day = 0,    ///< Today's defaults: the profile every clip had before the detector existed.
-    Night = 1,  ///< The short-decay, luma-only field; no exposure match; no lens shading.
+    Night = 1,  ///< The short-decay, lightly clamped field; no exposure match; no lens shading.
 };
 
 /// Stable name for logs and the Properties panel ("Day" / "Night").
@@ -253,13 +267,14 @@ struct SceneLightVerdict {
 
 /// The sky seam fix's luma decay at night, degrees beyond the overlap.
 inline constexpr double kNightPhotoDecayDeg = 6.0;
-/// The chroma field's decay scale at night: 0 = a luma-only field.
-inline constexpr double kNightPhotoChromaDecayScale = 0.0;
 /// The per-cell gain clamp at night, stops.
 inline constexpr double kNightPhotoMaxAbsLog2Gain = 0.75;
 
-/// Turn `params` into the night profile's field (decay, chroma, clamp);
-/// mode and strength are the user's and stay untouched.
+/// Turn `params` into the night profile's field (luma decay, clamp).  Mode
+/// and strength are the user's and stay untouched, and so does the chroma
+/// decay SCALE: the chroma ratios keep applying in full inside the overlap
+/// and decay over half the (now 6 deg) luma decay beyond it - see the file
+/// comment for why neither "no chroma" nor a chroma decay of 0 is better.
 void applyNightPhotoProfile(PhotoSeamParams& params) noexcept;
 
 /// The lens shading correction at night: Off (its sky gate accepts lit
