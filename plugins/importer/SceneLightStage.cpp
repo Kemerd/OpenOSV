@@ -319,6 +319,14 @@ void SceneLightStage::request(const SceneLightRequest& request, const std::strin
         if (stale(gen)) {
             return;  // stop() or another request came in meanwhile
         }
+        if (m_worker.joinable()) {
+            // Only reachable if two threads drove the stage at once, which
+            // its owner's lock rules out; assigning over a running thread
+            // would terminate the host, so the request is dropped instead
+            // (the frame stays on the day profile, an Exact one after its wait).
+            PluginLog::warn("scene light: '{}': a measurement is already running; request dropped", clipName);
+            return;
+        }
         m_worker = std::thread(&SceneLightStage::runJob, this, request, key, gen, clipName);
     } catch (const std::exception& e) {
         // A thread that cannot start, or no memory for the request copy: the
