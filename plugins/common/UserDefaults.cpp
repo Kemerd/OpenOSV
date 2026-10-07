@@ -170,6 +170,10 @@ static_assert(std::size(kSceneLightTokens) == static_cast<std::size_t>(PrefsScen
               "sceneLight does not spell every PrefsSceneLight value");
 static_assert(std::size(kLensFocalTokens) == static_cast<std::size_t>(PrefsLensFocal::Count),
               "lensFocal does not spell every PrefsLensFocal value");
+// Hide Mount, in enum order (On is 0, the mask every clip always had).
+constexpr const char* kHideMountTokens[] = {"on", "off"};
+static_assert(std::size(kHideMountTokens) == static_cast<std::size_t>(PrefsHideMount::Count),
+              "hideMount does not spell every PrefsHideMount value");
 
 static_assert(std::size(kColourTokens) == static_cast<std::size_t>(PrefsColorOutput::Count),
               "colourOutput does not spell every PrefsColorOutput value");
@@ -558,6 +562,12 @@ const FieldSpec kFields[] = {
      [](const PrefsBlob& p) { return tokenJson(p.lensFocal, kLensFocalTokens); },
      [](const Json& v, PrefsBlob& p, std::string& why, bool&) {
          return tokenFrom(v, kLensFocalTokens, p.lensFocal, why);
+     }},
+    // Hide Mount, spelled by choice ("on" | "off").
+    {{"hideMount", OSV_UD_FIELD(hideMount), 0, 0},
+     [](const PrefsBlob& p) { return tokenJson(p.hideMount, kHideMountTokens); },
+     [](const Json& v, PrefsBlob& p, std::string& why, bool&) {
+         return tokenFrom(v, kHideMountTokens, p.hideMount, why);
      }},
     // Not in the Source Settings effect (only the modal dialog's hidden
     // fields and osvtool reach them), but they are settings, so they are

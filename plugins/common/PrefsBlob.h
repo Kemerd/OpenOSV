@@ -336,6 +336,28 @@ enum class PrefsLensFocal : std::uint8_t {
     Count
 };
 
+/// "Hide Mount": whether the stitch applies the calibration's occlusion
+/// polygons, the per-lens masks the camera records around its own body and
+/// mount.  Persisted, so append-only.
+///
+/// On is 0 ON PURPOSE: it is what every clip was stitched with before the
+/// setting existed (the importer hard-wired the mask on), so an older
+/// project's zero byte renders exactly as it did, and a fresh blob gets it
+/// from defaults() too.
+///
+/// Why Off exists: on a car, helmet or suction mount the two lenses' polygons
+/// can both start before the 90 deg seam plane and leave a long arc of the
+/// seam ring with no overlap at all (97.6 deg of it on a measured car clip).
+/// Inside that arc nothing can align the lenses - no flow grid, no seam
+/// table, no carved seam - so near objects crossing it (a roof line) step at
+/// a forced cut.  Off gives the stitch the full lens overlap back there; the
+/// price is that the mount itself can show.
+enum class PrefsHideMount : std::uint8_t {
+    On = 0,   ///< The calibration's occlusion polygons cut the mount out (the default).
+    Off = 1,  ///< No occlusion mask: the full lens overlap, the mount visible.
+    Count
+};
+
 #pragma pack(push, 1)
 
 /// The 128-byte preferences record.  Use defaults() to construct one,
@@ -475,7 +497,12 @@ struct PrefsBlob {
     /// PrefsLensFocal (offset 57); 0 = Auto, the focal rule every older blob
     /// renders with.
     std::uint8_t lensFocal = 0;
-    std::uint8_t reserved[70] = {};    ///< Zero; future fields.
+    // ---- Hide Mount ---------------------------------------------------------------
+    /// PrefsHideMount (offset 58), taken from the front of the reserved block
+    /// like every field before it - the version stays 1, because an older
+    /// blob's zero byte here reads as On, exactly the mask it rendered with.
+    std::uint8_t hideMount = 0;
+    std::uint8_t reserved[69] = {};    ///< Zero; future fields.
 
     /// seamInset: the default inset in tenths of a degree (2.6 deg - the
     /// render weight then ends at 95.0 deg on the calibrated 97.59 deg lens;
@@ -578,6 +605,10 @@ struct PrefsBlob {
         // the single source of truth says it.
         p.sceneLight = static_cast<std::uint8_t>(PrefsSceneLight::Auto);
         p.lensFocal = static_cast<std::uint8_t>(PrefsLensFocal::Auto);
+        // Hide Mount On: the calibration's occlusion polygons stay in the
+        // stitch, as they always were.  The zero byte, stated so the single
+        // source of truth says it; Off is the user's call per clip.
+        p.hideMount = static_cast<std::uint8_t>(PrefsHideMount::On);
         return p;
     }
 
@@ -777,6 +808,10 @@ struct PrefsBlob {
                   static_cast<std::uint8_t>(PrefsSceneLight::Auto));
         clampEnum(lensFocal, static_cast<std::uint8_t>(PrefsLensFocal::Count),
                   static_cast<std::uint8_t>(PrefsLensFocal::Auto));
+        // Hide Mount: zero (On) is the default, so a corrupt byte lands where
+        // a fresh blob is - the mask on, never a mount shown by accident.
+        clampEnum(hideMount, static_cast<std::uint8_t>(PrefsHideMount::Count),
+                  static_cast<std::uint8_t>(PrefsHideMount::On));
         if (magic != kMagic || version != kVersion) {
             magic = kMagic;
             version = kVersion;
@@ -931,6 +966,13 @@ struct PrefsBlob {
     [[nodiscard]] PrefsLensFocal lensFocalChoice() const noexcept {
         return lensFocal < static_cast<std::uint8_t>(PrefsLensFocal::Count) ? static_cast<PrefsLensFocal>(lensFocal)
                                                                              : PrefsLensFocal::Auto;
+    }
+    /// The Hide Mount choice; an out-of-range byte (an unsanitised blob)
+    /// reads as On, the mask every clip was stitched with before the choice
+    /// existed.
+    [[nodiscard]] PrefsHideMount hideMountChoice() const noexcept {
+        return hideMount < static_cast<std::uint8_t>(PrefsHideMount::Count) ? static_cast<PrefsHideMount>(hideMount)
+                                                                             : PrefsHideMount::On;
     }
     /// [WP-PHOTO] Gain-field strength in percent (code 0 = the default 100).
     [[nodiscard]] double photoStrengthPercent() const noexcept {
@@ -1145,7 +1187,12 @@ static_assert(offsetof(PrefsBlob, hdrTone) == 55, "PrefsBlob layout drifted");
 // detector, which leaves every day clip as it was (see PrefsSceneLight).
 static_assert(offsetof(PrefsBlob, sceneLight) == 56, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, lensFocal) == 57, "PrefsBlob layout drifted");
-static_assert(offsetof(PrefsBlob, reserved) == 58, "PrefsBlob layout drifted");
+// Hide Mount takes offset 58 from the front of the reserved block.  Its zero
+// reads as On - the occlusion mask the importer always applied - so an older
+// project renders exactly as before and only an explicit Off changes a clip.
+static_assert(offsetof(PrefsBlob, hideMount) == 58, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, reserved) == 59, "PrefsBlob layout drifted");
+static_assert(static_cast<int>(PrefsHideMount::On) == 0, "zero must stay Hide Mount On (the mask always applied)");
 static_assert(static_cast<int>(PrefsSceneLight::Auto) == 0, "zero must stay Scene Light Auto");
 static_assert(static_cast<int>(PrefsLensFocal::Auto) == 0, "zero must stay the default focal rule");
 static_assert(static_cast<int>(PrefsHdrPeak::Nits1000) == 0, "zero must stay the no-roll-off default");

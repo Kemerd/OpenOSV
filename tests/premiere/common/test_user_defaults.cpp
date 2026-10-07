@@ -113,6 +113,8 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
     // Scene Light and Lens Focal, both away from Auto
     p.sceneLight = static_cast<std::uint8_t>(PrefsSceneLight::Night);
     p.lensFocal = static_cast<std::uint8_t>(PrefsLensFocal::Calibration);
+    // Hide Mount away from On
+    p.hideMount = static_cast<std::uint8_t>(PrefsHideMount::Off);
     REQUIRE(p.sanitise());  // already clean: every value above is in range
     return p;
 }
@@ -207,6 +209,7 @@ TEST_CASE("the defaults file round-trips every value of every setting bit for bi
         each([](PrefsBlob& p, std::uint8_t v) { p.hdrTone = v; }, static_cast<int>(PrefsHdrTone::Count));  // [WP-HDRTONE]
         each([](PrefsBlob& p, std::uint8_t v) { p.sceneLight = v; }, static_cast<int>(PrefsSceneLight::Count));
         each([](PrefsBlob& p, std::uint8_t v) { p.lensFocal = v; }, static_cast<int>(PrefsLensFocal::Count));
+        each([](PrefsBlob& p, std::uint8_t v) { p.hideMount = v; }, static_cast<int>(PrefsHideMount::Count));
         each([](PrefsBlob& p, std::uint8_t v) { p.seamSearch = v; }, 2);
         each([](PrefsBlob& p, std::uint8_t v) { p.gainMatch = v; }, 2);
         each([](PrefsBlob& p, std::uint8_t v) { p.flareRemoval = v; }, 2);
@@ -323,6 +326,7 @@ TEST_CASE("the written file is the documented, human-readable format", "[userdef
     CHECK(text.find("\"programMonitorColour\": \"match-source\"") != std::string::npos);
     CHECK(text.find("\"hdrPeakNits\": 400") != std::string::npos);  // [WP-HDRPEAK]
     CHECK(text.find("\"hdrTone\": \"bt2408-punchy\"") != std::string::npos);  // [WP-HDRTONE]
+    CHECK(text.find("\"hideMount\": \"off\"") != std::string::npos);  // Hide Mount
     // Plain ASCII text ending with a newline.
     CHECK(std::all_of(text.begin(), text.end(), [](char c) { return static_cast<unsigned char>(c) < 0x80; }));
     REQUIRE_FALSE(text.empty());
@@ -408,6 +412,7 @@ TEST_CASE("an old file without the newer settings reads them as built-in", "[use
     CHECK(p.directColour == d.directColour);
     CHECK(p.parallax == d.parallax);
     CHECK(p.flowBackend == d.flowBackend);
+    CHECK(p.hideMount == d.hideMount);  // Hide Mount: On, the mask a file this old always meant
 }
 
 TEST_CASE("unknown keys and values this build does not understand are noted and skipped", "[userdefaults]") {
@@ -721,6 +726,44 @@ TEST_CASE("the HDR peak is saved as its nits and only the four choices read back
         R"({"format": "openosv-source-settings-defaults", "version": 1, "settings": {"hdrPeakNits": 600.0}})");
     REQUIRE(parsed.ok());
     CHECK(parsed.value().prefs.hdrPeakChoice() == PrefsHdrPeak::Nits600);
+}
+
+TEST_CASE("Hide Mount is saved as on / off and only those two words read back", "[userdefaults][hidemount]") {
+    // Both choices round-trip under the words the file documents; the
+    // built-in default (On, the occlusion mask) is spelled out too.
+    const char* const kWords[] = {"on", "off"};
+    static_assert(std::size(kWords) == static_cast<std::size_t>(PrefsHideMount::Count));
+    for (int i = 0; i < static_cast<int>(PrefsHideMount::Count); ++i) {
+        PrefsBlob p = PrefsBlob::defaults();
+        p.hideMount = static_cast<std::uint8_t>(i);
+        const std::string text = userDefaultsToJson(p);
+        const std::string expected = std::string("\"hideMount\": \"") + kWords[i] + "\"";
+        INFO(expected);
+        CHECK(text.find(expected) != std::string::npos);
+        CHECK(roundTrip(p) == p);
+    }
+    CHECK(userDefaultsToJson(PrefsBlob::defaults()).find("\"hideMount\": \"on\"") != std::string::npos);
+    // Case does not matter.
+    {
+        const auto parsed = userDefaultsFromJson(
+            R"({"format": "openosv-source-settings-defaults", "version": 1, "settings": {"hideMount": "OFF"}})");
+        REQUIRE(parsed.ok());
+        CHECK(parsed.value().prefs.hideMountChoice() == PrefsHideMount::Off);
+    }
+    // Anything else - a boolean, a number, an unknown word - is refused (and
+    // noted), and new clips keep the mask: a hand-edited typo never shows the
+    // mount on every new clip.
+    for (const char* bad : {"false", "0", "1", "\"auto\"", "\"\"", "\"of\"", "null"}) {
+        const std::string doc = std::string(R"({"format": "openosv-source-settings-defaults", "version": 1, )") +
+                                R"("settings": {"hideMount": )" + bad + "}}";
+        const auto parsed = userDefaultsFromJson(doc);
+        INFO(doc);
+        REQUIRE(parsed.ok());
+        CHECK(parsed.value().prefs.hideMountChoice() == PrefsHideMount::On);
+        const auto& notes = parsed.value().notes;
+        CHECK(std::any_of(notes.begin(), notes.end(),
+                          [](const std::string& n) { return n.find("\"hideMount\"") != std::string::npos; }));
+    }
 }
 
 TEST_CASE("the HDR transfer function is saved by name and only the five names read back",

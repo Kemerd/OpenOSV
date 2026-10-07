@@ -278,6 +278,7 @@ namespace OpenOSV.Vegas.Tests
                 { "OSV_SS_LENS_ALIGN", Choices.LensAlignment },
                 { "OSV_SS_SCENE_LIGHT", Choices.SceneLight },
                 { "OSV_SS_LENS_FOCAL", Choices.LensFocal },
+                { "OSV_SS_HIDE_MOUNT", Choices.HideMount },
                 { "OSV_SS_FIT", Choices.DlogmCurve },
                 { "OSV_SS_DEVICE", Choices.RenderDevice },
                 { "OSV_SS_SIZE", Choices.SphereSize },

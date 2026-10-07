@@ -1259,10 +1259,11 @@ template <std::size_t N>
 /// clip itself (the geometry conventions, the calibrated lens FOV and blend)
 /// or has no use for.  Given with --engine plugin they are an error, never
 /// silently ignored: a render that looks different from what was asked for
-/// is worse than one that does not start.
+/// is worse than one that does not start.  (--occlusion / --no-occlusion is
+/// not among them: on the plug-in engine it is Source Settings Hide Mount.)
 constexpr const char* kClassicOnlyOptions[] = {
     "--protector",   "--stitch-distance", "--crop-scale",   "--focal-source",   "--extrinsic-order",
-    "--extrinsic-sense", "--lens-fov",    "--feather",      "--occlusion",      "--blend",
+    "--extrinsic-sense", "--lens-fov",    "--feather",      "--blend",
     "--attitude-convention", "--smooth-sigma", "--input-encoding", "--hw",      "--threads",
     "--blend-fov",   "--blend-feather",   "--photo-decay",  "--seam-low-sigma", "--seam-interval",
 };
@@ -1404,6 +1405,14 @@ int enginePrefs(const RenderOptions& o, const CLI::App& sub, premiere::PrefsBlob
     }
     if (given("--gain")) {
         out.gainMatch = o.gain ? 1 : 0;
+    }
+    // Source Settings "Hide Mount": the same switch as the classic pipeline's
+    // calibration occlusion polygon, so --no-occlusion renders a clip exactly
+    // as Premiere does with Hide Mount Off, and --occlusion with On.  Not
+    // given: the starting settings' choice (On for the built-in defaults).
+    if (given("--occlusion")) {
+        out.hideMount =
+            static_cast<std::uint8_t>(o.pipeline.occlusionMask ? pr::PrefsHideMount::On : pr::PrefsHideMount::Off);
     }
     if (given("--parallax")) {
         out.parallax = static_cast<std::uint8_t>(o.parallax ? pr::PrefsParallax::On : pr::PrefsParallax::Off);

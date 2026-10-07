@@ -103,6 +103,8 @@ struct ControlValues {
     // ---- Scene Light and Lens Focal (popups in enum order) ------------------------
     int sceneLight = OSV_SS_SCENE_LIGHT_DEFAULT;  ///< 1-based popup value (PrefsSceneLight + 1).
     int lensFocal = OSV_SS_LENS_FOCAL_DEFAULT;    ///< 1-based popup value (PrefsLensFocal + 1).
+    // ---- Hide Mount (popup in enum order) -------------------------------------------
+    int hideMount = OSV_SS_HIDE_MOUNT_DEFAULT;  ///< 1-based popup value (PrefsHideMount + 1).
 };
 
 /// Control values -> PrefsBlob.

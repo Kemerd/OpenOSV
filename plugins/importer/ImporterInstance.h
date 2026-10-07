@@ -1385,6 +1385,10 @@ private:
 
     /// The Lens Focal choice the rig was built for (rebuildRig trigger).
     PrefsLensFocal m_rigLensFocal = PrefsLensFocal::Auto;
+    /// The Hide Mount choice m_blend's occlusion switch was built for
+    /// (rebuildRig trigger): a change re-commits the analysis blend, and every
+    /// analysis measured through the other mask is dropped with it.
+    PrefsHideMount m_rigHideMount = PrefsHideMount::On;
     /// The sky cap measurement for Scene Light Auto on a dark clip.
     SceneLightStage m_sceneStage;
     /// The clip's metered light (camera metadata), computed once on first use.

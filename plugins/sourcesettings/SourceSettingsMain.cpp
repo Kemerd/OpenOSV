@@ -187,8 +187,12 @@ static_assert(kIndexSceneLight == kIndexLensAlign + 1 && kIndexLensFocal == kInd
 static_assert(kParamIdByIndex[kIndexSceneLight - 1] == OSV_SS_ID_SCENE_LIGHT &&
                   kParamIdByIndex[kIndexLensFocal - 1] == OSV_SS_ID_LENS_FOCAL,
               "kParamIdByIndex is not aligned with the ParamIndex enum");
-static_assert(kIndexStitchTopicEnd == kIndexLensFocal + 1,
-              "the Stitching group must close immediately after Lens Focal");
+// Hide Mount follows Lens Focal, and the Stitching group closes right after it.
+static_assert(kIndexHideMount == kIndexLensFocal + 1, "Hide Mount follows Lens Focal");
+static_assert(kParamIdByIndex[kIndexHideMount - 1] == OSV_SS_ID_HIDE_MOUNT,
+              "kParamIdByIndex is not aligned with the ParamIndex enum");
+static_assert(kIndexStitchTopicEnd == kIndexHideMount + 1,
+              "the Stitching group must close immediately after Hide Mount");
 static_assert(kParamIdByIndex[kIndexPhotoSeam - 1] == OSV_SS_ID_PHOTO_SEAM &&
                   kParamIdByIndex[kIndexPhotoStrength - 1] == OSV_SS_ID_PHOTO_STRENGTH &&
                   kParamIdByIndex[kIndexSeamInset - 1] == OSV_SS_ID_SEAM_INSET,
@@ -414,6 +418,10 @@ private:
     if (const PF_ParamDef* p = def(kIndexLensFocal)) {
         c.lensFocal = static_cast<int>(p->u.pd.value);
     }
+    // Hide Mount
+    if (const PF_ParamDef* p = def(kIndexHideMount)) {
+        c.hideMount = static_cast<int>(p->u.pd.value);
+    }
     if (const PF_ParamDef* p = def(kIndexDlogmFit)) {
         c.dlogmFit = static_cast<int>(p->u.pd.value);
     }
@@ -499,6 +507,7 @@ void writeControls(PF_ParamDef* params[], const ControlValues& wanted) noexcept 
     setPopup(kIndexLensAlign, wanted.lensAlign);        // [WP-STEADY]
     setPopup(kIndexSceneLight, wanted.sceneLight);      // Scene Light
     setPopup(kIndexLensFocal, wanted.lensFocal);        // Lens Focal
+    setPopup(kIndexHideMount, wanted.hideMount);        // Hide Mount
     setPopup(kIndexDlogmFit, wanted.dlogmFit);
     setSlider(kIndexExposure, wanted.exposureStops);
     setPopup(kIndexRenderDevice, wanted.renderDevice);
@@ -797,7 +806,17 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Lens Focal", OSV_SS_LENS_FOCAL_COUNT, OSV_SS_LENS_FOCAL_DEFAULT, OSV_SS_LENS_FOCAL_ITEMS,
                   kStaticFlags, OSV_SS_ID_LENS_FOCAL);
 
-    // ---- 26. Close the Stitching group -------------------------------------
+    // ---- 26. Hide Mount ----------------------------------------------------
+    // Whether the calibration's occlusion polygons cut the camera's mount
+    // out of the stitch (On, the default and what every older project
+    // renders with) or the seam keeps the full lens overlap (Off: a car,
+    // helmet or suction mount stops stepping at a forced cut; the mount
+    // shows).
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUPX("Hide Mount", OSV_SS_HIDE_MOUNT_COUNT, OSV_SS_HIDE_MOUNT_DEFAULT, OSV_SS_HIDE_MOUNT_ITEMS,
+                  kStaticFlags, OSV_SS_ID_HIDE_MOUNT);
+
+    // ---- 27. Close the Stitching group -------------------------------------
     // PF_END_TOPIC issues its own PF_ADD_PARAM (Param_Utils.h:309-316), so the
     // terminator occupies a parameter slot of its own and everything after it
     // shifts up by one.  Leaving it out would not merely lose a divider: the
@@ -807,16 +826,16 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_STITCH_TOPIC_END);
 
-    // ---- 27. Advanced topic (collapsed: most users never touch it) ----------
+    // ---- 28. Advanced topic (collapsed: most users never touch it) ----------
     AEFX_CLR_STRUCT(def);
     PF_ADD_TOPICX("Advanced", PF_ParamFlag_START_COLLAPSED, OSV_SS_ID_ADVANCED_TOPIC);
 
-    // ---- 28. D-Log M Curve -------------------------------------------------
+    // ---- 29. D-Log M Curve -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("D-Log M Curve", OSV_SS_FIT_COUNT, OSV_SS_FIT_DEFAULT, OSV_SS_FIT_ITEMS, kStaticFlags,
                   OSV_SS_ID_DLOGM_FIT);
 
-    // ---- 29. Exposure ------------------------------------------------------
+    // ---- 30. Exposure ------------------------------------------------------
     // Valid range is the blob's own +/- 6 stops (static_asserted below the
     // handlers); the slider shows the useful +/- 3 so a drag has resolution.
     AEFX_CLR_STRUCT(def);
@@ -824,12 +843,12 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_EXPOSURE_SLIDER_MIN, OSV_SS_EXPOSURE_SLIDER_MAX, OSV_SS_EXPOSURE_DEFAULT,
                          PF_Precision_TENTHS, PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_EXPOSURE);
 
-    // ---- 30. Render Device -------------------------------------------------
+    // ---- 31. Render Device -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Render Device", OSV_SS_DEVICE_COUNT, OSV_SS_DEVICE_DEFAULT, OSV_SS_DEVICE_ITEMS, kStaticFlags,
                   OSV_SS_ID_RENDER_DEVICE);
 
-    // ---- 31. Program Monitor Colour [WP-SETTINGS] --------------------------
+    // ---- 32. Program Monitor Colour [WP-SETTINGS] --------------------------
     // What Open 360 Reframe shows when this clip's Colour Output is not the
     // sequence's working space: the scene rendered straight into it (fast,
     // the default) or Premiere's own conversion of the output (matches the
@@ -839,11 +858,11 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Program Monitor Colour", OSV_SS_DIRECT_COLOUR_COUNT, OSV_SS_DIRECT_COLOUR_DEFAULT,
                   OSV_SS_DIRECT_COLOUR_ITEMS, kStaticFlags, OSV_SS_ID_DIRECT_COLOUR);
 
-    // ---- 32. Close the Advanced group --------------------------------------
+    // ---- 33. Close the Advanced group --------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_ADVANCED_TOPIC_END);
 
-    // ---- 31-34. Defaults [WP-DEFAULTS] -------------------------------------
+    // ---- 34-37. Defaults [WP-DEFAULTS] -------------------------------------
     // Two momentary buttons: store this clip's settings as the defaults every
     // NEW clip starts from, or remove them so new clips start from the
     // built-in defaults again.  Neither changes this clip.  A button carries
@@ -1202,6 +1221,12 @@ static_assert(OSV_SS_LENS_FOCAL_COUNT == static_cast<int>(osv::premiere::PrefsLe
               "the Lens Focal popup does not list every PrefsLensFocal value");
 static_assert(OSV_SS_LENS_FOCAL_DEFAULT == static_cast<int>(osv::premiere::PrefsLensFocal::Auto) + 1,
               "the Lens Focal popup's default is not PrefsBlob::defaults()' Auto");
+// Hide Mount: the popup in enum order, default item 1 = On (the mask every
+// clip was stitched with before the control existed).
+static_assert(OSV_SS_HIDE_MOUNT_COUNT == static_cast<int>(osv::premiere::PrefsHideMount::Count),
+              "the Hide Mount popup does not list every PrefsHideMount value");
+static_assert(OSV_SS_HIDE_MOUNT_DEFAULT == static_cast<int>(osv::premiere::PrefsHideMount::On) + 1,
+              "the Hide Mount popup's default is not PrefsBlob::defaults()' On");
 static_assert(OSV_SS_PHOTO_STRENGTH_MIN == 0.0 &&
                   OSV_SS_PHOTO_STRENGTH_MAX == static_cast<double>(osv::premiere::PrefsBlob::kMaxPhotoStrengthCode - 1),
               "the Sky Seam Strength range does not match PrefsBlob::photoStrength");

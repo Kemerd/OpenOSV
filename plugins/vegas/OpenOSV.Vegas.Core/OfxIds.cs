@@ -103,6 +103,7 @@ namespace OpenOSV.Vegas.Core
         public const string LensAlignment = "lensAlignment";
         public const string SceneLight = "sceneLight";
         public const string LensFocal = "lensFocal";
+        public const string HideMount = "hideMount";
         public const string AdvancedGroup = "advancedGroup";
         public const string DlogmCurve = "dlogmCurve";
         public const string Exposure = "exposure";
@@ -116,7 +117,7 @@ namespace OpenOSV.Vegas.Core
             SeamSearch, GainMatch, Calibration, FlareRemoval, SkySeamFix, SkySeamStrength,
             SeamEdgeInset, SeamBlend, ParallaxBlend, SeamSmoothing, NearOffset, FarOffset,
             LensShading, ShadingStrength, ParallaxGrid, LensAlignment, SceneLight, LensFocal,
-            AdvancedGroup, DlogmCurve, Exposure, RenderDevice, SphereSize,
+            HideMount, AdvancedGroup, DlogmCurve, Exposure, RenderDevice, SphereSize,
         };
     }
 
@@ -276,6 +277,8 @@ namespace OpenOSV.Vegas.Core
         public static readonly ChoiceList SceneLight = new ChoiceList("Auto|Day|Night", 0);
         /// <summary>Lens Focal; default Auto.</summary>
         public static readonly ChoiceList LensFocal = new ChoiceList("Auto|Camera (recorded focal)|Calibration (each lens)", 0);
+        /// <summary>Hide Mount; default On (the calibration's occlusion mask, as every older project).</summary>
+        public static readonly ChoiceList HideMount = new ChoiceList("On|Off (full lens overlap)", 0);
         public static readonly ChoiceList DlogmCurve = new ChoiceList("DJI Refit|Pocket 3|Osmo 360|Avata 360", 2);
         /// <summary>Render Device, as the Windows build lists it.</summary>
         public static readonly ChoiceList RenderDevice = new ChoiceList("Auto|CPU|CUDA|OpenCL", 0);

@@ -73,6 +73,10 @@ inline constexpr const char* kLensAlignment = "lensAlignment";
 inline constexpr const char* kSceneLight = "sceneLight";
 /// "Lens Focal": where each lens's focal length comes from.
 inline constexpr const char* kLensFocal = "lensFocal";
+/// "Hide Mount": whether the calibration's occlusion polygons cut the
+/// camera's mount out of the stitch (On) or the seam keeps the full lens
+/// overlap (Off).
+inline constexpr const char* kHideMount = "hideMount";
 inline constexpr const char* kAdvancedGroup = "advancedGroup";
 inline constexpr const char* kDlogmCurve = "dlogmCurve";
 inline constexpr const char* kExposure = "exposure";
@@ -111,7 +115,7 @@ inline constexpr const char* kAllParams[] = {
     kSeamSearch,    kGainMatch,     kCalibration,  kFlareRemoval,    kSkySeamFix,    kSkySeamStrength,
     kSeamEdgeInset, kSeamBlend,     kParallaxBlend, kSeamSmoothing,  kNearOffset,    kFarOffset,
     kLensShading,   kShadingStrength, kParallaxGrid, kLensAlignment, kSceneLight,    kLensFocal,
-    kAdvancedGroup, kDlogmCurve,    kExposure,     kRenderDevice,  kSphereSize,
+    kHideMount,     kAdvancedGroup, kDlogmCurve,    kExposure,     kRenderDevice,  kSphereSize,
 };
 
 /// Colour Output's default, 0-based: Rec. 709.

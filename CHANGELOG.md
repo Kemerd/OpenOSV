@@ -6,6 +6,20 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## 0.5.1 (unreleased)
+
+### Added
+
+* **Hide Mount** (Source Settings, and the OpenOSV Source generator in
+  Resolve and VEGAS: On, Off). Off stops the calibration's occlusion polygons
+  from cutting the seam, so the two lenses keep their full overlap where the
+  mask used to leave none. Car, helmet or suction mount and a step at the
+  seam: set it to Off. The mount itself can show. On is the default and what
+  every existing project keeps, bit for bit. On a car-roof clip the roof
+  line where it crosses the seam steps less (0.97° to 0.63° on the proxy);
+  near parts of the car that cross the seam still step. osvtool `render
+  --no-occlusion` now renders Off on the plug-in engine too.
+
 ## [0.5.0] - 2026-10-07
 
 8K and night footage, fixed at the cause. Built on a user's car-mounted 8K

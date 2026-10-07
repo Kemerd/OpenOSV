@@ -107,7 +107,9 @@ void addPipelineOptions(CLI::App* sub, PipelineOptions& opt) {
     geomGroup->add_option("--extrinsic-sense", opt.extrinsicSense, "body2lens|lens2body")->default_str("body2lens");
     geomGroup->add_option("--lens-fov", opt.lensFovDeg, "Usable lens FOV in degrees")->default_val(195.18);
     geomGroup->add_option("--feather", opt.featherDeg, "Seam feather width in degrees")->default_val(4.0);
-    geomGroup->add_flag("--occlusion,!--no-occlusion", opt.occlusionMask, "Apply the calibration occlusion polygon");
+    geomGroup->add_flag("--occlusion,!--no-occlusion", opt.occlusionMask,
+                        "Apply the calibration occlusion polygon (render's plug-in engine: Source Settings Hide "
+                        "Mount On / Off)");
     geomGroup->add_flag("--blend,!--no-blend", opt.blend, "Feather-blend the two lenses (off = nearest lens)");
 
     auto* stabGroup = sub->add_option_group("Stabilisation");

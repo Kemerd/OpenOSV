@@ -793,6 +793,11 @@ Status ImporterInstance::rebuildRig() {
     geom::LensRig builtRig = std::move(rig).value();
 
     // Blend defaults match osvtool's (4 degree feather, occlusion polygon on).
+    //
+    // The mask is ON here whatever Hide Mount says: the lens-protector check
+    // below scores the overlap through this blend and caches its verdict per
+    // FILE, so it must not depend on a per-clip display choice.  The stitch's
+    // own mask is set from Hide Mount just before the commit.
     geom::BlendParams blend = m_blend;
     blend.lensFovDeg = 195.18;
     blend.featherDeg = 4.0;
@@ -860,6 +865,18 @@ Status ImporterInstance::rebuildRig() {
         }
     }
 
+    // ---- Hide Mount: the stitch's occlusion mask ------------------------------------
+    //
+    // On (the default, and every older project's zero byte) applies the
+    // calibration's occlusion polygons exactly as the importer always did.
+    // Off drops them from the ANALYSIS blend - so the parallax grid, the
+    // seam table, the carved seam and every photometric measurement see the
+    // full lens overlap - and from the render blend derived from it.  On a
+    // car, helmet or suction mount that is what lets the seam align the near
+    // field the polygons would otherwise cut off; the mount itself can show.
+    const PrefsHideMount hideMount = m_prefs.hideMountChoice();
+    blend.useOcclusionMask = hideMount != PrefsHideMount::Off;
+
     // ---- commit ----------------------------------------------------------------
     m_calibration = calibration;
     m_baseRig = std::move(baseRig);  // [WP-STEADY]
@@ -868,6 +885,7 @@ Status ImporterInstance::rebuildRig() {
     m_lensAlignState = alignState;   // [WP-STEADY]
     m_rigLensAlign = alignChoice;    // [WP-STEADY]
     m_rigLensFocal = focalChoice;    // Lens Focal
+    m_rigHideMount = hideMount;      // Hide Mount
 
     // The notes feed the Properties panel.  A rebuild REPLACES the previous
     // calibration / scaling / rig notes instead of piling another copy on
@@ -926,6 +944,14 @@ Status ImporterInstance::rebuildRig() {
                     : focalChoice == PrefsLensFocal::Calibration ? "Calibration"
                                                                  : "Auto",
                     geom::focalSourceName(m_rig.focalSource));
+    // Hide Mount: only an explicit Off is worth a line - it is the one
+    // setting that can put the camera's mount into the picture, so a report
+    // of "the mount shows" is answerable from the log.
+    if (hideMount == PrefsHideMount::Off) {
+        PluginLog::info("hide mount: '{}': Off - the calibration's occlusion polygons are not applied; the seam "
+                        "uses the full lens overlap and the mount can show",
+                        m_path.filename().string());
+    }
 
     // The CHOICE, not the calibration byte: Auto and a forced Native share
     // calibration 0 but can stitch with different sets (on a clip recorded
@@ -1611,9 +1637,11 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
     }
 
     // The rig only depends on the calibration choice and [WP-STEADY] on
-    // whether the lens rotation is folded into it.
+    // whether the lens rotation is folded into it.  The analysis blend is
+    // committed with it, so Hide Mount (its occlusion switch) rebuilds too.
     if (m_parsed && (!m_rigBuilt || m_rigCalibration != incoming.calibrationChoice() ||
-                     m_rigLensAlign != incoming.lensAlignChoice() || m_rigLensFocal != incoming.lensFocalChoice())) {
+                     m_rigLensAlign != incoming.lensAlignChoice() || m_rigLensFocal != incoming.lensFocalChoice() ||
+                     m_rigHideMount != incoming.hideMountChoice())) {
         const Status st = rebuildRig();
         if (!st.ok()) {
             PluginLog::warn("prefs: calibration slot {} could not be applied: {}",
@@ -2434,6 +2462,10 @@ render::PhotoRimPenaltyScope ImporterInstance::preparePhotoSeam(std::uint32_t in
         // A different rig (calibration slot, lens-protector correction)
         // invalidates every rim and gain measured with the old one.
         std::vector<double> key = photoRigKey(m_rig);
+        // Hide Mount: the field is measured through the analysis blend's
+        // occlusion mask, which Source Settings can switch without touching
+        // the rig - fields measured through the other mask are stale.
+        key.push_back(m_blend.useOcclusionMask ? 1.0 : 0.0);
         // Scene Light: each cell is clamped when it is MEASURED, so fields
         // stored under the other profile's clamp are stale too.
         key.push_back(params.maxAbsLog2Gain);
@@ -2794,6 +2826,9 @@ void ImporterInstance::prepareLensShading(std::uint32_t index, const video::Fram
         // A different rig (calibration slot, lens-protector correction) moves
         // every lens angle the models are tabulated in.
         std::vector<double> rigKey = photoRigKey(m_rig);
+        // Hide Mount: the models are measured through the analysis blend's
+        // occlusion mask too, which can change while the rig does not.
+        rigKey.push_back(m_blend.useOcclusionMask ? 1.0 : 0.0);
         if (rigKey != m_shadingRigKey) {
             m_shading.clear();
             m_shadingStandIns.clear();  // [WP-TEMPORAL] measured with the old rig too

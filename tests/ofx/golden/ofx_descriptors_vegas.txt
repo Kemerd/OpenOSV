@@ -1000,6 +1000,17 @@ plugin org.openosv.OSVSource
       OfxPropLabel : string = ["Lens Focal"]
       OfxPropName : string = ["lensFocal"]
       OfxPropType : string = ["OfxTypeParameter"]
+    param hideMount (OfxParamTypeChoice)
+      OfxParamPropAnimates : int = [0]
+      OfxParamPropChoiceOption : string = ["On", "Off (full lens overlap)"]
+      OfxParamPropDefault : int = [0]
+      OfxParamPropHint : string = ["On cuts the camera's mount out of the stitch. Off keeps the full lens overlap: the mount shows, and the seam stops stepping on a car, helmet or suction mount."]
+      OfxParamPropParent : string = ["stitchGroup"]
+      OfxParamPropScriptName : string = ["hideMount"]
+      OfxParamPropType : string = ["OfxParamTypeChoice"]
+      OfxPropLabel : string = ["Hide Mount"]
+      OfxPropName : string = ["hideMount"]
+      OfxPropType : string = ["OfxTypeParameter"]
     param advancedGroup (OfxParamTypeGroup)
       OfxParamPropGroupOpen : int = [0]
       OfxParamPropScriptName : string = ["advancedGroup"]
