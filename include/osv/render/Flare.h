@@ -239,9 +239,14 @@ struct FlareParams {
     double sceneEv100 = std::numeric_limits<double>::quiet_NaN();
 
     // ---- one sun ------------------------------------------------------------
-    /// Two lenses that each report a sun must agree on its direction within
-    /// this angle (body frame) for both to be believed.  The lens alignment
-    /// disagrees by about 1 degree RMS between the lenses; 3 covers it.
+    /// Two lenses that each report a sun must agree on its direction (body
+    /// frame) within this angle PLUS the two blobs' own angular radii - their
+    /// clipped discs must touch on the sky - for both to be believed.  The
+    /// discs carry the bias of a sun in the overlap: each lens's usable
+    /// circle cuts the disc on its own side and pulls its centroid toward
+    /// its own axis (5.7-5.9 degrees apart on a sunset clip's seam
+    /// crossings, discs of 7.9-10.2 degrees).  This angle covers the lens
+    /// alignment, which disagrees by about 1 degree RMS; 3 covers it.
     double oneSunToleranceDeg = 3.0;
     /// When they disagree, the larger blob is still the sun if its clipped
     /// area is at least this multiple of the other's (a sunset sun against
@@ -359,15 +364,19 @@ using FlareSunFixes = std::array<FlareSunFix, 2>;
 /// Each found sun is turned into a body-frame direction (the lens's
 /// unprojection, rotated back through bodyToLens).  When both lenses report
 /// one:
-///   * within params.oneSunToleranceDeg of each other, both are kept - the
-///     sun sits in the overlap and each lens sees it;
+///   * when their clipped discs touch - the directions lie within
+///     params.oneSunToleranceDeg plus both blobs' angular radii (radiusPx
+///     at the lens's radial scale where each sits) - both are kept: the sun
+///     sits in the overlap and each lens sees the part its usable circle
+///     leaves it;
 ///   * farther apart, the one whose clipped area (radiusPx squared) is at
 ///     least params.oneSunAreaRatio times the other's is kept and the other
 ///     dropped (a glint in the far lens);
 ///   * otherwise both are dropped: two similar bright blobs in two
 ///     directions are lamps, signs or reflections, not the sun.
-/// A single sun, or none, passes unchanged.  A sun whose direction cannot be
-/// computed (bad lens, bad position) counts as disagreeing; invalid
+/// A single sun, or none, passes unchanged.  A sun whose direction or size
+/// cannot be computed (bad lens, bad position or radius) counts as
+/// disagreeing; invalid
 /// parameters drop both - every doubt removes nothing.  Pure, no allocation.
 [[nodiscard]] FlareSunFixes resolveOneSun(const geom::LensRig& rig, const FlareSunFixes& fixes,
                                           const FlareParams& params) noexcept;

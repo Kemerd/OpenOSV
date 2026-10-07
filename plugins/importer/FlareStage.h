@@ -45,8 +45,18 @@
 //     reflections, lane markings and headlights on ~3 % of a night drive's
 //     frames, one frame at a time.  The answer depends only on the frame's
 //     own metadata, so it is as final as any other.
-//   * The sun check is held to one sun (render::resolveOneSun), and a lens
-//     without the sun is never analysed.
+//   * The sun check is held to one sun (render::resolveOneSun), and only a
+//     lens the check found that sun in is analysed: a lens whose check found
+//     none, or whose blob the rule dropped, gets no working image and no
+//     fits.  This is deliberately wider than dropping the rule's rejects.
+//     Before the rule the other lens was analysed at the finer factor
+//     whenever either lens had a sun, and there detectSun could crown a blob
+//     the check never saw - a glint, or a sliver of a sun mostly outside the
+//     usable circle - and fit ghosts around it with nothing holding it to
+//     the one sun.  The check is now the one judge of where the sun is, as
+//     it already is for model reuse (flareSunsMatch).  For the same reason
+//     the finer suns of two analysed lenses are not held to one sun again:
+//     both lenses are analysed only when their checks already agree on it.
 //
 // COST ON THE RENDER THREAD
 // -------------------------

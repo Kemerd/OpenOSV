@@ -857,20 +857,46 @@ value into the sun check and the fits alike.
 lens's sun into a body direction (the lens's unprojection, back through
 `bodyToLens`):
 
-* within 3 deg (`oneSunToleranceDeg`) both stand: the sun in the overlap,
-  seen by both lenses (the lens alignment disagrees by ~1 deg RMS);
+* when their clipped discs touch - the directions lie within 3 deg
+  (`oneSunToleranceDeg`; the lens alignment disagrees by ~1 deg RMS) plus
+  both blobs' angular radii (`radiusPx` at the lens's radial scale where
+  each sits) - both stand: the sun in the overlap, seen by both lenses;
 * farther apart, the one with at least 4x the clipped area
   (`oneSunAreaRatio`) stands - a sunset sun against a glint in the far lens
   measured a median 275x;
 * otherwise neither: two alike blobs in two directions are lamps.
 
-Doubt removes nothing: a position that cannot be unprojected counts as
-disagreeing, broken parameters drop both. `FlareStage` analyses - and
-downsamples - only the lens holding the kept sun, and model reuse
-(`flareSunsMatch`) compares resolved checks, so a glint in the far lens no
-longer forces a new measurement. On the sunset drive's 8K frame 10000 the
-slave's glint at 87.7 deg off axis is now dropped ("slave lens: no sun");
-the master's real sun stands.
+The discs are not optional. Each lens's usable circle (97 % of the image
+circle, ~93.6 deg off axis) cuts an overlap sun's disc on its own side and
+pulls that lens's centroid toward its own axis. On the sunset drive's seam
+crossings (`.LRF` frames 5940 and 5960, 8K frame 11880) the two centroids of
+the one sun sat 5.7-5.9 deg apart, for discs of 7.9-10.2 deg and areas only
+1.5-2x apart. A bare 3 deg test dropped the real sun in both lenses there,
+so removal and the seam's glare term went off and on at every crossing. The
+unit test paints such a disc around one direction in both lenses and runs it
+through the real detector: 5.9-6.0 deg apart, both kept.
+
+A lamp in the overlap is one source to this rule too (the night scan has
+such pairs, at mirrored azimuths on both sides of the seam): telling it from
+the sun is the scene-brightness gate's job. A clip without exposure metadata keeps only
+the image tests, as before.
+
+Doubt removes nothing: a position that cannot be unprojected, or a blob that
+cannot be sized, counts as disagreeing; broken parameters drop both. Model
+reuse (`flareSunsMatch`) compares resolved checks, so a glint in the far
+lens no longer forces a new measurement. On the sunset drive's 8K frame
+10000 the slave's glint at 87.7 deg off axis is now dropped ("slave lens: no
+sun"); the master's real sun stands.
+
+`FlareStage` analyses - and downsamples - only a lens its check found the
+kept sun in. That is deliberately wider than skipping the rule's rejects: a
+lens whose check found no sun is not analysed either, even while the other
+lens has one. Before, that lens was analysed at the finer factor, where
+`detectSun` could crown a blob the check never saw (a glint, or a sliver of
+a sun mostly outside the usable circle) and fit ghosts around it with
+nothing holding it to the one sun. The check is the one judge of where the
+sun is, as it already is for model reuse; for the same reason the two
+analysed lenses' finer suns are not held to one sun again.
 
 ### 9.4 Measured after the change
 
@@ -885,6 +911,8 @@ the master's real sun stands.
 | sample `.OSV` and `.LRF`, all 65 frames | - | byte-identical to the previous build |
 | sample frame 3 log | 2 ghosts (+23 % at (1183, 1548), +7 % at (833, 1290)) | unchanged |
 | sunset `.LRF` (17 frames from 0 to 14000) and 8K frame 10000 | sun found (12-83 deg off axis) | sun found, byte-identical |
+| sunset seam crossings: `.LRF` 5940, 5960, 8K 11880 | sun in both lenses (85-89 deg off axis) | the same, byte-identical (a bare 3 deg rule had dropped both) |
+| sunset `.LRF` 5700-6100, every frame (1024 x 512) | - | 401 of 401 byte-identical |
 
 The frame rates are the quieter of two rounds of two runs each on a shared
 GPU; in the noisier round the previous build read 4.2-4.5 fps with removal

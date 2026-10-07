@@ -744,13 +744,96 @@ TEST_CASE("two lenses cannot see two different suns", "[flare]") {
         out = render::resolveOneSun(rig, both, fp);
         REQUIRE(out[0].found);
         REQUIRE(out[1].found);
-        // ... 5 degrees apart does not, and alike blobs are then dropped.
+        // ... 5 degrees apart does not for blobs this small (10 px at 6K,
+        // ~0.7 degrees each, so their discs reach 3 + 1.5 degrees), and alike
+        // blobs are then dropped.
         const double r5 = 5.0 * kPi / 180.0;
         const Vec3d far = side * std::cos(r5) + Vec3d{0.0, 0.0, 1.0} * std::sin(r5);
         both[1] = sunAt(geom::kMasterLens, far, 10.0);
         out = render::resolveOneSun(rig, both, fp);
         REQUIRE_FALSE(out[0].found);
         REQUIRE_FALSE(out[1].found);
+        // The same 5 degrees between two LARGE blobs (150 px, ~11 degrees
+        // each) is one source: their clipped discs overlap on the sky.
+        both[0].radiusPx = 150.0;
+        both[1].radiusPx = 150.0;
+        out = render::resolveOneSun(rig, both, fp);
+        REQUIRE(out[0].found);
+        REQUIRE(out[1].found);
+        // Large blobs whose discs are far from touching are still two
+        // sources: 40 degrees apart, alike, neither is kept.
+        const double r40 = 40.0 * kPi / 180.0;
+        const Vec3d away = side * std::cos(r40) + Vec3d{0.0, 0.0, 1.0} * std::sin(r40);
+        both[1] = sunAt(geom::kMasterLens, away, 150.0);
+        out = render::resolveOneSun(rig, both, fp);
+        REQUIRE_FALSE(out[0].found);
+        REQUIRE_FALSE(out[1].found);
+    }
+
+    SECTION("a sun on the seam, cut by both lenses' usable circles, is one sun through the real detector") {
+        // The clipped disc the sun leaves in the image (the bloom spreads
+        // in the image plane) is painted around where one body direction
+        // lands in each lens, and each lens's working image goes through
+        // locateSun at the check's resolution.  Each lens's usable-circle
+        // mask (97 % of the image circle, ~93.6 degrees) then cuts the disc
+        // on its own side, which pulls each centroid toward that lens's
+        // axis - what a seam crossing on a sunset clip does (centroids
+        // 5.7-5.9 degrees apart there).
+        const std::uint32_t factor = render::flareSunCheckFactor(3000);
+        const std::uint32_t side3000 = render::flareAnalysisSize(3000, factor);
+        const auto paint = [&](int lens, const Vec3d& d, double discPx) {
+            Vec2d c;
+            double theta = 0.0;
+            REQUIRE(rig.projectBody(lens, d.normalized(), c, theta));
+            render::FlareImage img;
+            img.factor = factor;
+            img.w = side3000;
+            img.h = side3000;
+            img.rgb.assign(static_cast<std::size_t>(img.w) * img.h * 3u, 0.5f);  // sky
+            for (std::uint32_t y = 0; y < img.h; ++y) {
+                for (std::uint32_t x = 0; x < img.w; ++x) {
+                    // The analysis pixel's centre in stream px.
+                    const double sx = (x + 0.5) * factor;
+                    const double sy = (y + 0.5) * factor;
+                    if (std::hypot(sx - c.x, sy - c.y) <= discPx) {
+                        float* p = &img.rgb[(static_cast<std::size_t>(y) * img.w + x) * 3u];
+                        p[0] = p[1] = p[2] = 4.0f;  // clipped
+                    }
+                }
+            }
+            return img;
+        };
+        // The body direction a lens's fix points at.
+        const auto bodyDir = [&rig](int lens, const render::FlareSunFix& s) {
+            const Result<Vec3d> ray = rig.lens[static_cast<std::size_t>(lens)].unproject(Vec2d{s.x, s.y});
+            REQUIRE(ray.ok());
+            return (rig.bodyToLens[static_cast<std::size_t>(lens)].transposed() * ray.value()).normalized();
+        };
+
+        const Vec3d axis = rig.opticalAxisBody(geom::kMasterLens);
+        const Vec3d mid = Vec3d{axis.y, -axis.x, 0.0}.normalized();
+        // In the middle of the overlap, and 1.5 degrees toward the master.
+        const double r15 = 1.5 * kPi / 180.0;
+        for (const Vec3d& sun : {mid, mid * std::cos(r15) + axis * std::sin(r15)}) {
+            render::FlareSunFixes fixes{};
+            for (int i = 0; i < 2; ++i) {
+                fixes[static_cast<std::size_t>(i)] = render::locateSun(paint(i, sun, 150.0), rig.lens[i], fp);
+            }
+            REQUIRE(fixes[0].found);
+            REQUIRE(fixes[1].found);
+            // The cut really biases the centroids beyond the lens alignment
+            // tolerance - a bare-angle rule would call these two suns.
+            const double apartDeg = bodyDir(0, fixes[0]).angleTo(bodyDir(1, fixes[1])) * 180.0 / kPi;
+            INFO("centroids " << apartDeg << " degrees apart; radii " << fixes[0].radiusPx << " and "
+                              << fixes[1].radiusPx << " px");
+            REQUIRE(apartDeg > fp.oneSunToleranceDeg);
+            // Their areas are alike, so no winner by area could save them.
+            const double ratio = (fixes[0].radiusPx * fixes[0].radiusPx) / (fixes[1].radiusPx * fixes[1].radiusPx);
+            REQUIRE(std::max(ratio, 1.0 / ratio) < fp.oneSunAreaRatio);
+            const render::FlareSunFixes out = render::resolveOneSun(rig, fixes, fp);
+            REQUIRE(out[0].found);
+            REQUIRE(out[1].found);
+        }
     }
 
     SECTION("a resolved check matches a later one without the glint: the model is reused") {
@@ -778,6 +861,15 @@ TEST_CASE("two lenses cannot see two different suns", "[flare]") {
         render::FlareSunFixes out = render::resolveOneSun(rig, bad, fp);
         REQUIRE_FALSE(out[0].found);
         REQUIRE_FALSE(out[1].found);
+        // A blob that cannot be sized has no disc to touch the other's: even
+        // at the same direction it cannot confirm one sun.
+        for (const double r : {std::nan(""), -10.0, std::numeric_limits<double>::infinity()}) {
+            bad = both;
+            bad[0].radiusPx = r;
+            out = render::resolveOneSun(rig, bad, fp);
+            REQUIRE_FALSE(out[0].found);
+            REQUIRE_FALSE(out[1].found);
+        }
         // A rig without lenses: the same.
         out = render::resolveOneSun(geom::LensRig{}, both, fp);
         REQUIRE_FALSE(out[0].found);

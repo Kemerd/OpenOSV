@@ -1619,20 +1619,23 @@ FlareSunFixes resolveOneSun(const geom::LensRig& rig, const FlareSunFixes& fixes
         return out;
     }
 
-    // ---- each sun as a direction in the body frame ----------------------------
+    // ---- each sun as a direction in the body frame, with its angular size ----
     // d_lens = bodyToLens * d_body, and bodyToLens is a rotation, so its
     // transpose takes the lens's ray back into the body frame where the two
-    // lenses' rays can be compared.  A position the lens cannot unproject
-    // leaves `comparable` false: the suns then count as disagreeing.
+    // lenses' rays can be compared.  A position the lens cannot unproject,
+    // or a blob that cannot be sized, leaves `comparable` false: the suns
+    // then count as disagreeing.
     std::array<Vec3d, 2> dir{};
+    std::array<double, 2> discRad{};  // each blob's equivalent radius as an angle (radians)
     bool comparable = true;
     for (std::size_t i = 0; i < 2; ++i) {
         const FlareSunFix& s = fixes[i];
-        if (!rig.lens[i].isValid() || !allFinite(s.x, s.y)) {
+        const geom::KannalaBrandt5& lens = rig.lens[i];
+        if (!lens.isValid() || !allFinite(s.x, s.y, s.radiusPx) || s.radiusPx < 0.0) {
             comparable = false;
             continue;
         }
-        const Result<Vec3d> ray = rig.lens[i].unproject(Vec2d{s.x, s.y});
+        const Result<Vec3d> ray = lens.unproject(Vec2d{s.x, s.y});
         if (!ray.ok()) {
             comparable = false;
             continue;
@@ -1641,11 +1644,34 @@ FlareSunFixes resolveOneSun(const geom::LensRig& rig, const FlareSunFixes& fixes
         // normalized() answers a zero vector for a degenerate ray.
         if (!dir[i].isFinite() || !(dir[i].norm() > 0.5)) {
             comparable = false;
+            continue;
         }
+        // The blob's radius at the lens's RADIAL scale where it sits:
+        // r_px = f * theta_d(theta), so one radian there spans
+        // f * theta_d'(theta) px.  On the Osmo 360's lenses that is fewer px
+        // per radian than the tangential f * theta_d / sin(theta) at every
+        // angle of the field (0.93 f against 1.70 f at 90 degrees), so the
+        // radius read radially is the larger angle and the disc is never
+        // sized too small.
+        const double theta = std::acos(std::clamp(ray.value().z, -1.0, 1.0));
+        const double pxPerRad = 0.5 * (lens.fx + lens.fy) * lens.dThetaD(theta);
+        if (!std::isfinite(pxPerRad) || !(pxPerRad > 0.0)) {
+            comparable = false;  // the model folds back here: no size to trust
+            continue;
+        }
+        discRad[i] = s.radiusPx / pxPerRad;
     }
 
-    // ---- one direction: the sun in the overlap, seen by both lenses -----------
-    if (comparable && dir[0].angleTo(dir[1]) <= toleranceDeg * kPi / 180.0) {
+    // ---- one source: the sun in the overlap, seen by both lenses ---------------
+    // The two views agree when their clipped discs touch on the sky, give or
+    // take the lens alignment.  Comparing the bare centroids is not enough:
+    // each lens's usable-circle mask cuts an overlap sun's disc on its own
+    // side, which pulls each centroid toward that lens's axis - on a sunset
+    // clip's seam crossings the two centroids of one sun sat 5.7-5.9 degrees
+    // apart, for discs of 7.9-10.2 degrees, and a bare 3-degree test
+    // dropped the real sun in both lenses.
+    const double allowedRad = toleranceDeg * kPi / 180.0 + discRad[0] + discRad[1];
+    if (comparable && std::isfinite(allowedRad) && dir[0].angleTo(dir[1]) <= allowedRad) {
         return out;
     }
 
