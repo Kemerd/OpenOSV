@@ -17,6 +17,7 @@ const char* focalSourceName(FocalSource source) noexcept {
     switch (source) {
     case FocalSource::DigitalFocalLength: return "DigitalFocalLength";
     case FocalSource::ScaledCalibration: return "ScaledCalibration";
+    case FocalSource::DigitalFocalLengthSameStream: return "DigitalFocalLengthSameStream";
     }
     return "Unknown";
 }
@@ -100,12 +101,24 @@ Result<KannalaBrandt5> buildLens(const meta::DewarpParams& params, const char* n
                           (digitalFocalLength > calFocalScaled * kFocalStaleFactor ||
                            digitalFocalLength < calFocalScaled / kFocalStaleFactor);
 
-    if (focalSource == FocalSource::DigitalFocalLength && dflUsable && dflAgreesWithCalibration) {
+    // "Lens Focal: Camera" reads the field the way every build before the 8K
+    // measurements did: trusted whenever it describes this stream size.
+    const bool sameStreamRule = focalSource == FocalSource::DigitalFocalLengthSameStream;
+    const bool dflRequested = focalSource == FocalSource::DigitalFocalLength || sameStreamRule;
+
+    if (sameStreamRule && dflUsable && calUsable && !dflStale) {
+        lens.fx = digitalFocalLength;
+        lens.fy = digitalFocalLength;
+        notes.push_back(std::format("{}: focal {:.4f} px from digital_focal_length as recorded ({:+.2f} % from "
+                                    "calibration * scale = {:.4f})",
+                                    name, digitalFocalLength, 100.0 * (digitalFocalLength / calFocalScaled - 1.0),
+                                    calFocalScaled));
+    } else if (focalSource == FocalSource::DigitalFocalLength && dflUsable && dflAgreesWithCalibration) {
         lens.fx = digitalFocalLength;
         lens.fy = digitalFocalLength;
         notes.push_back(std::format("{}: focal {:.4f} px from digital_focal_length (calibration * scale = {:.4f})",
                                     name, digitalFocalLength, calFocalScaled));
-    } else if (focalSource == FocalSource::DigitalFocalLength && dflUsable && dflStale) {
+    } else if (dflRequested && dflUsable && dflStale) {
         // Stale or mis-scaled metadata: say so loudly (once per lens) and use
         // the calibration, which is tied to this stream through `scaling`.
         lens.fx *= scaling.scale;
@@ -131,7 +144,7 @@ Result<KannalaBrandt5> buildLens(const meta::DewarpParams& params, const char* n
         log::info("LensRig: {} focal from the calibration ({:.4f} px): digital_focal_length {:.4f} is {:+.2f} % off",
                   name, lens.fx, digitalFocalLength, 100.0 * (digitalFocalLength / calFocalScaled - 1.0));
     } else {
-        if (focalSource == FocalSource::DigitalFocalLength) {
+        if (dflRequested) {
             notes.push_back(std::format("{}: digital_focal_length unusable ({}), using scaled calibration focal",
                                         name, digitalFocalLength));
         }

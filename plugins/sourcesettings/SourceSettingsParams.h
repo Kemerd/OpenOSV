@@ -202,9 +202,16 @@
  * ids are. */
 #define OSV_SS_ID_HDR_TONE 50
 
-/* Total parameters excluding the input layer: 26 value controls + 2 buttons
+/* "Scene Light" and "Lens Focal": two NEW ids from the next free range
+ * (52-53), placed inside the Stitching group right after Lens Alignment
+ * (indices 24-25); everything after them moved up by two - indices are not
+ * persisted, ids are.  The Defaults group stays last. */
+#define OSV_SS_ID_SCENE_LIGHT 52
+#define OSV_SS_ID_LENS_FOCAL 53
+
+/* Total parameters excluding the input layer: 28 value controls + 2 buttons
  * + 6 group markers.  out_data->num_params is this + 1. */
-#define OSV_SOURCE_SETTINGS_PARAM_COUNT 34
+#define OSV_SOURCE_SETTINGS_PARAM_COUNT 36
 
 /* ==========================================================================
  *  Popup item strings
@@ -408,6 +415,37 @@
 #define OSV_SS_LENS_ALIGN_COUNT 2
 #define OSV_SS_LENS_ALIGN_DEFAULT 1
 
+/* "Scene Light" - PrefsSceneLight: Auto, Day, Night (enum order, Auto first).
+ *
+ * Which photometric profile the seam corrections run with
+ * (osv/render/SceneLight.h).  "Auto" reads the camera's metered light and,
+ * when that is dark, confirms it with the sky above the levelled horizon:
+ * Night only when both are dark.  "Night" shortens the sky seam fix to a
+ * luma-only band near the seam and drops the exposure match and the lens
+ * shading correction, which street lights and a noisy black sky mislead.
+ * "Day" is the profile every clip had before.  Default 1 = Auto, which is
+ * also what an older project's zero byte reads as (it changes no day clip). */
+#define OSV_SS_SCENE_LIGHT_ITEMS "Auto|Day|Night"
+#define OSV_SS_SCENE_LIGHT_COUNT 3
+#define OSV_SS_SCENE_LIGHT_DEFAULT 1
+/* The hint the hosts that show tooltips put on the control (the importer's
+ * dialog, the OpenFX parameter). */
+#define OSV_SS_SCENE_LIGHT_HINT "Auto reads the camera's exposure and the sky. Night calms the seam's colour matching for dark skies and street lights."
+
+/* "Lens Focal" - PrefsLensFocal: Auto, Camera, Calibration (enum order).
+ *
+ * Where each lens's focal length comes from.  "Auto" takes the camera's
+ * recorded focal where it matches each lens's calibration (the 6K mode) and
+ * each lens's own calibration elsewhere (the 8K mode, whose recorded value is
+ * 1.3-2.7 % off).  "Camera" trusts the recorded focal whenever it fits the
+ * stream (the rule before the 8K mode was measured); "Calibration" always
+ * takes each lens's own.
+ * Default 1 = Auto, an older project's zero byte. */
+#define OSV_SS_LENS_FOCAL_ITEMS "Auto|Camera (recorded focal)|Calibration (each lens)"
+#define OSV_SS_LENS_FOCAL_COUNT 3
+#define OSV_SS_LENS_FOCAL_DEFAULT 1
+#define OSV_SS_LENS_FOCAL_HINT "Auto picks the focal each recording mode measures best. Camera trusts the recorded focal; Calibration uses each lens's own. Change it only if the seam doubles straight lines."
+
 /* ==========================================================================
  *  Checkbox and slider ranges / defaults
  * ========================================================================== */
@@ -522,17 +560,19 @@ namespace osv::premiere::sourcesettings {
 ///  21    Shading Strength         [WP-VIGNETTE]
 ///  22    Parallax Grid            [WP-STEADY]
 ///  23    Lens Alignment           [WP-STEADY]
-///  24  (GROUP_END, Stitching)
-///  25  Advanced           (GROUP_START, starts collapsed)
-///  26    D-Log M Curve
-///  27    Exposure
-///  28    Render Device
-///  29    Program Monitor Colour   [WP-SETTINGS]
-///  30  (GROUP_END, Advanced)
-///  31  Defaults           (GROUP_START, starts collapsed)   [WP-DEFAULTS]
-///  32    Save       [Save as Default for New Clips]
-///  33    Restore    [Restore Built-in Defaults]
-///  34  (GROUP_END, Defaults)
+///  24    Scene Light
+///  25    Lens Focal
+///  26  (GROUP_END, Stitching)
+///  27  Advanced           (GROUP_START, starts collapsed)
+///  28    D-Log M Curve
+///  29    Exposure
+///  30    Render Device
+///  31    Program Monitor Colour   [WP-SETTINGS]
+///  32  (GROUP_END, Advanced)
+///  33  Defaults           (GROUP_START, starts collapsed)   [WP-DEFAULTS]
+///  34    Save       [Save as Default for New Clips]
+///  35    Restore    [Restore Built-in Defaults]
+///  36  (GROUP_END, Defaults)
 enum ParamIndex : int {
     kIndexColorOutput = 1,
     kIndexHdrTone = 2,          // [WP-HDRTONE]
@@ -557,13 +597,15 @@ enum ParamIndex : int {
     kIndexShadingStrength = 21, // [WP-VIGNETTE]
     kIndexParallaxGrid = 22,    // [WP-STEADY]
     kIndexLensAlign = 23,       // [WP-STEADY]
-    kIndexStitchTopicEnd = 24,
-    kIndexAdvancedTopic = 25,
-    kIndexDlogmFit = 26,
-    kIndexExposure = 27,
-    kIndexRenderDevice = 28,
-    kIndexDirectColour = 29,
-    kIndexAdvancedTopicEnd = 30,
+    kIndexSceneLight = 24,
+    kIndexLensFocal = 25,
+    kIndexStitchTopicEnd = 26,
+    kIndexAdvancedTopic = 27,
+    kIndexDlogmFit = 28,
+    kIndexExposure = 29,
+    kIndexRenderDevice = 30,
+    kIndexDirectColour = 31,
+    kIndexAdvancedTopicEnd = 32,
     // [WP-DEFAULTS] Always the last group, so its indices are written
     // relative to the Advanced terminator: a control added to an earlier
     // group moves them with it and nothing here has to be renumbered.
@@ -588,6 +630,7 @@ inline constexpr int kParamIdByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
     OSV_SS_ID_NEAR_OFFSET,      OSV_SS_ID_FAR_OFFSET,
     OSV_SS_ID_LENS_SHADING,     OSV_SS_ID_SHADING_STRENGTH,  // [WP-VIGNETTE]
     OSV_SS_ID_PARALLAX_GRID,    OSV_SS_ID_LENS_ALIGN,        // [WP-STEADY]
+    OSV_SS_ID_SCENE_LIGHT,      OSV_SS_ID_LENS_FOCAL,        // Scene Light, Lens Focal
     OSV_SS_ID_STITCH_TOPIC_END, OSV_SS_ID_ADVANCED_TOPIC,
     OSV_SS_ID_DLOGM_FIT,        OSV_SS_ID_EXPOSURE,      OSV_SS_ID_RENDER_DEVICE,
     OSV_SS_ID_DIRECT_COLOUR,    OSV_SS_ID_ADVANCED_TOPIC_END,
@@ -605,8 +648,9 @@ inline constexpr int kParamCount = OSV_SOURCE_SETTINGS_PARAM_COUNT;
 /// ([WP-SEAMTOOLS] five more since the seam tools, [WP-VIGNETTE] two more
 /// since the lens shading correction, [WP-HDRPEAK] one more for the HDR
 /// peak, [WP-STEADY] two more since the steady seam and lens alignment,
-/// [WP-HDRTONE] one more for the HDR transfer function).
-inline constexpr int kValueParamCount = 26;
+/// [WP-HDRTONE] one more for the HDR transfer function, two more for Scene
+/// Light and Lens Focal).
+inline constexpr int kValueParamCount = 28;
 
 /// The parameter names, in index order, so a test can compare the built
 /// module's list without repeating the strings.
@@ -624,6 +668,7 @@ inline constexpr const char* kParamNameByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] 
     "Seam Edge Inset", "Seam Blend",  "Parallax Blend", "Seam Smoothing", "Near Offset", "Far Offset",
     "Lens Shading",   "Shading Strength",  // [WP-VIGNETTE]
     "Parallax Grid",  "Lens Alignment",    // [WP-STEADY]
+    "Scene Light",    "Lens Focal",
     "",               "Advanced",     "D-Log M Curve",
     "Exposure",       "Render Device", "Program Monitor Colour", "",
     // [WP-DEFAULTS]

@@ -589,6 +589,63 @@ TEST_CASE("LensRig: an 8K-mode digital_focal_length that misses the lenses' cali
                  Catch::Matchers::WithinAbs(static_cast<double>(set.master.fx), 1e-9));
 }
 
+TEST_CASE("LensRig: Lens Focal Camera trusts digital_focal_length for this stream size, Calibration never",
+          "[geom][rig]") {
+    // Source Settings "Lens Focal".  Camera is the rule before the 8K-mode
+    // measurements: the recorded value whenever it is within 1.2x of each
+    // lens's calibration * scale.  Calibration takes each lens's own always.
+    meta::CalibrationSet set = sampleCalibration();
+    set.slave.fx = 1033.4852f;
+    set.slave.fy = 1033.3813f;
+    set.master.fx = 1047.9333f;
+    set.master.fy = 1047.8409f;
+    constexpr double kDigitalFocal8K = 1061.5823;
+    auto scaling = StreamScaling::derive(3840, 3840, 3840, 3840, kDigitalFocal8K,
+                                         0.5 * (set.slave.fx + set.master.fx));
+    REQUIRE(scaling.ok());
+
+    // ---- Camera: both lenses take the recorded 1061.58 px (2.7 % / 1.3 % off) ----
+    auto camera = LensRig::build(set, scaling.value(), FocalSource::DigitalFocalLengthSameStream, kDigitalFocal8K,
+                                 ExtrinsicConvention{});
+    REQUIRE(camera.ok());
+    REQUIRE(camera.value().focalSource == FocalSource::DigitalFocalLengthSameStream);
+    for (const int i : {kSlaveLens, kMasterLens}) {
+        REQUIRE_THAT(camera.value().lens[i].fx, Catch::Matchers::WithinAbs(kDigitalFocal8K, 1e-9));
+        REQUIRE_THAT(camera.value().lens[i].fy, Catch::Matchers::WithinAbs(kDigitalFocal8K, 1e-9));
+    }
+    // ...but a value for another stream size (an LRF proxy repeating its
+    // clip's) is still refused: off by more than 1.2x.
+    auto stale = LensRig::build(set, scaling.value(), FocalSource::DigitalFocalLengthSameStream, kDigitalFocal8K * 1.3,
+                                ExtrinsicConvention{});
+    REQUIRE(stale.ok());
+    REQUIRE_THAT(stale.value().lens[kSlaveLens].fx,
+                 Catch::Matchers::WithinAbs(static_cast<double>(set.slave.fx), 1e-9));
+    // ...and an unusable value falls back to the calibration as well.
+    auto unusable = LensRig::build(set, scaling.value(), FocalSource::DigitalFocalLengthSameStream, 0.0,
+                                   ExtrinsicConvention{});
+    REQUIRE(unusable.ok());
+    REQUIRE_THAT(unusable.value().lens[kMasterLens].fx,
+                 Catch::Matchers::WithinAbs(static_cast<double>(set.master.fx), 1e-9));
+
+    // ---- Calibration: each lens's own, even where the recorded value agrees ----------
+    const double agreeing = 0.5 * (static_cast<double>(set.slave.fx) + set.slave.fy);
+    auto calibration = LensRig::build(set, scaling.value(), FocalSource::ScaledCalibration, agreeing,
+                                      ExtrinsicConvention{});
+    REQUIRE(calibration.ok());
+    REQUIRE_THAT(calibration.value().lens[kSlaveLens].fx,
+                 Catch::Matchers::WithinAbs(static_cast<double>(set.slave.fx), 1e-9));
+    REQUIRE_THAT(calibration.value().lens[kSlaveLens].fy,
+                 Catch::Matchers::WithinAbs(static_cast<double>(set.slave.fy), 1e-9));
+
+    // ---- Auto (DigitalFocalLength) is unchanged: the agreeing value is taken -----------
+    auto automatic = LensRig::build(set, scaling.value(), FocalSource::DigitalFocalLength, agreeing,
+                                    ExtrinsicConvention{});
+    REQUIRE(automatic.ok());
+    REQUIRE_THAT(automatic.value().lens[kSlaveLens].fx, Catch::Matchers::WithinAbs(agreeing, 1e-9));
+    REQUIRE(std::string(focalSourceName(FocalSource::DigitalFocalLengthSameStream)) ==
+            "DigitalFocalLengthSameStream");
+}
+
 // -----------------------------------------------------------------------------
 //  VirtualCamera
 // -----------------------------------------------------------------------------

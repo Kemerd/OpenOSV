@@ -125,6 +125,10 @@ PrefsBlob prefsFromControls(const ControlValues& controls) noexcept {
     // other outputs); an out-of-range popup value keeps the default from
     // defaults(), ACES 2 Bright.  The popup is in enum order.
     blob.hdrTone = fromPopup(controls.hdrTone, OSV_SS_HDR_TONE_COUNT, blob.hdrTone);
+    // Scene Light and Lens Focal: both popups are in enum order; an
+    // out-of-range value keeps the default from defaults(), Auto.
+    blob.sceneLight = fromPopup(controls.sceneLight, OSV_SS_SCENE_LIGHT_COUNT, blob.sceneLight);
+    blob.lensFocal = fromPopup(controls.lensFocal, OSV_SS_LENS_FOCAL_COUNT, blob.lensFocal);
 
     // Clamp everything into range and zero the reserved bytes.  After this
     // the blob is byte-for-byte what the importer expects, which is the
@@ -200,6 +204,9 @@ ControlValues controlsFromPrefs(const PrefsBlob& prefs) noexcept {
             break;
         }
     }
+    // Scene Light and Lens Focal: enum order, so the popup is the value + 1.
+    c.sceneLight = toPopup(clean.sceneLight, OSV_SS_SCENE_LIGHT_COUNT);
+    c.lensFocal = toPopup(clean.lensFocal, OSV_SS_LENS_FOCAL_COUNT);
     return c;
 }
 

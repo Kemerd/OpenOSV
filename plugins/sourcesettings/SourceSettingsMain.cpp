@@ -180,8 +180,15 @@ static_assert(kParamIdByIndex[kIndexParallaxGrid - 1] == OSV_SS_ID_PARALLAX_GRID
               "kParamIdByIndex is not aligned with the ParamIndex enum");
 static_assert(OSV_SS_ID_PARALLAX_GRID >= 40 && OSV_SS_ID_LENS_ALIGN <= 45,
               "WP-STEADY's parameter ids live in 40-45");
-static_assert(kIndexStitchTopicEnd == kIndexLensAlign + 1,
-              "the Stitching group must close immediately after Lens Alignment");
+// Scene Light and Lens Focal follow Lens Alignment, and the Stitching group
+// closes right after them.
+static_assert(kIndexSceneLight == kIndexLensAlign + 1 && kIndexLensFocal == kIndexSceneLight + 1,
+              "Scene Light and Lens Focal follow Lens Alignment in that order");
+static_assert(kParamIdByIndex[kIndexSceneLight - 1] == OSV_SS_ID_SCENE_LIGHT &&
+                  kParamIdByIndex[kIndexLensFocal - 1] == OSV_SS_ID_LENS_FOCAL,
+              "kParamIdByIndex is not aligned with the ParamIndex enum");
+static_assert(kIndexStitchTopicEnd == kIndexLensFocal + 1,
+              "the Stitching group must close immediately after Lens Focal");
 static_assert(kParamIdByIndex[kIndexPhotoSeam - 1] == OSV_SS_ID_PHOTO_SEAM &&
                   kParamIdByIndex[kIndexPhotoStrength - 1] == OSV_SS_ID_PHOTO_STRENGTH &&
                   kParamIdByIndex[kIndexSeamInset - 1] == OSV_SS_ID_SEAM_INSET,
@@ -400,6 +407,13 @@ private:
     if (const PF_ParamDef* p = def(kIndexLensAlign)) {
         c.lensAlign = static_cast<int>(p->u.pd.value);
     }
+    // Scene Light and Lens Focal
+    if (const PF_ParamDef* p = def(kIndexSceneLight)) {
+        c.sceneLight = static_cast<int>(p->u.pd.value);
+    }
+    if (const PF_ParamDef* p = def(kIndexLensFocal)) {
+        c.lensFocal = static_cast<int>(p->u.pd.value);
+    }
     if (const PF_ParamDef* p = def(kIndexDlogmFit)) {
         c.dlogmFit = static_cast<int>(p->u.pd.value);
     }
@@ -483,6 +497,8 @@ void writeControls(PF_ParamDef* params[], const ControlValues& wanted) noexcept 
     setSlider(kIndexShadingStrength, wanted.shadingStrengthPercent);
     setPopup(kIndexParallaxGrid, wanted.parallaxGrid);  // [WP-STEADY]
     setPopup(kIndexLensAlign, wanted.lensAlign);        // [WP-STEADY]
+    setPopup(kIndexSceneLight, wanted.sceneLight);      // Scene Light
+    setPopup(kIndexLensFocal, wanted.lensFocal);        // Lens Focal
     setPopup(kIndexDlogmFit, wanted.dlogmFit);
     setSlider(kIndexExposure, wanted.exposureStops);
     setPopup(kIndexRenderDevice, wanted.renderDevice);
@@ -765,7 +781,23 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Lens Alignment", OSV_SS_LENS_ALIGN_COUNT, OSV_SS_LENS_ALIGN_DEFAULT, OSV_SS_LENS_ALIGN_ITEMS,
                   kStaticFlags, OSV_SS_ID_LENS_ALIGN);
 
-    // ---- 24. Close the Stitching group -------------------------------------
+    // ---- 24. Scene Light ---------------------------------------------------
+    // Which photometric profile the seam corrections run with: Auto reads the
+    // camera's metered light and the sky, Night calms the colour matching for
+    // dark skies and street lights.  Default Auto, as PrefsBlob::defaults().
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUPX("Scene Light", OSV_SS_SCENE_LIGHT_COUNT, OSV_SS_SCENE_LIGHT_DEFAULT, OSV_SS_SCENE_LIGHT_ITEMS,
+                  kStaticFlags, OSV_SS_ID_SCENE_LIGHT);
+
+    // ---- 25. Lens Focal ----------------------------------------------------
+    // Where each lens's focal length comes from: Auto (the rule each recording
+    // mode measures best), the camera's recorded focal, or each lens's own
+    // calibration.  Default Auto.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUPX("Lens Focal", OSV_SS_LENS_FOCAL_COUNT, OSV_SS_LENS_FOCAL_DEFAULT, OSV_SS_LENS_FOCAL_ITEMS,
+                  kStaticFlags, OSV_SS_ID_LENS_FOCAL);
+
+    // ---- 26. Close the Stitching group -------------------------------------
     // PF_END_TOPIC issues its own PF_ADD_PARAM (Param_Utils.h:309-316), so the
     // terminator occupies a parameter slot of its own and everything after it
     // shifts up by one.  Leaving it out would not merely lose a divider: the
@@ -775,16 +807,16 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_STITCH_TOPIC_END);
 
-    // ---- 25. Advanced topic (collapsed: most users never touch it) ----------
+    // ---- 27. Advanced topic (collapsed: most users never touch it) ----------
     AEFX_CLR_STRUCT(def);
     PF_ADD_TOPICX("Advanced", PF_ParamFlag_START_COLLAPSED, OSV_SS_ID_ADVANCED_TOPIC);
 
-    // ---- 26. D-Log M Curve -------------------------------------------------
+    // ---- 28. D-Log M Curve -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("D-Log M Curve", OSV_SS_FIT_COUNT, OSV_SS_FIT_DEFAULT, OSV_SS_FIT_ITEMS, kStaticFlags,
                   OSV_SS_ID_DLOGM_FIT);
 
-    // ---- 27. Exposure ------------------------------------------------------
+    // ---- 29. Exposure ------------------------------------------------------
     // Valid range is the blob's own +/- 6 stops (static_asserted below the
     // handlers); the slider shows the useful +/- 3 so a drag has resolution.
     AEFX_CLR_STRUCT(def);
@@ -792,12 +824,12 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
                          OSV_SS_EXPOSURE_SLIDER_MIN, OSV_SS_EXPOSURE_SLIDER_MAX, OSV_SS_EXPOSURE_DEFAULT,
                          PF_Precision_TENTHS, PF_ValueDisplayFlag_NONE, kStaticFlags, OSV_SS_ID_EXPOSURE);
 
-    // ---- 28. Render Device -------------------------------------------------
+    // ---- 30. Render Device -------------------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Render Device", OSV_SS_DEVICE_COUNT, OSV_SS_DEVICE_DEFAULT, OSV_SS_DEVICE_ITEMS, kStaticFlags,
                   OSV_SS_ID_RENDER_DEVICE);
 
-    // ---- 29. Program Monitor Colour [WP-SETTINGS] --------------------------
+    // ---- 31. Program Monitor Colour [WP-SETTINGS] --------------------------
     // What Open 360 Reframe shows when this clip's Colour Output is not the
     // sequence's working space: the scene rendered straight into it (fast,
     // the default) or Premiere's own conversion of the output (matches the
@@ -807,7 +839,7 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     PF_ADD_POPUPX("Program Monitor Colour", OSV_SS_DIRECT_COLOUR_COUNT, OSV_SS_DIRECT_COLOUR_DEFAULT,
                   OSV_SS_DIRECT_COLOUR_ITEMS, kStaticFlags, OSV_SS_ID_DIRECT_COLOUR);
 
-    // ---- 30. Close the Advanced group --------------------------------------
+    // ---- 32. Close the Advanced group --------------------------------------
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(OSV_SS_ID_ADVANCED_TOPIC_END);
 
@@ -1161,6 +1193,15 @@ static_assert(OSV_SS_LENS_ALIGN_COUNT == static_cast<int>(osv::premiere::PrefsLe
 static_assert(osv::premiere::sourcesettings::kLensAlignByPopup[OSV_SS_LENS_ALIGN_DEFAULT - 1] ==
                   osv::premiere::PrefsLensAlign::Auto,
               "the Lens Alignment popup's default is not PrefsBlob::defaults()' Auto");
+// Scene Light and Lens Focal: popups in enum order, default item 1 = Auto.
+static_assert(OSV_SS_SCENE_LIGHT_COUNT == static_cast<int>(osv::premiere::PrefsSceneLight::Count),
+              "the Scene Light popup does not list every PrefsSceneLight value");
+static_assert(OSV_SS_SCENE_LIGHT_DEFAULT == static_cast<int>(osv::premiere::PrefsSceneLight::Auto) + 1,
+              "the Scene Light popup's default is not PrefsBlob::defaults()' Auto");
+static_assert(OSV_SS_LENS_FOCAL_COUNT == static_cast<int>(osv::premiere::PrefsLensFocal::Count),
+              "the Lens Focal popup does not list every PrefsLensFocal value");
+static_assert(OSV_SS_LENS_FOCAL_DEFAULT == static_cast<int>(osv::premiere::PrefsLensFocal::Auto) + 1,
+              "the Lens Focal popup's default is not PrefsBlob::defaults()' Auto");
 static_assert(OSV_SS_PHOTO_STRENGTH_MIN == 0.0 &&
                   OSV_SS_PHOTO_STRENGTH_MAX == static_cast<double>(osv::premiere::PrefsBlob::kMaxPhotoStrengthCode - 1),
               "the Sky Seam Strength range does not match PrefsBlob::photoStrength");

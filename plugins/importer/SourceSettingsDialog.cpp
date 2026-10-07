@@ -634,6 +634,94 @@ void steadyWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
 // ---- [/WP-STEADY] ------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+//  Scene Light and Lens Focal rows
+// ---------------------------------------------------------------------------
+// Two combo rows appended below the steady rows, the same way, each with a
+// tooltip (the hosts with tooltips show the same hints).  Ids clear of every
+// block above (resource.h, 1040-1049, 1070, 1080-1081 and their 11xx labels).
+constexpr int kIdcSceneLight = 1090;
+constexpr int kIdcLensFocal = 1091;
+constexpr int kIdcStaticSceneLight = 1190;
+constexpr int kIdcStaticLensFocal = 1191;
+
+/// Hang `hint` on the combo `comboId` and its label `labelId`.  The tooltip
+/// window is owned by the dialog, so its destruction takes it along; any
+/// failure leaves the row without a tooltip, never without the combo.
+void addRowTooltip(HWND dialog, int comboId, int labelId, const wchar_t* hint) noexcept {
+    if (!hint || !::GetDlgItem(dialog, comboId)) {
+        return;
+    }
+    // The tooltip class lives in comctl32; registering it is idempotent.
+    INITCOMMONCONTROLSEX icc{};
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_TAB_CLASSES;  // includes the tooltip class
+    ::InitCommonControlsEx(&icc);
+    HWND tip = ::CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                 CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, dialog, nullptr,
+                                 reinterpret_cast<HINSTANCE>(::GetWindowLongPtrW(dialog, GWLP_HINSTANCE)), nullptr);
+    if (!tip) {
+        PluginLog::oncef("dialog/row-tip", PluginLog::Level::Debug, "source settings: no tooltip window for a row");
+        return;
+    }
+    // One tool per window: the combo, and the label beside it.
+    for (const int id : {comboId, labelId}) {
+        HWND control = ::GetDlgItem(dialog, id);
+        if (!control) {
+            continue;
+        }
+        TOOLINFOW info{};
+        info.cbSize = TTTOOLINFOW_V2_SIZE;
+        info.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        info.hwnd = dialog;
+        info.uId = reinterpret_cast<UINT_PTR>(control);
+        info.lpszText = const_cast<wchar_t*>(hint);
+        ::SendMessageW(tip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
+    }
+    // Wrap long hints instead of one screen-wide line.
+    ::SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, 320);
+}
+
+/// Append the two rows and load `c` into them.  Both lists are in enum order
+/// (Auto first), so the combo index is the stored value.
+void addSceneRows(HWND dialog, const DialogControls& c) noexcept {
+    const int firstRow = growDialogForRows(dialog, 2);
+    static const wchar_t* const kScene[] = {L"Auto (reads the camera and the sky)", L"Day", L"Night"};
+    static_assert(std::size(kScene) == static_cast<std::size_t>(PrefsSceneLight::Count),
+                  "the Scene Light combo does not list every PrefsSceneLight value");
+    addDialogChild(dialog, L"STATIC", L"Scene light:", SS_LEFT, kIdcStaticSceneLight, 7, firstRow + 3, 70, 8);
+    addDialogChild(dialog, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kIdcSceneLight, 82, firstRow,
+                   179, 80);
+    fillCombo(dialog, kIdcSceneLight, kScene, static_cast<int>(std::size(kScene)), c.sceneLight);
+    static const wchar_t* const kFocal[] = {L"Auto (as measured per mode)", L"Camera (recorded focal)",
+                                            L"Calibration (each lens's own)"};
+    static_assert(std::size(kFocal) == static_cast<std::size_t>(PrefsLensFocal::Count),
+                  "the Lens Focal combo does not list every PrefsLensFocal value");
+    addDialogChild(dialog, L"STATIC", L"Lens focal:", SS_LEFT, kIdcStaticLensFocal, 7, firstRow + kRowStep + 3, 70,
+                   8);
+    addDialogChild(dialog, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kIdcLensFocal, 82,
+                   firstRow + kRowStep, 179, 80);
+    fillCombo(dialog, kIdcLensFocal, kFocal, static_cast<int>(std::size(kFocal)), c.lensFocal);
+    // The same hints the OpenFX parameters carry (SourceSettingsParams.h).
+    addRowTooltip(dialog, kIdcSceneLight, kIdcStaticSceneLight,
+                  L"Auto reads the camera's exposure and the sky. Night calms the seam's colour matching for dark "
+                  L"skies and street lights.");
+    addRowTooltip(dialog, kIdcLensFocal, kIdcStaticLensFocal,
+                  L"Auto picks the focal each recording mode measures best. Camera trusts the recorded focal; "
+                  L"Calibration uses each lens's own. Change it only if the seam doubles straight lines.");
+}
+
+/// Read the two rows back; a missing row keeps what the dialog opened with.
+void sceneWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
+    if (::GetDlgItem(dialog, kIdcSceneLight)) {
+        c.sceneLight = comboSelection(dialog, kIdcSceneLight);
+    }
+    if (::GetDlgItem(dialog, kIdcLensFocal)) {
+        c.lensFocal = comboSelection(dialog, kIdcLensFocal);
+    }
+}
+// ---- [/Scene Light and Lens Focal] ---------------------------------------------
+
+// ---------------------------------------------------------------------------
 //  [WP-DEFAULTS] "Save as Default"
 // ---------------------------------------------------------------------------
 // The template puts the button and its status line at the left of the OK /
@@ -808,6 +896,7 @@ void widgetsToControls(HWND dialog, DialogControls& c) noexcept {
     shadingWidgetsToControls(dialog, c);  // [WP-VIGNETTE]
     hdrPeakWidgetsToControls(dialog, c);  // [WP-HDRPEAK]
     steadyWidgetsToControls(dialog, c);    // [WP-STEADY]
+    sceneWidgetsToControls(dialog, c);     // Scene Light and Lens Focal
 }
 
 /// The dialog procedure.  It never throws (a C callback crossing back into
@@ -825,6 +914,7 @@ INT_PTR CALLBACK sourceSettingsProc(HWND dialog, UINT message, WPARAM wParam, LP
             addLensShadingRows(dialog, state->controls);  // [WP-VIGNETTE]
             addHdrPeakRow(dialog, state->controls);       // [WP-HDRPEAK]
             addSteadyRows(dialog, state->controls);       // [WP-STEADY]
+            addSceneRows(dialog, state->controls);        // Scene Light and Lens Focal
         }
         addHdrToneTooltip(dialog);  // [WP-HDRTONE]
         placeDefaultsRow(dialog);  // [WP-DEFAULTS] after every block that moves OK

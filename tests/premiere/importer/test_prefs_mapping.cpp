@@ -711,6 +711,45 @@ TEST_CASE("the Parallax Grid and Lens Alignment combos round trip and refuse gar
     }
 }
 
+TEST_CASE("the Scene Light and Lens Focal combos round trip and refuse garbage",
+          "[importer][prefs][mapping][scenelight]") {
+    // Defaults: both on their first entry, Auto, which is also both enums' 0.
+    const DialogControls shown = controlsFromPrefs(PrefsBlob::defaults());
+    REQUIRE(shown.sceneLight == 0);
+    REQUIRE(shown.lensFocal == 0);
+
+    // Every choice of both survives the round trip.
+    for (int scene = 0; scene < static_cast<int>(PrefsSceneLight::Count); ++scene) {
+        for (int focal = 0; focal < static_cast<int>(PrefsLensFocal::Count); ++focal) {
+            PrefsBlob original = PrefsBlob::defaults();
+            original.sceneLight = static_cast<std::uint8_t>(scene);
+            original.lensFocal = static_cast<std::uint8_t>(focal);
+            const DialogControls controls = controlsFromPrefs(original);
+            INFO("scene light " << scene << " lens focal " << focal);
+            REQUIRE(controls.sceneLight == scene);
+            REQUIRE(controls.lensFocal == focal);
+            REQUIRE(prefsFromControls(controls) == original);
+        }
+    }
+
+    // A dialog opened on a blob keeps every other field (the base overload).
+    PrefsBlob night = PrefsBlob::defaults();
+    night.sceneLight = static_cast<std::uint8_t>(PrefsSceneLight::Night);
+    night.parallax = static_cast<std::uint8_t>(PrefsParallax::Off);  // a field the dialog does not show
+    REQUIRE(prefsFromControls(controlsFromPrefs(night), night) == night);
+
+    // A combo with no selection (-1) or a corrupt index lands on Auto.
+    for (const int hostile : {-1, 3, 99}) {
+        DialogControls bad = controlsFromPrefs(PrefsBlob::defaults());
+        bad.sceneLight = hostile;
+        bad.lensFocal = hostile;
+        PrefsBlob blob = prefsFromControls(bad);
+        REQUIRE(blob.sceneLightChoice() == PrefsSceneLight::Auto);
+        REQUIRE(blob.lensFocalChoice() == PrefsLensFocal::Auto);
+        REQUIRE(blob.sanitise());
+    }
+}
+
 TEST_CASE("the transfer function combo round trips and refuses garbage", "[importer][prefs][mapping][hdrtone]") {
     // [WP-HDRTONE] The combo index IS the PrefsHdrTone value; the default,
     // ACES 2 Bright, is the first entry and the zero byte of every older

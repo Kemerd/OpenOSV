@@ -110,6 +110,9 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
     p.directColour = static_cast<std::uint8_t>(PrefsDirectColour::MatchSource);
     p.hdrPeak = static_cast<std::uint8_t>(PrefsHdrPeak::Nits400);  // [WP-HDRPEAK]
     p.hdrTone = static_cast<std::uint8_t>(PrefsHdrTone::Bt2408Punchy);  // [WP-HDRTONE]
+    // Scene Light and Lens Focal, both away from Auto
+    p.sceneLight = static_cast<std::uint8_t>(PrefsSceneLight::Night);
+    p.lensFocal = static_cast<std::uint8_t>(PrefsLensFocal::Calibration);
     REQUIRE(p.sanitise());  // already clean: every value above is in range
     return p;
 }
@@ -202,6 +205,8 @@ TEST_CASE("the defaults file round-trips every value of every setting bit for bi
         each([](PrefsBlob& p, std::uint8_t v) { p.directColour = v; }, static_cast<int>(PrefsDirectColour::Count));
         each([](PrefsBlob& p, std::uint8_t v) { p.hdrPeak = v; }, static_cast<int>(PrefsHdrPeak::Count));  // [WP-HDRPEAK]
         each([](PrefsBlob& p, std::uint8_t v) { p.hdrTone = v; }, static_cast<int>(PrefsHdrTone::Count));  // [WP-HDRTONE]
+        each([](PrefsBlob& p, std::uint8_t v) { p.sceneLight = v; }, static_cast<int>(PrefsSceneLight::Count));
+        each([](PrefsBlob& p, std::uint8_t v) { p.lensFocal = v; }, static_cast<int>(PrefsLensFocal::Count));
         each([](PrefsBlob& p, std::uint8_t v) { p.seamSearch = v; }, 2);
         each([](PrefsBlob& p, std::uint8_t v) { p.gainMatch = v; }, 2);
         each([](PrefsBlob& p, std::uint8_t v) { p.flareRemoval = v; }, 2);

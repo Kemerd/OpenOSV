@@ -301,6 +301,41 @@ enum class PrefsLensAlign : std::uint8_t {
     Count
 };
 
+/// "Scene Light": which photometric profile the seam corrections run with
+/// (osv/render/SceneLight.h).  Persisted, so append-only.
+///
+/// Auto is 0 ON PURPOSE, unlike the photoSeam / parallax rule: an older
+/// project's zero byte reads as Auto, so a night clip saved before the
+/// setting existed loses its sky halo without a Source Settings visit.  It
+/// cannot change a day clip: Auto renders every clip whose metered light is
+/// not dark - and every dark one whose sky is not - exactly as before.
+enum class PrefsSceneLight : std::uint8_t {
+    /// The camera's metered light, confirmed by the sky after levelling:
+    /// Night only when both are dark, Day otherwise.  The default.
+    Auto = 0,
+    Day = 1,    ///< Today's profile, whatever the clip says.
+    Night = 2,  ///< The night profile, whatever the clip says.
+    Count
+};
+
+/// "Lens Focal": where each lens's focal length comes from
+/// (geom::FocalSource).  Persisted, so append-only.
+///
+/// Auto is 0, the rule every clip is stitched with today, so an older
+/// project's zero byte renders exactly as it did.
+enum class PrefsLensFocal : std::uint8_t {
+    /// The recorded digital_focal_length where it matches each lens's own
+    /// calibration (within 0.5 %, the 6K mode), the calibration elsewhere
+    /// (8K mode).  The default.
+    Auto = 0,
+    /// The recorded digital_focal_length whenever it describes this stream
+    /// size (within 1.2x): the rule before 8K-mode clips were measured.
+    Camera = 1,
+    /// Each lens's own calibrated focal, always.
+    Calibration = 2,
+    Count
+};
+
 #pragma pack(push, 1)
 
 /// The 128-byte preferences record.  Use defaults() to construct one,
@@ -433,7 +468,14 @@ struct PrefsBlob {
     /// style, in the spare byte after the HDR peak (offset 55).  0 = ACES 2
     /// Bright, the default and what every older blob's zero reads as.
     std::uint8_t hdrTone = 0;
-    std::uint8_t reserved[72] = {};    ///< Zero; future fields.
+    // ---- Scene Light and Lens Focal ---------------------------------------------
+    /// PrefsSceneLight (offset 56); 0 = Auto, the default AND what every older
+    /// blob's zero reads as (see the enum for why that is safe).
+    std::uint8_t sceneLight = 0;
+    /// PrefsLensFocal (offset 57); 0 = Auto, the focal rule every older blob
+    /// renders with.
+    std::uint8_t lensFocal = 0;
+    std::uint8_t reserved[70] = {};    ///< Zero; future fields.
 
     /// seamInset: the default inset in tenths of a degree (2.6 deg - the
     /// render weight then ends at 95.0 deg on the calibrated 97.59 deg lens;
@@ -532,6 +574,10 @@ struct PrefsBlob {
         // BT.2408 puts it, a soft shoulder into a 600-nit sensor clip.  It is
         // the zero byte, so written out only to say so.
         p.hdrTone = static_cast<std::uint8_t>(PrefsHdrTone::Aces2Bright);
+        // Scene Light and Lens Focal: Auto, both the zero byte - stated so
+        // the single source of truth says it.
+        p.sceneLight = static_cast<std::uint8_t>(PrefsSceneLight::Auto);
+        p.lensFocal = static_cast<std::uint8_t>(PrefsLensFocal::Auto);
         return p;
     }
 
@@ -725,6 +771,12 @@ struct PrefsBlob {
                 clean = false;
             }
         }
+        // Scene Light and Lens Focal: zero is the default (Auto), so a
+        // corrupt byte lands where a fresh blob is.
+        clampEnum(sceneLight, static_cast<std::uint8_t>(PrefsSceneLight::Count),
+                  static_cast<std::uint8_t>(PrefsSceneLight::Auto));
+        clampEnum(lensFocal, static_cast<std::uint8_t>(PrefsLensFocal::Count),
+                  static_cast<std::uint8_t>(PrefsLensFocal::Auto));
         if (magic != kMagic || version != kVersion) {
             magic = kMagic;
             version = kVersion;
@@ -867,6 +919,18 @@ struct PrefsBlob {
     [[nodiscard]] PrefsLensAlign lensAlignChoice() const noexcept {
         return lensAlign < static_cast<std::uint8_t>(PrefsLensAlign::Count) ? static_cast<PrefsLensAlign>(lensAlign)
                                                                              : PrefsLensAlign::Off;
+    }
+    /// The Scene Light choice; an out-of-range byte (an unsanitised blob)
+    /// reads as Auto, the default.
+    [[nodiscard]] PrefsSceneLight sceneLightChoice() const noexcept {
+        return sceneLight < static_cast<std::uint8_t>(PrefsSceneLight::Count) ? static_cast<PrefsSceneLight>(sceneLight)
+                                                                               : PrefsSceneLight::Auto;
+    }
+    /// The Lens Focal choice; an out-of-range byte reads as Auto, the rule
+    /// every clip is stitched with by default.
+    [[nodiscard]] PrefsLensFocal lensFocalChoice() const noexcept {
+        return lensFocal < static_cast<std::uint8_t>(PrefsLensFocal::Count) ? static_cast<PrefsLensFocal>(lensFocal)
+                                                                             : PrefsLensFocal::Auto;
     }
     /// [WP-PHOTO] Gain-field strength in percent (code 0 = the default 100).
     [[nodiscard]] double photoStrengthPercent() const noexcept {
@@ -1075,7 +1139,15 @@ static_assert(offsetof(PrefsBlob, hdrPeak) == 54, "PrefsBlob layout drifted");
 // older blob's zero byte reads as PrefsHdrTone::Aces2Bright, the default -
 // the same rule the Rec.709 look's byte introduced.
 static_assert(offsetof(PrefsBlob, hdrTone) == 55, "PrefsBlob layout drifted");
-static_assert(offsetof(PrefsBlob, reserved) == 56, "PrefsBlob layout drifted");
+// Scene Light and Lens Focal take offsets 56-57 from the front of the
+// reserved block.  Both zeros read as Auto: for Lens Focal that is exactly
+// the rule an older project rendered with; for Scene Light it is the
+// detector, which leaves every day clip as it was (see PrefsSceneLight).
+static_assert(offsetof(PrefsBlob, sceneLight) == 56, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, lensFocal) == 57, "PrefsBlob layout drifted");
+static_assert(offsetof(PrefsBlob, reserved) == 58, "PrefsBlob layout drifted");
+static_assert(static_cast<int>(PrefsSceneLight::Auto) == 0, "zero must stay Scene Light Auto");
+static_assert(static_cast<int>(PrefsLensFocal::Auto) == 0, "zero must stay the default focal rule");
 static_assert(static_cast<int>(PrefsHdrPeak::Nits1000) == 0, "zero must stay the no-roll-off default");
 static_assert(static_cast<int>(PrefsHdrTone::Aces2Bright) == 0, "zero must stay the default HDR tone style");
 // The codes' upper bounds are the ranges the controls offer.

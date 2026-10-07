@@ -34,6 +34,7 @@
 #include "PrefsBlob.h"
 
 #include "osv/core/Log.h"
+#include "osv/geom/ConventionProbe.h"
 #include "osv/geom/EquirectMap.h"
 #include "osv/geom/Presets.h"
 #include "osv/geom/VirtualCamera.h"
@@ -47,6 +48,8 @@
 #include "osv/render/SeamTools.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
+#include "osv/render/SceneLight.h"
+#include "osv/render/ClipSteady.h"
 
 // [WP-DEFAULTS] The Premiere plug-ins' own (SDK-free) reader of the defaults
 // file, compiled into osvtool by tools/osvtool/CMakeLists.txt.
@@ -84,6 +87,11 @@ struct RenderOptions {
     bool flare = true;            ///< Sun ghost removal (--flare / --no-flare).
     std::string parallaxGrid;     ///< follows | steady | auto (empty = the defaults').
     std::string lensAlign;        ///< off | auto (empty = the defaults').
+    std::string lensFocal;        ///< auto | camera | calibration (empty = the defaults').
+    /// Scene Light, both engines: auto | day | night.  Empty = the engine's
+    /// default - the Source Settings defaults' (Auto) for the plug-in engine,
+    /// day (every analysis exactly as asked) for the classic pipeline.
+    std::string sceneLight;
     int frame = -1;               ///< Single frame (-1 = use range/all)
     std::string range;            ///< "a-b"
     bool all = false;
@@ -178,6 +186,11 @@ static_assert(std::size(kCliLook) == static_cast<std::size_t>(osv::premiere::Pre
 static_assert(std::size(kCliFlow) == static_cast<std::size_t>(osv::premiere::PrefsFlowBackend::Count));
 static_assert(std::size(kCliPhoto) == static_cast<std::size_t>(osv::premiere::PrefsPhotoSeam::Count));
 static_assert(std::size(kCliShading) == static_cast<std::size_t>(osv::premiere::PrefsLensShading::Count));
+// Scene Light and Lens Focal, in PrefsSceneLight / PrefsLensFocal order.
+constexpr const char* kCliSceneLight[] = {"auto", "day", "night"};
+constexpr const char* kCliLensFocal[] = {"auto", "camera", "calibration"};
+static_assert(std::size(kCliSceneLight) == static_cast<std::size_t>(osv::premiere::PrefsSceneLight::Count));
+static_assert(std::size(kCliLensFocal) == static_cast<std::size_t>(osv::premiere::PrefsLensFocal::Count));
 
 /// The token for an enum byte; the list's first entry for a value past it
 /// (the blob is sanitised, so that is a guard, not a path).
@@ -267,6 +280,11 @@ void applyUserDefaults(RenderOptions& o, const CLI::App& sub) {
     }
     if (!given("--shading-strength")) {
         o.shadingStrength = p.shadingStrengthPercent() / 100.0;
+    }
+    // Scene Light: the saved choice, so a classic render of a night clip gets
+    // the profile Premiere would give it.
+    if (!given("--scene-light")) {
+        o.sceneLight = cliToken(kCliSceneLight, p.sceneLight);
     }
     // [WP-SEAMTOOLS] the carved seam's tweaks (they act with --seam-carve).
     if (!given("--seam-blend")) {
@@ -627,13 +645,75 @@ private:
     std::mutex m_errorMutex;
 };
 
+/// Scene Light for the classic pipeline: `auto` decides it exactly as the
+/// plug-ins do - the clip's metered light, and for a dark clip the levelled
+/// zenith cap on the lens rotation fit's three sample frames - with the
+/// pipeline's own reader and attitude.  Never fails: anything that cannot be
+/// measured leaves the day profile, which is what the classic pipeline
+/// renders without the flag.
+[[nodiscard]] render::SceneLightVerdict classicSceneLight(Pipeline& P, const RenderOptions& o) {
+    const render::MeteredLight metered = render::meteredLightOf(P.track, P.frameCount());
+    if (!render::meteredLightSaysDark(metered)) {
+        return render::classifySceneLight(metered, std::nullopt);
+    }
+    // ---- gravity-up: the stabilisation's attitude, else one of our own ----------
+    std::optional<geom::AttitudeTrack> own;
+    const geom::AttitudeTrack* attitude = P.attitude ? &*P.attitude : nullptr;
+    if (!attitude) {
+        geom::AttitudeTrack::Options options;
+        geom::ConventionProbe::autoDetect(P.track).applyTo(options);
+        auto built = geom::AttitudeTrack::build(P.track, options);
+        if (built.ok() && built.value().sampleCount() > 0) {
+            own = std::move(built).value();
+            attitude = &*own;
+        }
+    }
+    if (!attitude) {
+        log::warn("--scene-light auto: the clip has no attitude to level the sky by; day profile");
+        return render::classifySceneLight(metered, std::nullopt);
+    }
+    // ---- the clip's decode to scene-linear (the --fit curve, no exposure) -------
+    color::DlogMFit fit = color::kDefaultDlogMFit;
+    if (!color::parseDlogMFit(o.pipeline.fit, fit)) {
+        fit = color::kDefaultDlogMFit;
+    }
+    const OsvColorParams linear = color::makeColorParams(fit, color::OutputTransfer::Linear, 0.0f, P.inputEncoding,
+                                                         true, video::kDecodedSampleBits);
+    // ---- the three sample frames, each measured where it decodes -------------------
+    std::vector<render::SkyCap> caps;
+    const std::vector<std::uint32_t> frames =
+        render::clipSampleFrames(P.frameCount(), P.syncFrames(), render::kLensRotationSamples, 0.1, 0.9);
+    for (const std::uint32_t f : frames) {
+        const std::optional<Vec3d> up = render::bodyUpAt(*attitude, P.track, f, P.fps());
+        auto pair = P.reader->read(f);
+        if (!up || !pair.ok()) {
+            log::warn("--scene-light auto: frame {} skipped ({})", f,
+                      pair.ok() ? std::string("no gravity direction") : log::safe(pair.error().message));
+            continue;
+        }
+        auto cap = render::measureSkyCap(P.rig, pair.value(), P.blendParams, *up, linear, *P.pool);
+        if (cap.ok()) {
+            log::info("--scene-light auto: frame {}: sky {:+.2f} stops, B/G {:+.2f}, flat {:.0f} %, around lights "
+                      "{:.0f} %",
+                      f, cap.value().stopsVsGrey, cap.value().log2BG, 100.0 * cap.value().flatFraction,
+                      100.0 * cap.value().sourceFraction);
+            caps.push_back(cap.value());
+        } else {
+            log::warn("--scene-light auto: frame {}: {}", f, log::safe(cap.error().message));
+        }
+    }
+    const render::SkyCap combined = render::combineSkyCaps(caps);
+    return render::classifySceneLight(metered, combined.valid ? std::optional<render::SkyCap>(combined)
+                                                              : std::nullopt);
+}
+
 int runRender(const RenderOptions& o) {
     // ---- open the pipeline ------------------------------------------------------
     // The per-frame analyses shade bands from host planes, so they decide
     // whether a CUDA decode may keep its frames on the GPU.
     PipelineOptions pipelineOptions = o.pipeline;
-    pipelineOptions.hostFramesRequired =
-        o.seamSearch || o.gain || o.parallax || o.seamCarve || o.photo != "off" || o.shading != "off";
+    pipelineOptions.hostFramesRequired = o.seamSearch || o.gain || o.parallax || o.seamCarve || o.photo != "off" ||
+                                         o.shading != "off" || o.sceneLight == "auto";
     auto pipe = Pipeline::open(pipelineOptions, true);
     if (!pipe.ok()) {
         std::fprintf(stderr, "error: %s\n", log::safe(pipe.value() ? "" : pipe.error().toString()).c_str());
@@ -770,6 +850,28 @@ int runRender(const RenderOptions& o) {
         return kExitUsage;
     }
     shadingParams.strength = o.shadingStrength;
+    // ---- Scene Light: the night profile for this pipeline's own analyses ---------------
+    // Night shortens the gain field to a luma-only 6 deg decay clamped at 0.75
+    // stop (overriding --photo-decay), turns the lens shading correction off
+    // and leaves --gain's exposure match out on every frame, the field-refused
+    // fallback included - exactly the plug-ins' night profile.
+    render::SceneLight scene = render::SceneLight::Day;
+    if (o.sceneLight == "night") {
+        scene = render::SceneLight::Night;
+    } else if (o.sceneLight == "auto") {
+        const render::SceneLightVerdict verdict = classicSceneLight(P, o);
+        scene = verdict.light;
+        log::info("--scene-light auto: {} ({}; {})", render::sceneLightName(scene), verdict.reason,
+                  render::sceneLightEvidence(verdict));
+    } else if (!o.sceneLight.empty() && o.sceneLight != "day") {
+        std::fprintf(stderr, "error: unknown --scene-light '%s' (auto|day|night)\n", log::safe(o.sceneLight).c_str());
+        return kExitUsage;
+    }
+    const bool night = scene == render::SceneLight::Night;
+    if (night) {
+        render::applyNightPhotoProfile(photoParams);
+        render::applyNightShadingProfile(shadingParams);
+    }
     render::LensShadingHistory shadingHistory;
     // [WP-SEAMTOOLS] The ranges the Source Settings sliders offer.
     const render::SeamTools& tools = o.seamTools;
@@ -938,7 +1040,8 @@ int runRender(const RenderOptions& o) {
                           log::safe(carved.error().message));
             }
         }
-        if (analyse && o.gain) {
+        // Scene Light: no exposure match at night (globalGain stays identity).
+        if (analyse && o.gain && !night) {
             render::BandParams band;
             auto g = render::estimateGain(P.rig, pair.value(), P.blendParams, band, *P.pool, shadingNow);
             if (g.ok()) {
@@ -1092,7 +1195,7 @@ constexpr const char* kClassicOnlyOptions[] = {
 };
 
 /// The plugin engine's own options, which the classic pipeline has no use for.
-constexpr const char* kPluginOnlyOptions[] = {"--flare", "--parallax-grid", "--lens-align"};
+constexpr const char* kPluginOnlyOptions[] = {"--flare", "--parallax-grid", "--lens-align", "--lens-focal"};
 
 /// The Source Settings a plugin-engine render uses: the built-in defaults of
 /// a new clip - or, with --use-user-defaults, the ones saved in Premiere -
@@ -1321,6 +1424,20 @@ int enginePrefs(const RenderOptions& o, const CLI::App& sub, premiere::PrefsBlob
         }
         out.lensAlign = static_cast<std::uint8_t>(index);
     }
+    if (given("--lens-focal")) {
+        const int index = tokenIndex(kCliLensFocal, o.lensFocal);
+        if (index < 0) {
+            return usage("unknown --lens-focal '" + o.lensFocal + "' (" + tokenList(kCliLensFocal) + ")");
+        }
+        out.lensFocal = static_cast<std::uint8_t>(index);
+    }
+    if (given("--scene-light")) {
+        const int index = tokenIndex(kCliSceneLight, o.sceneLight);
+        if (index < 0) {
+            return usage("unknown --scene-light '" + o.sceneLight + "' (" + tokenList(kCliSceneLight) + ")");
+        }
+        out.sceneLight = static_cast<std::uint8_t>(index);
+    }
     out.sanitise();
     return kExitOk;
 }
@@ -1493,6 +1610,13 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
                        "plugin engine: follows (per moment) | steady (one correction for the clip) | auto (default)");
     engine->add_option("--lens-align", opt->lensAlign,
                        "plugin engine: off | auto (default; fit the small rotation between the lenses per clip)");
+    engine->add_option("--lens-focal", opt->lensFocal,
+                       "plugin engine: auto (default; the recorded focal where it matches each lens's calibration) "
+                       "| camera (the recorded focal whenever it fits the stream) | calibration (each lens's own)");
+    engine->add_option("--scene-light", opt->sceneLight,
+                       "auto | day | night: the photometric profile (night: a short luma-only sky seam field, no "
+                       "exposure match, no lens shading).  Default: auto with the plugin engine (the camera's "
+                       "metered light, confirmed by the sky); day with --engine classic");
 
     auto* sel = sub->add_option_group("Frames");
     sel->add_option("--frame", opt->frame, "Single frame index")->default_val(-1);

@@ -211,10 +211,14 @@ TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     static_assert(offsetof(PrefsBlob, lensAlign) == 51, "lensAlign sits at 51");
     static_assert(offsetof(PrefsBlob, steadyReserved) == 52, "52-53 are WP-STEADY's spare bytes");
     // [WP-HDRPEAK] hdrPeak at 54 (its range is 54-55); [WP-HDRTONE] hdrTone
-    // takes the spare byte at 55; the reserved block starts at 56.
+    // takes the spare byte at 55.
     static_assert(offsetof(PrefsBlob, hdrPeak) == 54, "hdrPeak sits at 54");
     static_assert(offsetof(PrefsBlob, hdrTone) == 55, "hdrTone sits at 55");
-    static_assert(offsetof(PrefsBlob, reserved) == 56, "reserved fills the rest");
+    // Scene Light and Lens Focal at 56-57, from the front of the reserved
+    // block, which now starts at 58.
+    static_assert(offsetof(PrefsBlob, sceneLight) == 56, "sceneLight sits at 56");
+    static_assert(offsetof(PrefsBlob, lensFocal) == 57, "lensFocal sits at 57");
+    static_assert(offsetof(PrefsBlob, reserved) == 58, "reserved fills the rest");
     static_assert(std::is_trivially_copyable_v<PrefsBlob>, "the blob is memcpy'd to and from the host");
 
     REQUIRE(sizeof(PrefsBlob) == PrefsBlob::kSize);
@@ -254,6 +258,62 @@ TEST_CASE("a blob from an older build still deserialises", "[common][prefs]") {
     CHECK(old.directColourMode() == PrefsDirectColour::SequenceSpace);
     CHECK(fresh.directColourMode() == PrefsDirectColour::SequenceSpace);
     CHECK(fresh.directColour == 0u);
+}
+
+TEST_CASE("Scene Light and Lens Focal: zero is Auto, garbage lands on Auto, every choice round-trips",
+          "[common][prefs]") {
+    // Both bytes came out of the reserved block, so a project saved before
+    // them holds zeros there - which must read as Auto, the default of a
+    // fresh blob too (Scene Light Auto renders every day clip as before; Lens
+    // Focal Auto IS the rule an older build stitched with).
+    SECTION("an older blob's zeros and a fresh blob are Auto") {
+        PrefsBlob old = PrefsBlob::defaults();
+        old.sceneLight = 0;
+        old.lensFocal = 0;
+        REQUIRE(old.sanitise());  // zero is valid: nothing to rewrite
+        CHECK(old.sceneLightChoice() == PrefsSceneLight::Auto);
+        CHECK(old.lensFocalChoice() == PrefsLensFocal::Auto);
+        const PrefsBlob fresh = PrefsBlob::defaults();
+        CHECK(fresh.sceneLight == 0u);
+        CHECK(fresh.lensFocal == 0u);
+        CHECK(fresh == old);
+    }
+
+    SECTION("an out-of-range byte reads as Auto and sanitise() stores Auto") {
+        PrefsBlob p = PrefsBlob::defaults();
+        p.sceneLight = 3;
+        p.lensFocal = 0xFF;
+        CHECK(p.sceneLightChoice() == PrefsSceneLight::Auto);  // the accessor guards an unsanitised blob
+        CHECK(p.lensFocalChoice() == PrefsLensFocal::Auto);
+        CHECK_FALSE(p.sanitise());
+        CHECK(p.sceneLight == 0u);
+        CHECK(p.lensFocal == 0u);
+        CHECK(p == PrefsBlob::defaults());  // one meaning, one byte pattern, one cache key
+    }
+
+    SECTION("every choice survives the bytes and changes the cache key") {
+        const PrefsBlob base = PrefsBlob::defaults();
+        for (int v = 0; v < static_cast<int>(PrefsSceneLight::Count); ++v) {
+            PrefsBlob p = base;
+            p.sceneLight = static_cast<std::uint8_t>(v);
+            INFO("scene light " << v);
+            REQUIRE(p.sanitise());
+            const PrefsBlob back = PrefsBlob::fromBytes(&p, PrefsBlob::kSize);
+            CHECK(static_cast<int>(back.sceneLightChoice()) == v);
+            // The whole blob is the PPix cache key: a different choice is a
+            // different key, so a changed setting never hits a stale frame.
+            CHECK((std::memcmp(back.cacheKey(), base.cacheKey(), PrefsBlob::kSize) == 0) == (v == 0));
+        }
+        for (int v = 0; v < static_cast<int>(PrefsLensFocal::Count); ++v) {
+            PrefsBlob p = base;
+            p.lensFocal = static_cast<std::uint8_t>(v);
+            INFO("lens focal " << v);
+            REQUIRE(p.sanitise());
+            const PrefsBlob back = PrefsBlob::fromBytes(&p, PrefsBlob::kSize);
+            CHECK(static_cast<int>(back.lensFocalChoice()) == v);
+            CHECK((back == base) == (v == 0));
+        }
+    }
 }
 
 TEST_CASE("the calibration choice decodes from two bytes and old blobs keep their meaning", "[common][prefs]") {

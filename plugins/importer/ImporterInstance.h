@@ -39,6 +39,7 @@
 #include "FlareStage.h"  // [WP-FLARE]
 #include "PixelCopy.h"
 #include "PrefsBlob.h"
+#include "SceneLightStage.h"  // Scene Light
 #include "SteadyStage.h"  // [WP-STEADY]
 
 #include "osv/color/ColorParams.h"
@@ -60,6 +61,7 @@
 #include "osv/render/SeamCarve.h"
 #include "osv/render/SeamTools.h"  // [WP-SEAMTOOLS]
 #include "osv/render/RenderParamsBuilder.h"
+#include "osv/render/SceneLight.h"
 #include "osv/video/DualStreamReader.h"
 #include "osv/video/GpuClipDecoder.h"
 
@@ -1188,6 +1190,58 @@ private:
     /// on a rig with a folded rotation, the default otherwise.
     [[nodiscard]] render::ParallaxWarpParams parallaxParamsLocked() const noexcept;
     // ---- [/WP-STEADY] ----------------------------------------------------------
+
+    // ---- Scene Light (render/SceneLight.h, SceneLightStage.h) -----------------
+    // Which photometric profile the seam corrections run with.  Guarded by
+    // m_mutex; the stage has its own lock for what its worker publishes.
+
+    /// The Lens Focal choice the rig was built for (rebuildRig trigger).
+    PrefsLensFocal m_rigLensFocal = PrefsLensFocal::Auto;
+    /// The sky cap measurement for Scene Light Auto on a dark clip.
+    SceneLightStage m_sceneStage;
+    /// The clip's metered light (camera metadata), computed once on first use.
+    std::optional<render::MeteredLight> m_metered;
+    /// Auto's verdict once it is known (immediately for a clip whose metered
+    /// light is not dark, when the sky cap lands for one that is).  Depends
+    /// only on the clip, so it survives every settings change.
+    std::optional<render::SceneLightVerdict> m_sceneVerdict;
+    /// An attitude track built for the cap alone when the stabilisation built
+    /// none (Stabilisation Off): gravity-up is a property of the clip.
+    std::optional<geom::AttitudeTrack> m_sceneAttitude;
+    /// The profile in force (the frame being built, and every analysis
+    /// parameter derived from the prefs): Day is today's behaviour.
+    render::SceneLight m_sceneLight = render::SceneLight::Day;
+    /// False when the frame being built used the provisional day profile
+    /// while Auto's sky measurement was still running.
+    bool m_sceneFrameExact = true;
+    /// An Exact wait that timed out has been logged for this clip.
+    bool m_sceneWaitWarned = false;
+
+    /// Longest an Exact frame waits for the sky measurement before it renders
+    /// with the day profile (and says so).  The measurement is a few hundred
+    /// milliseconds; the bound only guards a decoder that hangs.
+    static constexpr std::chrono::milliseconds kSceneExactWait{30000};
+
+    /// At the top of every frame build, before the steady stage and the
+    /// analyses: settle the profile the frame renders with.  Day / Night
+    /// choices are taken as they are; Auto reads the metered light and, for a
+    /// dark clip, hands the stage its request (never for a draft), waits for
+    /// it when the frame is Exact, and adopts the verdict once it lands.
+    /// Caller holds m_mutex.
+    void prepareSceneLightLocked(RenderPurpose purpose, bool draft);
+
+    /// The sky cap request for this clip: the lens rotation fit's three
+    /// sample frames, each with its gravity-up.  nullopt when the clip has no
+    /// attitude or no frame to measure.  Caller holds m_mutex.
+    [[nodiscard]] std::optional<SceneLightRequest> sceneRequestLocked();
+
+    /// True when the night profile is in force.
+    [[nodiscard]] bool nightProfileLocked() const noexcept { return m_sceneLight == render::SceneLight::Night; }
+
+    /// "Night (auto: LV 3.7, sky -3.2 stops)" and the like, for the
+    /// Properties panel.  Caller holds m_mutex.
+    [[nodiscard]] std::string sceneLightTextLocked() const;
+    // ---- [/Scene Light] --------------------------------------------------------
 };
 
 }  // namespace osv::premiere

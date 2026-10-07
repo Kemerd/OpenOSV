@@ -105,6 +105,7 @@ set(_osv_ofx_sources
   # ---- the importer's clip engine ----
   "${_osv_ofx_importer}/ImporterInstance.cpp"
   "${_osv_ofx_importer}/SteadyStage.cpp"
+  "${_osv_ofx_importer}/SceneLightStage.cpp"
   "${_osv_ofx_importer}/FlareStage.cpp"
   "${_osv_ofx_importer}/ProtectorGuard.cpp"
   "${_osv_ofx_importer}/ImporterAudio.cpp"

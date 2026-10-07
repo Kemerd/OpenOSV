@@ -359,6 +359,29 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
         fixture.setPopup(kIndexLensAlign, 2);
         CHECK(translate(fixture, off).lensAlignChoice() == PrefsLensAlign::Off);
     }
+    SECTION("Scene Light") {
+        // "Auto" -> Auto, "Day" -> Day, "Night" -> Night: the popup is in enum order.
+        for (int item = 1; item <= OSV_SS_SCENE_LIGHT_COUNT; ++item) {
+            PrefsBuffer buffer;
+            fixture.setPopup(kIndexSceneLight, item);
+            INFO("popup value " << item);
+            CHECK(translate(fixture, buffer).sceneLightChoice() == static_cast<PrefsSceneLight>(item - 1));
+        }
+        PrefsBuffer night;
+        fixture.setPopup(kIndexSceneLight, 3);
+        CHECK(translate(fixture, night).sceneLightChoice() == PrefsSceneLight::Night);
+    }
+    SECTION("Lens Focal") {
+        for (int item = 1; item <= OSV_SS_LENS_FOCAL_COUNT; ++item) {
+            PrefsBuffer buffer;
+            fixture.setPopup(kIndexLensFocal, item);
+            INFO("popup value " << item);
+            CHECK(translate(fixture, buffer).lensFocalChoice() == static_cast<PrefsLensFocal>(item - 1));
+        }
+        PrefsBuffer calibration;
+        fixture.setPopup(kIndexLensFocal, 3);
+        CHECK(translate(fixture, calibration).lensFocalChoice() == PrefsLensFocal::Calibration);
+    }
     SECTION("Shading Strength") {  // [WP-VIGNETTE]
         for (const double percent : {0.0, 1.0, 42.0, 99.0, 100.0}) {
             PrefsBuffer buffer;
@@ -1085,6 +1108,47 @@ TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesetting
     // [WP-STEADY] both popups on their first item, Auto.
     CHECK(c.parallaxGrid == OSV_SS_PARALLAX_GRID_DEFAULT);
     CHECK(c.lensAlign == OSV_SS_LENS_ALIGN_DEFAULT);
+    // Scene Light and Lens Focal: item 1, Auto.
+    CHECK(c.sceneLight == OSV_SS_SCENE_LIGHT_DEFAULT);
+    CHECK(c.lensFocal == OSV_SS_LENS_FOCAL_DEFAULT);
+}
+
+TEST_CASE("the pure mapping round-trips Scene Light and Lens Focal", "[sourcesettings][mapping][scenelight]") {
+    // Every item of both popups, both ways.  Both lists are in enum order, so
+    // item N selects enum value N - 1.
+    for (int scene = 1; scene <= OSV_SS_SCENE_LIGHT_COUNT; ++scene) {
+        for (int focal = 1; focal <= OSV_SS_LENS_FOCAL_COUNT; ++focal) {
+            ControlValues c;
+            c.sceneLight = scene;
+            c.lensFocal = focal;
+            const PrefsBlob blob = prefsFromControls(c);
+            INFO("scene light item " << scene << ", lens focal item " << focal);
+            REQUIRE(blob.isValid());
+            CHECK(blob.sceneLightChoice() == static_cast<PrefsSceneLight>(scene - 1));
+            CHECK(blob.lensFocalChoice() == static_cast<PrefsLensFocal>(focal - 1));
+            const ControlValues back = controlsFromPrefs(blob);
+            CHECK(back.sceneLight == scene);
+            CHECK(back.lensFocal == focal);
+        }
+    }
+    // Hostile popup values: Auto, never a blob needing repair.
+    for (const int hostile : {std::numeric_limits<int>::min(), -1, 0, 4, 77}) {
+        ControlValues c;
+        c.sceneLight = hostile;
+        c.lensFocal = hostile;
+        PrefsBlob blob = prefsFromControls(c);
+        CHECK(blob.sceneLightChoice() == PrefsSceneLight::Auto);
+        CHECK(blob.lensFocalChoice() == PrefsLensFocal::Auto);
+        CHECK(blob.sanitise());
+    }
+    // An older project's blob (zero bytes) shows Auto for both - which is
+    // what it renders with.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.sceneLight = 0;
+    old.lensFocal = 0;
+    const ControlValues shown = controlsFromPrefs(old);
+    CHECK(shown.sceneLight == 1);
+    CHECK(shown.lensFocal == 1);
 }
 
 TEST_CASE("the pure mapping round-trips Parallax Grid and Lens Alignment", "[sourcesettings][mapping][steady]") {

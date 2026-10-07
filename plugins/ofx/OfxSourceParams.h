@@ -69,6 +69,10 @@ inline constexpr const char* kLensShading = "lensShading";
 inline constexpr const char* kShadingStrength = "shadingStrength";
 inline constexpr const char* kParallaxGrid = "parallaxGrid";
 inline constexpr const char* kLensAlignment = "lensAlignment";
+/// "Scene Light": the photometric profile (Auto / Day / Night).
+inline constexpr const char* kSceneLight = "sceneLight";
+/// "Lens Focal": where each lens's focal length comes from.
+inline constexpr const char* kLensFocal = "lensFocal";
 inline constexpr const char* kAdvancedGroup = "advancedGroup";
 inline constexpr const char* kDlogmCurve = "dlogmCurve";
 inline constexpr const char* kExposure = "exposure";
@@ -106,8 +110,8 @@ inline constexpr const char* kAllParams[] = {
     kColourGroup,   kColorOutput,   kHdrTone /* [WP-HDRTONE] */, kLook, kHdrPeak, kStabilization, kStitchGroup,
     kSeamSearch,    kGainMatch,     kCalibration,  kFlareRemoval,    kSkySeamFix,    kSkySeamStrength,
     kSeamEdgeInset, kSeamBlend,     kParallaxBlend, kSeamSmoothing,  kNearOffset,    kFarOffset,
-    kLensShading,   kShadingStrength, kParallaxGrid, kLensAlignment, kAdvancedGroup, kDlogmCurve,
-    kExposure,      kRenderDevice,  kSphereSize,
+    kLensShading,   kShadingStrength, kParallaxGrid, kLensAlignment, kSceneLight,    kLensFocal,
+    kAdvancedGroup, kDlogmCurve,    kExposure,     kRenderDevice,  kSphereSize,
 };
 
 /// Colour Output's default, 0-based: Rec. 709.

@@ -22,8 +22,18 @@ namespace osv::geom {
 
 /// Where the stream-space focal length comes from.
 enum class FocalSource {
-    DigitalFocalLength,  ///< fx = fy = ClipMeta.digital_focal_length (verified at 6K).
-    ScaledCalibration    ///< fx, fy = calibration focal lengths * StreamScaling.scale.
+    /// fx = fy = ClipMeta.digital_focal_length when it agrees with THIS lens's
+    /// calibration * scale within 0.5 % (verified at 6K); otherwise the
+    /// lens's own scaled calibration (8K-mode clips record a value 1.3-2.7 %
+    /// off their lenses).
+    DigitalFocalLength,
+    ScaledCalibration,  ///< fx, fy = calibration focal lengths * StreamScaling.scale, always.
+    /// fx = fy = ClipMeta.digital_focal_length whenever it describes this
+    /// stream SIZE (within 1.2x of calibration * scale), the rule before
+    /// 8K-mode clips were measured; the scaled calibration otherwise (the LRF
+    /// proxy repeats its full-size clip's value).  Source Settings "Lens
+    /// Focal: Camera".
+    DigitalFocalLengthSameStream,
 };
 
 /// Stable name for logs / JSON.

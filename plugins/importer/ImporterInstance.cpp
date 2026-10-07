@@ -213,6 +213,20 @@ void trimAnalysisCache(MapT& cache, std::size_t limit, const typename MapT::key_
     }
 }
 
+/// Map the Lens Focal choice onto the rig builder's focal source.  Auto is
+/// the rule every clip is stitched with by default (digital_focal_length only
+/// where it matches each lens's calibration); Camera is the rule before the
+/// 8K-mode measurements; Calibration ignores the recorded value.
+[[nodiscard]] geom::FocalSource toFocalSource(PrefsLensFocal choice) noexcept {
+    switch (choice) {
+    case PrefsLensFocal::Camera:      return geom::FocalSource::DigitalFocalLengthSameStream;
+    case PrefsLensFocal::Calibration: return geom::FocalSource::ScaledCalibration;
+    case PrefsLensFocal::Auto:
+    case PrefsLensFocal::Count:
+    default:                          return geom::FocalSource::DigitalFocalLength;
+    }
+}
+
 /// Map the prefs enum onto HostContext's device preference.
 [[nodiscard]] RenderDevicePreference toDevicePreference(PrefsRenderDevice dev) noexcept {
     switch (dev) {
@@ -706,8 +720,14 @@ Status ImporterInstance::rebuildRig() {
     // per-lens calibration focal measured a lower overlap NCC (0.807 vs
     // 0.824).  8K-mode clips record a value 1.3-2.7 % off their lenses and
     // take the calibrated focal instead.
+    //
+    // Source Settings "Lens Focal" overrides the rule for a clip whose mode
+    // it gets wrong: Camera trusts the recorded value whenever it describes
+    // this stream size (the rule before the 8K measurements), Calibration
+    // always takes each lens's own.  Auto is the rule above, bit for bit.
+    const PrefsLensFocal focalChoice = m_prefs.lensFocalChoice();
     const geom::ExtrinsicConvention conv;  // defaults are the verified values
-    auto rig = geom::LensRig::build(calibration, scaling.value(), geom::FocalSource::DigitalFocalLength,
+    auto rig = geom::LensRig::build(calibration, scaling.value(), toFocalSource(focalChoice),
                                     m_format.digitalFocalLength, conv, 195.18);
     if (!rig.ok()) {
         return rig.error();
@@ -789,6 +809,7 @@ Status ImporterInstance::rebuildRig() {
     m_blend = blend;
     m_lensAlignState = alignState;   // [WP-STEADY]
     m_rigLensAlign = alignChoice;    // [WP-STEADY]
+    m_rigLensFocal = focalChoice;    // Lens Focal
 
     // The notes feed the Properties panel.  A rebuild REPLACES the previous
     // calibration / scaling / rig notes instead of piling another copy on
@@ -840,6 +861,13 @@ Status ImporterInstance::rebuildRig() {
         // measurement logs its own line when it lands).
         PluginLog::info("{} ('{}')", alignNote, m_path.filename().string());
     }
+    // Lens Focal: which rule set each lens's focal (the rig notes carry the
+    // numbers), so a user's override is visible in the log.
+    PluginLog::info("lens focal: '{}': {} ({})", m_path.filename().string(),
+                    focalChoice == PrefsLensFocal::Camera        ? "Camera"
+                    : focalChoice == PrefsLensFocal::Calibration ? "Calibration"
+                                                                 : "Auto",
+                    geom::focalSourceName(m_rig.focalSource));
 
     // The CHOICE, not the calibration byte: Auto and a forced Native share
     // calibration 0 but can stitch with different sets (on a clip recorded
@@ -1460,7 +1488,7 @@ void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
     // The rig only depends on the calibration choice and [WP-STEADY] on
     // whether the lens rotation is folded into it.
     if (m_parsed && (!m_rigBuilt || m_rigCalibration != incoming.calibrationChoice() ||
-                     m_rigLensAlign != incoming.lensAlignChoice())) {
+                     m_rigLensAlign != incoming.lensAlignChoice() || m_rigLensFocal != incoming.lensFocalChoice())) {
         const Status st = rebuildRig();
         if (!st.ok()) {
             PluginLog::warn("prefs: calibration slot {} could not be applied: {}",
@@ -1941,7 +1969,12 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     // ---- [WP-SEAMTOOLS] Near / Far Offset and Seam Smoothing, on that seam ---
     applySeamTools(index, carvedSeam.get(), appliedGrid.get(), builder);
 
-    if (m_prefs.gainMatch != 0) {
+    // Scene Light: at night the global exposure match is a ratio of means the
+    // street lights dominate - it flipped sign within a second and made sky
+    // seam steps of up to 10.9 codes on the night driving clip (4.1 with no
+    // correction) - so the night profile renders without it on EVERY path,
+    // the field-refused fallback included.  The builder's gain stays identity.
+    if (m_prefs.gainMatch != 0 && !nightProfileLocked()) {
         auto cached = m_gains.find(bucket);
         if (cached == m_gains.end()) {
             render::BandParams band;
@@ -1963,6 +1996,7 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
 
     frameExact = applyPhotoSeam(builder) && frameExact;  // [WP-PHOTO] rim + gain field (after the global gain)
     frameExact = applyLensShading(builder) && frameExact;  // [WP-VIGNETTE] the lens shading correction
+    frameExact = frameExact && m_sceneFrameExact;  // Scene Light: a provisional day profile is not final
     return AnalysisOutcome{parallaxApplied, frameExact};
 }
 
@@ -2001,6 +2035,12 @@ render::PhotoSeamParams ImporterInstance::photoParamsLocked() const noexcept {
     default: params.mode = render::PhotoSeamMode::Off; break;
     }
     params.strength = m_prefs.photoStrengthPercent() / 100.0;
+    // Scene Light: at night a short, luma-only, gently clamped field - the
+    // 20 deg decay painted a halo band into a crushed black sky.  Day keeps
+    // every default, so a day clip renders exactly as before.
+    if (nightProfileLocked()) {
+        render::applyNightPhotoProfile(params);
+    }
     return params;
 }
 
@@ -2017,6 +2057,9 @@ render::PhotoRimPenaltyScope ImporterInstance::preparePhotoSeam(std::uint32_t in
         // A different rig (calibration slot, lens-protector correction)
         // invalidates every rim and gain measured with the old one.
         std::vector<double> key = photoRigKey(m_rig);
+        // Scene Light: each cell is clamped when it is MEASURED, so fields
+        // stored under the other profile's clamp are stale too.
+        key.push_back(params.maxAbsLog2Gain);
         if (key != m_photoRigKey) {
             m_photo.clear();
             m_photoLast.reset();
@@ -2098,6 +2141,178 @@ bool ImporterInstance::applyPhotoSeam(render::RenderParamsBuilder& builder) {
 }
 
 // ---------------------------------------------------------------------------
+//  Scene Light: the photometric profile (render/SceneLight.h)
+// ---------------------------------------------------------------------------
+void ImporterInstance::prepareSceneLightLocked(RenderPurpose purpose, bool draft) {
+    // The caller holds m_mutex.  Every path below leaves m_sceneLight set.
+    m_sceneFrameExact = true;
+    const std::string name = m_path.filename().string();
+
+    // ---- a forced choice is taken as it is ------------------------------------------
+    switch (m_prefs.sceneLightChoice()) {
+    case PrefsSceneLight::Day: m_sceneLight = render::SceneLight::Day; return;
+    case PrefsSceneLight::Night: m_sceneLight = render::SceneLight::Night; return;
+    case PrefsSceneLight::Auto:
+    case PrefsSceneLight::Count:
+    default: break;
+    }
+
+    // ---- Auto, already decided: the verdict depends only on the clip ----------------
+    if (m_sceneVerdict) {
+        m_sceneLight = m_sceneVerdict->light;
+        return;
+    }
+
+    // ---- the metered light, once (metadata only) ---------------------------------------
+    if (!m_metered) {
+        m_metered = render::meteredLightOf(m_track, m_frameCount);
+    }
+    if (!render::meteredLightSaysDark(*m_metered)) {
+        // Daylight, the ambiguous middle or no metadata: today's profile, decided
+        // without a single decoded pixel.
+        m_sceneVerdict = render::classifySceneLight(*m_metered, std::nullopt);
+        m_sceneLight = m_sceneVerdict->light;
+        PluginLog::info("scene light: '{}': {} ({})", name, render::sceneLightName(m_sceneLight),
+                        m_sceneVerdict->reason);
+        return;
+    }
+
+    // ---- dark metered light: the sky decides --------------------------------------------
+    // Drafts (thumbnails, prefetch) never start a measurement: importing a
+    // folder of night clips must not decode every one of them.
+    if (!draft) {
+        std::optional<SceneLightRequest> request = sceneRequestLocked();
+        if (!request) {
+            // No attitude (or no frame): the cap cannot be levelled, so the
+            // verdict is the day profile, and final.
+            m_sceneVerdict = render::classifySceneLight(*m_metered, std::nullopt);
+            m_sceneLight = m_sceneVerdict->light;
+            PluginLog::info("scene light: '{}': {} ({}; the clip has no attitude to level the sky by)", name,
+                            render::sceneLightName(m_sceneLight), m_sceneVerdict->reason);
+            return;
+        }
+        m_sceneStage.request(*request, name);
+        if (purpose == RenderPurpose::Exact) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool settled = m_sceneStage.waitSettled(kSceneExactWait);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (!settled && !m_sceneWaitWarned) {
+                m_sceneWaitWarned = true;
+                PluginLog::warn("scene light: '{}': the sky measurement was not ready after {:.0f} ms; this frame "
+                                "renders with the day profile",
+                                name, ms);
+            } else if (settled && ms > 1.0) {
+                PluginLog::debug("scene light: '{}': an exact frame waited {:.0f} ms for the sky measurement", name,
+                                 ms);
+            }
+        }
+    }
+
+    // ---- adopt the answer once it has landed ----------------------------------------------
+    const SceneLightStage::Snapshot snap = m_sceneStage.snapshot();
+    if (!snap.active || !snap.settled) {
+        // Still measuring (or a draft before any request): the day profile,
+        // provisionally - the frame is not final and stays out of the caches
+        // that serve Exact requests.
+        m_sceneLight = render::SceneLight::Day;
+        m_sceneFrameExact = false;
+        return;
+    }
+    m_sceneVerdict = render::classifySceneLight(*m_metered, snap.cap);
+    m_sceneLight = m_sceneVerdict->light;
+    PluginLog::info("scene light: '{}': {} ({})", name, render::sceneLightName(m_sceneLight), m_sceneVerdict->reason);
+    if (m_sceneLight != render::SceneLight::Day) {
+        // Frames rendered while the sky was measured used the day profile:
+        // drop the rendered frame and the exposure gains (the photometric
+        // fields and shading models go by themselves, keyed by their
+        // parameters).
+        m_lastFrame = RenderedFrame{};
+        m_gains.clear();
+    }
+}
+
+std::optional<SceneLightRequest> ImporterInstance::sceneRequestLocked() {
+    try {
+        SceneLightRequest r;
+        r.path = m_path;
+        r.format = m_format;
+        r.containerSamples = containerSamplesUsable(m_file.get(), m_format);
+
+        // ---- the fixed sample frames: the lens rotation fit's three --------------------
+        // 10 / 50 / 90 % of the clip, snapped to sync frames on a long clip,
+        // so each is one intra decode and the answer depends on the clip alone.
+        std::vector<std::uint32_t> syncFrames;
+        if (m_file) {
+            const std::uint32_t id = m_format.videoTrackIds[0] != 0 ? m_format.videoTrackIds[0] : 1u;
+            if (const TrackInfo* video = m_file->track(id); video && video->samples.hasSyncTable()) {
+                syncFrames = video->samples.syncSamples();
+            }
+        }
+        const std::vector<std::uint32_t> frames =
+            render::clipSampleFrames(m_frameCount, syncFrames, render::kLensRotationSamples, 0.1, 0.9);
+
+        // ---- gravity-up per frame: the stabilisation's attitude, or one of our own --------
+        const geom::AttitudeTrack* attitude = m_attitude ? &*m_attitude : nullptr;
+        if (!attitude) {
+            if (!m_sceneAttitude) {
+                // The same reading the stabilisation would use (measured
+                // gravity), built once for a clip rendered with it off.
+                geom::AttitudeTrack::Options options;
+                geom::ConventionProbe::autoDetect(m_track).applyTo(options);
+                auto built = geom::AttitudeTrack::build(m_track, options);
+                if (!built.ok() || built.value().sampleCount() == 0) {
+                    return std::nullopt;
+                }
+                m_sceneAttitude = std::move(built).value();
+            }
+            attitude = &*m_sceneAttitude;
+        }
+        for (const std::uint32_t f : frames) {
+            if (const std::optional<Vec3d> up = render::bodyUpAt(*attitude, m_track, f, fps())) {
+                r.frames.push_back(f);
+                r.upBody.push_back(*up);
+            }
+        }
+        if (r.frames.empty()) {
+            return std::nullopt;
+        }
+
+        // ---- the geometry and the decode to scene-linear ------------------------------------
+        // The calibration rig and the analysis blend (a rotation of a third of
+        // a degree is nothing to a 45 deg cap); the clip's own D-Log M curve,
+        // no exposure offset - the cap is compared against METERED grey.
+        r.rig = m_baseRig;
+        r.blend = m_blend;
+        r.linearColor = color::makeColorParams(toDlogMFit(m_prefs.fit()), color::OutputTransfer::Linear, 0.0f,
+                                               inputEncodingFor(m_format.colorMode), true, video::kDecodedSampleBits);
+        return r;
+    } catch (const std::exception& e) {
+        PluginLog::warn("scene light: '{}': no sky request ({}); day profile", m_path.filename().string(), e.what());
+        return std::nullopt;
+    }
+}
+
+std::string ImporterInstance::sceneLightTextLocked() const {
+    // A forced choice says so; Auto says what it decided and from what.
+    switch (m_prefs.sceneLightChoice()) {
+    case PrefsSceneLight::Day: return "Day (set in Source Settings)";
+    case PrefsSceneLight::Night: return "Night (set in Source Settings)";
+    case PrefsSceneLight::Auto:
+    case PrefsSceneLight::Count:
+    default: break;
+    }
+    if (m_sceneVerdict) {
+        return std::format("{} (auto: {})", render::sceneLightName(m_sceneVerdict->light),
+                           render::sceneLightEvidence(*m_sceneVerdict));
+    }
+    if (m_metered) {
+        return std::format("Auto, measuring the sky ({} {:.1f})", m_metered->fromAecLv ? "LV" : "EV100",
+                           m_metered->median);
+    }
+    return "Auto (decided on the first frame)";
+}
+
+// ---------------------------------------------------------------------------
 //  [WP-VIGNETTE] lens shading correction
 // ---------------------------------------------------------------------------
 render::LensShadingParams ImporterInstance::shadingParamsLocked() const noexcept {
@@ -2106,6 +2321,11 @@ render::LensShadingParams ImporterInstance::shadingParamsLocked() const noexcept
     params.mode = m_prefs.lensShadingMode() == PrefsLensShading::Auto ? render::LensShadingMode::Auto
                                                                        : render::LensShadingMode::Off;
     params.strength = m_prefs.shadingStrengthPercent() / 100.0;
+    // Scene Light: its sky gate is a smoothness test with no elevation, which
+    // a dark sky, a lit door and a blurred road all pass at night.
+    if (nightProfileLocked()) {
+        render::applyNightShadingProfile(params);
+    }
     return params;
 }
 
@@ -2610,6 +2830,7 @@ Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_
     // Assembled exactly as renderFrame assembles the equirect's, from the same
     // analysis caches, so a direct view and the importer's equirect of the
     // same frame are stitched identically.
+    prepareSceneLightLocked(purpose, /*draft=*/false);  // Scene Light: the profile the analyses read
     prepareSteadyLocked(purpose, /*draft=*/false);  // [WP-STEADY] before anything reads m_rig
     render::RenderParamsBuilder builder;
     refreshRenderBlend();  // [WP-PHOTO] the render-only inset blend; analyses keep m_blend
@@ -2807,6 +3028,7 @@ Result<render::RenderJob> ImporterInstance::buildEquirectJob(std::uint32_t index
     // The colour block is the clip's own unless this one request overrides
     // the transfer (colorForTransfer); the analyses never depend on it.
     const OsvColorParams frameColor = colorForTransfer(outputTransfer);
+    prepareSceneLightLocked(purpose, draft);  // Scene Light: the profile the analyses read
     prepareSteadyLocked(purpose, draft);  // [WP-STEADY] before anything reads m_rig
     render::RenderParamsBuilder builder;
     refreshRenderBlend();  // [WP-PHOTO] the render-only inset blend; analyses keep m_blend
@@ -3505,6 +3727,9 @@ void ImporterInstance::appendCameraSettingsLocked(const std::function<void(const
     if (cams.front().aecLv > 0.0f) {
         line("  Metered light value LV " + range([](const meta::CameraFrame& c) { return c.aecLv; }, "%.1f"));
     }
+    // Scene Light: the profile the seam corrections run with, and what Auto
+    // decided it from.
+    line("  Scene light: " + sceneLightTextLocked());
     if (cams.front().sensorTemperature != 0.0f) {
         line("  Sensor temperature " +
              range([](const meta::CameraFrame& c) { return c.sensorTemperature; }, "%.0f") + " C");

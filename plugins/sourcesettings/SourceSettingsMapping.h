@@ -100,6 +100,9 @@ struct ControlValues {
     int lensAlign = OSV_SS_LENS_ALIGN_DEFAULT;        ///< 1-based popup value (kLensAlignByPopup).
     // ---- [WP-HDRTONE] -----------------------------------------------------------
     int hdrTone = OSV_SS_HDR_TONE_DEFAULT;  ///< 1-based popup value (PrefsHdrTone + 1).
+    // ---- Scene Light and Lens Focal (popups in enum order) ------------------------
+    int sceneLight = OSV_SS_SCENE_LIGHT_DEFAULT;  ///< 1-based popup value (PrefsSceneLight + 1).
+    int lensFocal = OSV_SS_LENS_FOCAL_DEFAULT;    ///< 1-based popup value (PrefsLensFocal + 1).
 };
 
 /// Control values -> PrefsBlob.
