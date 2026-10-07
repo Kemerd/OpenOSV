@@ -13,8 +13,10 @@
 //   disBlurRows/ColsKernel  separable Gaussian (pyramid pre-blur, smoothFlow)
 //   disDecimateKernel     2x2 box half-scale              (halfScale)
 //   disGradientKernel     central differences             (gradients)
-//   disTensorKernel       per-patch inverse tensor        (precomputeTensors)
-//   disSolveGroupKernel   seeded inverse search, a lane group per patch
+//   disTensorKernel       per-patch regularised inverse tensor and the
+//                         epipolar-search flag         (precomputeTensors)
+//   disSolveGroupKernel   seeded 1-D epipolar search, then inverse search
+//                         with revert-on-runaway, a lane group per patch
 //                         (solvePatch; disSolveKernel for other patch sides)
 //   disDensifyKernel      photometric-weight gather       (densify)
 //   disConsistencyKernel  forward-backward check          (disFlowBidirectional)
@@ -22,18 +24,19 @@
 // WHY IT MIRRORS THE CPU ARITHMETIC SO CLOSELY
 // --------------------------------------------
 // DIS is an iterative solve with hard thresholds - a tensor determinant
-// floor, a displacement cap, an SSD rejection, a convergence break - so a
-// last-bit difference in one sum can flip a patch from accepted to rejected
-// and move the field by whole pixels there.  Rather than chase a tolerance,
-// every per-element computation here is written in the CPU's order and at
-// the CPU's precision: the structure tensor and the patch sums accumulate in
-// DOUBLE exactly as DisFlow.cpp does, each patch's sums run in the CPU's
-// order (one thread, or a lane group relaying the running sum in row order),
-// densify gathers overlapping patches in the CPU's order, and the Gaussian
-// taps are built on the host with the CPU's own code.  With -fmad=false and
-// IEEE division on both sides, the GPU field equals the CPU field bit for
-// bit - on the synthetic pairs of the tests and on the sample clip's real
-// bands (tests/unit/test_disflow_cuda.cpp compares them with ==).
+// floor, the epipolar search's argmin and ratio test, a displacement cap,
+// an SSD rejection, a convergence break - so a last-bit difference in one
+// sum can flip a patch from accepted to rejected (or move its seed a whole
+// pixel) and move the field by whole pixels there.  Rather than chase a
+// tolerance, every per-element computation here is written in the CPU's
+// order and at the CPU's precision: the structure tensor and the patch sums
+// accumulate in DOUBLE exactly as DisFlow.cpp does, each patch's sums run in
+// the CPU's order (one thread, or a lane group relaying the running sum in
+// row order), densify gathers overlapping patches in the CPU's order, and
+// the Gaussian taps are built on the host with the CPU's own code.  With
+// -fmad=false and IEEE division on both sides, the GPU field equals the CPU
+// field bit for bit - on the synthetic pairs of the tests and on the sample
+// clip's real bands (tests/unit/test_disflow_cuda.cpp compares them with ==).
 //
 // Double precision is slow on consumer GPUs (1/64 rate on the RTX 5090), and
 // it is still the right call here.  The solve is a few thousand patches of 64
@@ -274,9 +277,11 @@ __global__ void disGradientKernel(DisPair img, DisPairW gx, DisPairW gy, int w, 
 // ---------------------------------------------------------------------------
 
 /// DisFlow.cpp precomputeTensors, one thread per patch.  The tensor is
-/// accumulated in double, row by row, exactly as the CPU does it, and the
-/// singularity test is the same RAW determinant against DJI's floor.
-__global__ void disTensorKernel(DisPair gx, DisPair gy, int w, int h, DisGrid grid, double minTensorDet,
+/// accumulated in double, row by row, exactly as the CPU does it; the
+/// epipolar-search flag is taken from its raw trace, the Tikhonov term is
+/// added the same way, and the singularity test is the same RAW determinant
+/// against DJI's floor.
+__global__ void disTensorKernel(DisPair gx, DisPair gy, int w, int h, DisGrid grid, DisTensorConsts c,
                                 DisPatchPair patches) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     const int z = static_cast<int>(blockIdx.y);
@@ -299,6 +304,7 @@ __global__ void disTensorKernel(DisPair gx, DisPair gy, int w, int h, DisGrid gr
     p.iHxy = 0.0f;
     p.iHyy = 0.0f;
     p.usable = 0;
+    p.epipolar = 0;
 
     const float* __restrict__ gxp = gx.p[z];
     const float* __restrict__ gyp = gy.p[z];
@@ -319,9 +325,22 @@ __global__ void disTensorKernel(DisPair gx, DisPair gy, int w, int h, DisGrid gr
             hyy = addProduct(hyy, b, b);
         }
     }
-    // DJI's raw-determinant invertibility test (see DisFlowParams).
+    // The search's texture test reads the trace BEFORE regularisation, as on
+    // the CPU.
+    const double trace = hxx + hyy;
+    p.epipolar = trace >= c.epipolarMinTrace ? 1 : 0;
+    // Tikhonov: k * trace / 2 on both diagonal entries, skipped when off so
+    // the tensor is then the unregularised one bit for bit.  Two multiplies
+    // and two adds, none of them fusable (-fmad=false), in the CPU's order.
+    if (c.tikhonov > 0.0) {
+        const double eps = c.tikhonov * 0.5 * trace;
+        hxx += eps;
+        hyy += eps;
+    }
+    // DJI's raw-determinant invertibility test (see DisFlowParams), on the
+    // tensor actually inverted.
     const double det = hxx * hyy - hxy * hxy;
-    if (det > minTensorDet) {
+    if (det > c.minTensorDet) {
         const double invDet = 1.0 / det;
         p.iHxx = static_cast<float>(hyy * invDet);
         p.iHxy = static_cast<float>(-hxy * invDet);
@@ -329,6 +348,106 @@ __global__ void disTensorKernel(DisPair gx, DisPair gy, int w, int h, DisGrid gr
         p.usable = 1;
     }
     patches.p[z][i] = p;
+}
+
+/// +infinity as a double, for the running minima of the epipolar search
+/// (std::numeric_limits on the CPU side; the same bit pattern here).
+__device__ __forceinline__ double positiveInfinity() { return __longlong_as_double(0x7FF0000000000000LL); }
+
+/// The running state of the 1-D epipolar search over k = -radius .. radius,
+/// fed one candidate at a time in ascending k - DisFlow.cpp solvePatch's
+/// scan, statement for statement, so the same residual curve gives the same
+/// decision on both backends.  No per-candidate array: a per-thread array
+/// would reserve local memory for every resident thread on the device.
+struct EpipolarScan {
+    float seedV;     ///< The v the scan is centred on (candidate k is seedV + k).
+    double e0;       ///< e(0), the seed's own residual.
+    double best;     ///< The first minimum of the curve so far...
+    int kBest;       ///< ...at this offset...
+    float vBest;     ///< ...i.e. at this v.
+    double second;   ///< min e(j) over |j - kBest| >= 2.
+    double farMin;   ///< min e(j) over j <= k - 2.
+    double lag1;     ///< e(k - 1).
+    double lag2;     ///< e(k - 2).
+
+    __device__ void reset(float v) {
+        seedV = v;
+        e0 = positiveInfinity();
+        best = positiveInfinity();
+        kBest = 0;
+        vBest = v;
+        second = positiveInfinity();
+        farMin = positiveInfinity();
+        lag1 = positiveInfinity();
+        lag2 = positiveInfinity();
+    }
+
+    /// Call at the top of candidate k, before its residual is known.
+    __device__ void beginCandidate() {
+        if (lag2 < farMin) {
+            farMin = lag2;  // e(k - 2) is now two or more behind k
+        }
+    }
+
+    /// Record candidate k (v + k) with residual e (+inf when not scored).
+    __device__ void add(int k, float vk, double e) {
+        if (k == 0) {
+            e0 = e;
+        }
+        if (e < best) {
+            best = e;
+            kBest = k;
+            vBest = vk;
+            second = farMin;
+        } else if (k - kBest >= 2 && e < second) {
+            second = e;
+        }
+        lag2 = lag1;
+        lag1 = e;
+    }
+
+    /// Is the winner located and clear?  Located: a scored candidate on
+    /// either side (not at the end of the range, not against the cap), so
+    /// the curve is seen to rise both ways.  Clear: the absolute margin and
+    /// Lowe's ratio against the seed and the best rival two or more pixels
+    /// away.  DisFlow.cpp solvePatch's test, term for term.
+    __device__ bool adopt(const DisSolveConsts& c) const {
+        const bool bracketed =
+            kBest > -c.epipolarRadius && kBest < c.epipolarRadius &&
+            fabs(static_cast<double>(seedV + static_cast<float>(kBest - 1))) <= c.maxDisplacementPx &&
+            fabs(static_cast<double>(seedV + static_cast<float>(kBest + 1))) <= c.maxDisplacementPx;
+        const double ratio = c.epipolarRatio;
+        return kBest != 0 && bracketed && best < e0 - c.epipolarMarginCodes && best < ratio * e0 &&
+               best < ratio * second;
+    }
+};
+
+/// DisFlow.cpp windowResidual for the one-thread solve: the mean
+/// |mean-normalised residual| of the template against the target window
+/// displaced by (u, v).  Uses the clamped bilinear fetch throughout, which
+/// returns the same floats as the clamp-free one wherever that one applies
+/// (see solvePatch), and the CPU's sums in the CPU's order.
+__device__ double windowResidualAt(const float* tmpl, float tmplMean, const float* __restrict__ to, int w, int h,
+                                   int cx, int cy, int ps, int half, float u, float v, float* target) {
+    double targetSum = 0.0;
+    for (int dy = -half; dy < ps - half; ++dy) {
+        for (int dx = -half; dx < ps - half; ++dx) {
+            const float s =
+                sampleBilinear(to, w, h, static_cast<float>(cx + dx) + u, static_cast<float>(cy + dy) + v);
+            target[(dy + half) * ps + (dx + half)] = s;
+            targetSum += widen(s);
+        }
+    }
+    const double windowPixels = static_cast<double>(ps) * ps;
+    const float targetMean = static_cast<float>(targetSum / windowPixels);
+    double absResidual = 0.0;
+    for (int k = 0; k < ps * ps; ++k) {
+        const float t = tmpl[k] - tmplMean;
+        const float s = target[k] - targetMean;
+        const float residual = s - t;
+        absResidual += fabs(widen(residual));
+    }
+    return absResidual / windowPixels;
 }
 
 /// DisFlow.cpp solvePatch for one patch, run by one thread.
@@ -371,6 +490,34 @@ __device__ void solvePatch(DisPatch& patch, const float* __restrict__ from, cons
     float u = patch.u;
     float v = patch.v;
     double lastResidual = 0.0;
+
+    // The 1-D epipolar search along v (DisFlow.cpp solvePatch): only on a
+    // searching level, for a textured patch, from a seed within the cap.
+    // "<=" so a NaN cap or coordinate is never within it, as on the CPU.
+    if (c.epipolarRadius > 0 && patch.epipolar != 0 && fabs(static_cast<double>(u)) <= c.maxDisplacementPx &&
+        fabs(static_cast<double>(v)) <= c.maxDisplacementPx) {
+        EpipolarScan scan;
+        scan.reset(v);
+        for (int k = -c.epipolarRadius; k <= c.epipolarRadius; ++k) {
+            scan.beginCandidate();
+            const float vk = v + static_cast<float>(k);
+            double e = positiveInfinity();  // beyond the cap: never scored
+            if (fabs(static_cast<double>(vk)) <= c.maxDisplacementPx) {
+                e = windowResidualAt(tmpl, tmplMean, to, w, h, cx, cy, ps, half, u, vk, target);
+            }
+            scan.add(k, vk, e);
+        }
+        if (scan.adopt(c)) {
+            v = scan.vBest;
+        }
+    }
+
+    // Where the descent starts, for revertOnRunaway - only a start within
+    // the cap may be returned to.
+    const float startU = u;
+    const float startV = v;
+    const bool canRevert = c.revertOnRunaway != 0 && fabs(static_cast<double>(startU)) <= c.maxDisplacementPx &&
+                           fabs(static_cast<double>(startV)) <= c.maxDisplacementPx;
 
     for (int iter = 0; iter < c.iterations; ++iter) {
         // Is the whole displaced window safely inside the image?  Then every
@@ -484,8 +631,15 @@ __device__ void solvePatch(DisPatch& patch, const float* __restrict__ from, cons
         u += du;
         v += dv;
 
-        // Wandered past any real disparity: disown the patch.
+        // Wandered past any real disparity: return to the start and keep
+        // this iteration's residual (revertOnRunaway), or disown the patch.
         if (fabs(static_cast<double>(u)) > c.maxDisplacementPx || fabs(static_cast<double>(v)) > c.maxDisplacementPx) {
+            if (canRevert) {
+                u = startU;
+                v = startV;
+                lastResidual = meanAbsResidual();  // the CPU's lastResidual of this iteration
+                break;
+            }
             patch.usable = 0;
             patch.quality = 0.0f;
             return;
@@ -702,29 +856,35 @@ __global__ void disSolveGroupKernel(DisPair from, DisPair to, DisPair gx, DisPai
     float target[kRows][kPs];
     double wide[kRows][kPs];  // widened samples, then widened residuals
 
-    for (int iter = 0; iter < c.iterations; ++iter) {
-        // The clamp-free fetch applies when the whole displaced window is
-        // inside the image (see solvePatch); every lane tests the same
-        // window, so the choice is uniform across the group.
-        const float xFirst = static_cast<float>(cx - kHalf) + u;
-        const float xLast = static_cast<float>(cx + kPs - kHalf - 1) + u;
-        const float yFirst = static_cast<float>(cy - kHalf) + v;
-        const float yLast = static_cast<float>(cy + kPs - kHalf - 1) + v;
-        const bool inside = isfinite(u) && isfinite(v) && floorf(xFirst) >= 0.0f &&
+    // ---- the window stages, shared by the 1-D search and the descent -----
+    // Written once so a candidate the search scores is scored exactly as the
+    // descent would score it at the same displacement (and as DisFlow.cpp's
+    // windowResidual and its iteration both do).
+
+    // This lane's rows of the target window displaced by (uu, vv).  The
+    // clamp-free fetch applies when the whole displaced window is inside the
+    // image (see solvePatch); every lane tests the same window, so the
+    // choice is uniform across the group.
+    const auto sampleWindow = [&](float uu, float vv) {
+        const float xFirst = static_cast<float>(cx - kHalf) + uu;
+        const float xLast = static_cast<float>(cx + kPs - kHalf - 1) + uu;
+        const float yFirst = static_cast<float>(cy - kHalf) + vv;
+        const float yLast = static_cast<float>(cy + kPs - kHalf - 1) + vv;
+        const bool inside = isfinite(uu) && isfinite(vv) && floorf(xFirst) >= 0.0f &&
                             floorf(xLast) <= static_cast<float>(w - 2) && floorf(yFirst) >= 0.0f &&
                             floorf(yLast) <= static_cast<float>(h - 2);
 #pragma unroll
         for (int r = 0; r < kRows; ++r) {
             const int dy = rowBegin + r;
             if (inside) {
-                const float ys = static_cast<float>(cy + dy) + v;
+                const float ys = static_cast<float>(cy + dy) + vv;
                 const float fy = floorf(ys);
                 const int y0 = static_cast<int>(fy);
                 const float ty = ys - fy;
                 const float* __restrict__ line = dst + static_cast<size_t>(y0) * static_cast<size_t>(w);
 #pragma unroll
                 for (int dx = -kHalf; dx < kPs - kHalf; ++dx) {
-                    const float xs = static_cast<float>(cx + dx) + u;
+                    const float xs = static_cast<float>(cx + dx) + uu;
                     const float fx = floorf(xs);
                     const int x0 = static_cast<int>(fx);
                     const float tx = xs - fx;
@@ -741,10 +901,15 @@ __global__ void disSolveGroupKernel(DisPair from, DisPair to, DisPair gx, DisPai
 #pragma unroll
                 for (int dx = -kHalf; dx < kPs - kHalf; ++dx) {
                     target[r][dx + kHalf] =
-                        sampleBilinear(dst, w, h, static_cast<float>(cx + dx) + u, static_cast<float>(cy + dy) + v);
+                        sampleBilinear(dst, w, h, static_cast<float>(cx + dx) + uu, static_cast<float>(cy + dy) + vv);
                 }
             }
         }
+    };
+
+    // The window mean (a relayed sum), then the mean-normalised residuals,
+    // left widened in `wide` for the projections and the |residual| sum.
+    const auto windowResiduals = [&]() {
         // Widen this lane's samples in parallel with the other lanes, so the
         // relayed sum below is nothing but the ordered additions.
 #pragma unroll
@@ -767,9 +932,7 @@ __global__ void disSolveGroupKernel(DisPair from, DisPair to, DisPair gx, DisPai
         const float targetMean = static_cast<float>(targetSum / kWindowPixels);
 
         // The mean-normalised residuals (float, as on the CPU), widened in
-        // parallel; then bx / by, relayed together in the CPU's pixel order.
-        // fma of two widened floats rounds exactly like the CPU's exact
-        // product followed by a rounding add (see addProduct).
+        // parallel.
 #pragma unroll
         for (int r = 0; r < kRows; ++r) {
 #pragma unroll
@@ -780,6 +943,64 @@ __global__ void disSolveGroupKernel(DisPair from, DisPair to, DisPair gx, DisPai
                 wide[r][k] = widen(residual);
             }
         }
+    };
+
+    // The mean |residual| of the window windowResiduals() last formed,
+    // relayed like the other sums.  |x| of a double is exact, so this is the
+    // CPU's fabs(double(residual)) summed in the CPU's order.
+    const auto meanAbsResidual = [&]() {
+        const double absSum = relaySum<kLanes>(0.0, lane, groupMask, [&](double acc) {
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+#pragma unroll
+                for (int k = 0; k < kPs; ++k) {
+                    acc += fabs(wide[r][k]);
+                }
+            }
+            return acc;
+        });
+        return absSum / kWindowPixels;
+    };
+
+    // ---- the 1-D epipolar search along v (DisFlow.cpp solvePatch) --------
+    // Only on a searching level, for a textured patch, from a seed within the
+    // cap ("<=", so a NaN is never within it).  Every condition and every
+    // candidate's residual is the same on all lanes, so the relays inside
+    // always find their whole group.
+    if (c.epipolarRadius > 0 && patch.epipolar != 0 && fabs(static_cast<double>(u)) <= c.maxDisplacementPx &&
+        fabs(static_cast<double>(v)) <= c.maxDisplacementPx) {
+        EpipolarScan scan;
+        scan.reset(v);
+        for (int k = -c.epipolarRadius; k <= c.epipolarRadius; ++k) {
+            scan.beginCandidate();
+            const float vk = v + static_cast<float>(k);
+            double e = positiveInfinity();  // beyond the cap: never scored
+            if (fabs(static_cast<double>(vk)) <= c.maxDisplacementPx) {
+                sampleWindow(u, vk);
+                windowResiduals();
+                e = meanAbsResidual();
+            }
+            scan.add(k, vk, e);
+        }
+        if (scan.adopt(c)) {
+            v = scan.vBest;
+        }
+    }
+
+    // Where the descent starts, for revertOnRunaway - only a start within
+    // the cap may be returned to.
+    const float startU = u;
+    const float startV = v;
+    const bool canRevert = c.revertOnRunaway != 0 && fabs(static_cast<double>(startU)) <= c.maxDisplacementPx &&
+                           fabs(static_cast<double>(startV)) <= c.maxDisplacementPx;
+
+    for (int iter = 0; iter < c.iterations; ++iter) {
+        sampleWindow(u, v);
+        windowResiduals();
+
+        // bx / by from the widened residuals, relayed together in the CPU's
+        // pixel order.  fma of two widened floats rounds exactly like the
+        // CPU's exact product followed by a rounding add (see addProduct).
         double bx = 0.0;
         double by = 0.0;
         relaySum2<kLanes>(bx, by, lane, groupMask, [&](double& ax, double& ay) {
@@ -792,24 +1013,10 @@ __global__ void disSolveGroupKernel(DisPair from, DisPair to, DisPair gx, DisPai
                 }
             }
         });
-
-        // Only the iteration that ends the loop normally needs its mean
-        // |residual| (see solvePatch); relayed like the other sums.
-        // `wide` still holds this iteration's widened residuals; |x| of a
-        // double is exact, so this is the CPU's fabs(double(residual)).
-        const auto meanAbsResidual = [&]() {
-            const double absSum = relaySum<kLanes>(0.0, lane, groupMask, [&](double acc) {
-#pragma unroll
-                for (int r = 0; r < kRows; ++r) {
-#pragma unroll
-                    for (int k = 0; k < kPs; ++k) {
-                        acc += fabs(wide[r][k]);
-                    }
-                }
-                return acc;
-            });
-            return absSum / kWindowPixels;
-        };
+        // Only the iteration that ends the loop (converged, capped or
+        // reverted) needs its mean |residual| (see solvePatch); `wide` still
+        // holds this iteration's widened residuals when meanAbsResidual()
+        // reads them below.
 
         // The damped step and the tests - identical on every lane, because
         // every lane now holds the same bx, by, u and v.
@@ -824,6 +1031,14 @@ __global__ void disSolveGroupKernel(DisPair from, DisPair to, DisPair gx, DisPai
         u += du;
         v += dv;
         if (fabs(static_cast<double>(u)) > c.maxDisplacementPx || fabs(static_cast<double>(v)) > c.maxDisplacementPx) {
+            // Return to the start and keep this iteration's residual
+            // (revertOnRunaway), or disown the patch.
+            if (canRevert) {
+                u = startU;
+                v = startV;
+                lastResidual = meanAbsResidual();
+                break;
+            }
             patch.usable = 0;
             patch.quality = 0.0f;
             finish();
@@ -1006,7 +1221,7 @@ cudaError_t disLaunchGradients(DisPair img, DisPairW gx, DisPairW gy, int w, int
     return cudaGetLastError();
 }
 
-cudaError_t disLaunchTensors(DisPair gx, DisPair gy, int w, int h, DisGrid grid, double minTensorDet,
+cudaError_t disLaunchTensors(DisPair gx, DisPair gy, int w, int h, DisGrid grid, const DisTensorConsts& consts,
                              DisPatchPair patches, cudaStream_t stream) {
     const long long count = static_cast<long long>(grid.cols) * grid.rows;
     if (w <= 0 || h <= 0 || grid.cols <= 0 || grid.rows <= 0 || count > 0x7fffffffLL || grid.ps < 2 ||
@@ -1014,7 +1229,7 @@ cudaError_t disLaunchTensors(DisPair gx, DisPair gy, int w, int h, DisGrid grid,
         return cudaErrorInvalidValue;
     }
     const dim3 blocks((static_cast<unsigned>(count) + kPatchBlock - 1u) / kPatchBlock, 2u);
-    disTensorKernel<<<blocks, kPatchBlock, 0, stream>>>(gx, gy, w, h, grid, minTensorDet, patches);
+    disTensorKernel<<<blocks, kPatchBlock, 0, stream>>>(gx, gy, w, h, grid, consts, patches);
     return cudaGetLastError();
 }
 
@@ -1025,6 +1240,11 @@ cudaError_t disLaunchSolve(DisPair from, DisPair to, DisPair gx, DisPair gy, int
     if (w <= 0 || h <= 0 || grid.cols <= 0 || grid.rows <= 0 || count > 0x7fffffffLL || grid.ps < 2 ||
         grid.ps > kDisMaxPatchSize || consts.iterations < 1 || patches.p[0] == nullptr ||
         patches.p[1] == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    // The search loop runs 2 * radius + 1 candidates per patch: a corrupt
+    // radius must be refused here, not turned into an endless kernel.
+    if (consts.epipolarRadius < 0 || consts.epipolarRadius > kDisMaxEpipolarRadius) {
         return cudaErrorInvalidValue;
     }
     // A seeded solve must have a coarse field to read.

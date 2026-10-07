@@ -45,6 +45,49 @@
 // narrow strip with small disparities.  The gap is named rather than hidden;
 // if the reversed DJI constants turn out to imply it, it goes in then.
 //
+// WHERE THIS DEPARTS FROM THE PAPER, AND WHY
+// ------------------------------------------
+// Three additions, all measured on car-mounted clips whose body sits a metre
+// from the lenses.  The overlap band is only ~68 rows tall, so the pyramid
+// stops after three levels and plain coarse-to-fine descent seeded at zero
+// cannot reach the ~14 px (2.4 deg) the car body is offset along the
+// meridian; on its roof rails the 0.5.0 solver settled near 3 px of the 14.
+//
+//   1. Tikhonov regularisation of the structure tensor (tensorTikhonov).
+//      An edge patch - a roof rail, a horizon - has one strong eigenvalue
+//      and one nearly zero, and the raw inverse turns any residual into an
+//      unbounded step ALONG the edge, where nothing constrains it.  Adding a
+//      tenth of the mean eigenvalue to the diagonal bounds that step while
+//      leaving a well-textured patch's solve essentially unchanged.
+//
+//   2. A 1-D search along the band rows before the descent
+//      (epipolarSearchPx).  For a back-to-back pair the epipolar direction
+//      in the band is the band row (the meridian, ParallaxWarp.h), so the
+//      large near-field disparity is one-dimensional: each sufficiently
+//      textured patch on the coarse levels tries every whole-pixel offset
+//      along v and adopts the best one only when it is a LOCATED minimum
+//      (a scored candidate on both sides of it, never the end of the
+//      range) and clearly the best - better than the seed by an absolute
+//      margin, AND by Lowe's ratio against both the seed and the best
+//      candidate two or more pixels away, which is what keeps a railing's
+//      repeated bars from luring a patch one period off.  The bracket was
+//      added after measuring the night car-mounted clip: a diamond-plate
+//      body panel there drew patches to the END of the range, a whole
+//      pattern period off, and passed the ratio test doing it.  The
+//      restricted search follows Jump's stereo stitcher (Anderson et al.,
+//      "Jump: Virtual Reality Video", SIGGRAPH Asia 2016); the ratio test
+//      is Lowe's ("Distinctive Image Features from Scale-Invariant
+//      Keypoints", IJCV 2004).
+//
+//   3. Revert instead of kill on runaway (revertOnRunaway).  A patch whose
+//      descent wanders past maxDisplacementPx used to be disowned, which on
+//      1-D edges threw away patches whose seed was right; it now returns to
+//      where the descent started (the seed, or the search's pick) and keeps
+//      that, weighted by its residual like any other patch.
+//
+// With tensorTikhonov 0, epipolarSearchPx 0 and revertOnRunaway false the
+// solver is exactly the 0.5.0 one, bit for bit.
+//
 // Everything is plain C++ with no external dependency: OpenCV has
 // cv::DISOpticalFlow and it is the reference this was checked against in
 // spirit, but the library must build without it.
@@ -171,7 +214,8 @@ struct DisFlowParams {
     /// Largest displacement any single patch may report, in pixels, per
     /// level.  The overlap band is narrow and the true disparity is a few
     /// pixels; a patch that claims 50 has mismatched, and letting it through
-    /// tears the warp.
+    /// tears the warp.  What becomes of a patch whose descent passes it is
+    /// revertOnRunaway's decision.
     double maxDisplacementPx = 24.0;
 
     /// Gaussian sigma for the flow smoothing pass that follows densification,
@@ -183,11 +227,87 @@ struct DisFlowParams {
     /// more than this many pixels (the standard forward-backward consistency
     /// check).  Only used by disFlowBidirectional().
     double consistencyTolPx = 1.5;
+
+    // ---- Near-field additions (see "WHERE THIS DEPARTS FROM THE PAPER") ----
+    // None of these is a DJI constant.  Each was chosen on the car-mounted
+    // day and night clips and the 6K sample, measured as the overlap NCC the
+    // kernel renders with the resulting grid; 0 / false turns each one off.
+
+    /// Tikhonov term added to both diagonal entries of every patch's
+    /// structure tensor before it is inverted, as a fraction of the tensor's
+    /// mean eigenvalue: H + (tensorTikhonov * trace(H) / 2) * I.
+    ///
+    /// Relative to the trace, so it means the same on any contrast and on
+    /// any intensityScale.  With 0.1 the inverse's gain along an edge is at
+    /// most 20 / trace (21x the across-edge gain on a pure edge) instead of
+    /// 1 / lambda_min, which grows without bound as the patch approaches a
+    /// pure edge.  Measured on the day clip it raised the consistent fraction
+    /// from 0.19 to 0.31.  <= 0 (or non-finite) inverts the raw tensor.
+    double tensorTikhonov = 0.1;
+
+    /// Half range of the 1-D search along v (the band row, the epipolar
+    /// direction of the back-to-back pair), in FINEST-level pixels; each
+    /// pyramid level searches ceil(epipolarSearchPx / 2^level) whole pixels
+    /// either side of its seed (see disEpipolarRadius()).  24 matches
+    /// maxDisplacementPx, the most any patch may report.  <= 0 disables it.
+    ///
+    /// Whatever the range, the winning offset must be bracketed: a minimum
+    /// found at either end of it (or beside a candidate the cap excluded) is
+    /// never adopted, so a level whose radius is 1 can only keep its seed.
+    double epipolarSearchPx = 24.0;
+
+    /// Finest pyramid level (0 = full resolution) that runs the search.  1
+    /// searches the coarse levels only: their few patches are cheap and
+    /// their pick seeds the finer levels.  Searching at level 0 alone (four
+    /// times the patches of level 1, twice the radius) was measured to lose
+    /// most of the gain.
+    int epipolarSearchMinLevel = 1;
+
+    /// Only patches with at least this much texture search: the tensor's
+    /// trace BEFORE the Tikhonov term, per pixel of the patch, in
+    /// (intensityScale codes)^2.  1.0 keeps flat sky, where every offset
+    /// matches equally badly, out of the search.
+    double epipolarMinTracePerPx = 1.0;
+
+    /// Lowe's ratio: the best offset is adopted only when its residual is
+    /// below this fraction of the seed's AND of the best candidate at least
+    /// two pixels away from it.  Without it the 6K sample's OSV frame 60
+    /// lost 0.007 NCC to patches that jumped a repeated structure's period.
+    /// It is not sufficient on its own: two periods of a real (never quite
+    /// periodic) pattern can differ by more than 15 %, which is why the
+    /// winner must also be bracketed (see epipolarSearchPx).
+    double epipolarRatio = 0.85;
+
+    /// ...and only when it also beats the seed's residual by this many
+    /// codes (mean |residual| on the intensityScale range), so sensor noise
+    /// alone never moves a patch.
+    double epipolarMarginCodes = 0.05;
+
+    /// On a patch whose descent passes maxDisplacementPx, return it to the
+    /// position the descent started from and keep it (quality from its
+    /// residual as usual) instead of disowning it.  A start position that is
+    /// itself beyond the cap is still disowned, so no patch ever reports more
+    /// than maxDisplacementPx.
+    bool revertOnRunaway = true;
 };
 
 /// Below this width or height a pyramid level is not built: the patch grid
 /// would have fewer than two patches per axis and the solve degenerates.
 inline constexpr std::uint32_t kMinPyramidEdge = 16;
+
+/// Hard ceiling on the 1-D search radius at any level, in whole pixels, so a
+/// nonsense epipolarSearchPx cannot turn one patch into an unbounded loop.
+inline constexpr int kMaxEpipolarRadius = 64;
+
+/// Whole pixels the 1-D epipolar search covers either side of a patch's
+/// seed at pyramid level `level` (0 = finest): ceil(epipolarSearchPx /
+/// 2^level), clamped to kMaxEpipolarRadius, or 0 when the level does not
+/// search (below epipolarSearchMinLevel, a negative level, or the search
+/// disabled / non-finite).
+///
+/// Shared by the CPU solver and the CUDA port so both search exactly the
+/// same candidates.
+[[nodiscard]] int disEpipolarRadius(const DisFlowParams& params, int level) noexcept;
 
 /// A single-channel image plane, the input the solver works on.
 ///

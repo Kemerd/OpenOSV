@@ -8,8 +8,10 @@
 // map onto named parameters here rather than onto magic numbers:
 //
 //   buildPyramid            Gaussian half-scale pyramid of both images
-//   precomputeTensors       per-patch inverse structure tensor
-//   solvePatches            mean-normalised inverse search per patch
+//   precomputeTensors       per-patch inverse structure tensor (Tikhonov-
+//                           regularised, see DisFlowParams::tensorTikhonov)
+//   solvePatches            1-D epipolar search on the coarse levels, then
+//                           mean-normalised inverse search per patch
 //   densify                 quality-weighted scatter to pixels
 //   smoothFlow              separable Gaussian on the field
 //   repairFlow              hole filling from neighbours
@@ -30,6 +32,7 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <limits>
 
 namespace osv::render {
 
@@ -99,6 +102,9 @@ struct Patch {
     float iHxy = 0.0f;
     float iHyy = 0.0f;
     bool usable = false;  ///< False when the tensor was singular.
+    /// True when the patch carries enough texture (its raw tensor trace) to
+    /// run the 1-D epipolar search; see DisFlowParams::epipolarMinTracePerPx.
+    bool epipolar = false;
 };
 
 /// Separable Gaussian blur of a single plane, clamp-to-edge.  Both passes are
@@ -252,6 +258,13 @@ struct PatchGrid {
 /// whose H is near-singular is marked unusable here rather than producing a
 /// huge displacement later - that is the flat-sky case, and it is the common
 /// case in this application, where most of the overlap band is empty blue.
+///
+/// Before the inversion H is regularised towards a multiple of the identity
+/// (DisFlowParams::tensorTikhonov): an edge patch's raw inverse has an
+/// unbounded gain along the edge, which is what sent the roof-rail patches
+/// of a car-mounted clip sliding sideways until the displacement cap killed
+/// them.  The UN-regularised trace also decides whether the patch has enough
+/// texture to run the 1-D epipolar search (Patch::epipolar).
 PatchGrid precomputeTensors(const GrayImage& img, const std::vector<float>& gx, const std::vector<float>& gy,
                             const DisFlowParams& params, ThreadPool* pool) {
     PatchGrid grid;
@@ -264,6 +277,16 @@ PatchGrid precomputeTensors(const GrayImage& img, const std::vector<float>& gx, 
     if (img.w < static_cast<std::uint32_t>(ps) || img.h < static_cast<std::uint32_t>(ps)) {
         return grid;
     }
+
+    // The Tikhonov fraction, or 0 for "invert the raw tensor".  A negative or
+    // non-finite value would make the regularised tensor indefinite or NaN,
+    // so anything but a positive finite number switches the term off.  The
+    // CUDA port receives this same sanitised value from its host code.
+    const double tikhonov =
+        (params.tensorTikhonov > 0.0 && std::isfinite(params.tensorTikhonov)) ? params.tensorTikhonov : 0.0;
+    // Texture threshold of the epipolar search, summed over the patch: the
+    // per-pixel figure times the patch area, in the CUDA host's exact order.
+    const double searchTrace = params.epipolarMinTracePerPx * static_cast<double>(ps) * ps;
 
     // Centres run from `half` to the last position that keeps the patch
     // inside the image, `stride` apart - the same positions a nested
@@ -302,11 +325,28 @@ PatchGrid precomputeTensors(const GrayImage& img, const std::vector<float>& gx, 
                 }
             }
 
+            // The texture measure of the epipolar search is the trace BEFORE
+            // regularisation: the Tikhonov term scales with it, so testing
+            // the regularised trace would only move the threshold.
+            const double trace = hxx + hyy;
+            p.epipolar = trace >= searchTrace;
+
+            // Tikhonov: H + (k * trace / 2) * I, i.e. k times the mean
+            // eigenvalue added to both.  Skipped entirely when off, so the
+            // tensor is then bit-identical to the unregularised solver's.
+            if (tikhonov > 0.0) {
+                const double eps = tikhonov * 0.5 * trace;
+                hxx += eps;
+                hyy += eps;
+            }
+
             // Invertibility test on the RAW determinant, floored at
             // params.minTensorDet (DJI's 0.001).  A scale-free test
             // (det / trace^2) is arguably better conditioned in general, but
             // it is not what DJI does and the requirement is to match their
-            // output, so their test is the one used.
+            // output, so their test is the one used.  (With the Tikhonov term
+            // the determinant is that of the regularised tensor, which is the
+            // one actually inverted.)
             const double det = hxx * hyy - hxy * hxy;
             if (det > params.minTensorDet) {
                 const double invDet = 1.0 / det;
@@ -321,6 +361,53 @@ PatchGrid precomputeTensors(const GrayImage& img, const std::vector<float>& gx, 
     return grid;
 }
 
+/// Mean |mean-normalised residual| between a patch's template and the target
+/// window displaced by (u, v): the quantity solvePatch()'s iteration calls
+/// lastResidual, formed with exactly that iteration's arithmetic - the same
+/// bilinear samples, the double sum of the samples in row-major order, the
+/// float window mean, the float residual (s - mean) - (t - tmplMean) and its
+/// magnitude summed in double in the same order - so a candidate the 1-D
+/// search scores is scored as the descent would score it, bit for bit (and
+/// as the CUDA port's search scores it).
+///
+/// @param tmpl      The template, ps * ps row-major, already sampled.
+/// @param tmplMean  Its mean, as solvePatch() computed it.
+/// @param to        The image searched.
+/// @param cx, cy    The patch centre, in level pixels.
+/// @param ps, half  Patch side and its half (the centre's offset).
+/// @param u, v      The displacement to score.
+/// @param target    Caller-owned scratch of at least ps * ps floats.
+/// @return The mean absolute residual on the intensityScale range, or +inf
+///         when the scratch is too small (a caller bug, never a real score).
+double windowResidual(const std::vector<float>& tmpl, float tmplMean, const GrayImage& to, int cx, int cy, int ps,
+                      int half, float u, float v, std::vector<float>& target) {
+    const std::size_t patchPixels = static_cast<std::size_t>(ps) * static_cast<std::size_t>(ps);
+    if (ps <= 0 || tmpl.size() < patchPixels || target.size() < patchPixels) {
+        return std::numeric_limits<double>::infinity();  // never adopted, never a "second best"
+    }
+    // The displaced target window and its own mean (the iteration's first
+    // pass, verbatim).
+    double targetSum = 0.0;
+    for (int dy = -half; dy < ps - half; ++dy) {
+        for (int dx = -half; dx < ps - half; ++dx) {
+            const float s = to.sample(static_cast<float>(cx + dx) + u, static_cast<float>(cy + dy) + v);
+            target[static_cast<std::size_t>(dy + half) * ps + static_cast<std::size_t>(dx + half)] = s;
+            targetSum += s;
+        }
+    }
+    const float targetMean = static_cast<float>(targetSum / (static_cast<double>(ps) * ps));
+
+    // The mean-normalised residual's magnitude, in the iteration's order.
+    double absResidual = 0.0;
+    for (std::size_t k = 0; k < patchPixels; ++k) {
+        const float t = tmpl[k] - tmplMean;
+        const float s = target[k] - targetMean;
+        const float residual = s - t;
+        absResidual += std::fabs(static_cast<double>(residual));
+    }
+    return absResidual / (static_cast<double>(ps) * ps);
+}
+
 /// Solve one patch by inverse search, starting from (u, v).
 ///
 /// Each iteration measures the residual between the template (the patch in
@@ -331,11 +418,21 @@ PatchGrid precomputeTensors(const GrayImage& img, const std::vector<float>& gx, 
 /// lenses, and it is why DJI's stitcher also mean-normalises rather than
 /// using a plain SSD.
 ///
+/// Before the descent, a textured patch on a searching level (`radius` > 0)
+/// tries every whole-pixel offset along v within `radius` of its seed and
+/// moves its seed there when that offset wins clearly (see the ratio test
+/// below).  The descent is local - with the damped step it covers a few
+/// pixels at most - so this is what lets a coarse level reach a near-field
+/// disparity of many pixels along the epipolar direction at all.
+///
 /// `tmpl` and `target` are caller-owned scratch, reused across every patch a
 /// worker solves: allocating them per patch was one heap round trip for each
 /// of the tens of thousands of patches in a band.
+///
+/// @param radius  Whole pixels the 1-D search covers either side of the seed
+///                at this level (disEpipolarRadius()); 0 = no search.
 void solvePatch(Patch& patch, const GrayImage& from, const GrayImage& to, const std::vector<float>& gx,
-                const std::vector<float>& gy, const DisFlowParams& params, std::vector<float>& tmpl,
+                const std::vector<float>& gy, const DisFlowParams& params, int radius, std::vector<float>& tmpl,
                 std::vector<float>& target) {
     if (!patch.usable) {
         patch.quality = 0.0f;
@@ -363,6 +460,96 @@ void solvePatch(Patch& patch, const GrayImage& from, const GrayImage& to, const 
     float u = patch.u;
     float v = patch.v;
     double lastResidual = 0.0;
+
+    // A displacement within the cap every reported patch must respect.
+    // Written as "<=" on purpose: a NaN cap or coordinate is never within it.
+    const auto withinCap = [&params](float value) {
+        return std::fabs(static_cast<double>(value)) <= params.maxDisplacementPx;
+    };
+
+    // ---- 1-D epipolar search ----------------------------------------------
+    // Only on a searching level, only for a patch with texture to match, and
+    // only from a seed the descent would not disown on its first step anyway.
+    if (radius > 0 && patch.epipolar && withinCap(u) && withinCap(v)) {
+        // e(k) for k = -radius .. radius, scanned in ascending order without
+        // storing the curve (the CUDA port keeps the same running state, and
+        // a per-thread array there would reserve local memory for every
+        // resident thread on the device):
+        //   best / kBest  the FIRST minimum, as an argmin over the curve;
+        //   second        min e(j) over the candidates |j - kBest| >= 2 -
+        //                 when a new best appears at k it restarts from
+        //                 `farMin` (every j <= k - 2 seen so far), and later
+        //                 candidates join it once they are two past kBest;
+        //   lag1 / lag2   e(k - 1) and e(k - 2), feeding farMin.
+        // A candidate beyond the displacement cap is never scored (its e is
+        // +inf): the descent would disown it at once, so adopting it would
+        // turn a measurable patch into a lost one.
+        constexpr double kInf = std::numeric_limits<double>::infinity();
+        double e0 = kInf;
+        double best = kInf;
+        double second = kInf;
+        double farMin = kInf;
+        double lag1 = kInf;
+        double lag2 = kInf;
+        int kBest = 0;
+        float vBest = v;
+        for (int k = -radius; k <= radius; ++k) {
+            if (lag2 < farMin) {
+                farMin = lag2;  // e(k - 2) is now two or more behind k
+            }
+            const float vk = v + static_cast<float>(k);
+            double e = kInf;
+            if (withinCap(vk)) {
+                e = windowResidual(tmpl, tmplMean, to, cx, cy, ps, half, u, vk, target);
+            }
+            if (k == 0) {
+                e0 = e;  // the seed itself (always within the cap here)
+            }
+            if (e < best) {
+                best = e;
+                kBest = k;
+                vBest = vk;
+                second = farMin;  // k - 1 is too close; k + 1 will be skipped below
+            } else if (k - kBest >= 2 && e < second) {
+                second = e;
+            }
+            lag2 = lag1;
+            lag1 = e;
+        }
+        // Adopt only a LOCATED, CLEAR winner.
+        //
+        // Located: the minimum must be bracketed - a scored candidate on
+        // either side of it, so the curve is seen to rise both ways.  A best
+        // offset at the end of the scanned range (or against the cap) is a
+        // curve still falling where the scan stopped: the real minimum lies
+        // beyond what this level may reach, or there is none (the window
+        // sliding along an edge, or into the band's clamped border rows).
+        // Measured on the night car-mounted clip, adopting such end points
+        // moved diamond-plate patches by a whole pattern period and cost the
+        // car body 0.05-0.08 NCC; requiring the bracket recovered nearly all
+        // of it (frame 3500: 0.893 back to 0.947, against 0.946 before any
+        // of these additions) and left every day-clip gain in place.
+        //
+        // Clear: better than the seed by an absolute margin (noise alone
+        // never moves a patch), and by Lowe's ratio against both the seed and
+        // the best rival two or more pixels away (a railing's bars, a fence:
+        // near-equal minima one period apart mean the match is ambiguous,
+        // and the seed is kept).
+        const bool bracketed = kBest > -radius && kBest < radius && withinCap(v + static_cast<float>(kBest - 1)) &&
+                               withinCap(v + static_cast<float>(kBest + 1));
+        const double ratio = params.epipolarRatio;
+        if (kBest != 0 && bracketed && best < e0 - params.epipolarMarginCodes && best < ratio * e0 &&
+            best < ratio * second) {
+            v = vBest;
+        }
+    }
+
+    // Where the descent starts, kept for revertOnRunaway.  Only a start that
+    // is itself within the cap may be returned to: no patch ever reports a
+    // displacement past maxDisplacementPx.
+    const float startU = u;
+    const float startV = v;
+    const bool canRevert = params.revertOnRunaway && withinCap(startU) && withinCap(startV);
 
     for (int iter = 0; iter < std::max(1, params.iterations); ++iter) {
         // Target window at the current displacement, and its own mean.  The
@@ -415,10 +602,19 @@ void solvePatch(Patch& patch, const GrayImage& from, const GrayImage& to, const 
         v += dv;
 
         // A patch that has wandered further than any real disparity has
-        // locked onto the wrong feature; stop and disown it rather than
-        // letting it drag the densified field.
+        // locked onto the wrong feature.  Stop.  With revertOnRunaway it
+        // returns to where the descent started - the seed, or the epipolar
+        // search's pick - and is kept with this iteration's residual as its
+        // quality (the residual every exit of this loop reports: the one
+        // measured before the final step); otherwise it is disowned rather
+        // than left to drag the densified field.
         if (std::fabs(static_cast<double>(u)) > params.maxDisplacementPx ||
             std::fabs(static_cast<double>(v)) > params.maxDisplacementPx) {
+            if (canRevert) {
+                u = startU;
+                v = startV;
+                break;
+            }
             patch.usable = false;
             patch.quality = 0.0f;
             return;
@@ -700,6 +896,26 @@ std::uint64_t repairFlow(FlowField& flow, const std::vector<std::uint8_t>& ok) {
 // ---------------------------------------------------------------------------
 //  The solver
 // ---------------------------------------------------------------------------
+int disEpipolarRadius(const DisFlowParams& params, int level) noexcept {
+    // Off: disabled, nonsense (NaN, negative), or a level finer than the
+    // finest one asked to search.
+    if (!(params.epipolarSearchPx > 0.0) || !std::isfinite(params.epipolarSearchPx)) {
+        return 0;
+    }
+    if (level < 0 || level >= kMaxLevels || level < params.epipolarSearchMinLevel) {
+        return 0;
+    }
+    // The finest-level range expressed in this level's pixels, rounded UP
+    // so the coarse search never falls short of the range it stands for
+    // (24 px at level 0 is 12 at level 1 and 6 at level 2).  2^level is an
+    // exact double for every level the pyramid can have.
+    const double scaled = std::ceil(params.epipolarSearchPx / std::ldexp(1.0, level));
+    if (!(scaled >= 1.0)) {
+        return 0;  // cannot happen for a positive range; kept as a guard
+    }
+    return scaled >= static_cast<double>(kMaxEpipolarRadius) ? kMaxEpipolarRadius : static_cast<int>(scaled);
+}
+
 Result<FlowField> disFlow(const GrayImage& from, const GrayImage& to, const DisFlowParams& params, ThreadPool* pool) {
     if (!from.valid() || !to.valid()) {
         return Error{ErrorCode::InvalidArgument, "disFlow: an input image is empty or malformed"};
@@ -764,6 +980,9 @@ Result<FlowField> disFlow(const GrayImage& from, const GrayImage& to, const DisF
         // is reported rather than redone.
         const bool seeded = flow.valid();
         const FlowField& coarse = flow;
+        // The 1-D epipolar search radius of this level (0 = no search), from
+        // the helper the CUDA port uses too, so both search the same range.
+        const int radius = disEpipolarRadius(params, static_cast<int>(level));
         const ThreadPool::ChunkBody solveRange = [&](std::size_t begin, std::size_t end) {
             std::vector<float> tmpl;
             std::vector<float> target;
@@ -778,7 +997,7 @@ Result<FlowField> disFlow(const GrayImage& from, const GrayImage& to, const DisF
                     p.u = coarse.atU(sx, sy) * 2.0f;
                     p.v = coarse.atV(sx, sy) * 2.0f;
                 }
-                solvePatch(p, imgFrom, imgTo, gx, gy, params, tmpl, target);
+                solvePatch(p, imgFrom, imgTo, gx, gy, params, radius, tmpl, target);
             }
         };
         const std::size_t patchCount = grid.patches.size();

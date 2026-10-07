@@ -57,6 +57,11 @@ using gpu::cudaMessage;
 /// DisFlow.cpp's kMaxEdge: past this the patch-grid arithmetic overflows.
 constexpr std::uint32_t kMaxEdge = 1u << 16;
 
+// The kernels' copy of the search-radius ceiling must be the solver's, or a
+// radius disEpipolarRadius() returns could be refused by the launch.
+static_assert(gpu::kDisMaxEpipolarRadius == kMaxEpipolarRadius,
+              "CudaAnalysisLaunch.h kDisMaxEpipolarRadius must equal DisFlow.h kMaxEpipolarRadius");
+
 /// DisFlow.cpp's kMaxLevels: a hard ceiling on pyramid depth.
 constexpr int kMaxLevels = 8;
 
@@ -307,8 +312,25 @@ Result<BidirFlow> runDis(const WorkspaceLease& lease, const DisInputs& in, std::
     }
 
     // ---- 3. coarse to fine -------------------------------------------------
-    const DisSolveConsts consts{std::max(1, params.iterations), static_cast<float>(params.stepScale), params.minStepPx,
-                                params.maxDisplacementPx, params.maxPatchSsd};
+    // Every constant converted exactly as DisFlow.cpp converts it at its
+    // point of use, so the kernels see the CPU's values bit for bit.
+    DisSolveConsts consts{};
+    consts.iterations = std::max(1, params.iterations);
+    consts.stepScale = static_cast<float>(params.stepScale);
+    consts.minStepPx = params.minStepPx;
+    consts.maxDisplacementPx = params.maxDisplacementPx;
+    consts.maxPatchSsd = params.maxPatchSsd;
+    consts.epipolarRadius = 0;  // set per level below
+    consts.epipolarRatio = params.epipolarRatio;
+    consts.epipolarMarginCodes = params.epipolarMarginCodes;
+    consts.revertOnRunaway = params.revertOnRunaway ? 1 : 0;
+    // precomputeTensors' Tikhonov sanitising and its search threshold, in
+    // its own expression order (the grid's ps is DisFlow.cpp's max(2, ...)).
+    gpu::DisTensorConsts tensorConsts{};
+    tensorConsts.minTensorDet = params.minTensorDet;
+    tensorConsts.tikhonov =
+        (params.tensorTikhonov > 0.0 && std::isfinite(params.tensorTikhonov)) ? params.tensorTikhonov : 0.0;
+    tensorConsts.epipolarMinTrace = params.epipolarMinTracePerPx * static_cast<double>(finest.ps) * finest.ps;
     DisPairW gx{{ws.gradX[0].as<float>(), ws.gradX[1].as<float>()}};
     DisPairW gy{{ws.gradY[0].as<float>(), ws.gradY[1].as<float>()}};
     DisPatchPair patches{{ws.patches[0].as<DisPatch>(), ws.patches[1].as<DisPatch>()}};
@@ -335,8 +357,11 @@ Result<BidirFlow> runDis(const WorkspaceLease& lease, const DisInputs& in, std::
         }
         const DisPair gxr{{gx.p[0], gx.p[1]}};
         const DisPair gyr{{gy.p[0], gy.p[1]}};
-        OSV_TRY(launched(gpu::disLaunchTensors(gxr, gyr, lw, lh, grid, params.minTensorDet, patches, s),
+        OSV_TRY(launched(gpu::disLaunchTensors(gxr, gyr, lw, lh, grid, tensorConsts, patches, s),
                          "structure tensors"));
+        // The 1-D search radius of this level, from the helper the CPU
+        // solver uses, so both search exactly the same candidates.
+        consts.epipolarRadius = disEpipolarRadius(params, static_cast<int>(level));
 
         // Direction 0 solves A -> B from A's tensors, direction 1 B -> A
         // from B's.  The seed is the previous level's field, read before
