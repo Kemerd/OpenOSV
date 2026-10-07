@@ -6,6 +6,20 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## 0.5.1 (unreleased)
+
+### Fixed
+
+* **A ranged osvtool render plays its own sound.** `osvtool render --range
+  A-B` (or `--frame`) into an `.mp4` copied the source audio from 0:00, so
+  frames 3000-3020 of a 25 fps clip played the first 0.84 s of sound
+  instead of the sound at 2:00. The audio copy now starts at the first
+  rendered frame's moment, from the clip's exact frame rate (frame x
+  denominator / numerator). Measured on a 25 fps clip, frames 3000 and 3001
+  start their sound at 120.000 s and 120.040 s of the source to the sample.
+  A render from frame 0, and `--all`, run exactly the ffmpeg command they
+  always did.
+
 ## [0.5.0] - 2026-10-07
 
 8K and night footage, fixed at the cause. Built on a user's car-mounted 8K

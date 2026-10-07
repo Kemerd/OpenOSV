@@ -33,8 +33,40 @@ struct FfmpegPipeOptions {
     PipeTransfer transfer = PipeTransfer::PQ;
     int crf = 18;                          ///< Quality for software encoders (-crf) / nvenc (-cq).
     std::filesystem::path audioSource;     ///< Optional: copy the first audio stream of this file.
+    /// Where in `audioSource` the copied audio starts, in seconds (>= 0).
+    ///
+    /// A render of frames A..B must play the sound recorded with frame A, not
+    /// the sound at 0:00, so the caller sets this to the moment of the first
+    /// rendered frame on the clip's timeline (first frame x rate denominator
+    /// / rate numerator).  It becomes an input-side `-ss` on the audio input
+    /// only, written with microsecond precision.  With `-c:a copy` ffmpeg
+    /// starts the copy at the audio packet at or before that moment (an AAC
+    /// packet is 1024 samples, 21.3 ms at 48 kHz) and times it relative to
+    /// the moment itself, so the .mp4's edit list trims the lead-in and the
+    /// sound lines up to the sample.  0 - the default - adds no `-ss`
+    /// at all, so a render from the clip's start keeps the exact command
+    /// line it always had.  NaN, infinite or negative values are treated as
+    /// 0 (FfmpegPipeWriter::open logs a warning).  Ignored without
+    /// `audioSource`.
+    double audioStartSeconds = 0.0;
     std::vector<std::string> extraArgs;    ///< Appended verbatim before the output path.
 };
+
+/// The ffmpeg argument vector (WITHOUT the executable itself) that
+/// FfmpegPipeWriter::open() starts the encoder `codec` with, writing `out`.
+///
+/// Input 0 is the raw rgb48le frames on stdin; input 1, when
+/// `options.audioSource` is set, is that file, seeked to
+/// `options.audioStartSeconds` and its first audio stream copied.  Exposed
+/// so the exact command line can be checked without starting a process;
+/// open() uses nothing else.  Pure: no files, no environment, no logging.
+///
+/// @param options  The pipe's options (size, rate, codec knobs, audio).
+/// @param codec    The encoder to name after -c:v (options.codec or its fallback).
+/// @param out      The output file, passed through as the last argument.
+/// @return         Every argument in order, each one unquoted.
+[[nodiscard]] std::vector<std::string> buildFfmpegArgs(const FfmpegPipeOptions& options, const std::string& codec,
+                                                       const std::filesystem::path& out);
 
 class FfmpegPipeWriter {
 public:
