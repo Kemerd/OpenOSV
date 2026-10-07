@@ -22,6 +22,13 @@
 //
 // Either way, writing runs on its own thread behind a bounded queue so
 // encoding overlaps the next frame's decode and render.
+//
+// Frame numbers (--frame / --range / --all) count the clip's TIMELINE as the
+// plug-ins present it (osv::video::ClipTimeline): the recorded frames of a
+// constant-rate clip, and for a clip whose camera dropped frames while
+// recording, frames at the nominal rate with the previous picture held over
+// each gap - the only way an .mp4 at one frame rate keeps the source audio
+// in step.  `osvtool extract --frame` addresses the recorded samples.
 
 #include "Commands.h"
 #include "Pipeline.h"
@@ -47,6 +54,7 @@
 #include "osv/render/SeamTools.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
+#include "osv/video/ClipTimeline.h"
 
 // [WP-DEFAULTS] The Premiere plug-ins' own (SDK-free) reader of the defaults
 // file, compiled into osvtool by tools/osvtool/CMakeLists.txt.
@@ -645,9 +653,26 @@ int runRender(const RenderOptions& o) {
         log::info("{}", log::safe(n));
     }
 
+    // ---- [VFR] the clip's timeline ---------------------------------------------------
+    // Frames are counted on the clip's constant-rate timeline, exactly as the
+    // plug-in engine counts them (see runEngineRender): the sample list of a
+    // constant-rate clip; for one that dropped frames, its nominal-rate
+    // conform with the previous picture held over each gap.
+    const std::uint32_t videoTrackId = P.format.videoTrackIds[0] != 0 ? P.format.videoTrackIds[0] : 1u;
+    const TrackInfo* videoTrack = P.file ? P.file->track(videoTrackId) : nullptr;
+    const video::ClipTimeline timeline =
+        videoTrack ? video::clipTimelineFor(*videoTrack, &P.track) : video::ClipTimeline{};
+    const std::uint32_t timelineFrames = timeline.identity() ? P.frameCount() : timeline.frameCount();
+    if (!timeline.identity()) {
+        log::info("timing: the camera dropped frames: {} samples on a {}-frame timeline at {:.3f} fps, {} frames "
+                  "hold the previous picture ({} clock)",
+                  P.frameCount(), timelineFrames, timeline.fps(), timeline.heldFrames,
+                  video::timelineClockName(timeline.clock));
+    }
+
     // ---- frame selection ----------------------------------------------------------
     std::uint32_t first = 0, last = 0;
-    if (const int selected = selectFrames(o, P.frameCount(), first, last); selected != kExitOk) {
+    if (const int selected = selectFrames(o, timelineFrames, first, last); selected != kExitOk) {
         return selected;
     }
     const bool multi = last > first;
@@ -708,8 +733,12 @@ int runRender(const RenderOptions& o) {
     }
 
     // ---- output sink and its writer thread --------------------------------------------
+    // A dropped-frame clip is written at its nominal rate (its timeline's),
+    // never at the average the decoder reports; a constant-rate clip keeps
+    // the decoder's rate, which is the same number.
     FrameSink sink;
-    if (const int opened = sink.open(o, w, h, P.fps(), P.outputTransfer, color::hdrPeakNitsOf(P.color), multi);
+    const double sinkFps = timeline.identity() ? P.fps() : timeline.fps();
+    if (const int opened = sink.open(o, w, h, sinkFps, P.outputTransfer, color::hdrPeakNitsOf(P.color), multi);
         opened != kExitOk) {
         return opened;
     }
@@ -788,16 +817,44 @@ int runRender(const RenderOptions& o) {
     render::PhotoSeamHistory photoHistory;
     Vec3d globalGain[2] = {Vec3d{1, 1, 1}, Vec3d{1, 1, 1}};
     bool haveBlendSeam = false;
-    for (std::uint32_t f = first; f <= last && !sink.failed(); ++f) {
+    // [VFR] The picture a held timeline frame repeats: kept only while the
+    // NEXT timeline frame shows the same sample, so a constant-rate clip
+    // never copies a frame.
+    std::optional<render::ImageRGBAf> held;
+    std::uint32_t heldSample = 0;
+    const auto reportProgress = [&](std::uint32_t tf) {
+        if ((tf - first) % 10 == 9 || tf == last) {
+            const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            const double done = static_cast<double>(tf - first + 1);
+            std::fprintf(stderr, "  %u/%u frames  %.1f fps  (%s)\n", tf - first + 1, last - first + 1,
+                         sec > 0 ? done / sec : 0.0, P.rendererName.c_str());
+        }
+    };
+    for (std::uint32_t tf = first; tf <= last && !sink.failed(); ++tf) {
+        // `tf` is the timeline frame, `f` the sample it shows (the same index
+        // on a constant-rate clip); everything below works on the sample.
+        const std::uint32_t f = timeline.identity() ? tf : timeline.sampleFor(tf);
+        const bool nextHolds = !timeline.identity() && tf < last && timeline.sampleFor(tf + 1u) == f;
+        if (held && heldSample == f) {
+            // A frame the camera dropped: the previous picture again, no
+            // decode and no analysis.
+            sink.push(tf, *held);
+            if (!nextHolds) {
+                held.reset();
+            }
+            reportProgress(tf);
+            continue;
+        }
+        held.reset();
         auto pair = P.reader->read(f);
         if (!pair.ok()) {
-            std::fprintf(stderr, "error: frame %u: %s\n", f, log::safe(pair.error().toString()).c_str());
+            std::fprintf(stderr, "error: frame %u: %s\n", tf, log::safe(pair.error().toString()).c_str());
             exitCode = kExitRuntime;
             break;
         }
         // Optional per-frame analysis (every seamInterval frames).
         const bool analyse = (o.seamSearch || o.gain || o.parallax || o.seamCarve) &&
-                             ((f - first) % static_cast<std::uint32_t>(std::max(1, o.seamInterval)) == 0);
+                             ((tf - first) % static_cast<std::uint32_t>(std::max(1, o.seamInterval)) == 0);
         // 2-D parallax correction first.  When it yields a grid, the grid
         // REPLACES the seam table rather than composing with it - the same
         // policy as the Premiere importer, so this command's A/B shows the
@@ -1008,18 +1065,17 @@ int runRender(const RenderOptions& o) {
         }
         auto img = P.renderer->render(job.value());
         if (!img.ok()) {
-            std::fprintf(stderr, "error: frame %u: %s\n", f, log::safe(img.error().toString()).c_str());
+            std::fprintf(stderr, "error: frame %u: %s\n", tf, log::safe(img.error().toString()).c_str());
             exitCode = kExitRuntime;
             break;
         }
-        sink.push(f, std::move(img).value());
-
-        if ((f - first) % 10 == 9 || f == last) {
-            const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            const double done = static_cast<double>(f - first + 1);
-            std::fprintf(stderr, "  %u/%u frames  %.1f fps  (%s)\n", f - first + 1, last - first + 1,
-                         sec > 0 ? done / sec : 0.0, P.rendererName.c_str());
+        // [VFR] The next timeline frame repeats this picture: keep a copy.
+        if (nextHolds) {
+            held = img.value();
+            heldSample = f;
         }
+        sink.push(tf, std::move(img).value());
+        reportProgress(tf);
     }
     return sink.finish(exitCode);
 }
@@ -1387,11 +1443,23 @@ int runEngineRender(const RenderOptions& o, const CLI::App& sub) {
         settings.colorOutput = prefs.colorOutput;
     }
     clip->applyPrefs(&settings, pr::PrefsBlob::kSize);
-    log::info("engine: plug-in clip engine, {} frames at {:.3f} fps", clip->frameCount(), clip->fps());
+    // [VFR] Frames are counted on the clip's own TIMELINE, as the plug-ins
+    // present it: the sample list of a constant-rate clip, and for one that
+    // dropped frames its nominal-rate conform with the previous picture held
+    // over each gap - so --all into an .mp4 with the source audio stays in
+    // step with the sound.  `osvtool extract --frame` addresses samples.
+    const std::uint32_t timelineFrames = clip->ownTimelineFrameCount();
+    if (clip->ownTimeline().identity()) {
+        log::info("engine: plug-in clip engine, {} frames at {:.3f} fps", clip->frameCount(), clip->fps());
+    } else {
+        log::info("engine: plug-in clip engine, {} timeline frames at {:.3f} fps ({} samples; the camera dropped "
+                  "frames, {} of them hold the previous picture)",
+                  timelineFrames, clip->fps(), clip->frameCount(), clip->ownTimeline().heldFrames);
+    }
 
     // ---- frames -----------------------------------------------------------------------------------
     std::uint32_t first = 0, last = 0;
-    if (const int selected = selectFrames(o, clip->frameCount(), first, last); selected != kExitOk) {
+    if (const int selected = selectFrames(o, timelineFrames, first, last); selected != kExitOk) {
         return selected;
     }
     const bool multi = last > first;
@@ -1440,13 +1508,22 @@ int runEngineRender(const RenderOptions& o, const CLI::App& sub) {
     const auto t0 = std::chrono::steady_clock::now();
     int exitCode = kExitOk;
     for (std::uint32_t f = first; f <= last && !sink.failed(); ++f) {
+        // [VFR] The sample timeline frame `f` shows (the same index on a
+        // constant-rate clip).  A held frame asks for the sample it repeats,
+        // which the engine's last-frame cache serves without a decode.
+        const std::uint32_t sample = clip->ownSourceFrameFor(f);
         render::ImageRGBAf frame;
         {
             std::lock_guard<std::mutex> lock(clip->lock());
-            auto rendered = clip->renderFrame(f, geometry, false, pr::RenderPurpose::Exact);
+            auto rendered = clip->renderFrame(sample, geometry, false, pr::RenderPurpose::Exact);
             if (!rendered.ok() || rendered.value() == nullptr) {
-                std::fprintf(stderr, "error: frame %u: %s\n", f,
-                             rendered.ok() ? "no image" : log::safe(rendered.error().toString()).c_str());
+                if (sample == f) {
+                    std::fprintf(stderr, "error: frame %u: %s\n", f,
+                                 rendered.ok() ? "no image" : log::safe(rendered.error().toString()).c_str());
+                } else {
+                    std::fprintf(stderr, "error: frame %u (sample %u): %s\n", f, sample,
+                                 rendered.ok() ? "no image" : log::safe(rendered.error().toString()).c_str());
+                }
                 exitCode = kExitRuntime;
                 break;
             }
@@ -1495,9 +1572,17 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
                        "plugin engine: off | auto (default; fit the small rotation between the lenses per clip)");
 
     auto* sel = sub->add_option_group("Frames");
-    sel->add_option("--frame", opt->frame, "Single frame index")->default_val(-1);
-    sel->add_option("--range", opt->range, "Frame range a-b");
-    sel->add_flag("--all", opt->all, "Every frame");
+    // [VFR] Frames are TIMELINE frames, as the plug-ins present the clip: on
+    // a clip that dropped frames while recording, the nominal-rate timeline
+    // with the previous picture held over each gap (so --all with the source
+    // audio stays in step); on every other clip, the recorded frames.
+    // `osvtool extract --frame` addresses the recorded samples instead.
+    sel->add_option("--frame", opt->frame,
+                    "Single timeline frame index (a clip that dropped frames while recording is presented at its "
+                    "nominal rate with each gap held, as in the plug-ins; extract --frame addresses recorded samples)")
+        ->default_val(-1);
+    sel->add_option("--range", opt->range, "Timeline frame range a-b (see --frame)");
+    sel->add_flag("--all", opt->all, "Every timeline frame (see --frame); an .mp4 then stays in step with the audio");
 
     auto* outGeom = sub->add_option_group("Output");
     outGeom->add_option("--mode", opt->mode, "reframe|equirect|equirect-polar")->default_str("reframe");

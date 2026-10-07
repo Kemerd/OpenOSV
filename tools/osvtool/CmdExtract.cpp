@@ -460,7 +460,9 @@ void registerExtractCommand(CLI::App& app, CommandContext& ctx) {
     sub->add_option("file", opt->inputPath, "Input .OSV or .LRF")->required();
     sub->add_option("--hevc", opt->hevcPath, "Write one video track as an Annex-B elementary stream");
     sub->add_option("--stream", opt->stream, "Stream / lens for --hevc: 0 (slave) or 1 (master)")->capture_default_str();
-    sub->add_option("--frame", opt->frame, "Decode this frame index (with --lens and --out)");
+    sub->add_option("--frame", opt->frame,
+                    "Decode this recorded frame (sample) index, the same index as the metadata's (with --lens and "
+                    "--out); render --frame counts the presented timeline instead");
     sub->add_option("--lens", opt->lens, "Lens for --frame: 0 (slave) or 1 (master)")->capture_default_str();
     sub->add_option("--out", opt->framePath, "Output for --frame: raw.pgm (16-bit luma) or raw.ppm (16-bit Y/Cb/Cr)");
 #if defined(__APPLE__)

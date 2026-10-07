@@ -17,7 +17,10 @@
 //                      start codes and pushed with avcodec_send_packet.  The
 //                      extradata is the hvcC parameter sets in Annex-B form.
 // Both modes share the same receive loop, the same pts -> frame index mapping
-// and the same AVFrame -> PlanarFrame16 wrapping.
+// and the same AVFrame -> PlanarFrame16 wrapping.  The mapping is the OpenOSV
+// sample table whenever the container parsed (frame i == sample i, also on a
+// variable-frame-rate clip); the average frame rate is only the fallback for
+// files the parser declines.
 
 #include "osv/video/Decoder.h"
 
@@ -648,15 +651,42 @@ struct HevcStreamDecoder::Impl {
         return static_cast<double>(timeBase.den) / static_cast<double>(timeBase.num);
     }
 
-    /// Frame index = round((pts - startPts) * fps / ticksPerSecond).
+    /// True when frame indices come from our sample table rather than from
+    /// the average frame rate: the container parser accepted the file, its
+    /// table can index frames (no composition offsets, strictly increasing
+    /// times - every camera file) and the stream's time base is the track's
+    /// media timescale, so a decoded pts and the table's ticks are the same
+    /// unit (libavformat's mov demuxer and the samples mode both use it).
+    [[nodiscard]] bool tableTiming() const noexcept {
+        return container != nullptr && container->indexedByTable() && timeBase.num == 1 &&
+               static_cast<std::int64_t>(timeBase.den) == static_cast<std::int64_t>(container->timescale());
+    }
+
+    /// Frame index of a decoded picture's presentation time.
+    ///
+    /// With the sample table: the sample presented nearest to it, so frame
+    /// i is sample i (== djmd frame i) even on a variable-frame-rate clip,
+    /// where the camera wrote a dropped frame into the table as one longer
+    /// sample.  Without it (a plain MP4 our parser declined): the old
+    /// time-based index at the average rate, round((pts - startPts) * fps /
+    /// ticksPerSecond).  On a constant-rate track both give the same number.
     [[nodiscard]] std::int64_t indexFromPts(std::int64_t pts) const noexcept {
+        if (tableTiming()) {
+            return container->sampleAt(pts - startPts);
+        }
         const double seconds = static_cast<double>(pts - startPts) / ticksPerSecond();
         return static_cast<std::int64_t>(std::llround(seconds * fps));
     }
 
-    /// Stream ticks for the start of frame `index` (plus a 0.4-frame margin
-    /// so floating point rounding can never land just before the keyframe).
+    /// Stream ticks for a libavformat seek to frame `index`: the sample's own
+    /// presentation time plus 0.4 of its duration (so rounding in the demuxer
+    /// can never land just before the keyframe), or with the average-rate
+    /// fallback (index + 0.4) / fps.  Identical on a constant-rate track.
     [[nodiscard]] std::int64_t ptsForSeek(std::uint32_t index) const noexcept {
+        if (tableTiming()) {
+            const double margin = 0.4 * static_cast<double>(container->sampleDuration(index));
+            return startPts + container->presentationTicks(index) + static_cast<std::int64_t>(std::llround(margin));
+        }
         const double seconds = (static_cast<double>(index) + 0.4) / (fps > 0.0 ? fps : 1.0);
         return startPts + static_cast<std::int64_t>(std::llround(seconds * ticksPerSecond()));
     }
@@ -682,7 +712,19 @@ struct HevcStreamDecoder::Impl {
         if (!fmt) {
             return failStatus(ErrorCode::InvalidArgument, "decoder not open");
         }
-        const int ret = av_seek_frame(fmt.get(), streamIndex, ptsForSeek(index), AVSEEK_FLAG_BACKWARD);
+        // libavformat seeks to the LISTED keyframe at or before the time.
+        // When that one cannot start a decode (ContainerSource::previousSync:
+        // one lens of a dropped-frame recording), aim at the real start
+        // instead, so the decode passes a random access point before the
+        // target; whatever precedes it is discarded like any catch-up frame.
+        std::uint32_t seekIndex = index;
+        if (container) {
+            const std::uint32_t start = container->previousSync(index);
+            if (start != container->listedSync(index)) {
+                seekIndex = start;
+            }
+        }
+        const int ret = av_seek_frame(fmt.get(), streamIndex, ptsForSeek(seekIndex), AVSEEK_FLAG_BACKWARD);
         if (ret < 0) {
             return failStatus(ErrorCode::Decoder, "av_seek_frame(" + std::to_string(index) + "): " + ff::errorString(ret));
         }
@@ -936,8 +978,11 @@ struct HevcStreamDecoder::Impl {
                 continue;  // still catching up from the sync sample
             }
             if (fi > static_cast<std::int64_t>(index)) {
+                // The stream skipped the wanted frame: a property of the file
+                // (its timing), not of this decoder - Timing, so no caller
+                // drops a working hardware decoder over it.
                 invalidatePosition();
-                return Error{ErrorCode::Decoder, "presentation time mismatch: wanted frame " + std::to_string(index) +
+                return Error{ErrorCode::Timing, "presentation time mismatch: wanted frame " + std::to_string(index) +
                                                      " but decoder produced frame " + std::to_string(fi) + " (pts " +
                                                      std::to_string(pts) + ")"};
             }
@@ -1438,7 +1483,13 @@ Status HevcStreamDecoder::seek(std::uint32_t index) {
                                                           std::to_string(m_impl->frameCount) + " frames)");
     }
     // Lazy: decode() decides whether a forward skip suffices or a real seek
-    // to the previous sync sample is needed.
+    // to the previous sync sample is needed.  A step BACK can never be served
+    // by decoding forward from where the decoder is, but once nextIndex names
+    // the target, decode() would believe it is there and read on to the end
+    // of the stream - so a backward seek forgets the position.
+    if (index < m_impl->nextIndex) {
+        m_impl->invalidatePosition();
+    }
     m_impl->nextIndex = index;
     return okStatus();
 }

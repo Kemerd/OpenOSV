@@ -1016,13 +1016,14 @@ struct GpuClipDecoder::Impl {
             verdict = Status(second.error());
         } else {
             // Both tracks run on one encoder clock; more than a tick apart
-            // means the two surfaces are not the same instant.
+            // means the two surfaces are not the same instant - the file's
+            // timing, not NVDEC's doing, hence Timing.
             const std::int64_t a = first.value().ptsUs;
             const std::int64_t b = second.value().ptsUs;
             if ((a > b ? a - b : b - a) > ptsToleranceUs) {
-                verdict = failStatus(ErrorCode::Decoder, "lens presentation times differ at frame " +
-                                                             std::to_string(index) + ": " + std::to_string(a) +
-                                                             " us vs " + std::to_string(b) + " us");
+                verdict = failStatus(ErrorCode::Timing, "lens presentation times differ at frame " +
+                                                            std::to_string(index) + ": " + std::to_string(a) +
+                                                            " us vs " + std::to_string(b) + " us");
             }
         }
 

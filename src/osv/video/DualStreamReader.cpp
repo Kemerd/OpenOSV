@@ -299,11 +299,12 @@ Result<FramePair> DualStreamReader::read(std::uint32_t index) {
     const PlanarFrame16& s = slave.frame.value();
     const PlanarFrame16& m = master.frame.value();
     // Both tracks are written by the same encoder clock; anything beyond a
-    // single tick means the tracks are not the pair we think they are.
+    // single tick means the tracks are not the pair we think they are.  The
+    // tracks' own timing says so, whichever decoder read them: Timing.
     const std::int64_t delta = s.ptsUs > m.ptsUs ? s.ptsUs - m.ptsUs : m.ptsUs - s.ptsUs;
     if (delta > impl.ptsToleranceUs) {
-        return Error{ErrorCode::Decoder, "lens presentation times differ at frame " + std::to_string(index) + ": " +
-                                             std::to_string(s.ptsUs) + " us vs " + std::to_string(m.ptsUs) + " us"};
+        return Error{ErrorCode::Timing, "lens presentation times differ at frame " + std::to_string(index) + ": " +
+                                            std::to_string(s.ptsUs) + " us vs " + std::to_string(m.ptsUs) + " us"};
     }
     pair.lens[0] = s;
     pair.lens[1] = m;

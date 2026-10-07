@@ -551,17 +551,38 @@ Status ImporterInstance::parseOnce() {
     }
     m_frameCount = videoTrack->samples.count();
     m_rateNum = videoTrack->timescale;
-    // Every DJI clip is constant frame rate; the per-sample delta is the
+    // [VFR] The camera records at a constant rate, but drops frames when it
+    // cannot keep up and writes each gap into the table as one longer
+    // sample.  The clip's own timeline (video::ClipTimeline) is the sample
+    // list for a constant-rate clip and a held-frame conform at the nominal
+    // rate otherwise; its nominal period - the most common sample duration,
+    // every sample's on a constant-rate clip, never just sample 0's - is the
     // denominator.  Fall back to the whole duration over the sample count so
     // an unusual sample table still yields a sane rational.
+    m_timeline = video::clipTimelineFor(*videoTrack, &m_track);
     std::uint64_t delta = 0;
     if (m_frameCount > 0 && videoTrack->timescale > 0) {
-        delta = videoTrack->samples.sampleDuration(0);
+        delta = m_timeline.nominalTicks;
         if (delta == 0 && videoTrack->duration > 0) {
             delta = videoTrack->duration / m_frameCount;
         }
     }
     m_rateDen = static_cast<std::uint32_t>(delta);
+    if (!m_timeline.identity()) {
+        // What the host will be told, and why: a user comparing the clip's
+        // length with another tool finds the answer in the log.
+        PluginLog::info("timing: '{}' dropped frames while recording: {} samples presented as {} frames at {:.3f} "
+                        "fps ({:.3f} s), the previous picture held over {} gap frames, timed by the {} clock{}{}",
+                        m_path.filename().string(), m_frameCount, m_timeline.frameCount(), m_timeline.fps(),
+                        m_timeline.durationSeconds(), m_timeline.heldFrames,
+                        video::timelineClockName(m_timeline.clock), m_timeline.note.empty() ? "" : " - ",
+                        m_timeline.note);
+    } else if (!m_timeline.note.empty() && m_frameCount > 1) {
+        // A table that varies but could not be placed: presented sample for
+        // sample, as every version before the timeline did.
+        PluginLog::info("timing: '{}' is presented sample for sample ({})", m_path.filename().string(),
+                        m_timeline.note);
+    }
     if (m_rateNum == 0 || m_rateDen == 0) {
         // Last resort: the detected fps as a 1000-times rational.  Better a
         // slightly wrong timebase than a division by zero.
@@ -982,6 +1003,16 @@ Result<video::FramePair> ImporterInstance::readPair(std::uint32_t index) {
     if (active == video::HwAccel::None) {
         return pair;
     }
+    // A Timing error is the FILE's (a picture that is not the sample asked
+    // for, lenses that disagree about a moment): software decodes the same
+    // stream to the same failure, so it says nothing against the hardware.
+    // The frame fails; the clip keeps its hardware decoder.
+    if (pair.error().code == ErrorCode::Timing) {
+        PluginLog::warn("video: frame {} of '{}' cannot be decoded ({}); the stream's timing is at fault, so {} "
+                        "decoding stays on",
+                        index, m_path.filename().string(), pair.error().message, video::hwAccelName(active));
+        return pair;
+    }
     PluginLog::warn("video: {} decoding failed on frame {} of '{}' ({}); switching this clip to software decoding",
                     video::hwAccelName(active), index, m_path.filename().string(), pair.error().message);
     m_hwDecodeFailed = true;
@@ -1193,10 +1224,14 @@ void ImporterInstance::adoptProxyTimelineLocked() {
                         originalName);
         return;
     }
-    const std::uint32_t frames = video->samples.count();
-    std::uint64_t delta = video->samples.sampleDuration(0);
+    // [VFR] The original's own timeline, exactly as its own instance presents
+    // it: its sample list at a constant rate, its held-frame conform at the
+    // nominal rate when it dropped frames (the metadata is read only then).
+    const ::osv::video::ClipTimeline originalTimeline = ::osv::video::clipTimelineFor(*video, &track.value());
+    const std::uint32_t frames = originalTimeline.frameCount();
+    std::uint64_t delta = originalTimeline.nominalTicks;
     if (delta == 0 && video->duration > 0) {
-        delta = video->duration / frames;
+        delta = video->duration / video->samples.count();
     }
     if (delta == 0 || delta > 0xFFFFFFFFull) {
         PluginLog::info("proxy: '{}': '{}' has no usable frame rate; presented on its own timeline", name,
@@ -1220,7 +1255,9 @@ void ImporterInstance::adoptProxyTimelineLocked() {
     }
 
     // ---- they must cover the same moments ----------------------------------------
-    const double proxySeconds = fps() > 0.0 ? static_cast<double>(m_frameCount) / fps() : 0.0;
+    // Both on their own timelines: a dropped-frame .LRF lasts its timeline,
+    // not its sample count at the nominal rate.
+    const double proxySeconds = fps() > 0.0 ? static_cast<double>(ownTimelineFrameCount()) / fps() : 0.0;
     const double originalSeconds =
         static_cast<double>(frames) * static_cast<double>(delta) / static_cast<double>(video->timescale);
     if (!std::isfinite(offsetSeconds) || offsetSeconds >= proxySeconds || offsetSeconds + originalSeconds <= 0.0) {
@@ -1230,6 +1267,30 @@ void ImporterInstance::adoptProxyTimelineLocked() {
         return;
     }
 
+    // ---- [VFR] which .LRF sample each timeline frame shows ---------------------------
+    // Two constant-rate files keep the rate formula in sourceFrameFor().  If
+    // either dropped frames, a rate no longer finds the right picture: each
+    // timeline frame gets the .LRF sample captured nearest the moment the
+    // original shows there - both carry one camera clock, so a frame the
+    // original holds over a gap is held in the proxy too.
+    std::vector<std::uint32_t> toSample;
+    if (!originalTimeline.identity() || !m_timeline.identity()) {
+        const TrackInfo* own = m_file ? m_file->track(m_format.videoTrackIds[0]) : nullptr;
+        if (own) {
+            const ::osv::video::SampleClock proxyClock = ::osv::video::sampleClockFor(*own, &m_track);
+            toSample = ::osv::video::mapTimelineToClock(originalTimeline, proxyClock, offsetSeconds * 1e6);
+            PluginLog::info("proxy: '{}' dropped frames (it or '{}'): its {} samples are matched to the original's "
+                            "{} timeline frames by the {} clock{}{}",
+                            name, originalName, m_frameCount, frames, ::osv::video::timelineClockName(proxyClock.clock),
+                            proxyClock.note.empty() ? "" : " - ", proxyClock.note);
+        }
+        if (toSample.empty()) {
+            PluginLog::warn("proxy: '{}': the moments of '{}' could not be matched sample by sample; timeline "
+                            "frames are found by frame rate",
+                            name, originalName);
+        }
+    }
+
     m_proxy.active = true;
     m_proxy.original = original;
     m_proxy.rateNum = video->timescale;
@@ -1237,18 +1298,40 @@ void ImporterInstance::adoptProxyTimelineLocked() {
     m_proxy.frameCount = frames;
     m_proxy.originalLensH = format.value().streamH;
     m_proxy.offsetSeconds = offsetSeconds;
+    m_proxy.toSample = std::move(toSample);
     PluginLog::info("proxy: '{}' is presented as the proxy of '{}': {} frames at {:.3f} fps (its own: {} at "
                     "{:.3f}), the original's first frame {:+.3f} s into it",
                     name, originalName, frames,
-                    static_cast<double>(m_proxy.rateNum) / static_cast<double>(m_proxy.rateDen), m_frameCount, fps(),
-                    offsetSeconds);
+                    static_cast<double>(m_proxy.rateNum) / static_cast<double>(m_proxy.rateDen),
+                    ownTimelineFrameCount(), fps(), offsetSeconds);
+}
+
+std::uint32_t ImporterInstance::ownSourceFrameFor(std::uint32_t timelineIndex) const noexcept {
+    if (m_frameCount == 0) {
+        return 0;
+    }
+    // A constant-rate clip: timeline frame k is sample k.
+    if (m_timeline.identity()) {
+        return std::min(timelineIndex, m_frameCount - 1u);
+    }
+    // [VFR] A clip that dropped frames: the held-frame table built at open.
+    return std::min(m_timeline.sampleFor(timelineIndex), m_frameCount - 1u);
 }
 
 std::uint32_t ImporterInstance::sourceFrameFor(std::uint32_t timelineIndex) const noexcept {
     if (m_frameCount == 0) {
         return 0;
     }
-    if (!m_proxy.active || m_proxy.rateNum == 0 || m_proxy.rateDen == 0 || m_rateDen == 0) {
+    // A clip on its own timeline.
+    if (!m_proxy.active) {
+        return ownSourceFrameFor(timelineIndex);
+    }
+    // [VFR] A proxy pair with dropped frames: the table built at open.
+    if (!m_proxy.toSample.empty()) {
+        const std::size_t k = std::min<std::size_t>(timelineIndex, m_proxy.toSample.size() - 1u);
+        return std::min(m_proxy.toSample[k], m_frameCount - 1u);
+    }
+    if (m_proxy.rateNum == 0 || m_proxy.rateDen == 0 || m_rateDen == 0) {
         return std::min(timelineIndex, m_frameCount - 1u);
     }
     // The moment of the original's frame on the proxy's clock, then the
@@ -2888,7 +2971,13 @@ Status ImporterInstance::renderFrameToHost(std::uint32_t index, const OutputGeom
             m_lastFramePath.store(static_cast<int>(FramePath::Gpu), std::memory_order_relaxed);
             return okStatus();
         }
-        if (!served.ok()) {
+        if (!served.ok() && served.error().code == ErrorCode::Timing) {
+            // The stream's own timing (see ErrorCode::Timing): the host path
+            // gets its turn below, but the GPU path takes no strike for it.
+            PluginLog::warn("video: GPU frame path failed on frame {} of '{}' ({}); the stream's timing is at fault, "
+                            "not the GPU path",
+                            index, m_path.filename().string(), served.error().message);
+        } else if (!served.ok()) {
             // A real failure on a clip the path had accepted: a driver
             // hiccup, a lost device, VRAM pressure.  This frame takes the
             // host path; three in a row mean it is not a hiccup.
@@ -3399,6 +3488,14 @@ Result<bool> ImporterInstance::countDeviceFrameFailure(const Error& error) {
     // a lost device, VRAM pressure.  This frame fails (the caller renders it
     // its own way); three in a row move the clip to host decoding for good,
     // and its VRAM goes back - exactly renderFrameToHost()'s rule.
+    //
+    // A Timing error is not NVDEC's: the host decoder reads the same stream
+    // to the same failure.  The frame still fails, but it is no strike.
+    if (error.code == ErrorCode::Timing) {
+        PluginLog::warn("video: NVDEC frame failed on '{}' ({}); the stream's timing is at fault, not the decoder",
+                        m_path.filename().string(), error.message);
+        return error;
+    }
     ++m_gpuFrameFailures;
     PluginLog::warn("video: NVDEC frame failed on '{}' ({}){}", m_path.filename().string(), error.message,
                     m_gpuFrameFailures >= 3 ? " - three in a row, so this clip decodes on the host from now on" : "");
@@ -3545,7 +3642,15 @@ std::string ImporterInstance::analysisText() const {
         line("Frame rate: " + std::string(buf) + " fps (" + std::to_string(m_rateNum) + " / " +
              std::to_string(m_rateDen) + ")");
     }
-    line("Frames: " + std::to_string(m_frameCount));
+    // [VFR] A clip that dropped frames: what the timeline holds, and how many
+    // pictures it repeats to keep the sound in step.
+    if (m_timeline.identity()) {
+        line("Frames: " + std::to_string(m_frameCount));
+    } else {
+        line("Frames: " + std::to_string(ownTimelineFrameCount()) + " on the timeline (" +
+             std::to_string(m_frameCount) + " recorded; the camera dropped frames, the previous picture is held over " +
+             std::to_string(m_timeline.heldFrames) + " of them)");
+    }
 
     line(std::string("Source colour mode: ") + meta::colorModeName(m_format.colorMode) +
          (m_format.colorModeFromMetadata ? " (from metadata)" : " (inferred)"));

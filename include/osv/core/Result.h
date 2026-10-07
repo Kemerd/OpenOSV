@@ -30,7 +30,13 @@ enum class ErrorCode : std::uint16_t {
     Io,               ///< Operating system / file system failure.
     Decoder,          ///< Video decoder (FFmpeg) failure.
     Gpu,              ///< CUDA / OpenCL failure.
-    Internal          ///< Invariant violated inside the library (bug).
+    Internal,         ///< Invariant violated inside the library (bug).
+    /// The stream's own timing contradicts the request: a decoded picture is
+    /// not the sample that was asked for (presentation time mismatch), or two
+    /// lens tracks disagree about a moment.  A property of the FILE, so every
+    /// decoder - hardware or software - fails it identically: callers must
+    /// not take it as a reason to abandon a hardware decoder.
+    Timing
 };
 
 /// Human readable, stable name of an ErrorCode (for logs and JSON output).
@@ -46,6 +52,7 @@ enum class ErrorCode : std::uint16_t {
     case ErrorCode::Decoder: return "Decoder";
     case ErrorCode::Gpu: return "Gpu";
     case ErrorCode::Internal: return "Internal";
+    case ErrorCode::Timing: return "Timing";
     }
     return "Unknown";
 }
