@@ -93,12 +93,23 @@ TEST_CASE("verified conventions align the overlap band, alternatives do not", "[
     // geometries.  Asserting an ordering the measurement cannot support would
     // be pinning one clip's noise, so what is checked is that the alternative
     // scale stays in the same plausible range rather than that it loses.
+    //
+    // Those numbers were measured while LensRig still took
+    // digital_focal_length whenever it sat within 1.2x of a lens's
+    // calibration * scale, so the 0.78125 rig carried the 3776 px crop's
+    // focal with only its principal point rescaled.  digital_focal_length now
+    // has to agree within 0.5 % per lens (8K-mode clips miss by 1.3-2.7 %),
+    // and at 0.78125 it misses by 1.7 %, so this rig takes the calibration *
+    // 0.78125 focal as well: a real pure-scale geometry with a 1.7 % short
+    // focal, measured at 0.779 on the sample (the verified rig: 0.825).  The
+    // floor is set for a plausible but mis-scaled overlap; a broken rig (the
+    // transposed extrinsics below) sits far under it.
     auto rigScale = buildRig(l.value(), 3000.0 / 3840.0);
     REQUIRE(rigScale.ok());
     auto nccScale = render::overlapNcc(rigScale.value(), l.value().pair, blend, band, pool);
     REQUIRE(nccScale.ok());
     INFO("NCC with 0.78125 scale: " << nccScale.value());
-    REQUIRE(nccScale.value() >= 0.80);
+    REQUIRE(nccScale.value() >= 0.72);
     REQUIRE(std::abs(ncc.value() - nccScale.value()) < 0.10);
 
     // Transposed extrinsics must be much worse.
