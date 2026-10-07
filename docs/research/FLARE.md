@@ -637,7 +637,7 @@ was removed or why nothing was. The first line is from a test run on the
 sample; the others show the formats of the other outcomes:
 
 ```
-flare: 'example_footage_dlogm.OSV' frame 3: master lens: sun 10.0 deg off axis, 2 ghosts removed (+23% at (1183, 1548), +7% at (833, 1290)); slave lens: no sun
+flare: 'example_footage_dlogm.OSV' frame 3: master lens: sun 10.0 deg off axis, 2 ghosts removed (+23% at (1183, 1548), +7% at (833, 1290)); slave lens: no sun; scene metered at EV100 9.0
 flare: 'CAM_0001.OSV': no sun in either lens at frame 12; nothing to remove
 flare: 'CAM_0001.OSV': sun ghost removal is off in Source Settings
 flare: 'CAM_0001.OSV': the D-Log M passthrough output is not treated (it blends in log code); rendering without ghost removal
@@ -768,7 +768,184 @@ Status flareCostBand(const FlareModel&, const geom::LensRig&, uint32_t mapW,
 | `plugins/importer/FlareStage.h`, `FlareStage.cpp` | the importer's schedule, log and seam source |
 | `plugins/importer/ImporterInstance.cpp` `[WP-FLARE]` lines | `applyAnalyses`, the carve's penalty, the cache key, the sampler install |
 | `plugins/common/PrefsBlob.h`, `plugins/importer/{resource.h, OpenOSVImporter.rc, SourceSettingsDialog.cpp, PrefsMapping.cpp}`, `plugins/sourcesettings/*` | the switch |
-| `tests/unit/test_flare.cpp` | 21 test cases |
+| `tests/unit/test_flare.cpp` | 25 test cases (the EV100 gate, the luminance check and the one-sun rule: section 9) |
+| `tests/cli/test_flare_stage.cpp` | `FlareStage` driven directly (in `osv_cli_tests`): the gate's answers |
 | `tests/premiere/importer/test_flare_importer.cpp` | the importer end to end |
 | `tests/bench/FlareBench.cpp` | `osv_flare_bench` (not in ctest); `--sweep` replays the importer's schedule |
 | `research/flare/` | crops and `make_crops.py` |
+
+## 9. Night footage: can the sun be in view at all? (2026-10)
+
+A user's car-mounted 8K clips (a sunset drive and a night drive, `.OSV` and
+`.LRF` each) showed what the sample clip never could: with the sun out of the
+sky, the stage kept finding one.
+
+### 9.1 What went wrong
+
+* **The detector is purely relative.** A "sun" is the largest compact blob
+  within 92 % of the frame maximum, with that maximum at least 6x the
+  frame's median (`detectSun`). Every clipped source decodes to the same
+  level (3.765 linear), so the ratio measures the scene median, not the
+  source. Night: street lamps, lit signs and headlights read 25-56x (median
+  44x). The sample's real sun reads 20.5x, the sunset's only 6.3-7.6x. No
+  ratio separates them.
+* **A replica of the detector crowned a sun in 94 % of the night drive's
+  sampled frames**, in both lenses in 61 % - two different directions,
+  which one sun cannot be.
+* **The ghost search then ran from the false sun.** Glossy car paint, lit
+  asphalt and a lamp's halo are smooth relative to themselves, and a
+  specular reflection passes the 4 % contrast gate at +88..+149 %. On the
+  night `.LRF`, 234 of 7915 frames (2.96 %) changed with removal on: a
+  lamp's reflection on the white door became a purple-grey stadium (frame
+  1771), a lane dash vanished for one frame, a headlight's edge was shaved
+  for 160 frames. Fits passing on isolated frames made the cut-outs blink.
+* **It cost a full analysis per frame at 8K** (5.3 fps against 8-9 fps
+  without removal): the lamps move every frame, so no model was ever reused.
+
+### 9.2 The scene-brightness gate
+
+The sun in view means a daylit scene, and the camera's own exposure says how
+much light the scene had. That is absolute where every image test is
+relative:
+
+    EV100 = log2(N^2 / t) - log2(ISO / 100)
+
+(`flareSceneEv100`; N the clip's aperture, `ClipMeta::fNumber`, f/1.9 on the
+Osmo 360; t and ISO the frame's `CameraFrame::exposureTime` and `iso`).
+
+| Clip | EV100 |
+|---|---|
+| night drive (ISO 1696-8598 at 1/100 s) | 2.07 - 4.41 (median 3.28) |
+| the sample, sun in view through an ND filter (ISO 142, 1/208 s) | 9.05 |
+| sunset drive, sun in view (ISO 281-286, 1/1748 - 1/2567 s) | 11.11 - 11.66 |
+
+`FlareParams::minSceneEv100 = 6` leaves 1.6 stops over the night maximum and
+3 under the filtered sun. The camera's own AE light value
+(`CameraFrame::aecLv`) reaches 5.7 at night, too close to use.
+
+`FlareStage::apply` takes the frame's EV100 (`FlareStage::sceneEv100`, read
+in `ImporterInstance::applyAnalyses` only when the stage will look) and
+answers a darker frame **before the cache and before the sun check**:
+nothing to the builder, the seam penalty cleared, an exact frame, one log
+line per clip:
+
+    flare: '<clip>': scene metered at EV100 3.3 at frame 1771, too dark for
+    the sun to be in view; nothing to remove
+
+The once-per-clip model line ends with the brightness the frame was judged
+by ("scene metered at EV100 9.0", or "scene brightness not recorded"), so the
+log shows that the importer handed the stage the frame's exposure; the
+importer test "the importer hands the ghost stage the frame's metered
+exposure" reads it back for the sample. An unknown EV100 (a field not
+recorded) keeps the old behaviour. Through an
+ND filter EV100 reads darker, never brighter: removal is lost only past
+about 5 stops of ND at sunset or 8-9 at noon, and then the ghost stays -
+the safe failure. osvtool's classic engine has no flare path (`--flare` is
+plug-in engine only), so the stage every plug-in engine shares is the one
+place the gate lives.
+
+**Locked or manual exposure** (EV100 then follows the settings, not the
+scene): with the EV100 known, `detectSun` also requires the image's
+median-referenced luminance
+
+    L = (median / 0.18) * 2^EV100 / 8   cd/m^2      (flareSceneLuminance)
+
+to reach `FlareParams::minSceneLuminance = 8`: a reflected-light meter
+(K = 12.5) sets EV100 for a mid grey of 2^EV100 / 8 cd/m^2, and the camera
+renders that grey at 0.18. Measured: night 0.1-2.1, the filtered sun 59-68,
+the sunset 310-1200 cd/m^2. `FlareParams::sceneEv100` carries the frame's
+value into the sun check and the fits alike.
+
+### 9.3 One sun
+
+`resolveOneSun` (end of `locateSuns`, and of `analyseFlare`) turns each
+lens's sun into a body direction (the lens's unprojection, back through
+`bodyToLens`):
+
+* when their clipped discs touch - the directions lie within 3 deg
+  (`oneSunToleranceDeg`; the lens alignment disagrees by ~1 deg RMS) plus
+  both blobs' angular radii (`radiusPx` at the lens's radial scale where
+  each sits) - both stand: the sun in the overlap, seen by both lenses;
+* farther apart, the one with at least 4x the clipped area
+  (`oneSunAreaRatio`) stands - a sunset sun against a glint in the far lens
+  measured a median 275x;
+* otherwise neither: two alike blobs in two directions are lamps.
+
+The discs are not optional. Each lens's usable circle (97 % of the image
+circle, ~93.6 deg off axis) cuts an overlap sun's disc on its own side and
+pulls that lens's centroid toward its own axis. On the sunset drive's seam
+crossings (`.LRF` frames 5940 and 5960, 8K frame 11880) the two centroids of
+the one sun sat 5.7-5.9 deg apart, for discs of 7.9-10.2 deg and areas only
+1.5-2x apart. A bare 3 deg test dropped the real sun in both lenses there,
+so removal and the seam's glare term went off and on at every crossing. The
+unit test paints such a disc around one direction in both lenses and runs it
+through the real detector: 5.9-6.0 deg apart, both kept.
+
+A lamp in the overlap is one source to this rule too (the night scan has
+such pairs, at mirrored azimuths on both sides of the seam): telling it from
+the sun is the scene-brightness gate's job. A clip without exposure metadata keeps only
+the image tests, as before.
+
+Doubt removes nothing: a position that cannot be unprojected, or a blob that
+cannot be sized, counts as disagreeing; broken parameters drop both. Model
+reuse (`flareSunsMatch`) compares resolved checks, so a glint in the far
+lens no longer forces a new measurement. On the sunset drive's 8K frame
+10000 the slave's glint at 87.7 deg off axis is now dropped ("slave lens: no
+sun"); the master's real sun stands.
+
+`FlareStage` analyses - and downsamples - only a lens its check found the
+kept sun in. That is deliberately wider than skipping the rule's rejects: a
+lens whose check found no sun is not analysed either, even while the other
+lens has one. Before, that lens was analysed at the finer factor, where
+`detectSun` could crown a blob the check never saw (a glint, or a sliver of
+a sun mostly outside the usable circle) and fit ghosts around it with
+nothing holding it to the one sun. The check is the one judge of where the
+sun is, as it already is for model reuse; for the same reason the two
+analysed lenses' finer suns are not held to one sun again.
+
+### 9.4 Measured after the change
+
+(`osvtool render`, plug-in defaults, 2048 x 1024 Rec.709 unless stated.)
+
+| | before | after |
+|---|---|---|
+| night `.LRF` frame 1771, removal on vs off | 1694 px changed (max 0.226) | bit-identical |
+| night 8K frame 3530, removal on vs off | 673 px changed (max 0.204) | bit-identical |
+| night `.LRF`, every decodable frame, on vs off (1024 x 512, no parallax) | 234 of 7915 changed | 0 of 7915 (no sun crowned; EV100 2.1-4.4 logged) |
+| night 8K frames 3530-3569 on vs off, 1024 x 512, no parallax | 2 of 40 changed; 5.4-5.6 fps on, 9.5-9.9 off | 0 of 40; 7.8-9.4 fps on, 8.6-9.3 off |
+| sample `.OSV` and `.LRF`, all 65 frames | - | byte-identical to the previous build |
+| sample frame 3 log | 2 ghosts (+23 % at (1183, 1548), +7 % at (833, 1290)) | unchanged |
+| sunset `.LRF` (17 frames from 0 to 14000) and 8K frame 10000 | sun found (12-83 deg off axis) | sun found, byte-identical |
+| sunset seam crossings: `.LRF` 5940, 5960, 8K 11880 | sun in both lenses (85-89 deg off axis) | the same, byte-identical (a bare 3 deg rule had dropped both) |
+| sunset `.LRF` 5700-6100, every frame (1024 x 512) | - | 401 of 401 byte-identical |
+| sunset `.LRF`, the whole clip, every frame (512 x 256, no parallax) | - | 14453 of 14458 byte-identical; 13275-13279 differ (below) |
+
+On the whole sunset clip only frames 13275-13279 differ, and there the
+previous build was wrong. A 2-3 px glint 115-162 deg from the sun in the
+slave lens changed the raw sun check, which forced a fresh measurement at
+13275. That measurement accepted a "ghost" in clear sky above the sun
+(+39 %, which its neighbours reject) and cut a dark grey patch into the sky
+for 5 frames (0.2 s). The resolved check drops the glint (200-500x smaller
+than the sun), still matches the neighbours' model and reuses it, so the sky
+stays clean.
+
+The frame rates are the quieter of two rounds of two runs each on a shared
+GPU; in the noisier round the previous build read 4.2-4.5 fps with removal
+on, this one 5.6-9.9.
+
+### 9.5 Left open
+
+* **Clipped taps** (dropped this round): the factor-4 working image averages
+  a reflection's clipped core to below the clip level, so a fit can be
+  accepted over pixels whose true value is unknown. Carrying a clipped-tap
+  count per analysis pixel needs the CPU sampler (`osvFlareDownsamplePixel`)
+  and the CUDA sampler to change in step, with their parity tests.
+* **Real night lamp ghosts** exist (a pill in the sky, an iridescent spot),
+  but a per-frame sun-ghost stage could only make them blink; removing them
+  would need tracking across frames and several light sources.
+* **No user override** for heavy-ND sunset footage below EV100 6; failing
+  safe leaves the ghost in.
+* **An isolated false ghost** can still be accepted when a frame is measured
+  on its own: an export that starts at the sunset clip's frame 13275 cuts
+  the same dark patch the previous build blinked in a playthrough. That is
+  an acceptance problem (the clipped-taps item above), not a sun problem.

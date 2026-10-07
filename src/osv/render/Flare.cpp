@@ -715,6 +715,19 @@ SunBlob detectSun(const Gray& luma, const std::vector<std::uint8_t>& inside, con
     if (!(maxY > 0.0) || !(med > 0.0) || maxY < fp.sunMinRatioToMedian * med) {
         return sun;
     }
+    // Relative tests cannot tell the sun from a clipped lamp (both sit at the
+    // clip level); the scene's absolute light can.  Only with the frame's
+    // exposure known: a scene metered too dark, or one whose own median on
+    // that exposure is too dim (locked or manual exposure), holds no sun.
+    if (std::isfinite(fp.sceneEv100)) {
+        if (flareSceneTooDark(fp.sceneEv100, fp)) {
+            return sun;
+        }
+        const double nits = flareSceneLuminance(med, fp.sceneEv100);
+        if (std::isfinite(fp.minSceneLuminance) && std::isfinite(nits) && nits < fp.minSceneLuminance) {
+            return sun;
+        }
+    }
     // Candidate pixels: within sunLevelFraction of the maximum.
     const double level = fp.sunLevelFraction * maxY;
     std::vector<std::uint8_t> mask(luma.v.size(), 0);
@@ -1484,6 +1497,20 @@ Result<FlareModel> analyseFlare(const geom::LensRig& rig, const video::FramePair
         OSV_TRY_ASSIGN(FlareImage image, flareDownsampleLens(frames, i, color, params.factor, pool));
         OSV_TRY_ASSIGN(model.lens[li], analyseLensFlare(image, rig.lens[li], params, &pool));
     }
+    // One sun, as the per-frame check has it (resolveOneSun): a lens whose
+    // sun the rule drops keeps nothing of its analysis - no ghosts fitted
+    // from a lamp or a glint, and no sun for the seam's glare term.
+    FlareSunFixes suns{};
+    for (std::size_t i = 0; i < 2; ++i) {
+        const LensFlare& lf = model.lens[i];
+        suns[i] = {lf.sunFound, lf.sunX, lf.sunY, lf.sunRadiusPx};
+    }
+    const FlareSunFixes kept = resolveOneSun(rig, suns, params);
+    for (std::size_t i = 0; i < 2; ++i) {
+        if (suns[i].found && !kept[i].found) {
+            model.lens[i] = LensFlare{};
+        }
+    }
     return model;
 }
 
@@ -1573,7 +1600,135 @@ Result<FlareSunFixes> locateSuns(const geom::LensRig& rig, const video::FramePai
                        flareDownsampleLens(frames, i, color, flareSunCheckFactor(lensW), pool));
         fixes[li] = locateSun(image, rig.lens[li], params);
     }
-    return fixes;
+    // Each lens looked on its own; there is one sun to agree on.
+    return resolveOneSun(rig, fixes, params);
+}
+
+FlareSunFixes resolveOneSun(const geom::LensRig& rig, const FlareSunFixes& fixes, const FlareParams& params) noexcept {
+    // ---- a sun in one lens or in none: nothing to reconcile -------------------
+    if (!fixes[0].found || !fixes[1].found) {
+        return fixes;
+    }
+    FlareSunFixes out = fixes;
+    // ---- broken tuning: two suns that cannot be judged are not trusted --------
+    const double toleranceDeg = params.oneSunToleranceDeg;
+    const double areaRatio = params.oneSunAreaRatio;
+    if (!std::isfinite(toleranceDeg) || toleranceDeg < 0.0 || !std::isfinite(areaRatio) || areaRatio < 1.0) {
+        out[0] = FlareSunFix{};
+        out[1] = FlareSunFix{};
+        return out;
+    }
+
+    // ---- each sun as a direction in the body frame, with its angular size ----
+    // d_lens = bodyToLens * d_body, and bodyToLens is a rotation, so its
+    // transpose takes the lens's ray back into the body frame where the two
+    // lenses' rays can be compared.  A position the lens cannot unproject,
+    // or a blob that cannot be sized, leaves `comparable` false: the suns
+    // then count as disagreeing.
+    std::array<Vec3d, 2> dir{};
+    std::array<double, 2> discRad{};  // each blob's equivalent radius as an angle (radians)
+    bool comparable = true;
+    for (std::size_t i = 0; i < 2; ++i) {
+        const FlareSunFix& s = fixes[i];
+        const geom::KannalaBrandt5& lens = rig.lens[i];
+        if (!lens.isValid() || !allFinite(s.x, s.y, s.radiusPx) || s.radiusPx < 0.0) {
+            comparable = false;
+            continue;
+        }
+        const Result<Vec3d> ray = lens.unproject(Vec2d{s.x, s.y});
+        if (!ray.ok()) {
+            comparable = false;
+            continue;
+        }
+        dir[i] = (rig.bodyToLens[i].transposed() * ray.value()).normalized();
+        // normalized() answers a zero vector for a degenerate ray.
+        if (!dir[i].isFinite() || !(dir[i].norm() > 0.5)) {
+            comparable = false;
+            continue;
+        }
+        // The blob's radius at the lens's RADIAL scale where it sits:
+        // r_px = f * theta_d(theta), so one radian there spans
+        // f * theta_d'(theta) px.  On the Osmo 360's lenses that is fewer px
+        // per radian than the tangential f * theta_d / sin(theta) at every
+        // angle of the field (0.93 f against 1.70 f at 90 degrees), so the
+        // radius read radially is the larger angle and the disc is never
+        // sized too small.
+        const double theta = std::acos(std::clamp(ray.value().z, -1.0, 1.0));
+        const double pxPerRad = 0.5 * (lens.fx + lens.fy) * lens.dThetaD(theta);
+        if (!std::isfinite(pxPerRad) || !(pxPerRad > 0.0)) {
+            comparable = false;  // the model folds back here: no size to trust
+            continue;
+        }
+        discRad[i] = s.radiusPx / pxPerRad;
+    }
+
+    // ---- one source: the sun in the overlap, seen by both lenses ---------------
+    // The two views agree when their clipped discs touch on the sky, give or
+    // take the lens alignment.  Comparing the bare centroids is not enough:
+    // each lens's usable-circle mask cuts an overlap sun's disc on its own
+    // side, which pulls each centroid toward that lens's axis - on a sunset
+    // clip's seam crossings the two centroids of one sun sat 5.7-5.9 degrees
+    // apart, for discs of 7.9-10.2 degrees, and a bare 3-degree test
+    // dropped the real sun in both lenses.
+    const double allowedRad = toleranceDeg * kPi / 180.0 + discRad[0] + discRad[1];
+    if (comparable && std::isfinite(allowedRad) && dir[0].angleTo(dir[1]) <= allowedRad) {
+        return out;
+    }
+
+    // ---- two directions: only a clear winner by clipped area is the sun -------
+    // The equivalent radius is sqrt(area / pi), so the area ratio is the
+    // square of the radius ratio.  A sunset sun against a glint in the far
+    // lens measured a median 275x; two street lamps are alike.
+    const double area0 = fixes[0].radiusPx * fixes[0].radiusPx;
+    const double area1 = fixes[1].radiusPx * fixes[1].radiusPx;
+    const bool areasOk = allFinite(area0, area1) && area0 >= 0.0 && area1 >= 0.0;
+    if (areasOk && area0 > 0.0 && area0 >= areaRatio * area1) {
+        out[1] = FlareSunFix{};  // the slave's sun stands; the master saw a glint
+    } else if (areasOk && area1 > 0.0 && area1 >= areaRatio * area0) {
+        out[0] = FlareSunFix{};  // the master's sun stands; the slave saw a glint
+    } else {
+        out[0] = FlareSunFix{};  // two alike: neither is the sun
+        out[1] = FlareSunFix{};
+    }
+    return out;
+}
+
+// ===========================================================================
+//  Public: the scene-brightness gate
+// ===========================================================================
+
+double flareSceneEv100(double fNumber, double exposureSeconds, double iso) noexcept {
+    constexpr double kUnknown = std::numeric_limits<double>::quiet_NaN();
+    // Every input must be a finite positive number; zero is how the
+    // metadata says "not recorded".
+    if (!allFinite(fNumber, exposureSeconds, iso) || !(fNumber > 0.0) || !(exposureSeconds > 0.0) || !(iso > 0.0)) {
+        return kUnknown;
+    }
+    // EV100 = log2(N^2 / t) - log2(ISO / 100): the light the exposure was
+    // set for, referred to ISO 100.
+    const double ev = std::log2(fNumber * fNumber / exposureSeconds) - std::log2(iso / 100.0);
+    return std::isfinite(ev) ? ev : kUnknown;
+}
+
+bool flareSceneTooDark(double sceneEv100, const FlareParams& params) noexcept {
+    // Unknown on either side never gates: the frame is treated as before.
+    if (!std::isfinite(sceneEv100) || !std::isfinite(params.minSceneEv100)) {
+        return false;
+    }
+    return sceneEv100 < params.minSceneEv100;
+}
+
+double flareSceneLuminance(double medianLinear, double sceneEv100) noexcept {
+    constexpr double kUnknown = std::numeric_limits<double>::quiet_NaN();
+    // A median below zero is not light, and an unknown exposure says nothing.
+    if (!allFinite(medianLinear, sceneEv100) || medianLinear < 0.0) {
+        return kUnknown;
+    }
+    // The camera renders the metered mid grey - 2^EV100 / 8 cd/m^2 for a
+    // reflected-light meter with K = 12.5 at ISO 100 - at 0.18 scene-linear.
+    constexpr double kMeteredGrey = 0.18;
+    const double nits = (medianLinear / kMeteredGrey) * std::exp2(sceneEv100) / 8.0;
+    return std::isfinite(nits) ? nits : kUnknown;
 }
 
 bool flareSunsMatch(const FlareSunFixes& a, const FlareSunFixes& b, double tolerancePx) noexcept {

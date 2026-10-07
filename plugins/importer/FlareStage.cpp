@@ -16,6 +16,7 @@
 #include <format>
 #include <limits>
 #include <string>
+#include <vector>
 
 namespace osv::premiere {
 
@@ -28,6 +29,7 @@ enum Reason : int {
     kReasonCheck = 2,     ///< The sun check itself failed.
     kReasonAnalysis = 3,  ///< The analysis failed.
     kReasonPassthrough = 4,  ///< D-Log M passthrough output: the kernel cannot remove.
+    kReasonDark = 5,      ///< The scene metered too dark for the sun to be in view.
 };
 
 /// "master" / "slave" for a lens index.
@@ -171,15 +173,50 @@ void FlareStage::assignLocked(std::uint32_t bucket, std::uint32_t frame, const E
 
 Result<render::FlareModel> FlareStage::analyse(const std::array<render::FlareImage, 2>& images,
                                                const std::array<geom::KannalaBrandt5, 2>& lenses,
-                                               const render::FlareParams& params, ThreadPool* pool) {
+                                               const render::FlareSunFixes& suns, const render::FlareParams& params,
+                                               ThreadPool* pool) {
     render::FlareModel model;
     for (std::size_t i = 0; i < 2; ++i) {
+        // Only where the (one) sun is: a lens the sun check found none in,
+        // or whose blob the one-sun rule dropped, stays empty.
+        if (!suns[i].found) {
+            continue;
+        }
         OSV_TRY_ASSIGN(model.lens[i], render::analyseLensFlare(images[i], lenses[i], params, pool));
     }
     return model;
 }
 
-void FlareStage::logModelOnce(const std::string& clip, std::uint32_t frame, const render::FlareModel& model) noexcept {
+double FlareStage::sceneEv100(const meta::MetadataTrack& track, std::uint32_t index) noexcept {
+    constexpr double kUnknown = std::numeric_limits<double>::quiet_NaN();
+    try {
+        // ---- the clip's aperture: a [num, den] rational ([19, 10] = f/1.9) --
+        const std::vector<std::uint32_t>& fn = track.clip().fNumber;
+        if (fn.size() < 2 || fn[0] == 0 || fn[1] == 0) {
+            return kUnknown;
+        }
+        // ---- the frame's ISO and shutter (a [num, den] rational in seconds) --
+        const Result<meta::FrameMeta> frame = track.frame(index);
+        if (!frame.ok()) {
+            return kUnknown;
+        }
+        const meta::CameraFrame& camera = frame.value().camera;
+        const std::vector<std::int32_t>& et = camera.exposureTime;
+        if (et.size() < 2 || et[0] <= 0 || et[1] <= 0) {
+            return kUnknown;
+        }
+        // flareSceneEv100 refuses anything not finite and positive.
+        return render::flareSceneEv100(static_cast<double>(fn[0]) / static_cast<double>(fn[1]),
+                                       static_cast<double>(et[0]) / static_cast<double>(et[1]),
+                                       static_cast<double>(camera.iso));
+    } catch (...) {
+        // Copying the frame's metadata can only fail on allocation: unknown.
+        return kUnknown;
+    }
+}
+
+void FlareStage::logModelOnce(const std::string& clip, std::uint32_t frame, const render::FlareModel& model,
+                              double sceneEv100) noexcept {
     try {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -188,8 +225,12 @@ void FlareStage::logModelOnce(const std::string& clip, std::uint32_t frame, cons
             }
             m_loggedModel = true;
         }
-        PluginLog::info("flare: '{}' frame {}: {}; {}", clip, frame, describeLens(model.lens[1], 1),
-                        describeLens(model.lens[0], 0));
+        // The brightness last: the lens descriptions keep their place in the
+        // line, and an unknown value says so rather than printing "nan".
+        PluginLog::info("flare: '{}' frame {}: {}; {}; {}", clip, frame, describeLens(model.lens[1], 1),
+                        describeLens(model.lens[0], 0),
+                        std::isfinite(sceneEv100) ? std::format("scene metered at EV100 {:.1f}", sceneEv100)
+                                                  : std::string("scene brightness not recorded"));
     } catch (...) {
         // Formatting can only fail on allocation; the log line is optional.
     }
@@ -214,8 +255,8 @@ void FlareStage::logReasonOnce(int reason, const std::string& text) noexcept {
 // ---------------------------------------------------------------------------
 
 FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePair& pair, const geom::LensRig& rig,
-                                      const OsvColorParams& color, bool enabled, bool draft, bool exactWanted,
-                                      ThreadPool& pool, render::RenderParamsBuilder& builder,
+                                      const OsvColorParams& color, double sceneEv100, bool enabled, bool draft,
+                                      bool exactWanted, ThreadPool& pool, render::RenderParamsBuilder& builder,
                                       const std::string& clip) noexcept {
     Outcome out;
     try {
@@ -241,7 +282,29 @@ FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePai
                                       clip));
             return out;
         }
-        const render::FlareParams params;
+        // The frame's exposure travels with the parameters, so the sun check
+        // and the fits (here or on the worker) also hold the image's own
+        // median to it (FlareParams::minSceneLuminance).
+        const render::FlareParams params = [sceneEv100] {
+            render::FlareParams p;
+            p.sceneEv100 = sceneEv100;
+            return p;
+        }();
+
+        // ---- can the sun be in view at all? ------------------------------------
+        // The camera's exposure says how much light the scene had; a night
+        // street's clipped lamps pass every image test for "the sun", this
+        // one they cannot.  Before the cache and the sun check, so a dark
+        // frame costs nothing and nothing measured earlier reaches it.  The
+        // value is the frame's own metadata, so the answer is final (exact).
+        if (render::flareSceneTooDark(sceneEv100, params)) {
+            m_penalty.clear();
+            logReasonOnce(kReasonDark,
+                          std::format("flare: '{}': scene metered at EV100 {:.1f} at frame {}, too dark for the sun "
+                                      "to be in view; nothing to remove",
+                                      clip, sceneEv100, index));
+            return out;
+        }
         const std::uint32_t bucket = render::parallaxBucket(index);
 
         // ---- a frame already answered keeps its answer -------------------------
@@ -334,6 +397,11 @@ FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePai
             std::array<render::FlareImage, 2> images;
             bool imagesOk = true;
             for (int i = 0; i < 2 && imagesOk; ++i) {
+                // A lens without the sun is not analysed, so it needs no
+                // working image (analyse() never reads it).
+                if (!suns[static_cast<std::size_t>(i)].found) {
+                    continue;
+                }
                 auto image = render::flareDownsampleLens(pair, i, color, params.factor, pool);
                 if (image.ok()) {
                     images[static_cast<std::size_t>(i)] = std::move(image).value();
@@ -349,7 +417,7 @@ FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePai
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             if (imagesOk && exactWanted) {
                 // Exact: the whole analysis here, on the render pool.
-                auto model = analyse(images, {rig.lens[0], rig.lens[1]}, params, &pool);
+                auto model = analyse(images, {rig.lens[0], rig.lens[1]}, suns, params, &pool);
                 const double ms =
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 if (model.ok()) {
@@ -361,7 +429,7 @@ FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePai
                                      "images {:.1f}); {} + {} ghosts",
                                      index, bucket, ms + checkMs, checkMs, sampleMs,
                                      entry->model.lens[1].ghosts.size(), entry->model.lens[0].ghosts.size());
-                    logModelOnce(clip, index, entry->model);
+                    logModelOnce(clip, index, entry->model, params.sceneEv100);
                     own = entry;
                     std::lock_guard<std::mutex> lock(m_mutex);
                     storeLocked(bucket, own);
@@ -469,7 +537,7 @@ void FlareStage::workerLoop() noexcept {
         double ms = 0.0;
         try {
             const auto t0 = std::chrono::steady_clock::now();
-            auto model = analyse(job.images, job.lenses, job.params, nullptr);
+            auto model = analyse(job.images, job.lenses, job.suns, job.params, nullptr);
             ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             if (model.ok()) {
                 entry = std::make_shared<Entry>();
@@ -500,7 +568,7 @@ void FlareStage::workerLoop() noexcept {
             PluginLog::debug("flare: bucket {} (frame {}) measured in the background in {:.0f} ms{}", job.bucket,
                              job.frame, ms, stored ? "" : " - discarded, settings changed");
             if (stored) {
-                logModelOnce(job.clip, job.frame, entry->model);
+                logModelOnce(job.clip, job.frame, entry->model, job.params.sceneEv100);
             }
         } else {
             PluginLog::debug("flare: bucket {} (frame {}) failed in the background after {:.0f} ms ({})", job.bucket,

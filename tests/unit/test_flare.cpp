@@ -3,7 +3,8 @@
 //
 // Flare removal tests (WP-FLARE): the kernel primitives, ghost detection on
 // synthetic frames with known parameters, the bounds of the subtraction, the
-// seam cost hook, the veil estimate, CPU / GPU parity and the sample clip.
+// scene-brightness gate and the one-sun rule, the seam cost hook, the veil
+// estimate, CPU / GPU parity and the sample clip.
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
@@ -34,9 +35,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <random>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace osv;
@@ -525,6 +528,368 @@ TEST_CASE("the sun check finds the sun where the analysis does, and matches only
         REQUIRE_THAT(render::flareSunTolerancePx(6000), WithinAbs(6.0, 1e-12));
         REQUIRE_THAT(render::flareSunTolerancePx(0), WithinAbs(3.0, 1e-12));   // unknown: the 6K value
         REQUIRE_THAT(render::flareSunTolerancePx(100), WithinAbs(1.0, 1e-12)); // never below a pixel
+    }
+}
+
+// =============================================================================
+//  Can the sun be in view: the scene-brightness gate and the one-sun rule
+// =============================================================================
+
+TEST_CASE("the scene's EV100 comes from the camera's aperture, shutter and ISO", "[flare]") {
+    SECTION("the textbook values") {
+        // f/1, 1 s, ISO 100 is EV 0 by definition; each stop of aperture
+        // area, shutter or gain moves it by one.
+        REQUIRE_THAT(render::flareSceneEv100(1.0, 1.0, 100.0), WithinAbs(0.0, 1e-12));
+        REQUIRE_THAT(render::flareSceneEv100(2.0, 1.0, 100.0), WithinAbs(2.0, 1e-12));
+        REQUIRE_THAT(render::flareSceneEv100(1.0, 0.5, 100.0), WithinAbs(1.0, 1e-12));
+        REQUIRE_THAT(render::flareSceneEv100(1.0, 1.0, 200.0), WithinAbs(-1.0, 1e-12));
+    }
+
+    SECTION("the clips the gate was measured on, at the Osmo 360's f/1.9") {
+        // A night drive at 1/100 s: ISO 1696 and 4140 bound the clip.
+        REQUIRE_THAT(render::flareSceneEv100(1.9, 1.0 / 100.0, 1696.0), WithinAbs(4.41, 0.01));
+        REQUIRE_THAT(render::flareSceneEv100(1.9, 1.0 / 100.0, 4140.0), WithinAbs(3.12, 0.01));
+        // The sample clip: the sun through an ND filter, ISO 142 at 1/208 s.
+        REQUIRE_THAT(render::flareSceneEv100(1.9, 1.0 / 208.0, 142.0), WithinAbs(9.05, 0.01));
+        // A bare sunset: ISO 286 at 1/1748 s.
+        REQUIRE_THAT(render::flareSceneEv100(1.9, 1.0 / 1748.0, 286.0), WithinAbs(11.11, 0.01));
+    }
+
+    SECTION("anything not recorded or not usable is unknown, never a number") {
+        const double nan = std::nan("");
+        const double inf = std::numeric_limits<double>::infinity();
+        REQUIRE(std::isnan(render::flareSceneEv100(0.0, 0.01, 400.0)));    // aperture not recorded
+        REQUIRE(std::isnan(render::flareSceneEv100(1.9, 0.0, 400.0)));     // shutter not recorded
+        REQUIRE(std::isnan(render::flareSceneEv100(1.9, 0.01, 0.0)));      // ISO not recorded
+        REQUIRE(std::isnan(render::flareSceneEv100(-1.9, 0.01, 400.0)));
+        REQUIRE(std::isnan(render::flareSceneEv100(1.9, -0.01, 400.0)));
+        REQUIRE(std::isnan(render::flareSceneEv100(1.9, 0.01, -400.0)));
+        REQUIRE(std::isnan(render::flareSceneEv100(nan, 0.01, 400.0)));
+        REQUIRE(std::isnan(render::flareSceneEv100(1.9, nan, 400.0)));
+        REQUIRE(std::isnan(render::flareSceneEv100(1.9, 0.01, nan)));
+        REQUIRE(std::isnan(render::flareSceneEv100(inf, 0.01, 400.0)));
+        REQUIRE(std::isnan(render::flareSceneEv100(1.9, inf, 400.0)));
+        REQUIRE(std::isnan(render::flareSceneEv100(1.9, 0.01, inf)));
+        // Finite inputs whose quotient overflows are refused as well.
+        REQUIRE(std::isnan(render::flareSceneEv100(1e200, 1e-200, 1.0)));
+    }
+}
+
+TEST_CASE("the gate turns the sun search off only for a scene known to be too dark", "[flare]") {
+    const render::FlareParams fp;
+    REQUIRE_THAT(fp.minSceneEv100, WithinAbs(6.0, 1e-12));
+    // The night clip's whole range is below, every daylight clip above.
+    REQUIRE(render::flareSceneTooDark(2.07, fp));
+    REQUIRE(render::flareSceneTooDark(4.41, fp));
+    REQUIRE(render::flareSceneTooDark(5.999, fp));
+    REQUIRE_FALSE(render::flareSceneTooDark(6.0, fp));   // "below" the threshold, not at it
+    REQUIRE_FALSE(render::flareSceneTooDark(9.05, fp));  // the sun through an ND filter
+    REQUIRE_FALSE(render::flareSceneTooDark(11.66, fp)); // a sunset
+    // Unknown brightness never gates: the frame is treated exactly as before.
+    REQUIRE_FALSE(render::flareSceneTooDark(std::nan(""), fp));
+    REQUIRE_FALSE(render::flareSceneTooDark(-std::numeric_limits<double>::infinity(), fp));
+    // A NaN threshold switches the gate off.
+    render::FlareParams off;
+    off.minSceneEv100 = std::nan("");
+    REQUIRE_FALSE(render::flareSceneTooDark(2.0, off));
+}
+
+TEST_CASE("with the frame's exposure known, the sun detector also asks for daylight in the image", "[flare]") {
+    SECTION("median-referenced luminance: metered grey at 2^EV / 8 cd/m^2") {
+        REQUIRE_THAT(render::flareSceneLuminance(0.18, 3.0), WithinAbs(1.0, 1e-12));
+        REQUIRE_THAT(render::flareSceneLuminance(0.09, 3.0), WithinAbs(0.5, 1e-12));
+        REQUIRE_THAT(render::flareSceneLuminance(0.18, 9.05), WithinRel(66.27, 1e-3));
+        REQUIRE_THAT(render::flareSceneLuminance(0.0, 9.0), WithinAbs(0.0, 1e-12));
+        REQUIRE(std::isnan(render::flareSceneLuminance(-0.1, 9.0)));
+        REQUIRE(std::isnan(render::flareSceneLuminance(std::nan(""), 9.0)));
+        REQUIRE(std::isnan(render::flareSceneLuminance(0.18, std::nan(""))));
+        REQUIRE(std::isnan(render::flareSceneLuminance(0.18, std::numeric_limits<double>::infinity())));
+        REQUIRE(std::isnan(render::flareSceneLuminance(0.18, 5000.0)));  // overflows: not a number we trust
+    }
+
+    // The synthetic sky's median luma is ~0.11, so it reads (0.11 / 0.18) *
+    // 2^EV / 8: ~5.6 cd/m^2 at EV 6.2, ~12 at EV 8, ~40 at the sample's 9.05.
+    const render::FlareImage img = makeScene(SceneOptions{});
+    const auto withEv = [](double ev) {
+        render::FlareParams fp;
+        fp.sceneEv100 = ev;
+        return fp;
+    };
+
+    SECTION("unknown exposure: found exactly as before") {
+        const render::FlareParams plain;
+        REQUIRE(std::isnan(plain.sceneEv100));
+        const render::FlareSunFix a = render::locateSun(img, syntheticLens(), plain);
+        const render::FlareSunFix b = render::locateSun(img, syntheticLens(), withEv(std::nan("")));
+        REQUIRE(a.found);
+        REQUIRE(b.found);
+        REQUIRE(a.x == b.x);
+        REQUIRE(a.y == b.y);
+    }
+
+    SECTION("daylight on the image: the sun is found") {
+        REQUIRE(render::locateSun(img, syntheticLens(), withEv(8.0)).found);
+        REQUIRE(render::locateSun(img, syntheticLens(), withEv(9.05)).found);
+        auto res = render::analyseLensFlare(img, syntheticLens(), withEv(9.05));
+        REQUIRE(res.ok());
+        REQUIRE(res.value().sunFound);
+        REQUIRE_FALSE(res.value().ghosts.empty());
+    }
+
+    SECTION("an exposure set for daylight on a dim image (manual exposure): no sun, no ghosts") {
+        // EV 6.2 passes the EV gate, but the image's median says the scene
+        // gave ~5.6 cd/m^2, under the 8 a sunlit scene has.
+        REQUIRE_FALSE(render::flareSceneTooDark(6.2, render::FlareParams{}));
+        REQUIRE_FALSE(render::locateSun(img, syntheticLens(), withEv(6.2)).found);
+        auto res = render::analyseLensFlare(img, syntheticLens(), withEv(6.2));
+        REQUIRE(res.ok());
+        REQUIRE_FALSE(res.value().sunFound);
+        REQUIRE(res.value().ghosts.empty());
+        // With the luminance check switched off, the same frame finds it.
+        render::FlareParams off = withEv(6.2);
+        off.minSceneLuminance = std::nan("");
+        REQUIRE(render::locateSun(img, syntheticLens(), off).found);
+    }
+
+    SECTION("a scene metered too dark: the detector refuses it too") {
+        REQUIRE_FALSE(render::locateSun(img, syntheticLens(), withEv(3.3)).found);
+        auto res = render::analyseLensFlare(img, syntheticLens(), withEv(3.3));
+        REQUIRE(res.ok());
+        REQUIRE_FALSE(res.value().sunFound);
+        REQUIRE(res.value().ghosts.empty());
+    }
+}
+
+TEST_CASE("two lenses cannot see two different suns", "[flare]") {
+    auto rigRes = makeSampleRig(3000);
+    REQUIRE(rigRes.ok());
+    const geom::LensRig& rig = rigRes.value();
+    const render::FlareParams fp;
+
+    // A sun fix at the pixel where body direction `d` lands in lens `i`.
+    const auto sunAt = [&rig](int i, const Vec3d& d, double radiusPx) {
+        Vec2d px;
+        double theta = 0.0;
+        REQUIRE(rig.projectBody(i, d.normalized(), px, theta));
+        return render::FlareSunFix{true, px.x, px.y, radiusPx};
+    };
+    // Directions near each lens's own axis, half a sphere apart.
+    const Vec3d nearSlave = rig.opticalAxisBody(geom::kSlaveLens) + Vec3d{0.2, 0.0, 0.1};
+    const Vec3d nearMaster = rig.opticalAxisBody(geom::kMasterLens) + Vec3d{-0.1, 0.0, 0.2};
+
+    SECTION("a sun in one lens, or in none, passes untouched") {
+        render::FlareSunFixes one{};
+        one[1] = sunAt(geom::kMasterLens, nearMaster, 39.0);
+        const render::FlareSunFixes out = render::resolveOneSun(rig, one, fp);
+        REQUIRE(out[1].found);
+        REQUIRE_FALSE(out[0].found);
+        REQUIRE(out[1].x == one[1].x);
+        REQUIRE(out[1].y == one[1].y);
+        REQUIRE(out[1].radiusPx == one[1].radiusPx);
+        const render::FlareSunFixes none = render::resolveOneSun(rig, render::FlareSunFixes{}, fp);
+        REQUIRE_FALSE(none[0].found);
+        REQUIRE_FALSE(none[1].found);
+    }
+
+    SECTION("two alike blobs in two directions are lamps: neither is kept") {
+        render::FlareSunFixes two{};
+        two[0] = sunAt(geom::kSlaveLens, nearSlave, 20.0);
+        two[1] = sunAt(geom::kMasterLens, nearMaster, 24.0);
+        const render::FlareSunFixes out = render::resolveOneSun(rig, two, fp);
+        REQUIRE_FALSE(out[0].found);
+        REQUIRE_FALSE(out[1].found);
+        // Just under the 4x area margin (radius 1.95x) is still a tie.
+        two[1].radiusPx = 1.95 * two[0].radiusPx;
+        const render::FlareSunFixes tie = render::resolveOneSun(rig, two, fp);
+        REQUIRE_FALSE(tie[0].found);
+        REQUIRE_FALSE(tie[1].found);
+    }
+
+    SECTION("a clear winner by clipped area is the sun; the other lens saw a glint") {
+        render::FlareSunFixes two{};
+        two[0] = sunAt(geom::kSlaveLens, nearSlave, 5.0);     // a glint
+        two[1] = sunAt(geom::kMasterLens, nearMaster, 39.0);  // the sun, 60x the area
+        render::FlareSunFixes out = render::resolveOneSun(rig, two, fp);
+        REQUIRE_FALSE(out[0].found);
+        REQUIRE(out[1].found);
+        REQUIRE(out[1].x == two[1].x);
+        // Exactly 4x the area (2x the radius) is enough.
+        two[1].radiusPx = 2.0 * two[0].radiusPx;
+        out = render::resolveOneSun(rig, two, fp);
+        REQUIRE_FALSE(out[0].found);
+        REQUIRE(out[1].found);
+        // The other way round: the slave's sun stands.
+        two[0].radiusPx = 50.0;
+        two[1].radiusPx = 6.0;
+        out = render::resolveOneSun(rig, two, fp);
+        REQUIRE(out[0].found);
+        REQUIRE_FALSE(out[1].found);
+    }
+
+    SECTION("the same direction in both lenses is the sun in the overlap: both are kept") {
+        // A body direction 90 degrees from both axes: inside both lenses'
+        // 97.6-degree fields, in the middle of the overlap.
+        const Vec3d axis = rig.opticalAxisBody(geom::kMasterLens);
+        const Vec3d side = Vec3d{axis.y, -axis.x, 0.0}.normalized();
+        render::FlareSunFixes both{};
+        both[0] = sunAt(geom::kSlaveLens, side, 10.0);
+        both[1] = sunAt(geom::kMasterLens, side, 30.0);  // sizes need not agree in the overlap
+        render::FlareSunFixes out = render::resolveOneSun(rig, both, fp);
+        REQUIRE(out[0].found);
+        REQUIRE(out[1].found);
+        // 2 degrees apart (lens misalignment) still agrees ...
+        const double r2 = 2.0 * kPi / 180.0;
+        const Vec3d tilted = side * std::cos(r2) + Vec3d{0.0, 0.0, 1.0} * std::sin(r2);
+        both[1] = sunAt(geom::kMasterLens, tilted, 10.0);
+        out = render::resolveOneSun(rig, both, fp);
+        REQUIRE(out[0].found);
+        REQUIRE(out[1].found);
+        // ... 5 degrees apart does not for blobs this small (10 px at 6K,
+        // ~0.7 degrees each, so their discs reach 3 + 1.5 degrees), and alike
+        // blobs are then dropped.
+        const double r5 = 5.0 * kPi / 180.0;
+        const Vec3d far = side * std::cos(r5) + Vec3d{0.0, 0.0, 1.0} * std::sin(r5);
+        both[1] = sunAt(geom::kMasterLens, far, 10.0);
+        out = render::resolveOneSun(rig, both, fp);
+        REQUIRE_FALSE(out[0].found);
+        REQUIRE_FALSE(out[1].found);
+        // The same 5 degrees between two LARGE blobs (150 px, ~11 degrees
+        // each) is one source: their clipped discs overlap on the sky.
+        both[0].radiusPx = 150.0;
+        both[1].radiusPx = 150.0;
+        out = render::resolveOneSun(rig, both, fp);
+        REQUIRE(out[0].found);
+        REQUIRE(out[1].found);
+        // Large blobs whose discs are far from touching are still two
+        // sources: 40 degrees apart, alike, neither is kept.
+        const double r40 = 40.0 * kPi / 180.0;
+        const Vec3d away = side * std::cos(r40) + Vec3d{0.0, 0.0, 1.0} * std::sin(r40);
+        both[1] = sunAt(geom::kMasterLens, away, 150.0);
+        out = render::resolveOneSun(rig, both, fp);
+        REQUIRE_FALSE(out[0].found);
+        REQUIRE_FALSE(out[1].found);
+    }
+
+    SECTION("a sun on the seam, cut by both lenses' usable circles, is one sun through the real detector") {
+        // The clipped disc the sun leaves in the image (the bloom spreads
+        // in the image plane) is painted around where one body direction
+        // lands in each lens, and each lens's working image goes through
+        // locateSun at the check's resolution.  Each lens's usable-circle
+        // mask (97 % of the image circle, ~93.6 degrees) then cuts the disc
+        // on its own side, which pulls each centroid toward that lens's
+        // axis - what a seam crossing on a sunset clip does (centroids
+        // 5.7-5.9 degrees apart there).
+        const std::uint32_t factor = render::flareSunCheckFactor(3000);
+        const std::uint32_t side3000 = render::flareAnalysisSize(3000, factor);
+        const auto paint = [&](int lens, const Vec3d& d, double discPx) {
+            Vec2d c;
+            double theta = 0.0;
+            REQUIRE(rig.projectBody(lens, d.normalized(), c, theta));
+            render::FlareImage img;
+            img.factor = factor;
+            img.w = side3000;
+            img.h = side3000;
+            img.rgb.assign(static_cast<std::size_t>(img.w) * img.h * 3u, 0.5f);  // sky
+            for (std::uint32_t y = 0; y < img.h; ++y) {
+                for (std::uint32_t x = 0; x < img.w; ++x) {
+                    // The analysis pixel's centre in stream px.
+                    const double sx = (x + 0.5) * factor;
+                    const double sy = (y + 0.5) * factor;
+                    if (std::hypot(sx - c.x, sy - c.y) <= discPx) {
+                        float* p = &img.rgb[(static_cast<std::size_t>(y) * img.w + x) * 3u];
+                        p[0] = p[1] = p[2] = 4.0f;  // clipped
+                    }
+                }
+            }
+            return img;
+        };
+        // The body direction a lens's fix points at.
+        const auto bodyDir = [&rig](int lens, const render::FlareSunFix& s) {
+            const Result<Vec3d> ray = rig.lens[static_cast<std::size_t>(lens)].unproject(Vec2d{s.x, s.y});
+            REQUIRE(ray.ok());
+            return (rig.bodyToLens[static_cast<std::size_t>(lens)].transposed() * ray.value()).normalized();
+        };
+
+        const Vec3d axis = rig.opticalAxisBody(geom::kMasterLens);
+        const Vec3d mid = Vec3d{axis.y, -axis.x, 0.0}.normalized();
+        // In the middle of the overlap, and 1.5 degrees toward the master.
+        const double r15 = 1.5 * kPi / 180.0;
+        for (const Vec3d& sun : {mid, mid * std::cos(r15) + axis * std::sin(r15)}) {
+            render::FlareSunFixes fixes{};
+            for (int i = 0; i < 2; ++i) {
+                fixes[static_cast<std::size_t>(i)] = render::locateSun(paint(i, sun, 150.0), rig.lens[i], fp);
+            }
+            REQUIRE(fixes[0].found);
+            REQUIRE(fixes[1].found);
+            // The cut really biases the centroids beyond the lens alignment
+            // tolerance - a bare-angle rule would call these two suns.
+            const double apartDeg = bodyDir(0, fixes[0]).angleTo(bodyDir(1, fixes[1])) * 180.0 / kPi;
+            INFO("centroids " << apartDeg << " degrees apart; radii " << fixes[0].radiusPx << " and "
+                              << fixes[1].radiusPx << " px");
+            REQUIRE(apartDeg > fp.oneSunToleranceDeg);
+            // Their areas are alike, so no winner by area could save them.
+            const double ratio = (fixes[0].radiusPx * fixes[0].radiusPx) / (fixes[1].radiusPx * fixes[1].radiusPx);
+            REQUIRE(std::max(ratio, 1.0 / ratio) < fp.oneSunAreaRatio);
+            const render::FlareSunFixes out = render::resolveOneSun(rig, fixes, fp);
+            REQUIRE(out[0].found);
+            REQUIRE(out[1].found);
+        }
+    }
+
+    SECTION("a resolved check matches a later one without the glint: the model is reused") {
+        render::FlareSunFixes withGlint{};
+        withGlint[0] = sunAt(geom::kSlaveLens, nearSlave, 4.0);
+        withGlint[1] = sunAt(geom::kMasterLens, nearMaster, 39.0);
+        render::FlareSunFixes clean{};
+        clean[1] = withGlint[1];
+        // Raw, the glint makes the two checks of the same sun differ ...
+        REQUIRE_FALSE(render::flareSunsMatch(withGlint, clean, 3.0));
+        // ... held to one sun, they are the same.
+        REQUIRE(render::flareSunsMatch(render::resolveOneSun(rig, withGlint, fp), clean, 3.0));
+    }
+
+    SECTION("doubt removes nothing: unusable positions or tuning") {
+        render::FlareSunFixes both{};
+        const Vec3d axis = rig.opticalAxisBody(geom::kMasterLens);
+        const Vec3d side = Vec3d{axis.y, -axis.x, 0.0}.normalized();
+        both[0] = sunAt(geom::kSlaveLens, side, 10.0);
+        both[1] = sunAt(geom::kMasterLens, side, 10.0);
+        // A position that cannot be unprojected cannot confirm one sun; with
+        // alike areas neither is kept.
+        render::FlareSunFixes bad = both;
+        bad[1].x = std::nan("");
+        render::FlareSunFixes out = render::resolveOneSun(rig, bad, fp);
+        REQUIRE_FALSE(out[0].found);
+        REQUIRE_FALSE(out[1].found);
+        // A blob that cannot be sized has no disc to touch the other's: even
+        // at the same direction it cannot confirm one sun.
+        for (const double r : {std::nan(""), -10.0, std::numeric_limits<double>::infinity()}) {
+            bad = both;
+            bad[0].radiusPx = r;
+            out = render::resolveOneSun(rig, bad, fp);
+            REQUIRE_FALSE(out[0].found);
+            REQUIRE_FALSE(out[1].found);
+        }
+        // A rig without lenses: the same.
+        out = render::resolveOneSun(geom::LensRig{}, both, fp);
+        REQUIRE_FALSE(out[0].found);
+        REQUIRE_FALSE(out[1].found);
+        // Broken tuning drops both, even for an agreeing pair.
+        for (const auto& tweak : {std::pair{std::nan(""), 4.0}, std::pair{-1.0, 4.0}, std::pair{3.0, std::nan("")},
+                                  std::pair{3.0, 0.5}}) {
+            render::FlareParams broken;
+            broken.oneSunToleranceDeg = tweak.first;
+            broken.oneSunAreaRatio = tweak.second;
+            out = render::resolveOneSun(rig, both, broken);
+            REQUIRE_FALSE(out[0].found);
+            REQUIRE_FALSE(out[1].found);
+        }
+        // A NaN radius cannot win on area.
+        bad = both;
+        bad[1] = sunAt(geom::kMasterLens, nearMaster, std::nan(""));
+        out = render::resolveOneSun(rig, bad, fp);
+        REQUIRE_FALSE(out[0].found);
+        REQUIRE_FALSE(out[1].found);
     }
 }
 

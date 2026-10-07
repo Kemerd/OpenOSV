@@ -205,6 +205,11 @@ endif()
 #  (its request identity and answer cache, on files no decoder opens).
 #  CPU-only: AAC decoding is plain FFmpeg, nothing here opens NVDEC, CUDA or
 #  D3D11VA.
+#
+#  [WP-FLARE] It also holds the tests of the engine's SDK-free sun ghost stage
+#  (plugins/importer/FlareStage.cpp, test_flare_stage.cpp), driven directly
+#  with host-decoded frames of the sample clip: the scene-brightness gate is a
+#  decision on a clip's metadata that no host-loaded test can feed it.
 # -----------------------------------------------------------------------------
 if(TARGET osvtool)
   set(_osv_cli_importer "${CMAKE_SOURCE_DIR}/plugins/importer")
@@ -218,8 +223,10 @@ if(TARGET osvtool)
     cli/TestMain.cpp
     cli/test_vegas_cli.cpp
     cli/test_scene_light_stage.cpp   # the importer's Scene Light stage: request identity, answer cache
+    cli/test_flare_stage.cpp  # [WP-FLARE] the scene-brightness gate and the stage's answers
     "${_osv_cli_importer}/ImporterAudio.cpp"
     "${_osv_cli_importer}/SceneLightStage.cpp"
+    "${_osv_cli_importer}/FlareStage.cpp"
     "${_osv_cli_log}")
   target_include_directories(osv_cli_tests PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"

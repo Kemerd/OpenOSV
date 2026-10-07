@@ -76,6 +76,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -211,6 +212,47 @@ struct FlareParams {
     double sunMinFill = 0.5;             ///< Blob area / bounding-box area lower limit.
     double sunMinAreaPx = 3.0;           ///< Minimum blob area (analysis px).
 
+    // ---- can the sun be in view at all? -------------------------------------
+    /// Scene exposure value (EV100, see flareSceneEv100) below which a frame
+    /// is too dark for the sun to be in view, so nothing is looked for in it.
+    /// Every relative test above crowns a street lamp at night (a clipped
+    /// lamp decodes to the same level as the clipped sun, and the night median
+    /// is tiny); how much light the camera needed to expose the frame cannot
+    /// be fooled that way.  Measured: a night street 2.1 - 4.4, the sample's
+    /// sun through an ND filter 9.05, a bare sunset 11.1 - 11.7.  6 keeps 1.6
+    /// stops of margin over the night and 3 under the filtered sun.  NaN
+    /// switches the gate off.
+    double minSceneEv100 = 6.0;
+    /// Lowest median-referenced scene luminance (cd/m^2, see
+    /// flareSceneLuminance) a frame with the sun in view can have.  The
+    /// EV100 alone reflects the camera's SETTINGS, which with locked or
+    /// manual exposure need not follow the scene; the image's own median
+    /// placed on that exposure does.  Measured: a night street 0.1 - 2.1,
+    /// the sample's sun through an ND filter 59 - 68, a sunset 310 - 1200.
+    /// Applies only while sceneEv100 is known; NaN switches it off.
+    double minSceneLuminance = 8.0;
+    /// The analysed frame's own EV100 (flareSceneEv100) when the caller
+    /// knows it, NaN otherwise.  Per frame, not tuning: with it, the sun
+    /// detector itself refuses a frame flareSceneTooDark() calls dark or
+    /// whose median-referenced luminance is under minSceneLuminance - so the
+    /// per-frame sun check and the full analysis judge a frame alike.
+    double sceneEv100 = std::numeric_limits<double>::quiet_NaN();
+
+    // ---- one sun ------------------------------------------------------------
+    /// Two lenses that each report a sun must agree on its direction (body
+    /// frame) within this angle PLUS the two blobs' own angular radii - their
+    /// clipped discs must touch on the sky - for both to be believed.  The
+    /// discs carry the bias of a sun in the overlap: each lens's usable
+    /// circle cuts the disc on its own side and pulls its centroid toward
+    /// its own axis (5.7-5.9 degrees apart on a sunset clip's seam
+    /// crossings, discs of 7.9-10.2 degrees).  This angle covers the lens
+    /// alignment, which disagrees by about 1 degree RMS; 3 covers it.
+    double oneSunToleranceDeg = 3.0;
+    /// When they disagree, the larger blob is still the sun if its clipped
+    /// area is at least this multiple of the other's (a sunset sun against
+    /// a glint measured 275x median); otherwise neither is trusted.
+    double oneSunAreaRatio = 4.0;
+
     // ---- candidates ---------------------------------------------------------
     double corridorDeg = 20.0;           ///< Azimuth tolerance about the sun line (both directions).
     double backgroundSigmaPx = 12.0;     ///< Background blur for the relative band-pass (analysis px).
@@ -257,6 +299,8 @@ struct FlareParams {
 
 /// Downsample and analyse both lenses of a frame pair.  Host frames use the
 /// CPU sampler; device-only frames need an installed FlareDeviceSampler.
+/// The two lenses' suns are then held to one sun (resolveOneSun): a lens
+/// whose sun the rule drops is returned empty (no sun, no ghosts).
 [[nodiscard]] Result<FlareModel> analyseFlare(const geom::LensRig& rig, const video::FramePair& frames,
                                               const OsvColorParams& color, const FlareParams& params,
                                               ThreadPool& pool);
@@ -308,16 +352,81 @@ using FlareSunFixes = std::array<FlareSunFix, 2>;
                                     const FlareParams& params) noexcept;
 
 /// The sun check of a frame pair: both lenses at flareSunCheckFactor, host
-/// or device frames (see flareDownsampleLens).
+/// or device frames (see flareDownsampleLens), reduced to one sun by
+/// resolveOneSun.
 [[nodiscard]] Result<FlareSunFixes> locateSuns(const geom::LensRig& rig, const video::FramePair& frames,
                                                const OsvColorParams& color, const FlareParams& params,
                                                ThreadPool& pool);
 
+/// There is one sun: reduce two lenses' independent sun checks to what can
+/// be the same light source.
+///
+/// Each found sun is turned into a body-frame direction (the lens's
+/// unprojection, rotated back through bodyToLens).  When both lenses report
+/// one:
+///   * when their clipped discs touch - the directions lie within
+///     params.oneSunToleranceDeg plus both blobs' angular radii (radiusPx
+///     at the lens's radial scale where each sits) - both are kept: the sun
+///     sits in the overlap and each lens sees the part its usable circle
+///     leaves it;
+///   * farther apart, the one whose clipped area (radiusPx squared) is at
+///     least params.oneSunAreaRatio times the other's is kept and the other
+///     dropped (a glint in the far lens);
+///   * otherwise both are dropped: two similar bright blobs in two
+///     directions are lamps, signs or reflections, not the sun.
+/// A single sun, or none, passes unchanged.  A sun whose direction or size
+/// cannot be computed (bad lens, bad position or radius) counts as
+/// disagreeing; invalid
+/// parameters drop both - every doubt removes nothing.  Pure, no allocation.
+[[nodiscard]] FlareSunFixes resolveOneSun(const geom::LensRig& rig, const FlareSunFixes& fixes,
+                                          const FlareParams& params) noexcept;
+
 /// True when two sun checks describe the same sun: present in the same
 /// lenses, and each within `tolerancePx` of the other.  Both sides must come
 /// from the same kind of check (the importer compares sun checks with sun
-/// checks, never with a model's own full-resolution sun).
+/// checks, never with a model's own full-resolution sun), and both must
+/// already be resolved to one sun (locateSuns does that), so a glint the
+/// rule dropped never makes two checks of the same sun differ.
 [[nodiscard]] bool flareSunsMatch(const FlareSunFixes& a, const FlareSunFixes& b, double tolerancePx) noexcept;
+
+// ===========================================================================
+//  The scene-brightness gate
+// ===========================================================================
+//
+// The sun in view means a daylit scene, and the camera's own exposure says
+// how bright the scene is: the light it needed for this frame.  That is an
+// absolute measure where every image test is relative, so it tells a night
+// street's clipped lamps from the clipped sun, which no ratio to the frame's
+// median can (the clip level is the same for both).
+
+/// Scene exposure value at ISO 100 from the camera's settings for one frame:
+///
+///     EV100 = log2(N^2 / t) - log2(ISO / 100)
+///
+/// with `fNumber` N, `exposureSeconds` t and the sensor `iso`.  NaN when any
+/// input is not a finite positive number (unknown: callers then behave as if
+/// there were no gate).  Through an ND filter the value reads darker than
+/// the scene, never brighter.
+[[nodiscard]] double flareSceneEv100(double fNumber, double exposureSeconds, double iso) noexcept;
+
+/// True when `sceneEv100` is known (finite) and below params.minSceneEv100:
+/// the frame is too dark for the sun to be in view.  An unknown value or a
+/// NaN threshold never gates.
+[[nodiscard]] bool flareSceneTooDark(double sceneEv100, const FlareParams& params) noexcept;
+
+/// Median-referenced scene luminance (cd/m^2) of a frame exposed for
+/// `sceneEv100` whose working image has the scene-linear median luma
+/// `medianLinear`:
+///
+///     L = (median / 0.18) * 2^EV100 / 8
+///
+/// A reflected-light meter (calibration constant K = 12.5) sets EV100 for
+/// a mid grey of 2^EV100 / 8 cd/m^2, and the camera renders that grey at
+/// 0.18 scene-linear, so the median stands for median / 0.18 times it.
+/// Where the EV100 only says what the exposure was SET to (locked or manual
+/// exposure), the median says what the scene then gave.  NaN for a
+/// non-finite or negative median or a non-finite EV100.
+[[nodiscard]] double flareSceneLuminance(double medianLinear, double sceneEv100) noexcept;
 
 // ===========================================================================
 //  Veil (OFF by default - read before enabling)

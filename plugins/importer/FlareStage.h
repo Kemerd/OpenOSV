@@ -36,6 +36,28 @@
 //     before it (the direct path relies on that).  render::smoothFlare stays
 //     available for a caller that can afford the dependence.
 //
+// WHEN IT DOES NOT LOOK AT ALL
+// ----------------------------
+//   * A scene the camera metered too dark for the sun to be in view
+//     (render::flareSceneTooDark on the frame's EV100, sceneEv100()) is
+//     answered before the sun check: at night every street lamp passes the
+//     image tests for "the sun", and fitting ghosts around lamps removed
+//     reflections, lane markings and headlights on ~3 % of a night drive's
+//     frames, one frame at a time.  The answer depends only on the frame's
+//     own metadata, so it is as final as any other.
+//   * The sun check is held to one sun (render::resolveOneSun), and only a
+//     lens the check found that sun in is analysed: a lens whose check found
+//     none, or whose blob the rule dropped, gets no working image and no
+//     fits.  This is deliberately wider than dropping the rule's rejects.
+//     Before the rule the other lens was analysed at the finer factor
+//     whenever either lens had a sun, and there detectSun could crown a blob
+//     the check never saw - a glint, or a sliver of a sun mostly outside the
+//     usable circle - and fit ghosts around it with nothing holding it to
+//     the one sun.  The check is now the one judge of where the sun is, as
+//     it already is for model reuse (flareSunsMatch).  For the same reason
+//     the finer suns of two analysed lenses are not held to one sun again:
+//     both lenses are analysed only when their checks already agree on it.
+//
 // COST ON THE RENDER THREAD
 // -------------------------
 // Every wanted frame pays the sun check once (both lenses at ~375 px:
@@ -57,6 +79,7 @@
 #include "osv/core/ThreadPool.h"
 #include "osv/geom/KannalaBrandt5.h"
 #include "osv/geom/LensRig.h"
+#include "osv/meta/MetadataTrack.h"
 #include "osv/render/Flare.h"
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamCarve.h"
@@ -101,13 +124,23 @@ public:
     /// `exactWanted` the request's purpose.  `color` is the clip's block:
     /// the analysis reads only its input decode (it works in native linear
     /// light), and a passthrough output (D-Log M) switches the removal off,
-    /// because the kernel blends that output in log code.  `clip`
-    /// names the file in the log.  The caller holds the instance lock.
-    /// Never fails a frame: every problem is logged and leaves the frame
-    /// without removal.
+    /// because the kernel blends that output in log code.  `sceneEv100` is
+    /// the frame's metered scene brightness (sceneEv100()): below
+    /// FlareParams::minSceneEv100 the frame is answered with nothing to
+    /// remove before any image is looked at; NaN (not recorded) keeps the
+    /// full check.  `clip` names the file in the log.  The caller holds the
+    /// instance lock.  Never fails a frame: every problem is logged and
+    /// leaves the frame without removal.
     Outcome apply(std::uint32_t index, const video::FramePair& pair, const geom::LensRig& rig,
-                  const OsvColorParams& color, bool enabled, bool draft, bool exactWanted, ThreadPool& pool,
-                  render::RenderParamsBuilder& builder, const std::string& clip) noexcept;
+                  const OsvColorParams& color, double sceneEv100, bool enabled, bool draft, bool exactWanted,
+                  ThreadPool& pool, render::RenderParamsBuilder& builder, const std::string& clip) noexcept;
+
+    /// Scene exposure value (render::flareSceneEv100) of frame `index` of a
+    /// clip, from what the camera recorded: the frame's ISO and shutter and
+    /// the clip's aperture.  NaN when any of them is missing or unusable, or
+    /// the frame's metadata cannot be read.  Reads one cached metadata
+    /// sample: cheap enough for every frame.
+    [[nodiscard]] static double sceneEv100(const meta::MetadataTrack& track, std::uint32_t index) noexcept;
 
     /// The hook for WP-SEAM's carve (SeamCarveParams::penalty): it makes
     /// the lens showing the model applied by the latest apply() expensive
@@ -170,13 +203,22 @@ private:
     /// The caller holds m_mutex.
     void assignLocked(std::uint32_t bucket, std::uint32_t frame, const EntryPtr& entry);
 
-    /// Analyse both working images (serially when `pool` is null).
+    /// Analyse the working images of the lenses the sun check `suns` (already
+    /// held to one sun) has the sun in, serially when `pool` is null.  A lens
+    /// without it is left empty and its image is not read (it may be empty):
+    /// a lamp or a glint there is not the sun, and ghosts fitted around it
+    /// would cut real scene.
     [[nodiscard]] static Result<render::FlareModel> analyse(const std::array<render::FlareImage, 2>& images,
                                                             const std::array<geom::KannalaBrandt5, 2>& lenses,
+                                                            const render::FlareSunFixes& suns,
                                                             const render::FlareParams& params, ThreadPool* pool);
 
-    /// Log the first measured model of the clip (once per reset).
-    void logModelOnce(const std::string& clip, std::uint32_t frame, const render::FlareModel& model) noexcept;
+    /// Log the first measured model of the clip (once per reset), with the
+    /// scene brightness the frame was judged by (`sceneEv100`, NaN when not
+    /// recorded) - the one place the log shows that the importer handed the
+    /// stage the frame's metered exposure.
+    void logModelOnce(const std::string& clip, std::uint32_t frame, const render::FlareModel& model,
+                      double sceneEv100) noexcept;
 
     /// Log why a frame has no removal (once per reason per reset).
     void logReasonOnce(int reason, const std::string& text) noexcept;
@@ -195,7 +237,7 @@ private:
     std::uint64_t m_generation = 0;
     std::map<std::uint32_t, Bucket> m_models;
     bool m_loggedModel = false;
-    std::array<bool, 5> m_loggedReason{};
+    std::array<bool, 6> m_loggedReason{};  ///< One per Reason (FlareStage.cpp).
 
     /// Latest model for WP-SEAM's carve (thread-safe on its own).
     render::FlareSeamPenalty m_penalty;

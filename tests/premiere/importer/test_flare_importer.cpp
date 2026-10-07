@@ -15,7 +15,10 @@
 //     cannot treat - the frame is bit-identical to a render without it;
 //   * an interactive request never waits for the analysis: the first one
 //     comes back uncorrected, bit for bit, and later ones receive the
-//     background result.
+//     background result;
+//   * the importer hands the stage each frame's metered exposure (the
+//     scene-brightness gate's input): the stage's model line in the plug-in
+//     log carries the EV100 of the clip's own ISO, shutter and aperture.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -42,7 +45,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <format>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <thread>
@@ -241,6 +249,75 @@ struct Reference {
     return false;
 }
 
+/// Raise the plug-in log to INFO for the lifetime of the object, so the
+/// stage's model line is written (TestMain keeps it at ERROR).  Must exist
+/// BEFORE the harness: the module reads the level once, when it initialises
+/// its log, and the harness loads a fresh module.
+class InfoLogLevel {
+public:
+    InfoLogLevel() {
+        char* old = nullptr;
+        std::size_t length = 0;
+        if (::_dupenv_s(&old, &length, "OSV_PLUGIN_LOG_LEVEL") == 0 && old) {
+            m_previous = old;
+            m_hadPrevious = true;
+        }
+        std::free(old);
+        ::_putenv_s("OSV_PLUGIN_LOG_LEVEL", "info");
+    }
+    ~InfoLogLevel() { ::_putenv_s("OSV_PLUGIN_LOG_LEVEL", m_hadPrevious ? m_previous.c_str() : ""); }
+    InfoLogLevel(const InfoLogLevel&) = delete;
+    InfoLogLevel& operator=(const InfoLogLevel&) = delete;
+
+private:
+    std::string m_previous;
+    bool m_hadPrevious = false;
+};
+
+/// The importer's log for this process (LOCALAPPDATA is the isolated one,
+/// TestMain); empty when there is none yet.  The plug-in flushes every line.
+[[nodiscard]] std::string importerLog() {
+    wchar_t buffer[32768] = {};
+    const DWORD n = ::GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, static_cast<DWORD>(std::size(buffer)));
+    if (n == 0 || n >= std::size(buffer)) {
+        return {};
+    }
+    std::ifstream in(std::filesystem::path(std::wstring(buffer, n)) / L"OpenOSV" / L"OpenOSVImporter.log",
+                     std::ios::binary);
+    return in ? std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()) : std::string();
+}
+
+/// Occurrences of `needle` in `hay`.
+[[nodiscard]] std::size_t countOf(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (std::size_t pos = hay.find(needle); !needle.empty() && pos != std::string::npos;
+         pos = hay.find(needle, pos + needle.size())) {
+        ++n;
+    }
+    return n;
+}
+
+/// The sample's frame `index` EV100, from the raw metadata through the
+/// library's formula: what the importer must hand the stage.
+[[nodiscard]] double sampleSceneEv100(std::uint32_t index) {
+    auto file = osv::OsvFile::open(sampleClipPath());
+    REQUIRE(file.ok());
+    auto track = osv::meta::MetadataTrack::load(file.value());
+    REQUIRE(track.ok());
+    const std::vector<std::uint32_t>& fn = track.value().clip().fNumber;
+    REQUIRE(fn.size() >= 2);
+    REQUIRE(fn[1] != 0u);
+    auto frame = track.value().frame(index);
+    REQUIRE(frame.ok());
+    const osv::meta::CameraFrame& camera = frame.value().camera;
+    REQUIRE(camera.exposureTime.size() >= 2);
+    REQUIRE(camera.exposureTime[1] != 0);
+    return osv::render::flareSceneEv100(static_cast<double>(fn[0]) / static_cast<double>(fn[1]),
+                                        static_cast<double>(camera.exposureTime[0]) /
+                                            static_cast<double>(camera.exposureTime[1]),
+                                        static_cast<double>(camera.iso));
+}
+
 }  // namespace
 
 // =============================================================================
@@ -406,6 +483,53 @@ TEST_CASE("an interactive request never waits for the ghost analysis, and later 
     harness.host().clearCache();
     const Frame exported = render(harness, clip, ppix, 1, imRenderIntent_Export, on);
     REQUIRE(changedPixels(off1, exported) > 500);
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
+// =============================================================================
+//  The scene-brightness gate's input
+// =============================================================================
+
+TEST_CASE("the importer hands the ghost stage the frame's metered exposure", "[importer][video][flare][sample]") {
+    // The gate that keeps night footage untouched (FlareStage::apply) works
+    // only on what ImporterInstance hands it; were that NaN ("not recorded")
+    // every stage test would still pass and street lamps would be crowned
+    // as suns again.  The stage's once-per-clip model line names the
+    // brightness the frame was judged by, so the export below must log the
+    // sample's own EV100 (9.05, sun through an ND filter: above the gate).
+    REQUIRE_SAMPLE_CLIP();
+    const double expected = sampleSceneEv100(0);
+    REQUIRE(std::isfinite(expected));
+    REQUIRE(expected > osv::render::FlareParams{}.minSceneEv100);
+
+    InfoLogLevel info;  // before the harness: the module reads it once
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+
+    // ---- one export with the removal on measures, and logs, the model -------
+    const std::string lineStart = "flare: '" + sampleClipPath().filename().string() + "' frame 0: ";
+    const std::size_t before = countOf(importerLog(), lineStart);
+    const Frame on = render(harness, clip, ppix, 0, imRenderIntent_Export, flareOnlyPrefs(true));
+    REQUIRE(on.width == kWidth);
+    const std::string log = importerLog();
+    REQUIRE(countOf(log, lineStart) == before + 1u);
+
+    // ---- that line carries the clip's own EV100, not "not recorded" ---------
+    const std::size_t at = log.rfind(lineStart);
+    REQUIRE(at != std::string::npos);
+    const std::size_t end = log.find('\n', at);
+    const std::string line = log.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    INFO(line);
+    REQUIRE(line.find(std::format("scene metered at EV100 {:.1f}", expected)) != std::string::npos);
+    REQUIRE(line.find("not recorded") == std::string::npos);
+    // The sun is still found at that brightness.
+    REQUIRE(line.find("master lens: sun") != std::string::npos);
 
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }

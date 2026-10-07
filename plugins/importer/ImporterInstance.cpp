@@ -2036,8 +2036,15 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
 
     // ---- [WP-FLARE] sun ghost removal (FlareStage.h) --------------------------
     // Before the carve, which reads this frame's model through the penalty.
-    const FlareStage::Outcome flare = m_flare.apply(index, pair, m_rig, m_color, m_prefs.flareRemoval != 0, draft,
-                                                    exactWanted, pool, builder, m_path.filename().string());
+    // The frame's metered scene brightness (ISO, shutter, aperture) tells the
+    // stage when the sun cannot be in view; read only when the stage will
+    // look (NaN, "not recorded", otherwise).
+    const bool flareWanted = m_prefs.flareRemoval != 0 && !draft;
+    const double sceneEv100 =
+        flareWanted ? FlareStage::sceneEv100(m_track, index) : std::numeric_limits<double>::quiet_NaN();
+    const FlareStage::Outcome flare = m_flare.apply(index, pair, m_rig, m_color, sceneEv100,
+                                                    m_prefs.flareRemoval != 0, draft, exactWanted, pool, builder,
+                                                    m_path.filename().string());
     frameExact = frameExact && flare.exact;
 
     // ---- [WP-SEAM] carved blend seam ---------------------------------------
