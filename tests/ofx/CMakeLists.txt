@@ -107,6 +107,16 @@ if(WIN32 AND OSV_ENABLE_CUDA)
   target_link_options(osv_ofx_tests PRIVATE "/DELAYLOAD:nvcuda.dll")
   target_link_libraries(osv_ofx_tests PRIVATE delayimp)
 endif()
+if(WIN32)
+  # [VFR] The [vfr-sample] case reads its clip with the library itself, whose
+  # container and logging code import fmt and spdlog.  Delay-loaded, so a
+  # process that never calls into them - every other case, and every ctest
+  # process - never loads them from bin/: the [bundle] case checks that the
+  # MODULE resolves its own copies from Contents/Libraries/Win64, which an
+  # already-loaded bin/fmt.dll would answer for it.
+  target_link_options(osv_ofx_tests PRIVATE "/DELAYLOAD:fmt.dll" "/DELAYLOAD:spdlog.dll")
+  target_link_libraries(osv_ofx_tests PRIVATE delayimp)
+endif()
 if(NOT WIN32)
   target_link_libraries(osv_ofx_tests PRIVATE ${CMAKE_DL_LIBS})  # dlopen
 endif()

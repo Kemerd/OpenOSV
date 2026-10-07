@@ -483,6 +483,56 @@ std::uint64_t SampleTable::sampleDuration(std::uint32_t index) const noexcept {
     return it->delta;
 }
 
+std::uint32_t SampleTable::sampleAtOrBeforeDts(std::uint64_t dts) const noexcept {
+    // An empty table, or one without timing, has only one honest answer.
+    if (m_count == 0 || m_timeRuns.empty()) {
+        return 0;
+    }
+    // The last run that starts at or before `dts`.  Run start times never
+    // decrease (zero-duration runs repeat a start time, which upper_bound
+    // handles by landing after all of them).
+    auto it = std::upper_bound(m_timeRuns.begin(), m_timeRuns.end(), dts,
+                               [](std::uint64_t value, const TimeRun& run) { return value < run.startTime; });
+    if (it == m_timeRuns.begin()) {
+        return 0;
+    }
+    --it;
+    // Inside the run: whole deltas since its start.  A zero delta cannot
+    // separate its samples, so the run's first sample answers.
+    std::uint64_t within = it->delta > 0 ? (dts - it->startTime) / it->delta : 0;
+    // Only the LAST run extrapolates past its own count (as sampleDts does
+    // for samples stts does not cover); any other run ends where the next
+    // begins, so this clamp only guards against an inconsistent table.
+    const bool lastRun = (it + 1) == m_timeRuns.end();
+    if (!lastRun && it->count > 0 && within >= it->count) {
+        within = it->count - 1u;
+    }
+    const std::uint64_t index = static_cast<std::uint64_t>(it->firstSample) + within;
+    // Clamp to the samples that can actually be located.
+    return index >= m_count ? m_count - 1u : static_cast<std::uint32_t>(index);
+}
+
+bool SampleTable::dtsStrictlyIncreasing() const noexcept {
+    // Zero or one sample: nothing to order.
+    if (m_count <= 1) {
+        return true;
+    }
+    // No stts at all: every sample sits at time 0.
+    if (m_timeRuns.empty()) {
+        return false;
+    }
+    // A zero-duration run puts the sample after its first one at the same
+    // time - unless that first sample is the final locatable one.  Samples
+    // past the table are extrapolated with the last run's delta, so a final
+    // zero run that still has successors fails here too.
+    for (const TimeRun& run : m_timeRuns) {
+        if (run.delta == 0 && static_cast<std::uint64_t>(run.firstSample) + 1u < m_count) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::int64_t SampleTable::compositionOffset(std::uint32_t index) const noexcept {
     if (m_compositionRuns.empty()) {
         return 0;

@@ -17,6 +17,11 @@
 
 #include "ReframeCpu.h"
 
+#include "osv/container/OsvFile.h"
+#include "osv/meta/FormatDetector.h"
+#include "osv/meta/MetadataTrack.h"
+#include "osv/video/ClipTimeline.h"
+
 #include <catch2/catch_test_macros.hpp>
 
 #if defined(OSV_OFX_TEST_HAVE_CUDA)
@@ -399,3 +404,63 @@ TEST_CASE("a generator render leaves the host's CUDA context current", "[ofx][so
     cuCtxDestroy(hostContext);
 }
 #endif  // OSV_OFX_TEST_HAVE_CUDA
+
+// =============================================================================
+//  [VFR] A clip whose camera dropped frames (OSV_VFR_SAMPLE)
+// =============================================================================
+
+TEST_CASE("a clip that dropped frames plays on its nominal-rate timeline, gaps held", "[ofx][source][vfr-sample]") {
+    REQUIRE(Fixture::get().ready);
+    const char* env = std::getenv("OSV_VFR_SAMPLE");
+    if (env == nullptr || !std::filesystem::exists(env)) {
+        SKIP("OSV_VFR_SAMPLE does not name a variable-frame-rate clip");
+    }
+    const std::string clip = env;
+
+    // ---- the timeline, built by the library from the file -------------------------
+    auto file = osv::OsvFile::open(clip);
+    REQUIRE(file.ok());
+    auto meta = osv::meta::MetadataTrack::load(file.value());
+    REQUIRE(meta.ok());
+    auto format = osv::meta::FormatDetector::detect(file.value(), &meta.value());
+    REQUIRE(format.ok());
+    const osv::TrackInfo* video = file.value().track(format.value().videoTrackIds[0]);
+    REQUIRE(video != nullptr);
+    const osv::video::ClipTimeline timeline = osv::video::clipTimelineFor(*video, &meta.value());
+    REQUIRE_FALSE(timeline.identity());
+    // The first held frame that is followed by a new picture.
+    std::uint32_t held = 0;
+    for (std::uint32_t k = 1; k + 1u < timeline.frameCount() && held == 0; ++k) {
+        const std::uint32_t s = timeline.sampleFor(k);
+        if (s == timeline.sampleFor(k - 1u) && timeline.sampleFor(k + 1u) != s) {
+            held = k;
+        }
+    }
+    REQUIRE(held > 0);
+
+    // ---- the Clip read-out names that timeline ----------------------------------------
+    SourceRig rig(512, 256, timeline.fps());
+    rig.param(src::kFile).s = clip;
+    rig.param(src::kOutput).i = src::kOutputEquirect;
+    REQUIRE(Fixture::get().source.instanceChanged(*rig.effect, src::kFile, kOfxChangeUserEdited, 0.0) == kOfxStatOK);
+    const std::string info = rig.param(src::kClipInfo).s;
+    INFO(info);
+    CHECK(info.find(std::to_string(timeline.frameCount()) + " frames at ") != std::string::npos);
+
+    // ---- a held frame repeats the picture before it; the next one moves on ------------
+    // The host runs at the clip's nominal rate, so time k is timeline frame k.
+    REQUIRE(rig.render(static_cast<double>(held - 1u)) == kOfxStatOK);
+    const HostImage before = rig.output;
+    REQUIRE(rig.render(static_cast<double>(held)) == kOfxStatOK);
+    const HostImage atHeld = rig.output;
+    REQUIRE(rig.render(static_cast<double>(held + 1u)) == kOfxStatOK);
+    INFO("held timeline frame " << held << " (sample " << timeline.sampleFor(held) << ")");
+    CHECK(maxDifference(before, atHeld, rig.frame) == 0.0);
+    CHECK(maxDifference(atHeld, rig.output, rig.frame) > 0.0);
+
+    // ---- the last timeline frame shows a picture, the one after it nothing ------------
+    REQUIRE(rig.render(static_cast<double>(timeline.frameCount() - 1u)) == kOfxStatOK);
+    CHECK_FALSE(rig.allTransparent());
+    REQUIRE(rig.render(static_cast<double>(timeline.frameCount())) == kOfxStatOK);
+    CHECK(rig.allTransparent());
+}

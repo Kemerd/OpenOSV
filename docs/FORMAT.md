@@ -126,6 +126,56 @@ interoperability; understanding only, nothing copied):
 * **Underwater / above water** use similar curves (much larger: 90 deg maps to
   86.5 / 78.6 deg) that OpenOSV does not model yet.
 
+## Dropped frames (variable frame rate)
+
+The camera records at a constant rate, but when it cannot keep up - seen on a
+long night drive at high ISO, from 75 s in - it drops frames and writes each
+gap into the time table (`stts`) as one longer sample. A 50 fps 8K clip of
+326.6 s then holds 16157 samples: 15988 of 20 ms, 167 of 40 ms and 2 of 60 ms
+(its `.LRF`: 8083 samples of 40 ms, 163 of 80 ms). What the files say about it:
+
+* **Per-frame capture timestamps** (`FrameMeta.1` timestamp, one `djmd` sample
+  per video sample) are the camera's clock: their deltas are exactly the
+  dropped periods, and they span the audio's length. The `djmd` sequence
+  number has no gaps and cannot show a drop.
+* The **`.OSV` time table** follows that clock to within 10 ms. The **`.LRF`
+  time table does not**: it writes every 60 ms gap as 80 ms, 3.1 s too long
+  over the clip. The first capture timestamps of an `.OSV` and its `.LRF` are
+  equal.
+* Both lens tracks of an `.OSV` share one time table and one sync table
+  (`stss`), and both lenses drop the same frames (the larger first picture
+  after each gap sits on the same sample in both tracks). After a 60 ms gap,
+  though, the second lens's encoder can place its IDR pictures one sample
+  later than the first lens's: on the night clip, from sample 12549 on, every
+  listed sync sample of track 2 (72 of them) is a trailing picture, and its
+  IDR is the next sample.
+
+How OpenOSV reads such a clip:
+
+* **Frame index = sample index = `djmd` index**, in both decoder modes: a
+  decoded picture is matched to its sample by the sample table, never by a
+  time index at the average frame rate (which named a different sample than
+  the one asked for on such a clip, and none at all around a gap). A listed
+  sync sample whose first picture is not a random access point is not used as
+  a decode start; the nearest real one before the request is.
+* **Hosts see a constant-rate timeline at the NOMINAL rate** - the most common
+  sample duration, never sample 0's - with the previous picture held over
+  every gap, each sample placed by its capture timestamp (the time table only
+  when the timestamps are missing, not one per sample, not increasing, or
+  span more than 3 % differently from the table). The night clip's `.OSV`
+  becomes 16328 frames at 50 fps (326.56 s against 326.57 s of audio, 171
+  frames held), its `.LRF` 8168 at 25 fps. A constant-rate clip is its own
+  sample list, unchanged. Premiere, the OpenFX generator (Resolve, VEGAS),
+  `osvtool probe` (`frameCount`, `fps`, `durationSeconds`, plus a `timeline`
+  object) and `osvtool render --frame / --range / --all` all count this
+  timeline; `osvtool extract --frame` addresses samples.
+* An `.LRF` presented as its `.OSV`'s proxy takes the original's timeline and
+  shows, at every timeline frame, the `.LRF` sample captured nearest the
+  moment the original shows there.
+
+`osv::video::ClipTimeline` (`include/osv/video/ClipTimeline.h`) is the one
+implementation every host shares.
+
 ## Index table
 
 The second `free` box holds three 16-byte entries. For `camd` the offset is

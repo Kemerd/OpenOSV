@@ -171,7 +171,7 @@ std::map<ClipKey, std::weak_ptr<ImporterInstance>> g_cache;
     }
     g_cache[key] = clip;
     PluginLog::info("ofx source: opened '{}' ({} frames at {:.3f} fps, {})", path.filename().string(),
-                    clip->frameCount(), clip->fps(), meta::modeName(clip->format().mode));
+                    clip->ownTimelineFrameCount(), clip->fps(), meta::modeName(clip->format().mode));
     return clip;
 }
 
@@ -289,7 +289,9 @@ struct Instance {
 /// The Clip read-out: what the user needs to trim the generator to.
 [[nodiscard]] std::string describeClip(const ImporterInstance& clip) {
     const double fps = clip.fps();
-    const std::uint32_t frames = clip.frameCount();
+    // The clip's own timeline: a recording that dropped frames runs as long
+    // as its sound, with the gaps held (ImporterInstance::ownTimelineFrameCount).
+    const std::uint32_t frames = clip.ownTimelineFrameCount();
     const double seconds = (fps > 0.0) ? static_cast<double>(frames) / fps : 0.0;
     const auto& format = clip.format();
     const char* mode = meta::modeName(format.mode);
@@ -662,14 +664,18 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
                             clip->path().filename().string(), hostName(), time, haveRange ? "known" : "unknown",
                             range[0], range[1], rangeText(outputProps, kOfxImageEffectPropUnmappedFrameRange),
                             doubleText(effectPropSet, kOfxImageEffectInstancePropEffectDuration), hostFps,
-                            clip->fps(), startFrame, index, clip->frameCount(), frameW, frameH, sx, sy,
+                            clip->fps(), startFrame, index, clip->ownTimelineFrameCount(), frameW, frameH, sx, sy,
                             hostDepthName(outputView->depth), hostOrderName(outputView->order),
                             outputLevelsName(levels), stringText(effectPropSet, kPropVegasContext),
                             hostQualityName(renderMode.quality), renderMode.interactive ? "interactive" : "exact",
                             renderMode.draft ? "draft" : "full stitch");
         }
     }
-    if (index < 0 || index >= static_cast<long long>(clip->frameCount())) {
+    // `index` counts the clip's own TIMELINE (clip->fps() is its nominal
+    // rate): a recording that dropped frames has more timeline frames than
+    // samples, each gap holding the previous picture, so its picture stays
+    // with its sound.  On a constant-rate clip the two are the same.
+    if (index < 0 || index >= static_cast<long long>(clip->ownTimelineFrameCount())) {
         clearCpu(*outputView, window, levels);  // before or past the clip: nothing to show
         return kOfxStatOK;
     }
@@ -689,15 +695,16 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     // stays where it is.  Good and Best - every file render - stitch the
     // .OSV.  `engine` / `engineIndex` are what renders from here on.
     ImporterInstance* engine = clip.get();
-    std::uint32_t engineIndex = static_cast<std::uint32_t>(index);
+    const std::uint32_t timelineIndex = static_cast<std::uint32_t>(index);
+    std::uint32_t engineIndex = clip->ownSourceFrameFor(timelineIndex);  // the .OSV sample shown there
     std::shared_ptr<ImporterInstance> proxy;  // keeps the proxy alive for this render
     if (renderMode.playback && source_params::playbackProxyAt(params, time, profile)) {
         proxy = proxyFor(*inst, clip->path(), prefs);
         // The proxy's timeline IS the .OSV's; a mismatch means the two files
         // disagree about the clip, and the .OSV is the one the user chose.
-        if (proxy && proxy->timelineFrameCount() == clip->frameCount()) {
+        if (proxy && proxy->timelineFrameCount() == clip->ownTimelineFrameCount()) {
             engine = proxy.get();
-            engineIndex = proxy->sourceFrameFor(engineIndex);
+            engineIndex = proxy->sourceFrameFor(timelineIndex);
             std::lock_guard<std::mutex> lock(inst->mutex);
             if (!inst->loggedProxy) {
                 inst->loggedProxy = true;
@@ -710,7 +717,8 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
             PluginLog::oncef("ofx/source/proxy-timeline", PluginLog::Level::Warn,
                              "ofx source: the proxy of '{}' presents {} frames, the .OSV has {}; playback stitches "
                              "the .OSV",
-                             clip->path().filename().string(), proxy->timelineFrameCount(), clip->frameCount());
+                             clip->path().filename().string(), proxy->timelineFrameCount(),
+                             clip->ownTimelineFrameCount());
         }
     }
 

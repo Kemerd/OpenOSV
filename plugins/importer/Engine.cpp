@@ -930,7 +930,9 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_AcquireFrame(const OsvEn
             auto frame = clip->directFrame(index, context, purpose, request->outputTransfer);
             if (!frame.ok()) {
                 writeError(error, errorCapacity, frame.error().message);
-                return frame.error().code == ErrorCode::Decoder ? OSV_ENGINE_ERR_DECODE : OSV_ENGINE_ERR_INTERNAL;
+                // A stream-timing failure is a decode failure to the caller too.
+                const bool decode = frame.error().code == ErrorCode::Decoder || frame.error().code == ErrorCode::Timing;
+                return decode ? OSV_ENGINE_ERR_DECODE : OSV_ENGINE_ERR_INTERNAL;
             }
             lease->frame = std::move(frame.value().lease);
             job = std::move(frame.value().job);

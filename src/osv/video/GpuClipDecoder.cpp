@@ -663,25 +663,47 @@ struct GpuClipDecoder::Impl {
     //  GOP helpers
     // -------------------------------------------------------------------------
 
-    /// Sync sample the decode of `index` has to start from.  Both tracks are
-    /// written with the same GOP layout by the camera; taking the earlier of
-    /// the two keeps us correct even if they ever disagree.
-    [[nodiscard]] std::uint32_t syncFor(std::uint32_t index) const noexcept {
+    /// Where each lens's decode of `index` can start, as the two ends of a
+    /// range.  The camera writes both tracks with one sync table, but after
+    /// a dropped-frame gap one lens's encoder can put its random access
+    /// points a sample after the listed entries (each lens's start comes from
+    /// ContainerSource::previousSync(), which checks the picture), so the two
+    /// starts may differ.
+    struct LensStarts {
+        std::uint32_t earliest = 0;  ///< The lens that can start first; never past `index`.
+        std::uint32_t latest = 0;    ///< The lens that can start last; never past `index`.
+    };
+
+    /// Both lenses' decode starts for `index` (one sync lookup per lens).
+    [[nodiscard]] LensStarts startsFor(std::uint32_t index) const noexcept {
         const std::uint32_t a = lens[0].previousSyncIndex(index).value_or(0);
         const std::uint32_t b = lens[1].previousSyncIndex(index).value_or(0);
-        return std::min({a, b, index});
+        // Clamped to the request: a start past it would mean decoding
+        // frames the request never needs (or none at all).
+        return {std::min({a, b, index}), std::min(std::max(a, b), index)};
     }
 
-    /// First frame a decode towards `target` produces: the engine's current
-    /// position when it lies inside target's GOP and not past target
-    /// (continuing is never more work than restarting), else the sync sample.
+    /// First frame a decode towards `target` produces.
+    ///
+    ///   * Continue: the engine's current position, when it is not past
+    ///     target and not before the EARLIER lens start.  A restart costs the
+    ///     lens that starts first (target - earliest) frames, so continuing
+    ///     is never more work than restarting.
+    ///   * Restart: at the LATER lens start.  Each lens's decodeFrame()
+    ///     catches up from its own verified start on its own, so the lens
+    ///     whose start is earlier decodes the few frames in between and
+    ///     discards them.  Restarting at the earlier start instead would make
+    ///     the other lens decode a frame from BEFORE its own start - its whole
+    ///     previous GOP.  When the two agree (every constant-rate file, every
+    ///     GOP before a gap) both ends are the same sample.
+    ///
     /// Engine owner only (or under the store mutex while the engine is idle).
     [[nodiscard]] std::uint32_t planStart(std::uint32_t target) const noexcept {
-        const std::uint32_t sync = syncFor(target);
-        if (engineValid && engineNext <= target && sync <= engineNext) {
+        const LensStarts starts = startsFor(target);
+        if (engineValid && engineNext <= target && starts.earliest <= engineNext) {
             return engineNext;
         }
-        return sync;
+        return starts.latest;
     }
 
     // -------------------------------------------------------------------------
@@ -1016,13 +1038,14 @@ struct GpuClipDecoder::Impl {
             verdict = Status(second.error());
         } else {
             // Both tracks run on one encoder clock; more than a tick apart
-            // means the two surfaces are not the same instant.
+            // means the two surfaces are not the same instant - the file's
+            // timing, not NVDEC's doing, hence Timing.
             const std::int64_t a = first.value().ptsUs;
             const std::int64_t b = second.value().ptsUs;
             if ((a > b ? a - b : b - a) > ptsToleranceUs) {
-                verdict = failStatus(ErrorCode::Decoder, "lens presentation times differ at frame " +
-                                                             std::to_string(index) + ": " + std::to_string(a) +
-                                                             " us vs " + std::to_string(b) + " us");
+                verdict = failStatus(ErrorCode::Timing, "lens presentation times differ at frame " +
+                                                            std::to_string(index) + ": " + std::to_string(a) +
+                                                            " us vs " + std::to_string(b) + " us");
             }
         }
 

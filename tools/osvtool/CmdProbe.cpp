@@ -30,11 +30,16 @@
 //                    present when a metadata track loaded)
 //   path             the path as given on the command line
 //   frameCount       video frames (the metadata track's count when it loads,
-//                    else the video track's sample count)
+//                    else the video track's sample count); for a clip that
+//                    dropped frames (variable frame rate) the frames of its
+//                    constant-rate timeline, gaps held, as the plug-ins
+//                    present it (see "timeline" and osv::video::ClipTimeline)
 //   fps              { "num": int, "den": int, "value": double } - exact
 //                    rational from the video track's timescale and summed
-//                    sample durations, reduced (60000/1001, never 59.94)
-//   durationSeconds  the video track's duration in seconds
+//                    sample durations, reduced (60000/1001, never 59.94); for
+//                    a variable-frame-rate clip its NOMINAL rate (50/1)
+//   durationSeconds  the video track's duration in seconds; for a
+//                    variable-frame-rate clip its timeline's (frameCount / fps)
 //   streamW/streamH  size of one lens stream (the whole frame for an LRF)
 //   mode             recording mode name ("K6", ...) or null
 //   colorModeName    colour mode name ("DLogM", ...) or null
@@ -52,6 +57,7 @@
 #include "osv/meta/MetaJson.h"
 #include "osv/meta/MetadataTrack.h"
 #include "osv/meta/ProtoTree.h"
+#include "osv/video/ClipTimeline.h"
 
 #include <nlohmann/json.hpp>
 
@@ -184,12 +190,31 @@ bool exactFrameRate(const osv::TrackInfo& t, std::uint64_t& num, std::uint64_t& 
     return num <= 0x7FFFFFFFull && den <= 0x7FFFFFFFull;
 }
 
+/// The "timeline" object: how the clip is presented on a constant-rate
+/// timeline (see osv::video::ClipTimeline).  Not part of the stable subset;
+/// the stable keys already carry its frame count, rate and length.
+json timelineJson(const osv::video::ClipTimeline& timeline) {
+    json t;
+    t["variable"] = !timeline.identity();
+    t["clock"] = osv::video::timelineClockName(timeline.clock);
+    t["samples"] = timeline.sampleCount;
+    t["frames"] = timeline.frameCount();
+    t["heldFrames"] = timeline.heldFrames;
+    t["skippedSamples"] = timeline.skippedSamples;
+    t["nominalTicks"] = timeline.nominalTicks;
+    t["timescale"] = timeline.timescale;
+    t["note"] = safe(timeline.note);
+    return t;
+}
+
 /// Add the stable top-level subset (see the file comment) to `doc`.
 ///
 /// `format` may be null (detection failed); `metaFrames` is the metadata
-/// track's frame count (0 without one).
+/// track's frame count (0 without one) and `meta` that track (null without
+/// one; its capture timestamps time a variable-frame-rate clip).
 void addStableKeys(json& doc, const osv::MovieInfo& movie, const osv::meta::FormatInfo* format,
-                   std::uint32_t metaFrames, const std::filesystem::path& input) {
+                   std::uint32_t metaFrames, const osv::meta::MetadataTrack* meta,
+                   const std::filesystem::path& input) {
     doc["schema"] = kProbeSchema;
 
     // ---- the video track the numbers describe -------------------------------------------
@@ -216,6 +241,31 @@ void addStableKeys(json& doc, const osv::MovieInfo& movie, const osv::meta::Form
         doc["fps"] = nullptr;
     }
     doc["durationSeconds"] = video && video->durationSeconds() > 0.0 ? video->durationSeconds() : movie.durationSeconds();
+
+    // ---- [VFR] a clip that dropped frames: its constant-rate timeline ---------------------
+    // The plug-ins present such a clip at its nominal rate with the previous
+    // picture held over each gap (osv::video::ClipTimeline), and so must the
+    // VEGAS import that sizes its event from these three keys - or the picture
+    // ends before the sound.  A constant-rate clip keeps the values above.
+    if (video) {
+        const osv::video::ClipTimeline timeline = osv::video::clipTimelineFor(*video, meta);
+        doc["timeline"] = timelineJson(timeline);
+        if (!timeline.identity() && timeline.nominalTicks > 0 && timeline.timescale > 0) {
+            std::uint64_t tNum = timeline.timescale;
+            std::uint64_t tDen = timeline.nominalTicks;
+            const std::uint64_t g = std::gcd(tNum, tDen);
+            if (g > 1) {
+                tNum /= g;
+                tDen /= g;
+            }
+            doc["frameCount"] = timeline.frameCount();
+            doc["fps"] = json{{"num", tNum}, {"den", tDen},
+                              {"value", static_cast<double>(tNum) / static_cast<double>(tDen)}};
+            doc["durationSeconds"] = timeline.durationSeconds();
+        }
+    } else {
+        doc["timeline"] = nullptr;
+    }
 
     // ---- detected format --------------------------------------------------------------------
     if (format) {
@@ -849,7 +899,17 @@ int runProbe(const ProbeOptions& opt) {
 
     // ---- warnings + JSON --------------------------------------------------------------
     doc["warnings"] = warnings;
-    addStableKeys(doc, movie, format.ok() ? &format.value() : nullptr, meta ? meta->frameCount() : 0u, inputPath);
+    addStableKeys(doc, movie, format.ok() ? &format.value() : nullptr, meta ? meta->frameCount() : 0u, meta.get(),
+                  inputPath);
+    // A clip that dropped frames says so on the console too.
+    if (doc.contains("timeline") && doc["timeline"].is_object() && doc["timeline"].value("variable", false)) {
+        const json& t = doc["timeline"];
+        const double rate = doc["fps"].is_object() ? doc["fps"].value("value", 0.0) : 0.0;
+        std::printf("timing: variable frame rate - %u samples presented as %u frames at %.3f fps (%.3f s), %u held "
+                    "over dropped frames, %s clock\n",
+                    t.value("samples", 0u), t.value("frames", 0u), rate, doc.value("durationSeconds", 0.0),
+                    t.value("heldFrames", 0u), t.value("clock", std::string("container")).c_str());
+    }
     if (!warnings.empty()) {
         std::printf("warnings (%u):\n", static_cast<unsigned>(warnings.size()));
         for (const json& w : warnings) {

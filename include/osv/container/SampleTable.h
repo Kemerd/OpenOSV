@@ -71,6 +71,24 @@ public:
     /// Composition offset of sample `index` (0 without ctts).
     [[nodiscard]] std::int64_t compositionOffset(std::uint32_t index) const noexcept;
 
+    /// Index of the last sample whose decode timestamp is at or before `dts`
+    /// (media timescale units), 0 when `dts` precedes every sample.
+    ///
+    /// A binary search over the run-length stts runs, O(log runs), so a
+    /// decoder can turn a timestamp back into a sample index per decoded
+    /// frame without expanding the time table.  Samples past the last run
+    /// are extrapolated with its delta exactly as sampleDts() does, and the
+    /// answer is clamped to the last locatable sample.  The answer is only
+    /// unambiguous when dtsStrictlyIncreasing() holds - with a zero-duration
+    /// run several samples share one timestamp and the last of them wins.
+    [[nodiscard]] std::uint32_t sampleAtOrBeforeDts(std::uint64_t dts) const noexcept;
+
+    /// True when every locatable sample is decoded strictly later than the
+    /// one before it, i.e. no stts run of zero duration separates two
+    /// samples (a zero duration on the final sample alone is harmless).
+    /// Only then is "the sample at time t" a well-defined question.
+    [[nodiscard]] bool dtsStrictlyIncreasing() const noexcept;
+
     /// True when sample `index` is a sync sample.  Without an stss box every
     /// sample is a sync sample (ISO 14496-12 8.6.2).
     [[nodiscard]] bool isSync(std::uint32_t index) const noexcept;

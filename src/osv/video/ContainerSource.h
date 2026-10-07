@@ -61,9 +61,21 @@ public:
     /// Number of samples in the track.
     [[nodiscard]] std::uint32_t sampleCount() const noexcept;
 
-    /// Index of the nearest sync sample at or before `index` (0 when the
-    /// table has no stss, which means every sample is a sync sample).
+    /// Index of the nearest sample at or before `index` a decode can start
+    /// from.  That is the listed sync sample (listedSync()) whenever its own
+    /// first picture is a random access point - every camera file, except one
+    /// lens of a recording that dropped frames, whose IDRs can sit a sample
+    /// after the shared sync table's entries.  Then the nearest sample at or
+    /// before `index` whose first picture IS one is returned instead (found
+    /// from the NAL headers, at most kMaxDecodeStartScan samples back), so a
+    /// decode never starts on a picture whose references precede it.  0 when
+    /// the table has no stss (every sample is a sync sample) or nothing else
+    /// is known.
     [[nodiscard]] std::uint32_t previousSync(std::uint32_t index) const noexcept;
+
+    /// The sync table's own answer: the nearest LISTED sync sample at or
+    /// before `index` (0 without an stss).  What libavformat's index holds.
+    [[nodiscard]] std::uint32_t listedSync(std::uint32_t index) const noexcept;
 
     /// Bytes and timing of sample `index`.  Errors: InvalidArgument (out of
     /// range), Truncated (sample lies outside the file).
@@ -72,8 +84,49 @@ public:
     /// Media timescale of the track (60000 on the sample clip).
     [[nodiscard]] std::uint32_t timescale() const noexcept;
 
-    /// Frames per second from the sample table (stts), 0.0 when unknown.
+    /// AVERAGE frames per second over the sample table (stts): samples - 1
+    /// over the span from the first to the last decode time; 0.0 when
+    /// unknown.  Exact for a constant-rate track and informational on a
+    /// variable-rate one - frame indices come from the sample table
+    /// (sampleAt / presentationTicks), never from this.
     [[nodiscard]] double fps() const noexcept;
+
+    // ---- the sample table as a clock -----------------------------------------
+    //
+    // On a variable-frame-rate recording (the camera drops frames when it
+    // cannot keep up and writes the gap into the stts as a longer sample) a
+    // time-based index at the average rate names a different sample than
+    // the one asked for.  These turn the table itself into the index: sample
+    // i is presented at presentationTicks(i), and a decoded frame's pts maps
+    // back to exactly one sample.  For a constant-rate track they return
+    // exactly what the average-rate formulas did (i * delta), so behaviour
+    // there is unchanged.
+
+    /// True when frames can be indexed by the sample table: the track has no
+    /// composition offsets (no B-frame reordering, which the camera never
+    /// writes; reordered streams keep the average-rate fallback until they
+    /// are tested) and every sample is presented strictly after the previous
+    /// one.  False for an unopened source.
+    [[nodiscard]] bool indexedByTable() const noexcept;
+
+    /// Presentation time of sample `index` in timescale ticks, relative to
+    /// sample 0's: dts(i) + cts(i) - (dts(0) + cts(0)).  Samples past the end
+    /// are extrapolated with the last duration (as the table does); 0 for an
+    /// unopened source.
+    [[nodiscard]] std::int64_t presentationTicks(std::uint32_t index) const noexcept;
+
+    /// Duration of sample `index` in timescale ticks (its stts delta; the
+    /// last run's for an index past the end, 0 when unknown).
+    [[nodiscard]] std::uint64_t sampleDuration(std::uint32_t index) const noexcept;
+
+    /// The sample presented NEAREST to `relTicks` (ticks relative to sample
+    /// 0's presentation time), a tie going to the later sample - exactly
+    /// llround(relTicks / delta) on a constant-rate track.  Times before the
+    /// first or after the last sample are extrapolated with the edge
+    /// sample's duration, so the answer can be negative or >= sampleCount(),
+    /// as the average-rate formula's could; callers treat those as "not a
+    /// sample of this track".  Meaningful only when indexedByTable().
+    [[nodiscard]] std::int64_t sampleAt(std::int64_t relTicks) const noexcept;
 
     /// Coded width / height from the sample entry (0 when absent).
     [[nodiscard]] std::uint32_t codedWidth() const noexcept;

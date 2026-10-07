@@ -60,6 +60,7 @@
 #include "osv/render/SeamCarve.h"
 #include "osv/render/SeamTools.h"  // [WP-SEAMTOOLS]
 #include "osv/render/RenderParamsBuilder.h"
+#include "osv/video/ClipTimeline.h"
 #include "osv/video/DualStreamReader.h"
 #include "osv/video/GpuClipDecoder.h"
 
@@ -261,13 +262,43 @@ public:
     [[nodiscard]] const geom::LensRig& rig() const noexcept { return m_rig; }
     [[nodiscard]] bool parsed() const noexcept { return m_parsed; }
 
-    /// Number of video frames (0 before open()).
+    /// Number of video frames - the clip's SAMPLES, the index space of
+    /// renderFrame(), the decoders and the metadata (0 before open()).  The
+    /// host sees timelineFrameCount() instead.
     [[nodiscard]] std::uint32_t frameCount() const noexcept { return m_frameCount; }
 
     /// Frame rate as the exact container rational: numerator / denominator
-    /// (60000 / 1001 for the sample clip).  Both are > 0 after open().
+    /// (60000 / 1001 for the sample clip).  Both are > 0 after open().  The
+    /// denominator is the NOMINAL period, the most common sample duration,
+    /// which on a variable-frame-rate clip is the rate it was recorded at
+    /// (see video::ClipTimeline).
     [[nodiscard]] std::uint32_t rateNumerator() const noexcept { return m_rateNum; }
     [[nodiscard]] std::uint32_t rateDenominator() const noexcept { return m_rateDen; }
+
+    // ---- [VFR] the clip's own constant-rate timeline -----------------------
+    //
+    // A recording that dropped frames (variable frame rate: the container
+    // records each gap as one longer sample) is presented at its nominal
+    // rate with the last captured picture held over each gap, timed by the
+    // camera's capture timestamps, so the picture stays with the sound.  A
+    // constant-rate clip's own timeline is its sample list: frame k is
+    // sample k, exactly as before.  An .LRF presented as a proxy shows its
+    // original's timeline instead (timelineFrameCount() / sourceFrameFor());
+    // these two always describe the clip on its own.
+
+    /// Frames on the clip's own timeline: frameCount() for a constant-rate
+    /// clip, more on one that dropped frames (each gap holds a picture).
+    [[nodiscard]] std::uint32_t ownTimelineFrameCount() const noexcept {
+        return m_timeline.identity() ? m_frameCount : m_timeline.frameCount();
+    }
+
+    /// The sample shown at frame `timelineIndex` of the clip's own timeline:
+    /// the same index on a constant-rate clip; always inside
+    /// [0, frameCount()) for a parsed clip.
+    [[nodiscard]] std::uint32_t ownSourceFrameFor(std::uint32_t timelineIndex) const noexcept;
+
+    /// The clip's own timeline as built at open (identity for constant rate).
+    [[nodiscard]] const video::ClipTimeline& ownTimeline() const noexcept { return m_timeline; }
 
     /// Frames per second as a double (rateNumerator / rateDenominator).
     [[nodiscard]] double fps() const noexcept;
@@ -298,8 +329,8 @@ public:
     /// The .OSV this .LRF is presented as the proxy of (empty otherwise).
     [[nodiscard]] const std::filesystem::path& proxyOriginal() const noexcept { return m_proxy.original; }
 
-    /// The timeline the host sees: the clip's own frame rate and frame count,
-    /// or for a proxy the original's.
+    /// The timeline the host sees: the clip's own frame rate and timeline
+    /// frame count (ownTimelineFrameCount()), or for a proxy the original's.
     [[nodiscard]] std::uint32_t timelineRateNumerator() const noexcept {
         return m_proxy.active ? m_proxy.rateNum : m_rateNum;
     }
@@ -307,13 +338,14 @@ public:
         return m_proxy.active ? m_proxy.rateDen : m_rateDen;
     }
     [[nodiscard]] std::uint32_t timelineFrameCount() const noexcept {
-        return m_proxy.active ? m_proxy.frameCount : m_frameCount;
+        return m_proxy.active ? m_proxy.frameCount : ownTimelineFrameCount();
     }
 
-    /// The clip's own frame shown at timeline frame `timelineIndex`: the same
-    /// index for a clip on its own timeline; for a proxy, the .LRF frame
-    /// recorded nearest the moment of the original's frame `timelineIndex`.
-    /// Always inside [0, frameCount()) for a parsed clip.
+    /// The clip's own frame (sample) shown at timeline frame
+    /// `timelineIndex`: ownSourceFrameFor() for a clip on its own timeline;
+    /// for a proxy, the .LRF frame recorded nearest the moment the
+    /// original's frame `timelineIndex` shows.  Always inside
+    /// [0, frameCount()) for a parsed clip.
     [[nodiscard]] std::uint32_t sourceFrameFor(std::uint32_t timelineIndex) const noexcept;
 
     /// The .OSV an .LRF was recorded beside: the same folder and name with
@@ -770,6 +802,10 @@ private:
     std::uint32_t m_rateNum = 0;
     std::uint32_t m_rateDen = 0;
     std::uint64_t m_creationTime1904 = 0;
+    /// [VFR] The clip's own constant-rate timeline (identity - no table - for
+    /// a constant-rate clip).  Written once in parseOnce() under the lock and
+    /// read-only afterwards, like the timing fields above.
+    video::ClipTimeline m_timeline;
 
     /// [PROXY] The original's timeline this .LRF is presented on (see
     /// isProxy()).  Written once in parseOnce() under the lock and read-only
@@ -779,12 +815,17 @@ private:
         std::filesystem::path original;    ///< The .OSV beside the .LRF.
         std::uint32_t rateNum = 0;         ///< The original's frame rate rational.
         std::uint32_t rateDen = 0;
-        std::uint32_t frameCount = 0;      ///< The original's frame count.
+        std::uint32_t frameCount = 0;      ///< The original's timeline frame count.
         std::uint32_t originalLensH = 0;   ///< Its lens height: its native equirect is 2x this by this.
         /// The original's first frame on the .LRF's own clock, in seconds
         /// after the .LRF's first frame (the camera's timestamps of the two;
         /// 0 when either file carries none).
         double offsetSeconds = 0.0;
+        /// [VFR] Timeline frame -> .LRF sample, built when either file is
+        /// variable frame rate (each frame shows the .LRF sample captured
+        /// nearest the moment the original shows there).  EMPTY when both
+        /// are constant rate: sourceFrameFor() then keeps its rate formula.
+        std::vector<std::uint32_t> toSample;
     };
     ProxyTimeline m_proxy;
 

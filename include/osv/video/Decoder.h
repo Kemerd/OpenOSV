@@ -15,11 +15,16 @@
 //     supplies the samples directly and libavformat is not involved at all,
 //     which makes "frame index == sample index == djmd index" hold by
 //     construction.
-//   * Frame accuracy.  decodeFrame(i) only returns the frame whose
-//     presentation time rounds to index i.  A request outside the currently
-//     decoded GOP seeks to the previous sync sample (from our SampleTable when
-//     the container parsed, otherwise through FFmpeg's index) and decodes
-//     forward, discarding frames until the timestamp matches.
+//   * Frame accuracy.  decodeFrame(i) only returns sample i: the frame
+//     whose presentation time is sample i's in our SampleTable whenever the
+//     container parsed (every camera file, in both demuxing modes), so the
+//     index is the sample (and djmd) index even on a variable-frame-rate clip
+//     whose table records a dropped frame as one longer sample.  Only a file
+//     our parser declines falls back to a time index at the average frame
+//     rate.  A request outside the currently decoded GOP seeks to the
+//     previous sync sample (from our SampleTable when the container parsed,
+//     otherwise through FFmpeg's index) and decodes forward, discarding
+//     frames until the timestamp matches.
 //   * Output.  PlanarFrame16 aliases the decoder's planes whenever the pixel
 //     format allows it (yuv420p10le, P010) and widens 8-bit sources
 //     (yuv420p / NV12 from the .LRF proxy) into an owned uint16 buffer.  The
@@ -107,8 +112,11 @@ public:
     /// Number of frames (samples) in the selected track.
     [[nodiscard]] std::uint32_t frameCount() const noexcept;
 
-    /// Frames per second derived from the sample durations (59.94 for the
-    /// sample clip), used to map presentation times to frame indices.
+    /// AVERAGE frames per second over the sample durations (59.94 for the
+    /// sample clip).  Exact on a constant-rate track; on a variable-rate one
+    /// informational only - presentation times map to frame indices through
+    /// the sample table, and this rate is that mapping only for a file the
+    /// container parser declined.
     [[nodiscard]] double fps() const noexcept;
 
     /// Decoded (cropped) luma width / height in pixels.
@@ -146,8 +154,9 @@ public:
     /// Decode frame `index` (frame accurate).  Sequential requests decode
     /// forward without seeking; anything else seeks to the previous sync
     /// sample first.  Errors: InvalidArgument (index out of range),
-    /// Decoder (libavcodec failure or a presentation time that does not
-    /// match the request).
+    /// Decoder (libavcodec failure), Timing (the stream produced a
+    /// presentation time past the request - a property of the file that
+    /// every decoder reproduces, never a reason to leave hardware decoding).
     Result<PlanarFrame16> decodeFrame(std::uint32_t index);
 
     /// Decode the next frame in presentation order (after open() or seek()

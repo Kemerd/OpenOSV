@@ -279,16 +279,19 @@ public:
     /// waits while another thread's decode is running (and returns as soon as
     /// that decode produced the frame), or runs the decoder itself: from the
     /// decoder's current position when that is inside the frame's GOP and not
-    /// past it, else from the previous sync sample.  EVERY frame decoded on
-    /// the way is kept in the cache, so stepping around inside that GOP
-    /// afterwards is a cache hit.  A foreground request preempts the
-    /// decode-ahead worker within one frame pair.
+    /// past it, else from the previous sync sample (the later of the two
+    /// lenses' own, when one lens of a dropped-frame recording starts its
+    /// GOPs a sample after the listed entry).  EVERY frame decoded on the way
+    /// is kept in the cache, so stepping around inside that GOP afterwards is
+    /// a cache hit.  A foreground request preempts the decode-ahead worker
+    /// within one frame pair.
     ///
     /// Errors: InvalidArgument (index out of range), Decoder (libavcodec
-    /// failure, the two lenses disagree on the presentation time), Gpu (a
-    /// driver call failed), Unsupported (every cache slot is pinned by a
-    /// live lease so the frame has nowhere to go - release leases and
-    /// retry), Internal (the decoder is shutting down).
+    /// failure), Timing (the stream's own timing: a picture that is not the
+    /// sample asked for, or the two lenses disagree on the presentation
+    /// time), Gpu (a driver call failed), Unsupported (every cache slot is
+    /// pinned by a live lease so the frame has nowhere to go - release
+    /// leases and retry), Internal (the decoder is shutting down).
     [[nodiscard]] Result<GpuFrameLease> acquire(std::uint32_t frameIndex);
 
     /// True when `frameIndex` is in the cache right now.  Pure query: it does
