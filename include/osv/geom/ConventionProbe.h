@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// ConventionProbe: score every reading of the attitude quaternion against
-// the accelerometer.  For a static or slowly moving camera camera_acc points
-// along gravity in the body frame, so the correct convention is the one for
-// which R_body_from_world * up_world lines up with the normalised
-// acceleration frame after frame.  All 2 x 2 x 2 = 8 combinations of
-// component order, rotation sense and world-up axis are scored.
+// ConventionProbe: score every plain reading of the attitude quaternion
+// against the accelerometer, and the reading every `auto` caller uses.
+//
+// For a static or slowly moving camera camera_acc points along gravity in
+// the body frame, so a convention can be scored by how well
+// R_body_from_world * up_world lines up with the normalised acceleration
+// frame after frame.  All 2 x 2 x 4 = 16 plain combinations of component
+// order, rotation sense and world-up axis are scored (scoreAll / best, a
+// research tool).  autoDetect does not score: it returns the verified
+// reading and keeps the accelerometer only as a canary (see AutoConvention).
 #pragma once
 
 #include "osv/core/Math.h"
@@ -38,49 +42,67 @@ struct ProbeSample {
     Vec3f acc;
 };
 
-/// The reading `auto` resolves to, with the evidence behind it.
+/// The canary's alarm threshold (deg): the accelerometer's gravity and the
+/// reading's up have agreed within 1 deg on every car clip measured so far
+/// (0.2-0.8 deg over 256 frames of two 8K drives, OSV and LRF), so 15 deg
+/// means the reading no longer describes the camera (another body, another
+/// firmware), not noise.
+inline constexpr double kAttitudeCanaryWarnDeg = 15.0;
+
+/// The reading `auto` resolves to, with the accelerometer canary beside it.
 ///
-/// What the Osmo 360 records, measured on two car-mounted clips (a vehicle
-/// turns about the true vertical, which gives an independent check):
+/// What the Osmo 360 records, measured against image truth on two car clips
+/// (lamp poles, the sunset sun through a 106 deg turn) and on the airborne
+/// sample (its horizon, checked by eye):
 ///
-///   * camera_acc is the specific force in a WORLD frame, not the body
-///     frame: it stays within a few degrees of one direction for ten
-///     minutes of driving while the body turns through every heading.
-///   * That frame is the world frame of the stored quaternion read in
-///     w,x,y,z order as world->body.  The verified reading (XYZW,
-///     body->world) describes the same motion with its world frame turned a
-///     quarter turn about Y, so a vector a in the accelerometer's frame is
-///     (a.z, a.y, -a.x) in ours.
-///   * The quaternion's world frame is NOT level: the turn axis of the car
-///     sits 11 and 30 deg away from -Y on the two clips, and the mapped
-///     accelerometer lands within 2 deg of it both times.  Levelling on -Y
-///     alone leaves those clips' horizons tilted by that much.
+///   * the stored attitude is a world -> body rotation in the IMU's own
+///     axes; relabelled into the rig's axes (AttitudeConvention::rigAxes)
+///     its world is level, +Z up.  No accelerometer is needed to level it.
+///   * camera_acc is the specific force in the BODY frame, in yet another
+///     axis order: (a_y, a_x, -a_z) in rig axes.  On a car or a tripod its
+///     clip mean is the gravity reaction, i.e. the body's up.
 ///
-/// So the accelerometer measures the true up directly.  Scoring it against
-/// the body-frame gravity of each candidate (score / best) proves nothing,
-/// and on a clean 1 g clip it latches onto a reading that rolls the horizon
-/// a quarter turn.
+/// 0.5.0 read the attitude transposed (XYZW, body -> world, -Y up) and took
+/// camera_acc for a world-frame vector to move that reading's up towards
+/// gravity.  That repaired the world-side half of the error only; the car
+/// clips stayed 28 and 8 deg off.  The accelerometer now only checks the
+/// reading: the angle between its mean gravity and the reading's mean body
+/// up is logged and, when it exceeds kAttitudeCanaryWarnDeg on a clean
+/// gravity reaction, flagged.  The levelling never depends on it.
 struct AutoConvention {
     AttitudeConvention conv;          ///< The reading to build the attitude track with.
-    Vec3d measuredUp{0.0, 0.0, 0.0};  ///< True up in conv's world frame; zero = not measured.
-    bool upFromAccelerometer = false; ///< True when measuredUp came from camera_acc.
+    /// Always zero: the reading's world is level by construction.  Kept so
+    /// applyTo() also clears an up a reused Options may still carry.
+    Vec3d measuredUp{0.0, 0.0, 0.0};
     double meanAccG = 0.0;            ///< |mean camera_acc| over the probed frames (g).
     double spreadDeg = 180.0;         ///< Mean angle between each frame's acc and the mean (deg).
-    double tiltDeg = 0.0;             ///< Angle between the measured up and conv's axis (deg).
-    std::size_t framesUsed = 0;       ///< Frames that carried a finite, non-zero acc.
-    std::string reason;               ///< One line for logs.
+    std::size_t framesUsed = 0;       ///< Frames that carried an attitude and a finite, non-zero acc.
+    /// True when the canary was computed (enough frames, a non-zero mean).
+    bool canaryMeasured = false;
+    /// True when the accelerometer is a clean gravity reaction (mean
+    /// 0.6..1.4 g, frames within 35 deg of the mean), so the canary means
+    /// something.  An airborne or aerobatic clip measures motion, not
+    /// gravity, and is reported without a verdict.
+    bool canaryJudged = false;
+    /// Angle (deg) between the clip-mean accelerometer gravity in rig axes
+    /// and the clip-mean body up of the reading, R(t)^T * up.
+    double canaryDeg = 0.0;
+    bool canaryWarning = false;       ///< canaryJudged and canaryDeg > kAttitudeCanaryWarnDeg.
+    std::string reason;               ///< One line for logs (7-bit ASCII).
 
-    /// Copy the reading and the measured up into AttitudeTrack build options.
+    /// Copy the reading into AttitudeTrack build options (and clear any
+    /// measured up: the reading's own axis is the up).
     void applyTo(AttitudeTrack::Options& options) const noexcept {
         options.conv = conv;
         options.measuredUp = measuredUp;
     }
 };
 
-/// Scores the eight quaternion conventions.
+/// Scores the sixteen plain quaternion conventions; resolves `auto`.
 class ConventionProbe {
 public:
-    /// The eight candidate conventions in a fixed order.
+    /// The sixteen plain candidate conventions (rigAxes = false) in a fixed
+    /// order: order-major, then sense, then up axis.
     [[nodiscard]] static std::vector<AttitudeConvention> candidates();
 
     /// Collect up to `maxFrames` (attitude, acc) pairs from the track and
@@ -102,19 +124,19 @@ public:
     /// Pick the best entry of an existing score list.
     [[nodiscard]] static ConventionScore best(const std::vector<ConventionScore>& scores) noexcept;
 
-    /// The reading every `auto` caller uses (importer horizon lock, osvtool).
+    /// The reading every `auto` caller uses (importer horizon lock, the OFX
+    /// generator and its Playback Proxy, Scene Light, osvtool).
     ///
-    /// Component order and rotation sense stay at the verified default
-    /// (XYZW, body->world: horizon lock checked by eye on the airborne sample,
-    /// and the only reading under which a car-mounted camera turns about the
-    /// body axis its fisheyes show to be vertical).  The true up is measured
-    /// from the accelerometer when it carries a clean gravity reaction (mean
-    /// 0.6..1.4 g, frames within 35 deg of the mean, result within 60 deg of
-    /// -Y); otherwise it stays -Y.  Frames are sampled evenly over the whole
-    /// clip, up to `maxFrames`.
+    /// Always the default AttitudeConvention with no measured up: the
+    /// levelling depends on the attitude alone.  The accelerometer canary
+    /// (AutoConvention) is computed on frames sampled evenly over the whole
+    /// clip, up to `maxFrames`, and reported in `reason`; above
+    /// kAttitudeCanaryWarnDeg on a clean gravity reaction it is also logged
+    /// as a warning.
     [[nodiscard]] static AutoConvention autoDetect(const meta::MetadataTrack& track, std::size_t maxFrames = 256);
 
-    /// The same rule on explicit samples (tests / synthetic data).
+    /// The same rule on explicit samples (tests / synthetic data).  Samples
+    /// without an attitude, or with a zero / non-finite acc, are ignored.
     [[nodiscard]] static AutoConvention autoDetect(const std::vector<ProbeSample>& samples);
 };
 

@@ -11,7 +11,7 @@ drifts. The evidence column names the test that guards it.
 | Lens | +z optical axis, +x image right, +y image down | Kannala-Brandt model lives here |
 | Body | X right, Y forward, Z up (right-handed) | +Y = master lens axis, -Y = slave lens axis |
 | View | X right, Y forward, Z up | Virtual camera; `VirtualCamera::rotation()` = Rz(yaw) Rx(pitch) Ry(roll) |
-| World | Y-up (best-supported reading of the IMU quaternions) | Only matters for stabilisation |
+| World | Z-up (the IMU quaternion's own world, in rig axes; see IMU attitude) | Stabilisation, Scene Light's sky |
 
 The kernel composes `Rout = bodyFromWorld * viewToBody`; with stabilisation
 off, `bodyFromWorld` is the identity and the camera is defined in the body of
@@ -128,14 +128,55 @@ at 3 m.
 ## IMU attitude
 
 Each frame carries a batch of 16-17 fused quaternions (about 995 Hz); the
-per-frame `camera_attitude` equals batch entry 4. The reading was settled
-empirically by rendering the sample clip with horizon lock and looking at the
-result: components (x, y, z, w), `R(q)` mapping **body to world**, and a world
-"up" of **-Y** level the picture upright (matching the camera's own stitched
-cover image). Reading the same quaternions as world-to-body with +Y up, the
-earlier hypothesis, does not level the horizon at all. The component order
-cannot be told apart on a static clip and stays (x, y, z, w) until a rotation
-clip says otherwise; `--attitude-convention` exposes all 16 readings (order x
-sense x up in {y, z, ny, nz}). The accelerometer field in the metadata is not a
-gravity vector, so `ConventionProbe` only decides when it finds one (mean angle
-below 15 degrees); otherwise `auto` uses the default above.
+per-frame `camera_attitude` equals batch entry 4. With `f0..f3` the four
+stored floats in file order, the reading is
+
+```
+q' = (w = f3;  x = -f1,  y = f2,  z = f0)        body -> world, world up = +Z
+```
+
+i.e. the floats read (x, y, z, w) are a **world-to-body** rotation in the
+IMU's own axes, relabelled into the rig's axes by `K: (x, y, z) -> (y, -z,
+-x)` on both sides (`AttitudeConvention{XYZW, WorldToBody, Z, rigAxes}`, the
+default; `osvtool --attitude-convention xyzw-w2b-z-rig`, what `auto` resolves
+to). Its world is level by construction, so Horizon Lock needs no
+accelerometer. It was settled against image truth on two car-mounted 8K
+clips, where the car turns about the true vertical:
+
+| Check | 0.5.0 reading | This reading |
+|---|---|---|
+| Zenith fitted to lamp poles / building edges (Horizon Lock render), day | 27.8-28.1 deg off | 0.8-3.8 deg |
+| The same, night | 7.3 deg (pole trace), 11.4 deg (building trace) | 3.1 deg, 1.6 deg |
+| Sunset sun elevation over five frames through a 106 deg turn (ephemeris 6.3-7.1 deg) | +33 / +36 / -2 / -1 / +38 deg | +9.9 / +8.1 / +9.6 / +9.7 / +6.3 deg |
+| The sun's latitude in a Full (locked) render, 1000 frames apart | +73 vs -33 deg | -19 vs -21 deg |
+
+The zenith is the smallest eigenvector of the traced verticals' great-circle
+normals on the sphere (Collins and Weiss 1990, `docs/CITATIONS.md`); the
+render's rotation is measured by registering it against the stab-off render
+of the same frame, so the numbers describe the shipped engine, not a model of
+it.
+
+The reading 0.4.x / 0.5.0 used, components (x, y, z, w) as **body-to-world**
+with a world up of **-Y** (`xyzw-b2w-ny`), is that rotation transposed and
+relabelled. It was checked by eye on the airborne sample clip, whose attitude
+changes by only 4.9 degrees over the whole clip: at that one pose the two
+readings agree within 0.1-0.5 degrees (`test_attitude`, every frame of the
+.OSV and the .LRF), so the sample could not tell them apart and its horizon
+does not move (0.4 px at 2048x1024). On a car that turns, the transposed
+rotation turns the wrong way (Full and Smooth swing) and its world is not
+level. 0.5.0 then levelled on the accelerometer taken as a world-frame
+vector, `(a.z, a.y, -a.x)`, which on a pure yaw puts the render's up on the
+body's -X every frame: off by the whole mount tilt.
+
+`camera_acc` is a **body-frame** specific force in its own axis order:
+`(a_y, a_x, -a_z)` in rig axes. On a car or a tripod its clip mean is the
+gravity reaction and lands within 1 degree of this reading's body up (0.2-0.8
+degrees over 256 frames, both drives, .OSV and .LRF). `ConventionProbe::
+autoDetect` keeps it only as a canary: the angle is logged with the reading,
+and above 15 degrees on a clean gravity reaction (mean 0.6-1.4 g, frames
+within 35 degrees of the mean) it is logged as a warning. It never moves the
+levelling. An airborne clip measures its flight, not gravity, and is reported
+without a verdict. `--attitude-convention` still exposes the 16 plain
+readings (order x sense x up in {y, z, ny, nz}) and each with `-rig`; pitch
+and roll dynamics beyond a car's, and the Avata 360's lens-up mount, are not
+yet verified against image truth.

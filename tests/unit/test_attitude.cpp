@@ -23,10 +23,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace osv;
@@ -46,9 +48,9 @@ struct SampleMeta {
     meta::MetadataTrack track;
 };
 
-std::unique_ptr<SampleMeta> openSample() {
+std::unique_ptr<SampleMeta> openSample(const std::filesystem::path& path) {
     auto s = std::make_unique<SampleMeta>();
-    auto file = OsvFile::open(osvtest::sampleOsv());
+    auto file = OsvFile::open(path);
     REQUIRE(file.ok());
     s->file = std::move(file).value();
     auto track = meta::MetadataTrack::load(s->file);
@@ -57,10 +59,22 @@ std::unique_ptr<SampleMeta> openSample() {
     return s;
 }
 
+std::unique_ptr<SampleMeta> openSample() { return openSample(osvtest::sampleOsv()); }
+
+/// The reading 0.4.x / 0.5.0 levelled with: the plain XYZW, body -> world,
+/// -Y up.  Kept to show what the 0.5.1 reading replaces.
+constexpr AttitudeConvention kReading050{QuatOrder::XYZW, AttitudeSense::BodyToWorld, WorldUp::NegY, false};
+
 /// Encode a worldFromBody rotation into the four stored floats so that
 /// reading them under `conv` reproduces it (the inverse of
 /// worldFromBodyQuat()).  Used to synthesise probe data with a known truth.
-meta::Quaternion encode(const Quatd& worldFromBody, const AttitudeConvention& conv) {
+meta::Quaternion encode(const Quatd& worldFromBodyIn, const AttitudeConvention& conv) {
+    // Undo the rig relabelling first: worldFromBodyQuat maps the IMU's
+    // (w; x, y, z) to the rig's (w; y, -z, -x), so the inverse takes the
+    // rig's (w; x, y, z) back to (w; -z, x, -y).
+    const Quatd worldFromBody =
+        conv.rigAxes ? Quatd{worldFromBodyIn.w, -worldFromBodyIn.z, worldFromBodyIn.x, -worldFromBodyIn.y}
+                     : worldFromBodyIn;
     // The stored rotation is either body->world or world->body.
     const Quatd stored = (conv.sense == AttitudeSense::WorldToBody) ? worldFromBody.conj() : worldFromBody;
     meta::Quaternion q;
@@ -87,7 +101,7 @@ Quatd randomQuat(std::mt19937_64& rng) {
 }
 
 bool sameConvention(const AttitudeConvention& a, const AttitudeConvention& b) {
-    return a.order == b.order && a.sense == b.sense && a.up == b.up;
+    return a.order == b.order && a.sense == b.sense && a.up == b.up && a.rigAxes == b.rigAxes;
 }
 
 /// The up axis with its sign reversed (Y <-> -Y, Z <-> -Z).
@@ -106,7 +120,8 @@ WorldUp oppositeUp(WorldUp up) {
 /// from -up with -g (the stored quaternions and the measured vectors are the
 /// same numbers), so that pair counts as one recovered convention.
 bool sameUpToSign(const AttitudeConvention& a, const AttitudeConvention& b) {
-    return a.order == b.order && a.sense == b.sense && (a.up == b.up || a.up == oppositeUp(b.up));
+    return a.order == b.order && a.sense == b.sense && a.rigAxes == b.rigAxes &&
+           (a.up == b.up || a.up == oppositeUp(b.up));
 }
 
 }  // namespace
@@ -116,7 +131,17 @@ bool sameUpToSign(const AttitudeConvention& a, const AttitudeConvention& b) {
 // -----------------------------------------------------------------------------
 TEST_CASE("Attitude convention helpers round trip through encode()", "[attitude]") {
     std::mt19937_64 rng(11u);
-    for (const AttitudeConvention& conv : ConventionProbe::candidates()) {
+    // Every plain reading, and each of them with the rig relabelling (the
+    // default among them).
+    std::vector<AttitudeConvention> all = ConventionProbe::candidates();
+    for (const AttitudeConvention& plain : ConventionProbe::candidates()) {
+        REQUIRE_FALSE(plain.rigAxes);
+        AttitudeConvention rig = plain;
+        rig.rigAxes = true;
+        all.push_back(rig);
+    }
+    REQUIRE(all.size() == 32);
+    for (const AttitudeConvention& conv : all) {
         for (int n = 0; n < 50; ++n) {
             const Quatd truth = randomQuat(rng);
             const meta::Quaternion stored = encode(truth, conv);
@@ -128,15 +153,53 @@ TEST_CASE("Attitude convention helpers round trip through encode()", "[attitude]
             REQUIRE(bw.distance(decoded.toMatrix().transposed()) < 1e-12);
         }
     }
-    // Absent quaternion -> identity.
+    // Absent quaternion -> identity, with and without the rig relabelling.
     meta::Quaternion absent;
     REQUIRE(worldFromBodyQuat(absent, AttitudeConvention{}).angleTo(Quatd::identity()) == 0.0);
+    REQUIRE(worldFromBodyQuat(absent, kReading050).angleTo(Quatd::identity()) == 0.0);
     REQUIRE(worldUpVector(WorldUp::Y).y == 1.0);
     REQUIRE(worldUpVector(WorldUp::Z).z == 1.0);
-    REQUIRE(attitudeConventionName(AttitudeConvention{}) == "XYZW/BodyToWorld/-Y");
+    REQUIRE(attitudeConventionName(AttitudeConvention{}) == "XYZW/WorldToBody/Z/rig");
+    REQUIRE(attitudeConventionName(kReading050) == "XYZW/BodyToWorld/-Y");
     REQUIRE(std::string(attitudeSenseName(AttitudeSense::BodyToWorld)) == "BodyToWorld");
     REQUIRE(std::string(worldUpName(WorldUp::Z)) == "Z");
     REQUIRE(ConventionProbe::candidates().size() == 16);
+}
+
+TEST_CASE("The default attitude reading is q' = (f3; -f1, f2, f0) body -> world, +Z up", "[attitude]") {
+    // The default, spelled out: the stored floats read (x, y, z, w) as a
+    // world -> body rotation, with the IMU's axes relabelled into the rig's.
+    const AttitudeConvention def{};
+    REQUIRE(def.order == QuatOrder::XYZW);
+    REQUIRE(def.sense == AttitudeSense::WorldToBody);
+    REQUIRE(def.up == WorldUp::Z);
+    REQUIRE(def.rigAxes);
+    REQUIRE(worldUpVector(def.up).z == 1.0);
+
+    // Closed form against the three-step reading, on arbitrary unit floats.
+    std::mt19937_64 rng(31u);
+    for (int n = 0; n < 200; ++n) {
+        const Quatd r = randomQuat(rng);
+        meta::Quaternion stored;
+        stored.present = true;
+        stored.w = static_cast<float>(r.w);  // f0
+        stored.x = static_cast<float>(r.x);  // f1
+        stored.y = static_cast<float>(r.y);  // f2
+        stored.z = static_cast<float>(r.z);  // f3
+        const Quatd expected =
+            Quatd{stored.z, -stored.x, stored.y, stored.w}.normalized();  // (f3; -f1, f2, f0)
+        const Quatd got = worldFromBodyQuat(stored, def);
+        INFO("n " << n);
+        // angleTo() resolves ~3e-8 near zero (acos of 1 - eps).
+        REQUIRE(got.angleTo(expected) < 1e-7);
+        // The same rotation as K * R_v^T * K^T, R_v = the 0.5.0 reading and
+        // K: (x, y, z) -> (y, -z, -x): the transposed rotation, relabelled.
+        const Mat3d k = Mat3d::fromColumns(Vec3d{0.0, 0.0, -1.0}, Vec3d{1.0, 0.0, 0.0}, Vec3d{0.0, -1.0, 0.0});
+        REQUIRE((k * Vec3d{1.0, 2.0, 3.0} - Vec3d{2.0, -3.0, -1.0}).norm() < 1e-15);
+        REQUIRE_THAT(k.determinant(), Catch::Matchers::WithinAbs(1.0, 1e-15));
+        const Mat3d rv = worldFromBodyQuat(stored, kReading050).toMatrix();
+        REQUIRE(got.toMatrix().distance(k * rv.transposed() * k.transposed()) < 1e-12);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -177,7 +240,8 @@ TEST_CASE("AttitudeTrack slerp midpoint, clamping and tidying", "[attitude]") {
     const double step = track.worldFromBody(999.999).angleTo(track.worldFromBody(1000.001));
     REQUIRE(step < 1e-5);
     REQUIRE_THAT(step, Catch::Matchers::WithinAbs(0.002 / 1000.0 * kHalfPi, 1e-7));
-    REQUIRE(track.worldUp().y == -1.0);
+    // The default reading's world: +Z up.
+    REQUIRE(track.worldUp().z == 1.0);
     REQUIRE(track.clockFit().n == 0);
 
     // Nothing usable -> error, and an empty track answers identity.
@@ -260,98 +324,275 @@ TEST_CASE("ConventionProbe recovers every convention from synthetic gravity", "[
 //  ConventionProbe::autoDetect - the reading every `auto` caller uses
 // -----------------------------------------------------------------------------
 //
-//  camera_acc is the specific force in the accelerometer's world frame, a
-//  quarter turn about Y from the verified reading's world frame.  The numbers
-//  below are the measured means of two car-mounted clips from a second camera
-//  (firmware 10.00.25): the mapped vector matched each car's turn axis within
-//  2 deg, while plain -Y left the horizons 9 and 29 deg tilted.
+//  The default reading's world is level (+Z up) by construction, so `auto`
+//  never levels on the accelerometer.  camera_acc is a body-frame specific
+//  force in its own axis order, (a_y, a_x, -a_z) in rig axes; its clip mean
+//  is the gravity reaction on a car or a tripod and must agree with the
+//  reading's body up.  That agreement is the canary.
 namespace {
 
-/// Samples whose acc is `meanAcc` plus Gaussian noise, with random attitudes
-/// (the attitude must not influence the measured up at all).
-std::vector<ProbeSample> gravitySamples(const Vec3d& meanAcc, double noiseG, int count, std::uint64_t seed) {
+/// The rig-axes vector `r` as camera_acc stores it: the map (a_y, a_x, -a_z)
+/// is its own inverse, so (r.y, r.x, -r.z).
+Vec3d accelerometerFromRig(const Vec3d& r) { return Vec3d{r.y, r.x, -r.z}; }
+
+/// A car clip with a known truth: a camera mounted on its side with the
+/// given tilt (the day clip: world up sits 28 deg from the body's -X towards
+/// +Z), driving `turnDeg` of heading about the true vertical with a little
+/// pitch and roll from the road.  Returns the true worldFromBody per frame.
+std::vector<Quatd> carTurn(double mountTiltDeg, double turnDeg, int frames) {
+    // The mount: a turn about the body's +Y that carries the body up
+    // (-cos t, 0, sin t) onto +Z.
+    const Quatd mount = Quatd::fromAxisAngle(Vec3d{0.0, 1.0, 0.0}, deg2rad(90.0 - mountTiltDeg));
+    std::vector<Quatd> out;
+    out.reserve(static_cast<std::size_t>(frames));
+    for (int k = 0; k < frames; ++k) {
+        const double s = frames > 1 ? static_cast<double>(k) / static_cast<double>(frames - 1) : 0.0;
+        // Road pitch and body roll: a degree, slowly varying.
+        const Quatd road = Quatd::fromAxisAngle(Vec3d{1.0, 0.0, 0.0}, deg2rad(1.0 * std::sin(7.0 * s))) *
+                           Quatd::fromAxisAngle(Vec3d{0.0, 1.0, 0.0}, deg2rad(0.8 * std::cos(5.0 * s)));
+        const Quatd heading = Quatd::fromAxisAngle(Vec3d{0.0, 0.0, 1.0}, deg2rad(turnDeg * s));
+        out.push_back((heading * road * mount).normalized());
+    }
+    return out;
+}
+
+/// Probe samples for a truth sequence: the attitude stored through `conv`,
+/// the accelerometer reading the body's gravity reaction (1 g up, plus
+/// `extraG` of the given body-frame acceleration and Gaussian noise).
+std::vector<ProbeSample> probeSamples(const std::vector<Quatd>& truth, const AttitudeConvention& conv, double noiseG,
+                                      std::uint64_t seed) {
     std::mt19937_64 rng(seed);
     std::normal_distribution<double> noise(0.0, noiseG);
     std::vector<ProbeSample> samples;
-    samples.reserve(static_cast<std::size_t>(count));
-    for (int n = 0; n < count; ++n) {
-        const Vec3d acc = meanAcc + Vec3d{noise(rng), noise(rng), noise(rng)};
-        samples.push_back({encode(randomQuat(rng), AttitudeConvention{}), Vec3f(acc)});
+    samples.reserve(truth.size());
+    for (const Quatd& q : truth) {
+        const Vec3d upBody = q.conj().rotate(Vec3d{0.0, 0.0, 1.0});
+        const Vec3d acc = accelerometerFromRig(upBody) + Vec3d{noise(rng), noise(rng), noise(rng)};
+        samples.push_back({encode(q, conv), Vec3f(acc)});
     }
     return samples;
 }
 
-}  // namespace
-
-TEST_CASE("ConventionProbe::autoDetect levels on the measured gravity", "[attitude][probe]") {
-    // ---- the night car clip: 9 deg off -Y --------------------------------------
-    {
-        const AutoConvention a = ConventionProbe::autoDetect(gravitySamples({-0.111, -0.987, -0.112}, 0.05, 256, 7u));
-        INFO(a.reason);
-        REQUIRE(a.upFromAccelerometer);
-        REQUIRE(a.framesUsed == 256);
-        // Order and sense stay at the verified default.
-        REQUIRE(a.conv.order == QuatOrder::XYZW);
-        REQUIRE(a.conv.sense == AttitudeSense::BodyToWorld);
-        REQUIRE(a.conv.up == WorldUp::NegY);
-        // (a.z, a.y, -a.x) of the normalised mean.
-        const Vec3d expected = Vec3d{-0.112, -0.987, 0.111}.normalized();
-        REQUIRE(rad2deg(a.measuredUp.angleTo(expected)) < 1.0);
-        REQUIRE_THAT(a.measuredUp.norm(), Catch::Matchers::WithinAbs(1.0, 1e-9));
-        REQUIRE_THAT(a.tiltDeg, Catch::Matchers::WithinAbs(9.1, 0.6));
-        REQUIRE_THAT(a.meanAccG, Catch::Matchers::WithinAbs(1.0, 0.02));
-    }
-    // ---- the day car clip: 29 deg off -Y, still accepted -----------------------
-    {
-        const AutoConvention a = ConventionProbe::autoDetect(gravitySamples({0.034, -0.877, -0.478}, 0.05, 256, 8u));
-        INFO(a.reason);
-        REQUIRE(a.upFromAccelerometer);
-        const Vec3d expected = Vec3d{-0.478, -0.877, -0.034}.normalized();
-        REQUIRE(rad2deg(a.measuredUp.angleTo(expected)) < 1.0);
-        REQUIRE_THAT(a.tiltDeg, Catch::Matchers::WithinAbs(28.7, 0.8));
-    }
-    // ---- applyTo hands both the reading and the measured up to the track -------
-    {
-        const AutoConvention a = ConventionProbe::autoDetect(gravitySamples({0.0, -1.0, -0.2}, 0.02, 64, 9u));
-        REQUIRE(a.upFromAccelerometer);
-        AttitudeTrack::Options options;
-        a.applyTo(options);
-        REQUIRE(options.conv.up == a.conv.up);
-        REQUIRE(rad2deg(options.measuredUp.angleTo(a.measuredUp)) < 1e-9);
-        auto track = AttitudeTrack::fromSamples({{0.0, Quatd::identity()}, {1000.0, Quatd::identity()}}, options);
-        REQUIRE(track.ok());
-        REQUIRE(rad2deg(track.value().worldUp().angleTo(a.measuredUp)) < 1e-9);
-    }
+/// The default reading, no measured up: what every autoDetect must return.
+void requireDefaultReading(const AutoConvention& a) {
+    INFO(a.reason);
+    REQUIRE(sameConvention(a.conv, AttitudeConvention{}));
+    REQUIRE(a.measuredUp.norm() == 0.0);
+    // The log line always says what the levelling is based on.
+    REQUIRE(a.reason.find("level on the attitude's own up (Z)") == 0);
 }
 
-TEST_CASE("ConventionProbe::autoDetect keeps -Y when the accelerometer is not a clean gravity reaction",
+}  // namespace
+
+TEST_CASE("ConventionProbe::autoDetect levels on the attitude alone; the accelerometer agrees on a car",
           "[attitude][probe]") {
-    const auto expectDefault = [](const AutoConvention& a) {
-        INFO(a.reason);
-        REQUIRE_FALSE(a.upFromAccelerometer);
-        REQUIRE(a.measuredUp.norm() == 0.0);
-        REQUIRE(a.conv.up == WorldUp::NegY);
-        REQUIRE(a.conv.order == QuatOrder::XYZW);
-        REQUIRE(a.conv.sense == AttitudeSense::BodyToWorld);
-    };
+    // ---- the day clip's geometry: 28 deg mount tilt, a 106 deg turn ----------------
+    const std::vector<Quatd> truth = carTurn(28.0, 106.0, 256);
+    const AutoConvention a = ConventionProbe::autoDetect(probeSamples(truth, AttitudeConvention{}, 0.05, 7u));
+    requireDefaultReading(a);
+    REQUIRE(a.framesUsed == 256);
+    REQUIRE(a.canaryMeasured);
+    REQUIRE(a.canaryJudged);
+    REQUIRE_FALSE(a.canaryWarning);
+    // Noise and the road's pitch / roll only: well under a degree.
+    REQUIRE(a.canaryDeg < 1.0);
+    REQUIRE_THAT(a.meanAccG, Catch::Matchers::WithinAbs(1.0, 0.02));
+    REQUIRE(a.spreadDeg < 10.0);
+    REQUIRE(a.reason.find("accelerometer canary: gravity") != std::string::npos);
+
+    // ---- applyTo hands over the reading and clears a stale measured up --------------
+    AttitudeTrack::Options options;
+    options.conv = kReading050;
+    options.measuredUp = Vec3d{0.1, -1.0, 0.3};
+    a.applyTo(options);
+    REQUIRE(sameConvention(options.conv, AttitudeConvention{}));
+    REQUIRE(options.measuredUp.norm() == 0.0);
+    auto track = AttitudeTrack::fromSamples({{0.0, Quatd::identity()}, {1000.0, Quatd::identity()}}, options);
+    REQUIRE(track.ok());
+    REQUIRE(rad2deg(track.value().worldUp().angleTo(Vec3d{0.0, 0.0, 1.0})) < 1e-12);
+
+    // ---- the accelerometer cannot move the levelling, whatever it says ----------------
+    // A clean 1 g reaction 40 deg away from the reading's up: the canary
+    // fires, the reading stays.
+    std::vector<ProbeSample> off = probeSamples(truth, AttitudeConvention{}, 0.02, 8u);
+    const Quatd skew = Quatd::fromAxisAngle(Vec3d{0.0, 1.0, 0.0}, deg2rad(40.0));
+    // accelerometerFromRig is its own inverse: the inner call takes the
+    // stored acc to rig axes, the outer one back to the sensor's.
+    for (ProbeSample& s : off) {
+        s.acc = Vec3f(accelerometerFromRig(skew.rotate(accelerometerFromRig(s.acc.toDouble()))));
+    }
+    const AutoConvention warned = ConventionProbe::autoDetect(off);
+    requireDefaultReading(warned);
+    REQUIRE(warned.canaryJudged);
+    REQUIRE(warned.canaryWarning);
+    REQUIRE_THAT(warned.canaryDeg, Catch::Matchers::WithinAbs(40.0, 1.0));
+    REQUIRE(warned.reason.find("WARNING accelerometer canary") != std::string::npos);
+    // Just inside the threshold: no warning.  The turn is about the body's
+    // +Y, perpendicular to the body up (-cos 28, 0, sin 28), so the angle
+    // between the two is the full turn.
+    std::vector<ProbeSample> near = probeSamples(truth, AttitudeConvention{}, 0.0, 9u);
+    const Quatd small = Quatd::fromAxisAngle(Vec3d{0.0, 1.0, 0.0}, deg2rad(kAttitudeCanaryWarnDeg - 1.0));
+    for (ProbeSample& s : near) {
+        s.acc = Vec3f(accelerometerFromRig(small.rotate(accelerometerFromRig(s.acc.toDouble()))));
+    }
+    const AutoConvention quiet = ConventionProbe::autoDetect(near);
+    REQUIRE(quiet.canaryJudged);
+    REQUIRE_FALSE(quiet.canaryWarning);
+    REQUIRE_THAT(quiet.canaryDeg, Catch::Matchers::WithinAbs(kAttitudeCanaryWarnDeg - 1.0, 0.5));
+}
+
+TEST_CASE("ConventionProbe::autoDetect reports no canary verdict when the accelerometer is not gravity",
+          "[attitude][probe]") {
+    const std::vector<Quatd> truth = carTurn(28.0, 60.0, 256);
     // No data, and fewer than the 8 frames a measurement needs.
-    expectDefault(ConventionProbe::autoDetect(std::vector<ProbeSample>{}));
-    expectDefault(ConventionProbe::autoDetect(gravitySamples({0.0, -1.0, 0.0}, 0.01, 7, 1u)));
-    // Aerobatics: the direction swings far more than 35 deg around the mean.
-    expectDefault(ConventionProbe::autoDetect(gravitySamples({0.0, -1.0, 0.0}, 1.2, 256, 2u)));
-    // Free fall / a dead sensor: the mean is far below 0.6 g.
-    expectDefault(ConventionProbe::autoDetect(gravitySamples({0.0, -0.2, 0.0}, 0.01, 256, 3u)));
-    // A sustained 2 g: not gravity alone.
-    expectDefault(ConventionProbe::autoDetect(gravitySamples({0.0, -2.0, 0.0}, 0.01, 256, 4u)));
-    // Clean, but more than 60 deg from -Y: not trusted.
-    expectDefault(ConventionProbe::autoDetect(gravitySamples({0.0, 0.0, 1.0}, 0.01, 256, 5u)));
-    // Zero and non-finite frames are ignored rather than averaged in.
-    std::vector<ProbeSample> junk = gravitySamples({0.0, -1.0, 0.0}, 0.01, 4, 6u);
-    junk.push_back({meta::Quaternion{}, Vec3f{0.0f, 0.0f, 0.0f}});
-    junk.push_back({meta::Quaternion{}, Vec3f{std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f}});
+    {
+        const AutoConvention a = ConventionProbe::autoDetect(std::vector<ProbeSample>{});
+        requireDefaultReading(a);
+        REQUIRE_FALSE(a.canaryMeasured);
+        REQUIRE_FALSE(a.canaryWarning);
+        REQUIRE(a.framesUsed == 0);
+    }
+    {
+        std::vector<ProbeSample> few = probeSamples(truth, AttitudeConvention{}, 0.01, 1u);
+        few.resize(7);
+        const AutoConvention a = ConventionProbe::autoDetect(few);
+        requireDefaultReading(a);
+        REQUIRE_FALSE(a.canaryMeasured);
+        REQUIRE(a.framesUsed == 7);
+    }
+    // Aerobatics (the direction swings far more than 35 deg), free fall and
+    // a sustained 2 g: measured, never judged, never a warning, even with a
+    // gravity far from the reading's up.
+    const auto scaled = [&](double gain, double noiseG, std::uint64_t seed) {
+        std::vector<ProbeSample> s = probeSamples(truth, AttitudeConvention{}, 0.0, seed);
+        std::mt19937_64 rng(seed + 100u);
+        std::normal_distribution<double> noise(0.0, noiseG);
+        for (ProbeSample& p : s) {
+            p.acc = Vec3f(p.acc.toDouble() * gain + Vec3d{noise(rng), noise(rng), noise(rng)});
+        }
+        return s;
+    };
+    for (const auto& [gain, noiseG] : {std::pair{1.0, 1.2}, std::pair{0.2, 0.01}, std::pair{2.0, 0.01}}) {
+        const AutoConvention a = ConventionProbe::autoDetect(scaled(gain, noiseG, 2u));
+        INFO("gain " << gain << " noise " << noiseG);
+        requireDefaultReading(a);
+        REQUIRE(a.canaryMeasured);
+        REQUIRE_FALSE(a.canaryJudged);
+        REQUIRE_FALSE(a.canaryWarning);
+        REQUIRE(a.reason.find("canary not judged") != std::string::npos);
+    }
+    // An upside-down accelerometer (gravity 180 deg from the reading's up) on
+    // a noisy aerial clip: still no verdict.
+    {
+        std::vector<ProbeSample> s = scaled(-1.0, 1.2, 3u);
+        const AutoConvention a = ConventionProbe::autoDetect(s);
+        requireDefaultReading(a);
+        REQUIRE_FALSE(a.canaryWarning);
+    }
+    // Zero / non-finite accelerations and frames without an attitude are
+    // ignored rather than averaged in.
+    std::vector<ProbeSample> junk = probeSamples(truth, AttitudeConvention{}, 0.01, 6u);
+    junk.resize(10);
+    junk.push_back({encode(truth[0], AttitudeConvention{}), Vec3f{0.0f, 0.0f, 0.0f}});
+    junk.push_back({encode(truth[0], AttitudeConvention{}),
+                    Vec3f{std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f}});
+    junk.push_back({meta::Quaternion{}, Vec3f{0.0f, 0.0f, 1.0f}});
     const AutoConvention fromJunk = ConventionProbe::autoDetect(junk);
-    REQUIRE(fromJunk.framesUsed == 4);
-    expectDefault(fromJunk);
+    requireDefaultReading(fromJunk);
+    REQUIRE(fromJunk.framesUsed == 10);
+    REQUIRE(fromJunk.canaryJudged);
+    REQUIRE(fromJunk.canaryDeg < 1.0);
+}
+
+TEST_CASE("A car turning about the true vertical levels with the 0.5.1 reading and not with 0.5.0's",
+          "[attitude][probe][stab]") {
+    // The day clip's geometry: a camera on its side, 28 deg mount tilt, a
+    // 106 deg turn.  The stored floats are what the camera would write if
+    // the 0.5.1 reading is right (encoded through its inverse); the 0.5.0
+    // rule reads the same floats as XYZW / body -> world and levels on the
+    // accelerometer mapped as a world-frame vector, (a.z, a.y, -a.x).
+    constexpr int kFrames = 300;
+    const std::vector<Quatd> truth = carTurn(28.0, 106.0, kFrames);
+    const std::vector<ProbeSample> samples = probeSamples(truth, AttitudeConvention{}, 0.0, 12u);
+
+    // ---- both readings as tracks, exactly as the engine builds them ----------------
+    AttitudeTrack::Options now;
+    ConventionProbe::autoDetect(samples).applyTo(now);
+    AttitudeTrack::Options before;
+    before.conv = kReading050;
+    {
+        Vec3d mean{0.0, 0.0, 0.0};
+        for (const ProbeSample& s : samples) {
+            mean += s.acc.toDouble();
+        }
+        const Vec3d m = mean.normalized();
+        before.measuredUp = Vec3d{m.z, m.y, -m.x};  // 0.5.0's measured up
+    }
+    std::vector<AttitudeTrack::Sample> nowSamples;
+    std::vector<AttitudeTrack::Sample> beforeSamples;
+    for (int k = 0; k < kFrames; ++k) {
+        const double t = 1000.0 * k;
+        nowSamples.push_back({t, worldFromBodyQuat(samples[static_cast<std::size_t>(k)].attitude, now.conv)});
+        beforeSamples.push_back(
+            {t, worldFromBodyQuat(samples[static_cast<std::size_t>(k)].attitude, before.conv)});
+    }
+    auto nowTrack = AttitudeTrack::fromSamples(nowSamples, now);
+    auto beforeTrack = AttitudeTrack::fromSamples(beforeSamples, before);
+    REQUIRE(nowTrack.ok());
+    REQUIRE(beforeTrack.ok());
+
+    // ---- Horizon Lock: where the render's zenith sits in the body --------------------
+    // C maps view rays into the body, so C * (0,0,1) is the render's up as the
+    // body sees it; the truth is the body's real up.
+    StabilizationParams horizon;
+    horizon.mode = StabilizationMode::HorizonLock;
+    double worstNow = 0.0;
+    double bestBefore = 180.0;
+    for (int k = 0; k < kFrames; ++k) {
+        const double t = 1000.0 * k;
+        const Vec3d trueUp = truth[static_cast<std::size_t>(k)].conj().rotate(Vec3d{0.0, 0.0, 1.0});
+        const Mat3d cNow = stabilizationBodyFromWorld(nowTrack.value().worldFromBody(t), horizon,
+                                                      nowTrack.value().worldFromBody(0.0), nowTrack.value().worldUp());
+        const Mat3d cBefore =
+            stabilizationBodyFromWorld(beforeTrack.value().worldFromBody(t), horizon,
+                                       beforeTrack.value().worldFromBody(0.0), beforeTrack.value().worldUp());
+        worstNow = std::max(worstNow, rad2deg((cNow * Vec3d{0.0, 0.0, 1.0}).angleTo(trueUp)));
+        bestBefore = std::min(bestBefore, rad2deg((cBefore * Vec3d{0.0, 0.0, 1.0}).angleTo(trueUp)));
+    }
+    INFO("horizon error: 0.5.1 worst " << worstNow << " deg, 0.5.0 best " << bestBefore << " deg");
+    REQUIRE(worstNow < 0.5);
+    // 0.5.0 levels on the body's -X every frame: off by the full mount tilt.
+    REQUIRE(bestBefore > 20.0);
+
+    // ---- Full: a fixed world direction (the sun) stays put in the view --------------
+    StabilizationParams full;
+    full.mode = StabilizationMode::Full;
+    const Vec3d sunWorld = Vec3d{0.3, 0.9, 0.12}.normalized();
+    Vec3d firstNow;
+    Vec3d firstBefore;
+    double driftNow = 0.0;
+    double driftBefore = 0.0;
+    for (int k = 0; k < kFrames; ++k) {
+        const double t = 1000.0 * k;
+        // The sun as the camera body sees it, then into each reading's view.
+        const Vec3d sunBody = truth[static_cast<std::size_t>(k)].conj().rotate(sunWorld);
+        const Mat3d cNow = stabilizationBodyFromWorld(nowTrack.value().worldFromBody(t), full,
+                                                      nowTrack.value().worldFromBody(0.0), nowTrack.value().worldUp());
+        const Mat3d cBefore =
+            stabilizationBodyFromWorld(beforeTrack.value().worldFromBody(t), full,
+                                       beforeTrack.value().worldFromBody(0.0), beforeTrack.value().worldUp());
+        const Vec3d vNow = cNow.transposed() * sunBody;
+        const Vec3d vBefore = cBefore.transposed() * sunBody;
+        if (k == 0) {
+            firstNow = vNow;
+            firstBefore = vBefore;
+        }
+        driftNow = std::max(driftNow, rad2deg(vNow.angleTo(firstNow)));
+        driftBefore = std::max(driftBefore, rad2deg(vBefore.angleTo(firstBefore)));
+    }
+    INFO("sun drift in the Full view: 0.5.1 " << driftNow << " deg, 0.5.0 " << driftBefore << " deg");
+    REQUIRE(driftNow < 0.5);
+    REQUIRE(driftBefore > 20.0);
 }
 
 TEST_CASE("AttitudeTrack::worldUp ignores a degenerate measured up", "[attitude]") {
@@ -924,9 +1165,12 @@ TEST_CASE("ConventionProbe on the sample clip", "[attitude][sample]") {
     // Discriminating check (verified by rendering with horizon lock): the
     // sample clip was shot from an aircraft with the lens axes horizontal and
     // the sky centred on the body -X direction.  Under the default reading
-    // (XYZW, body->world, world up = -Y) the world up vector lands near body
-    // -X on every frame; the previously assumed reading (XYZW, world->body,
-    // +Y up) does not level the picture at all.
+    // (q' = (f3; -f1, f2, f0), +Z up) the world up vector lands near body -X
+    // on every frame - and so it does under the 0.5.0 reading (XYZW,
+    // body->world, -Y up): at this one, nearly constant pose the two agree,
+    // which is why the sample could never tell them apart.  The reading
+    // assumed before both (XYZW, world->body, +Y up) does not level the
+    // picture at all.
     const auto frame0 = s.track.frame(0);
     REQUIRE(frame0.ok());
     const meta::Quaternion att = frame0.value().camera.attitude;
@@ -934,13 +1178,16 @@ TEST_CASE("ConventionProbe on the sample clip", "[attitude][sample]") {
     REQUIRE_THAT(att.w, Catch::Matchers::WithinAbs(0.46131432, 1e-6));
     const AttitudeConvention documented{};
     REQUIRE(documented.order == QuatOrder::XYZW);
-    REQUIRE(documented.sense == AttitudeSense::BodyToWorld);
-    REQUIRE(documented.up == WorldUp::NegY);
+    REQUIRE(documented.sense == AttitudeSense::WorldToBody);
+    REQUIRE(documented.up == WorldUp::Z);
+    REQUIRE(documented.rigAxes);
     const Vec3d skyBody{-1.0, 0.0, 0.0};
     const Vec3d upDocumented = bodyFromWorldMatrix(att, documented) * worldUpVector(documented.up);
     INFO("world up in body frame: " << upDocumented.x << ", " << upDocumented.y << ", " << upDocumented.z);
     REQUIRE(rad2deg(upDocumented.angleTo(skyBody)) < 15.0);
-    const AttitudeConvention previous{QuatOrder::XYZW, AttitudeSense::WorldToBody, WorldUp::Y};
+    const Vec3d up050 = bodyFromWorldMatrix(att, kReading050) * worldUpVector(kReading050.up);
+    REQUIRE(rad2deg(up050.angleTo(skyBody)) < 15.0);
+    const AttitudeConvention previous{QuatOrder::XYZW, AttitudeSense::WorldToBody, WorldUp::Y, false};
     const Vec3d upPrevious = bodyFromWorldMatrix(att, previous) * worldUpVector(WorldUp::Y);
     REQUIRE(rad2deg(upPrevious.angleTo(skyBody)) > 30.0);
     // And it holds for every frame of the clip, not just the first.
@@ -949,6 +1196,48 @@ TEST_CASE("ConventionProbe on the sample clip", "[attitude][sample]") {
         REQUIRE(f.ok());
         const Vec3d up = bodyFromWorldMatrix(f.value().camera.attitude, documented) * worldUpVector(documented.up);
         REQUIRE(rad2deg(up.angleTo(skyBody)) < 15.0);
+    }
+}
+
+TEST_CASE("On the sample clip the 0.5.1 body up equals the 0.5.0 -Y body up within 1 deg on every frame",
+          "[attitude][sample]") {
+    // The maintainer's airborne sample was levelled by eye under the 0.5.0
+    // reading (-Y up); its horizon must not move with the new reading.
+    // Both the .OSV and its .LRF proxy, every recorded frame.
+    OSV_REQUIRE_SAMPLE();
+    std::vector<std::filesystem::path> clips{osvtest::sampleOsv()};
+    if (osvtest::haveSampleLrf()) {
+        clips.push_back(osvtest::sampleLrf());
+    }
+    for (const std::filesystem::path& clip : clips) {
+        const std::unique_ptr<SampleMeta> sample = openSample(clip);
+        const meta::MetadataTrack& track = sample->track;
+        REQUIRE(track.frameCount() > 0);
+        double worstDeg = 0.0;
+        std::uint32_t compared = 0;
+        for (std::uint32_t i = 0; i < track.frameCount(); ++i) {
+            const auto f = track.frame(i);
+            REQUIRE(f.ok());
+            const meta::Quaternion& att = f.value().camera.attitude;
+            if (!att.present) {
+                continue;
+            }
+            const Vec3d upNow = bodyFromWorldMatrix(att, AttitudeConvention{}) * Vec3d{0.0, 0.0, 1.0};
+            const Vec3d up050 = bodyFromWorldMatrix(att, kReading050) * Vec3d{0.0, -1.0, 0.0};
+            worstDeg = std::max(worstDeg, rad2deg(upNow.angleTo(up050)));
+            ++compared;
+        }
+        INFO(clip.filename().string() << ": " << compared << " frames, worst " << worstDeg << " deg");
+        REQUIRE(compared == track.frameCount());
+        REQUIRE(worstDeg < 1.0);
+        // The accelerometer canary has no verdict on an airborne clip: its
+        // camera_acc measures the flight, not gravity.
+        const AutoConvention a = ConventionProbe::autoDetect(track);
+        INFO(a.reason);
+        REQUIRE(sameConvention(a.conv, AttitudeConvention{}));
+        REQUIRE(a.measuredUp.norm() == 0.0);
+        REQUIRE_FALSE(a.canaryJudged);
+        REQUIRE_FALSE(a.canaryWarning);
     }
 }
 
@@ -971,7 +1260,7 @@ TEST_CASE("Stabilization Full on the sample clip is identity at the reference fr
     const double angleDeg = rad2deg(Quatd::fromMatrix(c).angleTo(Quatd::identity()));
     REQUIRE(angleDeg > 0.5);
     REQUIRE(angleDeg < 3.0);
-    // HorizonLock with the documented Y-up convention keeps the view level.
+    // HorizonLock with the documented +Z-up reading keeps the view level.
     params.mode = StabilizationMode::HorizonLock;
     const Mat3d h = stabilizationBodyFromWorld(last, params, reference, track.worldUp());
     const Vec3d viewUpWorld = last.toMatrix() * (h * Vec3d{0.0, 0.0, 1.0});

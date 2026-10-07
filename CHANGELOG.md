@@ -6,6 +6,29 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## 0.5.1 (unreleased)
+
+### Fixed
+
+* **Horizon Lock is level on mounted clips, in every host.** 0.5.0 still
+  left the two 8K car drives leaning: lamp posts 28° off on the sunset
+  drive and 7-11° at night, the sunset sun at +36° when it sat 7° above the
+  horizon. The camera's stored attitude was being read transposed, and the
+  airborne sample, whose attitude barely moves, could not tell the two
+  readings apart. The new reading levels both drives within about 4° of
+  their lamp posts and keeps the sun at +6 to +10° through a 106° turn,
+  with no help from the accelerometer. Full and Smooth now turn with the
+  car instead of against it. Premiere, VEGAS and Resolve share the fix, the
+  Playback Proxy included. The sample's horizon moves by less than half a
+  pixel. Saved projects with Pan keyframes on mounted clips will see their
+  horizon move: that is the fix.
+* The accelerometer no longer steers the levelling; it is a canary. The
+  log names the angle between its gravity and the attitude's up (under 1°
+  on the car drives) and warns above 15°.
+* osvtool `--attitude-convention` takes a `-rig` suffix: `auto` is
+  `xyzw-w2b-z-rig`, and `xyzw-b2w-ny` still gives the old reading, for
+  comparisons.
+
 ## [0.5.0] - 2026-10-07
 
 8K and night footage, fixed at the cause. Built on a user's car-mounted 8K
