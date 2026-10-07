@@ -211,6 +211,28 @@ struct FlareParams {
     double sunMinFill = 0.5;             ///< Blob area / bounding-box area lower limit.
     double sunMinAreaPx = 3.0;           ///< Minimum blob area (analysis px).
 
+    // ---- can the sun be in view at all? -------------------------------------
+    /// Scene exposure value (EV100, see flareSceneEv100) below which a frame
+    /// is too dark for the sun to be in view, so nothing is looked for in it.
+    /// Every relative test above crowns a street lamp at night (a clipped
+    /// lamp decodes to the same level as the clipped sun, and the night median
+    /// is tiny); how much light the camera needed to expose the frame cannot
+    /// be fooled that way.  Measured: a night street 2.1 - 4.4, the sample's
+    /// sun through an ND filter 9.05, a bare sunset 11.1 - 11.7.  6 keeps 1.6
+    /// stops of margin over the night and 3 under the filtered sun.  NaN
+    /// switches the gate off.
+    double minSceneEv100 = 6.0;
+
+    // ---- one sun ------------------------------------------------------------
+    /// Two lenses that each report a sun must agree on its direction within
+    /// this angle (body frame) for both to be believed.  The lens alignment
+    /// disagrees by about 1 degree RMS between the lenses; 3 covers it.
+    double oneSunToleranceDeg = 3.0;
+    /// When they disagree, the larger blob is still the sun if its clipped
+    /// area is at least this multiple of the other's (a sunset sun against
+    /// a glint measured 275x median); otherwise neither is trusted.
+    double oneSunAreaRatio = 4.0;
+
     // ---- candidates ---------------------------------------------------------
     double corridorDeg = 20.0;           ///< Azimuth tolerance about the sun line (both directions).
     double backgroundSigmaPx = 12.0;     ///< Background blur for the relative band-pass (analysis px).
@@ -257,6 +279,8 @@ struct FlareParams {
 
 /// Downsample and analyse both lenses of a frame pair.  Host frames use the
 /// CPU sampler; device-only frames need an installed FlareDeviceSampler.
+/// The two lenses' suns are then held to one sun (resolveOneSun): a lens
+/// whose sun the rule drops is returned empty (no sun, no ghosts).
 [[nodiscard]] Result<FlareModel> analyseFlare(const geom::LensRig& rig, const video::FramePair& frames,
                                               const OsvColorParams& color, const FlareParams& params,
                                               ThreadPool& pool);
@@ -308,16 +332,63 @@ using FlareSunFixes = std::array<FlareSunFix, 2>;
                                     const FlareParams& params) noexcept;
 
 /// The sun check of a frame pair: both lenses at flareSunCheckFactor, host
-/// or device frames (see flareDownsampleLens).
+/// or device frames (see flareDownsampleLens), reduced to one sun by
+/// resolveOneSun.
 [[nodiscard]] Result<FlareSunFixes> locateSuns(const geom::LensRig& rig, const video::FramePair& frames,
                                                const OsvColorParams& color, const FlareParams& params,
                                                ThreadPool& pool);
 
+/// There is one sun: reduce two lenses' independent sun checks to what can
+/// be the same light source.
+///
+/// Each found sun is turned into a body-frame direction (the lens's
+/// unprojection, rotated back through bodyToLens).  When both lenses report
+/// one:
+///   * within params.oneSunToleranceDeg of each other, both are kept - the
+///     sun sits in the overlap and each lens sees it;
+///   * farther apart, the one whose clipped area (radiusPx squared) is at
+///     least params.oneSunAreaRatio times the other's is kept and the other
+///     dropped (a glint in the far lens);
+///   * otherwise both are dropped: two similar bright blobs in two
+///     directions are lamps, signs or reflections, not the sun.
+/// A single sun, or none, passes unchanged.  A sun whose direction cannot be
+/// computed (bad lens, bad position) counts as disagreeing; invalid
+/// parameters drop both - every doubt removes nothing.  Pure, no allocation.
+[[nodiscard]] FlareSunFixes resolveOneSun(const geom::LensRig& rig, const FlareSunFixes& fixes,
+                                          const FlareParams& params) noexcept;
+
 /// True when two sun checks describe the same sun: present in the same
 /// lenses, and each within `tolerancePx` of the other.  Both sides must come
 /// from the same kind of check (the importer compares sun checks with sun
-/// checks, never with a model's own full-resolution sun).
+/// checks, never with a model's own full-resolution sun), and both must
+/// already be resolved to one sun (locateSuns does that), so a glint the
+/// rule dropped never makes two checks of the same sun differ.
 [[nodiscard]] bool flareSunsMatch(const FlareSunFixes& a, const FlareSunFixes& b, double tolerancePx) noexcept;
+
+// ===========================================================================
+//  The scene-brightness gate
+// ===========================================================================
+//
+// The sun in view means a daylit scene, and the camera's own exposure says
+// how bright the scene is: the light it needed for this frame.  That is an
+// absolute measure where every image test is relative, so it tells a night
+// street's clipped lamps from the clipped sun, which no ratio to the frame's
+// median can (the clip level is the same for both).
+
+/// Scene exposure value at ISO 100 from the camera's settings for one frame:
+///
+///     EV100 = log2(N^2 / t) - log2(ISO / 100)
+///
+/// with `fNumber` N, `exposureSeconds` t and the sensor `iso`.  NaN when any
+/// input is not a finite positive number (unknown: callers then behave as if
+/// there were no gate).  Through an ND filter the value reads darker than
+/// the scene, never brighter.
+[[nodiscard]] double flareSceneEv100(double fNumber, double exposureSeconds, double iso) noexcept;
+
+/// True when `sceneEv100` is known (finite) and below params.minSceneEv100:
+/// the frame is too dark for the sun to be in view.  An unknown value or a
+/// NaN threshold never gates.
+[[nodiscard]] bool flareSceneTooDark(double sceneEv100, const FlareParams& params) noexcept;
 
 // ===========================================================================
 //  Veil (OFF by default - read before enabling)
