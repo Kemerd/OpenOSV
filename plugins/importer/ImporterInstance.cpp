@@ -700,10 +700,12 @@ Status ImporterInstance::rebuildRig() {
     // Note what the focal source means for a calibration switch: with
     // DigitalFocalLength both lenses take the clip's one digital focal length,
     // so a set contributes its principal point, radial terms, extrinsic
-    // rotation and occlusion arc - but not its own fx/fy (unless those
-    // disagree with the digital focal length by more than 1.2x, see
-    // LensRig.cpp).  On the sample that is the verified-best choice: the
-    // per-lens calibration focal measured a lower overlap NCC (0.807 vs 0.824).
+    // rotation and occlusion arc - but not its own fx/fy, unless those
+    // disagree with the digital focal length by more than 0.5 % (see
+    // LensRig.cpp).  On the 6K sample that is the verified-best choice: the
+    // per-lens calibration focal measured a lower overlap NCC (0.807 vs
+    // 0.824).  8K-mode clips record a value 1.3-2.7 % off their lenses and
+    // take the calibrated focal instead.
     const geom::ExtrinsicConvention conv;  // defaults are the verified values
     auto rig = geom::LensRig::build(calibration, scaling.value(), geom::FocalSource::DigitalFocalLength,
                                     m_format.digitalFocalLength, conv, 195.18);
@@ -1581,16 +1583,14 @@ void ImporterInstance::rebuildStabilization() {
         return;
     }
 
-    // Convention detection is the same two-branch rule Pipeline.cpp uses for
-    // `--attitude-convention auto`: trust the accelerometer probe only when
-    // the clip really carries a gravity-like vector.
+    // Convention detection is the rule Pipeline.cpp uses for
+    // `--attitude-convention auto`: the verified reading, with the world-up
+    // axis measured from the accelerometer's world-frame gravity reaction.
     geom::AttitudeTrack::Options attOpt;
-    const geom::ConventionScore best = geom::ConventionProbe::best(m_track);
-    if (best.framesUsed > 0 && best.meanGravityAngleDeg < 15.0) {
-        attOpt.conv = best.conv;
-    } else {
-        attOpt.conv = geom::AttitudeConvention{};
-    }
+    const geom::AutoConvention detected = geom::ConventionProbe::autoDetect(m_track);
+    detected.applyTo(attOpt);
+    PluginLog::info("stabilisation: '{}': attitude reading {}: {}", m_path.filename().string(),
+                    geom::attitudeConventionName(detected.conv), detected.reason);
 
     auto built = geom::AttitudeTrack::build(m_track, attOpt);
     if (!built.ok() || built.value().sampleCount() == 0) {

@@ -79,6 +79,11 @@ public:
         bool dense = false;           ///< Use every IMU batch sample instead of one per frame.
         int batchAnchorIndex = 4;     ///< Batch entry that coincides with the frame timestamp.
         double extraOffsetUs = 0.0;   ///< Additional time offset applied to dense samples (us).
+        /// Measured world-up direction in the convention's world frame.  The
+        /// IMU's world frame is not always level (car-mounted clips sit 9 to
+        /// 29 deg off -Y), so `auto` measures the true up from the
+        /// accelerometer and passes it here.  Zero length = conv.up.
+        Vec3d measuredUp{0.0, 0.0, 0.0};
     };
 
     /// One orientation sample.
@@ -125,7 +130,8 @@ public:
     /// The clock fit computed at build time (n == 0 when no IMU batches).
     [[nodiscard]] const ClockFit& clockFit() const noexcept { return m_clockFit; }
 
-    /// Unit world-up vector of the convention used to build the track.
+    /// Unit world-up vector the track was built with: Options::measuredUp
+    /// when one was measured, else the convention's axis.
     [[nodiscard]] Vec3d worldUp() const noexcept;
 
     /// The options used to build the track.

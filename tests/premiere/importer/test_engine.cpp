@@ -452,10 +452,7 @@ TEST_CASE("every stabilisation mode reaches the engine's frame, Smooth + Horizon
     auto track = osv::meta::MetadataTrack::load(file.value());
     REQUIRE(track.ok());
     osv::geom::AttitudeTrack::Options attOpt;
-    const osv::geom::ConventionScore best = osv::geom::ConventionProbe::best(track.value());
-    if (best.framesUsed > 0 && best.meanGravityAngleDeg < 15.0) {
-        attOpt.conv = best.conv;
-    }
+    osv::geom::ConventionProbe::autoDetect(track.value()).applyTo(attOpt);
     auto built = osv::geom::AttitudeTrack::build(track.value(), attOpt);
     REQUIRE(built.ok());
     const osv::geom::AttitudeTrack& attitude = built.value();

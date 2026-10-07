@@ -5,6 +5,8 @@
 *.lrf
 *.pkg
 ref/
+# user-supplied sample clips for stitch regression (never committed)
+ref_hc/
 
 # ---- build outputs ----
 build/

@@ -464,10 +464,7 @@ void partB(const Options& o) {
         // the Gaussian smoothing the default mode, smooth + horizon lock, adds.
         const double attitudeMs = timeMs([&] {
             osv::geom::AttitudeTrack::Options attOpt;
-            const osv::geom::ConventionScore best = osv::geom::ConventionProbe::best(pipe->track);
-            if (best.framesUsed > 0 && best.meanGravityAngleDeg < 15.0) {
-                attOpt.conv = best.conv;
-            }
+            osv::geom::ConventionProbe::autoDetect(pipe->track).applyTo(attOpt);
             auto built = osv::geom::AttitudeTrack::build(pipe->track, attOpt);
             if (built.ok()) {
                 std::vector<osv::Quatd> perSample;

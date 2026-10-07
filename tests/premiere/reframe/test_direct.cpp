@@ -738,10 +738,7 @@ std::unique_ptr<SampleClip> openSampleClip() {
     // ---- smooth + horizon lock (rebuildStabilization) -----------------------
     clip->stab.mode = geom::StabilizationMode::SmoothLevel;
     geom::AttitudeTrack::Options attOpt;
-    const geom::ConventionScore best = geom::ConventionProbe::best(clip->track);
-    if (best.framesUsed > 0 && best.meanGravityAngleDeg < 15.0) {
-        attOpt.conv = best.conv;
-    }
+    geom::ConventionProbe::autoDetect(clip->track).applyTo(attOpt);
     auto att = geom::AttitudeTrack::build(clip->track, attOpt);
     if (att.ok() && att.value().sampleCount() > 0) {
         clip->attitude = std::move(att).value();

@@ -257,6 +257,120 @@ TEST_CASE("ConventionProbe recovers every convention from synthetic gravity", "[
 }
 
 // -----------------------------------------------------------------------------
+//  ConventionProbe::autoDetect - the reading every `auto` caller uses
+// -----------------------------------------------------------------------------
+//
+//  camera_acc is the specific force in the accelerometer's world frame, a
+//  quarter turn about Y from the verified reading's world frame.  The numbers
+//  below are the measured means of two car-mounted clips from a second camera
+//  (firmware 10.00.25): the mapped vector matched each car's turn axis within
+//  2 deg, while plain -Y left the horizons 9 and 29 deg tilted.
+namespace {
+
+/// Samples whose acc is `meanAcc` plus Gaussian noise, with random attitudes
+/// (the attitude must not influence the measured up at all).
+std::vector<ProbeSample> gravitySamples(const Vec3d& meanAcc, double noiseG, int count, std::uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    std::normal_distribution<double> noise(0.0, noiseG);
+    std::vector<ProbeSample> samples;
+    samples.reserve(static_cast<std::size_t>(count));
+    for (int n = 0; n < count; ++n) {
+        const Vec3d acc = meanAcc + Vec3d{noise(rng), noise(rng), noise(rng)};
+        samples.push_back({encode(randomQuat(rng), AttitudeConvention{}), Vec3f(acc)});
+    }
+    return samples;
+}
+
+}  // namespace
+
+TEST_CASE("ConventionProbe::autoDetect levels on the measured gravity", "[attitude][probe]") {
+    // ---- the night car clip: 9 deg off -Y --------------------------------------
+    {
+        const AutoConvention a = ConventionProbe::autoDetect(gravitySamples({-0.111, -0.987, -0.112}, 0.05, 256, 7u));
+        INFO(a.reason);
+        REQUIRE(a.upFromAccelerometer);
+        REQUIRE(a.framesUsed == 256);
+        // Order and sense stay at the verified default.
+        REQUIRE(a.conv.order == QuatOrder::XYZW);
+        REQUIRE(a.conv.sense == AttitudeSense::BodyToWorld);
+        REQUIRE(a.conv.up == WorldUp::NegY);
+        // (a.z, a.y, -a.x) of the normalised mean.
+        const Vec3d expected = Vec3d{-0.112, -0.987, 0.111}.normalized();
+        REQUIRE(rad2deg(a.measuredUp.angleTo(expected)) < 1.0);
+        REQUIRE_THAT(a.measuredUp.norm(), Catch::Matchers::WithinAbs(1.0, 1e-9));
+        REQUIRE_THAT(a.tiltDeg, Catch::Matchers::WithinAbs(9.1, 0.6));
+        REQUIRE_THAT(a.meanAccG, Catch::Matchers::WithinAbs(1.0, 0.02));
+    }
+    // ---- the day car clip: 29 deg off -Y, still accepted -----------------------
+    {
+        const AutoConvention a = ConventionProbe::autoDetect(gravitySamples({0.034, -0.877, -0.478}, 0.05, 256, 8u));
+        INFO(a.reason);
+        REQUIRE(a.upFromAccelerometer);
+        const Vec3d expected = Vec3d{-0.478, -0.877, -0.034}.normalized();
+        REQUIRE(rad2deg(a.measuredUp.angleTo(expected)) < 1.0);
+        REQUIRE_THAT(a.tiltDeg, Catch::Matchers::WithinAbs(28.7, 0.8));
+    }
+    // ---- applyTo hands both the reading and the measured up to the track -------
+    {
+        const AutoConvention a = ConventionProbe::autoDetect(gravitySamples({0.0, -1.0, -0.2}, 0.02, 64, 9u));
+        REQUIRE(a.upFromAccelerometer);
+        AttitudeTrack::Options options;
+        a.applyTo(options);
+        REQUIRE(options.conv.up == a.conv.up);
+        REQUIRE(rad2deg(options.measuredUp.angleTo(a.measuredUp)) < 1e-9);
+        auto track = AttitudeTrack::fromSamples({{0.0, Quatd::identity()}, {1000.0, Quatd::identity()}}, options);
+        REQUIRE(track.ok());
+        REQUIRE(rad2deg(track.value().worldUp().angleTo(a.measuredUp)) < 1e-9);
+    }
+}
+
+TEST_CASE("ConventionProbe::autoDetect keeps -Y when the accelerometer is not a clean gravity reaction",
+          "[attitude][probe]") {
+    const auto expectDefault = [](const AutoConvention& a) {
+        INFO(a.reason);
+        REQUIRE_FALSE(a.upFromAccelerometer);
+        REQUIRE(a.measuredUp.norm() == 0.0);
+        REQUIRE(a.conv.up == WorldUp::NegY);
+        REQUIRE(a.conv.order == QuatOrder::XYZW);
+        REQUIRE(a.conv.sense == AttitudeSense::BodyToWorld);
+    };
+    // No data, and fewer than the 8 frames a measurement needs.
+    expectDefault(ConventionProbe::autoDetect(std::vector<ProbeSample>{}));
+    expectDefault(ConventionProbe::autoDetect(gravitySamples({0.0, -1.0, 0.0}, 0.01, 7, 1u)));
+    // Aerobatics: the direction swings far more than 35 deg around the mean.
+    expectDefault(ConventionProbe::autoDetect(gravitySamples({0.0, -1.0, 0.0}, 1.2, 256, 2u)));
+    // Free fall / a dead sensor: the mean is far below 0.6 g.
+    expectDefault(ConventionProbe::autoDetect(gravitySamples({0.0, -0.2, 0.0}, 0.01, 256, 3u)));
+    // A sustained 2 g: not gravity alone.
+    expectDefault(ConventionProbe::autoDetect(gravitySamples({0.0, -2.0, 0.0}, 0.01, 256, 4u)));
+    // Clean, but more than 60 deg from -Y: not trusted.
+    expectDefault(ConventionProbe::autoDetect(gravitySamples({0.0, 0.0, 1.0}, 0.01, 256, 5u)));
+    // Zero and non-finite frames are ignored rather than averaged in.
+    std::vector<ProbeSample> junk = gravitySamples({0.0, -1.0, 0.0}, 0.01, 4, 6u);
+    junk.push_back({meta::Quaternion{}, Vec3f{0.0f, 0.0f, 0.0f}});
+    junk.push_back({meta::Quaternion{}, Vec3f{std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f}});
+    const AutoConvention fromJunk = ConventionProbe::autoDetect(junk);
+    REQUIRE(fromJunk.framesUsed == 4);
+    expectDefault(fromJunk);
+}
+
+TEST_CASE("AttitudeTrack::worldUp ignores a degenerate measured up", "[attitude]") {
+    AttitudeTrack::Options options;
+    options.conv.up = WorldUp::Z;
+    for (const Vec3d bad : {Vec3d{0.0, 0.0, 0.0}, Vec3d{std::numeric_limits<double>::quiet_NaN(), 1.0, 0.0}}) {
+        options.measuredUp = bad;
+        auto track = AttitudeTrack::fromSamples({{0.0, Quatd::identity()}, {1000.0, Quatd::identity()}}, options);
+        REQUIRE(track.ok());
+        REQUIRE(rad2deg(track.value().worldUp().angleTo(Vec3d{0.0, 0.0, 1.0})) < 1e-9);
+    }
+    // A non-unit measurement comes back normalised.
+    options.measuredUp = Vec3d{0.0, -3.0, 0.0};
+    auto track = AttitudeTrack::fromSamples({{0.0, Quatd::identity()}, {1000.0, Quatd::identity()}}, options);
+    REQUIRE(track.ok());
+    REQUIRE_THAT(track.value().worldUp().y, Catch::Matchers::WithinAbs(-1.0, 1e-12));
+}
+
+// -----------------------------------------------------------------------------
 //  Stabilisation
 // -----------------------------------------------------------------------------
 TEST_CASE("Stabilization corrections: Off, Full, HorizonLock, Smooth", "[attitude][stab]") {

@@ -369,21 +369,13 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     if (p->stabParams.mode != geom::StabilizationMode::Off) {
         geom::AttitudeTrack::Options attOpt;
         if (lower(options.attitudeConvention) == "auto") {
-            // The accelerometer probe only decides when the clip actually
-            // carries a gravity-like vector (mean angle well below 15 deg);
-            // otherwise the best-supported documented reading is used.
-            const geom::ConventionScore best = geom::ConventionProbe::best(p->track);
-            if (best.framesUsed > 0 && best.meanGravityAngleDeg < 15.0) {
-                attOpt.conv = best.conv;
-                p->notes.push_back("attitude convention (auto, probe): " + geom::attitudeConventionName(best.conv) +
-                                   ", mean gravity angle " + std::to_string(best.meanGravityAngleDeg) + " deg");
-            } else {
-                attOpt.conv = geom::AttitudeConvention{};
-                p->notes.push_back("attitude convention (auto, default): " +
-                                   geom::attitudeConventionName(attOpt.conv) +
-                                   " (probe inconclusive, mean gravity angle " +
-                                   std::to_string(best.meanGravityAngleDeg) + " deg)");
-            }
+            // The verified reading, with the world-up axis measured from the
+            // accelerometer's world-frame gravity reaction when it is clean
+            // (the same rule the importer's horizon lock uses).
+            const geom::AutoConvention detected = geom::ConventionProbe::autoDetect(p->track);
+            detected.applyTo(attOpt);
+            p->notes.push_back("attitude convention (auto): " + geom::attitudeConventionName(detected.conv) + ", " +
+                               detected.reason);
         } else if (!parseAttitudeConvention(options.attitudeConvention, attOpt.conv)) {
             return Error{ErrorCode::InvalidArgument,
                          "unknown --attitude-convention '" + options.attitudeConvention + "'"};

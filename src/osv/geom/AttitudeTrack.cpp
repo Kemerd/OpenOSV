@@ -218,7 +218,15 @@ double AttitudeTrack::beginUs() const noexcept { return m_samples.empty() ? 0.0 
 
 double AttitudeTrack::endUs() const noexcept { return m_samples.empty() ? 0.0 : m_samples.back().tUs; }
 
-Vec3d AttitudeTrack::worldUp() const noexcept { return worldUpVector(m_options.conv.up); }
+Vec3d AttitudeTrack::worldUp() const noexcept {
+    // A measured up wins when it is a usable direction; anything degenerate
+    // (zero, NaN) falls back to the convention's axis.
+    const Vec3d& measured = m_options.measuredUp;
+    if (measured.isFinite() && measured.norm() > 1e-6) {
+        return measured.normalized();
+    }
+    return worldUpVector(m_options.conv.up);
+}
 
 // -----------------------------------------------------------------------------
 //  Clock fit

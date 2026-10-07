@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <string>
 
 namespace osv::geom {
 
@@ -123,6 +125,119 @@ ConventionScore ConventionProbe::best(const std::vector<ConventionScore>& scores
 
 ConventionScore ConventionProbe::best(const meta::MetadataTrack& track, std::size_t maxFrames) {
     return best(scoreAll(track, maxFrames));
+}
+
+// -----------------------------------------------------------------------------
+//  autoDetect: the reading `auto` resolves to
+// -----------------------------------------------------------------------------
+//
+//  camera_acc is the specific force in the accelerometer's world frame.  A
+//  camera at rest, cruising or riding a car feels 1 g straight up, so the
+//  mean of the samples IS the up direction there; one fixed quarter turn
+//  about Y carries it into the verified reading's world frame (see
+//  AutoConvention).  Order and sense cannot be measured this way and keep the
+//  verified default.
+namespace {
+
+/// The accelerometer's world frame -> the verified reading's world frame.
+/// R = [[0,0,1],[0,1,0],[-1,0,0]], a quarter turn about +Y.
+[[nodiscard]] Vec3d accelerometerToWorld(const Vec3d& a) noexcept { return Vec3d{a.z, a.y, -a.x}; }
+
+}  // namespace
+
+AutoConvention ConventionProbe::autoDetect(const std::vector<ProbeSample>& samples) {
+    AutoConvention out;
+    out.conv = AttitudeConvention{};
+
+    // ---- mean specific force over every usable sample ------------------------
+    Vec3d sum{0.0, 0.0, 0.0};
+    std::vector<Vec3d> accs;
+    accs.reserve(samples.size());
+    for (const ProbeSample& s : samples) {
+        const Vec3d acc = s.acc.toDouble();
+        if (!acc.isFinite() || !(acc.norm() > 1e-6)) {
+            continue;
+        }
+        sum += acc;
+        accs.push_back(acc);
+    }
+    out.framesUsed = accs.size();
+
+    // A handful of frames is not a measurement; keep the default.
+    constexpr std::size_t kMinFrames = 8;
+    if (out.framesUsed < kMinFrames) {
+        out.reason = "level on -Y (the clip carries " + std::to_string(out.framesUsed) +
+                     " accelerometer frames, too few to measure gravity)";
+        return out;
+    }
+    const Vec3d mean = sum / static_cast<double>(out.framesUsed);
+    out.meanAccG = mean.norm();
+    if (!(out.meanAccG > 1e-6)) {
+        out.reason = "level on -Y (the accelerometer averages to zero)";
+        return out;
+    }
+    const Vec3d meanDir = mean / out.meanAccG;
+
+    // ---- how steady the direction is -------------------------------------------
+    double spread = 0.0;
+    for (const Vec3d& a : accs) {
+        spread += rad2deg(a.angleTo(meanDir));
+    }
+    out.spreadDeg = spread / static_cast<double>(out.framesUsed);
+
+    // ---- the measured up in the verified world frame ---------------------------
+    const Vec3d up = accelerometerToWorld(meanDir).normalized();
+    const Vec3d axis = worldUpVector(out.conv.up);
+    out.tiltDeg = rad2deg(up.angleTo(axis));
+
+    // ---- accept only a clean gravity reaction ----------------------------------
+    // Thresholds: a car or a hand-held walk keeps the mean near 1 g and every
+    // frame within a few tens of degrees; an aerobatic clip (the airborne
+    // sample swings 0.4..3.4 g) does not, and then -Y stands.  The frame tilt
+    // measured so far is 9..29 deg; past 60 deg the reading is not trusted.
+    constexpr double kMinG = 0.6;
+    constexpr double kMaxG = 1.4;
+    constexpr double kMaxSpreadDeg = 35.0;
+    constexpr double kMaxTiltDeg = 60.0;
+    const bool clean = out.meanAccG >= kMinG && out.meanAccG <= kMaxG && out.spreadDeg <= kMaxSpreadDeg &&
+                       out.tiltDeg <= kMaxTiltDeg && up.isFinite();
+    char numbers[192];
+    std::snprintf(numbers, sizeof(numbers), "mean %.2f g, spread %.1f deg, %.1f deg from -Y, %zu frames",
+                  out.meanAccG, out.spreadDeg, out.tiltDeg, out.framesUsed);
+    if (!clean) {
+        out.reason = std::string("level on -Y (accelerometer not a clean gravity reaction: ") + numbers + ")";
+        return out;
+    }
+    out.measuredUp = up;
+    out.upFromAccelerometer = true;
+    out.reason = std::string("level on the measured gravity (") + numbers + ")";
+    return out;
+}
+
+AutoConvention ConventionProbe::autoDetect(const meta::MetadataTrack& track, std::size_t maxFrames) {
+    // Even sampling over the whole clip, so a launch or a hard brake in the
+    // first seconds cannot dominate the mean.
+    std::vector<ProbeSample> samples;
+    const std::size_t count = static_cast<std::size_t>(track.frameCount());
+    if (count == 0 || maxFrames == 0) {
+        return autoDetect(samples);
+    }
+    const std::size_t take = std::min(count, maxFrames);
+    samples.reserve(take);
+    for (std::size_t k = 0; k < take; ++k) {
+        // The first frame of each of `take` equal slices of the clip.
+        const std::size_t i = take == count ? k : (k * count) / take;
+        const Result<meta::FrameMeta> frame = track.frame(static_cast<std::uint32_t>(i));
+        if (!frame.ok()) {
+            continue;
+        }
+        const meta::FrameMeta& f = frame.value();
+        if (!f.camera.accPresent) {
+            continue;
+        }
+        samples.push_back(ProbeSample{f.camera.attitude, f.camera.acc});
+    }
+    return autoDetect(samples);
 }
 
 }  // namespace osv::geom
