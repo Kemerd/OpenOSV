@@ -205,6 +205,10 @@ void hashClipParams(Hasher& h, const render::ClipSteadyParams& p) noexcept {
         h.f64(v);
     }
     h.u64(p.minGrids);
+    // The verdict's tolerance and the sample minimum change the result too.
+    h.f64(d.maxFailedFraction);
+    h.f64(d.maxFailedLoss);
+    h.u64(p.minSamples);
 }
 
 /// Lower-case hex of a hash.
@@ -472,6 +476,26 @@ private:
         s += (s.empty() ? "" : ", ") + std::to_string(f);
     }
     return s;
+}
+
+/// "; frame 7080 could not be decoded (...); measured frame 7105 in its place"
+/// - a measurement's sample notes as a log suffix (empty when there are none).
+[[nodiscard]] std::string notesSuffix(const std::vector<std::string>& notes) {
+    std::string s;
+    for (const std::string& n : notes) {
+        s += "; " + n;
+    }
+    return s;
+}
+
+/// The substitutes for an undecodable sample of `planned` (render::
+/// clipSampleAlternates over the request's own sync table): a function of the
+/// clip alone, like the sample frames themselves.
+[[nodiscard]] render::ClipFrameAlternates alternatesFor(const SteadyRequest& r,
+                                                        const std::vector<std::uint32_t>& planned) {
+    return [frameCount = r.frameCount, sync = r.syncFrames, planned](std::uint32_t frame) {
+        return render::clipSampleAlternates(frame, frameCount, sync, planned);
+    };
 }
 
 /// The identity key of a request (no filesystem access: cheap per frame).
@@ -825,9 +849,14 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
             rp.backend = render::FlowBackendKind::ClassicalCuda;
             const auto t0 = Clock::now();
             auto measured = render::measureLensRotation(job.baseRig, job.blend, frames, source, rp,
-                                                        render::LensRotationParams{}, ensurePool(), cancelled);
+                                                        render::LensRotationParams{}, ensurePool(), cancelled,
+                                                        alternatesFor(job, frames));
             const double ms = msSince(t0);
             std::optional<LensAlignVerdict> verdict;
+            // A verdict from substituted or skipped samples is kept for this
+            // session only: the disk cache's key names the PLANNED frames, and
+            // a later build that decodes them must measure on them.
+            bool persist = true;
             if (measured.ok()) {
                 const render::LensRotationMeasurement& m = measured.value();
                 LensAlignVerdict v;
@@ -841,10 +870,11 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
                 } else {
                     v.summary = "no rotation the flow agrees on: " + m.reason;
                 }
+                persist = m.sampleNotes.empty();
                 verdict = v;
-                PluginLog::info("lens alignment: '{}': {} - measured in {:.0f} ms (decode {:.0f}) on frames {}",
+                PluginLog::info("lens alignment: '{}': {} - measured in {:.0f} ms (decode {:.0f}) on frames {}{}",
                                 clipName, v.accepted ? v.summary : "keeping the calibration; " + v.summary, ms,
-                                m.decodeMs, frameList(frames));
+                                m.decodeMs, frameList(m.frames), notesSuffix(m.sampleNotes));
             } else if (!cancelled()) {
                 PluginLog::warn("lens alignment: '{}': could not be measured ({}); keeping the calibration",
                                 clipName, measured.error().message);
@@ -856,7 +886,9 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
                     g.rotationsInFlight.erase(rk);
                     if (verdict) {
                         g.rotations[rk] = *verdict;
-                        appendDisk(rk, *verdict);
+                        if (persist) {
+                            appendDisk(rk, *verdict);
+                        }
                     }
                 }
                 g.cv.notify_all();
@@ -928,7 +960,7 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
             publish(gen, [&](Snapshot& s) { s.samples.emplace_back(frame, std::move(grid)); });
         };
         auto measured = render::measureClipSteady(rig, job.blend, frames, source, params, ensurePool(), onSample,
-                                                  cancelled);
+                                                  cancelled, alternatesFor(job, frames));
         if (measured.ok()) {
             clip = std::make_shared<const render::ClipSteady>(std::move(measured).value());
         } else if (!cancelled()) {
@@ -969,12 +1001,13 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
         }();
         PluginLog::info("steady: '{}': clip correction ready {:.0f} ms after the first request ({}; {} sample frames "
                         "{}, {} grids accepted; decode {:.0f} / measure {:.0f} / finish {:.0f} ms): grid {}, seam "
-                        "table {}, seam {}; Auto: {}",
+                        "table {}, seam {}; Auto: {}{}",
                         clipName, sinceRequest, produce ? std::format("measured in {:.0f} ms", msSince(tJob))
                                                         : std::string("another instance measured it"),
                         clip->frames.size(), frameList(clip->frames), clip->acceptedGrids, clip->decodeMs,
                         clip->measureMs, clip->finishMs, clip->grid ? "yes" : "no", clip->seamTable ? "yes" : "no",
-                        clip->seam ? "yes" : "no", render::describeSteadyDecision(clip->decision));
+                        clip->seam ? "yes" : "no", render::describeSteadyDecision(clip->decision),
+                        notesSuffix(clip->sampleNotes));
     }
     publish(gen, [&](Snapshot& s) {
         s.clipSettled = true;

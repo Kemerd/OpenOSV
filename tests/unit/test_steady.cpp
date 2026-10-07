@@ -39,11 +39,13 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace osv;
@@ -423,6 +425,99 @@ TEST_CASE("the sample frames depend on the clip alone", "[steady][clip]") {
     CHECK(render::clipSampleFrames(100, {}, 1) == std::vector<std::uint32_t>{50});
 }
 
+TEST_CASE("a sample the decoder refuses has fixed substitutes between its neighbours", "[steady][clip]") {
+    // A long clip: the neighbouring SYNC frames, nearest first, the later on a tie.
+    std::vector<std::uint32_t> sync;
+    for (std::uint32_t s = 0; s < 3600; s += 60) {
+        sync.push_back(s);
+    }
+    const auto samples = render::clipSampleFrames(3600, sync, 9);
+    REQUIRE(samples == std::vector<std::uint32_t>{0, 420, 900, 1320, 1800, 2220, 2700, 3120, 3540});
+    CHECK(render::clipSampleAlternates(1800, 3600, sync, samples) == std::vector<std::uint32_t>{1860, 1740});
+    CHECK(render::clipSampleAlternates(0, 3600, sync, samples) == std::vector<std::uint32_t>{60, 120});
+    CHECK(render::clipSampleAlternates(3540, 3600, sync, samples) == std::vector<std::uint32_t>{3480, 3420});
+    CHECK(render::clipSampleAlternates(1800, 3600, sync, samples, 1) == std::vector<std::uint32_t>{1860});
+    // Never past a neighbouring sample: 420's substitutes stay inside (0, 900).
+    for (const std::uint32_t f : render::clipSampleAlternates(420, 3600, sync, samples, 50)) {
+        CHECK(f > 0u);
+        CHECK(f < 900u);
+    }
+
+    // A short clip: the plain neighbouring frames.
+    const auto shortSamples = render::clipSampleFrames(65, {0, 60}, 9);
+    CHECK(render::clipSampleAlternates(8, 65, {0, 60}, shortSamples) == std::vector<std::uint32_t>{9, 7});
+    CHECK(render::clipSampleAlternates(64, 65, {0, 60}, shortSamples) == std::vector<std::uint32_t>{63, 62});
+    // Neighbours with no room between them, a frame that is not a sample,
+    // a frame past the clip, no substitutes asked for: none.
+    CHECK(render::clipSampleAlternates(2, 5, {}, render::clipSampleFrames(5, {}, 9)).empty());
+    CHECK(render::clipSampleAlternates(10, 65, {0, 60}, shortSamples).empty());
+    CHECK(render::clipSampleAlternates(70, 65, {0, 60}, shortSamples).empty());
+    CHECK(render::clipSampleAlternates(8, 65, {0, 60}, shortSamples, 0).empty());
+}
+
+TEST_CASE("a per-clip measurement skips a sample it cannot decode and fails only below its minimum",
+          "[steady][clip][synthetic]") {
+    ThreadPool pool;
+    auto rig = makeSyntheticRig(1024);
+    REQUIRE(rig.ok());
+    const SynthPair frame = synthPair(rig.value(), texturedSky, pool);
+    geom::BlendParams blend;
+    blend.useOcclusionMask = false;
+    const std::vector<std::uint32_t> frames = render::clipSampleFrames(65, {}, 9);
+    REQUIRE(frames.size() == 9u);
+    // The decoder refuses `bad`; everything else decodes (the same picture).
+    const auto sourceFailing = [&](std::vector<std::uint32_t> bad) {
+        return render::ClipFrameSource([&frame, bad](std::uint32_t f) -> Result<video::FramePair> {
+            if (std::find(bad.begin(), bad.end(), f) != bad.end()) {
+                return Error{ErrorCode::Decoder, "presentation time mismatch"};
+            }
+            video::FramePair p = frame.pair;
+            p.index = f;
+            return p;
+        });
+    };
+    const render::ClipFrameAlternates alternates = [&](std::uint32_t f) {
+        return render::clipSampleAlternates(f, 65, {}, frames);
+    };
+    render::ClipSteadyParams params;
+    params.parallax.backend = render::FlowBackendKind::Classical;
+    params.seamOn = false;  // the grid and the verdict are enough to show the sampling
+
+    SECTION("one replaced, one skipped: measured on the rest, and said so") {
+        // 16 is refused, its first substitute 17 too, its second (15) decodes;
+        // 40 and both its substitutes are refused.
+        auto m = render::measureClipSteady(rig.value(), blend, frames, sourceFailing({16, 17, 40, 41, 39}), params,
+                                           pool, {}, {}, alternates);
+        REQUIRE(m.ok());
+        CHECK(m.value().frames == std::vector<std::uint32_t>{0, 8, 15, 24, 32, 48, 56, 64});
+        REQUIRE(m.value().sampleNotes.size() == 2u);
+        CHECK(m.value().sampleNotes[0].find("measured frame 15 in its place") != std::string::npos);
+        CHECK(m.value().sampleNotes[1].find("frame 40 could not be decoded") != std::string::npos);
+        CHECK(m.value().sampleNotes[1].find("skipped") != std::string::npos);
+    }
+    SECTION("fewer than the minimum decode: an error naming every refusal") {
+        auto m = render::measureClipSteady(rig.value(), blend, frames, sourceFailing({0, 8, 16, 24, 32}), params,
+                                           pool);
+        REQUIRE_FALSE(m.ok());
+        CHECK(m.error().message.find("only 4 of 9") != std::string::npos);
+        CHECK(m.error().message.find("frame 32 could not be decoded") != std::string::npos);
+    }
+    SECTION("the lens rotation: two of three are enough") {
+        render::ParallaxWarpParams pw;
+        pw.backend = render::FlowBackendKind::Classical;
+        const std::vector<std::uint32_t> three{6, 32, 58};
+        auto m = render::measureLensRotation(rig.value(), blend, three, sourceFailing({32, 33, 31}), pw, {}, pool, {},
+                                             [&](std::uint32_t f) {
+                                                 return render::clipSampleAlternates(f, 65, {}, three);
+                                             });
+        REQUIRE(m.ok());
+        CHECK(m.value().frames == std::vector<std::uint32_t>{6, 58});
+        CHECK(m.value().sampleNotes.size() == 1u);
+        auto none = render::measureLensRotation(rig.value(), blend, three, sourceFailing({6, 32}), pw, {}, pool);
+        CHECK_FALSE(none.ok());
+    }
+}
+
 TEST_CASE("the clip correction's medians are medians, and a median seam is a valid seam", "[steady][clip]") {
     SECTION("grid") {
         render::ParallaxWarpGrid a;
@@ -553,6 +648,42 @@ TEST_CASE("Auto holds a static near object still and follows one that moves", "[
         INFO(render::describeSteadyDecision(d));
         CHECK(d.steady);
     }
+}
+
+TEST_CASE("Auto tolerates a few small failures, never many or large ones", "[steady][auto]") {
+    const render::SteadyDecisionParams p;
+    // Nothing failed: steady, as before the tolerance existed.
+    CHECK(render::steadyWithinTolerance(23, 0, 0.0, p));
+    CHECK(render::steadyWithinTolerance(0, 0, 0.0, p));
+    // 5 % of the judged sectors, rounded down: 77 judged tolerate 3 ...
+    CHECK(render::steadyWithinTolerance(77, 3, 0.09, p));
+    CHECK_FALSE(render::steadyWithinTolerance(77, 4, 0.05, p));
+    // ... 20 tolerate one, 19 none.
+    CHECK(render::steadyWithinTolerance(20, 1, 0.01, p));
+    CHECK_FALSE(render::steadyWithinTolerance(19, 1, 0.01, p));
+    // A rare failure that loses more than the sample's own largest kept loss is no transient.
+    CHECK_FALSE(render::steadyWithinTolerance(77, 1, 0.15, p));
+    // A user's car-mounted 8K clips (measured): follows scene, as they should.
+    CHECK_FALSE(render::steadyWithinTolerance(77, 6, 0.152, p));
+    CHECK_FALSE(render::steadyWithinTolerance(105, 11, 0.663, p));
+    // Garbage tolerates nothing.
+    CHECK_FALSE(render::steadyWithinTolerance(77, 1, std::nan(""), p));
+    CHECK_FALSE(render::steadyWithinTolerance(2, 3, 0.0, p));
+    render::SteadyDecisionParams bad;
+    bad.maxFailedFraction = std::nan("");
+    CHECK_FALSE(render::steadyWithinTolerance(77, 1, 0.01, bad));
+    // decideSteady refuses the tolerance out of range.
+    bad = render::SteadyDecisionParams{};
+    bad.maxFailedLoss = -0.1;
+    CHECK_FALSE(render::decideSteady({}, render::SeamCorrection{}, bad).ok());
+
+    // The log line says when failures were tolerated.
+    render::SteadyDecision d;
+    d.judged = 40;
+    d.failed = 1;
+    d.worstFailedLoss = 0.05;
+    d.steady = true;
+    CHECK(render::describeSteadyDecision(d).find("within the tolerance") != std::string::npos);
 }
 
 TEST_CASE("decideSteady refuses malformed input", "[steady][auto]") {

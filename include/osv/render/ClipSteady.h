@@ -66,11 +66,22 @@
 //     correction's gain.  A near object that moved past the seam fails (the
 //     median of the other samples has no parallax where it now is: the gain
 //     kept is ~0); a static one does not (the median carries it).
-//   * Steady when no judged sector of any sample fails.
+//   * Steady when at most maxFailedFraction (5 %) of the judged sectors
+//     fail and none of them loses more than maxFailedLoss (0.10 NCC).
 //
 // On the sample clip (rotation folded, the aligned gate) the worst judged
 // sector keeps 74 % of its own gain and none fails, so Auto holds it still;
 // the per-sector loss there is at most 0.053 NCC, at the wing root.
+//
+// The tolerance replaced "steady only when NOTHING fails": a long drive past
+// traffic always has a sample with a passing car in some sector, and one
+// such sector vetoed the clip correction for the whole clip.  A failure is
+// tolerated only while it is rare (a transient) AND small - no larger than
+// the losses the keep test already lets through on the sample clip (up to
+// 0.093 NCC at the wing root, measured with the 8K focal fix in force).  A
+// near object that really moves still fails in many samples and by far more
+// (a user's car-mounted 8K clips: 6 of 77 and 11 of 105 judged sectors, up
+// to 0.15 and 0.66 NCC lost), so those clips keep following the scene.
 #pragma once
 
 #include "osv/core/Result.h"
@@ -121,8 +132,50 @@ inline constexpr std::uint32_t kClipSequentialFrames = 240;
                                                           double lastFraction = 1.0,
                                                           std::uint32_t sequentialFrames = kClipSequentialFrames);
 
-/// Decoded frames for the per-clip analyses, asked for in ascending order.
+/// Decoded frames for the per-clip analyses, asked for in ascending order
+/// (a substitute for a sample the decoder refused may step back once, see
+/// clipSampleAlternates).
 using ClipFrameSource = std::function<Result<video::FramePair>(std::uint32_t frame)>;
+
+// ===========================================================================
+//  A sample frame the decoder refuses
+// ===========================================================================
+// One undecodable sample used to abort the whole per-clip measurement: a
+// user's night driving clip (variable frame rate, a few dropped frames) lost
+// its clip correction to ONE of nine samples, so Steady silently rendered
+// per moment.  A sample that cannot be decoded is now replaced by the nearest
+// frame that can be (the neighbouring sync frame on a long clip), or skipped,
+// and the measurement fails only when fewer than a minimum decode at all.
+// Which frames were used, and why, travels with the result (`frames`,
+// `sampleNotes`), so the log and the caches say what was measured.
+
+/// Fewest of the clip correction's nine samples that must decode: five keep
+/// the per-cell median a majority of the planned samples.
+inline constexpr std::uint32_t kClipSteadyMinSamples = 5;
+/// Fewest of the lens rotation's three samples that must decode: two, the
+/// least combineLensRotations can call an agreement.
+inline constexpr std::uint32_t kLensRotationMinSamples = 2;
+/// Substitutes tried for one undecodable sample before it is skipped.
+inline constexpr std::uint32_t kClipSampleAlternates = 2;
+
+/// Frames to try, in order, in place of sample `frame` when it cannot be
+/// decoded (empty: skip it).  Built by clipSampleAlternates.
+using ClipFrameAlternates = std::function<std::vector<std::uint32_t>(std::uint32_t frame)>;
+
+/// The substitutes for sample `frame` of the sample set `samples` (as
+/// clipSampleFrames returned it): at most `maxAlternates` frames strictly
+/// between the neighbouring samples, so the set stays ascending and
+/// distinct, nearest first and the later one first on a tie (a forward
+/// decoder keeps going forward).  On a clip longer than `sequentialFrames`
+/// with a sync table they are the neighbouring SYNC frames (one cheap decode
+/// each, like the samples themselves); otherwise the neighbouring frames.
+/// Depends on nothing but its arguments.  Empty for a frame outside the
+/// clip, a frame that is not one of `samples`, or maxAlternates == 0.
+[[nodiscard]] std::vector<std::uint32_t> clipSampleAlternates(std::uint32_t frame, std::uint32_t frameCount,
+                                                              const std::vector<std::uint32_t>& syncFrames,
+                                                              const std::vector<std::uint32_t>& samples,
+                                                              std::uint32_t maxAlternates = kClipSampleAlternates,
+                                                              std::uint32_t sequentialFrames = kClipSequentialFrames);
 
 /// Polled between samples: true abandons the measurement (Cancelled).
 using ClipCancel = std::function<bool()>;
@@ -135,7 +188,10 @@ using ClipCancel = std::function<bool()>;
 /// `reason` says why), not an error: a clip of open sky has no rotation to
 /// find, and that verdict is as cacheable as a fit.
 struct LensRotationMeasurement {
-    std::vector<std::uint32_t> frames;      ///< Frames measured.
+    std::vector<std::uint32_t> frames;      ///< Frames measured (substitutes included, skipped samples left out).
+    /// One line per sample that could not be decoded: what replaced it, or
+    /// that it was skipped.  Empty when every planned frame decoded.
+    std::vector<std::string> sampleNotes;
     std::vector<LensRotationFit> perFrame;  ///< The frames whose own fit was accepted.
     std::vector<std::string> refusals;      ///< Why each other frame's fit was refused.
     bool accepted = false;                  ///< `fit` is the clip's rotation.
@@ -148,15 +204,16 @@ struct LensRotationMeasurement {
 /// Measure the rotation on `frames`: each frame's bands through `rig` (the
 /// calibration, uncorrected), the flow and grid as the importer builds them
 /// (`parallax`), the raw cells fitted (fitLensRotation), and the accepted
-/// fits combined (combineLensRotations).  Errors only for a frame that cannot
-/// be decoded, a band render failure, malformed input or cancellation.
-[[nodiscard]] Result<LensRotationMeasurement> measureLensRotation(const geom::LensRig& rig,
-                                                                  const geom::BlendParams& blend,
-                                                                  const std::vector<std::uint32_t>& frames,
-                                                                  const ClipFrameSource& source,
-                                                                  const ParallaxWarpParams& parallax,
-                                                                  const LensRotationParams& params, ThreadPool& pool,
-                                                                  const ClipCancel& cancelled = {});
+/// fits combined (combineLensRotations).  A frame that cannot be decoded is
+/// replaced by the first of `alternates(frame)` that can, else skipped (see
+/// "A sample frame the decoder refuses"); errors only when fewer than
+/// min(`minSamples`, frames.size()) frames decode, for a band render failure,
+/// malformed input or cancellation.
+[[nodiscard]] Result<LensRotationMeasurement> measureLensRotation(
+    const geom::LensRig& rig, const geom::BlendParams& blend, const std::vector<std::uint32_t>& frames,
+    const ClipFrameSource& source, const ParallaxWarpParams& parallax, const LensRotationParams& params,
+    ThreadPool& pool, const ClipCancel& cancelled = {}, const ClipFrameAlternates& alternates = {},
+    std::uint32_t minSamples = kLensRotationMinSamples);
 
 // ===========================================================================
 //  Medians
@@ -208,6 +265,13 @@ struct SteadyDecisionParams {
     /// gate settings (0.74 with the rotation folded); a near object that
     /// moved keeps ~0.
     double minKeep = 0.4;
+    /// The verdict's tolerance (see "Steady when" in the header): at most
+    /// this fraction of the judged sectors may fail ...
+    double maxFailedFraction = 0.05;
+    /// ... and none of those failures may lose more than this NCC: the
+    /// largest loss the keep test already passes on the sample clip (0.093
+    /// at frame 32, the wing root, keeping 73 % of its gain), rounded up.
+    double maxFailedLoss = 0.10;
 };
 
 /// One sample as the Auto rule sees it: its uncorrected bands (as
@@ -235,6 +299,7 @@ struct SteadyDecision {
     std::uint32_t textured = 0;     ///< (sample, sector) pairs with the texture to score at all.
     std::uint32_t judged = 0;       ///< ... of which the own correction aligned something (judged).
     std::uint32_t failed = 0;       ///< ... of which the clip correction lost it (see the header).
+    double worstFailedLoss = 0.0;   ///< The largest NCC loss of a failed pair (0 when none failed).
     double meanLoss = 0.0;          ///< Mean NCC loss (own - clip) over the textured pairs.
     /// The judged pair that kept the least of its own correction's gain
     /// (1 when nothing was judged).
@@ -256,6 +321,13 @@ struct SteadyDecision {
 [[nodiscard]] Result<SteadyDecision> decideSteady(const std::vector<SteadySample>& samples,
                                                   const SeamCorrection& clip, const SteadyDecisionParams& params,
                                                   ThreadPool* pool = nullptr);
+
+/// The verdict's rule on its own (pure): steady when nothing failed, or when
+/// the failures are at most floor(maxFailedFraction x judged) AND none lost
+/// more than maxFailedLoss NCC.  decideSteady sets SteadyDecision::steady
+/// with it; exposed so the tolerance is pinned by tests without footage.
+[[nodiscard]] bool steadyWithinTolerance(std::uint32_t judged, std::uint32_t failed, double worstFailedLoss,
+                                         const SteadyDecisionParams& params) noexcept;
 
 /// "steady: worst sector loses 0.012 NCC (frame 32, 158 deg), 180 judged" -
 /// the log line's words for a verdict.
@@ -287,11 +359,19 @@ struct ClipSteadyParams {
     /// Accepted sample grids needed for a clip grid: fewer is a clip the
     /// flow mostly refused (open sky), which the seam table then serves.
     std::uint32_t minGrids = 3;
+    /// Sample frames that must decode (substitutes count); fewer is an
+    /// error.  Capped at the number of planned frames.
+    std::uint32_t minSamples = kClipSteadyMinSamples;
 };
 
 /// The clip correction and how it was measured.
 struct ClipSteady {
-    std::vector<std::uint32_t> frames;                   ///< Sample frames measured.
+    /// Sample frames measured: the planned ones, a substitute where one could
+    /// not be decoded, a skipped one left out.
+    std::vector<std::uint32_t> frames;
+    /// One line per planned sample that could not be decoded (what replaced
+    /// it, or that it was skipped); empty when every one decoded.
+    std::vector<std::string> sampleNotes;
     std::shared_ptr<const ParallaxWarpGrid> grid;        ///< Clip grid; null when not measured or refused.
     std::uint32_t acceptedGrids = 0;                     ///< Samples whose own grid was accepted.
     std::shared_ptr<const std::vector<float>> seamTable; ///< Clip seam table; null when none was needed or found.
@@ -307,14 +387,17 @@ struct ClipSteady {
 using ClipSampleGridFn = std::function<void(std::uint32_t frame, std::shared_ptr<const ParallaxWarpGrid> grid)>;
 
 /// Measure the clip correction on `frames` through `rig` (which already
-/// carries any lens rotation), in one pass over the frames.  Errors only for
-/// a frame that cannot be decoded, a band render failure, malformed input or
-/// cancellation; an analysis the content refuses (no grid, no table) is a
-/// result with that piece null.
+/// carries any lens rotation), in one pass over the frames.  A frame that
+/// cannot be decoded is replaced by the first of `alternates(frame)` that
+/// can, else skipped (see "A sample frame the decoder refuses").  Errors only
+/// when fewer than min(params.minSamples, frames.size()) frames decode, for a
+/// band render failure, malformed input or cancellation; an analysis the
+/// content refuses (no grid, no table) is a result with that piece null.
 [[nodiscard]] Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::BlendParams& blend,
                                                    const std::vector<std::uint32_t>& frames,
                                                    const ClipFrameSource& source, const ClipSteadyParams& params,
                                                    ThreadPool& pool, const ClipSampleGridFn& onSampleGrid = {},
-                                                   const ClipCancel& cancelled = {});
+                                                   const ClipCancel& cancelled = {},
+                                                   const ClipFrameAlternates& alternates = {});
 
 }  // namespace osv::render
