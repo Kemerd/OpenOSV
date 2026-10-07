@@ -810,3 +810,127 @@ TEST_CASE("osvtool render uses the plug-ins' engine by default; --engine classic
     const RunResult bogus = runTool("render " + clip + " --engine turbo" + frame + quoted(refusedPath));
     CHECK(bogus.exitCode != 0);
 }
+
+// osvtool render --alpha: the coverage alpha a host composites with, written
+// into the stills as a 4th channel - and only when asked, so every render
+// without the flag stays byte-for-byte what it was.  Without it, a band of
+// transparent rows (which a host shows black over a black background) was
+// invisible to every osvtool-based check, because the stills carried RGB only.
+TEST_CASE("osvtool render --alpha writes the coverage alpha into .tif / .png / .exr stills, only when asked",
+          "[cli][alpha][sample]") {
+    OSV_REQUIRE_SAMPLE_LRF();
+    if (std::string(kToolPath).empty() || !std::filesystem::exists(kToolPath)) {
+        SKIP("osvtool not built");
+    }
+    namespace fs = std::filesystem;
+    const std::string clip = quoted(osvtest::sampleLrf());
+    // The research pipeline with a 150-degree lens: the two lenses no longer
+    // meet, so the picture has a real, partly transparent coverage - rows
+    // near the poles that no lens sees - that the alpha must carry.
+    const std::string narrow =
+        " --engine classic --lens-fov 150 --mode equirect --size 256x128 --frame 0 --device cpu";
+    const auto sidecar = [](const fs::path& image) {
+        std::ifstream in(image.string() + ".json");
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+
+    // ---- without the flag: RGB only, as always ----------------------------------------
+    const auto plainTif = osvtest::tempDir() / "cli_alpha_off.tif";
+    const RunResult plain = runTool("render " + clip + narrow + " --out " + quoted(plainTif));
+    INFO(plain.output);
+    REQUIRE(plain.exitCode == 0);
+    CHECK(sidecar(plainTif).find("\"alpha\": false") != std::string::npos);
+    auto plainImage = osv::io::readImage(plainTif);
+    REQUIRE(plainImage.ok());
+
+    // ---- with it: the same colour, plus the coverage -------------------------------------
+    const auto alphaTif = osvtest::tempDir() / "cli_alpha_on.tif";
+    const auto alphaPng = osvtest::tempDir() / "cli_alpha_on.png";
+    const auto alphaExr = osvtest::tempDir() / "cli_alpha_on.exr";
+    for (const fs::path& out : {alphaTif, alphaPng, alphaExr}) {
+        const RunResult r = runTool("render " + clip + narrow + " --alpha --out " + quoted(out));
+        INFO(out.filename().string() << ": " << r.output);
+        REQUIRE(r.exitCode == 0);
+    }
+    CHECK(sidecar(alphaTif).find("\"alpha\": true") != std::string::npos);
+    CHECK(sidecar(alphaPng).find("\"alpha\": true") != std::string::npos);
+    // Four 16-bit channels instead of three.
+    std::error_code ec;
+    CHECK(fs::file_size(alphaTif, ec) > fs::file_size(plainTif, ec) * 5u / 4u);
+
+    auto tif = osv::io::readImage(alphaTif);
+    auto png = osv::io::readImage(alphaPng);
+    auto exr = osv::io::readExr(alphaExr);
+    REQUIRE(tif.ok());
+    REQUIRE(png.ok());
+    REQUIRE(exr.ok());
+    const auto& a = tif.value();
+    REQUIRE(a.w == 256u);
+    REQUIRE(a.h == 128u);
+    REQUIRE(plainImage.value().w == a.w);
+    REQUIRE(plainImage.value().data.size() == a.data.size());
+    REQUIRE(png.value().data.size() == a.data.size());
+    REQUIRE(exr.value().data.size() == a.data.size());
+
+    std::size_t transparentPixels = 0;
+    std::size_t transparentRows = 0;
+    float colourDiff = 0.0f;
+    float pngAlphaDiff = 0.0f;
+    float exrAlphaDiff = 0.0f;
+    float plainAlphaMin = 1.0f;
+    for (std::uint32_t y = 0; y < a.h; ++y) {
+        double rowAlpha = 0.0;
+        for (std::uint32_t x = 0; x < a.w; ++x) {
+            const std::size_t i = (static_cast<std::size_t>(y) * a.w + x) * 4u;
+            // The flag changes nothing about the colour...
+            for (std::size_t c = 0; c < 3; ++c) {
+                colourDiff = std::max(colourDiff, std::fabs(a.data[i + c] - plainImage.value().data[i + c]));
+            }
+            // ...the RGB-only still reads back fully opaque...
+            plainAlphaMin = std::min(plainAlphaMin, plainImage.value().data[i + 3]);
+            // ...and the three formats carry the same alpha (16-bit .tif and
+            // .png exactly; the float .exr to within half a 16-bit step).
+            pngAlphaDiff = std::max(pngAlphaDiff, std::fabs(png.value().data[i + 3] - a.data[i + 3]));
+            exrAlphaDiff = std::max(exrAlphaDiff, std::fabs(exr.value().data[i + 3] - a.data[i + 3]));
+            transparentPixels += a.data[i + 3] < 0.5f ? 1u : 0u;
+            rowAlpha += a.data[i + 3];
+        }
+        transparentRows += rowAlpha < 0.5 * a.w ? 1u : 0u;
+    }
+    INFO("transparent pixels " << transparentPixels << ", transparent rows " << transparentRows);
+    CHECK(colourDiff == 0.0f);
+    CHECK(plainAlphaMin == 1.0f);
+    CHECK(pngAlphaDiff == 0.0f);
+    CHECK(exrAlphaDiff <= 0.5f / 65535.0f + 1e-6f);
+    // The uncovered rows show up - exactly what the RGB-only still hid.
+    CHECK(transparentPixels > 0u);
+    CHECK(transparentRows > 0u);
+
+    // ---- the plug-ins' engine: every row of the .LRF covered ---------------------------
+    const auto engineTif = osvtest::tempDir() / "cli_alpha_engine.tif";
+    const RunResult engine = runTool("render " + clip +
+                                     " --mode equirect --size 256x128 --frame 0 --device cpu --alpha --out " +
+                                     quoted(engineTif));
+    INFO(engine.output);
+    REQUIRE(engine.exitCode == 0);
+    auto delivered = osv::io::readImage(engineTif);
+    REQUIRE(delivered.ok());
+    const auto& d = delivered.value();
+    std::uint32_t worstRow = 0;
+    std::size_t worstOpaque = d.w;
+    for (std::uint32_t y = 0; y < d.h; ++y) {
+        std::size_t opaque = 0;
+        for (std::uint32_t x = 0; x < d.w; ++x) {
+            opaque += d.data[(static_cast<std::size_t>(y) * d.w + x) * 4u + 3u] >= 0.5f ? 1u : 0u;
+        }
+        if (opaque < worstOpaque) {
+            worstOpaque = opaque;
+            worstRow = y;
+        }
+    }
+    INFO("worst row " << worstRow << ": " << worstOpaque << " of " << d.w << " columns opaque");
+    CHECK(worstOpaque * 100u >= static_cast<std::size_t>(d.w) * 95u);
+
+    // ---- the flag is documented -------------------------------------------------------------
+    CHECK(runTool("render --help").output.find("--alpha") != std::string::npos);
+}

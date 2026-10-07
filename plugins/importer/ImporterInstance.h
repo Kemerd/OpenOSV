@@ -37,6 +37,7 @@
 #pragma once
 
 #include "FlareStage.h"  // [WP-FLARE]
+#include "FrameRowCheck.h"
 #include "PixelCopy.h"
 #include "PrefsBlob.h"
 #include "SceneLightStage.h"  // Scene Light
@@ -686,6 +687,17 @@ public:
     }
     void noteVideoRequest() noexcept { m_videoRequests.fetch_add(1, std::memory_order_relaxed); }
 
+    /// Which rendered frames imGetSourceVideo's delivered-row self-check
+    /// looks at: the first few of every delivered size, format and quality
+    /// (rowcheck::FrameBudget).  NOT thread-safe; caller holds m_mutex.
+    [[nodiscard]] rowcheck::FrameBudget& rowCheckBudgetLocked() noexcept { return m_rowCheckBudget; }
+
+    /// The request sizes imGetSourceVideo has already offered its "delivering
+    /// the nearest size" line for (rowcheck::SeenSizes).  Lock-free, because
+    /// the handler asks it before it takes the instance lock - and before the
+    /// cache lookup, so a repeat request costs a few loads and no string.
+    [[nodiscard]] rowcheck::SeenSizes& loggedRequestSizes() noexcept { return m_loggedRequestSizes; }
+
     /// The importer id Premiere assigns this instance (imFileOpenRec8 ::
     /// inImporterID, mirrored into imImageInfoRec::importerID).  It keys
     /// every PPix cache entry, so a zero id means "do not use the cache".
@@ -1235,6 +1247,10 @@ private:
     // an atomic is sufficient - see the accessors above.
     std::atomic<std::uint64_t> m_videoRequests{0};
     std::atomic<std::uint32_t> m_importerId{0};
+    // imGetSourceVideo's diagnostics (FrameRowCheck.h): the size memo is
+    // lock-free like the two above, the frame budget is guarded by m_mutex.
+    rowcheck::SeenSizes m_loggedRequestSizes;  ///< Mismatched request sizes already logged (loggedRequestSizes()).
+    rowcheck::FrameBudget m_rowCheckBudget;    ///< Frames to row-check per delivered geometry (rowCheckBudgetLocked()).
 
     // ---- [WP-IMPORTER] the importer's own frame on the GPU -----------------
     /// Build the equirect stitch job for frame `index` at `geometry` from

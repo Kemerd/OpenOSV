@@ -138,6 +138,10 @@ struct RenderOptions {
     double seamLowSigma = -1.0;    ///< Research: low-band blur sigma, degrees (< 0 = the default).
     int seamInterval = 1;
     std::string out;
+    /// Write the coverage alpha as a fourth channel into still outputs
+    /// (--alpha).  Off by default, so every existing render stays
+    /// byte-identical; a video carries no alpha and says so.
+    bool alpha = false;
     std::string ffmpeg;
     std::string codec = "hevc_nvenc";
     int crf = 18;
@@ -564,6 +568,18 @@ public:
         m_imageFormat = io::formatFromExtension(o.out);
         if (!toVideo && m_imageFormat == io::ImageFormat::Exr && transfer != color::OutputTransfer::Linear) {
             log::warn("writing non-linear values into an EXR; use --color linear for scene-referred output");
+        }
+        // --alpha: the coverage alpha as a 4th channel.  Every still format
+        // carries it (.exr float A, .tif RGBA 16-bit, .png RGBA 16-bit), and
+        // it is what a host composites with - a transparent band shows black
+        // over a black background while the RGB looks complete.  The pipe to
+        // ffmpeg is RGB only, so a video says so instead of silently dropping it.
+        if (o.alpha) {
+            if (toVideo) {
+                log::warn("--alpha ignored: a .mp4 / .mov output carries no alpha; write .exr, .tif or .png");
+            } else {
+                m_tag.includeAlpha = true;
+            }
         }
         m_writer = std::thread([this] { writerLoop(); });
         return kExitOk;
@@ -1781,6 +1797,9 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
         ->default_val(-1.0);
     outGeom->add_option("--seam-interval", opt->seamInterval, "Re-run the analyses every N frames")->default_val(1);
     outGeom->add_option("--out", opt->out, "Output: image (.png/.tif/.exr, %05d pattern) or .mp4")->required();
+    outGeom->add_flag("--alpha", opt->alpha,
+                      "Write the coverage alpha as a 4th channel into .exr / .tif / .png stills (default: RGB "
+                      "only; videos carry no alpha)");
     outGeom->add_option("--ffmpeg", opt->ffmpeg, "ffmpeg executable for .mp4 output");
     outGeom->add_option("--codec", opt->codec, "Video encoder (hevc_nvenc, libx265, ...)")->default_str("hevc_nvenc");
     outGeom->add_option("--crf", opt->crf, "Quality (crf / cq)")->default_val(18);

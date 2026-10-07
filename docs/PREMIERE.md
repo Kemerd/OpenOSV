@@ -2359,3 +2359,59 @@ is the one thing a human has to do.
   exactly; only the transfer/matrix handling for the 8-bit proxy is
   outstanding. Unverified and untouched by this work.
 * Windows on ARM builds are not produced (no CUDA); the CPU path would work.
+
+## Troubleshooting
+
+### A band of the frame is black (or transparent)
+
+Every frame path of the importer writes every row of the frame it hands to
+Premiere, or fails the whole frame (Premiere then shows a missing frame, and
+the log has an `imGetSourceVideo: frame N failed` line). A flat, full-width
+band of black rows is therefore far more likely to come from the sequence
+than from the stitch - but the importer now checks its own output, so the log
+settles it either way.
+
+What to try, in order, each of which rules a cause in or out:
+
+1. **Source Monitor.** Open the clip in the Source Monitor, where no sequence
+   effect applies. A band there comes from the importer; a band only in the
+   Program Monitor comes from the sequence (Crop, Transform, a mask or track
+   matte, or something on a track above).
+2. **White matte.** Put a white Color Matte on the track *below* the clip. If
+   the band turns white, those pixels are transparent (the importer's coverage
+   alpha, which Premiere composites over black); if it stays black, the
+   pixels are black or something masks them.
+3. **Source Settings.** Render Device = CPU, then Stabilisation = Off. A band
+   that follows either is a renderer or stabilisation interaction; one that
+   does not is not.
+
+What the plug-in log says (`%LOCALAPPDATA%\OpenOSV\OpenOSVImporter.log`):
+
+* `imGetSourceVideo #n: ... requested WxH, chose W'xH' fmt ..., row bytes R,
+  ...` - the first five frame requests of each clip: the size Premiere asked
+  for (`0x0` = any), the size delivered and the frame's row pitch.
+* `imGetSourceVideo: '<clip>' requested WxH <format>; delivering W'xH', the
+  nearest size the clip advertises` - once per clip and requested size,
+  whenever Premiere asks for a size the clip does not advertise (it then
+  scales the frame). Normal, and the one host interaction a cropped or
+  shifted picture can come from.
+* `imGetSourceVideo: frame F rows a..b (x% of H) came out transparent / black;
+  requested WxH <format>, delivered W'xH' (...)` - a WARNING, once per clip:
+  the importer sampled 64 columns of every row of a frame it had just
+  delivered and found a run of rows whose alpha averaged below 0.5, or whose
+  colour was exactly zero everywhere. It checks the first three rendered
+  frames of every size, format and quality (draft or full) it delivers for a
+  clip, so the sequence or export frames are checked even when thumbnails and
+  the Source Monitor came first. With `OSV_PLUGIN_LOG_LEVEL=debug` set before Premiere starts, each
+  checked frame also writes one `row check` line, so the log shows that the
+  check ran and found nothing; with `OSV_PLUGIN_LOG_LEVEL=trace` every frame
+  is checked. (The check reads 64 x height pixels, about 3 ms on an 8K
+  frame.)
+
+No `came out` warning, with `row check` lines for the frames in question
+(`trace` checks every frame), means the importer delivered those frames
+complete and the band was added later.
+
+`osvtool render ... --alpha` writes the same coverage alpha into `.exr`,
+`.tif` and `.png` stills as a fourth channel (off by default; videos carry no
+alpha), so a transparent band can be seen outside Premiere too.

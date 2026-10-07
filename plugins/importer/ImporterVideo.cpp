@@ -14,6 +14,7 @@
 #include "HostUtf16.h"
 #include "ImporterInstance.h"
 
+#include "FrameRowCheck.h"
 #include "PixelCopy.h"
 #include "PluginLog.h"
 
@@ -26,6 +27,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -434,6 +437,160 @@ struct FormatChoice {
         return {};
     }
     return std::string(reinterpret_cast<const char*>(buffer.data()));
+}
+
+// ---------------------------------------------------------------------------
+//  imGetSourceVideo diagnostics: the size asked for, and the rows delivered
+// ---------------------------------------------------------------------------
+//
+// Two facts a support log could not show before, and the only two host
+// interactions a frame with a band of empty rows can come from: whether the
+// host and the importer disagreed about the frame size, and whether the
+// pixels the importer handed over were complete.  Both are written at the
+// default log level - the size once per clip and requested size, the rows
+// for the first frames of every size, format and quality delivered - so a
+// user's log answers the question without anybody having to switch logging
+// up first.  Neither costs anything in steady playback: each asks a small
+// per-clip memo (rowcheck::SeenSizes, rowcheck::FrameBudget) before it
+// builds or reads anything.
+
+/// The clip's file name, UTF-8, for a log line.  Never throws: a name the
+/// conversion refuses (a lone surrogate) logs as "?".
+[[nodiscard]] std::string clipNameForLog(const ImporterInstance& instance) noexcept {
+    try {
+        const std::u8string name = instance.path().filename().u8string();
+        return std::string(name.begin(), name.end());
+    } catch (...) {
+        return "?";
+    }
+}
+
+/// A PluginLog::once key part that names this clip: the hash of its full
+/// native path, so two clips that share a file name in different folders
+/// are still two clips.  No conversion, so nothing to fail but an
+/// allocation, which the caller's guard absorbs.
+[[nodiscard]] std::string clipLogKey(const ImporterInstance& instance) {
+    return std::to_string(std::hash<std::filesystem::path::string_type>{}(instance.path().native()));
+}
+
+/// "2000x1000", or "any size" when the host left both dimensions at 0.
+[[nodiscard]] std::string requestedSizeText(const FormatChoice& choice) {
+    if (choice.width <= 0 && choice.height <= 0) {
+        return "any size";
+    }
+    return std::to_string(choice.width) + "x" + std::to_string(choice.height);
+}
+
+/// Log, once per clip and requested size, a request the importer does not
+/// deliver at the size asked for.
+///
+/// That is legitimate - nearestAdvertisedSize() answers with the nearest of
+/// the sizes the clip advertises and the host scales the frame - but it was
+/// invisible: the per-request line only ever showed the delivered size.  A
+/// dimension the host left at 0 ("any") is not a disagreement.  Keyed by the
+/// requested size too, because the host asks one clip at several sizes
+/// (thumbnails, the Source Monitor, the sequence) and the first of them is
+/// rarely the one a user is looking at.
+///
+/// Called on EVERY request, cache hits included, so a size already logged
+/// for this instance returns after a few relaxed loads of the instance's
+/// rowcheck::SeenSizes - before any string is built or the log's lock taken.
+void noteSizeMismatch(ImporterInstance& instance, const FormatChoice& choice,
+                      const OutputGeometry& geometry) noexcept {
+    try {
+        // ---- does the delivered size answer the request? -------------------
+        const bool widthDiffers = choice.width > 0 && choice.width != geometry.width;
+        const bool heightDiffers = choice.height > 0 && choice.height != geometry.height;
+        if (!widthDiffers && !heightDiffers) {
+            return;
+        }
+        // ---- already said for this instance: nothing to build --------------
+        // The level test first, so a size is only remembered once it could
+        // actually have been written.
+        if (!PluginLog::enabled(PluginLog::Level::Info) ||
+            !instance.loggedRequestSizes().firstTime(choice.width, choice.height)) {
+            return;
+        }
+        // ---- once per clip and requested size -------------------------------
+        // Still keyed by the clip's path: a reopened clip (a new instance,
+        // with an empty memo) must not repeat what the log already holds.
+        const std::string key = "srcvideo-size/" + clipLogKey(instance) + "/" + std::to_string(choice.width) + "x" +
+                                std::to_string(choice.height);
+        PluginLog::oncef(key, PluginLog::Level::Info,
+                         "imGetSourceVideo: '{}' requested {} {}; delivering {}x{}, the nearest size the clip "
+                         "advertises (the host scales it)",
+                         clipNameForLog(instance), requestedSizeText(choice), formatName(choice.format),
+                         geometry.width, geometry.height);
+    } catch (...) {
+        // A log line is never worth a frame.
+    }
+}
+
+/// Self-check the rows of a frame just rendered into the host's PPix.
+///
+/// Runs on the first rowcheck::kFramesPerGeometry rendered frames of every
+/// delivered size, format and quality (`draft`, the request's) - the
+/// instance's rowcheck::FrameBudget - and on every frame only at Trace level,
+/// so Debug logging, which the benchmarks use for their frame-cost lines,
+/// never adds the scan to frames the default level would not scan.  Samples
+/// rowcheck::kSampleColumns pixels of every row (rowcheck::scanHostFrame)
+/// and, when a run of rows came out transparent or black, warns once per
+/// clip with the rows, the share of the height, the size the host asked for
+/// and the size delivered.  At Debug level each checked frame also gets a
+/// one-line summary, so a log can prove the check ran and found nothing.
+///
+/// Read-only on the pixels, and called under the instance lock (which the
+/// frame budget relies on) after the render and BEFORE the frame goes into
+/// the host's cache, so the frame checked is exactly the frame cached and
+/// delivered.  Never throws and never fails the frame: the result is a log
+/// line and nothing else.
+void checkDeliveredRows(ImporterInstance& instance, const pixelcopy::HostFrame& frame,
+                        pixelcopy::HostPixelFormat layout, const FormatChoice& choice, std::uint32_t frameIndex,
+                        bool draft) noexcept {
+    try {
+        // ---- is this frame one to check? -----------------------------------
+        // Nothing to say when even the warning would be dropped; otherwise
+        // the first few frames of this delivered size, format and quality,
+        // or every frame at Trace.  The budget is counted only below Trace,
+        // so a run at Trace never spends it.
+        if (!PluginLog::enabled(PluginLog::Level::Warn)) {
+            return;
+        }
+        const bool everyFrame = PluginLog::enabled(PluginLog::Level::Trace);
+        if (!everyFrame && !instance.rowCheckBudgetLocked().admit(frame.width, frame.height, layout, draft)) {
+            return;
+        }
+
+        // ---- scan --------------------------------------------------------------
+        const rowcheck::RowScan scan = rowcheck::scanHostFrame(pixelcopy::ConstHostFrame(frame), layout);
+        if (!scan.scanned) {
+            // Unreachable after the handler's own dst.valid() test, but a
+            // refusal must still say why nothing was checked.
+            PluginLog::debug("imGetSourceVideo: frame {} could not be row-checked ({}x{} {}, row bytes {})",
+                             frameIndex, frame.width, frame.height, pixelcopy::hostPixelFormatName(layout),
+                             frame.rowBytes);
+            return;
+        }
+        PluginLog::debug("imGetSourceVideo: frame {} row check {}x{} {}: {} transparent / {} black rows of {}, "
+                         "worst row {} opaque on {}/{} samples, {} non-finite samples{}",
+                         frameIndex, scan.width, scan.height, pixelcopy::hostPixelFormatName(layout),
+                         scan.transparentRows, scan.blackRows, scan.height, scan.worstRow, scan.worstRowOpaque,
+                         scan.columns, scan.nonFiniteSamples, draft ? ", draft" : "");
+        if (!scan.defective()) {
+            return;
+        }
+
+        // ---- the warning, once per clip -----------------------------------------
+        PluginLog::oncef("srcvideo-rows/" + clipLogKey(instance), PluginLog::Level::Warn,
+                         "imGetSourceVideo: frame {} {}; requested {} {}, delivered {}x{} ('{}', row bytes {}, "
+                         "{} of {} rows empty, worst row {} opaque on {}/{} samples)",
+                         frameIndex, rowcheck::describeRun(scan), requestedSizeText(choice),
+                         formatName(choice.format), scan.width, scan.height, clipNameForLog(instance),
+                         frame.rowBytes, scan.badRows, scan.height, scan.worstRow, scan.worstRowOpaque,
+                         scan.columns);
+    } catch (...) {
+        // A diagnostic is never worth a frame.
+    }
 }
 
 }  // namespace
@@ -908,17 +1065,31 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
     const bool draft = isDraftRequest(*rec);
 
     // Log the first few requests with everything that decides what we do, so
-    // a support log shows the host's real behaviour without drowning.
+    // a support log shows the host's real behaviour without drowning: the
+    // size the host asked for (0 = any) next to the size chosen, and the
+    // PPix's row pitch.  The pitch is only known once there is a PPix, so the
+    // line is written from the three places a request can get one - the
+    // host's cache, a PPix that failed to be created (pitch 0), or the PPix
+    // created below - always before the render, so a frame that then fails
+    // still has its request line above the error.
     instance->noteVideoRequest();
-    if (instance->videoRequestCount() <= 5) {
+    const std::uint64_t requestNumber = instance->videoRequestCount();
+    const bool logThisRequest = requestNumber <= 5;
+    const auto logRequest = [&](csSDK_int32 rowBytes, const char* source) noexcept {
+        if (!logThisRequest) {
+            return;
+        }
         PluginLog::info(
-            "imGetSourceVideo #{}: t={} -> frame {}, {} formats requested, chose {}x{} fmt 0x{:08X}, quality {}, "
-            "intent {} (ratio {:.2f}), draft {}",
-            instance->videoRequestCount(), static_cast<long long>(rec->inFrameTime), frameIndex,
-            rec->inNumFrameFormats, geometry.width, geometry.height, static_cast<unsigned>(choice.format),
-            static_cast<int>(rec->inQuality), intentName(rec->inRenderContext.inIntent),
-            rec->inRenderContext.inPlaybackRatio, draft ? 1 : 0);
-    }
+            "imGetSourceVideo #{}: t={} -> frame {}, {} formats requested, requested {}x{}, chose {}x{} fmt "
+            "0x{:08X}, row bytes {}, quality {}, intent {} (ratio {:.2f}), draft {}{}",
+            requestNumber, static_cast<long long>(rec->inFrameTime), frameIndex, rec->inNumFrameFormats,
+            choice.width, choice.height, geometry.width, geometry.height, static_cast<unsigned>(choice.format),
+            rowBytes, static_cast<int>(rec->inQuality), intentName(rec->inRenderContext.inIntent),
+            rec->inRenderContext.inPlaybackRatio, draft ? 1 : 0, source);
+    };
+    // A size the importer does not deliver as asked is legitimate (the host
+    // scales), but worth one line per clip and size: see noteSizeMismatch().
+    noteSizeMismatch(*instance, choice, geometry);
 
     // ---- cache lookup ------------------------------------------------------
     // The blob is part of the key, so changed settings never hit a stale
@@ -947,6 +1118,15 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
                                                              &wanted, &cached, &delivered, PrefsBlob::cacheKeySize());
         }
         if (cacheErr == suiteError_NoError && cached) {
+            // The cached frame's own pitch for the request line (0 when the
+            // suite will not say), asked only while requests are logged.
+            if (logThisRequest) {
+                csSDK_int32 cachedRowBytes = 0;
+                if (g.suites.ppix->GetRowBytes(cached, &cachedRowBytes) != suiteError_NoError) {
+                    cachedRowBytes = 0;
+                }
+                logRequest(cachedRowBytes, ", from the host's cache");
+            }
             *rec->outFrame = cached;
             return imNoErr;
         }
@@ -994,6 +1174,7 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
         createErr = g.suites.ppixCreator->CreatePPix(&frame, PrPPixBufferAccess_ReadWrite, choice.format, &bounds);
     }
     if (createErr != suiteError_NoError || !frame) {
+        logRequest(0, ", no PPix");
         PluginLog::error("imGetSourceVideo: PPix creation failed with {}", static_cast<int>(createErr));
         return imMemErr;
     }
@@ -1001,8 +1182,11 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
     // ---- copy --------------------------------------------------------------
     char* pixels = nullptr;
     csSDK_int32 rowBytes = 0;
-    if (g.suites.ppix->GetPixels(frame, PrPPixBufferAccess_ReadWrite, &pixels) != suiteError_NoError || !pixels ||
-        g.suites.ppix->GetRowBytes(frame, &rowBytes) != suiteError_NoError || rowBytes == 0) {
+    const bool havePixels =
+        g.suites.ppix->GetPixels(frame, PrPPixBufferAccess_ReadWrite, &pixels) == suiteError_NoError && pixels &&
+        g.suites.ppix->GetRowBytes(frame, &rowBytes) == suiteError_NoError && rowBytes != 0;
+    logRequest(rowBytes, "");
+    if (!havePixels) {
         g.suites.ppix->Dispose(frame);
         PluginLog::error("imGetSourceVideo: GetPixels / GetRowBytes failed");
         return imMemErr;
@@ -1035,6 +1219,15 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
         // missing frame and carries on.
         return rendered.error().code == ErrorCode::InvalidArgument ? imFrameNotFound : imDecompressionError;
     }
+
+    // ---- self-check of the delivered rows -----------------------------------
+    // Every frame path writes every row or fails the frame (handled above),
+    // and this proves it on the user's machine: the first frames of every
+    // size, format and quality delivered, or every frame at Trace, are sampled
+    // for rows that came out transparent or black, and a hit is logged with
+    // the size the host asked for.  Read-only, under the lock, before the
+    // frame is cached.
+    checkDeliveredRows(*instance, dst, layout, choice, frameIndex, draft);
 
     // ---- cache + hand over -------------------------------------------------
     // [WP-STEADY] Only a frame with its final pixels is cached.  An
