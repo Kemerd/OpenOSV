@@ -412,8 +412,9 @@ TEST_CASE("the popup item lists are the documented ones", "[sourcesettings][para
           "BT.2408 - Deep Blacks + Punchy|BT.2408 - Neutral");
     CHECK(std::string(params[kIndexHdrTone - 1].PF_DEF_NAME) == "Transfer Function (HDR)");
     // Hide Mount spelled out: a project stores the popup value, so On must
-    // stay item 1 (the mask every older project rendered with) and Off item 2.
-    CHECK(popupItems(params[kIndexHideMount - 1]) == "On|Off (full lens overlap)");
+    // stay item 1 (the mask every older project rendered with), Off item 2,
+    // and Auto - appended - item 3.
+    CHECK(popupItems(params[kIndexHideMount - 1]) == "On|Off (full lens overlap)|Auto (measured per clip)");
     CHECK(std::string(params[kIndexHideMount - 1].PF_DEF_NAME) == "Hide Mount");
     CHECK(params[kIndexHideMount - 1].uu.id == OSV_SS_ID_HIDE_MOUNT);
 }

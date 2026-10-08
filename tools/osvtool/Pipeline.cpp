@@ -10,6 +10,8 @@
 #include "osv/geom/StreamScaling.h"
 #include "osv/meta/CalibrationSelector.h"
 #include "osv/meta/FormatDetector.h"
+#include "osv/render/ClipSteady.h"
+#include "osv/render/MountMask.h"
 
 #include <algorithm>
 #include <cctype>
@@ -135,6 +137,10 @@ void addPipelineOptions(CLI::App* sub, PipelineOptions& opt) {
     geomGroup->add_option("--lens-fov", opt.lensFovDeg, "Usable lens FOV in degrees")->default_val(195.18);
     geomGroup->add_option("--feather", opt.featherDeg, "Seam feather width in degrees")->default_val(4.0);
     geomGroup->add_flag("--occlusion,!--no-occlusion", opt.occlusionMask, "Apply the calibration occlusion polygon");
+    geomGroup->add_option("--hide-mount", opt.hideMount,
+                          "Source Settings Hide Mount: on (the calibration occlusion polygons) | off (none) | auto "
+                          "(kept only where the lenses disagree on the clip's nine sample frames); wins over "
+                          "--occlusion");
     geomGroup->add_flag("--blend,!--no-blend", opt.blend, "Feather-blend the two lenses (off = nearest lens)");
 
     auto* stabGroup = sub->add_option_group("Stabilisation");
@@ -295,6 +301,18 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     p->blendParams.lensFovDeg = lensFovDeg;
     p->blendParams.featherDeg = options.featherDeg;
     p->blendParams.useOcclusionMask = options.occlusionMask;
+    // ---- Hide Mount (Source Settings), parsed before any decoding --------------
+    // On / Off are the occlusion switch; Auto keeps the mask on and rebuilds
+    // the polygons once the reader is open (the end of this function).
+    const std::string hideMount = lower(options.hideMount);
+    if (hideMount == "on" || hideMount == "auto") {
+        p->blendParams.useOcclusionMask = true;
+    } else if (hideMount == "off") {
+        p->blendParams.useOcclusionMask = false;
+    } else if (!hideMount.empty()) {
+        return Error{ErrorCode::InvalidArgument,
+                     "unknown --hide-mount '" + options.hideMount + "' (expected on, off or auto)"};
+    }
 
     // ---- decoder -------------------------------------------------------------------
     video::DecoderOptions decOpt;
@@ -306,8 +324,9 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     decOpt.threads = options.threads;
     // Zero-copy (frames stay on the GPU) only when nothing needs them on the
     // host: the CPU renderer and the band analyses both read host planes.
-    decOpt.keepOnDevice =
-        (decOpt.hw == video::HwAccel::Cuda) && lower(options.device) != "cpu" && !options.hostFramesRequired;
+    // Hide Mount Auto shades its bands from host planes as well.
+    decOpt.keepOnDevice = (decOpt.hw == video::HwAccel::Cuda) && lower(options.device) != "cpu" &&
+                          !options.hostFramesRequired && hideMount != "auto";
     OSV_TRY_ASSIGN(video::DualStreamReader reader, video::DualStreamReader::open(options.input, p->format, decOpt));
     p->reader = std::make_unique<video::DualStreamReader>(std::move(reader));
 
@@ -438,6 +457,61 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     if (needRenderer) {
         OSV_TRY_ASSIGN(p->renderer, render::makeRenderer(options.device, *p->pool, &p->rendererName));
         p->notes.push_back("renderer: " + p->rendererName);
+    }
+
+    // ---- Hide Mount Auto: the mount mask, exactly as the plug-ins measure it ------
+    // The clip correction's nine sample frames, both lenses without the mask,
+    // through this calibration rig; then the rig's polygons are rebuilt from
+    // the verdict.  A measurement that fails keeps the full polygons (the
+    // plug-ins' fallback) and says so.
+    if (hideMount == "auto") {
+        const std::vector<std::uint32_t> frames =
+            render::clipSampleFrames(p->frameCount(), p->syncFrames(), render::kClipSteadySamples);
+        video::DualStreamReader* sampleReader = p->reader.get();
+        const render::ClipFrameSource source = [sampleReader](std::uint32_t f) -> Result<video::FramePair> {
+            if (!sampleReader) {
+                return Error{ErrorCode::Internal, "no reader"};
+            }
+            return sampleReader->read(f);
+        };
+        const render::MountMaskParams mountParams;
+        auto mask = render::measureMountMask(p->rig, p->blendParams, frames, source, mountParams, *p->pool);
+        if (!mask.ok()) {
+            p->notes.push_back("hide mount: auto could not be measured (" + mask.error().message +
+                               "); keeping the full mask");
+        } else {
+            auto applied = render::applyMountMask(p->rig, mask.value(), p->blendParams, mountParams);
+            if (applied.ok()) {
+                const render::MountMaskApplied& a = applied.value();
+                char buf[160] = {};
+                std::snprintf(buf, sizeof(buf),
+                              "; lens 0 %s, lens 1 %s; %u / %u clamped columns; %.0f ms (decode %.0f)",
+                              a.changed[0] ? "rebuilt" : "unchanged", a.changed[1] ? "rebuilt" : "unchanged",
+                              a.clampedColumns[0], a.clampedColumns[1], mask.value().measureMs + mask.value().decodeMs,
+                              mask.value().decodeMs);
+                p->notes.push_back("hide mount: auto - " + render::describeMountMask(mask.value()) + buf);
+            } else {
+                p->notes.push_back("hide mount: auto - the verdict could not be applied (" +
+                                   applied.error().message + "); keeping the full mask");
+            }
+            // The per-window numbers behind the verdict, for the record.  At
+            // info level: the sub-command runs while the options are still
+            // being parsed, before a global --verbose takes effect.
+            for (const render::MountWindow& w : mask.value().windows) {
+                // The smoothed far-side difference and the kept columns'
+                // verdict say which lens, if any, may be clamped there.
+                char line[256] = {};
+                std::snprintf(line, sizeof(line),
+                              "hide mount: window %4u-%4u agreement %+.3f upper %+.3f lower %+.3f diff %+.3f (%s) "
+                              "sigma %.4f %.4f frames %u%s%s",
+                              w.col0, w.col0 + mountParams.windowCols - 1, w.agreement, w.upperNcc, w.lowerNcc,
+                              w.cleanDiff, render::describeMountKeep(w.keep), w.sigma[0], w.sigma[1], w.frames,
+                              w.flat ? " flat" : "", w.released ? " released" : "");
+                log::info("{}", line);
+            }
+        }
+        // Every command shows it, `seam` included, which prints no notes.
+        log::info("{}", p->notes.back());
     }
     return p;
 }

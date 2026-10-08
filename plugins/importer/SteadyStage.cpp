@@ -218,6 +218,18 @@ void hashClipParams(Hasher& h, const render::ClipSteadyParams& p) noexcept {
     h.u64(p.minSamples);
 }
 
+/// Hide Mount Auto's parameters (every field changes the verdict).
+void hashMountParams(Hasher& h, const render::MountMaskParams& p) noexcept {
+    h.u64(p.equirectW);
+    h.u64(p.windowCols);
+    h.u64(p.dilateCols);
+    h.u64(p.minFrames);
+    for (const double v : {p.rowsHalfDeg, p.searchAlongDeg, p.searchAcrossDeg, p.releaseNcc, p.flatSigma,
+                           p.minCovalidFraction, p.clampThetaDeg, p.cleanMarginNcc, p.cleanMinNcc}) {
+        h.f64(v);
+    }
+}
+
 /// Lower-case hex of a hash.
 [[nodiscard]] std::string hex64(std::uint64_t v) { return std::format("{:016x}", v); }
 
@@ -229,8 +241,29 @@ void hashClipParams(Hasher& h, const render::ClipSteadyParams& p) noexcept {
     return std::format("r1|{}|{}|{}|{}", id.size, id.mtime, hex64(h.value()), id.path);
 }
 
+/// Cache key of a Hide Mount Auto verdict: the file, the calibration rig it
+/// is measured through and defined against (hashRig includes both lenses'
+/// occlusion polygons, so a calibration whose polygon changed is another
+/// verdict), the blend's geometry (the bands' field of view; the occlusion
+/// switch is not part of it - the bands never use the mask) and the rule's
+/// parameters.  Bump the leading version when the measurement or the meaning
+/// of a stored state changes: m2 decides the clean lens per window and adds
+/// "kept, no clamp" (state 3); an m1 line named one lens per kept run.
+[[nodiscard]] std::string mountKey(const FileIdentity& id, const geom::LensRig& baseRig,
+                                   const geom::BlendParams& blend, const render::MountMaskParams& params) {
+    Hasher h;
+    hashRig(h, baseRig);
+    h.f64(blend.lensFovDeg);
+    h.f64(blend.featherDeg);
+    h.f64(blend.occlusionFeatherPx);
+    h.f64(blend.seamShiftDeg);
+    hashMountParams(h, params);
+    return std::format("m2|{}|{}|{}|{}", id.size, id.mtime, hex64(h.value()), id.path);
+}
+
 /// Cache key of a clip correction: the file, the rig it is measured through
-/// (rotation included), the blend, the sample frames and the parameters.
+/// (rotation and mount mask included), the blend, the sample frames and the
+/// parameters.
 [[nodiscard]] std::string clipKey(const FileIdentity& id, const geom::LensRig& rig, const geom::BlendParams& blend,
                                   const std::vector<std::uint32_t>& frames, const render::ClipSteadyParams& params) {
     Hasher h;
@@ -268,12 +301,70 @@ struct Global {
     std::map<std::string, CachedClip> clips;
     std::set<std::string> clipsInFlight;
     std::uint64_t useCounter = 0;
+    // ---- Hide Mount Auto ------------------------------------------------------------
+    /// Verdicts by mountKey; a null entry is never stored (a failure is not a verdict).
+    std::map<std::string, std::shared_ptr<const render::MountMask>> mounts;
+    std::set<std::string> mountsInFlight;
+    bool mountDiskLoaded = false;
 };
 
 Global& global() {
     static Global g;
     return g;
 }
+
+/// A key this worker put into one of Global's in-flight sets
+/// (rotationsInFlight, mountsInFlight, clipsInFlight).
+///
+/// The normal way out erases the key in the same locked section that stores
+/// the verdict - a waiting instance must never find neither - and then
+/// dismiss()es the claim.  Every other way out (an exception from the
+/// measurement, an allocation failure) erases it here, so the other
+/// instances of the clip stop waiting for a measurement nobody is running
+/// any more and measure it themselves.
+class InFlightClaim {
+public:
+    InFlightClaim() = default;
+    InFlightClaim(const InFlightClaim&) = delete;
+    InFlightClaim& operator=(const InFlightClaim&) = delete;
+    ~InFlightClaim() { release(); }
+
+    /// Answer for `key` in `set` from now on.  Called under g.mutex right
+    /// after the insert; `key` must outlive the claim (declare it first).
+    void claim(std::set<std::string>& set, const std::string& key) noexcept {
+        m_set = &set;
+        m_key = &key;
+    }
+
+    /// The caller erased the key itself (under the lock): nothing left to do.
+    void dismiss() noexcept {
+        m_set = nullptr;
+        m_key = nullptr;
+    }
+
+private:
+    /// Erase the key and wake the waiters; never throws (a destructor).
+    void release() noexcept {
+        if (m_set == nullptr || m_key == nullptr) {
+            return;
+        }
+        try {
+            Global& g = global();
+            {
+                std::lock_guard<std::mutex> lock(g.mutex);
+                m_set->erase(*m_key);
+            }
+            g.cv.notify_all();
+        } catch (...) {
+            // A lock that cannot be taken leaves the key; the waiters still
+            // poll their own cancellation, so nothing hangs past a reset.
+        }
+        dismiss();
+    }
+
+    std::set<std::string>* m_set = nullptr;
+    const std::string* m_key = nullptr;
+};
 
 /// The disk cache path (next to the plug-in log); empty when the log has no
 /// file, and then only the memory cache is used.
@@ -402,6 +493,122 @@ void appendDisk(const std::string& key, const LensAlignVerdict& v) noexcept {
 }
 
 // =============================================================================
+//  Hide Mount Auto's disk cache (hide-mount.tsv)
+// =============================================================================
+
+/// The mount mask's disk cache path (next to lens-alignment.tsv); empty when
+/// the log has no file, and then only the memory cache is used.
+[[nodiscard]] std::filesystem::path mountDiskCachePath() noexcept {
+    try {
+        const std::filesystem::path rotation = diskCachePath();
+        if (rotation.empty()) {
+            return {};
+        }
+        return rotation.parent_path() / kMountMaskCacheFile;
+    } catch (...) {
+        return {};
+    }
+}
+
+/// Where the path starts in a "<tag>|size|mtime|hash|path" key (the position
+/// of the fourth '|'); npos for a key without one.
+[[nodiscard]] std::size_t keyPathCut(const std::string& key) noexcept {
+    std::size_t pos = std::string::npos;
+    for (int i = 0; i < 4; ++i) {
+        pos = key.find('|', pos == std::string::npos ? 0 : pos + 1);
+        if (pos == std::string::npos) {
+            return std::string::npos;
+        }
+    }
+    return pos;
+}
+
+/// Load every well-formed line of the mount cache into `g.mounts`.  Lines:
+///   1 TAB key-without-path TAB columns TAB arc TAB released TAB states TAB path
+/// where the key part is "m2|size|mtime|hash" and `states` is
+/// render::encodeMountColumns' text.  Anything malformed (a truncated last
+/// line, another version - an m1 line's per-run lens choice included -,
+/// states that do not cover the ring) is skipped.
+/// Caller holds g.mutex.
+void loadMountDisk(Global& g) noexcept {
+    g.mountDiskLoaded = true;
+    try {
+        const std::filesystem::path file = mountDiskCachePath();
+        if (file.empty()) {
+            return;
+        }
+        std::ifstream in(file, std::ios::binary);
+        if (!in.good()) {
+            return;  // no cache yet
+        }
+        std::string line;
+        std::size_t loaded = 0;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            // Six tab-separated fields, then the path (the rest of the line).
+            std::vector<std::string> f;
+            std::size_t start = 0;
+            for (int i = 0; i < 6; ++i) {
+                const std::size_t tab = line.find('\t', start);
+                if (tab == std::string::npos) {
+                    break;
+                }
+                f.push_back(line.substr(start, tab - start));
+                start = tab + 1;
+            }
+            if (f.size() != 6 || f[0] != "1" || start >= line.size() || !f[1].starts_with("m2|")) {
+                continue;
+            }
+            std::uint32_t columns = 0;
+            std::uint32_t arcColumns = 0;
+            std::uint32_t releasedColumns = 0;
+            if (!parseNumber(f[2], columns) || !parseNumber(f[3], arcColumns) ||
+                !parseNumber(f[4], releasedColumns) || columns == 0 || columns > 16384) {
+                continue;
+            }
+            auto states = render::decodeMountColumns(f[5], columns);
+            if (!states.ok()) {
+                continue;
+            }
+            auto mask = std::make_shared<render::MountMask>();
+            mask->columns = columns;
+            mask->state = std::move(states).value();
+            mask->arcColumns = arcColumns;
+            mask->releasedColumns = releasedColumns;
+            g.mounts[f[1] + "|" + line.substr(start)] = std::move(mask);  // later lines win
+            ++loaded;
+        }
+        PluginLog::debug("hide mount: {} cached verdict(s) loaded", loaded);
+    } catch (...) {
+        // A damaged cache only costs a re-measurement.
+        PluginLog::warn("hide mount: the cache file could not be read; clips will be re-measured");
+    }
+}
+
+/// Append one verdict to the mount cache.  Failures are logged, not fatal.
+void appendMountDisk(const std::string& key, const render::MountMask& mask) noexcept {
+    try {
+        const std::filesystem::path file = mountDiskCachePath();
+        const std::size_t cut = keyPathCut(key);
+        if (file.empty() || cut == std::string::npos || !mask.valid()) {
+            return;
+        }
+        std::ofstream out(file, std::ios::binary | std::ios::app);
+        if (!out.good()) {
+            PluginLog::warn("hide mount: cannot write the cache file");
+            return;
+        }
+        out << "1\t" + key.substr(0, cut) + '\t' + std::to_string(mask.columns) + '\t' +
+                   std::to_string(mask.arcColumns) + '\t' + std::to_string(mask.releasedColumns) + '\t' +
+                   render::encodeMountColumns(mask.state) + '\t' + key.substr(cut + 1) + '\n';
+    } catch (...) {
+        PluginLog::warn("hide mount: cannot write the cache file");
+    }
+}
+
+// =============================================================================
 //  The stage's own decoder
 // =============================================================================
 
@@ -521,17 +728,31 @@ private:
     h.u64(r.wantClip ? 1u : 0u);
     h.u64(r.containerSamples ? 1u : 0u);
     hashClipParams(h, r.clip);
+    // Hide Mount Auto: whether the mask is measured, and with what rule.
+    h.u64(r.wantMount ? 1u : 0u);
+    hashMountParams(h, r.mount);
     return hex64(h.value());
 }
 
 /// The rig and the parameters the clip correction is measured with, given
-/// the rotation verdict.
-void clipRigAndParams(const SteadyRequest& r, const std::optional<LensAlignVerdict>& rotation, geom::LensRig& rig,
+/// the rotation verdict and (Hide Mount Auto) the mount mask.  A mask that
+/// cannot be applied leaves the calibration's polygons, exactly as the
+/// importer does with it (ImporterInstance::settleMountLocked).
+void clipRigAndParams(const SteadyRequest& r, const std::optional<LensAlignVerdict>& rotation,
+                      const std::shared_ptr<const render::MountMask>& mount, geom::LensRig& rig,
                       render::ClipSteadyParams& params) {
     rig = r.baseRig;
     params = r.clip;
     if (r.wantRotation && rotation && rotation->accepted && render::applyLensRotation(rig, rotation->wRad).ok()) {
         params.parallax.requiredImprovement = render::kAlignedRequiredImprovement;
+    }
+    if (r.wantMount && mount) {
+        // Rebuilt against the calibration rig the verdict was measured
+        // through (its band columns), then copied into the rotated rig:
+        // the polygons live in fisheye pixels, so the rotation does not move
+        // them, but it would move the columns.  On failure `rig` is left
+        // untouched - the full polygons, as the importer keeps them.
+        (void)render::applyMountMaskFrom(r.baseRig, rig, *mount, r.blend, r.mount);
     }
 }
 
@@ -570,6 +791,33 @@ std::optional<LensAlignVerdict> cachedLensAlign(const std::filesystem::path& pat
 }
 
 // =============================================================================
+//  Mount mask cache lookup (rebuildRig)
+// =============================================================================
+std::shared_ptr<const render::MountMask> cachedMountMask(const std::filesystem::path& path,
+                                                         const geom::LensRig& baseRig, const geom::BlendParams& blend,
+                                                         const render::MountMaskParams& params) noexcept {
+    try {
+        if (!sharedCacheEnabled()) {
+            return nullptr;  // every instance measures its own (diagnostics)
+        }
+        const std::optional<FileIdentity> id = identityOf(path);
+        if (!id) {
+            return nullptr;
+        }
+        const std::string key = mountKey(*id, baseRig, blend, params);
+        Global& g = global();
+        std::lock_guard<std::mutex> lock(g.mutex);
+        if (!g.mountDiskLoaded) {
+            loadMountDisk(g);
+        }
+        const auto it = g.mounts.find(key);
+        return it == g.mounts.end() ? nullptr : it->second;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+// =============================================================================
 //  The stage
 // =============================================================================
 SteadyStage::~SteadyStage() { stop(); }
@@ -593,7 +841,7 @@ bool SteadyStage::stale(std::uint64_t gen) const noexcept {
 }
 
 void SteadyStage::request(const SteadyRequest& req, const std::string& clipName) {
-    if (!req.wantRotation && !req.wantClip) {
+    if (!req.wantRotation && !req.wantClip && !req.wantMount) {
         return;  // nothing per clip was asked for
     }
     const std::string key = requestKey(req);
@@ -612,12 +860,20 @@ void SteadyStage::request(const SteadyRequest& req, const std::string& clipName)
         rotation = cachedLensAlign(req.path, req.baseRig);
         rotationKnown = rotation.has_value();
     }
+    // Hide Mount Auto: the clip correction is measured through the mask's
+    // polygons, so it can only come from the cache once the mask is known.
+    std::shared_ptr<const render::MountMask> mount;
+    bool mountKnown = !req.wantMount;
+    if (req.wantMount) {
+        mount = cachedMountMask(req.path, req.baseRig, req.blend, req.mount);
+        mountKnown = mount != nullptr;
+    }
     std::shared_ptr<const render::ClipSteady> clip;
-    if (req.wantClip && rotationKnown && sharedCacheEnabled()) {
+    if (req.wantClip && rotationKnown && mountKnown && sharedCacheEnabled()) {
         if (const std::optional<FileIdentity> id = identityOf(req.path)) {
             geom::LensRig rig;
             render::ClipSteadyParams params;
-            clipRigAndParams(req, rotation, rig, params);
+            clipRigAndParams(req, rotation, mount, rig, params);
             const std::vector<std::uint32_t> frames =
                 render::clipSampleFrames(req.frameCount, req.syncFrames, render::kClipSteadySamples);
             const std::string ck = clipKey(*id, rig, req.blend, frames, params);
@@ -645,6 +901,10 @@ void SteadyStage::request(const SteadyRequest& req, const std::string& clipName)
             m_state.rotationSettled = true;
             m_state.rotation = rotation;
         }
+        if (req.wantMount && mount) {
+            m_state.mountSettled = true;
+            m_state.mount = mount;
+        }
         if (req.wantClip && clip) {
             m_state.clipSettled = true;
             m_state.clip = clip;
@@ -652,7 +912,8 @@ void SteadyStage::request(const SteadyRequest& req, const std::string& clipName)
         m_state.serial = m_serial.load(std::memory_order_relaxed) + 1u;
         m_serial.store(m_state.serial, std::memory_order_release);
         // Work only for what is missing.
-        m_pending = (req.wantRotation && !m_state.rotationSettled) || (req.wantClip && !m_state.clipSettled);
+        m_pending = (req.wantRotation && !m_state.rotationSettled) || (req.wantMount && !m_state.mountSettled) ||
+                    (req.wantClip && !m_state.clipSettled);
         startWorker = m_pending && !m_worker.joinable();
     }
     if (clip) {
@@ -671,7 +932,9 @@ void SteadyStage::request(const SteadyRequest& req, const std::string& clipName)
                             clipName, e.what());
             publish(m_generation.load(), [&](Snapshot& s) {
                 s.failure = "no worker thread";
+                s.mountFailure = s.failure;  // every stage settles with this reason
                 s.rotationSettled = true;
+                s.mountSettled = true;
                 s.clipSettled = true;
             });
             return;
@@ -693,8 +956,11 @@ bool SteadyStage::waitSettled(bool clip, std::chrono::milliseconds timeout) {
             return true;  // nothing to wait for
         }
         const bool rotationDone = !m_request->wantRotation || m_state.rotationSettled;
+        // The mount mask changes the rig like the rotation does: an Exact
+        // frame always waits for it.
+        const bool mountDone = !m_request->wantMount || m_state.mountSettled;
         const bool clipDone = !clip || !m_request->wantClip || m_state.clipSettled;
-        return rotationDone && clipDone;
+        return rotationDone && mountDone && clipDone;
     };
     return m_settledCv.wait_for(lock, timeout, settled);
 }
@@ -776,13 +1042,17 @@ void SteadyStage::workerLoop() noexcept {
                             name, e.what());
             publish(gen, [&](Snapshot& s) {
                 s.failure = e.what();
+                s.mountFailure = s.failure;  // every stage settles with this reason
                 s.rotationSettled = true;
+                s.mountSettled = true;
                 s.clipSettled = true;
             });
         } catch (...) {
             publish(gen, [&](Snapshot& s) {
                 s.failure = "unknown exception";
+                s.mountFailure = s.failure;  // every stage settles with this reason
                 s.rotationSettled = true;
+                s.mountSettled = true;
                 s.clipSettled = true;
             });
         }
@@ -821,6 +1091,7 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
             }
         }
         const std::string rk = id ? rotationKey(*id, job.baseRig) : std::string();
+        InFlightClaim rotationClaim;  // erases rk from rotationsInFlight on an exception
         bool produce = !rotation.has_value();
         // ---- the process-wide cache, or another instance's measurement -----------
         while (produce && !rk.empty()) {
@@ -836,6 +1107,7 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
             }
             if (g.rotationsInFlight.count(rk) == 0) {
                 g.rotationsInFlight.insert(rk);  // this worker measures it
+                rotationClaim.claim(g.rotationsInFlight, rk);
                 break;
             }
             // Another instance is measuring this very rotation: wait for it,
@@ -899,6 +1171,7 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
                 {
                     std::lock_guard<std::mutex> lock(g.mutex);
                     g.rotationsInFlight.erase(rk);
+                    rotationClaim.dismiss();
                     if (verdict) {
                         g.rotations[rk] = *verdict;
                         if (persist) {
@@ -931,7 +1204,116 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
         return;
     }
 
-    // ---- 2. the clip correction -----------------------------------------------------
+    // ---- 2. the mount mask (Hide Mount Auto) ------------------------------------------
+    // Through the CALIBRATION rig (no rotation): the verdict is defined
+    // against its polygons and keyed by it, so every instance of the clip -
+    // the direct path's second engine included - reads the same one.
+    std::shared_ptr<const render::MountMask> mount;
+    if (job.wantMount) {
+        bool fromRequest = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (gen == m_generation.load() && m_state.mountSettled) {
+                mount = m_state.mount;  // served from the cache at request time
+                fromRequest = true;
+            }
+        }
+        const std::string mk = id ? mountKey(*id, job.baseRig, job.blend, job.mount) : std::string();
+        InFlightClaim mountClaim;  // erases mk from mountsInFlight on an exception
+        bool produce = !fromRequest;
+        // ---- the process-wide cache, or another instance's measurement ---------------
+        while (produce && !mk.empty()) {
+            std::unique_lock<std::mutex> lock(g.mutex);
+            if (!g.mountDiskLoaded) {
+                loadMountDisk(g);
+            }
+            if (const auto it = g.mounts.find(mk); it != g.mounts.end()) {
+                mount = it->second;
+                produce = false;
+                break;
+            }
+            if (g.mountsInFlight.count(mk) == 0) {
+                g.mountsInFlight.insert(mk);  // this worker measures it
+                mountClaim.claim(g.mountsInFlight, mk);
+                break;
+            }
+            // Another instance is measuring this very mask: wait for it,
+            // polling this job's own cancellation.
+            g.cv.wait_for(lock, std::chrono::milliseconds(50));
+            if (cancelled()) {
+                return;
+            }
+        }
+        std::string mountFailure;
+        if (produce) {
+            // ---- measure: the clip correction's sample frames, no mask --------------
+            const std::vector<std::uint32_t> frames =
+                render::clipSampleFrames(job.frameCount, job.syncFrames, render::kClipSteadySamples);
+            auto measured = render::measureMountMask(job.baseRig, job.blend, frames, source, job.mount, ensurePool(),
+                                                     cancelled, alternatesFor(job, frames));
+            // A verdict from substituted or skipped samples is kept for this
+            // session only: the disk key names the planned frames' clip.
+            bool persist = true;
+            if (measured.ok()) {
+                const render::MountMask& m = measured.value();
+                persist = m.sampleNotes.empty();
+                mount = std::make_shared<const render::MountMask>(std::move(measured).value());
+                PluginLog::info("hide mount: '{}': Auto - {} - measured in {:.0f} ms (decode {:.0f}) on frames {}{}",
+                                clipName, render::describeMountMask(*mount), mount->measureMs + mount->decodeMs,
+                                mount->decodeMs, frameList(mount->frames), notesSuffix(mount->sampleNotes));
+                // The numbers behind the verdict, one line per window, at
+                // Debug only: a "the mount shows" report is answerable from
+                // the log without re-measuring.
+                if (PluginLog::enabled(PluginLog::Level::Debug)) {
+                    for (const render::MountWindow& w : mount->windows) {
+                        PluginLog::debug("hide mount: '{}': window {}-{} agreement {:+.3f} (far sides {:+.3f} / "
+                                         "{:+.3f}, smoothed difference {:+.3f}: {}), sigma {:.4f} / {:.4f}, {} "
+                                         "frames{}{}",
+                                         clipName, w.col0, w.col0 + job.mount.windowCols - 1, w.agreement,
+                                         w.upperNcc, w.lowerNcc, w.cleanDiff, render::describeMountKeep(w.keep),
+                                         w.sigma[0], w.sigma[1], w.frames, w.flat ? ", flat" : "",
+                                         w.released ? ", released" : "");
+                    }
+                }
+            } else if (!cancelled()) {
+                mountFailure = measured.error().message;
+                PluginLog::warn("hide mount: '{}': Auto could not be measured ({}); keeping the full mask", clipName,
+                                mountFailure);
+            }
+            // ---- remember it (a failure or a cancellation is not a verdict) ---------
+            if (!mk.empty()) {
+                {
+                    std::lock_guard<std::mutex> lock(g.mutex);
+                    g.mountsInFlight.erase(mk);
+                    mountClaim.dismiss();
+                    if (mount) {
+                        g.mounts[mk] = mount;
+                        if (persist) {
+                            appendMountDisk(mk, *mount);
+                        }
+                    }
+                }
+                g.cv.notify_all();
+            }
+            if (cancelled()) {
+                return;
+            }
+        }
+        if (!fromRequest) {
+            publish(gen, [&](Snapshot& s) {
+                s.mountSettled = true;
+                s.mount = mount;
+                // Its own field: writing `failure` would overwrite (or later be
+                // overwritten by) the rotation's and the clip correction's.
+                s.mountFailure = mountFailure;
+            });
+        }
+    }
+    if (cancelled()) {
+        return;
+    }
+
+    // ---- 3. the clip correction -----------------------------------------------------
     if (!job.wantClip) {
         return;
     }
@@ -943,10 +1325,11 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
     }
     geom::LensRig rig;
     render::ClipSteadyParams params;
-    clipRigAndParams(job, rotation, rig, params);
+    clipRigAndParams(job, rotation, mount, rig, params);
     const std::vector<std::uint32_t> frames =
         render::clipSampleFrames(job.frameCount, job.syncFrames, render::kClipSteadySamples);
     const std::string ck = id ? clipKey(*id, rig, job.blend, frames, params) : std::string();
+    InFlightClaim clipClaim;  // erases ck from clipsInFlight on an exception
     std::shared_ptr<const render::ClipSteady> clip;
     bool produce = true;
     while (!ck.empty()) {
@@ -959,6 +1342,7 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
         }
         if (g.clipsInFlight.count(ck) == 0) {
             g.clipsInFlight.insert(ck);
+            clipClaim.claim(g.clipsInFlight, ck);
             break;
         }
         g.cv.wait_for(lock, std::chrono::milliseconds(50));
@@ -989,6 +1373,7 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
             {
                 std::lock_guard<std::mutex> lock(g.mutex);
                 g.clipsInFlight.erase(ck);
+                clipClaim.dismiss();
                 if (clip) {
                     g.clips[ck] = CachedClip{clip, ++g.useCounter};
                     // Least recently used first out.

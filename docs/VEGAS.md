@@ -30,7 +30,7 @@ the Premiere plug-ins' own source. Stitch, seam, parallax, sky seam fix, lens
 shading, scene light, lens focal, colour and the camera are the Premiere ones
 (the Stitching group lists them; [`PREMIERE.md`](PREMIERE.md) says what each
 does).
-Car, helmet or suction mount and a step at the seam: set **Hide Mount** (Stitching group) to **Off**.
+Car, helmet or suction mount and a step at the seam: set **Hide Mount** (Stitching group) to **Off**, or **Auto** to keep the mask only around the mount.
 
 An OpenFX generator can't say how long it is and has no audio, and VEGAS
 won't do that part for you. So VEGAS gets one more piece, an **Application

@@ -36,8 +36,21 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <initializer_list>
+#include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 
 using namespace osv::premiere;
 using namespace osv::premiere::test;
@@ -147,6 +160,77 @@ public:
 private:
     const char* m_name;
 };
+
+/// Raise the plug-in log to INFO for the lifetime of the object.  Must be
+/// constructed BEFORE the harness: the module reads the level once, when it
+/// initialises its log.  _putenv_s updates the CRT copy and the OS block, so
+/// the module sees it through either API.
+class InfoLogLevel {
+public:
+    InfoLogLevel() {
+        char* old = nullptr;
+        std::size_t length = 0;
+        if (::_dupenv_s(&old, &length, "OSV_PLUGIN_LOG_LEVEL") == 0 && old) {
+            m_previous = old;
+            m_hadPrevious = true;
+        }
+        std::free(old);
+        ::_putenv_s("OSV_PLUGIN_LOG_LEVEL", "info");
+    }
+    ~InfoLogLevel() { ::_putenv_s("OSV_PLUGIN_LOG_LEVEL", m_hadPrevious ? m_previous.c_str() : ""); }
+    InfoLogLevel(const InfoLogLevel&) = delete;
+    InfoLogLevel& operator=(const InfoLogLevel&) = delete;
+
+private:
+    std::string m_previous;
+    bool m_hadPrevious = false;
+};
+
+/// The importer's log file for this process (LOCALAPPDATA was redirected by
+/// isolatePluginLogs() in TestMain, so this is never the user's own log).
+[[nodiscard]] std::filesystem::path importerLogPath() {
+    wchar_t buffer[32768] = {};
+    const DWORD n = ::GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, static_cast<DWORD>(std::size(buffer)));
+    if (n == 0 || n >= std::size(buffer)) {
+        return {};
+    }
+    return std::filesystem::path(std::wstring(buffer, n)) / L"OpenOSV" / L"OpenOSVImporter.log";
+}
+
+/// Whole text of the importer log (empty when there is none yet).  The
+/// plug-in keeps the file open with a deny-WRITE share, which a reader is
+/// allowed through, and flushes every line.
+[[nodiscard]] std::string importerLog() {
+    const std::filesystem::path path = importerLogPath();
+    if (path.empty()) {
+        return {};
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+/// Lines of `text` that contain every one of `needles`.
+[[nodiscard]] std::size_t linesWith(const std::string& text, std::initializer_list<std::string> needles) {
+    std::size_t n = 0;
+    std::size_t begin = 0;
+    while (begin < text.size()) {
+        std::size_t end = text.find('\n', begin);
+        if (end == std::string::npos) {
+            end = text.size();
+        }
+        const std::string_view line(text.data() + begin, end - begin);
+        bool all = true;
+        for (const std::string& needle : needles) {
+            all = all && line.find(needle) != std::string_view::npos;
+        }
+        n += all ? 1u : 0u;
+        begin = end + 1;
+    }
+    return n;
+}
 
 }  // namespace
 
@@ -472,6 +556,107 @@ TEST_CASE("the lens rotation cached by a Hide Mount Off clip is the one an On cl
     const Pixels cached = renderOnce(on, 3313);
     INFO(differing(fresh, cached) << " pixels differ");
     CHECK(cached == fresh);
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
+// ---- Hide Mount Auto: the per-clip mount mask ----------------------------------
+
+TEST_CASE("Hide Mount Auto keeps the 6K sample's polygons: its frame is On's, bit for bit",
+          "[importer][hidemount][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    // On the 6K sample none of the polygon arc's windows agrees at 0.8 over
+    // the nine sample frames (the stick and its mount are in them), so Auto
+    // keeps the calibration's polygons and must render exactly what On does,
+    // photometric field and lens shading included.
+    ScopedEnv noSharing("OPENOSV_STEADY_NO_SHARED_CACHE", "1");
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+    const PrefsBlob on = hideMountPrefs(PrefsHideMount::On, true);
+    const PrefsBlob automatic = hideMountPrefs(PrefsHideMount::Auto, true);
+
+    const auto renderOnce = [&](const PrefsBlob& prefs, csSDK_int32 id) {
+        auto clip = harness.openClip(sampleClipPath(), id);
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+        harness.host().clearCache();
+        return render(harness, clip, ppix, requestFor(20, imRenderIntent_Export), prefs);
+    };
+    const Pixels masked = renderOnce(on, 3401);
+    const Pixels measured = renderOnce(automatic, 3402);
+    INFO(differing(masked, measured) << " pixels differ between On and Auto");
+    CHECK(measured == masked);
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
+TEST_CASE("Hide Mount Auto: a second instance of the clip stitches with the verdict the first measured",
+          "[importer][hidemount][sample]") {
+    // The effect's direct path opens a second engine for the clip it shows;
+    // it must stitch with the same polygons as the importer's own instance,
+    // not with a verdict of its own.  On the sample's LRF proxy Auto releases
+    // part of the arc, so the frames say whether the polygons were rebuilt.
+    const std::filesystem::path proxy = sampleProxyPath();
+    std::error_code ec;
+    if (proxy.empty() || !std::filesystem::exists(proxy, ec)) {
+        SKIP("the .LRF proxy is not present at " << proxy.string());
+    }
+    InfoLogLevel info;  // before the harness: the module reads it once; the count below reads INFO lines
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+    const PrefsBlob on = hideMountPrefs(PrefsHideMount::On, false);
+    const PrefsBlob automatic = hideMountPrefs(PrefsHideMount::Auto, false);
+
+    const auto renderOnce = [&](const PrefsBlob& prefs, csSDK_int32 id) {
+        auto clip = harness.openClip(proxy, id);
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+        harness.host().clearCache();
+        // The proxy advertises its own size (2000 x 1000 beside the 6K
+        // original): ask for exactly that, as Premiere does.
+        REQUIRE(info.vidInfo.imageWidth > 0);
+        REQUIRE(info.vidInfo.imageHeight > 0);
+        ImporterHarness::SourceVideoRequest request = requestFor(20, imRenderIntent_Export);
+        request.width = info.vidInfo.imageWidth;
+        request.height = info.vidInfo.imageHeight;
+        return render(harness, clip, ppix, request, prefs);
+    };
+    // A: an instance that shares nothing measures its own verdict.
+    Pixels own;
+    {
+        ScopedEnv noSharing("OPENOSV_STEADY_NO_SHARED_CACHE", "1");
+        own = renderOnce(automatic, 3411);
+    }
+    // The verdict changes the stitch (the test is not vacuous) ...
+    const Pixels masked = renderOnce(on, 3412);
+    CHECK(differing(own, masked) > 1000u);
+    // ... B measures with the shared caches on and leaves the verdict there;
+    // C, a second instance of the same clip, is served it.  Both render the
+    // frame A measured for itself: one verdict per clip, whoever asks.
+    const std::string logBefore = importerLog();
+    const Pixels first = renderOnce(automatic, 3413);
+    const Pixels second = renderOnce(automatic, 3414);
+    INFO(differing(own, first) << " / " << differing(first, second) << " pixels differ");
+    CHECK(first == own);
+    CHECK(second == first);
+    // Served, not measured again: equal pixels alone cannot tell (the
+    // measurement is deterministic), the log can.  Between B's open and C's
+    // frame exactly one measurement of this clip's mask was logged - B's.
+    const std::string logAfter = importerLog();
+    REQUIRE(logAfter.size() >= logBefore.size());  // 4 MB rotation is far off in one test
+    const std::string logged = logAfter.substr(logBefore.size());
+    const std::size_t measurements =
+        linesWith(logged, {"hide mount: '" + proxy.filename().string() + "': Auto - ", " - measured in "});
+    INFO(logged);
+    CHECK(measurements == 1u);
 
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }

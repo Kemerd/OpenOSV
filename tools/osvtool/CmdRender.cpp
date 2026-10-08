@@ -182,6 +182,7 @@ constexpr const char* kCliFit[] = {"dji", "pocket3", "osmo360", "avata360"};
 constexpr const char* kCliDevice[] = {"auto", "cpu", "cuda", "opencl"};
 constexpr const char* kCliLook[] = {"dji", "standard"};
 constexpr const char* kCliFlow[] = {"auto", "classical", "neural"};
+constexpr const char* kCliHideMount[] = {"on", "off", "auto"};  // PrefsHideMount order
 constexpr const char* kCliPhoto[] = {"off", "rim", "full"};
 constexpr const char* kCliShading[] = {"off", "auto"};  // [WP-VIGNETTE]
 constexpr const char* kCliHdrPeak[] = {"1000", "600", "400", "203"};  // [WP-HDRPEAK] PrefsHdrPeak order
@@ -197,6 +198,7 @@ static_assert(std::size(kCliFit) == static_cast<std::size_t>(osv::premiere::Pref
 static_assert(std::size(kCliDevice) == static_cast<std::size_t>(osv::premiere::PrefsRenderDevice::Count));
 static_assert(std::size(kCliLook) == static_cast<std::size_t>(osv::premiere::PrefsLook::Count));
 static_assert(std::size(kCliFlow) == static_cast<std::size_t>(osv::premiere::PrefsFlowBackend::Count));
+static_assert(std::size(kCliHideMount) == static_cast<std::size_t>(osv::premiere::PrefsHideMount::Count));
 static_assert(std::size(kCliPhoto) == static_cast<std::size_t>(osv::premiere::PrefsPhotoSeam::Count));
 static_assert(std::size(kCliShading) == static_cast<std::size_t>(osv::premiere::PrefsLensShading::Count));
 // Scene Light and Lens Focal, in PrefsSceneLight / PrefsLensFocal order.
@@ -1506,6 +1508,15 @@ int enginePrefs(const RenderOptions& o, const CLI::App& sub, premiere::PrefsBlob
     if (given("--occlusion")) {
         out.hideMount =
             static_cast<std::uint8_t>(o.pipeline.occlusionMask ? pr::PrefsHideMount::On : pr::PrefsHideMount::Off);
+    }
+    // --hide-mount names the Source Settings choice itself (Auto included)
+    // and wins over --occlusion, as it does on the classic pipeline.
+    if (given("--hide-mount")) {
+        const int index = tokenIndex(kCliHideMount, o.pipeline.hideMount);
+        if (index < 0) {
+            return usage("unknown --hide-mount '" + o.pipeline.hideMount + "' (" + tokenList(kCliHideMount) + ")");
+        }
+        out.hideMount = static_cast<std::uint8_t>(index);
     }
     if (given("--parallax")) {
         out.parallax = static_cast<std::uint8_t>(o.parallax ? pr::PrefsParallax::On : pr::PrefsParallax::Off);

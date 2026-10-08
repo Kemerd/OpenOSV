@@ -15,7 +15,11 @@
 #include "osv/meta/Types.h"
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace osv::geom {
@@ -82,5 +86,85 @@ struct LensRig {
     /// True when `i` is a valid lens index.
     [[nodiscard]] static constexpr bool validIndex(int i) noexcept { return i >= 0 && i < kLensCount; }
 };
+
+// =============================================================================
+//  Hide Mount Auto: clipping an occlusion polygon to azimuth stretches
+// =============================================================================
+//
+// The calibration's occlusion polygon (buildOcclusion in LensRig.cpp) is the
+// sliver between the mount's arc and the rim of the image circle.  Seen from
+// the lens centre it covers one stretch of POLAR ANGLE (azimuth about the
+// optical axis, atan2(y - cy, x - cx) in fisheye pixels), and at every
+// azimuth inside that stretch it starts at an inner radius (the arc) and ends
+// at an outer one (the rim).
+//
+// Hide Mount Auto measures, per stretch of azimuth, whether the polygon hides
+// the mount or only scene both lenses see, and rebuilds the polygon so that
+//
+//   * Keep    stretches are exactly the calibration's sliver (the same edges);
+//   * Release stretches start beyond the usable image circle, so no pixel the
+//               stitch ever weighs is inside or near the polygon there;
+//   * Clamp   stretches are kept but start no closer to the centre than a
+//               given radius (the lens that does not image the mount must be
+//               fully trusted on the seam plane, or the coverage dips there).
+//
+// The result is still ONE simple polygon (an inner run forward in azimuth,
+// an outer run back), so the render kernels' even-odd test and distance
+// feather (osvOcclusionFactor) take it unchanged, and it is built once per
+// clip - nothing per pixel or per frame changes.
+
+/// How Hide Mount Auto treats one stretch of a lens's occlusion polygon.
+enum class OcclusionSpanState : std::uint8_t {
+    Keep = 0,     ///< The calibration's polygon, unchanged.
+    Release = 1,  ///< Moved beyond the usable image circle: the lens is used there.
+    Clamp = 2,    ///< Kept, but starting no closer to the lens centre than the clamp radius.
+};
+
+/// One stretch of polar angle about the lens centre, counter-clockwise from
+/// `fromRad` to `toRad` (radians, the atan2(y - cy, x - cx) convention of the
+/// fisheye image; any multiple of 2 pi is accepted).
+struct OcclusionSpan {
+    double fromRad = 0.0;  ///< Start of the stretch.
+    double toRad = 0.0;    ///< End of the stretch (counter-clockwise from the start).
+    OcclusionSpanState state = OcclusionSpanState::Keep;  ///< What happens to the polygon inside it.
+};
+
+/// Parameters of clipOcclusionPolygon.
+struct OcclusionClipParams {
+    /// Radius (px) beyond which no pixel of this lens is ever given weight:
+    /// the usable image circle plus the occlusion feather.  Released stretches
+    /// are moved beyond it, with margin for the chords between vertices.
+    double usableRadiusPx = 0.0;
+    /// Smallest inner radius (px) of a Clamp stretch.  Ignored by the others.
+    double clampRadiusPx = 0.0;
+    /// Vertex budget of the render kernels (OSV_MAX_OCCLUSION_POINTS): a
+    /// polygon that would need more is refused (OutOfRange-like Unsupported),
+    /// so the caller can merge stretches and try again.
+    std::size_t maxVertices = 32;
+};
+
+/// Distances from `centre` along the ray at polar angle `angleRad` to the
+/// nearest and the farthest crossing of `polygon`'s edges.  nullopt when the
+/// ray misses the polygon, the polygon has fewer than three vertices, or any
+/// input is not finite.
+[[nodiscard]] std::optional<std::pair<double, double>> occlusionRayRadii(const std::vector<Vec2d>& polygon,
+                                                                         const Vec2d& centre,
+                                                                         double angleRad) noexcept;
+
+/// Rebuild an occlusion polygon for Hide Mount Auto (see the block comment
+/// above).  `spans` that do not cover part of the polygon leave it Keep there.
+/// Returns the polygon UNCHANGED (the same vertices, bit for bit) when every
+/// stretch it covers is Keep, or Clamp with a clamp radius inside which the
+/// polygon never reaches: a clip whose verdict keeps everything renders
+/// exactly as with the calibration's mask.
+///
+/// Fails with InvalidArgument for malformed input (non-finite values, fewer
+/// than three vertices, a non-positive usable radius) and Unsupported for a
+/// polygon this cannot express as one inner and one outer run (it surrounds
+/// the lens centre or spans more than 300 deg) or one that would need more
+/// than `params.maxVertices` vertices.
+[[nodiscard]] Result<std::vector<Vec2d>> clipOcclusionPolygon(const std::vector<Vec2d>& polygon, const Vec2d& centre,
+                                                              const std::vector<OcclusionSpan>& spans,
+                                                              const OcclusionClipParams& params);
 
 }  // namespace osv::geom

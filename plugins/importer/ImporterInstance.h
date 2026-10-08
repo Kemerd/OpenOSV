@@ -1412,6 +1412,30 @@ private:
     /// the calibration (Refused).  Caller holds m_mutex.
     void settleLensAlignLocked(const std::optional<LensAlignVerdict>& rotation, const std::string& failure);
 
+    // ---- Hide Mount Auto (render/MountMask.h) ------------------------------------
+    /// Where the Hide Mount Auto verdict stands for the current rig.
+    enum class MountState : std::uint8_t {
+        Off,      ///< Hide Mount On or Off: the calibration's polygons, or none.
+        Pending,  ///< Auto, not measured yet: the full polygons until it lands.
+        Settled,  ///< Auto, answered: m_mountMask folded into m_rig (null: the full polygons stay).
+    };
+    MountState m_mountState = MountState::Off;
+    /// The verdict folded into m_rig's occlusion polygons; null for the
+    /// calibration's own (Hide Mount On, Auto still pending, or a failed
+    /// measurement).  Re-applied whenever m_rig is rebuilt from m_baseRig.
+    std::shared_ptr<const render::MountMask> m_mountMask;
+
+    /// Fold m_mountMask into `rig`, which must carry the calibration's
+    /// polygons (m_baseRig, with or without the rotation).  No-op without a
+    /// verdict; false (and `rig` untouched) when it cannot be applied.
+    /// Caller holds m_mutex.
+    bool applyMountMaskLocked(geom::LensRig& rig) const;
+
+    /// Adopt a settled Hide Mount Auto answer: rebuild m_rig's polygons from
+    /// it and drop every analysis measured through the old ones.  Caller
+    /// holds m_mutex.
+    void settleMountLocked(const std::shared_ptr<const render::MountMask>& mount, const std::string& failure);
+
     /// Which schedule serves this frame (see SteadyUse).  Caller holds m_mutex.
     [[nodiscard]] SteadyUse steadyUseLocked(RenderPurpose purpose) const noexcept;
 
@@ -1429,7 +1453,8 @@ private:
     PrefsLensFocal m_rigLensFocal = PrefsLensFocal::Auto;
     /// The Hide Mount choice m_blend's occlusion switch was built for
     /// (rebuildRig trigger): a change re-commits the analysis blend, and every
-    /// analysis measured through the other mask is dropped with it.
+    /// analysis measured through the other mask is dropped with it.  Auto
+    /// also rebuilds the polygons themselves (m_mountMask).
     PrefsHideMount m_rigHideMount = PrefsHideMount::On;
     /// The sky cap measurement for Scene Light Auto on a dark clip.
     SceneLightStage m_sceneStage;

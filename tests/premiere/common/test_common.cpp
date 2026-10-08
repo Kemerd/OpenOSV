@@ -341,7 +341,8 @@ TEST_CASE("Hide Mount: zero is On, garbage lands on On, every choice round-trips
     }
 
     SECTION("an out-of-range byte reads as On and sanitise() stores On") {
-        for (const std::uint8_t hostile : {std::uint8_t{2}, std::uint8_t{7}, std::uint8_t{0x80}, std::uint8_t{0xFF}}) {
+        // 2 is Auto now (appended third); 3 is the first byte with no meaning.
+        for (const std::uint8_t hostile : {std::uint8_t{3}, std::uint8_t{7}, std::uint8_t{0x80}, std::uint8_t{0xFF}}) {
             PrefsBlob p = PrefsBlob::defaults();
             p.hideMount = hostile;
             INFO("byte " << static_cast<int>(hostile));
@@ -386,6 +387,14 @@ TEST_CASE("Hide Mount: zero is On, garbage lands on On, every choice round-trips
         off.hideMount = static_cast<std::uint8_t>(PrefsHideMount::Off);
         REQUIRE(off.sanitise());
         CHECK(PrefsBlob::fromBytes(&off, PrefsBlob::kSize).hideMountChoice() == PrefsHideMount::Off);
+        // Auto, appended third: byte 2, valid as it stands, and not the
+        // default (an older project's zero stays On).
+        PrefsBlob autoMount = base;
+        autoMount.hideMount = 2;
+        REQUIRE(autoMount.sanitise());
+        CHECK(PrefsBlob::fromBytes(&autoMount, PrefsBlob::kSize).hideMountChoice() == PrefsHideMount::Auto);
+        CHECK(static_cast<int>(PrefsHideMount::Count) == 3);
+        CHECK(base.hideMountChoice() == PrefsHideMount::On);
     }
 }
 

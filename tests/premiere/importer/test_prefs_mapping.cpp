@@ -758,7 +758,8 @@ TEST_CASE("the Hide Mount combo round trips, keeps the other fields and refuses 
     REQUIRE(shown.hideMount == 0);
     REQUIRE(prefsFromControls(shown) == PrefsBlob::defaults());
 
-    // Both choices survive the round trip, and the combo index IS the byte.
+    // Every choice (On, Off, Auto) survives the round trip, and the combo
+    // index IS the byte.
     for (int mode = 0; mode < static_cast<int>(PrefsHideMount::Count); ++mode) {
         PrefsBlob original = PrefsBlob::defaults();
         original.hideMount = static_cast<std::uint8_t>(mode);
@@ -782,7 +783,8 @@ TEST_CASE("the Hide Mount combo round trips, keeps the other fields and refuses 
 
     // A combo with no selection (-1) or a corrupt index lands on On, never on
     // a mount shown by accident, and the blob needs no repair.
-    for (const int hostile : {-1, 2, 99, std::numeric_limits<int>::min(), std::numeric_limits<int>::max()}) {
+    // (2 is Auto, the third entry, since it was appended; 3 is past the list.)
+    for (const int hostile : {-1, 3, 99, std::numeric_limits<int>::min(), std::numeric_limits<int>::max()}) {
         DialogControls bad = controlsFromPrefs(PrefsBlob::defaults());
         bad.hideMount = hostile;
         PrefsBlob blob = prefsFromControls(bad);

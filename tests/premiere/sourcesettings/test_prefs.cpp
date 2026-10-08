@@ -396,6 +396,12 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
         const PrefsBlob blob = translate(fixture, off);
         CHECK(blob.hideMountChoice() == PrefsHideMount::Off);
         CHECK(blob.hideMount == 1u);  // the byte the importer keys its rig rebuild on
+        // Auto, the appended third item.
+        PrefsBuffer autoMount;
+        fixture.setPopup(kIndexHideMount, 3);
+        const PrefsBlob autoBlob = translate(fixture, autoMount);
+        CHECK(autoBlob.hideMountChoice() == PrefsHideMount::Auto);
+        CHECK(autoBlob.hideMount == 2u);
     }
     SECTION("Shading Strength") {  // [WP-VIGNETTE]
         for (const double percent : {0.0, 1.0, 42.0, 99.0, 100.0}) {
@@ -1131,8 +1137,8 @@ TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesetting
 }
 
 TEST_CASE("the pure mapping round-trips Hide Mount", "[sourcesettings][mapping][hidemount]") {
-    // Both items, both ways.  The list is in enum order, so item N selects
-    // enum value N - 1: item 1 = On, item 2 = Off.
+    // Every item, both ways.  The list is in enum order, so item N selects
+    // enum value N - 1: item 1 = On, item 2 = Off, item 3 = Auto.
     for (int item = 1; item <= OSV_SS_HIDE_MOUNT_COUNT; ++item) {
         ControlValues c;
         c.hideMount = item;
@@ -1147,7 +1153,8 @@ TEST_CASE("the pure mapping round-trips Hide Mount", "[sourcesettings][mapping][
     // whose Source Settings never saw the control renders as it always did.
     CHECK(prefsFromControls(ControlValues{}) == PrefsBlob::defaults());
     // Hostile popup values: On, never a blob needing repair.
-    for (const int hostile : {std::numeric_limits<int>::min(), -1, 0, 3, 77, std::numeric_limits<int>::max()}) {
+    // (Item 3 is Auto since it was appended; 4 is the first item past the list.)
+    for (const int hostile : {std::numeric_limits<int>::min(), -1, 0, 4, 77, std::numeric_limits<int>::max()}) {
         ControlValues c;
         c.hideMount = hostile;
         PrefsBlob blob = prefsFromControls(c);
