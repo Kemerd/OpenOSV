@@ -251,21 +251,13 @@ struct CellTask {
     return okStatus();
 }
 
-/// Squared central-difference luma gradient of one lens at band pixel
-/// (r, c), on the 0..1 code scale (ParallaxWarpParams::minStructureGradient
-/// documents the rule).
-///
-/// Half the difference of the two neighbours along the band (longitude,
-/// wrapping: the band is a ring) and across it (latitude).  A neighbour this
-/// lens does not cover (alpha <= 0.5), a non-finite one, or one beyond the
-/// band's top or bottom row is replaced by the centre pixel - a one-sided
-/// half difference, the same as edge padding - so the black beyond a rim or
-/// an occlusion polygon never reads as structure.  NaN for a non-finite
-/// centre, which then fails every comparison: no structure.
-///
-/// @pre r < h, c < w, both planes w * h (gridFromFlow checks the sizes).
-[[nodiscard]] double lumaGradientSq(const std::vector<float>& luma, const std::vector<float>& alpha, std::uint32_t w,
-                                    std::uint32_t h, std::uint32_t r, std::uint32_t c) noexcept {
+}  // namespace
+
+// The structure measure is shared with the mesh warp (MeshWarp.cpp), which
+// must count structured pixels exactly as the structured gate does - one
+// definition, so the two can never drift apart.  Documented in the header.
+double bandLumaGradientSq(const std::vector<float>& luma, const std::vector<float>& alpha, std::uint32_t w,
+                          std::uint32_t h, std::uint32_t r, std::uint32_t c) noexcept {
     const std::size_t i = static_cast<std::size_t>(r) * w + c;
     const double centre = static_cast<double>(luma[i]);
     if (!std::isfinite(centre)) {
@@ -289,6 +281,8 @@ struct CellTask {
     const double gy = 0.5 * (down - up);
     return gx * gx + gy * gy;
 }
+
+namespace {
 
 /// Bilinear sample of a band plane at continuous PIXEL-CENTRE coordinates
 /// (x, y) = (column + 0.5, row + 0.5) at the centre of a pixel.  Longitude
@@ -477,7 +471,7 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
 
     // ---- structure, for the structured gate (parallaxFromBands) -------------
     // A co-visible pixel is STRUCTURED when both lenses show a luma gradient
-    // of at least minStructureGradient there (lumaGradientSq): the flow can
+    // of at least minStructureGradient there (bandLumaGradientSq): the flow can
     // lock onto it, so its forward-backward verdict says something about the
     // measurement.  Compared squared, so no square root per pixel.  Bands
     // without luma planes of the band's size (a caller that only exercises
@@ -487,8 +481,8 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
     const double structureSq = params.minStructureGradient * params.minStructureGradient;
     const auto structuredAt = [&](std::uint32_t r, std::uint32_t c) noexcept {
         return lumaUsable &&
-               lumaGradientSq(bands.luma[0], bands.alpha[0], bands.w, bands.h, r, c) >= structureSq &&
-               lumaGradientSq(bands.luma[1], bands.alpha[1], bands.w, bands.h, r, c) >= structureSq;
+               bandLumaGradientSq(bands.luma[0], bands.alpha[0], bands.w, bands.h, r, c) >= structureSq &&
+               bandLumaGradientSq(bands.luma[1], bands.alpha[1], bands.w, bands.h, r, c) >= structureSq;
     };
 
     // Tasks of cells (see CellTask): each owns its cells outright and walks

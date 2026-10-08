@@ -518,12 +518,15 @@ TEST_CASE("a per-clip measurement skips a sample it cannot decode and fails only
     }
 }
 
-TEST_CASE("with the seam on, the clip grid renders after the per-column guard and the fallback table is unchanged",
-          "[steady][clip][synthetic][guard]") {
-    // One picture of a textured sky seen by both lenses with no parallax:
-    // every sample's grid measures every column, so the guard has nothing to
-    // hand over and the clip correction is the grid alone - exactly what it
-    // was before every sample also measured a seam table.
+TEST_CASE("with the seam on, the clip correction is one mesh field: no table under it, its lines kept straight",
+          "[steady][clip][synthetic][mesh]") {
+    // [WP-M] One picture of a textured sky seen by both lenses with no
+    // parallax, nine times: every sample's mesh is the same field, so their
+    // median is that field, and the line pass over the nine samples' lines
+    // (the same lines nine times) has nothing left to straighten.  The clip
+    // correction is then exactly one field of the mesh's layout - no seam
+    // table under it (0.5.1's guarded grid carried a table share), no
+    // fallback table (there IS a field).
     ThreadPool pool;
     auto rig = makeSyntheticRig(1024);
     REQUIRE(rig.ok());
@@ -539,26 +542,36 @@ TEST_CASE("with the seam on, the clip grid renders after the per-column guard an
     render::ClipSteadyParams params;
     params.parallax.backend = render::FlowBackendKind::Classical;
     params.seamOn = true;
+    // Each sample's own mesh, as it is published for the stand-ins.
+    std::vector<std::shared_ptr<const render::ParallaxWarpGrid>> sampleFields;
+    const render::ClipSampleGridFn onSample = [&](std::uint32_t, std::shared_ptr<const render::ParallaxWarpGrid> g) {
+        sampleFields.push_back(std::move(g));
+    };
 
-    auto measured = render::measureClipSteady(rig.value(), blend, frames, source, params, pool);
+    auto measured = render::measureClipSteady(rig.value(), blend, frames, source, params, pool, onSample);
     REQUIRE(measured.ok());
     const render::ClipSteady& c = measured.value();
-    INFO("accepted " << c.acceptedGrids << " of " << c.frames.size() << ", guarded columns " << c.guardedColumns);
+    INFO("solved " << c.acceptedGrids << " of " << c.frames.size() << ", " << c.lines << " lines, residual "
+                   << c.lineResidualBeforePx << " -> " << c.lineResidualAfterPx << " px");
     REQUIRE(c.grid != nullptr);
     REQUIRE(c.grid->valid());
-    // The clip grid carries the median untrusted share the guard read.
-    REQUIRE(c.grid->untrustedShare.size() == c.grid->w);
-    // The scene this test is built on: every sample accepted at full
-    // strength, and nothing for the guard to hand over.  Required, so a
-    // change to the synthetic setup fails here instead of leaving the checks
-    // below with nothing to check.
+    // Every sample solved, and published as it was.
     REQUIRE(c.acceptedGrids == c.frames.size());
-    REQUIRE(c.grid->strength >= 1.0);
-    REQUIRE(c.guardedColumns == 0u);
-    // No refused sample, so no fallback table - as before - and nothing of a
-    // table under the grid, since the guard handed it no column.
+    REQUIRE(sampleFields.size() == c.frames.size());
+    REQUIRE(sampleFields.front() != nullptr);
+    // The mesh's own layout: the clip field IS a mesh field.
+    const render::MeshWarpParams mesh;
+    CHECK(c.grid->w == mesh.meshCols);
+    CHECK(c.grid->h == sampleFields.front()->h);
+    // The line pass straightens, never bends.
+    CHECK(c.lineResidualAfterPx <= c.lineResidualBeforePx + 1e-9);
+    // Nine identical samples: the clip field is the samples' field.
+    auto change = render::meanAbsGridChangeDeg(*c.grid, *sampleFields.front(), params.parallax.band.bandHalfDeg);
+    REQUIRE(change.ok());
+    INFO("clip field vs a sample's own: mean |difference| " << change.value() << " deg");
+    CHECK(change.value() < 0.01);
+    // A field exists, so there is no fallback table.
     CHECK(c.seamTable == nullptr);
-    CHECK((c.gridTable == nullptr || c.gridTable->empty()));
 }
 
 TEST_CASE("the clip correction's medians are medians, and a median seam is a valid seam", "[steady][clip]") {

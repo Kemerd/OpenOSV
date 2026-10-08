@@ -2491,13 +2491,10 @@ library's own messages and FFmpeg's now land in the plug-in log at its level
   compare`. A WARNING `deliver: ... the host buffer does not hold the frame
   that was rendered` means the copy into Premiere's buffer, or the buffer, is
   at fault.
-* `frame N (bucket B, anchor A) of 'clip': parallax refused after ... (...:
-  structured 18.2% of 4235 px (needs 30% of at least 1500), all co-visible
-  9.6%); ...` - the per-bucket analysis lines now name the clip and say how
-  much of the flow was consistent: over the pixels with structure in both
-  lenses (the share the gate judges) and over all co-visible pixels. An
-  accepted line adds the `strength` the grid applies at; below 1.00 the seam
-  table fills the rest.
+* `frame N (bucket B, anchor A) of 'clip': mesh field (...): solved s 1.00
+  (structured x%), M matches ..., L lines ..., t ms` - the per-bucket
+  analysis lines name the clip and say what the seam correction was built
+  from (see the car-mount section below for every field of the line).
 
 **The five-minute check.** On the clip that shows the problem, over about two
 seconds around the damaged frame:
@@ -2562,12 +2559,20 @@ looks wrong.
 3. **Seam Search** (on by default) measures a per-column seam shift; since
    0.5.1 only columns both lenses can see move it, with a confidence per
    column, so a blank sky can no longer bend a lamp pole beside the seam.
-   Switch it off only to see what the calibration alone gives.
-4. **Parallax Grid.** Auto decides per clip whether one steady correction
-   serves the whole clip or each moment is measured on its own. On a rigid
-   mount the near part never moves, so Steady (per clip) is worth a try when
-   the seam still breathes; Follows scene (per moment) when something passes
-   close by.
+   With Parallax Grid on it is the starting point of the seam correction,
+   not a correction of its own: it is what lets the correction reach a car
+   body a metre away. Switch it off only to see what the calibration alone
+   gives.
+4. **Parallax Grid.** The seam correction is ONE smooth field per moment (a
+   mesh warp: it follows the measured parallax, keeps the straight edges it
+   finds at the seam straight, and leans on the moment before so it does not
+   jitter). Auto decides per clip whether one steady field serves the whole
+   clip or each moment is measured on its own. On a rigid mount the near
+   part never moves, so Steady (per clip) is worth a try when the seam still
+   breathes; Follows scene (per moment) when something passes close by.
+   During playback a moment that is still being measured shows the one
+   before it for a few frames; once measured, a frame looks exactly as it
+   does when you stop on it.
 5. **Parallax Blend** and **Seam Blend** widen the crossfade; a wider blend
    hides a small residual step as a soft double edge instead of a cut.
 
@@ -2585,20 +2590,40 @@ lines):
   N ms` - the Auto verdict, cached in `hide-mount.tsv` beside it. At Debug a
   line per 16-column window gives its agreement and which lens was kept.
 * `steady: 'clip': clip correction ready N ms after the first request (...;
-  9 sample frames ..., K grids accepted; ...): grid yes (N of 256 columns
-  to the seam table)|no, seam table yes|no, seam yes|no; Auto: ...` - the
-  per-clip correction and the Auto verdict (`follows scene` means each
-  moment is measured on its own). The column count is how much of the
-  grid the seam table took over where the flow could not measure the seam
-  and the table was sure of it: a car hood typically hands over 10-20
-  columns, the 6K sample none.
-* `frame N (bucket B, anchor A) of 'clip': parallax accepted ... structured
-  x% ... strength s` or `parallax refused ...` - each moment's 2-D
-  correction. A refusal is normal on sky and fog: the seam table carries
-  those moments. Many accepted lines at a strength below 1.00 mean the share
-  hovers at the gate and the table fills the rest. The Debug line `the seam
-  table under the parallax grid takes N of 256 grid columns` that follows an
-  accepted moment is the same hand-over, per moment.
+  9 sample frames ..., K meshes solved; ...): mesh field yes (L lines kept
+  straight, residual a -> b px, correction mean c / max d deg)|no, seam
+  table yes|no, seam yes|no; Auto: ...` - the per-clip correction and the
+  Auto verdict (`follows scene` means each moment is measured on its own).
+  The clip field is the median of the nine frames' fields, then kept
+  straight along every line those frames show; the residual is how far
+  those lines were from straight before and after (band pixels).
+* `frame N (bucket B, anchor A) of 'clip': mesh field (prior: bucket B-1
+  alone) [in the background]: solved s 1.00 (structured x%), M matches (R
+  raw / F refined, S shared), L lines (T triples), line residual a -> b
+  px, energy e0 -> e1, 2 solves, temporal |dV| v deg, t ms` - each moment's
+  correction (Debug). `matches` is how much of the flow it followed (on the
+  raw picture and on the picture already corrected by the seam table), `s`
+  the structured gate's weight on them (0 on open sky: nothing is
+  followed, and the field is the seam table's shift only for the clip's
+  first moment with no straight edge in the band - otherwise it is still
+  held toward the moment before and bent by the edges it keeps straight),
+  `lines` the straight edges it kept straight and how straight, `|dV|` how
+  far it moved from the moment before, `t` the solve's cost (10-14 ms on
+  four CPU threads, the field alone included). `field alone (its temporal
+  prior is not measured)` is a moment measured before the one ahead of it
+  (playback that started without a parked frame): not final, measured
+  again once the moment before is known. `stand-in field` is a moment
+  measured on the frame itself because nothing around it was measured yet:
+  not final either. `mesh failed (...); the bucket renders the seam table's
+  lift` falls back to the seam table's shift for that moment (`uncorrected`
+  when its table could not be measured either).
+* `frame N (bucket B, anchor bands A): seam carved ... through the mesh
+  field, steered by the anchor's ghosts` - the blend line carved from the
+  first frame's analysis bands that the measurement kept, steered around
+  the sun ghosts of that first frame, so a frame after it carves exactly
+  what a parked frame carves. `this frame's ghosts` marks a seam carved on
+  the frame itself (a stand-in, or an export whose first frame of the
+  moment could not be decoded).
 
 **What to send** when the seam is still wrong: the clip's name and recording
 mode (4K / 6K / 8K), the frame number or timecode of the moment, the Source
@@ -2607,12 +2632,14 @@ a screenshot of the moment and, if you have it, DJI Studio's export of the
 same moment at the same view. A ten-second cut of the original `.OSV` and its
 `.LRF` around that moment lets the stitch be reproduced exactly.
 
-Known limits on a mount in 0.5.1: a near part that crosses the seam inside
-the mask's arc still steps with Hide Mount On (about 2.7 deg for the lower
-roof edge on the measured car's proxy, 0.8 deg for the upper); Off brings
-them to about 2.3 and 0.6 deg, and Auto keeps the mask there unless the
-clip shows which lens does not see the mount. What remains is the near
-part's own disparity along the seam and about half a degree across it,
-which the seam correction (columns moved along the seam only) cannot
-remove. A passing walker very close to the camera can double for a few
-frames after a refused moment.
+Known limits on a mount: a near part that crosses the seam inside the
+mask's arc still steps with Hide Mount On (about 2.7 deg for the lower roof
+edge on the measured car's proxy, 0.8 deg for the upper); Off brings them
+to about 2.3 and 0.6 deg, and Auto keeps the mask there unless the clip
+shows which lens does not see the mount. Inside that arc only one lens sees
+the car, so nothing can be aligned there; next to it the correction now
+moves the picture along AND across the seam where both lenses see it. At
+night the car body beside the arc lines up a little worse than in 0.5.1
+(the thin overlap there gives the flow little to hold on to). A passing
+walker very close to the camera can double for a few frames before the
+moment's measurement lands.

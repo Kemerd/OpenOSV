@@ -98,6 +98,46 @@ a publication, that is recorded in `docs/LEGAL.md`, not here.
   - Implemented: the ratio test. The classical flow solver's 1-D search
     adopts an offset only when its residual beats the runner-up by the
     ratio (`include/osv/render/DisFlow.h`).
+- Tianli Liao, Nan Li. **Single-Perspective Warps in Natural Image
+  Stitching.** *IEEE Transactions on Image Processing* 29, 2020 (online
+  2019). <https://doi.org/10.1109/TIP.2019.2934344>
+  (arXiv: <https://arxiv.org/abs/1802.04645>)
+  - Implemented: the mesh warp of the seam band as one sparse
+    least-squares energy over bilinearly interpolated vertices, with an
+    alignment term over point matches and a line term over sampled line
+    segments - its eq. 13 second difference, as the collinearity residual
+    across each detected line (`include/osv/render/MeshWarp.h`,
+    `src/osv/render/MeshWarp.cpp`).
+- Qi Jia, ZhengJun Li, Xin Fan et al. **Leveraging Line-Point Consistence
+  To Preserve Structures for Wide Parallax Image Stitching.** *IEEE/CVF
+  CVPR*, 2021.
+  <https://openaccess.thecvf.com/content/CVPR2021/html/Jia_Leveraging_Line-Point_Consistence_To_Preserve_Structures_for_Wide_Parallax_Image_CVPR_2021_paper.html>
+  - Implemented: the line-straightness metric - a straight line fitted to
+    each line's warped samples and the residual reported (its eq. 8;
+    `measureLineStraightness` in `MeshWarp.h`, `osvtool seam --mesh`).
+    Reference: line-preserving terms for wide parallax (its eq. 5).
+- Wei Jiang, Jinwei Gu. **Video Stitching with Spatial-Temporal
+  Content-Preserving Warping.** *IEEE/CVF CVPR Workshops*, 2015.
+  <https://openaccess.thecvf.com/content_cvpr_workshops_2015/W10/html/Jiang_Video_Stitching_With_2015_CVPR_paper.html>
+  - Implemented: the mesh warp's temporal term (their E_gt: a pull toward
+    the previous frame's mesh, stronger where the scene is static) and its
+    anchor (their E_gs: a pull toward the pre-warped mesh where no match
+    guides a vertex) (`MeshWarp.h`).
+  - Adapted in the plug-ins: the previous mesh is the previous bucket's
+    solved WITHOUT its own temporal term (`MeshWarpResult::alone`) rather
+    than its final mesh, so every bucket's field depends on two anchors
+    only and a frame renders the same in playback, in an export and when
+    parked, whatever was rendered before it (`ImporterInstance.cpp`).
+- Julio Zaragoza, Tat-Jun Chin, Michael S. Brown, David Suter.
+  **As-Projective-As-Possible Image Stitching with Moving DLT.** *IEEE
+  CVPR*, 2013.
+  <https://openaccess.thecvf.com/content_cvpr_2013/html/Zaragoza_As-Projective-As-Possible_Image_Stitching_2013_CVPR_paper.html>
+- Che-Han Chang, Yoichi Sato, Yung-Yu Chuang. **Shape-Preserving
+  Half-Projective Warps for Image Stitching.** *IEEE CVPR*, 2014.
+  <https://openaccess.thecvf.com/content_cvpr_2014/html/Chang_Shape-Preserving_Half-Projective_Warps_2014_CVPR_paper.html>
+  - Reference (both): why a local warp must fall to a rigid transform away
+    from the matched region - the mesh warp's field is pinned to zero at
+    its latitude edges (`MeshWarp.h`).
 
 ## 2. Photometric alignment and filtering
 
@@ -143,6 +183,9 @@ a publication, that is recorded in `docs/LEGAL.md`, not here.
   - Evaluated (both): flat-field fall-off compensation and rigid MLS
     alignment, in the survey (`NEURAL_STITCHING.md` sections 1.5, 3 and 4).
     Reference code by the first author, drNoob13/fisheyeStitcher, is MIT.
+  - Reference (both): the interpolation-grid formulation of a dual-fisheye
+    seam correction and its temporal coherence, behind the mesh warp
+    (`include/osv/render/MeshWarp.h`).
 - I-Chan Lo, Kuang-Tsu Shih, Homer H. Chen. **Efficient and Accurate
   Stitching for 360° Dual-Fisheye Images and Videos.** *IEEE Transactions on
   Image Processing* 31, 2022. <https://doi.org/10.1109/TIP.2021.3130531>
@@ -613,6 +656,13 @@ removal is its own single-lens detector and parametric fit
   <https://www.ijcai.org/Proceedings/81-2/Papers/017.pdf>
   - Implemented in tests only: sub-pixel tile alignment that checks
     rendered framing (`tests/premiere/reframe/GpuTestSupport.cpp`).
+- Rafael Grompone von Gioi, Jérémie Jakubowicz, Jean-Michel Morel, Gregory
+  Randall. **LSD: a Line Segment Detector.** *Image Processing On Line* 2,
+  2012. <https://doi.org/10.5201/ipol.2012.gjmr-lsd>
+  - Implemented: the line detector on the seam band - level-line region
+    growing and the a-contrario Number of False Alarms test, without the
+    rectangle refinement (`detectSeamLines` in
+    `include/osv/render/MeshWarp.h`, `src/osv/render/MeshWarpLines.cpp`).
 
 ## 11. Colour standards and colour science
 

@@ -12,6 +12,7 @@
 #include "osv/geom/StreamScaling.h"
 #include "osv/render/ClipSteady.h"  // [WP-STEADY]
 #include "osv/render/LensAlign.h"   // [WP-STEADY]
+#include "osv/render/MeshWarp.h"    // [WP-M]
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"
 #include "osv/render/RenderParamsBuilder.h"
@@ -72,7 +73,44 @@ struct SeamOptions {
     /// Several named column windows scored with --parallax, e.g.
     /// "sky:410-900,ground:1110-1700,wing:1880-2040" (of 2048, wraps).
     std::string regions;
+    // ---- the mesh warp (render/MeshWarp.h) -------------------------------------
+    /// Solve the one-field mesh correction and score it: overlap NCC, the
+    /// --region window, and the straightness of every line detected on the
+    /// raw band - next to the seam table alone, the grid alone and the 0.5.1
+    /// composition (the grid guarded by the table) when --search ran.
+    bool mesh = false;
+    /// Measure the mesh's flow on the RAW bands instead of the bands
+    /// prewarped by the seam table's lift (needs --search to matter).
+    bool meshRawBands = false;
+    /// With --mesh: also solve this many consecutive buckets (frame, frame +
+    /// 8, ...) with the previous solve as the temporal prior, and report the
+    /// mean change of the field between consecutive solves - with and without
+    /// the temporal term.
+    int temporal = 0;
+    /// With --mesh: score the field the PLUG-INS render for this frame's
+    /// measurement - solved with the previous bucket (frame - 8) solved alone
+    /// as its temporal prior - instead of this frame solved alone.
+    bool meshPrior = false;
+    /// Tuning overrides for the mesh solve; the measurement block (band,
+    /// gates, flow) is taken from the --parallax tuning above.
+    render::MeshWarpParams meshTuning;
 };
+
+/// [WP-M] The line-straightness numbers as a JSON object.
+nlohmann::json straightnessJson(const render::LineStraightness& s) {
+    return {{"lines", s.lines},
+            {"samples", s.samples},
+            {"rmsPx", s.rmsPx},
+            {"maxPx", s.maxPx},
+            {"meanLineRmsPx", s.meanLineRmsPx},
+            {"maxLineRmsPx", s.maxLineRmsPx}};
+}
+
+/// [WP-M] The energy terms as a JSON object.
+nlohmann::json energyJson(const render::MeshWarpEnergy& e) {
+    return {{"alignment", e.alignment}, {"lines", e.lines},       {"shape", e.shape},
+            {"anchor", e.anchor},       {"temporal", e.temporal}, {"total", e.total()}};
+}
 
 /// [WP-STEADY] One named --regions window.
 struct NamedRegion {
@@ -389,6 +427,7 @@ int runSeam(const SeamOptions& o) {
         render::ClipSteadyParams cp;
         cp.parallax = o.parallaxTuning;
         cp.parallax.backend = backend;
+        cp.mesh = o.meshTuning;  // [WP-M] the clip field is the mesh's (its measurement block is cp.parallax)
         cp.parallaxOn = true;
         cp.seamOn = true;
         const std::vector<std::uint32_t> frames =
@@ -411,16 +450,17 @@ int runSeam(const SeamOptions& o) {
             if (c.grid) {
                 sj["meanDisparityDeg"] = c.grid->meanAbsCorrectionDeg;
                 sj["maxDisparityDeg"] = c.grid->maxAbsCorrectionDeg;
-                // The median of the accepted samples' structured-gate
-                // strengths; below 1 the clip seam table fills the rest.
+                // The median of the samples' structured-gate strengths (for
+                // the record: each mesh already weighs its data by its own).
                 sj["gridStrength"] = c.grid->strength;
                 sj["structuredFraction"] = c.grid->structuredFraction();
             }
             sj["seamTable"] = c.seamTable != nullptr;
-            // The table share under the clip grid and the columns the
-            // per-column guard handed to it (render::guardGridWithTable).
-            sj["gridTable"] = c.gridTable != nullptr && !c.gridTable->empty();
-            sj["guardedColumns"] = c.guardedColumns;
+            // [WP-M] The line pass over the median of the samples' meshes:
+            // the segments of every sample it keeps straight, and how straight.
+            sj["lines"] = c.lines;
+            sj["lineResidualBeforePx"] = c.lineResidualBeforePx;
+            sj["lineResidualAfterPx"] = c.lineResidualAfterPx;
             sj["seam"] = c.seam != nullptr;
             sj["decision"] = {{"steady", c.decision.steady},
                               {"textured", c.decision.textured},
@@ -682,13 +722,11 @@ int runSeam(const SeamOptions& o) {
                 if (held.ok()) {
                     pj["nccAfterSteady"] = held.value();
                 }
-                // The clip correction exactly as the importer renders it: the
-                // clip grid (after the per-column guard) and the clip table
-                // share under it (ClipSteady::gridTable), not this frame's table.
-                const std::vector<float>* clipShare =
-                    (steady->gridTable && !steady->gridTable->empty()) ? steady->gridTable.get() : nullptr;
+                // The clip correction exactly as the importer renders it:
+                // [WP-M] the clip field alone, the whole correction (no
+                // table under it, and not this frame's table).
                 auto asRendered =
-                    render::overlapNcc(P.rig, pair.value(), P.blendParams, band, *P.pool, clipShare, &steadyView);
+                    render::overlapNcc(P.rig, pair.value(), P.blendParams, band, *P.pool, nullptr, &steadyView);
                 if (asRendered.ok()) {
                     pj["nccAfterClip"] = asRendered.value();
                 }
@@ -809,6 +847,262 @@ int runSeam(const SeamOptions& o) {
         out["parallax"] = pj;
     }
 
+    // ---- [WP-M] the mesh warp: one field, scored next to what it replaces ----------
+    // The mesh is solved exactly as render::buildMeshWarp does it for the
+    // plug-ins: lines on the raw bands, the seam table (with --search) lifted
+    // into the prior and - unless --mesh-raw-bands - prewarping the flow
+    // bands, the flow, the solve.  Every score below is rendered by the
+    // kernel on the SAME scored band as the numbers above, with the 1-D seam
+    // shift OFF: the mesh is the whole correction.
+    if (o.mesh) {
+        render::MeshWarpParams mp = o.meshTuning;
+        mp.parallax = o.parallaxTuning;
+        mp.parallax.backend = backend;
+        const std::vector<float>* table = seamHold.empty() ? nullptr : &seamHold;
+        nlohmann::json mj;
+        // [WP-M] --mesh-prior: the plug-ins' temporal prior for this
+        // measurement - the previous bucket's frame (frame - 8), its own seam
+        // table, solved alone - so the field scored below is the one the
+        // plug-ins render, not this frame solved on its own.
+        render::ParallaxWarpGrid priorAlone;
+        bool havePrior = false;
+        if (o.meshPrior) {
+            const long long fp = static_cast<long long>(o.frame) - static_cast<long long>(render::kParallaxBucketFrames);
+            mj["priorFrame"] = fp;
+            if (fp < 0) {
+                mj["priorNote"] = "the clip's first bucket has no temporal prior";
+            } else if (auto pp = P.reader->read(static_cast<std::uint32_t>(fp)); !pp.ok()) {
+                mj["priorError"] = pp.error().message;
+            } else {
+                std::vector<float> tp;
+                if (table != nullptr) {
+                    auto prof = render::searchSeam(P.rig, pp.value(), P.blendParams, render::SeamSearchParams{},
+                                                   *P.pool);
+                    if (prof.ok()) {
+                        tp = prof.value().shiftDeg;
+                    }
+                }
+                auto alone = render::buildMeshWarp(P.rig, pp.value(), P.blendParams, mp, tp.empty() ? nullptr : &tp,
+                                                   !o.meshRawBands, nullptr, *P.pool);
+                if (alone.ok()) {
+                    priorAlone = std::move(alone.value().grid);
+                    havePrior = true;
+                } else {
+                    mj["priorError"] = alone.error().message;
+                }
+            }
+        }
+        render::MeshWarpBuildInfo info;
+        const auto t0 = std::chrono::steady_clock::now();
+        auto mesh = render::buildMeshWarp(P.rig, pair.value(), P.blendParams, mp, table, !o.meshRawBands,
+                                          havePrior ? &priorAlone : nullptr, *P.pool, &info);
+        mj["buildMs"] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        int rc0 = 0, rc1 = 0;
+        const bool regionAsked = !o.region.empty() && std::sscanf(o.region.c_str(), "%d-%d", &rc0, &rc1) == 2 &&
+                                 rc0 >= 0 && rc1 >= 0 && rc0 < static_cast<int>(band.equirectW) &&
+                                 rc1 < static_cast<int>(band.equirectW);
+        if (!mesh.ok()) {
+            mj["error"] = mesh.error().message;
+        } else {
+            const render::MeshWarpResult& m = mesh.value();
+            const render::MeshWarpReport& r = m.report;
+            mj["mode"] = r.mode == render::MeshWarpMode::Solved ? "solved" : "prior only";
+            mj["summary"] = r.summary();
+            mj["prewarped"] = info.bandsPrewarped;
+            mj["backend"] = render::flowBackendName(m.grid.usedBackend);
+            mj["strength"] = r.strength;
+            mj["structuredFraction"] = r.structuredFraction;
+            mj["structuredPixels"] = m.grid.structuredPixels;
+            mj["matches"] = r.matches;
+            mj["matchesPrimary"] = r.matchesPrimary;
+            mj["matchesRefined"] = r.matchesRefined;
+            mj["matchPairs"] = r.matchPairs;
+            mj["matchWeight"] = r.matchWeight;
+            mj["lines"] = {{"detected", info.lines.lines.size()},
+                           {"perLens", {info.lines.perLens[0], info.lines.perLens[1]}},
+                           {"regions", info.lines.regions},
+                           {"rejected", info.lines.rejected},
+                           {"detectMs", info.lines.ms},
+                           {"used", r.lines},
+                           {"triples", r.lineTriples},
+                           {"triplesDropped", r.lineTriplesDropped}};
+            mj["benefitGatedCells"] = r.benefitGatedCells;
+            mj["irlsIterations"] = r.irlsIterations;
+            mj["energyBefore"] = energyJson(r.before);
+            mj["energyAfter"] = energyJson(r.after);
+            mj["lineResidualBeforePx"] = r.lineResidualBeforePx;
+            mj["lineResidualAfterPx"] = r.lineResidualAfterPx;
+            mj["ms"] = {{"rawBands", info.rawBandMs}, {"warpedBands", info.warpedBandMs}, {"flow", m.grid.flowMs},
+                        {"matches", r.matchMs},       {"assemble", r.assembleMs},      {"factor", r.factorMs},
+                        {"benefit", r.benefitMs},     {"total", r.totalMs}};
+            mj["gridW"] = m.grid.w;
+            mj["gridH"] = m.grid.h;
+            mj["meanDisparityDeg"] = m.grid.meanAbsCorrectionDeg;
+            mj["maxDisparityDeg"] = m.grid.maxAbsCorrectionDeg;
+            mj["untrustedShare"] = m.grid.untrustedShare;
+            // ---- the overlap, rendered by the kernel with the mesh alone ---------------
+            const render::WarpGridView view = render::warpGridView(m.grid);
+            auto after = render::overlapNcc(P.rig, pair.value(), P.blendParams, band, *P.pool, nullptr, &view);
+            if (after.ok()) {
+                mj["nccAfter"] = after.value();
+            } else {
+                mj["nccError"] = after.error().message;
+            }
+            if (regionAsked) {
+                auto bands = render::renderLensBands(P.rig, pair.value(), P.blendParams, band, false, nullptr,
+                                                     *P.pool, &view);
+                if (bands.ok()) {
+                    const RegionScore s = scoreRegion(bands.value(), rc0, rc1);
+                    mj["region"] = {{"ncc", s.ncc}, {"meanAbsDiff", s.meanAbsDiff}, {"samples", s.samples}};
+                }
+            }
+            // ---- line straightness: the mesh against what it replaces ---------------------
+            // Every line detected on the raw band, warped by each correction
+            // as the kernel moves it, fitted with a straight line.  "none" is
+            // zero by construction (the samples lie on the detected segment).
+            const std::vector<render::SeamLine>& lines = info.lines.lines;
+            const std::uint32_t mapW = mp.parallax.band.equirectW;
+            nlohmann::json ls;
+            const auto putStraightness = [&](const char* name, const render::ParallaxWarpGrid* grid,
+                                             const std::vector<float>* tableShare) {
+                auto s = render::measureLineStraightness(lines, mapW, grid, tableShare);
+                if (s.ok()) {
+                    ls[name] = straightnessJson(s.value());
+                }
+            };
+            putStraightness("none", nullptr, nullptr);
+            putStraightness("mesh", &m.grid, nullptr);
+            if (table != nullptr) {
+                putStraightness("table", nullptr, table);
+                // The 0.5.1 composition, through the same calls the importer
+                // made: the grid on the raw bands, guarded by the table.
+                render::ParallaxWarpParams pw = o.parallaxTuning;
+                pw.backend = backend;
+                auto legacy = [&]() -> Result<render::ParallaxWarpGrid> {
+                    OSV_TRY_ASSIGN(render::LensBands lb, render::measureParallaxBands(P.rig, pair.value(),
+                                                                                     P.blendParams, pw, nullptr,
+                                                                                     *P.pool));
+                    return render::parallaxFromBands(lb, pw, P.pool.get());
+                }();
+                if (legacy.ok()) {
+                    putStraightness("gridAlone", &legacy.value(), nullptr);
+                    auto guarded = render::guardGridWithTable(legacy.value(), seamHold, seamConfHold);
+                    if (guarded.ok()) {
+                        const render::GuardedCorrection& gc = guarded.value();
+                        const render::ParallaxWarpGrid& shown = gc.changed ? gc.grid : legacy.value();
+                        putStraightness("guarded", &shown, gc.table.empty() ? nullptr : &gc.table);
+                        // The 0.5.1 picture of the band, for a before/after look.
+                        if (!o.dumpBands.empty()) {
+                            const render::WarpGridView gv = render::warpGridView(shown);
+                            writeBands("guarded", gc.table.empty() ? nullptr : &gc.table, &gv);
+                        }
+                    }
+                } else {
+                    // Refused on the raw bands: 0.5.1 rendered the table alone.
+                    putStraightness("guarded", nullptr, table);
+                    mj["legacyRefused"] = legacy.error().message;
+                }
+            }
+            mj["lineStraightness"] = ls;
+            // ---- --dump-bands: the mesh-corrected band, the field, the lines -------------
+            if (!o.dumpBands.empty()) {
+                writeBands("mesh", nullptr, &view);
+                writeRawPlane(o.dumpBands + "_meshgrid.f32", m.grid.uv);
+                nlohmann::json lj = nlohmann::json::array();
+                for (const render::SeamLine& ln : lines) {
+                    lj.push_back({ln.lens, ln.lon0Rad, ln.lat0Rad, ln.lon1Rad, ln.lat1Rad, ln.lengthPx, ln.logNfa});
+                }
+                mj["dumpLines"] = lj;  // [lens, lon0, lat0, lon1, lat1, length px, log10 NFA]
+            }
+            // ---- --temporal N: consecutive buckets, with and without the temporal term ----
+            if (o.temporal > 1) {
+                nlohmann::json tj = nlohmann::json::array();
+                // Three schedules over the same buckets: the full chain
+                // (Jiang & Gu: each bucket on the previous bucket's result),
+                // independent solves, and [WP-M] the plug-ins' rule - each
+                // bucket on the previous bucket's field solved ALONE, so a
+                // field depends on two anchors only (playback == parked).
+                render::ParallaxWarpGrid prevTemporal = m.grid;
+                render::ParallaxWarpGrid prevIndependent = m.grid;
+                render::ParallaxWarpGrid prevPlugin = m.grid;
+                double sumT = 0.0;
+                double sumI = 0.0;
+                double sumP = 0.0;
+                int steps = 0;
+                for (int k = 1; k < o.temporal; ++k) {
+                    const long long f = static_cast<long long>(o.frame) +
+                                        static_cast<long long>(k) * static_cast<long long>(render::kParallaxBucketFrames);
+                    if (f >= static_cast<long long>(P.frameCount())) {
+                        break;
+                    }
+                    auto pk = P.reader->read(static_cast<std::uint32_t>(f));
+                    if (!pk.ok()) {
+                        tj.push_back({{"frame", f}, {"error", pk.error().message}});
+                        break;
+                    }
+                    // This bucket's own table, as the importer measures one per anchor.
+                    std::vector<float> tk;
+                    if (table != nullptr) {
+                        auto prof = render::searchSeam(P.rig, pk.value(), P.blendParams, render::SeamSearchParams{},
+                                                       *P.pool);
+                        if (prof.ok()) {
+                            tk = prof.value().shiftDeg;
+                        }
+                    }
+                    const std::vector<float>* tkp = tk.empty() ? nullptr : &tk;
+                    auto withT = render::buildMeshWarp(P.rig, pk.value(), P.blendParams, mp, tkp, !o.meshRawBands,
+                                                       &prevTemporal, *P.pool);
+                    // The plug-ins' rule, with this bucket's field alone from
+                    // the same solve (MeshWarpResult::alone) - which is also
+                    // exactly the independent solve.
+                    auto plugin = render::buildMeshWarp(P.rig, pk.value(), P.blendParams, mp, tkp, !o.meshRawBands,
+                                                        &prevIndependent, *P.pool, nullptr, true);
+                    if (!withT.ok() || !plugin.ok() || !plugin.value().alone) {
+                        tj.push_back({{"frame", f},
+                                      {"error", !withT.ok()    ? withT.error().message
+                                                : !plugin.ok() ? plugin.error().message
+                                                               : std::string("no field alone")}});
+                        break;
+                    }
+                    const render::ParallaxWarpGrid& alone = *plugin.value().alone;
+                    const double bandDeg = mp.parallax.band.bandHalfDeg;
+                    auto dT = render::meanAbsGridChangeDeg(withT.value().grid, prevTemporal, bandDeg);
+                    auto dI = render::meanAbsGridChangeDeg(alone, prevIndependent, bandDeg);
+                    auto dP = render::meanAbsGridChangeDeg(plugin.value().grid, prevPlugin, bandDeg);
+                    const double vT = dT.ok() ? dT.value() : -1.0;
+                    const double vI = dI.ok() ? dI.value() : -1.0;
+                    const double vP = dP.ok() ? dP.value() : -1.0;
+                    sumT += vT;
+                    sumI += vI;
+                    sumP += vP;
+                    ++steps;
+                    tj.push_back({{"frame", f},
+                                  {"meanAbsDeltaUvDeg", vT},
+                                  {"meanAbsDeltaUvDegIndependent", vI},
+                                  {"meanAbsDeltaUvDegPlugin", vP},
+                                  {"solveMs", withT.value().report.totalMs},
+                                  {"pluginSolveMs", plugin.value().report.totalMs},
+                                  {"summary", withT.value().report.summary()},
+                                  {"pluginSummary", plugin.value().report.summary()}});
+                    prevTemporal = withT.value().grid;
+                    prevIndependent = alone;
+                    prevPlugin = plugin.value().grid;
+                }
+                // Per frame: the glide moves 1/kParallaxBucketFrames of a
+                // bucket-to-bucket change each frame.
+                const double perFrame = 1.0 / static_cast<double>(render::kParallaxBucketFrames);
+                mj["temporal"] = {{"buckets", tj},
+                                  {"steps", steps},
+                                  {"meanAbsDeltaUvDeg", steps ? sumT / steps : 0.0},
+                                  {"meanAbsDeltaUvDegIndependent", steps ? sumI / steps : 0.0},
+                                  {"meanAbsDeltaUvDegPlugin", steps ? sumP / steps : 0.0},
+                                  {"perFrameDeltaUvDegPlugin", steps ? perFrame * sumP / steps : 0.0},
+                                  {"perFrameDeltaUvDegIndependent", steps ? perFrame * sumI / steps : 0.0}};
+            }
+        }
+        out["mesh"] = mj;
+    }
+
     if (o.photo) {
         out["photo"] = photoSeamReport(P, pair.value(), o);  // [WP-PHOTO]
     }
@@ -848,6 +1142,29 @@ int runSeam(const SeamOptions& o) {
                                 name, m["line"].get<double>(), m["band"].get<double>(), m["broad"].get<double>(),
                                 m["dE"].get<double>(), m["lineX"].get<double>(), m["bandX"].get<double>(),
                                 m["broadX"].get<double>(), m["dEX"].get<double>());
+                }
+            }
+        }
+        if (out.contains("mesh")) {
+            const nlohmann::json& mj = out["mesh"];
+            if (mj.contains("error")) {
+                std::printf("  mesh warp: unavailable (%s)\n", mj["error"].get<std::string>().c_str());
+            } else {
+                std::printf("  mesh warp: %s\n", mj["summary"].get<std::string>().c_str());
+                std::printf("    NCC after %.4f, disparity mean %.3f / max %.3f deg\n", mj.value("nccAfter", -1.0),
+                            mj["meanDisparityDeg"].get<double>(), mj["maxDisparityDeg"].get<double>());
+                if (mj.contains("lineStraightness")) {
+                    for (const auto& [name, s] : mj["lineStraightness"].items()) {
+                        std::printf("    lines %-9s RMS %.3f px, max %.3f px over %u lines\n", name.c_str(),
+                                    s["rmsPx"].get<double>(), s["maxPx"].get<double>(), s["lines"].get<unsigned>());
+                    }
+                }
+                if (mj.contains("temporal")) {
+                    std::printf("    temporal: mean |delta uv| %.4f deg with the temporal term, %.4f deg without, "
+                                "over %d steps\n",
+                                mj["temporal"]["meanAbsDeltaUvDeg"].get<double>(),
+                                mj["temporal"]["meanAbsDeltaUvDegIndependent"].get<double>(),
+                                mj["temporal"]["steps"].get<int>());
                 }
             }
         }
@@ -934,6 +1251,53 @@ void registerSeamCommand(CLI::App& app, CommandContext& ctx) {
     sub->add_option("--parallax-band-deg", opt->parallaxTuning.band.bandHalfDeg,
                     "Half height of the analysed band in degrees (tuning)")
         ->default_val(opt->parallaxTuning.band.bandHalfDeg);
+    // [WP-M] the mesh warp
+    sub->add_flag("--mesh", opt->mesh,
+                  "Solve the one-field mesh correction (line, shape and temporal terms) and score it: overlap NCC, "
+                  "--region, and line straightness next to the table, the grid and their 0.5.1 composition");
+    sub->add_flag("--mesh-raw-bands", opt->meshRawBands,
+                  "Measure the mesh's flow on the raw bands instead of bands prewarped by the --search table");
+    sub->add_flag("--mesh-prior", opt->meshPrior,
+                  "With --mesh: score the field the plug-ins render - solved with the previous bucket (frame - 8) "
+                  "solved alone as its temporal prior");
+    sub->add_option("--temporal", opt->temporal,
+                    "With --mesh: solve N consecutive buckets with the temporal prior and report the mean change")
+        ->default_val(0);
+    sub->add_option("--mesh-cols", opt->meshTuning.meshCols, "Mesh columns round the ring (tuning)")
+        ->default_val(opt->meshTuning.meshCols);
+    sub->add_option("--mesh-row-deg", opt->meshTuning.rowSpacingDeg, "Mesh row spacing in degrees (tuning)")
+        ->default_val(opt->meshTuning.rowSpacingDeg);
+    sub->add_option("--mesh-line-weight", opt->meshTuning.lineWeight, "Line term weight, 0 = off (tuning)")
+        ->default_val(opt->meshTuning.lineWeight);
+    sub->add_option("--mesh-bending", opt->meshTuning.shapeBending, "Shape bending density (tuning)")
+        ->default_val(opt->meshTuning.shapeBending);
+    sub->add_option("--mesh-temporal-weight", opt->meshTuning.temporalWeight, "Temporal weight (tuning)")
+        ->default_val(opt->meshTuning.temporalWeight);
+    sub->add_option("--mesh-irls", opt->meshTuning.irlsIterations, "Mesh IRLS solves (tuning)")
+        ->default_val(opt->meshTuning.irlsIterations);
+    sub->add_option("--mesh-robust-px", opt->meshTuning.robustScalePx, "Cauchy scale of the matches, px (tuning)")
+        ->default_val(opt->meshTuning.robustScalePx);
+    sub->add_option("--mesh-anchor", opt->meshTuning.anchorWeight, "Anchor (prior) weight (tuning)")
+        ->default_val(opt->meshTuning.anchorWeight);
+    sub->add_option("--mesh-cross-shape", opt->meshTuning.crossMeridianShapeScale,
+                    "Shape multiplier of the cross-meridian component (tuning)")
+        ->default_val(opt->meshTuning.crossMeridianShapeScale);
+    sub->add_option("--mesh-stride", opt->meshTuning.matchStride, "Match stride in band pixels (tuning)")
+        ->default_val(opt->meshTuning.matchStride);
+    sub->add_option("--mesh-shared-refined", opt->meshTuning.sharedRefinedShare,
+                    "Share of the prewarped flow where both flows matched a pixel (tuning)")
+        ->default_val(opt->meshTuning.sharedRefinedShare);
+    sub->add_option("--mesh-flat-weight", opt->meshTuning.unstructuredWeight,
+                    "Weight of consistent matches without structure (tuning)")
+        ->default_val(opt->meshTuning.unstructuredWeight);
+    sub->add_option("--mesh-membrane", opt->meshTuning.shapeMembrane, "Shape membrane density (tuning)")
+        ->default_val(opt->meshTuning.shapeMembrane);
+    sub->add_option("--mesh-temporal-scale", opt->meshTuning.temporalScalePx,
+                    "Scale of the temporal term's Cauchy weight, px (tuning)")
+        ->default_val(opt->meshTuning.temporalScalePx);
+    sub->add_option("--mesh-anchor-covisible", opt->meshTuning.anchorCovisibleScale,
+                    "No-data anchor multiplier where both lenses see the vertex (tuning)")
+        ->default_val(opt->meshTuning.anchorCovisibleScale);
     sub->callback([opt, &ctx]() { ctx.exitCode = runSeam(*opt); });
 }
 

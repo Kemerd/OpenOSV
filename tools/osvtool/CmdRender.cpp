@@ -50,6 +50,7 @@
 #include "osv/io/SphericalMetadata.h"
 #include "osv/render/FlowBackend.h"
 #include "osv/render/LensShading.h"
+#include "osv/render/MeshWarp.h"  // [WP-M] the one correction field
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"
 #include "osv/render/SeamCarve.h"
@@ -97,6 +98,16 @@ struct RenderOptions {
     std::string parallaxGrid;     ///< follows | steady | auto (empty = the defaults').
     std::string lensAlign;        ///< off | auto (empty = the defaults').
     std::string lensFocal;        ///< auto | camera | calibration (empty = the defaults').
+    /// [WP-M] The request kind every frame is rendered with, as the plug-ins
+    /// see Premiere's: exact (export, a parked frame - the default) |
+    /// interactive (playback: never waits for an analysis, may render a
+    /// non-final frame) | playback (the playback == parked check: the first
+    /// frame parked, the range played twice, the SECOND pass written - each
+    /// frame of it re-asked until final, as Premiere re-asks a frame that
+    /// stayed out of its cache) | play (what a viewer sees while Premiere
+    /// plays from a parked frame: the first frame parked, then ONE
+    /// Interactive pass, every frame written as it came back, final or not).
+    std::string purpose = "exact";
     /// Scene Light, both engines: auto | day | night.  Empty = the engine's
     /// default - the Source Settings defaults' (Auto) for the plug-in engine,
     /// day (every analysis exactly as asked) for the classic pipeline.
@@ -951,14 +962,16 @@ int runRender(const RenderOptions& o) {
     const auto t0 = std::chrono::steady_clock::now();
     int exitCode = kExitOk;
     std::vector<float> seamTable;
-    std::vector<float> seamConfidence;  // the table's per-column confidence (the per-column guard's)
-    render::ParallaxWarpGrid warpGrid;  // as measured
+    // [WP-M] The one correction field (render/MeshWarp.h), as the plug-ins
+    // build a bucket's: the mesh solved on each analysed frame with its seam
+    // table lifted in as the prior and the previous analysed frame's field
+    // ALONE as its temporal prior - the importer's rule, so this command's
+    // A/B shows the picture a user gets there.
+    render::ParallaxWarpGrid appliedGrid;  // the field as it renders
     bool haveWarp = false;
-    // The grid as it renders - after the per-column guard with the frame's
-    // seam table (render::guardGridWithTable) - and the table share under
-    // it, exactly as the importer builds a bucket's correction.
-    render::ParallaxWarpGrid appliedGrid;
-    std::vector<float> gridTable;
+    render::ParallaxWarpGrid meshAlone;    // the last analysed frame's field alone (the next one's prior)
+    bool haveAlone = false;
+    const std::vector<float> noSeamShift;  // the kernel's 1-D shift under the mesh: nothing
     render::BlendSeam blendSeam;  // the carved seam in force (--seam-carve)
     // [WP-PHOTO] --photo: the parameters, the per-clip field history (EMA,
     // cross-fade, the rim median over the run of buckets - exactly the
@@ -1075,45 +1088,9 @@ int runRender(const RenderOptions& o) {
         // Optional per-frame analysis (every seamInterval frames).
         const bool analyse = (o.seamSearch || o.gain || o.parallax || o.seamCarve) &&
                              ((tf - first) % static_cast<std::uint32_t>(std::max(1, o.seamInterval)) == 0);
-        // 2-D parallax correction first.  When it yields a grid, the grid
-        // REPLACES the seam table rather than composing with it - except in
-        // the columns the grid could not measure, where the table is sure and
-        // found a disparity the grid missed, which the per-column guard hands
-        // to the table - the same policy as the Premiere importer, so this
-        // command's A/B shows the picture a user actually gets there.  Composing the two everywhere costs the
-        // 6K sample (whole-band overlap NCC, OSV frame 60: grid alone 0.9197,
-        // table + grid 0.9128).  See ImporterInstance::applyAnalyses.
-        //
-        // A refused grid is NOT fatal: on featureless content the flow cannot
-        // be trusted and buildParallaxWarp says so, and the seam table (when
-        // --seam-search is on) becomes the fallback for that stretch.
-        if (analyse && o.parallax) {
-            render::ParallaxWarpParams pw;
-            pw.backend = parallaxBackend;
-            const auto tWarp0 = std::chrono::steady_clock::now();
-            auto grid = render::buildParallaxWarp(P.rig, pair.value(), P.blendParams, pw, nullptr, *P.pool);
-            const double warpMs =
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tWarp0).count();
-            if (grid.ok()) {
-                warpGrid = std::move(grid).value();
-                haveWarp = true;
-                log::info("frame {}: parallax {} in {:.0f} ms (flow {:.0f}), consistent {:.1f}%, gated {}/{}, "
-                          "disparity mean {:.3f} / max {:.3f} deg",
-                          f, render::flowBackendName(warpGrid.usedBackend), warpMs, warpGrid.flowMs,
-                          100.0 * warpGrid.consistentFraction(), warpGrid.gatedCells, warpGrid.measuredCells,
-                          warpGrid.meanAbsCorrectionDeg, warpGrid.maxAbsCorrectionDeg);
-            } else {
-                haveWarp = false;
-                log::warn("frame {}: parallax correction refused ({}){}", f, log::safe(grid.error().message),
-                          o.seamSearch ? "; using the seam table" : "; rendering without it");
-            }
-        }
-        const bool useWarp = o.parallax && haveWarp;
-
-        // The seam table: the correction where the grid is refused or off,
-        // and under an accepted grid the per-column guard's - so it is
-        // measured on every analysed frame, as the importer measures it for
-        // every bucket with Seam Search on.
+        // The seam table first: with Parallax Grid on it is the mesh's prior
+        // (its lift) and the field the refined flow's bands are rendered
+        // through; with it off, the correction itself.
         if (analyse && o.seamSearch) {
             render::SeamSearchParams sp;
             auto profile = render::searchSeam(P.rig, pair.value(), P.blendParams, sp, *P.pool);
@@ -1121,36 +1098,43 @@ int runRender(const RenderOptions& o) {
                 render::SeamProfile& p = profile.value();
                 log::debug("frame {}: seam meanNcc {:.3f}, accepted {}", f, p.meanNcc, p.acceptedColumns);
                 seamTable = std::move(p.shiftDeg);
-                seamConfidence = std::move(p.confidence);
             } else {
                 log::warn("frame {}: seam search failed: {}", f, profile.error().message);
             }
         }
-        // The grid as it renders: the per-column guard with this frame's
-        // table hands the table the columns the grid could not measure where
-        // the table is sure and found a disparity the grid missed, and leaves
-        // the table's share under the grid (1 - strength plus those columns).
-        // Without a table, the grid alone.
-        if (analyse && useWarp) {
-            appliedGrid = warpGrid;
-            gridTable.clear();
-            if (o.seamSearch && !seamTable.empty()) {
-                auto guarded = render::guardGridWithTable(warpGrid, seamTable, seamConfidence);
-                if (guarded.ok()) {
-                    render::GuardedCorrection& g = guarded.value();
-                    log::info("frame {}: the seam table under the parallax grid takes {} of {} grid columns (mean "
-                              "weight {:.2f})",
-                              f, g.guardedColumns, warpGrid.w, g.meanGuard);
-                    if (g.changed) {
-                        appliedGrid = std::move(g.grid);
-                    }
-                    gridTable = std::move(g.table);
-                } else {
-                    log::warn("frame {}: per-column guard refused ({}); the grid alone", f,
-                              log::safe(guarded.error().message));
+        // [WP-M] The mesh field: ONE correction (alignment to the flow,
+        // straight lines kept straight, shape, the table as its prior, the
+        // previous analysed frame as its temporal prior) - it replaces the
+        // 0.5.1 composition of the flow grid, the table under it and the
+        // per-column guard, whose switches between two fields bent every
+        // straight line crossing the seam band.  With nothing to measure the
+        // field is the table's lift: one field either way.
+        if (analyse && o.parallax) {
+            render::MeshWarpParams mp;
+            mp.parallax.backend = parallaxBackend;
+            const std::vector<float>* table = (o.seamSearch && !seamTable.empty()) ? &seamTable : nullptr;
+            const auto tWarp0 = std::chrono::steady_clock::now();
+            auto mesh = render::buildMeshWarp(P.rig, pair.value(), P.blendParams, mp, table, true,
+                                              haveAlone ? &meshAlone : nullptr, *P.pool, nullptr, true);
+            const double warpMs =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tWarp0).count();
+            if (mesh.ok()) {
+                render::MeshWarpResult& m = mesh.value();
+                if (m.alone) {
+                    meshAlone = std::move(*m.alone);
+                    haveAlone = true;
                 }
+                appliedGrid = std::move(m.grid);
+                haveWarp = true;
+                log::info("frame {}: mesh in {:.0f} ms: {}", f, warpMs, m.report.summary());
+            } else {
+                haveWarp = false;
+                log::warn("frame {}: mesh correction failed ({}){}", f, log::safe(mesh.error().message),
+                          o.seamSearch ? "; using the seam table" : "; rendering without it");
             }
         }
+        const bool useWarp = o.parallax && haveWarp;
+
         // [WP-VIGNETTE] The lens shading correction for this frame, FIRST:
         // the photometric field and the exposure match below are measured
         // on the corrected lenses, as the importer does.  One measurement
@@ -1223,17 +1207,9 @@ int runRender(const RenderOptions& o) {
             render::WarpGridView warpView;
             render::SeamCorrection correction;
             if (useWarp) {
-                // The correction on screen: the guarded grid and the table
-                // share under it.
-                warpView.uv = appliedGrid.uv.data();
-                warpView.w = appliedGrid.w;
-                warpView.h = appliedGrid.h;
-                warpView.latMinRad = appliedGrid.latMinRad;
-                warpView.latMaxRad = appliedGrid.latMaxRad;
+                // The correction on screen: the mesh field, the whole of it.
+                warpView = render::warpGridView(appliedGrid);
                 correction.warp = &warpView;
-                if (!gridTable.empty()) {
-                    correction.seamShiftDeg = &gridTable;
-                }
             } else if (o.seamSearch && !seamTable.empty()) {
                 correction.seamShiftDeg = &seamTable;
             }
@@ -1273,11 +1249,11 @@ int runRender(const RenderOptions& o) {
             }
         }
         // The builder persists across frames, so both corrections are set
-        // explicitly every frame: the guarded grid and the table share under
-        // it (none when empty), or the table alone.
+        // explicitly every frame: the mesh field with no 1-D shift under it,
+        // or the table alone.
         if (useWarp) {
             builder.warp(appliedGrid.uv, appliedGrid.w, appliedGrid.h, appliedGrid.latMinRad, appliedGrid.latMaxRad);
-            builder.seam(gridTable);
+            builder.seam(noSeamShift);
         } else {
             builder.clearWarp();
             if (o.seamSearch) {
@@ -1345,12 +1321,18 @@ int runRender(const RenderOptions& o) {
 /// The engine's log lines on osvtool's console (PluginLog::setMirror): the
 /// clip engine logs through the plug-ins' logger, which osvtool never points
 /// at a file, so nothing it does lands in the plug-ins' own log files.
+///
+/// The engine's Debug and Trace lines reach this mirror only when
+/// OSV_PLUGIN_LOG_LEVEL asked for them (the plug-ins' logger filters first),
+/// and a sub-command runs before osvtool's own -v takes effect - so they are
+/// printed at info, marked, rather than dropped: the per-bucket mesh lines
+/// (matches, lines, residuals, ms) are what that variable is set for.
 void mirrorEngineLog(premiere::PluginLog::Level level, std::string_view text) noexcept {
     try {
         const std::string line = log::safe(text);
         switch (level) {
         case premiere::PluginLog::Level::Trace:
-        case premiere::PluginLog::Level::Debug: log::debug("engine: {}", line); break;
+        case premiere::PluginLog::Level::Debug: log::info("engine (debug): {}", line); break;
         case premiere::PluginLog::Level::Info: log::info("engine: {}", line); break;
         case premiere::PluginLog::Level::Warn: log::warn("engine: {}", line); break;
         case premiere::PluginLog::Level::Error: log::error("engine: {}", line); break;
@@ -1407,7 +1389,8 @@ constexpr const char* kClassicOnlyOptions[] = {
 };
 
 /// The plugin engine's own options, which the classic pipeline has no use for.
-constexpr const char* kPluginOnlyOptions[] = {"--flare", "--parallax-grid", "--lens-align", "--lens-focal"};
+constexpr const char* kPluginOnlyOptions[] = {"--flare", "--parallax-grid", "--lens-align", "--lens-focal",
+                                             "--purpose"};
 
 /// The Source Settings a plugin-engine render uses: the built-in defaults of
 /// a new clip - or, with --use-user-defaults, the ones saved in Premiere -
@@ -1803,33 +1786,121 @@ int runEngineRender(const RenderOptions& o, const CLI::App& sub) {
         return sinkOpened;
     }
 
-    // ---- main loop ----------------------------------------------------------------------------------
-    // Exact renders: every analysis a frame needs is made before it is drawn,
-    // as for a Premiere export.  The frame is copied out of the engine's
-    // frame cache under the clip's lock, because the next render reuses it.
-    const auto t0 = std::chrono::steady_clock::now();
-    int exitCode = kExitOk;
-    for (std::uint32_t f = first; f <= last && !sink.failed(); ++f) {
+    // ---- the request kind ---------------------------------------------------------------------------
+    // [WP-M] exact: as for a Premiere export or a parked frame, every analysis
+    // a frame needs is made before it is drawn.  interactive / playback: as
+    // Premiere's playback asks, never waiting for an analysis (see --purpose).
+    const bool interactivePass = o.purpose == "interactive";
+    const bool playbackCheck = o.purpose == "playback";
+    // play: the first frame parked (Exact, as Premiere renders the frame the
+    // playhead rests on), every later frame Interactive and written as it
+    // came back - the pictures a viewer sees during playback, non-final
+    // stand-ins included, which the playback check never writes.
+    const bool playOnce = o.purpose == "play";
+    if (!interactivePass && !playbackCheck && !playOnce && o.purpose != "exact") {
+        std::fprintf(stderr, "error: unknown --purpose '%s' (exact | interactive | playback | play)\n",
+                     log::safe(o.purpose).c_str());
+        return kExitUsage;
+    }
+
+    // One render of timeline frame `f` with `purpose`, copied out of the
+    // engine's frame cache under the clip's lock (the next render reuses it);
+    // `final` receives whether the engine rendered the frame's final pixels.
+    // `fresh` drops the engine's one-frame cache first (a re-ask of a frame
+    // that came back non-final must be built again, not served from it).
+    const auto renderOne = [&](std::uint32_t f, pr::RenderPurpose purpose, render::ImageRGBAf* out, bool& final,
+                               bool fresh = false) -> bool {
         // [VFR] The sample timeline frame `f` shows (the same index on a
         // constant-rate clip).  A held frame asks for the sample it repeats,
         // which the engine's last-frame cache serves without a decode.
         const std::uint32_t sample = clip->ownSourceFrameFor(f);
-        render::ImageRGBAf frame;
-        {
-            std::lock_guard<std::mutex> lock(clip->lock());
-            auto rendered = clip->renderFrame(sample, geometry, false, pr::RenderPurpose::Exact);
-            if (!rendered.ok() || rendered.value() == nullptr) {
-                if (sample == f) {
-                    std::fprintf(stderr, "error: frame %u: %s\n", f,
-                                 rendered.ok() ? "no image" : log::safe(rendered.error().toString()).c_str());
-                } else {
-                    std::fprintf(stderr, "error: frame %u (sample %u): %s\n", f, sample,
-                                 rendered.ok() ? "no image" : log::safe(rendered.error().toString()).c_str());
-                }
+        std::lock_guard<std::mutex> lock(clip->lock());
+        if (fresh) {
+            clip->dropRenderedFrame();
+        }
+        auto rendered = clip->renderFrame(sample, geometry, false, purpose);
+        if (!rendered.ok() || rendered.value() == nullptr) {
+            if (sample == f) {
+                std::fprintf(stderr, "error: frame %u: %s\n", f,
+                             rendered.ok() ? "no image" : log::safe(rendered.error().toString()).c_str());
+            } else {
+                std::fprintf(stderr, "error: frame %u (sample %u): %s\n", f, sample,
+                             rendered.ok() ? "no image" : log::safe(rendered.error().toString()).c_str());
+            }
+            return false;
+        }
+        final = clip->lastRenderExact();
+        if (out != nullptr) {
+            *out = *rendered.value();
+        }
+        return true;
+    };
+
+    int exitCode = kExitOk;
+    // ---- the playback == parked check: a parked frame, then the range played once ---------------
+    // Premiere renders the frame the playhead is parked on (Exact) before
+    // playback starts; playback then asks every frame Interactive.  The
+    // frames of this first pass are not written.
+    std::uint32_t pass1Final = 0;
+    if (playbackCheck) {
+        bool parkedFinal = false;
+        if (!renderOne(first, pr::RenderPurpose::Exact, nullptr, parkedFinal)) {
+            exitCode = kExitRuntime;
+        }
+        for (std::uint32_t f = first; f <= last && exitCode == kExitOk; ++f) {
+            bool final = false;
+            if (!renderOne(f, pr::RenderPurpose::Interactive, nullptr, final)) {
                 exitCode = kExitRuntime;
                 break;
             }
-            frame = *rendered.value();
+            pass1Final += final ? 1u : 0u;
+        }
+        log::info("playback check: parked frame {} {}; first pass {} of {} frames final", first,
+                  parkedFinal ? "final" : "NOT final", pass1Final, last - first + 1);
+    }
+
+    // ---- main loop ----------------------------------------------------------------------------------
+    // The frames written: Exact renders, the Interactive pass, or the
+    // playback check's second pass - each frame of which is asked again
+    // until it is final (the background measurements of the first pass may
+    // still be landing), for at most kFinalWait.
+    constexpr auto kFinalWait = std::chrono::seconds(30);
+    const pr::RenderPurpose purpose = o.purpose == "exact" ? pr::RenderPurpose::Exact : pr::RenderPurpose::Interactive;
+    std::uint32_t finalAtOnce = 0;
+    std::uint32_t finalAfterWait = 0;
+    std::uint32_t neverFinal = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (std::uint32_t f = first; f <= last && !sink.failed() && exitCode == kExitOk; ++f) {
+        render::ImageRGBAf frame;
+        bool final = false;
+        // play: the parked first frame is Exact, the rest as playback asks.
+        const pr::RenderPurpose framePurpose = (playOnce && f == first) ? pr::RenderPurpose::Exact : purpose;
+        if (!renderOne(f, framePurpose, &frame, final)) {
+            exitCode = kExitRuntime;
+            break;
+        }
+        if (playbackCheck && !final) {
+            // Not final yet: ask again until it is, as Premiere does with a
+            // frame that stayed out of its cache.
+            const auto deadline = std::chrono::steady_clock::now() + kFinalWait;
+            while (!final && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                if (!renderOne(f, purpose, &frame, final, true)) {
+                    exitCode = kExitRuntime;
+                    break;
+                }
+            }
+            if (exitCode != kExitOk) {
+                break;
+            }
+            finalAfterWait += final ? 1u : 0u;
+            neverFinal += final ? 0u : 1u;
+            if (!final) {
+                log::warn("playback check: frame {} never became final within {} s", f, kFinalWait.count());
+            }
+        } else {
+            finalAtOnce += final ? 1u : 0u;
+            neverFinal += (!final && (interactivePass || playOnce)) ? 1u : 0u;
         }
         sink.push(f, std::move(frame));
 
@@ -1839,6 +1910,13 @@ int runEngineRender(const RenderOptions& o, const CLI::App& sub) {
             std::fprintf(stderr, "  %u/%u frames  %.1f fps  (%s)\n", f - first + 1, last - first + 1,
                          sec > 0 ? done / sec : 0.0, clip->rendererName().c_str());
         }
+    }
+    if (playbackCheck || interactivePass || playOnce) {
+        log::info("{}: {} of {} frames final at once, {} after waiting for the background measurements, {} not "
+                  "final",
+                  playbackCheck ? "playback check, second pass"
+                                : (playOnce ? "play (parked first frame, one Interactive pass)" : "interactive pass"),
+                  finalAtOnce, last - first + 1, finalAfterWait, neverFinal);
     }
     exitCode = sink.finish(exitCode);
 
@@ -1875,6 +1953,15 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
     engine->add_option("--lens-focal", opt->lensFocal,
                        "plugin engine: auto (default; the recorded focal where it matches each lens's calibration) "
                        "| camera (the recorded focal whenever it fits the stream) | calibration (each lens's own)");
+    engine
+        ->add_option("--purpose", opt->purpose,
+                     "plugin engine: exact (default; export or a parked frame - every analysis made first) | "
+                     "interactive (playback: never waits for an analysis) | playback (the playback == parked check: "
+                     "the first frame parked, the range played twice, the second pass written, each frame re-asked "
+                     "until final) | play (the first frame parked, then one Interactive pass written as it came "
+                     "back: what a viewer sees during playback)")
+        ->default_str("exact")
+        ->check(CLI::IsMember({"exact", "interactive", "playback", "play"}));
     engine->add_option("--scene-light", opt->sceneLight,
                        "auto | day | night: the photometric profile (night: a short, narrow sky seam field, no "
                        "exposure match, no lens shading).  Default: auto with the plugin engine (the camera's "
@@ -1914,8 +2001,9 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
     // default off for one render.  Without that flag they change nothing.
     outGeom->add_flag("--seam-search,!--no-seam-search", opt->seamSearch, "Per-column seam disparity correction");
     outGeom->add_flag("--parallax,!--no-parallax", opt->parallax,
-                      "2-D optical-flow parallax correction at the seam; when accepted it replaces --seam-search, "
-                      "which remains the fallback");
+                      "The seam band's one correction field: a mesh warp solved on the optical flow, the lines "
+                      "detected at the seam and (with --seam-search) the seam table as its prior; the table alone "
+                      "without it");
     outGeom->add_flag("--seam-carve", opt->seamCarve,
                       "Carve the seam through the overlap by dynamic programming and blend narrowly along it "
                       "(no doubled near objects); composes with --parallax / --seam-search");

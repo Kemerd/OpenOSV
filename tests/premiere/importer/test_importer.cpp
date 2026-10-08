@@ -2367,6 +2367,16 @@ namespace {
     return std::asin(std::clamp(dy, -1.0, 1.0)) * 180.0 / kPi;
 }
 
+/// [WP-M] How far from the seam plane the seam correction may move a pixel,
+/// in degrees.  The correction is the mesh field (render/MeshWarp.h), whose
+/// lattice reaches to MeshWarpParams::reachDeg = 12 deg - where the kernel's
+/// 1-D seam shift has always ended too (OSV_SEAM_SHIFT_ZERO_DEG) - and is
+/// pinned to zero there; half a degree covers the output pixels' footprint
+/// and the lens alignment's fraction-of-a-degree turn of the seam plane.
+/// (The 0.5.1 flow grid ended at 9.1 deg, which the bound of 9.5 here
+/// described before the mesh replaced it.)
+constexpr double kCorrectionReachDeg = 12.5;
+
 /// Render one frame and read it back; disposes the PPix.
 [[nodiscard]] DecodedFrame renderFrame(ImporterHarness& harness, ImporterHarness::ClipHandle& clip,
                                        const PrSDKPPixSuite* ppix, const ImporterHarness::SourceVideoRequest& request,
@@ -2418,9 +2428,10 @@ TEST_CASE("parallax correction changes only the overlap band, and only when aske
     REQUIRE(frameOff.width == frameOn.width);
     REQUIRE(frameOff.height == frameOn.height);
 
-    // The grid spans +/-9.1 degrees around the seam plane (a 6 degree band
-    // plus the decay ring) and the kernel returns exactly zero correction
-    // beyond it, so everything outside must be BIT-identical - a tolerance
+    // The mesh field spans +/-12 degrees around the seam plane (the 6 degree
+    // analysed band plus the rows that bring it to zero, kCorrectionReachDeg)
+    // and the kernel returns exactly zero correction beyond it, so everything
+    // outside must be BIT-identical - a tolerance
     // here would hide a correction leaking out of the overlap.  Inside, the
     // correction must actually do something.
     std::uint64_t changedInside = 0;
@@ -2433,7 +2444,7 @@ TEST_CASE("parallax correction changes only the overlap band, and only when aske
             if (!changed) {
                 continue;
             }
-            if (std::fabs(seamLatitudeDeg(x, y, frameOn.width, frameOn.height)) > 9.5) {
+            if (std::fabs(seamLatitudeDeg(x, y, frameOn.width, frameOn.height)) > kCorrectionReachDeg) {
                 ++changedOutside;
             } else {
                 ++changedInside;
@@ -2497,7 +2508,7 @@ TEST_CASE("parallax correction changes only the overlap band, and only when aske
                 if (a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]) {
                     continue;
                 }
-                if (std::fabs(seamLatitudeDeg(x, y, frameOn.width, frameOn.height)) > 9.5) {
+                if (std::fabs(seamLatitudeDeg(x, y, frameOn.width, frameOn.height)) > kCorrectionReachDeg) {
                     ++seamOutside;
                 } else {
                     ++seamInside;
@@ -2584,7 +2595,7 @@ TEST_CASE("parallax correction cost in the importer",
 namespace {
 
 /// Pixels that differ between two renders of one frame, split by whether
-/// they lie in the overlap band (|seam latitude| <= 9.5 deg, the grid's span
+/// they lie in the overlap band (|seam latitude| <= kCorrectionReachDeg, the field's span
 /// plus margin) or outside it.
 struct BandDifference {
     std::uint64_t inside = 0;
@@ -2602,7 +2613,7 @@ struct BandDifference {
             if (p[0] == q[0] && p[1] == q[1] && p[2] == q[2] && p[3] == q[3]) {
                 continue;
             }
-            if (std::fabs(seamLatitudeDeg(x, y, a.width, a.height)) > 9.5) {
+            if (std::fabs(seamLatitudeDeg(x, y, a.width, a.height)) > kCorrectionReachDeg) {
                 ++d.outside;
             } else {
                 ++d.inside;

@@ -6,6 +6,93 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+* **One correction for the seam instead of three, and it keeps straight
+  lines straight.** 0.5.1 built the seam correction from a 1-D shift table,
+  a 2-D flow grid and a per-column switch between the two; every switch put
+  a kink into lines crossing the seam, which is the bump the car roof and the
+  hood crease showed. The new mesh warp solves the whole correction as one
+  smooth field: it follows the measured parallax, keeps detected straight
+  edges straight, falls to zero away from the seam, and - across frames -
+  holds still on a static scene but follows a real change within a bucket or
+  two. It uses the flow on the raw picture and on the picture already
+  corrected by the seam table, so it reaches both the fine texture of an
+  aerial clip and the large offset of a car body a metre away. On the car
+  drives (band-level, plug-in engine, classical flow) detected lines bend
+  7-14 times less than with 0.5.1 (0.016-0.029 px RMS against 0.16-0.20 px
+  on the day frames), the car body lines up better (0.990-0.994 against
+  0.967-0.978) and the whole seam a little better (0.997 against 0.993 on
+  the day proxy); it costs 10-14 ms on four CPU threads per measured
+  bucket, the field the next bucket leans on included. Where
+  nothing can be measured at all - the stick strip of the aerial sample, the
+  thin overlap beside a car mount's blind arc at night - 0.5.1's copied
+  correction still scores a little higher (sample frame 60: 0.915 against
+  0.920). `osvtool seam --mesh` scores it (`--temporal N` for consecutive
+  buckets, `--mesh-prior` for the field exactly as the plug-ins render it).
+* `osvtool render --purpose exact|interactive|playback|play` renders the
+  way Premiere asks during playback; `playback` parks on the first frame,
+  plays the range twice and writes the second pass, so a byte compare with
+  an `exact` render shows whether playback and a parked frame agree once
+  measured; `play` parks on the first frame and writes one played pass as
+  it comes back - the pictures a viewer sees while Premiere plays.
+
+### Fixed
+
+* **The seam is one smooth field in Premiere, Resolve and VEGAS.** The
+  plug-ins now render the mesh correction above instead of the 0.5.1 mix of
+  shift table, flow grid and per-column switch, so a roof edge or a pole
+  crossing the seam no longer picks up a kink where the two used to hand
+  over. Measured on the day drive's proxy, field as the plug-ins render it:
+  the car body lines up at 0.992 instead of 0.971 (median of 18 frames),
+  detected straight edges bend 0.01-0.04 px instead of 0.06-0.26 px, and the
+  whole seam scores higher on every day frame. The seam table is still
+  measured - it is the field's starting point - and rendered on its own
+  only for a moment whose field could not be measured at all (as in 0.5.1,
+  Parallax Grid on never leaves a moment with less than its table). On the
+  day drive's hood, a panel gap crossing the seam now runs straight: 0.16
+  px from a smooth curve instead of 0.55 px (largest bend 0.9 px instead of
+  3.7 px, frames 11970-11986). The 6K sample's propeller blade, which bent
+  at the seam in 0.5.1 (parked as well as playing), renders single and
+  straight.
+* **Playback shows the frame you get when you stop.** During playback a
+  frame used to borrow corrections measured on itself, so the seam moved
+  while playing: on the day drive's hood, played from a parked frame, 11 of
+  17 frames differed from the same frames parked, a bolt on the seam sat
+  2.3 px off and a panel gap moved up to 2.2 px. Now each 8-frame bucket is
+  measured once, on its first frame, and every frame of it renders the same
+  whether playing or parked: on that hood the measured frames are byte for
+  byte the parked ones and the rest (a bucket still being measured shows
+  the previous bucket's correction until it lands) differ by at most 0.14
+  px on the gap. Byte for byte once measured on the 6K sample (17 of 17
+  frames, and 13 of 13 parked mid-bucket) and the day drive (32 of 32). The
+  seam's carve is steered around the sun ghosts of the bucket's first
+  frame, whichever frame carves it.
+* **The seam moves less from one moment to the next.** Each bucket's field
+  leans on the bucket before it, so measurement noise is held still while a
+  real change (a car passing) still comes through: the field changes 1.4-1.6
+  times less between buckets on the clips measured, and on the day drive
+  (frames 3400-3460, stabilisation off) the stitch at the car body changes
+  less from frame to frame with the per-moment field (0.64 against 0.67 at
+  bucket starts, 0.58 against 0.62 inside them, thousandths of full scale);
+  with the Auto default, which now holds this clip steady, 0.61 / 0.55. The
+  start-to-inside ratio is 1.11 against 1.09 (1.09 with no seam correction
+  at all) there and 1.05 against 1.04 (1.07) on frames 5992-6080.
+* Parallax Grid Steady and Auto judge the new field: the clip correction is
+  the median of nine frames' fields, then kept straight along every line the
+  nine frames show. Auto now holds the day drive steady and lets the 6K
+  aerial sample follow the scene (the other way round in 0.5.1).
+
+Known limits: on the night drive the car body next to the mount's blind arc
+lines up a little worse than 0.5.1 (0.717 against 0.768 at frame 2000,
+0.924 against 0.947 at frame 3500), and the 6K sample's frame 60 0.004
+worse over the whole seam (the stick strip, where nothing can be
+measured); lamp poles beside the seam are as straight as before within a
+few hundredths of a pixel (0.20 against 0.18 px RMS on the 8K drive);
+the clip correction takes 29-36 % longer on the CPU (5.2 s against 4.1 s
+on the 6K sample in `osvtool`: every sample frame is measured twice, on
+the raw picture and through its seam table).
+
 ## [0.5.1] - 2026-10-07
 
 Premiere on a car mount, fixed at the cause. Built on the same two 8K car
