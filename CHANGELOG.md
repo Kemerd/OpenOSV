@@ -6,6 +6,27 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+* **One correction for the seam instead of three, and it keeps straight
+  lines straight.** 0.5.1 built the seam correction from a 1-D shift table,
+  a 2-D flow grid and a per-column switch between the two; every switch put
+  a kink into lines crossing the seam, which is the bump the car roof and the
+  hood crease showed. The new mesh warp solves the whole correction as one
+  smooth field: it follows the measured parallax, keeps detected straight
+  edges straight, falls to zero away from the seam, and - across frames -
+  holds still on a static scene but follows a real change within a bucket or
+  two. It uses the flow on the raw picture and on the picture already
+  corrected by the seam table, so it reaches both the fine texture of an
+  aerial clip and the large offset of a car body a metre away. On the car
+  drives (band-level, plug-in engine, classical flow) detected lines bend
+  4-14 times less than with 0.5.1 (0.016-0.029 px RMS against 0.16-0.20 px
+  on the day frames), the car body lines up better (0.990-0.994 against
+  0.967-0.978) and the whole seam a little better (0.997 against 0.993 on
+  the day proxy); it costs 11-15 ms of CPU per measured bucket. Available in
+  `osvtool seam --mesh` (with `--temporal N` for consecutive buckets) for
+  now; the plug-ins switch to it in the next step.
+
 ## [0.5.1] - 2026-10-07
 
 Premiere on a car mount, fixed at the cause. Built on the same two 8K car
