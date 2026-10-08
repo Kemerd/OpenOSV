@@ -165,6 +165,8 @@
 #include "osv/video/PlanarFrame.h"
 
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -461,6 +463,9 @@ struct MeshWarpReport {
     double assembleMs = 0.0;  ///< Building the normal equations (all solves).
     double factorMs = 0.0;    ///< Banded Cholesky factorisations and solves (all IRLS iterations).
     double benefitMs = 0.0;   ///< The benefit gate's residual pass.
+    /// The extra solve without the temporal term (MeshWarpInputs::solveAlone
+    /// with a previous mesh); 0 when none ran.  Included in factorMs too.
+    double aloneMs = 0.0;
     double totalMs = 0.0;     ///< The whole of solveMeshWarp.
 
     /// One human-readable line: mode, strength, matches, lines, residuals, ms.
@@ -476,6 +481,18 @@ struct MeshWarpResult {
     /// pixel counts are the flow's, untrustedShare is per mesh column.
     ParallaxWarpGrid grid;
     MeshWarpReport report;
+    /// With MeshWarpInputs::solveAlone: the same field solved WITHOUT the
+    /// temporal term - this measurement on its own, the field a later solve
+    /// takes as ITS previous mesh when the temporal prior must not chain
+    /// (the plug-ins' rule: bucket b's prior is bucket b - 1 solved alone, so
+    /// every bucket depends on two anchors and never on the order frames were
+    /// asked for).  With no previous mesh it is a copy of `grid`.  At the
+    /// defaults (two IRLS solves, no Cauchy weight on the matches) it is bit
+    /// for bit what solveMeshWarp returns with `previous` null: the first
+    /// solve and the benefit gate never see the temporal term, and the last
+    /// solve is repeated at the same weights without it.  Empty without
+    /// solveAlone.
+    std::optional<ParallaxWarpGrid> alone;
 };
 
 /// The inputs of one solve.  Pointers are borrowed for the call only.
@@ -521,6 +538,10 @@ struct MeshWarpInputs {
     const ParallaxWarpGrid* prior = nullptr;
     /// The previous solve's mesh (the temporal prior), or null for none.
     const ParallaxWarpGrid* previous = nullptr;
+    /// Also return the field solved without the temporal term
+    /// (MeshWarpResult::alone): one more factorisation (~4 ms) instead of a
+    /// second solve, for a caller that keeps both.
+    bool solveAlone = false;
     // ---- diagnostics copied onto the grid ------------------------------------
     FlowBackendKind usedBackend = FlowBackendKind::Classical;
     double bandMs = 0.0;
@@ -574,14 +595,22 @@ struct MeshWarpInputs {
 /// and, when `prewarped` is given, on those bands too (the refined
 /// measurement; `prewarp` is the field they were rendered with), each with
 /// params.parallax.backend (falling back like computeFlow), then
-/// solveMeshWarp.  `lines`, `prior` and `previous` are solveMeshWarp's.
+/// solveMeshWarp.  `lines`, `prior`, `previous` and `solveAlone` are
+/// solveMeshWarp's (MeshWarpInputs).
+///
+/// A flow that FAILS (an allocation, a backend error) does not fail the
+/// field: the solve then runs on what is left - the lines, the prior and the
+/// previous mesh - exactly as on a band with nothing to match, so a bucket
+/// always gets one field through the one code path.  `flowFailure`
+/// (optional) receives the flow's message in that case, empty otherwise.
 [[nodiscard]] Result<MeshWarpResult> meshWarpFromBands(const LensBands& raw, const LensBands* prewarped,
                                                        const ParallaxWarpGrid* prewarp,
                                                        const std::vector<SeamLine>* lines,
                                                        const ParallaxWarpGrid* prior,
                                                        const ParallaxWarpGrid* previous,
                                                        const MeshWarpParams& params, ThreadPool* pool,
-                                                       double bandMs = 0.0);
+                                                       double bandMs = 0.0, bool solveAlone = false,
+                                                       std::string* flowFailure = nullptr);
 
 /// What buildMeshWarp did on the side, for a caller that reports it.
 struct MeshWarpBuildInfo {
@@ -589,6 +618,9 @@ struct MeshWarpBuildInfo {
     bool bandsPrewarped = false;     ///< The flow ran on bands rendered with the table's lift.
     double rawBandMs = 0.0;          ///< Rendering the raw bands (lines, and the flow when not prewarped).
     double warpedBandMs = 0.0;       ///< Rendering the prewarped bands (0 when not prewarped).
+    /// Why the flow failed when it did (the field was then solved without
+    /// matches, see meshWarpFromBands); empty otherwise.
+    std::string flowFailure;
 };
 
 /// Everything from a decoded frame pair: render the raw bands, find the lines
@@ -597,13 +629,14 @@ struct MeshWarpBuildInfo {
 /// warp, so a second flow measures only what the table left (coarse to fine:
 /// the 1-D search finds large near-field offsets the flow's pyramid cannot
 /// reach on a 68-row band).  Then the flows and the solve
-/// (meshWarpFromBands).  `previous` is the temporal prior.  `info`
-/// (optional) receives the lines and the timings.
+/// (meshWarpFromBands).  `previous` is the temporal prior and `solveAlone`
+/// asks for MeshWarpResult::alone as well.  `info` (optional) receives the
+/// lines and the timings.
 [[nodiscard]] Result<MeshWarpResult> buildMeshWarp(const geom::LensRig& rig, const video::FramePair& frames,
                                                    const geom::BlendParams& blend, const MeshWarpParams& params,
                                                    const std::vector<float>* tableDeg, bool prewarp,
                                                    const ParallaxWarpGrid* previous, ThreadPool& pool,
-                                                   MeshWarpBuildInfo* info = nullptr);
+                                                   MeshWarpBuildInfo* info = nullptr, bool solveAlone = false);
 
 /// A borrowed view of a grid for renderLensBands / overlapNcc.
 [[nodiscard]] WarpGridView warpGridView(const ParallaxWarpGrid& grid) noexcept;

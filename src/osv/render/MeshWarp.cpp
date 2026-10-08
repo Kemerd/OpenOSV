@@ -1353,6 +1353,10 @@ Result<MeshWarpResult> solveMeshWarp(const MeshWarpInputs& in, const MeshWarpPar
         rep.mode = MeshWarpMode::PriorOnly;
         rep.totalMs = msSince(tStart);
         result.grid.gridMs = rep.totalMs;
+        // No previous mesh took part, so the field on its own IS the field.
+        if (in.solveAlone) {
+            result.alone = result.grid;
+        }
         return result;
     }
 
@@ -1440,6 +1444,71 @@ Result<MeshWarpResult> solveMeshWarp(const MeshWarpInputs& in, const MeshWarpPar
     const bool benefitOn = pp.requiredImprovement > 0.0 && verify != nullptr && !matches.empty();
     BandedSpd system;  // this iteration's matrix, factored in place
 
+    // ---- one exact solve at the current weights ---------------------------------------
+    // Assembles the system from the constant part (shape, lines), the matches
+    // at their current weights and the per-vertex anchor - plus, with
+    // `withTemporal`, the temporal pull toward the previous mesh - then
+    // factors it and solves into `xOut` (block-major).  Without the temporal
+    // term NOTHING of it is added (not even zeros), so a solve without a
+    // previous mesh and the "alone" solve below assemble the same numbers in
+    // the same order.
+    const auto assembleAndSolve = [&](bool withTemporal, std::vector<double>& xOut) -> Status {
+        const auto tAsm = Clock::now();
+        std::vector<double> b = baseB;  // interleaved
+        system.copyFrom(baseA);
+        for (const Match& m : matches) {
+            if (!(m.weight > 0.0)) {
+                continue;
+            }
+            std::array<Entry, 4> e{};
+            for (std::uint8_t k = 0; k < m.st.n; ++k) {
+                e[k].idx = m.st.idx[k];
+                e[k].coef = m.st.w[k];
+            }
+            (void)addOuterComp(system, e.data(), m.st.n, m.weight, 0);
+            (void)addOuterComp(system, e.data(), m.st.n, m.weight, 1);
+            for (std::uint8_t k = 0; k < m.st.n; ++k) {
+                b[il(m.st.idx[k], 0)] += m.weight * m.st.w[k] * m.mLon;
+                b[il(m.st.idx[k], 1)] += m.weight * m.st.w[k] * m.mLat;
+            }
+        }
+        const bool temporalOn = withTemporal && !xPrev.empty();
+        for (std::size_t v = 0; v < N; ++v) {
+            const auto vi = static_cast<std::uint32_t>(v);
+            for (int c = 0; c < 2; ++c) {
+                const std::size_t base = static_cast<std::size_t>(c) * N;
+                if (temporalOn) {
+                    (void)system.add(il(vi, c), il(vi, c), anchorW[v] + temporalW[v]);
+                } else {
+                    (void)system.add(il(vi, c), il(vi, c), anchorW[v]);
+                }
+                b[il(vi, c)] += anchorW[v] * x0[base + v];
+                if (temporalOn) {
+                    b[il(vi, c)] += temporalW[v] * xPrev[base + v];
+                }
+            }
+        }
+        rep.assembleMs += msSince(tAsm);
+
+        // ---- solve exactly: factor this system, two triangular sweeps ---------------------
+        // About 17 million multiply-adds at the defaults (2 x 128 x 11
+        // unknowns, half width 109): cheaper and more predictable than
+        // conjugate gradients on the previous iteration's factor, which the
+        // benefit gate's reweighting left 17-44 steps from converging.
+        const auto tFactor = Clock::now();
+        if (!system.factor()) {
+            return failStatus(ErrorCode::Internal, "solveMeshWarp: the normal equations are not positive definite");
+        }
+        system.solveInPlace(b.data());
+        xOut.assign(2u * N, 0.0);
+        for (std::size_t v = 0; v < N; ++v) {
+            xOut[v] = b[2u * v];
+            xOut[N + v] = b[2u * v + 1u];
+        }
+        rep.factorMs += msSince(tFactor);
+        return okStatus();
+    };
+
     for (int it = 0; it < params.irlsIterations; ++it) {
         const auto tAsm = Clock::now();
         // ---- the match weights: benefit x robust (from the last iterate) ----------
@@ -1498,52 +1567,12 @@ Result<MeshWarpResult> solveMeshWarp(const MeshWarpInputs& in, const MeshWarpPar
             }
         }
         // ---- assemble the system ------------------------------------------------------
-        std::vector<double> b = baseB;  // interleaved
-        system.copyFrom(baseA);
-        for (const Match& m : matches) {
-            if (!(m.weight > 0.0)) {
-                continue;
-            }
-            std::array<Entry, 4> e{};
-            for (std::uint8_t k = 0; k < m.st.n; ++k) {
-                e[k].idx = m.st.idx[k];
-                e[k].coef = m.st.w[k];
-            }
-            (void)addOuterComp(system, e.data(), m.st.n, m.weight, 0);
-            (void)addOuterComp(system, e.data(), m.st.n, m.weight, 1);
-            for (std::uint8_t k = 0; k < m.st.n; ++k) {
-                b[il(m.st.idx[k], 0)] += m.weight * m.st.w[k] * m.mLon;
-                b[il(m.st.idx[k], 1)] += m.weight * m.st.w[k] * m.mLat;
-            }
-        }
-        for (std::size_t v = 0; v < N; ++v) {
-            const auto vi = static_cast<std::uint32_t>(v);
-            for (int c = 0; c < 2; ++c) {
-                const std::size_t base = static_cast<std::size_t>(c) * N;
-                (void)system.add(il(vi, c), il(vi, c), anchorW[v] + temporalW[v]);
-                b[il(vi, c)] += anchorW[v] * x0[base + v];
-                if (!xPrev.empty()) {
-                    b[il(vi, c)] += temporalW[v] * xPrev[base + v];
-                }
-            }
-        }
+        // (assembleAndSolve, below the loop's weights: the same assembly also
+        // serves the solve WITHOUT the temporal term after the loop.)
         rep.assembleMs += msSince(tAsm);
-
-        // ---- solve exactly: factor this iteration's system, two triangular sweeps ---------
-        // About 17 million multiply-adds at the defaults (2 x 128 x 11
-        // unknowns, half width 109): cheaper and more predictable than
-        // conjugate gradients on the previous iteration's factor, which the
-        // benefit gate's reweighting left 17-44 steps from converging.
-        const auto tFactor = Clock::now();
-        if (!system.factor()) {
-            return Error{ErrorCode::Internal, "solveMeshWarp: the normal equations are not positive definite"};
+        if (const Status solved = assembleAndSolve(true, x); !solved.ok()) {
+            return solved.error();
         }
-        system.solveInPlace(b.data());
-        for (std::size_t v = 0; v < N; ++v) {
-            x[v] = b[2u * v];
-            x[N + v] = b[2u * v + 1u];
-        }
-        rep.factorMs += msSince(tFactor);
         ++rep.irlsIterations;
         if (it == 0 && !xPrev.empty() && params.irlsIterations > 1) {
             xFree = x;  // what the data ask for: the temporal term judges the change by it
@@ -1739,8 +1768,39 @@ Result<MeshWarpResult> solveMeshWarp(const MeshWarpInputs& in, const MeshWarpPar
     }
     fillDiagnostics(result.grid, preGateWeight, cellGate);
     rep.benefitGatedCells = result.grid.gatedCells;
+
+    // ---- the field on its own: the last solve again, without the temporal term ----------
+    // The match weights (benefit gate, Cauchy), the anchor and the constant
+    // part stay exactly as the last iteration left them; only the pull toward
+    // the previous mesh is left out.  At the defaults those weights never
+    // depended on the previous mesh (the gate judged the first, temporal-free
+    // solve), so this is the solve a caller without a previous mesh gets.
+    if (in.solveAlone) {
+        if (xPrev.empty()) {
+            result.alone = result.grid;  // nothing temporal took part
+        } else {
+            const auto tAlone = Clock::now();
+            std::vector<double> xAlone;
+            if (const Status solved = assembleAndSolve(false, xAlone); !solved.ok()) {
+                return solved.error();
+            }
+            for (const double v : xAlone) {
+                if (!std::isfinite(v)) {
+                    return Error{ErrorCode::Internal, "solveMeshWarp: the solve without the temporal term produced a "
+                                                      "non-finite field"};
+                }
+            }
+            ParallaxWarpGrid alone = finishGrid(xAlone);
+            fillDiagnostics(alone, preGateWeight, cellGate);
+            result.alone = std::move(alone);
+            rep.aloneMs = msSince(tAlone);
+        }
+    }
     rep.totalMs = msSince(tStart);
     result.grid.gridMs = rep.totalMs;
+    if (result.alone) {
+        result.alone->gridMs = rep.totalMs;
+    }
     return result;
 }
 
@@ -1778,35 +1838,61 @@ Result<BidirFlow> bandFlow(const LensBands& bands, const MeshWarpParams& params,
 Result<MeshWarpResult> meshWarpFromBands(const LensBands& raw, const LensBands* prewarped,
                                          const ParallaxWarpGrid* prewarp, const std::vector<SeamLine>* lines,
                                          const ParallaxWarpGrid* prior, const ParallaxWarpGrid* previous,
-                                         const MeshWarpParams& params, ThreadPool* pool, double bandMs) {
+                                         const MeshWarpParams& params, ThreadPool* pool, double bandMs,
+                                         bool solveAlone, std::string* flowFailure) {
+    if (flowFailure != nullptr) {
+        flowFailure->clear();
+    }
     OSV_TRY(checkMeshWarpParams(params));
     if (prewarped != nullptr && (prewarp == nullptr || !prewarp->valid())) {
         return Error{ErrorCode::InvalidArgument, "meshWarpFromBands: prewarped bands without the field they "
                                                  "were rendered with"};
     }
     // ---- the primary measurement: the flow on the raw bands --------------------------
+    // A flow that fails leaves its measurement out instead of failing the
+    // field: the solve then runs on the lines, the prior and the previous
+    // mesh, like a band with nothing to match (one field, one code path).
     const auto tFlow = Clock::now();
     FlowBackendKind used = params.parallax.backend;
-    OSV_TRY_ASSIGN(BidirFlow flow, bandFlow(raw, params, pool, used));
+    std::string failure;
+    std::optional<BidirFlow> flow;
+    if (auto f = bandFlow(raw, params, pool, used); f.ok()) {
+        flow = std::move(f).value();
+    } else {
+        failure = f.error().message;
+    }
     // ---- the refined one: the flow on the prewarped bands (the residual) -------------
-    BidirFlow flow2;
-    if (prewarped != nullptr) {
+    // Only beside a primary one (solveMeshWarp's rule): the refined flow alone
+    // would carry no structured gate.
+    std::optional<BidirFlow> flow2;
+    if (prewarped != nullptr && flow) {
         FlowBackendKind used2 = params.parallax.backend;
-        OSV_TRY_ASSIGN(flow2, bandFlow(*prewarped, params, pool, used2));
+        if (auto f = bandFlow(*prewarped, params, pool, used2); f.ok()) {
+            flow2 = std::move(f).value();
+        } else {
+            failure = f.error().message;
+        }
+    }
+    if (!failure.empty()) {
+        log::warn("mesh warp: a band flow failed ({}); the field is solved without its matches", failure);
+        if (flowFailure != nullptr) {
+            *flowFailure = failure;
+        }
     }
     MeshWarpInputs in;
     in.bands = &raw;
-    in.flow = &flow;
+    in.flow = flow ? &*flow : nullptr;
     in.bandWarp = nullptr;
-    if (prewarped != nullptr) {
+    if (prewarped != nullptr && flow2) {
         in.bands2 = prewarped;
-        in.flow2 = &flow2;
+        in.flow2 = &*flow2;
         in.bandWarp2 = prewarp;
     }
     in.verifyBands = &raw;
     in.lines = lines;
     in.prior = prior;
     in.previous = previous;
+    in.solveAlone = solveAlone;
     in.usedBackend = used;
     in.bandMs = bandMs;
     in.flowMs = msSince(tFlow);
@@ -1816,7 +1902,8 @@ Result<MeshWarpResult> meshWarpFromBands(const LensBands& raw, const LensBands* 
 Result<MeshWarpResult> buildMeshWarp(const geom::LensRig& rig, const video::FramePair& frames,
                                      const geom::BlendParams& blend, const MeshWarpParams& params,
                                      const std::vector<float>* tableDeg, bool prewarp,
-                                     const ParallaxWarpGrid* previous, ThreadPool& pool, MeshWarpBuildInfo* info) {
+                                     const ParallaxWarpGrid* previous, ThreadPool& pool, MeshWarpBuildInfo* info,
+                                     bool solveAlone) {
     OSV_TRY(checkMeshWarpParams(params));
     MeshWarpBuildInfo local;
     MeshWarpBuildInfo& inf = info != nullptr ? *info : local;
@@ -1842,10 +1929,10 @@ Result<MeshWarpResult> buildMeshWarp(const geom::LensRig& rig, const video::Fram
         inf.warpedBandMs = msSince(tWarped);
         inf.bandsPrewarped = true;
         return meshWarpFromBands(raw, &warped, &prior, &inf.lines.lines, &prior, previous, params, &pool,
-                                 inf.rawBandMs + inf.warpedBandMs);
+                                 inf.rawBandMs + inf.warpedBandMs, solveAlone, &inf.flowFailure);
     }
     return meshWarpFromBands(raw, nullptr, nullptr, &inf.lines.lines, haveTable ? &prior : nullptr, previous,
-                             params, &pool, inf.rawBandMs);
+                             params, &pool, inf.rawBandMs, solveAlone, &inf.flowFailure);
 }
 
 // ===========================================================================

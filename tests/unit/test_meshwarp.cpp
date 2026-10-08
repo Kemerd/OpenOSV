@@ -454,6 +454,70 @@ TEST_CASE("mesh warp: time - identical input is identical output, a static scene
     CHECK(errors[3] < 0.2);         // and essentially there after four
 }
 
+TEST_CASE("mesh warp: the field alone is the solve without the previous mesh, bit for bit",
+          "[render][mesh][temporal]") {
+    // The plug-ins take bucket b's temporal prior from bucket b - 1 solved
+    // ALONE (MeshWarpResult::alone), so a field depends on two anchors only.
+    // That is only true if `alone` is exactly what a solve without the
+    // previous mesh returns - checked here on a field that a previous mesh
+    // really pulls (a different scene before), with a line in the line term.
+    const render::MeshWarpParams p = testParams();
+    Disparity d;
+    d.fvWave = 1.0;
+    const Synthetic s = makeSynthetic(d, 2.0, 600, 640);
+    const std::vector<render::SeamLine> lines = {segment(1, 500.0, 30.0, 760.0, 34.0)};
+    render::MeshWarpInputs in;
+    in.bands = &s.bands;
+    in.flow = &s.flow;
+    in.lines = &lines;
+
+    // The reference: no previous mesh at all.
+    auto reference = render::solveMeshWarp(in, p);
+    REQUIRE(reference.ok());
+
+    // Without a previous mesh, `alone` is the field itself.
+    in.solveAlone = true;
+    auto self = render::solveMeshWarp(in, p);
+    REQUIRE(self.ok());
+    REQUIRE(self.value().alone.has_value());
+    CHECK(self.value().alone->uv == self.value().grid.uv);
+    CHECK(self.value().grid.uv == reference.value().grid.uv);
+
+    // With a previous mesh from another scene: the field moves toward it,
+    // `alone` does not.
+    Disparity other;
+    other.fv = 9.0;
+    const Synthetic so = makeSynthetic(other);
+    render::MeshWarpInputs inOther;
+    inOther.bands = &so.bands;
+    inOther.flow = &so.flow;
+    auto previous = render::solveMeshWarp(inOther, p);
+    REQUIRE(previous.ok());
+    in.previous = &previous.value().grid;
+    ThreadPool pool(4);
+    auto pulled = render::solveMeshWarp(in, p, &pool);
+    REQUIRE(pulled.ok());
+    REQUIRE(pulled.value().alone.has_value());
+    CHECK(pulled.value().report.temporal);
+    CHECK(pulled.value().report.aloneMs > 0.0);
+    CHECK(pulled.value().alone->uv == reference.value().grid.uv);   // bit for bit (no pool there, a pool here)
+    CHECK(pulled.value().grid.uv != reference.value().grid.uv);     // the previous mesh did pull the field
+    auto moved = render::meanAbsGridChangeDeg(pulled.value().grid, reference.value().grid, 6.0);
+    REQUIRE(moved.ok());
+    INFO("the temporal prior moved the field by " << moved.value() << " deg on average");
+    CHECK(moved.value() > 1e-4);
+
+    // Nothing measured, nothing to keep straight, no previous mesh: the prior,
+    // and `alone` with it.
+    render::MeshWarpInputs empty;
+    empty.solveAlone = true;
+    auto prior = render::solveMeshWarp(empty, p);
+    REQUIRE(prior.ok());
+    CHECK(prior.value().report.mode == render::MeshWarpMode::PriorOnly);
+    REQUIRE(prior.value().alone.has_value());
+    CHECK(prior.value().alone->uv == prior.value().grid.uv);
+}
+
 // ===========================================================================
 //  The ring, the counts, the threads, malformed input
 // ===========================================================================
