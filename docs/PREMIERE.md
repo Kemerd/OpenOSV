@@ -2419,10 +2419,11 @@ It finds the pair by name, the panel by the same rule:
 * `CAM_..._D.LRF` beside ONE `CAM_..._D-001.OSV` - a download or a copy that
   added a `-<digits>` suffix to the .OSV only. Two such .OSVs beside one .LRF
   are ambiguous: the importer then leaves the .LRF on its own timeline (25
-  fps, its own length), which Premiere must not be given as a proxy. The
-  panel only looks for the .LRF, not for a second copy, so keep one copy of a
-  recording per folder before attaching (the importer log says `proxy: ...
-  is presented as the proxy of ...` when the pair is found).
+  fps, its own length), which Premiere must not be given as a proxy, and the
+  panel, applying the same rule, attaches nothing and says "Several copies
+  ... share one .LRF". Keep one copy of a recording per folder (the importer
+  log says `proxy: ... is presented as the proxy of ...` when the pair is
+  found).
 
 **Source Settings.** A newly attached proxy starts from the Source Settings
 its .OSV is decoded with (Premiere does not carry them over itself). After

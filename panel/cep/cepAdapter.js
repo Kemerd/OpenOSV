@@ -299,10 +299,13 @@
              * item: OsvCore ranks where the .LRF can be, host.jsx checks which
              * exists and attaches it (ProjectItem.attachProxy(path, 0)) unless
              * the item has a proxy already.
-             * -> {attached, already, missing, failed, unsupported, errors[]}
+             * An .LRF found only through the .OSV's copy suffix is taken for
+             * the ONE renamed copy in its folder (host.jsx counts them).
+             * -> {attached, already, missing, failed, unsupported, ambiguous, errors[]}
              */
             attachProxies: function (seq, items) {
-                var result = { attached: 0, already: 0, missing: 0, failed: 0, unsupported: 0, errors: [] };
+                var result = { attached: 0, already: 0, missing: 0, failed: 0, unsupported: 0, ambiguous: 0,
+                               errors: [] };
                 var requests = [];
                 (Array.isArray(items) ? items : []).forEach(function (i) {
                     if (!i || i.key === undefined || i.key === null || String(i.key).length === 0) {
@@ -311,14 +314,21 @@
                     // An .LRF on the timeline is a proxy itself: nothing to attach.
                     var candidates = core.lrfCandidatesFor(i.mediaPath);
                     if (candidates.length > 0) {
-                        requests.push({ key: String(i.key), candidates: candidates });
+                        var copy = core.copySuffixOf(i.mediaPath);
+                        requests.push({
+                            key: String(i.key),
+                            candidates: candidates,
+                            exact: core.LRF_EXACT_CANDIDATES,
+                            folder: copy ? copy.folder : '',
+                            base: copy ? copy.base : ''
+                        });
                     }
                 });
                 if (requests.length === 0) {
                     return Promise.resolve(result);
                 }
                 return call('attachProxies', { sequenceId: seq ? seq.id : '', requests: requests }).then(function (r) {
-                    ['attached', 'already', 'missing', 'failed', 'unsupported'].forEach(function (k) {
+                    ['attached', 'already', 'missing', 'failed', 'unsupported', 'ambiguous'].forEach(function (k) {
                         result[k] = Math.max(0, Number(r[k]) || 0);
                     });
                     result.errors = Array.isArray(r.errors) ? r.errors.map(String) : [];

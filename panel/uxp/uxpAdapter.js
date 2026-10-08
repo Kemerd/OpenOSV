@@ -38,7 +38,7 @@
  *   signature()              -> string that changes when clips are added
  *   scan(seq, {selectedOnly})-> {items: OSV items, otherCount}
  *   apply(seq, items, settings) -> {applied, already, failed, errors[], notes[], missingEffect}
- *   attachProxies(seq, items)-> {attached, already, missing, failed, unsupported, noFileAccess, errors[]}
+ *   attachProxies(seq, items)-> {attached, already, missing, failed, unsupported, ambiguous, noFileAccess, errors[]}
  *   checkEffect()            -> {available: true | false | null}
  *   capabilities()           -> {undoGroups, stabilization}
  *   setEasing(seq, items, {entry, popupBase})
@@ -95,7 +95,8 @@
     /**
      * @param {object} ppro     require('premierepro')
      * @param {object} core     OsvCore
-     * @param {object} [options] { log(message), fileExists(path) -> Promise<true | false | null> }
+     * @param {object} [options] { log(message), fileExists(path) -> Promise<true | false | null>,
+     *                            listFolder(path) -> Promise<string[] | null> }
      */
     function createUxpAdapter(ppro, core, options) {
         if (!ppro || (typeof ppro !== 'object' && typeof ppro !== 'function')) {
@@ -110,6 +111,9 @@
         // cannot tell).  main.js builds it on UXP's fs module; the premierepro
         // module has no such call, and the camera's .LRF is found by name.
         var fileExists = typeof opts.fileExists === 'function' ? opts.fileExists : null;
+        // The file names in a folder: path -> Promise<string[] | null>, for
+        // the one-copy rule of an .LRF found through a copy suffix.
+        var listFolder = typeof opts.listFolder === 'function' ? opts.listFolder : null;
 
         var onEvent = null;
         var trackListeners = [];   // {track, name, handler}
@@ -380,9 +384,9 @@
          * (then a missing .LRF is not proven).
          */
         function firstExisting(candidates) {
-            var found = { path: '', unknown: false };
+            var found = { path: '', index: -1, unknown: false };
             var chain = Promise.resolve();
-            candidates.forEach(function (candidate) {
+            candidates.forEach(function (candidate, index) {
                 chain = chain.then(function () {
                     if (found.path !== '') {
                         return undefined;
@@ -390,6 +394,7 @@
                     return invoke(function () { return fileExists(candidate); }).then(function (yes) {
                         if (yes === true) {
                             found.path = candidate;
+                            found.index = index;
                         } else if (yes !== false) {
                             found.unknown = true;
                         }
@@ -402,12 +407,30 @@
         }
 
         /**
+         * True when `copy` ({folder, base}) names the ONE renamed copy of its
+         * recording in the folder (OsvCore.countCopies, the importer's rule).
+         * A folder that cannot be listed is not proof: false.
+         */
+        function onlyCopy(copy) {
+            if (!copy || !listFolder) {
+                return Promise.resolve(false);
+            }
+            return invoke(function () { return listFolder(copy.folder); }).then(function (names) {
+                return core.countCopies(names, copy.base) === 1;
+            }, function () {
+                return false;
+            });
+        }
+
+        /**
          * Attach the first existing candidate as the proxy of one clip
          * project item, unless it has a proxy already, and count the outcome.
          * hasProxy() is read again afterwards, so an answer Premiere did not
-         * act on is never counted as attached.
+         * act on is never counted as attached.  A candidate found only
+         * through the .OSV's copy suffix is taken for the one copy only.
          */
-        function attachProxyTo(clip, candidates, result) {
+        function attachProxyTo(clip, entry, result) {
+            var candidates = entry.candidates;
             return safeCall(function () { return typeof clip.hasProxy === 'function' ? clip.hasProxy() : false; },
                             false)
                 .then(function (has) {
@@ -441,30 +464,45 @@
                                     }
                                     return undefined;
                                 }
-                                // ---- attach as the proxy (isHiRes false), then check -----
-                                return invoke(function () { return clip.attachProxy(found.path, false, false); })
-                                    .then(function (ok) {
-                                        if (ok !== true) {
-                                            result.failed += 1;
-                                            result.errors.push('Premiere did not take ' + found.path + ' as the proxy');
-                                            return undefined;
-                                        }
-                                        return safeCall(function () {
-                                            return typeof clip.hasProxy === 'function' ? clip.hasProxy() : true;
-                                        }, true).then(function (now) {
-                                            if (now === false) {
-                                                result.failed += 1;
-                                                result.errors.push('Premiere did not take ' + found.path + ' as the proxy');
-                                            } else {
-                                                result.attached += 1;
-                                            }
-                                        });
-                                    }, function (err) {
-                                        result.failed += 1;
-                                        result.errors.push(messageOf(err));
-                                    });
+                                var checked = found.index >= core.LRF_EXACT_CANDIDATES
+                                    ? onlyCopy(entry.copy) : Promise.resolve(true);
+                                return checked.then(function (single) {
+                                    if (!single) {
+                                        result.ambiguous += 1;
+                                        return undefined;
+                                    }
+                                    return attachFound(clip, found.path, result);
+                                });
                             });
                         });
+                });
+        }
+
+        /**
+         * attachProxy(path) as the proxy (isHiRes false, no Team Projects
+         * alternate link), then hasProxy() again; counts the outcome.
+         */
+        function attachFound(clip, path, result) {
+            return invoke(function () { return clip.attachProxy(path, false, false); })
+                .then(function (ok) {
+                    if (ok !== true) {
+                        result.failed += 1;
+                        result.errors.push('Premiere did not take ' + path + ' as the proxy');
+                        return undefined;
+                    }
+                    return safeCall(function () {
+                        return typeof clip.hasProxy === 'function' ? clip.hasProxy() : true;
+                    }, true).then(function (now) {
+                        if (now === false) {
+                            result.failed += 1;
+                            result.errors.push('Premiere did not take ' + path + ' as the proxy');
+                        } else {
+                            result.attached += 1;
+                        }
+                    });
+                }, function (err) {
+                    result.failed += 1;
+                    result.errors.push(messageOf(err));
                 });
         }
 
@@ -1329,11 +1367,13 @@
              * where the .LRF can be; the injected fileExists() says which is
              * there.  An item with a proxy already keeps it, and each project
              * item is handled once however many of its clips are listed.
-             * -> {attached, already, missing, failed, unsupported, noFileAccess, errors[]}
+             * An .LRF found only through the .OSV's copy suffix is taken for
+             * the ONE renamed copy in its folder (the injected listFolder()).
+             * -> {attached, already, missing, failed, unsupported, ambiguous, noFileAccess, errors[]}
              */
             attachProxies: function (seq, items) {
-                var result = { attached: 0, already: 0, missing: 0, failed: 0, unsupported: 0, noFileAccess: false,
-                               errors: [] };
+                var result = { attached: 0, already: 0, missing: 0, failed: 0, unsupported: 0, ambiguous: 0,
+                               noFileAccess: false, errors: [] };
                 var list = [];
                 (Array.isArray(items) ? items : []).forEach(function (i) {
                     if (!i || typeof i.key !== 'string' || i.key.length === 0) {
@@ -1342,7 +1382,7 @@
                     // An .LRF on the timeline is a proxy itself: nothing to attach.
                     var candidates = core.lrfCandidatesFor(i.mediaPath);
                     if (candidates.length > 0) {
-                        list.push({ key: i.key, candidates: candidates });
+                        list.push({ key: i.key, candidates: candidates, copy: core.copySuffixOf(i.mediaPath) });
                     }
                 });
                 if (list.length === 0) {
@@ -1388,7 +1428,7 @@
                                     result.unsupported += 1;
                                     return undefined;
                                 }
-                                return attachProxyTo(clip, entry.candidates, result);
+                                return attachProxyTo(clip, entry, result);
                             });
                         });
                     });

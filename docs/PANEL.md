@@ -153,17 +153,22 @@ project; **Attach .LRF proxies** does it for every OSV clip of the active
 sequence. `OsvCore.lrfCandidatesFor()` ranks where the `.LRF` can be (the same
 name, then the name without a `-<digits>` copy suffix: `CAM_..._D-001.OSV`
 beside `CAM_..._D.LRF`), which is the importer's own rule
-(`ImporterInstance::proxyFileFor`). A master clip that has a proxy keeps it
+(`ImporterInstance::proxyFileFor`). An `.LRF` reached only through the copy
+suffix is taken when that `.OSV` is the one renamed copy in its folder
+(`OsvCore.countCopies`, the importer's `proxyOriginalFor` rule); two copies
+are ambiguous, the importer would leave the `.LRF` on its own timeline, and
+the panel attaches nothing. A master clip that has a proxy keeps it
 (`hasProxy()`); a new one is attached as the proxy and checked with
 `hasProxy()` again:
 
 * **UXP**: `ClipProjectItem.attachProxy(mediaPath, false, false)` (since 25.6,
-  `Promise<boolean>`, not undoable). Whether the `.LRF` exists comes from UXP's
-  `fs` module, which needs `localFileSystem: "fullAccess"` in the manifest;
+  `Promise<boolean>`, not undoable). Whether the `.LRF` exists, and the
+  folder's names for the one-copy rule, come from UXP's `fs` module (`lstat`,
+  `readdir`), which needs `localFileSystem: "fullAccess"` in the manifest;
   without an answer the status line says so and nothing is attached.
 * **CEP**: `ProjectItem.attachProxy(mediaPath, 0)` (`0` = as the proxy;
   "returns 0 if successful"), the file checked with ExtendScript's
-  `File(path).exists`.
+  `File(path).exists` and the folder listed with `Folder.getFiles()`.
 
 Quiet on a drop unless something was attached or failed; the button reports
 attached / had one / no `.LRF` beside it. See `docs/PREMIERE.md`, "The

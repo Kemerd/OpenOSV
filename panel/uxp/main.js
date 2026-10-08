@@ -79,6 +79,35 @@
     }
 
     /**
+     * The file names in `folder`: Promise<string[] | null>, null when the
+     * folder cannot be read.  Native path first, then its file: URL form.
+     */
+    function listFolder(folder) {
+        if (!fs || typeof fs.readdir !== 'function' || typeof folder !== 'string' || folder.length === 0) {
+            return Promise.resolve(null);
+        }
+        var plain = folder.replace(/[\\\/]+$/, '');
+        var forms = [plain, 'file:' + plain.replace(/\\/g, '/')];
+        var names = null;
+        var chain = Promise.resolve();
+        forms.forEach(function (form) {
+            chain = chain.then(function () {
+                if (names !== null) {
+                    return undefined;
+                }
+                return new Promise(function (resolve) { resolve(fs.readdir(form)); }).then(function (list) {
+                    if (Array.isArray(list)) {
+                        names = list.map(function (n) { return String(n); });
+                    }
+                }, function () {
+                    // The next form, or "cannot tell".
+                });
+            });
+        });
+        return chain.then(function () { return names; });
+    }
+
+    /**
      * Close to Premiere's panel grey per theme, for hosts older than 26.5,
      * which cannot say the exact colour.  Only a fallback: without it a light
      * theme would show the light cards on the stylesheet's dark page.
@@ -139,7 +168,7 @@
             if (!ppro) {
                 throw new Error('this Premiere has no UXP API (Premiere Pro 25.6 or later is needed)');
             }
-            return g.OsvUxpAdapter.createUxpAdapter(ppro, g.OsvCore, { log: log, fileExists: fileExists });
+            return g.OsvUxpAdapter.createUxpAdapter(ppro, g.OsvCore, { log: log, fileExists: fileExists, listFolder: listFolder });
         },
         theme: theme,
         log: log

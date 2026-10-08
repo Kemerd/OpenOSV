@@ -30,7 +30,8 @@ All notable changes to OpenOSV are documented here. The format follows
 
 * **The camera's `.LRF` becomes the `.OSV`'s proxy.** With Auto-apply on, the
   OpenOSV panel attaches the `.LRF` beside each dropped `.OSV` as its proxy
-  (once per master clip, never over a proxy that is already there), and
+  (once per master clip, never over a proxy that is already there, and not
+  when several renamed copies of the recording share one `.LRF`), and
   **Attach .LRF proxies** does it for the clips already in a sequence. Toggle
   Proxies in the Program Monitor then edits on the light file; export still
   uses the `.OSV`. The UXP panel now asks for file access to find the `.LRF`.

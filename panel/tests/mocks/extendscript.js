@@ -303,6 +303,26 @@ function createWorld(options) {
     CSXSEvent.prototype.dispatch = function () {
         world.dispatched.push({ type: this.type, data: this.data });
     };
+    /**
+     * ExtendScript's Folder: `Folder.fs` names the platform; getFiles() lists
+     * the world's files directly inside the folder, each with its plain
+     * displayName and its URI-encoded name, as ExtendScript gives them.
+     */
+    function Folder(p) {
+        this.fsName = String(p).replace(/[\\/]+$/, '');
+        const prefix = this.fsName + '\\';
+        this.exists = world.files.some((f) => f.indexOf(prefix) === 0);
+    }
+    Folder.fs = 'Windows';
+    Folder.prototype.getFiles = function () {
+        const prefix = this.fsName + '\\';
+        return world.files
+            .filter((f) => f.indexOf(prefix) === 0 && f.substring(prefix.length).indexOf('\\') === -1)
+            .map((f) => {
+                const name = f.substring(prefix.length);
+                return { displayName: name, name: encodeURI(name) };
+            });
+    };
     /** ExtendScript's File: `exists` is whether the world lists the path. */
     function File(p) {
         this.fsName = String(p);
@@ -319,7 +339,7 @@ function createWorld(options) {
 
     const context = vm.createContext({
         app: app,
-        Folder: { fs: 'Windows' },
+        Folder: Folder,
         CSXSEvent: CSXSEvent,
         ExternalObject: ExternalObject,
         File: File,

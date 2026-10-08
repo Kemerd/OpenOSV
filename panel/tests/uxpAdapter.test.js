@@ -267,12 +267,21 @@ function filesThatExist(list) {
     return async (p) => list.indexOf(p) !== -1;
 }
 
+/** A listFolder() over the same list: the names directly inside a folder. */
+function namesIn(list) {
+    return async (folder) => {
+        const prefix = folder.replace(/[\\/]+$/, '') + '\\';
+        return list.filter((f) => f.indexOf(prefix) === 0 && f.substring(prefix.length).indexOf('\\') === -1)
+            .map((f) => f.substring(prefix.length));
+    };
+}
+
 test('attachProxies attaches the .LRF beside each .OSV once, as the proxy, and keeps one that is there', async () => {
     const m = createMockPremiere();
     const seq = m.addSequence('seq-1', 'Main', 2);
-    const adapter = createUxpAdapter(m.ppro, core, {
-        fileExists: filesThatExist(['C:\\DCIM\\CAM_X_D.LRF', 'C:\\DCIM\\CAM_Y.LRF'])
-    });
+    const files = ['C:\\DCIM\\CAM_X_D-001.OSV', 'C:\\DCIM\\CAM_X_D.LRF', 'C:\\DCIM\\CAM_Y.OSV', 'C:\\DCIM\\CAM_Y.LRF',
+                   'C:\\DCIM\\CAM_Z.OSV'];
+    const adapter = createUxpAdapter(m.ppro, core, { fileExists: filesThatExist(files), listFolder: namesIn(files) });
     const shared = { id: 'pi-x', path: 'C:\\DCIM\\CAM_X_D-001.OSV', isSequence: false };
     m.addClip(seq, 0, { name: 'x', start: 0, end: 1000, projectItem: shared });
     m.addClip(seq, 1, { name: 'x again', start: 0, end: 1000, projectItem: shared });
@@ -284,8 +293,8 @@ test('attachProxies attaches the .LRF beside each .OSV once, as the proxy, and k
     const active = await adapter.getActiveSequence();
     const scanned = await adapter.scan(active, { selectedOnly: false });
     const r = await adapter.attachProxies(active, scanned.items);
-    assert.deepEqual(r, { attached: 1, already: 1, missing: 1, failed: 0, unsupported: 0, noFileAccess: false,
-                          errors: [] });
+    assert.deepEqual(r, { attached: 1, already: 1, missing: 1, failed: 0, unsupported: 0, ambiguous: 0,
+                          noFileAccess: false, errors: [] });
     // As the proxy (isHiRes false), not as a Team Projects alternate link, once.
     assert.deepEqual(m.world.proxyCalls, [{ item: 'pi-x', path: 'C:\\DCIM\\CAM_X_D.LRF', isHiRes: false,
                                             alternateLink: false }]);
@@ -335,7 +344,8 @@ test('attachProxies: a refusal fails, no file access or no proxy API is said, ne
 test('auto-apply attaches the .LRF of a dropped .OSV once; the button reports every clip', async () => {
     const m = createMockPremiere();
     const seq = m.addSequence('seq-1', 'Main', 2);
-    const adapter = createUxpAdapter(m.ppro, core, { fileExists: filesThatExist(['C:\\DCIM\\CAM_D.LRF']) });
+    const files = ['C:\\DCIM\\CAM_D-001.OSV', 'C:\\DCIM\\CAM_D.LRF'];
+    const adapter = createUxpAdapter(m.ppro, core, { fileExists: filesThatExist(files), listFolder: namesIn(files) });
     const timers = fakeTimers();
     const ctl = createController({ core, adapter, timers, storage: null });
     const step = async (ms) => {
@@ -364,4 +374,29 @@ test('auto-apply attaches the .LRF of a dropped .OSV once; the button reports ev
     await ctl.attachProxies();
     assert.equal(ctl.getState().status.text, 'The OSV clip already has its proxy.');
     ctl.stop();
+});
+
+test('attachProxies: an .LRF reached through a copy suffix needs the one copy, and a folder it can read', async () => {
+    const run = async (files, listing) => {
+        const m = createMockPremiere();
+        const seq = m.addSequence('seq-1', 'Main', 1);
+        m.addClip(seq, 0, { name: 'x', start: 0, end: 1000,
+                            projectItem: { id: 'pi-x', path: 'C:\\DCIM\\CAM_X_D-001.OSV', isSequence: false } });
+        const adapter = createUxpAdapter(m.ppro, core, { fileExists: filesThatExist(files), listFolder: listing });
+        adapter.init(() => {});
+        const active = await adapter.getActiveSequence();
+        const scanned = await adapter.scan(active, { selectedOnly: false });
+        const r = await adapter.attachProxies(active, scanned.items);
+        return { r, calls: m.world.proxyCalls.length };
+    };
+    const two = ['C:\\DCIM\\CAM_X_D-001.OSV', 'C:\\DCIM\\CAM_X_D-002.OSV', 'C:\\DCIM\\CAM_X_D.LRF'];
+    const ambiguous = await run(two, namesIn(two));
+    assert.equal(ambiguous.r.ambiguous, 1);
+    assert.equal(ambiguous.calls, 0);
+    const unread = await run(two.filter((f) => !f.endsWith('-002.OSV')), async () => null);
+    assert.equal(unread.r.ambiguous, 1, 'a folder that cannot be read proves nothing');
+    assert.equal(unread.calls, 0);
+    const one = two.filter((f) => !f.endsWith('-002.OSV'));
+    const single = await run(one, namesIn(one));
+    assert.equal(single.r.attached, 1);
 });

@@ -836,9 +836,49 @@ var OpenOSVHost = (function () {
     }
 
     /**
+     * How many .OSV files in `folder` are named `base` plus a "-<digits>"
+     * copy suffix (OsvCore.countCopies' rule, the importer's), or -1 when
+     * the folder cannot be listed.  ExtendScript's File.name is URI-encoded;
+     * displayName is the plain name.
+     */
+    function countCopiesIn(folder, base) {
+        try {
+            var dir = new Folder(String(folder));
+            if (!dir.exists) {
+                return -1;
+            }
+            var files = dir.getFiles();
+            if (!files) {
+                return -1;
+            }
+            var n = 0;
+            for (var i = 0; i < files.length; i += 1) {
+                var name = '';
+                try {
+                    name = files[i].displayName ? String(files[i].displayName) : decodeURI(String(files[i].name));
+                } catch (e) {
+                    name = '';
+                }
+                var m = /^(.+)-[0-9]{1,4}\.osv$/i.exec(name);
+                if (m && m[1] === String(base)) {
+                    n += 1;
+                }
+            }
+            return n;
+        } catch (e) {
+            return -1;
+        }
+    }
+
+    /**
      * Attach the first existing path of `candidates` as the proxy of one
      * project item, unless it has a proxy already (the user's own, or one
      * attached before), and count the outcome in `result`.
+     *
+     * A candidate past the first `exact` comes from the .OSV's name without
+     * its copy suffix (CAM_..._D-001.OSV -> CAM_..._D.LRF); it is taken only
+     * when that .OSV is the ONE such copy in `folder` - the importer's rule,
+     * which otherwise leaves the .LRF on its own timeline, the wrong proxy.
      *
      * Official DOM (ppro-scripting.docsforadobe.dev, ProjectItem):
      * hasProxy() -> Boolean, canProxy() -> Boolean, and
@@ -846,7 +886,12 @@ var OpenOSVHost = (function () {
      * which "returns 0 if successful".  hasProxy() is read again afterwards,
      * so an answer Premiere did not act on is never counted as attached.
      */
-    function attachProxyTo(item, candidates, result) {
+    function attachProxyTo(item, request, result) {
+        var candidates = isArray(request.candidates) ? request.candidates : [];
+        var exact = Number(request.exact);
+        if (!(exact >= 0)) {
+            exact = candidates.length;
+        }
         // ---- a proxy already there is kept ----------------------------------
         var has = false;
         try {
@@ -873,14 +918,21 @@ var OpenOSVHost = (function () {
         }
         // ---- the first candidate that exists ------------------------------------
         var path = '';
+        var at = -1;
         for (var c = 0; c < candidates.length && path === ''; c += 1) {
             var candidate = String(candidates[c]);
             if (candidate.length > 0 && fileExists(candidate)) {
                 path = candidate;
+                at = c;
             }
         }
         if (path === '') {
             result.missing += 1;
+            return;
+        }
+        // ---- an .LRF found through the copy suffix: only for the one copy ---------
+        if (at >= exact && countCopiesIn(request.folder, request.base) !== 1) {
+            result.ambiguous += 1;
             return;
         }
         // ---- attach, then believe hasProxy() -----------------------------------
@@ -1438,12 +1490,14 @@ var OpenOSVHost = (function () {
     /**
      * Attach the camera's .LRF as the proxy of the project items behind the
      * clips named in `request.requests` - [{key: track item nodeId,
-     * candidates: [path, ...]}], the candidates in the order the panel's
-     * OsvCore.lrfCandidatesFor() ranks them.  Each project item is handled
-     * once however many of its clips are listed, and an item with a proxy
-     * already keeps it.
+     * candidates: [path, ...], exact, folder, base}], the candidates in the
+     * order the panel's OsvCore.lrfCandidatesFor() ranks them, the first
+     * `exact` from the .OSV's own name, and `folder` / `base` its
+     * copy-suffix reading (OsvCore.copySuffixOf).  Each project item is
+     * handled once however many of its clips are listed, and an item with a
+     * proxy already keeps it.
      *
-     * Returns {attached, already, missing, failed, unsupported, errors[], paths[]}.
+     * Returns {attached, already, missing, failed, unsupported, ambiguous, errors[], paths[]}.
      */
     api.attachProxies = function (request) {
         try {
@@ -1453,7 +1507,8 @@ var OpenOSVHost = (function () {
                 return errorJson('the active sequence changed. Try again');
             }
             var list = isArray(req.requests) ? req.requests : [];
-            var result = { attached: 0, already: 0, missing: 0, failed: 0, unsupported: 0, errors: [], paths: [] };
+            var result = { attached: 0, already: 0, missing: 0, failed: 0, unsupported: 0, ambiguous: 0, errors: [],
+                           paths: [] };
             var done = {};
             for (var i = 0; i < list.length; i += 1) {
                 var r = list[i] || {};
@@ -1484,7 +1539,7 @@ var OpenOSVHost = (function () {
                 if (id) {
                     done[id] = true;
                 }
-                attachProxyTo(item, isArray(r.candidates) ? r.candidates : [], result);
+                attachProxyTo(item, r, result);
             }
             return okJson(result);
         } catch (e) {

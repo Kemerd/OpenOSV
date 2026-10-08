@@ -504,3 +504,17 @@ test('summarizeProxies: attached, already, missing, failed and the quiet automat
     assert.match(core.summarizeProxies({ noFileAccess: true }, 'all').text, /can't look for \.LRF files/);
     assert.equal(core.summarizeProxies(null, 'all').text, 'No OSV clips in this sequence.');
 });
+
+test('copySuffixOf and countCopies: the importer\'s one-copy rule', () => {
+    assert.deepEqual(core.copySuffixOf('L:\\ref\\CAM_20260122163617_0007_D-001.OSV'),
+                     { folder: 'L:\\ref\\', base: 'CAM_20260122163617_0007_D' });
+    assert.equal(core.copySuffixOf('L:\\ref\\CAM_D.OSV'), null);
+    assert.equal(core.copySuffixOf('L:\\ref\\CAM_D-001.LRF'), null, 'an .LRF has no proxy to find');
+    assert.equal(core.copySuffixOf(null), null);
+    const names = ['CAM_D-001.OSV', 'CAM_D.LRF', 'CAM_D-002.osv', 'CAM_DX-003.OSV', 'cam_d-004.OSV', 'CAM_D-12345.OSV', 7];
+    assert.equal(core.countCopies(names, 'CAM_D'), 2, 'the stem exactly, the extension in any case, 1-4 digits');
+    assert.equal(core.countCopies(['CAM_D-001.OSV'], 'CAM_D'), 1);
+    assert.equal(core.countCopies(null, 'CAM_D'), 0);
+    assert.equal(core.LRF_EXACT_CANDIDATES, 2);
+    assert.match(core.summarizeProxies({ ambiguous: 1 }, 'auto').text, /Several copies of 1 recording share one \.LRF/);
+});

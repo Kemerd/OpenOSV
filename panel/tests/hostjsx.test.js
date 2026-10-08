@@ -250,6 +250,19 @@ test('every entry point answers JSON even when the DOM throws', () => {
 //  The camera's .LRF as the proxy (ProjectItem.attachProxy(path, 0))
 // ---------------------------------------------------------------------------
 
+/** The request the CEP adapter sends for one clip (cepAdapter.attachProxies). */
+function proxyRequest(clip) {
+    const media = clip.projectItem.getMediaPath();
+    const copy = core.copySuffixOf(media);
+    return {
+        key: clip.nodeId,
+        candidates: core.lrfCandidatesFor(media),
+        exact: core.LRF_EXACT_CANDIDATES,
+        folder: copy ? copy.folder : '',
+        base: copy ? copy.base : ''
+    };
+}
+
 test('attachProxies attaches the first .LRF that exists, once per project item, and keeps a proxy that is there', () => {
     const { w, seq, call } = boot();
     // The user's pair (renamed .OSV), a second clip of the same master clip,
@@ -258,11 +271,9 @@ test('attachProxies attaches the first .LRF that exists, once per project item, 
     const a2 = osv(w, seq, 1, 0, { path: 'C:\\DCIM\\CAM_X_D-001.OSV', projectItemId: 'pi-a' });
     const b = osv(w, seq, 0, 2000, { path: 'C:\\DCIM\\CAM_Y.OSV', projectItemId: 'pi-b', proxyPath: 'D:\\mine.mov' });
     const c = osv(w, seq, 0, 4000, { path: 'C:\\DCIM\\CAM_Z.OSV', projectItemId: 'pi-c' });
-    w.world.files.push('C:\\DCIM\\CAM_X_D.LRF', 'C:\\DCIM\\CAM_Y.LRF');
-    const requests = [a, a2, b, c].map((clip) => ({
-        key: clip.nodeId,
-        candidates: core.lrfCandidatesFor(clip.projectItem.getMediaPath())
-    }));
+    w.world.files.push('C:\\DCIM\\CAM_X_D-001.OSV', 'C:\\DCIM\\CAM_X_D.LRF', 'C:\\DCIM\\CAM_Y.OSV',
+                       'C:\\DCIM\\CAM_Y.LRF', 'C:\\DCIM\\CAM_Z.OSV');
+    const requests = [a, a2, b, c].map(proxyRequest);
     const r = call('attachProxies', { sequenceId: 'seq-1', requests: requests });
     assert.equal(r.ok, true);
     assert.equal(r.attached, 1);
@@ -285,10 +296,7 @@ test('attachProxies counts a refusal as failed and an older Premiere as unsuppor
     const cannot = osv(w, seq, 1, 0, { projectItemId: 'pi-no', canProxy: false });
     w.world.files.push('C:\\DCIM\\CAM_0.LRF', 'C:\\DCIM\\CAM_2000.LRF');
     w.world.proxyRefuses = true;
-    const requests = [a, old, cannot].map((clip) => ({
-        key: clip.nodeId,
-        candidates: core.lrfCandidatesFor(clip.projectItem.getMediaPath())
-    }));
+    const requests = [a, old, cannot].map(proxyRequest);
     const r = call('attachProxies', { sequenceId: 'seq-1', requests: requests });
     assert.equal(r.ok, true);
     assert.equal(r.failed, 1);
@@ -299,4 +307,23 @@ test('attachProxies counts a refusal as failed and an older Premiere as unsuppor
     const moved = call('attachProxies', { sequenceId: 'other', requests: requests });
     assert.equal(moved.ok, false);
     assert.equal(w.world.proxyCalls.length, 1);
+});
+
+test('attachProxies takes an .LRF through a copy suffix only for the one renamed copy in its folder', () => {
+    const { w, seq, call } = boot();
+    const one = osv(w, seq, 0, 0, { path: 'C:\\DCIM\\CAM_X_D-001.OSV', projectItemId: 'pi-1' });
+    const two = osv(w, seq, 0, 2000, { path: 'C:\\DCIM\\CAM_X_D-002.OSV', projectItemId: 'pi-2' });
+    // Two renamed copies of one recording beside its .LRF: the importer
+    // leaves the .LRF on its own timeline, so neither may get it as proxy.
+    w.world.files.push('C:\\DCIM\\CAM_X_D-001.OSV', 'C:\\DCIM\\CAM_X_D-002.OSV', 'C:\\DCIM\\CAM_X_D.LRF');
+    const r = call('attachProxies', { sequenceId: 'seq-1', requests: [one, two].map(proxyRequest) });
+    assert.equal(r.ok, true);
+    assert.equal(r.ambiguous, 2);
+    assert.equal(r.attached, 0);
+    assert.equal(w.world.proxyCalls.length, 0);
+    // With one copy left it is the pair.
+    w.world.files.splice(w.world.files.indexOf('C:\\DCIM\\CAM_X_D-002.OSV'), 1);
+    const again = call('attachProxies', { sequenceId: 'seq-1', requests: [one].map(proxyRequest) });
+    assert.equal(again.attached, 1);
+    assert.equal(again.ambiguous, 0);
 });
