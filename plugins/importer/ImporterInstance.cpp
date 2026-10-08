@@ -49,6 +49,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cwctype>
 #include <exception>
 #include <format>
@@ -377,6 +378,90 @@ void ensureGpuAnalyses() noexcept {
     return opt;
 }
 
+/// @brief True when the environment variable `name` is an explicit yes.
+///
+/// "1", "true", "yes" or "on" (any case), exactly as
+/// importerGpuDecodeDisabledByEnvironment() reads OPENOSV_IMPORTER_NO_GPU_DECODE:
+/// anything else - unset, "0", garbage - is no, so a stray value can never
+/// slow a user down.
+[[nodiscard]] bool importerSwitchOn(const char* name) noexcept {
+    if (name == nullptr) {
+        return false;
+    }
+#if defined(_WIN32)
+    // getenv_s: the importer is /MD and shares the CRT's environment with the
+    // host (and with a test that sets the variable).
+    char value[8] = {};
+    std::size_t length = 0;
+    if (getenv_s(&length, value, sizeof(value), name) != 0 || length == 0) {
+        return false;
+    }
+#else
+    const char* env = std::getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        return false;
+    }
+    char value[8] = {};
+    std::strncpy(value, env, sizeof(value) - 1);
+#endif
+    const char c = value[0];
+    const char d = value[1];
+    return c == '1' || c == 't' || c == 'T' || c == 'y' || c == 'Y' ||
+           ((c == 'o' || c == 'O') && (d == 'n' || d == 'N'));
+}
+
+/// @brief The clip's file name for a log line, UTF-8; "?" when it cannot be
+/// converted.  Never throws: path::string() converts through the ANSI code
+/// page and throws on a name it cannot map, which must not happen on a
+/// noexcept path such as the parallax worker's.
+[[nodiscard]] std::string clipLogName(const std::filesystem::path& path) noexcept {
+    try {
+        const std::u8string name = path.filename().u8string();
+        return std::string(name.begin(), name.end());
+    } catch (...) {
+        return "?";
+    }
+}
+
+/// @brief "consistent 18% (needs 25%)" - the share of a parallax measurement
+/// that passed its consistency check, for a per-bucket refusal line.
+///
+/// A refusal hands back an Error, not the grid that held the share, so it is
+/// rebuilt from what parallaxFromBands() fills in on the side: the consistent
+/// pixels are the sum of the per-cell counts (every consistent pixel lands in
+/// exactly one cell), the examined ones are the band pixels both lenses cover
+/// (alpha > 0.5 in both - gridFromFlow's own test).  The result is exactly
+/// ParallaxWarpGrid::consistentFraction() of the refused grid.
+///
+/// @param cells        What gridFromFlow() saw per cell (empty when it never ran).
+/// @param bands        The bands the measurement was made on.
+/// @param minFraction  The threshold the measurement had to meet.
+/// @return The text, or "consistent n/a" when the flow never got that far.
+[[nodiscard]] std::string consistentShareText(const render::ParallaxCellStats& cells, const render::LensBands& bands,
+                                              double minFraction) {
+    // ---- the examined pixels: co-visible band pixels -------------------------
+    const std::size_t n = static_cast<std::size_t>(bands.w) * static_cast<std::size_t>(bands.h);
+    if (!cells.valid() || n == 0 || bands.alpha[0].size() < n || bands.alpha[1].size() < n) {
+        return "consistent n/a";
+    }
+    std::uint64_t covisible = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (bands.alpha[0][i] > 0.5f && bands.alpha[1][i] > 0.5f) {
+            ++covisible;
+        }
+    }
+    // ---- the consistent ones: the cells' pixel counts -------------------------
+    std::uint64_t consistent = 0;
+    for (const std::uint32_t p : cells.pixels) {
+        consistent += p;
+    }
+    if (covisible == 0) {
+        return "consistent n/a (no co-visible pixel)";
+    }
+    const double share = static_cast<double>(consistent) / static_cast<double>(covisible);
+    return std::format("consistent {:.1f}% (needs {:.0f}%)", 100.0 * share, 100.0 * minFraction);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -419,12 +504,20 @@ void ImporterInstance::parallaxWorkerLoop() noexcept {
         double ms = 0.0;
         try {
             const auto t0 = std::chrono::steady_clock::now();
-            auto grid = render::parallaxFromBands(job.bands, job.params, nullptr, job.bandMs);
+            // The per-cell counts ride along so a refusal can say how much of
+            // the flow was consistent (consistentShareText); output only.
+            render::ParallaxCellStats cells;
+            auto grid = render::parallaxFromBands(job.bands, job.params, nullptr, job.bandMs, &cells);
             ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             if (grid.ok()) {
                 result = std::make_shared<const render::ParallaxWarpGrid>(std::move(grid).value());
             } else {
                 refusal = grid.error().message;
+                // The consistent share walks every band pixel, and only the
+                // Debug line below prints it: below Debug it is never built.
+                if (PluginLog::enabled(PluginLog::Level::Debug)) {
+                    refusal += ", " + consistentShareText(cells, job.bands, job.params.minConsistentFraction);
+                }
             }
         } catch (const std::exception& e) {
             // Allocation failure is the realistic case.  Record it as a
@@ -453,13 +546,18 @@ void ImporterInstance::parallaxWorkerLoop() noexcept {
                 stored = true;
             }
         }
+        // The clip on every line: two clips' buckets interleave in one log.
+        // (m_path is set at construction and never changes, so this thread
+        // may read it without m_mutex.)
         const char* lane = job.standIn ? " (stand-in)" : "";
         if (result) {
-            PluginLog::debug("parallax bucket {}{} measured in the background in {:.0f} ms (flow {:.0f}){}", job.bucket,
-                             lane, ms, result->flowMs, stored ? "" : " - discarded, settings changed");
+            PluginLog::debug("parallax bucket {}{} of '{}' measured in the background in {:.0f} ms (flow {:.0f}), "
+                             "consistent {:.1f}%{}",
+                             job.bucket, lane, clipLogName(m_path), ms, result->flowMs,
+                             100.0 * result->consistentFraction(), stored ? "" : " - discarded, settings changed");
         } else {
-            PluginLog::debug("parallax bucket {}{} refused in the background after {:.0f} ms ({})", job.bucket, lane,
-                             ms, refusal);
+            PluginLog::debug("parallax bucket {}{} of '{}' refused in the background after {:.0f} ms ({})", job.bucket,
+                             lane, clipLogName(m_path), ms, refusal);
         }
     }
 }
@@ -967,8 +1065,24 @@ Status ImporterInstance::ensureReader() {
     //
     // macOS: VideoToolbox takes D3D11VA's place - Apple's hardware HEVC
     // decoder, on every Apple Silicon Mac - with the same host copy.
+    //
+    // OPENOSV_IMPORTER_LRF_SOFTWARE=1 (a diagnostic switch, off by default)
+    // keeps the side-by-side PROXY on software from the start: it separates a
+    // fault in the hardware decode from one later in the chain within a
+    // single Premiere session.  Measured on a 2048x1024 proxy it costs
+    // 1.3 ms a frame with four threads (3.5 ms single-threaded), so a
+    // worst-case landing at the end of a 20-frame GOP is ~25-70 ms instead of
+    // ~16 ms.  The native streams are never affected: software is ~1 s per
+    // landing there.  The pool key includes the back-end, so a parked
+    // hardware reader of the clip is never taken back while the switch is on.
+    const bool proxySoftware = m_format.sideBySideProxy && importerSwitchOn("OPENOSV_IMPORTER_LRF_SOFTWARE");
+    if (proxySoftware) {
+        const std::string clip = clipLogName(m_path);
+        PluginLog::oncef("lrf-software/" + clip, PluginLog::Level::Info,
+                         "video: '{}' decodes in software (OPENOSV_IMPORTER_LRF_SOFTWARE is set)", clip);
+    }
     std::vector<video::HwAccel> order;
-    if (!m_hwDecodeFailed) {
+    if (!m_hwDecodeFailed && !proxySoftware) {
 #if defined(__APPLE__)
         order.push_back(video::HwAccel::VideoToolbox);
 #else
@@ -1958,26 +2072,39 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
                 const double bandMs =
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tBand).count();
                 if (!bands.ok()) {
-                    PluginLog::debug("frame {} (bucket {}): parallax bands failed ({}); rendering without", index,
-                                     bucket, bands.error().message);
+                    PluginLog::debug("frame {} (bucket {}) of '{}': parallax bands failed ({}); rendering without",
+                                     index, bucket, clipLogName(m_path), bands.error().message);
                 } else if (now) {
                     const auto t0 = std::chrono::steady_clock::now();
-                    auto grid = render::parallaxFromBands(bands.value(), pw, &pool, bandMs);
+                    // Per-cell counts on the side, for the refusal line's
+                    // consistent share (output only: the grid is the same).
+                    render::ParallaxCellStats cells;
+                    auto grid = render::parallaxFromBands(bands.value(), pw, &pool, bandMs, &cells);
                     const double ms =
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() +
                         bandMs;
+                    // The clip on every line: two clips' buckets interleave in one log.
                     if (grid.ok()) {
                         const render::ParallaxWarpGrid& g = grid.value();
-                        PluginLog::debug("frame {} (bucket {}, anchor {}): parallax {} in {:.0f} ms (flow {:.0f}), "
-                                         "consistent {:.0f}%, gated {}/{}, disparity mean {:.2f} / max {:.2f} deg",
-                                         index, bucket, source->index, render::flowBackendName(g.usedBackend), ms,
-                                         g.flowMs, 100.0 * g.consistentFraction(), g.gatedCells, g.measuredCells,
+                        PluginLog::debug("frame {} (bucket {}, anchor {}) of '{}': parallax {} in {:.0f} ms (flow "
+                                         "{:.0f}), consistent {:.0f}%, gated {}/{}, disparity mean {:.2f} / max {:.2f} "
+                                         "deg",
+                                         index, bucket, source->index, clipLogName(m_path),
+                                         render::flowBackendName(g.usedBackend), ms, g.flowMs,
+                                         100.0 * g.consistentFraction(), g.gatedCells, g.measuredCells,
                                          g.meanAbsCorrectionDeg, g.maxAbsCorrectionDeg);
                         out.grid = std::make_shared<const render::ParallaxWarpGrid>(std::move(grid).value());
                     } else {
-                        PluginLog::debug("frame {} (bucket {}, anchor {}): parallax refused after {:.0f} ms ({}); {}",
-                                         index, bucket, source->index, ms, grid.error().message,
-                                         wantSeam ? "using the seam table instead" : "rendering without it");
+                        // Built only at Debug: the consistent share walks every
+                        // band pixel, and the line is the only thing that uses it.
+                        if (PluginLog::enabled(PluginLog::Level::Debug)) {
+                            PluginLog::debug("frame {} (bucket {}, anchor {}) of '{}': parallax refused after {:.0f} "
+                                             "ms ({}, {}); {}",
+                                             index, bucket, source->index, clipLogName(m_path), ms,
+                                             grid.error().message,
+                                             consistentShareText(cells, bands.value(), pw.minConsistentFraction),
+                                             wantSeam ? "using the seam table instead" : "rendering without it");
+                        }
                         out.grid = nullptr;  // a stored nullptr records the refusal
                     }
                     gridKnown = true;

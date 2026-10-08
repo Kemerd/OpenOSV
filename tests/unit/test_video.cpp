@@ -13,9 +13,13 @@
 #include "TestSample.h"
 
 #include "osv/container/OsvFile.h"
+#include "osv/core/Crc64.h"
+#include "osv/core/Log.h"
 #include "osv/core/Result.h"
 #include "osv/meta/FormatInfo.h"
 #include "osv/meta/MetadataTrack.h"
+#include "osv/render/ParallaxWarp.h"
+#include "osv/render/SeamAnalysis.h"
 #include "osv/video/Decoder.h"
 #include "osv/video/DualStreamReader.h"
 #include "osv/video/HwAccel.h"
@@ -29,14 +33,19 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -761,6 +770,18 @@ TEST_CASE("D3D11VA random access on the LRF matches software frame for frame", "
     }
     WARN("d3d11va random access: " << compared << " frames over " << landings << " landings, " << mismatched
                                    << " mismatched, worst PSNR " << worstPsnr << " dB at frame " << worstIndex);
+    // ---- was it hardware at all? -----------------------------------------------------
+    // get_format drops a decoder to software, silently but for one log line,
+    // when the stream offers no D3D11 surface; every comparison above would
+    // then be software against software and prove nothing about D3D11VA.
+    // The verdict counts only when the decoder is still on D3D11VA.
+    if (hw.activeHw() != HwAccel::D3D11VA) {
+        SKIP("the d3d11va decoder fell back to " << hwAccelName(hw.activeHw())
+                                                 << " (get_format was offered no D3D11 surface for this stream), so "
+                                                 << compared << " comparisons were software against software");
+    }
+    WARN("d3d11va random access: decoded on " << hwAccelName(hw.activeHw()));
+    REQUIRE(hw.activeHw() == HwAccel::D3D11VA);
     REQUIRE(mismatched == 0);
 }
 
@@ -1190,6 +1211,845 @@ TEST_CASE("D3D11VA replay of a recorded LRF request order matches software", "[v
     reports[0].hardwareWorker = true;
     reports[0].activeHw = hwOpened.value().activeHw();
     judgeWorkers(reports, "replayed order");
+}
+
+// =============================================================================
+//  Observability: the log sink, fingerprints, damage flags, the shadow check
+// =============================================================================
+// Everything below runs on the CPU (software decoding only): it is what makes
+// a damaged proxy frame in a host session diagnosable - library and FFmpeg
+// messages that reach the host's log, a per-picture fingerprint, libavcodec's
+// own damage flags, and a software re-decode that names the first bad row.
+namespace {
+
+/// @brief Captures every osv::log message for its lifetime.
+///
+/// Installs itself as the library's sink at `level` and puts stderr and the
+/// previous level back on destruction.  The sink is called from FFmpeg's
+/// frame threads too, hence the mutex.
+class CapturedLog {
+public:
+    explicit CapturedLog(log::Level level) : m_previous(log::level()) {
+        log::setSink(&CapturedLog::sink, this);
+        log::setLevel(level);
+    }
+    ~CapturedLog() {
+        log::setSink(nullptr, nullptr);
+        log::setLevel(m_previous);
+    }
+    CapturedLog(const CapturedLog&) = delete;
+    CapturedLog& operator=(const CapturedLog&) = delete;
+
+    /// Every line captured so far, in arrival order.
+    [[nodiscard]] std::vector<std::string> lines() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_lines;
+    }
+    /// How many captured lines contain `needle`.
+    [[nodiscard]] std::size_t count(const std::string& needle) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return static_cast<std::size_t>(std::count_if(m_lines.begin(), m_lines.end(), [&](const std::string& l) {
+            return l.find(needle) != std::string::npos;
+        }));
+    }
+    /// The first captured line containing `needle` (empty when none).
+    [[nodiscard]] std::string first(const std::string& needle) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const std::string& l : m_lines) {
+            if (l.find(needle) != std::string::npos) {
+                return l;
+            }
+        }
+        return {};
+    }
+
+private:
+    static void sink(log::Level /*level*/, std::string_view text, void* user) {
+        auto* self = static_cast<CapturedLog*>(user);
+        if (self == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(self->m_mutex);
+        self->m_lines.emplace_back(text);
+    }
+
+    mutable std::mutex m_mutex;
+    std::vector<std::string> m_lines;
+    log::Level m_previous;
+};
+
+/// Set an environment variable for the lifetime of the object (the C
+/// runtime's copy, which std::getenv - and the library - read).
+class ScopedEnv {
+public:
+    ScopedEnv(const char* name, const char* value) : m_name(name) {
+        if (const char* old = std::getenv(name); old != nullptr) {
+            m_had = true;
+            m_old = old;
+        }
+        set(value);
+    }
+    ~ScopedEnv() { set(m_had ? m_old.c_str() : ""); }
+    ScopedEnv(const ScopedEnv&) = delete;
+    ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+private:
+    void set(const char* value) {
+#if defined(_WIN32)
+        ::_putenv_s(m_name.c_str(), value);  // "" removes the variable
+#else
+        if (value[0] == '\0') {
+            ::unsetenv(m_name.c_str());
+        } else {
+            ::setenv(m_name.c_str(), value, 1);
+        }
+#endif
+    }
+    std::string m_name;
+    std::string m_old;
+    bool m_had = false;
+};
+
+/// @brief A copy of an LRF in which ONE P picture is truncated.
+///
+/// The second half of the picture's slice NAL is zeroed in the copy, the way
+/// a recording damaged mid-picture looks to a decoder: the first rows decode
+/// as recorded, the rest come from libavcodec's concealment (pictures of
+/// earlier frames), and every later picture of the GOP predicts from that.
+/// The next sync sample heals it.
+struct DamagedLrf {
+    std::filesystem::path dir;      ///< A private temporary folder (removed by the test).
+    std::filesystem::path path;     ///< The damaged copy.
+    std::uint32_t damaged = 0;      ///< The truncated picture.
+    std::uint32_t sync = 0;         ///< Its GOP's sync sample.
+    std::uint32_t nextSync = 0;     ///< The next GOP's sync sample.
+};
+
+/// Build a DamagedLrf of `clean` in `<temp>/openosv-<tag>` (REQUIREs on the
+/// way: a clip this cannot damage is a broken fixture, not a skip).
+DamagedLrf makeDamagedLrf(const std::filesystem::path& clean, const std::string& tag) {
+    DamagedLrf out;
+    // ---- the sample table: a P picture with clean pictures around it ------------
+    auto file = OsvFile::open(clean);
+    REQUIRE(file.ok());
+    const TrackInfo* track = file.value().track(1);
+    REQUIRE(track != nullptr);
+    const std::vector<std::uint32_t>& syncs = track->samples.syncSamples();
+    REQUIRE(syncs.size() >= 2);
+    bool found = false;
+    for (std::size_t i = 0; i + 1 < syncs.size() && !found; ++i) {
+        // stss is 1-based in the file; syncSamples() holds 0-based indices
+        // (isSync agrees, checked below).  Six pictures of room: the damaged
+        // one at +3 has two clean predecessors and two damaged successors.
+        if (syncs[i + 1] >= syncs[i] + 6u) {
+            out.sync = syncs[i];
+            out.nextSync = syncs[i + 1];
+            out.damaged = syncs[i] + 3u;
+            found = true;
+        }
+    }
+    REQUIRE(found);
+    REQUIRE(track->samples.isSync(out.sync));
+    REQUIRE_FALSE(track->samples.isSync(out.damaged));
+
+    // ---- the bytes, with the damaged picture's last NAL half zeroed -----------
+    std::vector<char> bytes;
+    {
+        std::ifstream in(clean, std::ios::binary);
+        REQUIRE(in.good());
+        bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const std::uint64_t offset = track->samples.sampleOffset(out.damaged);
+    const std::uint32_t size = track->samples.sampleSize(out.damaged);
+    REQUIRE(size > 16u);
+    REQUIRE(offset + size <= bytes.size());
+    // Walk the 4-byte NAL length prefixes (the avcC of every camera LRF) to
+    // the last NAL, so no length prefix is ever touched.
+    std::uint64_t pos = offset;
+    std::uint64_t lastPayload = 0;
+    std::uint32_t lastLength = 0;
+    while (pos + 4u <= offset + size) {
+        const auto b = [&](std::uint64_t at) { return static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[at])); };
+        const std::uint32_t len = (b(pos) << 24) | (b(pos + 1) << 16) | (b(pos + 2) << 8) | b(pos + 3);
+        REQUIRE(len > 0u);
+        REQUIRE(pos + 4u + len <= offset + size);
+        lastPayload = pos + 4u;
+        lastLength = len;
+        pos += 4u + len;
+    }
+    REQUIRE(pos == offset + size);
+    REQUIRE(lastLength > 8u);
+    std::fill(bytes.begin() + static_cast<std::ptrdiff_t>(lastPayload + lastLength / 2u),
+              bytes.begin() + static_cast<std::ptrdiff_t>(lastPayload + lastLength), '\0');
+
+    // ---- written to a private folder ---------------------------------------------
+    std::error_code ec;
+    out.dir = std::filesystem::temp_directory_path(ec) / ("openosv-" + tag);
+    REQUIRE_FALSE(ec);
+    std::filesystem::remove_all(out.dir, ec);
+    std::filesystem::create_directories(out.dir, ec);
+    REQUIRE_FALSE(ec);
+    out.path = out.dir / ("damaged_" + clean.filename().string());
+    std::ofstream o(out.path, std::ios::binary | std::ios::trunc);
+    o.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    REQUIRE(o.good());
+    return out;
+}
+
+/// A software decoder of `path` the way the importer's software fallback
+/// opens one, with two frame threads (CPU-friendly) and the sample feed.
+Result<HevcStreamDecoder> openSoftware(const std::filesystem::path& path) {
+    DecoderOptions o;
+    o.hw = HwAccel::None;
+    o.threads = 2;
+    o.useContainerSamples = true;
+    return HevcStreamDecoder::open(path, 1, o);
+}
+
+/// A synthetic 4:2:0 frame owning its planes: planar 10-bit (bitShift 0), or
+/// P010-like (values << 6, Cb/Cr interleaved) carrying the same values.
+PlanarFrame16 syntheticFrame(std::uint32_t w, std::uint32_t h, bool p010,
+                             const std::function<std::uint16_t(int plane, std::uint32_t x, std::uint32_t y)>& value) {
+    PlanarFrame16 f;
+    f.width = w;
+    f.height = h;
+    f.chromaW = (w + 1) / 2;
+    f.chromaH = (h + 1) / 2;
+    f.bitDepth = 10;
+    f.bitShift = p010 ? 6 : 0;
+    f.chromaInterleaved = p010;
+    const std::size_t lumaElems = static_cast<std::size_t>(w) * h;
+    const std::size_t chromaRow = p010 ? static_cast<std::size_t>(f.chromaW) * 2u : f.chromaW;
+    const std::size_t chromaElems = chromaRow * f.chromaH;
+    auto buffer = std::make_shared<std::vector<std::uint16_t>>(lumaElems + (p010 ? chromaElems : 2u * chromaElems));
+    std::uint16_t* y = buffer->data();
+    std::uint16_t* cb = y + lumaElems;
+    std::uint16_t* cr = p010 ? cb + 1 : cb + chromaElems;
+    const int shift = f.bitShift;
+    for (std::uint32_t r = 0; r < h; ++r) {
+        for (std::uint32_t c = 0; c < w; ++c) {
+            y[static_cast<std::size_t>(r) * w + c] = static_cast<std::uint16_t>(value(0, c, r) << shift);
+        }
+    }
+    const std::size_t step = p010 ? 2u : 1u;
+    for (std::uint32_t r = 0; r < f.chromaH; ++r) {
+        for (std::uint32_t c = 0; c < f.chromaW; ++c) {
+            cb[r * chromaRow + c * step] = static_cast<std::uint16_t>(value(1, c, r) << shift);
+            cr[r * chromaRow + c * step] = static_cast<std::uint16_t>(value(2, c, r) << shift);
+        }
+    }
+    f.plane = {y, cb, cr};
+    f.strideElems = {w, chromaRow, chromaRow};
+    f.owner = std::static_pointer_cast<void>(buffer);
+    return f;
+}
+
+}  // namespace
+
+TEST_CASE("CRC-64/XZ matches its check value and the byte-wise form", "[video][crc]") {
+    // ---- the published check value of CRC-64/XZ ----------------------------------
+    const char* check = "123456789";
+    CHECK(osv::crc64(check, 9) == 0x995DC9BBDF1939FAull);
+    // ---- slicing by 8 against the tests' byte-at-a-time form, every tail length ---
+    std::vector<std::uint8_t> data(1031);
+    std::uint64_t state = 0x243F6A8885A308D3ull;
+    for (std::uint8_t& b : data) {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        b = static_cast<std::uint8_t>(state >> 56);
+    }
+    for (std::size_t n : {0u, 1u, 7u, 8u, 9u, 63u, 64u, 1031u}) {
+        Crc64 reference;
+        reference.update(data.data(), n);
+        INFO("length " << n);
+        CHECK(osv::crc64(data.data(), n) == (n == 0 ? 0u : reference.value()));
+    }
+    // ---- streaming: two blocks give the CRC of their concatenation -------------------
+    CHECK(osv::crc64(data.data() + 500, 531, osv::crc64(data.data(), 500)) == osv::crc64(data.data(), 1031));
+    // A null pointer with a size is refused without touching memory.
+    CHECK(osv::crc64(nullptr, 16, 42u) == 42u);
+}
+
+TEST_CASE("frameFingerprint is the same for planar and interleaved layouts of one picture", "[video][crc]") {
+    const auto value = [](int plane, std::uint32_t x, std::uint32_t y) {
+        return static_cast<std::uint16_t>((plane * 311 + x * 7 + y * 13) % 1024);
+    };
+    const PlanarFrame16 planar = syntheticFrame(64, 36, false, value);
+    const PlanarFrame16 p010 = syntheticFrame(64, 36, true, value);
+    REQUIRE(planar.valid());
+    REQUIRE(p010.valid());
+    const std::uint64_t a = frameFingerprint(planar);
+    CHECK(a != 0u);
+    // NV12 / P010 from a hardware decoder and yuv420p from software: one value.
+    CHECK(frameFingerprint(p010) == a);
+    // Row 8 is hashed (every 4th row), row 9 is not.
+    const PlanarFrame16 row8 = syntheticFrame(64, 36, false, [&](int plane, std::uint32_t x, std::uint32_t y) {
+        return static_cast<std::uint16_t>(value(plane, x, y) ^ ((plane == 0 && y == 8 && x == 5) ? 1u : 0u));
+    });
+    const PlanarFrame16 row9 = syntheticFrame(64, 36, false, [&](int plane, std::uint32_t x, std::uint32_t y) {
+        return static_cast<std::uint16_t>(value(plane, x, y) ^ ((plane == 0 && y == 9 && x == 5) ? 1u : 0u));
+    });
+    CHECK(frameFingerprint(row8) != a);
+    CHECK(frameFingerprint(row9) == a);
+    // A chroma change in a hashed chroma row counts too.
+    const PlanarFrame16 cr = syntheticFrame(64, 36, false, [&](int plane, std::uint32_t x, std::uint32_t y) {
+        return static_cast<std::uint16_t>(value(plane, x, y) ^ ((plane == 2 && y == 4 && x == 3) ? 2u : 0u));
+    });
+    CHECK(frameFingerprint(cr) != a);
+    // An invalid frame has no fingerprint.
+    CHECK(frameFingerprint(PlanarFrame16{}) == 0u);
+}
+
+TEST_CASE("compareDecodedLuma names the first bad row and the bottom half's share", "[video][verify]") {
+    const auto clean = [](int plane, std::uint32_t x, std::uint32_t y) {
+        return static_cast<std::uint16_t>(64 + (plane * 97 + x * 5 + y * 3) % 800);
+    };
+    const PlanarFrame16 a = syntheticFrame(64, 32, false, clean);
+    const PlanarFrame16 sameP010 = syntheticFrame(64, 32, true, clean);
+    // ---- identical content, different layouts: no difference ---------------------
+    const LumaComparison same = compareDecodedLuma(a, sameP010);
+    REQUIRE(same.comparable);
+    CHECK_FALSE(same.mismatch());
+    CHECK(std::isinf(same.psnrDb));
+    CHECK(same.badRows == 0u);
+    CHECK(same.firstBadRow == 32u);  // == height: none
+    // ---- rows 20..31 damaged: all twelve in the bottom half --------------------------
+    const PlanarFrame16 damaged = syntheticFrame(64, 32, false, [&](int plane, std::uint32_t x, std::uint32_t y) {
+        return plane == 0 && y >= 20 ? static_cast<std::uint16_t>(clean(plane, x, y) / 2) : clean(plane, x, y);
+    });
+    const LumaComparison bad = compareDecodedLuma(damaged, a);
+    REQUIRE(bad.comparable);
+    CHECK(bad.mismatch());
+    CHECK(bad.psnrDb < kDecodeMismatchPsnrDb);
+    CHECK(bad.firstBadRow == 20u);
+    CHECK(bad.lastBadRow == 31u);
+    CHECK(bad.badRows == 12u);
+    CHECK(bad.badRowsBottom == 12u);
+    // ---- different sizes, or an invalid frame: not comparable -------------------------
+    CHECK_FALSE(compareDecodedLuma(a, syntheticFrame(32, 32, false, clean)).comparable);
+    CHECK_FALSE(compareDecodedLuma(a, PlanarFrame16{}).comparable);
+    CHECK_FALSE(compareDecodedLuma(a, PlanarFrame16{}).mismatch());
+}
+
+TEST_CASE("a log sink receives the library's messages at the level set and never recurses", "[video][log]") {
+    // ---- delivered, at the level -------------------------------------------------------
+    {
+        CapturedLog captured(log::Level::Warn);
+        CHECK(log::enabled(log::Level::Warn));
+        CHECK_FALSE(log::enabled(log::Level::Info));
+        CHECK_FALSE(log::enabled(log::Level::Off));
+        log::warn("sink-marker {}", 7);
+        log::info("below-the-level {}", 8);
+        CHECK(captured.count("sink-marker 7") == 1u);
+        CHECK(captured.count("below-the-level") == 0u);
+        // The level is the sink's to follow: Debug lets debug lines through.
+        log::setLevel(log::Level::Debug);
+        CHECK(log::enabled(log::Level::Debug));
+        log::debug("debug-marker");
+        CHECK(captured.count("debug-marker") == 1u);
+    }
+    // ---- a sink that logs from inside itself: the nested line goes to stderr ----------
+    {
+        struct Recursing {
+            static void sink(log::Level, std::string_view text, void* user) {
+                auto* calls = static_cast<std::atomic<int>*>(user);
+                calls->fetch_add(1);
+                // Would recurse without end if osv::log re-entered the sink.
+                log::warn("nested inside the sink: {}", text);
+            }
+        };
+        std::atomic<int> calls{0};
+        const log::Level previous = log::level();
+        log::setLevel(log::Level::Warn);
+        log::setSink(&Recursing::sink, &calls);
+        log::warn("outer");
+        log::setSink(nullptr, nullptr);
+        log::setLevel(previous);
+        CHECK(calls.load() == 1);
+    }
+    // ---- removed: messages go back to stderr, the old sink sees nothing -------------
+    {
+        std::vector<std::string> seen;
+        {
+            CapturedLog captured(log::Level::Warn);
+            log::warn("while installed");
+            seen = captured.lines();
+        }
+        log::warn("after removal (stderr)");
+        CHECK(seen.size() == 1u);
+    }
+}
+
+TEST_CASE("a damaged LRF picture: FFmpeg's lines name the clip, the flags are reported, software serves it",
+          "[video][sample][verify]") {
+    OSV_REQUIRE_SAMPLE_LRF();
+    const DamagedLrf damaged = makeDamagedLrf(osvtest::sampleLrf(), "lrfverify-flags");
+    {
+        CapturedLog captured(log::Level::Warn);
+        auto opened = openSoftware(damaged.path);
+        REQUIRE(opened.ok());
+        HevcStreamDecoder& dec = opened.value();
+        // ---- the picture before the damage is clean ---------------------------------
+        auto before = dec.decodeFrame(damaged.damaged - 1u);
+        REQUIRE(before.ok());
+        REQUIRE(dec.lastFrameInfo().has_value());
+        CHECK(dec.lastFrameInfo()->decodeErrorFlags == 0);
+        CHECK_FALSE(dec.lastFrameInfo()->corrupt);
+        CHECK(dec.lastFrameInfo()->hw == HwAccel::None);
+        CHECK(dec.lastFrameInfo()->surface == -1);
+        CHECK(dec.lastFrameInfo()->gopDamagedAt == -1);
+        // ---- the damaged one: still served (software has no fallback), flagged --------
+        auto hit = dec.decodeFrame(damaged.damaged);
+        REQUIRE(hit.ok());
+        const std::optional<DecodedFrameInfo> info = dec.lastFrameInfo();
+        REQUIRE(info.has_value());
+        CHECK(info->index == damaged.damaged);
+        CHECK_FALSE(info->keyFrame);
+        WARN("damaged frame " << damaged.damaged << ": decode_error_flags 0x" << std::hex << info->decodeErrorFlags
+                              << std::dec << ", corrupt " << info->corrupt);
+        CHECK((info->decodeErrorFlags != 0 || info->corrupt));
+        CHECK(info->gopDamagedAt == static_cast<std::int64_t>(damaged.damaged));
+        CHECK(captured.count("decoded with damage") >= 1u);
+        // ---- the next picture predicts from it: damaged without its own flag --------
+        auto after = dec.decodeFrame(damaged.damaged + 1u);
+        REQUIRE(after.ok());
+        REQUIRE(dec.lastFrameInfo().has_value());
+        CHECK(dec.lastFrameInfo()->gopDamagedAt == static_cast<std::int64_t>(damaged.damaged));
+        // ---- and so does a fresh random access to a later picture of the GOP --------
+        // (the damaged picture is decoded on the way, as a catch-up picture).
+        auto fresh = openSoftware(damaged.path);
+        REQUIRE(fresh.ok());
+        auto later = fresh.value().decodeFrame(damaged.damaged + 2u);
+        REQUIRE(later.ok());
+        REQUIRE(fresh.value().lastFrameInfo().has_value());
+        CHECK(fresh.value().lastFrameInfo()->gopDamagedAt == static_cast<std::int64_t>(damaged.damaged));
+        // ---- FFmpeg said so too, and every line names the clip -----------------------
+        const std::string tag = "ffmpeg: [h264 'damaged_" + osvtest::sampleLrf().filename().string() + "']";
+        const std::vector<std::string> lines = captured.lines();
+        std::size_t ffmpeg = 0;
+        std::size_t tagged = 0;
+        for (const std::string& l : lines) {
+            if (l.rfind("ffmpeg: ", 0) == 0) {
+                ++ffmpeg;
+                tagged += l.rfind(tag, 0) == 0 ? 1u : 0u;
+            }
+        }
+        INFO("first ffmpeg line: " << captured.first("ffmpeg: "));
+        CHECK(ffmpeg >= 1u);
+        CHECK(tagged == ffmpeg);
+        // ---- the next GOP is whole again ---------------------------------------------
+        auto healed = dec.decodeFrame(damaged.nextSync);
+        REQUIRE(healed.ok());
+        CHECK(dec.lastFrameInfo()->decodeErrorFlags == 0);
+        CHECK(dec.lastFrameInfo()->keyFrame);
+        CHECK(dec.lastFrameInfo()->gopDamagedAt == -1);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(damaged.dir, ec);
+}
+
+TEST_CASE("the shadow verifier names the first bad row, dumps the planes and hands back the software picture",
+          "[video][sample][verify]") {
+    OSV_REQUIRE_SAMPLE_LRF();
+    // The primary decodes the DAMAGED copy (standing in for a hardware decoder
+    // that returned a wrong picture); the verifier's reference decodes the
+    // clean file, as it decodes the reader's own file in production.
+    const DamagedLrf damaged = makeDamagedLrf(osvtest::sampleLrf(), "lrfverify-shadow");
+    const std::filesystem::path dumps = damaged.dir / "decode-mismatch";
+    {
+        CapturedLog captured(log::Level::Warn);
+        auto primaryOpened = openSoftware(damaged.path);
+        REQUIRE(primaryOpened.ok());
+        HevcStreamDecoder& primary = primaryOpened.value();
+        DecoderOptions primaryOptions;
+        primaryOptions.useContainerSamples = true;
+        auto verifierOpened = ShadowDecodeVerifier::open(osvtest::sampleLrf(), 1, primaryOptions, dumps);
+        REQUIRE(verifierOpened.ok());
+        ShadowDecodeVerifier& verifier = verifierOpened.value();
+        REQUIRE(verifier.isOpen());
+        auto clean = openSoftware(osvtest::sampleLrf());
+        REQUIRE(clean.ok());
+        const std::string clip = "verify-test.LRF";
+
+        // ---- a clean picture: nothing to replace ---------------------------------------
+        {
+            auto p = primary.decodeFrame(damaged.damaged - 1u);
+            REQUIRE(p.ok());
+            auto v = verifier.check(damaged.damaged - 1u, p.value(), primary.lastFrameInfo(),
+                                    primary.previousSyncIndex(damaged.damaged - 1u), clip);
+            REQUIRE(v.ok());
+            CHECK(v.value().comparison.comparable);
+            CHECK_FALSE(v.value().comparison.mismatch());
+            CHECK_FALSE(v.value().replacement.has_value());
+        }
+        // ---- the damaged picture: named, dumped, replaced ------------------------------
+        {
+            auto p = primary.decodeFrame(damaged.damaged);
+            REQUIRE(p.ok());
+            auto v = verifier.check(damaged.damaged, p.value(), primary.lastFrameInfo(),
+                                    primary.previousSyncIndex(damaged.damaged), clip);
+            REQUIRE(v.ok());
+            const LumaComparison& c = v.value().comparison;
+            WARN("damaged frame " << damaged.damaged << ": PSNR " << c.psnrDb << " dB, first bad row "
+                                  << c.firstBadRow << ", last " << c.lastBadRow << ", " << c.badRows << " bad rows ("
+                                  << c.badRowsBottom << " in the bottom half) of " << c.height);
+            CHECK(c.mismatch());
+            CHECK(c.badRows > 0u);
+            CHECK(c.firstBadRow < c.height);
+            CHECK(c.badRowsBottom > 0u);
+            // The software picture comes back, and it IS the clean picture.
+            REQUIRE(v.value().replacement.has_value());
+            auto reference = clean.value().decodeFrame(damaged.damaged);
+            REQUIRE(reference.ok());
+            CHECK(std::isinf(compareDecodedLuma(*v.value().replacement, reference.value()).psnrDb));
+            CHECK(frameFingerprint(*v.value().replacement) == frameFingerprint(reference.value()));
+            // Both luma planes on disk, as 16-bit PGMs of the right size.
+            REQUIRE_FALSE(v.value().dumpedPrimary.empty());
+            REQUIRE_FALSE(v.value().dumpedReference.empty());
+            const std::uintmax_t pixels = static_cast<std::uintmax_t>(p.value().width) * p.value().height;
+            CHECK(std::filesystem::file_size(v.value().dumpedPrimary) > pixels * 2u);
+            CHECK(std::filesystem::file_size(v.value().dumpedReference) > pixels * 2u);
+            // The warning says where and how far into the GOP.
+            const std::string warning = captured.first("differs from software");
+            INFO(warning);
+            CHECK(warning.find("frame " + std::to_string(damaged.damaged) + " (sync " +
+                               std::to_string(damaged.sync) + " + 3)") != std::string::npos);
+            CHECK(warning.find("first bad row " + std::to_string(c.firstBadRow)) != std::string::npos);
+            CHECK(warning.find("serving the software picture") != std::string::npos);
+            // The reference decoded the CLEAN file: the line blames the primary.
+            CHECK(warning.find("the software decode is clean") != std::string::npos);
+        }
+        // ---- the rest of the GOP predicts from it; only its onset is dumped ----------
+        {
+            auto p = primary.decodeFrame(damaged.damaged + 1u);
+            REQUIRE(p.ok());
+            auto v = verifier.check(damaged.damaged + 1u, p.value(), primary.lastFrameInfo(),
+                                    primary.previousSyncIndex(damaged.damaged + 1u), clip);
+            REQUIRE(v.ok());
+            CHECK(v.value().comparison.mismatch());
+            CHECK(v.value().replacement.has_value());
+            CHECK(v.value().dumpedPrimary.empty());
+        }
+        // ---- the next GOP: clean again -------------------------------------------------
+        {
+            auto p = primary.decodeFrame(damaged.nextSync);
+            REQUIRE(p.ok());
+            auto v = verifier.check(damaged.nextSync, p.value(), primary.lastFrameInfo(),
+                                    primary.previousSyncIndex(damaged.nextSync), clip);
+            REQUIRE(v.ok());
+            CHECK_FALSE(v.value().comparison.mismatch());
+        }
+        CHECK(verifier.checked() == 4u);
+        CHECK(verifier.mismatched() == 2u);
+    }
+    // ---- a reference that decodes a DAMAGED recording says so -----------------------------
+    // In production the reference decodes the reader's own file.  When that
+    // file is damaged, a mismatch is two decoders concealing differently, not
+    // a hardware fault - also for a picture that is only PREDICTED from the
+    // damaged one and carries no flag of its own.  Roles swapped here: the
+    // primary is the clean decode, the reference the damaged file.
+    {
+        CapturedLog captured(log::Level::Warn);
+        auto primaryOpened = openSoftware(osvtest::sampleLrf());
+        REQUIRE(primaryOpened.ok());
+        DecoderOptions primaryOptions;
+        primaryOptions.useContainerSamples = true;
+        auto verifierOpened = ShadowDecodeVerifier::open(damaged.path, 1, primaryOptions, std::filesystem::path());
+        REQUIRE(verifierOpened.ok());
+        const std::uint32_t index = damaged.damaged + 1u;
+        auto p = primaryOpened.value().decodeFrame(index);
+        REQUIRE(p.ok());
+        auto v = verifierOpened.value().check(index, p.value(), primaryOpened.value().lastFrameInfo(),
+                                             primaryOpened.value().previousSyncIndex(index), "verify-test.LRF");
+        REQUIRE(v.ok());
+        CHECK(v.value().comparison.mismatch());
+        // No dump folder given: nothing written.
+        CHECK(v.value().dumpedPrimary.empty());
+        const std::string warning = captured.first("differs from software");
+        INFO(warning);
+        CHECK(warning.find("the software decode saw damage too, at frame " + std::to_string(damaged.damaged)) !=
+              std::string::npos);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(damaged.dir, ec);
+}
+
+TEST_CASE("the shadow verifier dumps into, and names, a folder the ANSI code page cannot spell",
+          "[video][sample][verify]") {
+    OSV_REQUIRE_SAMPLE_LRF();
+    // A user profile (the dump folder sits under %LOCALAPPDATA%) or a clip
+    // name outside the ANSI code page - Greek or CJK on a Western Windows -
+    // made path::string() throw inside the mismatch warning.  The reader's
+    // catch then lost the software replacement and delivered the hardware
+    // picture.  The folder here holds characters no single-byte code page
+    // has, so on such a system the old conversion throws.
+    const DamagedLrf damaged = makeDamagedLrf(osvtest::sampleLrf(), "lrfverify-unicode");
+    const std::filesystem::path dumps = damaged.dir / std::filesystem::path(u8"decode-mismatch-Ω日本");
+    {
+        CapturedLog captured(log::Level::Warn);
+        auto primaryOpened = openSoftware(damaged.path);
+        REQUIRE(primaryOpened.ok());
+        HevcStreamDecoder& primary = primaryOpened.value();
+        DecoderOptions primaryOptions;
+        primaryOptions.useContainerSamples = true;
+        auto verifierOpened = ShadowDecodeVerifier::open(osvtest::sampleLrf(), 1, primaryOptions, dumps);
+        REQUIRE(verifierOpened.ok());
+
+        // ---- the damaged picture: compared, replaced, dumped, named ---------------------
+        auto p = primary.decodeFrame(damaged.damaged);
+        REQUIRE(p.ok());
+        auto v = verifierOpened.value().check(damaged.damaged, p.value(), primary.lastFrameInfo(),
+                                              primary.previousSyncIndex(damaged.damaged), "verify-unicode.LRF");
+        REQUIRE(v.ok());
+        CHECK(v.value().comparison.mismatch());
+        // The software picture still comes back: nothing was lost to the path.
+        CHECK(v.value().replacement.has_value());
+        // Both planes went into the folder (the session's dump budget is
+        // far from spent by this binary's two dumping tests).
+        REQUIRE_FALSE(v.value().dumpedPrimary.empty());
+        REQUIRE_FALSE(v.value().dumpedReference.empty());
+        std::error_code exists;
+        CHECK(std::filesystem::exists(v.value().dumpedPrimary, exists));
+        CHECK(std::filesystem::exists(v.value().dumpedReference, exists));
+        CHECK(v.value().dumpedPrimary.parent_path() == dumps);
+        // The warning says where (its non-ASCII bytes made safe for a console).
+        const std::string warning = captured.first("differs from software");
+        INFO(warning);
+        CHECK(warning.find("serving the software picture") != std::string::npos);
+        CHECK(warning.find("luma planes dumped to ") != std::string::npos);
+        CHECK(warning.find("decode-mismatch-") != std::string::npos);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(damaged.dir, ec);
+}
+
+TEST_CASE("the reader's shadow check never runs on a software picture", "[video][sample][verify]") {
+    OSV_REQUIRE_SAMPLE_LRF();
+    // OPENOSV_VERIFY_HW_DECODE asks for the check, but a software primary has
+    // nothing independent to be compared with: the verifier never opens.
+    ScopedEnv verify("OPENOSV_VERIFY_HW_DECODE", "1");
+    DecoderOptions o;
+    o.hw = HwAccel::None;
+    o.threads = 2;
+    o.useContainerSamples = true;
+    auto reader = DualStreamReader::open(osvtest::sampleLrf(), proxyFormat(), o);
+    REQUIRE(reader.ok());
+    for (const std::uint32_t i : {0u, 1u, 5u}) {
+        auto pair = reader.value().read(i);
+        REQUIRE(pair.ok());
+    }
+    CHECK(reader.value().verifiedFrames() == 0u);
+    CHECK(reader.value().verifyMismatches() == 0u);
+}
+
+TEST_CASE("the decoder's Debug line carries the picture's fingerprint", "[video][sample][log]") {
+    OSV_REQUIRE_SAMPLE_LRF();
+    CapturedLog captured(log::Level::Debug);
+    auto opened = openSoftware(osvtest::sampleLrf());
+    REQUIRE(opened.ok());
+    auto frame = opened.value().decodeFrame(3);
+    REQUIRE(frame.ok());
+    char crc[17] = {};
+    std::snprintf(crc, sizeof(crc), "%016llx", static_cast<unsigned long long>(frameFingerprint(frame.value())));
+    const std::string line = captured.first("decode: track 1 frame 3 ");
+    INFO(line);
+    CHECK(line.find(std::string("crc ") + crc + " hw none key 0") != std::string::npos);
+    CHECK(line.find("'" + osvtest::sampleLrf().filename().string() + "'") != std::string::npos);
+    // The open itself is at Debug too, and now reaches a sink.
+    CHECK(captured.count("video: opened track 1 of ") == 1u);
+}
+
+TEST_CASE("a demuxer's FFmpeg lines name the clip they are about", "[video][sample][log]") {
+    OSV_REQUIRE_SAMPLE_LRF();
+    // A codec context names its clip through our tag in `opaque`; a format
+    // context has no such slot, but it keeps the name it was opened with.
+    // Without the clip, demuxer warnings ("stream 0, timescale not set") could
+    // not be told apart between clips, and their once-per-clip throttle in the
+    // plug-in logs was really once per module.  The libavformat feed (no
+    // container samples) opens the mov demuxer on the clip.
+    CapturedLog captured(log::Level::Warn);
+    DecoderOptions o;
+    o.hw = HwAccel::None;
+    o.threads = 2;
+    o.useContainerSamples = false;
+    auto opened = HevcStreamDecoder::open(osvtest::sampleLrf(), 1, o);
+    REQUIRE(opened.ok());
+    auto frame = opened.value().decodeFrame(0);
+    REQUIRE(frame.ok());
+
+    // ---- every demuxer line carries the clip ------------------------------------------
+    const std::string demuxer = "ffmpeg: [mov,mp4,m4a,3gp,3g2,mj2";
+    const std::string tagged = demuxer + " '" + osvtest::sampleLrf().filename().string() + "'] ";
+    std::size_t lines = 0;
+    std::size_t named = 0;
+    for (const std::string& l : captured.lines()) {
+        if (l.rfind(demuxer, 0) == 0) {
+            ++lines;
+            named += l.rfind(tagged, 0) == 0 ? 1u : 0u;
+        }
+    }
+    INFO("first demuxer line: " << captured.first(demuxer));
+    if (lines == 0u) {
+        SKIP("the demuxer reported nothing about this clip at WARNING");
+    }
+    CHECK(named == lines);
+}
+
+TEST_CASE("a refused parallax measurement's consistent share is rebuilt exactly from its cell counts",
+          "[verify][parallax]") {
+    // The importer's per-bucket refusal line reports the share of consistent
+    // flow, but a refusal returns an Error, not the grid that held it.  It is
+    // rebuilt from what parallaxFromBands hands out on the side: the sum of
+    // the per-cell consistent pixel counts over the band pixels both lenses
+    // cover.  That must be EXACTLY the grid's own consistentFraction(), which
+    // an accepted measurement lets this test compare.
+    constexpr std::uint32_t kW = 1024;
+    constexpr std::uint32_t kH = 64;
+    render::LensBands bands;
+    bands.w = kW;
+    bands.h = kH;
+    bands.mapH = 1024;
+    bands.rowOffset = (bands.mapH - kH) / 2u;
+    const std::size_t n = static_cast<std::size_t>(kW) * kH;
+    for (int lens = 0; lens < 2; ++lens) {
+        bands.luma[lens].assign(n, 0.0f);
+        bands.alpha[lens].assign(n, 1.0f);
+    }
+    // Smooth texture (sums of incommensurate sines) the classical solver can
+    // lock onto; lens 1 sees it two columns further on - a pure parallax.
+    const auto texture = [](double x, double y) {
+        return static_cast<float>(0.5 + 0.18 * std::sin(x * 0.21 + y * 0.07) + 0.12 * std::sin(x * 0.053 - y * 0.31) +
+                                  0.08 * std::sin((x + y) * 0.137));
+    };
+    for (std::uint32_t y = 0; y < kH; ++y) {
+        for (std::uint32_t x = 0; x < kW; ++x) {
+            const std::size_t i = static_cast<std::size_t>(y) * kW + x;
+            bands.luma[0][i] = texture(x, y);
+            bands.luma[1][i] = texture(static_cast<double>(x) + 2.0, y);
+            // A stretch only one lens covers, so co-visible != all pixels.
+            if (x < 96) {
+                bands.alpha[1][i] = 0.0f;
+            }
+        }
+    }
+    render::ParallaxWarpParams params;
+    params.backend = render::FlowBackendKind::Classical;
+    render::ParallaxCellStats cells;
+    auto grid = render::parallaxFromBands(bands, params, nullptr, 0.0, &cells);
+    INFO((grid.ok() ? std::string("accepted") : grid.error().message));
+    REQUIRE(grid.ok());
+    REQUIRE(cells.valid());
+    // ---- the rebuild, as the importer does it -----------------------------------------
+    std::uint64_t covisible = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        covisible += (bands.alpha[0][i] > 0.5f && bands.alpha[1][i] > 0.5f) ? 1u : 0u;
+    }
+    std::uint64_t consistent = 0;
+    for (const std::uint32_t p : cells.pixels) {
+        consistent += p;
+    }
+    CHECK(covisible == grid.value().totalPixels);
+    CHECK(consistent == grid.value().consistentPixels);
+    CHECK(static_cast<double>(consistent) / static_cast<double>(covisible) == grid.value().consistentFraction());
+    CHECK(covisible < n);  // the one-lens stretch really was left out
+}
+
+// -----------------------------------------------------------------------------
+//  Software fingerprints for a host session's log (hidden, CPU only)
+// -----------------------------------------------------------------------------
+// The importer at Debug writes 'decode: track 1 frame N crc C hw H ...' for
+// every picture it decodes.  This prints the SOFTWARE fingerprint of the same
+// frames in the same format, so the two can be lined up frame by frame: a
+// frame whose hardware CRC differs from this one was decoded wrong.
+//   OSV_SEEK_LRF=<clip> OSV_CRC_FRAMES=<first>-<last> osv_tests "[.lrfcrc]"
+// (or OSV_SEEK_SEQUENCE=<file of indices>).  Software decoding only.
+TEST_CASE("software fingerprints of an LRF, for lining up with a session log", "[video][.lrfcrc]") {
+    const std::filesystem::path path = stressLrfPath();
+    if (!std::filesystem::exists(path)) {
+        SKIP("LRF not available: " << path.string());
+    }
+    // ---- which frames ---------------------------------------------------------------
+    std::vector<std::uint32_t> order;
+    if (const char* range = std::getenv("OSV_CRC_FRAMES"); range != nullptr && *range != '\0') {
+        unsigned long long a = 0;
+        unsigned long long b = 0;
+        char dash = 0;
+        std::istringstream in(range);
+        REQUIRE(static_cast<bool>(in >> a >> dash >> b));
+        REQUIRE(dash == '-');
+        REQUIRE(a <= b);
+        REQUIRE(b - a < 100000u);
+        for (unsigned long long i = a; i <= b; ++i) {
+            order.push_back(static_cast<std::uint32_t>(i));
+        }
+    } else if (const char* seq = std::getenv("OSV_SEEK_SEQUENCE"); seq != nullptr && *seq != '\0') {
+        std::ifstream in(seq);
+        REQUIRE(in.good());
+        long long v = 0;
+        while (in >> v) {
+            if (v >= 0) {
+                order.push_back(static_cast<std::uint32_t>(v));
+            }
+        }
+    } else {
+        for (std::uint32_t i = 0; i < 30u; ++i) {
+            order.push_back(i);
+        }
+    }
+    // ---- decode and print ------------------------------------------------------------
+    // The decode and the fingerprint are timed too: what the software path
+    // (OPENOSV_IMPORTER_LRF_SOFTWARE, the shadow check's reference) and the
+    // Debug 'decode:' line cost per picture on this machine.
+    using Clock = std::chrono::steady_clock;
+    // OSV_CRC_THREADS: the decoder's frame threads (default 2, the shadow
+    // check's reference; 0 = libavcodec's own count, the importer's software
+    // reader).  Bit-exact streams decode identically either way; a DAMAGED
+    // picture's concealment need not, which is worth being able to see.
+    DecoderOptions crcOptions;
+    crcOptions.hw = HwAccel::None;
+    crcOptions.threads = 2;
+    crcOptions.useContainerSamples = true;
+    if (const char* t = std::getenv("OSV_CRC_THREADS"); t != nullptr && *t != '\0') {
+        crcOptions.threads = std::clamp(std::atoi(t), 0, 64);
+    }
+    auto opened = HevcStreamDecoder::open(path, 1, crcOptions);
+    REQUIRE(opened.ok());
+    HevcStreamDecoder& dec = opened.value();
+    const std::string clip = path.filename().string();
+    int printed = 0;
+    double decodeMs = 0.0;
+    double fingerprintMs = 0.0;
+    for (const std::uint32_t index : order) {
+        if (index >= dec.frameCount()) {
+            continue;
+        }
+        const auto t0 = Clock::now();
+        auto f = dec.decodeFrame(index);
+        const auto t1 = Clock::now();
+        REQUIRE(f.ok());
+        const std::uint64_t crc = frameFingerprint(f.value());
+        const auto t2 = Clock::now();
+        decodeMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        fingerprintMs += std::chrono::duration<double, std::milli>(t2 - t1).count();
+        const std::optional<DecodedFrameInfo> info = dec.lastFrameInfo();
+        std::printf("decode: track 1 frame %u crc %016llx hw none key %d '%s'\n", index,
+                    static_cast<unsigned long long>(crc), (info && info->keyFrame) ? 1 : 0, clip.c_str());
+        ++printed;
+    }
+    REQUIRE(printed > 0);
+    // ---- the CRC's own throughput (a 32 MiB buffer: one 2048x1024 32f frame) -------
+    std::vector<std::uint8_t> block(32u << 20);
+    for (std::size_t i = 0; i < block.size(); ++i) {
+        block[i] = static_cast<std::uint8_t>(i * 2654435761u >> 24);
+    }
+    const auto c0 = Clock::now();
+    const std::uint64_t blockCrc = osv::crc64(block.data(), block.size());
+    const double crcMs = std::chrono::duration<double, std::milli>(Clock::now() - c0).count();
+    std::printf("timing: %d pictures %ux%u, software decode %.2f ms/picture (%d threads, this order), fingerprint "
+                "%.3f ms/picture, crc64 %.2f GB/s (crc %016llx)\n",
+                printed, dec.width(), dec.height(), decodeMs / printed, crcOptions.threads, fingerprintMs / printed,
+                crcMs > 0.0 ? static_cast<double>(block.size()) / (crcMs * 1.0e6) : 0.0,
+                static_cast<unsigned long long>(blockCrc));
+    std::fflush(stdout);
 }
 
 TEST_CASE("CUDA decode matches software within 50 dB", "[video][sample][hwaccel][cuda]") {

@@ -22,6 +22,13 @@
 // their first log line and shutdown() from imShutdown / effect global
 // setdown.  Logging before init() (or after shutdown()) still reaches
 // OutputDebugStringW.
+//
+// init() also makes this log the library's (osv::log::setSink): every
+// message of the OpenOSV library, FFmpeg's included, lands in the plug-in's
+// file at PluginLog's level, and setLevel() keeps the two levels equal.
+// FFmpeg lines are kept to warnings and errors, each shape once per clip
+// (PluginLogSink.h).  A host that never calls init() - osvtool - keeps the
+// library on its own console.
 #pragma once
 
 #include <format>

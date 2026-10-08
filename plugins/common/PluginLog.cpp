@@ -2,6 +2,7 @@
 // Copyright 2026 The OpenOSV Contributors
 
 #include "PluginLog.h"
+#include "PluginLogSink.h"  // the library's log, routed into this one
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -173,6 +174,11 @@ void rotateLocked(LogState& s) noexcept {
 // -----------------------------------------------------------------------------
 bool PluginLog::init(std::wstring_view pluginName) noexcept {
     applyEnvironmentLevel();
+    // Every library message - FFmpeg's included - from now on reaches this
+    // log instead of a stderr nobody reads inside a host, at this log's
+    // level (PluginLogSink.h).  Before the file opens on purpose: even when
+    // it cannot, the debugger copy is still better than stderr.
+    detail::installLibrarySink();
     LogState& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
 
@@ -218,6 +224,8 @@ void PluginLog::shutdown() noexcept {
 void PluginLog::setLevel(Level level) noexcept {
     g_levelInitialised.store(true);
     g_level.store(static_cast<int>(level));
+    // The library follows, once init() made this log its destination.
+    detail::mirrorLibraryLevel(level);
 }
 
 PluginLog::Level PluginLog::level() noexcept {

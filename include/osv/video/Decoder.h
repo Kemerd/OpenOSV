@@ -84,6 +84,47 @@ struct DecoderOpenTimings {
     bool firstFrameDeferred = false; ///< True when open() skipped the frame-0 decode (DecoderOptions::deferFirstFrame).
 };
 
+/// @brief What libavcodec said about one decoded picture.
+///
+/// Recorded for the picture decodeFrame() handed out last (or refused last:
+/// a hardware picture libavcodec flagged as damaged is refused, see
+/// decodeFrame()), so a caller that suspects the picture - the LRF shadow
+/// verifier in DualStreamReader - can name exactly what the decoder knew.
+struct DecodedFrameInfo {
+    std::uint32_t index = 0;        ///< Frame (sample) index of the picture.
+    HwAccel hw = HwAccel::None;     ///< The path that decoded it (activeHw() at that moment).
+    bool keyFrame = false;          ///< AV_FRAME_FLAG_KEY: an intra random access picture.
+    bool corrupt = false;           ///< AV_FRAME_FLAG_CORRUPT: libavcodec marked the picture as possibly damaged.
+    int decodeErrorFlags = 0;       ///< AVFrame::decode_error_flags (FF_DECODE_ERROR_* bits; 0 = clean).
+    /// D3D11VA only: the texture-array slice the picture was decoded into
+    /// (AVFrame::data[1] of an AV_PIX_FMT_D3D11 frame), so two reports that
+    /// name the same surface can be told apart from two that do not.  -1 on
+    /// every other path.
+    std::int64_t surface = -1;
+    /// The first picture since the last key frame - this one included - that
+    /// libavcodec flagged as damaged, catch-up pictures counted; -1 when none.
+    /// A picture predicted from a damaged one carries its damage WITHOUT being
+    /// flagged itself, so this, not the picture's own flags, says whether the
+    /// recording is damaged up to here.
+    std::int64_t gopDamagedAt = -1;
+};
+
+/// @brief Content fingerprint of a decoded picture, for per-frame log lines.
+///
+/// CRC-64/XZ (osv/core/Crc64.h) over every 4th row of luma, then every 4th
+/// row of Cb, then of Cr, each sample brought to the frame's bitDepth scale
+/// (sample >> bitShift) and hashed as 16-bit little-endian.  Brought to one
+/// layout like that, a D3D11VA picture (NV12, interleaved chroma) and a
+/// software one (yuv420p, planar) of the same content fingerprint
+/// identically, so a host session's "decode:" lines can be compared with an
+/// offline software decode of the same frames.  Every 4th row still catches
+/// any block-sized damage (16-pixel macroblocks span 16 rows) at a quarter of
+/// the cost of hashing the whole picture.
+///
+/// @param frame  A host-memory picture (PlanarFrame16::valid()).
+/// @return The fingerprint, or 0 for an invalid frame.
+[[nodiscard]] std::uint64_t frameFingerprint(const PlanarFrame16& frame) noexcept;
+
 class HevcStreamDecoder {
 public:
     /// An unopened decoder; every accessor reports zero / empty and every
@@ -154,10 +195,18 @@ public:
     /// Decode frame `index` (frame accurate).  Sequential requests decode
     /// forward without seeking; anything else seeks to the previous sync
     /// sample first.  Errors: InvalidArgument (index out of range),
-    /// Decoder (libavcodec failure), Timing (the stream produced a
-    /// presentation time past the request - a property of the file that
-    /// every decoder reproduces, never a reason to leave hardware decoding).
+    /// Decoder (libavcodec failure, or a HARDWARE picture libavcodec flagged
+    /// as damaged - decode_error_flags or AV_FRAME_FLAG_CORRUPT - which a
+    /// caller with a software fallback should decode again there), Timing
+    /// (the stream produced a presentation time past the request - a
+    /// property of the file that every decoder reproduces, never a reason to
+    /// leave hardware decoding).  A flagged SOFTWARE picture is still
+    /// returned, with a warning: there is no better decoder to ask.
     Result<PlanarFrame16> decodeFrame(std::uint32_t index);
+
+    /// What libavcodec reported about the last picture decodeFrame() / next()
+    /// returned or refused; std::nullopt before the first one.
+    [[nodiscard]] std::optional<DecodedFrameInfo> lastFrameInfo() const noexcept;
 
     /// Decode the next frame in presentation order (after open() or seek()
     /// that is frame 0 / the seek target).  Returns NotFound past the end.

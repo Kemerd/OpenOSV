@@ -22,6 +22,7 @@
 // several host processes write to one file.
 
 #include "PluginLog.h"
+#include "PluginLogSink.h"  // the library's log, routed into this one
 
 #include <atomic>
 #include <cerrno>
@@ -239,6 +240,8 @@ void rotateLocked(LogState& s) noexcept {
 // -----------------------------------------------------------------------------
 bool PluginLog::init(std::wstring_view pluginName) noexcept {
     applyEnvironmentLevel();
+    // The library's messages from now on, as on Windows (PluginLogSink.h).
+    detail::installLibrarySink();
     try {
         LogState& s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
@@ -291,6 +294,8 @@ void PluginLog::shutdown() noexcept {
 void PluginLog::setLevel(Level level) noexcept {
     g_levelInitialised.store(true);
     g_level.store(static_cast<int>(level));
+    // The library follows, once init() made this log its destination.
+    detail::mirrorLibraryLevel(level);
 }
 
 PluginLog::Level PluginLog::level() noexcept {

@@ -12,15 +12,374 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <exception>
+#include <format>
+#include <fstream>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace osv::video {
+
+// =============================================================================
+//  Helpers
+// =============================================================================
+namespace {
+
+/// @brief True when the environment variable `name` is an explicit yes.
+///
+/// "1", "true", "yes" or "on" in any case, as the importer's own switches
+/// read them (importerGpuDecodeDisabledByEnvironment): anything else - unset,
+/// "0", garbage - is no, so a stray value never turns a diagnostic on.
+/// std::getenv reads the C runtime's copy, which the plug-ins share with the
+/// host process (/MD) and which _putenv_s in a test updates.
+[[nodiscard]] bool environmentSwitchOn(const char* name) noexcept {
+    if (name == nullptr) {
+        return false;
+    }
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    const char c = value[0];
+    const char d = value[1];
+    return c == '1' || c == 't' || c == 'T' || c == 'y' || c == 'Y' ||
+           ((c == 'o' || c == 'O') && (d == 'n' || d == 'N'));
+}
+
+/// @brief A path as UTF-8 text for a log line or an error message.
+///
+/// path::string() converts through the ANSI code page on Windows and throws
+/// on a character it cannot map - a non-ASCII user profile under
+/// %LOCALAPPDATA%, a renamed clip.  Inside the verifier that exception would
+/// be swallowed by verifyAgainstSoftware()'s catch, silently skipping the
+/// check or, after a mismatch, losing the software replacement.  The UTF-8
+/// form exists for every path; "?" only when even that cannot be built.
+[[nodiscard]] std::string pathText(const std::filesystem::path& p) noexcept {
+    try {
+        const std::u8string text = p.u8string();
+        return std::string(text.begin(), text.end());
+    } catch (...) {
+        return "?";
+    }
+}
+
+/// Mismatch dump pairs written by every verifier of this module so far.  The
+/// cap (ShadowDecodeVerifier::kMaxDumps) bounds the dump folder for the whole
+/// session: a reader that is reopened (a pool miss, a new instance of the
+/// clip) gets a new verifier, and a per-verifier count would start again.
+std::atomic<std::uint32_t> g_dumpPairsWritten{0};
+
+/// @brief Make a clip name usable in a file name: [A-Za-z0-9._-] kept, the
+/// rest replaced by '_', at most 80 characters.
+[[nodiscard]] std::string fileSafeName(std::string_view name) {
+    std::string out;
+    out.reserve(std::min<std::size_t>(name.size(), 80u));
+    for (const char ch : name) {
+        if (out.size() >= 80u) {
+            break;
+        }
+        const bool keep = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+                          ch == '.' || ch == '_' || ch == '-';
+        out.push_back(keep ? ch : '_');
+    }
+    return out.empty() ? std::string("clip") : out;
+}
+
+/// @brief Write the luma plane of `frame` as a 16-bit binary PGM.
+///
+/// P5 with maxval 1023: the samples on their 10-bit scale (>> bitShift),
+/// two bytes each, most significant first as the format requires above 255.
+/// Any image viewer or `python -c "import imageio"` opens it, so the two
+/// dumps of a mismatch can be compared outside the plug-in.
+///
+/// @param file   Destination (its folder must exist).
+/// @param frame  A valid host picture.
+/// @return okStatus, or Io when the file cannot be written.
+Status writeLumaPgm(const std::filesystem::path& file, const PlanarFrame16& frame) {
+    if (!frame.valid() || frame.bitShift > 15) {
+        return failStatus(ErrorCode::InvalidArgument, "writeLumaPgm: not a host picture");
+    }
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return failStatus(ErrorCode::Io, "cannot create " + pathText(file));
+    }
+    out << "P5\n" << frame.width << ' ' << frame.height << "\n1023\n";
+    // One row of big-endian samples at a time.
+    std::vector<unsigned char> row(static_cast<std::size_t>(frame.width) * 2u);
+    for (std::uint32_t y = 0; y < frame.height; ++y) {
+        const std::uint16_t* src = frame.plane[0] + static_cast<std::size_t>(y) * frame.strideElems[0];
+        for (std::uint32_t x = 0; x < frame.width; ++x) {
+            const std::uint16_t v = static_cast<std::uint16_t>(src[x] >> frame.bitShift);
+            row[static_cast<std::size_t>(x) * 2u] = static_cast<unsigned char>(v >> 8);
+            row[static_cast<std::size_t>(x) * 2u + 1u] = static_cast<unsigned char>(v & 0xFFu);
+        }
+        out.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
+    }
+    if (!out) {
+        return failStatus(ErrorCode::Io, "cannot write " + pathText(file));
+    }
+    return okStatus();
+}
+
+}  // namespace
+
+// =============================================================================
+//  compareDecodedLuma / defaultDecodeMismatchDirectory
+// =============================================================================
+LumaComparison compareDecodedLuma(const PlanarFrame16& a, const PlanarFrame16& b) noexcept {
+    LumaComparison out;
+    // ---- comparable at all? ---------------------------------------------------
+    if (!a.valid() || !b.valid() || a.width != b.width || a.height != b.height || a.bitShift > 15 ||
+        b.bitShift > 15) {
+        return out;
+    }
+    out.comparable = true;
+    out.height = a.height;
+    out.firstBadRow = a.height;
+
+    // ---- row by row, on the 10-bit scale ---------------------------------------
+    // Integer sums per row (at most 1023^2 * 32768 < 2^35, so 64 bits are
+    // plenty), so the verdict never depends on floating-point order.
+    std::uint64_t sse = 0;
+    const std::uint32_t half = a.height / 2u;
+    for (std::uint32_t y = 0; y < a.height; ++y) {
+        const std::uint16_t* pa = a.plane[0] + static_cast<std::size_t>(y) * a.strideElems[0];
+        const std::uint16_t* pb = b.plane[0] + static_cast<std::size_t>(y) * b.strideElems[0];
+        std::uint64_t rowSse = 0;
+        for (std::uint32_t x = 0; x < a.width; ++x) {
+            const int d = static_cast<int>(pa[x] >> a.bitShift) - static_cast<int>(pb[x] >> b.bitShift);
+            rowSse += static_cast<std::uint64_t>(d * d);
+        }
+        sse += rowSse;
+        // A row is bad when ITS mean error alone fails the 60 dB bar.
+        const double rowMse = static_cast<double>(rowSse) / static_cast<double>(a.width);
+        if (rowMse > kDecodeBadRowMse) {
+            if (out.badRows == 0) {
+                out.firstBadRow = y;
+            }
+            out.lastBadRow = y;
+            ++out.badRows;
+            if (y >= half) {
+                ++out.badRowsBottom;
+            }
+        }
+    }
+
+    // ---- the whole frame --------------------------------------------------------
+    const double mse = static_cast<double>(sse) / (static_cast<double>(a.width) * static_cast<double>(a.height));
+    out.psnrDb = mse > 0.0 ? 10.0 * std::log10(1023.0 * 1023.0 / mse) : std::numeric_limits<double>::infinity();
+    return out;
+}
+
+std::filesystem::path defaultDecodeMismatchDirectory() {
+    try {
+#if defined(_WIN32)
+        // _wdupenv_s: a user name with non-ASCII characters must survive, and
+        // the copy is ours (the pointer _wgetenv returns is the CRT's).
+        wchar_t* value = nullptr;
+        std::size_t length = 0;
+        if (_wdupenv_s(&value, &length, L"LOCALAPPDATA") == 0 && value != nullptr) {
+            std::filesystem::path base(value);
+            std::free(value);
+            if (!base.empty()) {
+                return base / L"OpenOSV" / L"decode-mismatch";
+            }
+        }
+#elif defined(__APPLE__)
+        // Beside the plug-ins' logs (PluginLogPosix.cpp: ~/Library/Logs/OpenOSV).
+        if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+            return std::filesystem::path(home) / "Library" / "Logs" / "OpenOSV" / "decode-mismatch";
+        }
+#endif
+        std::error_code ec;
+        const std::filesystem::path temp = std::filesystem::temp_directory_path(ec);
+        if (!ec && !temp.empty()) {
+            return temp / "OpenOSV" / "decode-mismatch";
+        }
+    } catch (...) {
+        // Allocation failure building a path: no folder.
+    }
+    return {};
+}
+
+// =============================================================================
+//  ShadowDecodeVerifier
+// =============================================================================
+struct ShadowDecodeVerifier::Impl {
+    HevcStreamDecoder reference;            ///< Software decoder of the reference file.
+    std::filesystem::path dumpDirectory;    ///< Empty = never dump.
+    std::uint64_t checked = 0;              ///< Pictures compared.
+    std::uint64_t mismatched = 0;           ///< Of those, how many differed.
+    std::optional<std::uint32_t> lastDumpedSync;  ///< The GOP (its sync sample) of the last dump.
+
+    /// @brief Dump both luma planes of a mismatch, if this one should be.
+    ///
+    /// Only the first mismatch after each sync sample - the onset of a
+    /// damaged run, which is what says where it started - and at most
+    /// kMaxDumps pairs per process (g_dumpPairsWritten), however many readers
+    /// and verifiers the session opens.  Failures are logged, never returned:
+    /// a dump is a convenience on top of the warning.
+    void maybeDump(Verdict& verdict, std::uint32_t index, const PlanarFrame16& primary, const PlanarFrame16& ref,
+                   const std::optional<DecodedFrameInfo>& info, std::uint32_t sync, std::string_view clipName) {
+        if (dumpDirectory.empty() || (lastDumpedSync && *lastDumpedSync == sync)) {
+            return;
+        }
+        // ---- reserve one of the session's pairs --------------------------------------
+        // A compare-exchange, so two verifiers on two readers can never both
+        // take the last slot.  Given back below when nothing was written.
+        std::uint32_t used = g_dumpPairsWritten.load(std::memory_order_relaxed);
+        do {
+            if (used >= kMaxDumps) {
+                return;
+            }
+        } while (!g_dumpPairsWritten.compare_exchange_weak(used, used + 1u, std::memory_order_relaxed));
+        std::error_code ec;
+        std::filesystem::create_directories(dumpDirectory, ec);
+        if (ec) {
+            g_dumpPairsWritten.fetch_sub(1u, std::memory_order_relaxed);
+            log::warn("video: decode check: cannot create {} ({})", log::safe(pathText(dumpDirectory)), ec.message());
+            return;
+        }
+        // <clip>_f<index>_<path>.pgm and <clip>_f<index>_software.pgm.
+        const std::string stem = fileSafeName(clipName) + "_f" + std::to_string(index);
+        const std::string primaryPath = (info && info->hw != HwAccel::None) ? hwAccelName(info->hw) : "primary";
+        const std::filesystem::path a = dumpDirectory / (stem + "_" + primaryPath + ".pgm");
+        const std::filesystem::path b = dumpDirectory / (stem + "_software.pgm");
+        const Status wa = writeLumaPgm(a, primary);
+        const Status wb = writeLumaPgm(b, ref);
+        if (!wa.ok() || !wb.ok()) {
+            g_dumpPairsWritten.fetch_sub(1u, std::memory_order_relaxed);  // nothing usable written
+            log::warn("video: decode check: could not dump frame {} ({})", index,
+                      !wa.ok() ? wa.error().message : wb.error().message);
+            return;
+        }
+        lastDumpedSync = sync;
+        verdict.dumpedPrimary = a;
+        verdict.dumpedReference = b;
+    }
+};
+
+ShadowDecodeVerifier::ShadowDecodeVerifier() = default;
+ShadowDecodeVerifier::~ShadowDecodeVerifier() = default;
+ShadowDecodeVerifier::ShadowDecodeVerifier(ShadowDecodeVerifier&& other) noexcept = default;
+ShadowDecodeVerifier& ShadowDecodeVerifier::operator=(ShadowDecodeVerifier&& other) noexcept = default;
+
+Result<ShadowDecodeVerifier> ShadowDecodeVerifier::open(const std::filesystem::path& reference, std::uint32_t trackId,
+                                                        const DecoderOptions& primaryOptions,
+                                                        const std::filesystem::path& dumpDirectory) {
+    if (reference.empty()) {
+        return Error{ErrorCode::InvalidArgument, "ShadowDecodeVerifier: empty reference path"};
+    }
+    if (trackId == 0) {
+        return Error{ErrorCode::InvalidArgument, "ShadowDecodeVerifier: track ids are 1-based"};
+    }
+    // ---- the reference decoder ---------------------------------------------------
+    // Software, whatever the primary runs on: the point is an independent
+    // decode.  The same sample feed as the primary (so frame i means the
+    // same sample in both), two frame threads (a third of the CPU a default
+    // software decoder would take; the proxy decodes in 1.3-3.5 ms a frame),
+    // no device of any kind, and no frame-0 probe at open.
+    DecoderOptions options;
+    options.hw = HwAccel::None;
+    options.threads = 2;
+    options.keepOnDevice = false;
+    options.useContainerSamples = primaryOptions.useContainerSamples;
+    options.shareHwDevice = false;
+    options.deferFirstFrame = true;
+    ShadowDecodeVerifier verifier;
+    verifier.m_impl = std::make_unique<Impl>();
+    OSV_TRY_ASSIGN(verifier.m_impl->reference, HevcStreamDecoder::open(reference, trackId, options));
+    verifier.m_impl->dumpDirectory = dumpDirectory;
+    return verifier;
+}
+
+Result<ShadowDecodeVerifier::Verdict> ShadowDecodeVerifier::check(std::uint32_t index, const PlanarFrame16& primary,
+                                                                  const std::optional<DecodedFrameInfo>& primaryInfo,
+                                                                  std::optional<std::uint32_t> previousSync,
+                                                                  std::string_view clipName) {
+    // ---- inputs ------------------------------------------------------------------
+    if (!isOpen()) {
+        return Error{ErrorCode::InvalidArgument, "ShadowDecodeVerifier: not open"};
+    }
+    if (!primary.valid()) {
+        return Error{ErrorCode::InvalidArgument, "ShadowDecodeVerifier: the primary picture is not a host picture"};
+    }
+    Impl& s = *m_impl;
+
+    // ---- the reference picture ------------------------------------------------------
+    auto ref = s.reference.decodeFrame(index);
+    if (!ref.ok()) {
+        return Error{ref.error().code, "the software reference could not decode frame " + std::to_string(index) +
+                                           ": " + ref.error().message};
+    }
+
+    // ---- compare --------------------------------------------------------------------
+    Verdict verdict;
+    verdict.comparison = compareDecodedLuma(primary, ref.value());
+    ++s.checked;
+    const LumaComparison& c = verdict.comparison;
+    const std::string clip = log::safe(clipName);
+    if (!c.comparable) {
+        // Different sizes: the reader's own width check rejects such a
+        // picture anyway; say so and leave the decision to it.
+        log::warn("video: decode check: '{}' frame {}: the primary picture ({}x{}) and the software one ({}x{}) "
+                  "cannot be compared",
+                  clip, index, primary.width, primary.height, ref.value().width, ref.value().height);
+        return verdict;
+    }
+    if (!c.mismatch()) {
+        // A heartbeat every 100 pictures, so a log shows the check is running.
+        if (s.checked % 100u == 0u) {
+            log::debug("video: decode check: '{}' {} pictures checked against software, {} mismatched", clip,
+                       s.checked, s.mismatched);
+        }
+        return verdict;
+    }
+
+    // ---- a mismatch: dump, say everything, hand back the software picture -----------
+    ++s.mismatched;
+    const std::uint32_t sync = previousSync.value_or(index);
+    s.maybeDump(verdict, index, primary, ref.value(), primaryInfo, sync, clipName);
+    const DecodedFrameInfo info = primaryInfo.value_or(DecodedFrameInfo{});
+    // What the SOFTWARE decoder said about this GOP decides what the mismatch
+    // means: a reference that decoded every picture up to here cleanly makes
+    // it a fault of the hardware decode; one that saw damage - on this
+    // picture, or on one it is predicted from (gopDamagedAt) - means the
+    // recording is damaged, and two decoders simply conceal it differently
+    // (libavcodec's own concealment even varies with its thread count).
+    const std::optional<DecodedFrameInfo> refInfo = s.reference.lastFrameInfo();
+    const bool refDamaged = refInfo && refInfo->gopDamagedAt >= 0;
+    const std::string refVerdict =
+        refDamaged ? std::format("the software decode saw damage too, at frame {} (this picture: decode_error_flags "
+                                 "0x{:x}, corrupt {}): the recording is damaged here and the two decoders conceal it "
+                                 "differently",
+                                 refInfo->gopDamagedAt, static_cast<unsigned>(refInfo->decodeErrorFlags),
+                                 refInfo->corrupt ? "yes" : "no")
+                   : std::string("the software decode is clean: the hardware decode is at fault");
+    log::warn("video: decode check: '{}' frame {} (sync {} + {}) differs from software: luma PSNR {:.1f} dB, "
+              "{} bad rows of {} ({} in the bottom half), first bad row {}, last {}; decoded on {}, "
+              "decode_error_flags 0x{:x}, corrupt {}, key {}, surface {}; {}; serving the software picture{}",
+              clip, index, sync, index >= sync ? index - sync : 0u, c.psnrDb, c.badRows, c.height, c.badRowsBottom,
+              c.firstBadRow, c.lastBadRow, hwAccelName(info.hw), static_cast<unsigned>(info.decodeErrorFlags),
+              info.corrupt ? "yes" : "no", info.keyFrame ? 1 : 0, info.surface, refVerdict,
+              verdict.dumpedPrimary.empty() ? std::string()
+                                            : "; luma planes dumped to " + log::safe(pathText(verdict.dumpedPrimary)) +
+                                                  " and " + log::safe(pathText(verdict.dumpedReference)));
+    verdict.replacement = std::move(ref).value();
+    return verdict;
+}
+
+bool ShadowDecodeVerifier::isOpen() const noexcept { return m_impl != nullptr && m_impl->reference.isOpen(); }
+
+std::uint64_t ShadowDecodeVerifier::checked() const noexcept { return m_impl ? m_impl->checked : 0u; }
+
+std::uint64_t ShadowDecodeVerifier::mismatched() const noexcept { return m_impl ? m_impl->mismatched : 0u; }
 
 // =============================================================================
 //  Impl
@@ -28,6 +387,10 @@ namespace osv::video {
 struct DualStreamReader::Impl {
     HevcStreamDecoder decoders[2];   ///< [0] slave, [1] master ([1] unused when side by side).
     bool sideBySide = false;         ///< Single stream split into halves.
+    // ---- the proxy's shadow check (OPENOSV_VERIFY_HW_DECODE) -------------------
+    bool verifyHw = false;               ///< Asked for when the reader opened (proxy only).
+    bool verifierTried = false;          ///< The verifier's open was attempted (never retried).
+    ShadowDecodeVerifier verifier;       ///< Opened on the first hardware picture.
     // ---- what open() was given (ReaderPool keys on these) ----------------------
     std::filesystem::path path;                ///< File the reader decodes.
     DecoderOptions options;                    ///< Options exactly as passed to open().
@@ -80,6 +443,65 @@ struct DualStreamReader::Impl {
         }
         return r;
     }
+
+    /// @brief The shadow check of one side-by-side picture (verifyHw only).
+    ///
+    /// Only a picture the HARDWARE decoded is checked - a software primary
+    /// has nothing independent to be compared with - and only once the
+    /// decoder's own report names this very index.  The verifier opens on
+    /// the first such picture (a reader that never decodes on hardware never
+    /// pays for it) and is not retried after a failed open.  When the two
+    /// decodes differ, `whole` is replaced by the software picture, so the
+    /// frame delivered is the right one, and any device view of the
+    /// hardware picture is dropped with it.
+    ///
+    /// @param index  The frame just decoded.
+    /// @param whole  The decode result; replaced in place on a mismatch.
+    void verifyAgainstSoftware(std::uint32_t index, LensResult& whole) noexcept {
+        try {
+            if (!whole.frame.ok()) {
+                return;
+            }
+            const HevcStreamDecoder& d = decoders[0];
+            const std::optional<DecodedFrameInfo> info = d.lastFrameInfo();
+            if (!info || info->hw == HwAccel::None || info->index != index) {
+                return;
+            }
+            const std::string clip = log::safe(pathText(path.filename()));
+            // ---- the reference decoder, on the first hardware picture -----------------
+            if (!verifier.isOpen()) {
+                if (verifierTried) {
+                    return;
+                }
+                verifierTried = true;
+                const std::filesystem::path dumps = defaultDecodeMismatchDirectory();
+                auto opened = ShadowDecodeVerifier::open(path, trackIds[0], options, dumps);
+                if (!opened.ok()) {
+                    log::warn("video: decode check: '{}' cannot open the software reference ({}); hardware "
+                              "pictures stay unchecked",
+                              clip, opened.error().message);
+                    return;
+                }
+                verifier = std::move(opened).value();
+                log::info("video: decode check: '{}' every {} picture is compared with a software decode "
+                          "(OPENOSV_VERIFY_HW_DECODE); mismatches are logged, replaced and dumped to {}",
+                          clip, hwAccelName(info->hw),
+                          dumps.empty() ? std::string("nowhere") : log::safe(pathText(dumps)));
+            }
+            // ---- compare, and deliver the software picture on a mismatch ------------
+            auto verdict = verifier.check(index, whole.frame.value(), info, d.previousSyncIndex(index), clip);
+            if (!verdict.ok()) {
+                log::warn("video: decode check: '{}' frame {} not checked ({})", clip, index, verdict.error().message);
+                return;
+            }
+            if (verdict.value().replacement) {
+                whole.frame = std::move(*verdict.value().replacement);
+                whole.device.reset();
+            }
+        } catch (...) {
+            // A diagnostic never costs the frame: the primary picture stands.
+        }
+    }
 };
 
 // =============================================================================
@@ -130,6 +552,9 @@ Result<DualStreamReader> DualStreamReader::open(const std::filesystem::path& pat
         impl.fps = d.fps();
         const TimeBase tb = d.timeBase();
         impl.ptsToleranceUs = static_cast<std::int64_t>(std::ceil(1e6 * static_cast<double>(tb.num) / static_cast<double>(tb.den)));
+        // The shadow check is a diagnostic switch read once per reader: it
+        // doubles the proxy's decode work, so it is never on by default.
+        impl.verifyHw = environmentSwitchOn("OPENOSV_VERIFY_HW_DECODE");
         return reader;
     }
 
@@ -244,6 +669,10 @@ Result<FramePair> DualStreamReader::read(std::uint32_t index) {
         if (!whole.frame.ok()) {
             return Error(whole.frame.error());
         }
+        // ---- the shadow check (OPENOSV_VERIFY_HW_DECODE=1 only) ---------------
+        if (impl.verifyHw) {
+            impl.verifyAgainstSoftware(index, whole);
+        }
         const PlanarFrame16& frame = whole.frame.value();
         if (frame.width != impl.lensWidth * 2) {
             return Error{ErrorCode::Decoder, "side-by-side frame width changed mid-stream"};
@@ -346,6 +775,12 @@ std::uint32_t DualStreamReader::lensWidth() const noexcept { return m_impl ? m_i
 std::uint32_t DualStreamReader::lensHeight() const noexcept { return m_impl ? m_impl->lensHeight : 0; }
 
 bool DualStreamReader::isSideBySide() const noexcept { return m_impl != nullptr && m_impl->sideBySide; }
+
+std::uint64_t DualStreamReader::verifiedFrames() const noexcept { return m_impl ? m_impl->verifier.checked() : 0u; }
+
+std::uint64_t DualStreamReader::verifyMismatches() const noexcept {
+    return m_impl ? m_impl->verifier.mismatched() : 0u;
+}
 
 const HevcStreamDecoder* DualStreamReader::decoder(int lens) const noexcept {
     if (!m_impl || lens < 0 || lens > 1) {

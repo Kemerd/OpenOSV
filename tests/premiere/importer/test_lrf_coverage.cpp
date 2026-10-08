@@ -32,6 +32,13 @@
 // first asked for late, are still checked; an exhausted one is not checked
 // again), and that a mismatched request size repeated many times, across
 // more sizes than the importer's memo holds, is logged exactly once.
+//
+// A third case proves the per-frame delivery fingerprint (the 'deliver:'
+// line, OPENOSV_VERIFY_DELIVERY=1) really compares what it promises on the
+// host path, for the .LRF as its .OSV's proxy - where the host's frame
+// numbers are the ORIGINAL's and the frame rendered for each one is a
+// different proxy sample.  CPU only: Render Device = CPU, the classical flow
+// on the CPU, and the proxy decoded in software (OPENOSV_IMPORTER_LRF_SOFTWARE).
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -95,6 +102,39 @@ public:
     LogLevel& operator=(const LogLevel&) = delete;
 
 private:
+    std::string m_previous;
+    bool m_hadPrevious = false;
+};
+
+/// Set one environment variable for the lifetime of the object, restoring the
+/// previous value (or its absence) afterwards.  _putenv_s, because the .prm
+/// shares this process's CRT (/MD) and reads its switches with getenv_s.
+class ScopedEnv {
+public:
+    ScopedEnv(const char* name, const char* value) : m_name(name ? name : "") {
+        if (m_name.empty()) {
+            return;  // nothing to set, nothing to restore
+        }
+        char* old = nullptr;
+        std::size_t length = 0;
+        if (::_dupenv_s(&old, &length, m_name.c_str()) == 0 && old) {
+            m_previous = old;
+            m_hadPrevious = true;
+        }
+        std::free(old);
+        ::_putenv_s(m_name.c_str(), value ? value : "");
+    }
+    ~ScopedEnv() {
+        if (!m_name.empty()) {
+            // An empty value removes the variable, which is "unset" again.
+            ::_putenv_s(m_name.c_str(), m_hadPrevious ? m_previous.c_str() : "");
+        }
+    }
+    ScopedEnv(const ScopedEnv&) = delete;
+    ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+private:
+    std::string m_name;
     std::string m_previous;
     bool m_hadPrevious = false;
 };
@@ -437,6 +477,84 @@ void checkLog(const std::string& log, std::size_t rendered) {
     CHECK(log.find(", row bytes ") != std::string::npos);
 }
 
+/// One 'deliver:' line of the importer's log, taken apart.
+struct DeliverLine {
+    std::uint32_t frame = 0;   ///< The host's (timeline) frame.
+    std::uint32_t source = 0;  ///< The clip's own frame rendered for it.
+    std::string text;          ///< The whole line, for messages.
+};
+
+/// Parse the unsigned decimal number at `pos` in `line`; false when there is
+/// none (or it does not fit 32 bits).  Advances `pos` past the digits.
+[[nodiscard]] bool parseNumber(std::string_view line, std::size_t& pos, std::uint32_t& out) {
+    std::uint64_t value = 0;
+    const std::size_t start = pos;
+    while (pos < line.size() && line[pos] >= '0' && line[pos] <= '9') {
+        value = value * 10u + static_cast<std::uint64_t>(line[pos] - '0');
+        if (value > 0xFFFFFFFFull) {
+            return false;
+        }
+        ++pos;
+    }
+    out = static_cast<std::uint32_t>(value);
+    return pos > start;
+}
+
+/// Every 'deliver:' line of `log`, with its two frame numbers
+/// ("deliver: clip '<name>' frame N (source S) ...").  A line that does not
+/// carry both numbers is returned with `source` = UINT32_MAX, so a test sees
+/// the malformed line instead of losing it.
+[[nodiscard]] std::vector<DeliverLine> deliverLines(const std::string& log) {
+    std::vector<DeliverLine> out;
+    std::size_t start = 0;
+    while (start < log.size()) {
+        std::size_t end = log.find('\n', start);
+        if (end == std::string::npos) {
+            end = log.size();
+        }
+        const std::string_view line(log.data() + start, end - start);
+        start = end + 1;
+        const std::size_t tag = line.find("deliver: clip '");
+        if (tag == std::string_view::npos) {
+            continue;
+        }
+        DeliverLine d;
+        d.text = std::string(line);
+        d.source = 0xFFFFFFFFu;
+        // The clip name is quoted; the numbers follow its closing quote.
+        const std::size_t frameAt = line.find("' frame ", tag);
+        if (frameAt != std::string_view::npos) {
+            std::size_t pos = frameAt + std::string_view("' frame ").size();
+            std::uint32_t frame = 0;
+            std::uint32_t source = 0;
+            if (parseNumber(line, pos, frame) && line.substr(pos, 9) == " (source " &&
+                (pos += 9, parseNumber(line, pos, source))) {
+                d.frame = frame;
+                d.source = source;
+            }
+        }
+        out.push_back(std::move(d));
+    }
+    return out;
+}
+
+/// True when some line of `log` contains both `a` and `b`.
+[[nodiscard]] bool anyLineWithBoth(const std::string& log, std::string_view a, std::string_view b) {
+    std::size_t start = 0;
+    while (start < log.size()) {
+        std::size_t end = log.find('\n', start);
+        if (end == std::string::npos) {
+            end = log.size();
+        }
+        const std::string_view line(log.data() + start, end - start);
+        start = end + 1;
+        if (line.find(a) != std::string_view::npos && line.find(b) != std::string_view::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 TEST_CASE("an .LRF delivers every row at host-style mismatched sizes, as its .OSV's proxy and on its own",
@@ -590,4 +708,120 @@ TEST_CASE("at Debug the row self-check covers the first frames of every delivere
         INFO(line);
         CHECK(countOf(log, line) == 1u);
     }
+}
+
+TEST_CASE("the delivery fingerprint compares every host-path frame of a proxy .LRF with the frame rendered for it",
+          "[importer][lrf][proxy][deliver][sample]") {
+    const std::filesystem::path proxyPath = sampleProxyPath();
+    std::error_code ec;
+    if (proxyPath.empty() || !std::filesystem::exists(proxyPath, ec)) {
+        SKIP("the .LRF proxy is not present at " << proxyPath.string());
+    }
+    std::filesystem::path original = proxyPath;
+    original.replace_extension(".OSV");
+    if (!std::filesystem::exists(original, ec)) {
+        SKIP("the sample .LRF is not beside its .OSV: " << original.string());
+    }
+
+    // ---- the switches, all before the harness loads the module -----------------
+    // Debug: the decoder's per-picture 'decode:' lines too, to line the two
+    // up.  OPENOSV_VERIFY_DELIVERY: the 'deliver:' line at Info for every
+    // frame.  OPENOSV_IMPORTER_LRF_SOFTWARE: the proxy decodes on the CPU.
+    const LogLevel debugLog("debug");
+    const ScopedEnv verifyDelivery("OPENOSV_VERIFY_DELIVERY", "1");
+    const ScopedEnv proxySoftware("OPENOSV_IMPORTER_LRF_SOFTWARE", "1");
+
+    // ---- the requests: several sizes, formats and qualities --------------------
+    // The original runs at twice the proxy's rate, so neighbouring timeline
+    // frames can land on one proxy sample (on the sample clip, 1 and 2 both
+    // do): the second is then served from the instance's own one-frame cache
+    // - still the host path, still comparable.
+    struct Request {
+        std::int64_t frame;
+        std::int32_t width;
+        std::int32_t height;
+        PrPixelFormat format;
+        imRenderIntent intent;
+    };
+    const Request requests[] = {
+        {0, 2000, 1000, PrPixelFormat_BGRA_4444_32f, imRenderIntent_Export},
+        {1, 2000, 1000, PrPixelFormat_BGRA_4444_32f, imRenderIntent_Export},
+        {2, 2000, 1000, PrPixelFormat_BGRA_4444_32f, imRenderIntent_Export},
+        {20, 1000, 500, PrPixelFormat_BGRA_4444_16u, imRenderIntent_Thumbnail},  // a draft
+        {40, 1920, 1080, PrPixelFormat_BGRA_4444_8u, imRenderIntent_Playing},
+        {64, 2000, 1000, PrPixelFormat_BGRA_4444_32f, imRenderIntent_Export},
+    };
+
+    const std::uintmax_t logStart = logSize();
+    std::size_t delivered = 0;
+    {
+        ImporterHarness harness;
+        REQUIRE(harness.loaded());
+        auto clip = harness.openClip(proxyPath);
+        INFO("open result " << clip.openResult());
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info) == imNoErr);
+        // Presented as the 6K original's proxy: 2000 x 1000 on its timeline.
+        REQUIRE(info.vidInfo.imageWidth == 2000);
+        REQUIRE(info.vidInfo.imageHeight == 1000);
+        REQUIRE(info.vidInfo.frameRate > 0);
+
+        const void* suite = nullptr;
+        REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) ==
+                kSPNoError);
+        const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+
+        // The clip's defaults, rendered on the CPU: the host frame path,
+        // which is the one the fingerprint can compare, and the explicit
+        // classical flow, which stays on the CPU (Auto would take the GPU).
+        PrefsBlob prefs = PrefsBlob::defaults();
+        prefs.renderDevice = static_cast<std::uint8_t>(PrefsRenderDevice::Cpu);
+        prefs.flowBackend = static_cast<std::uint8_t>(PrefsFlowBackend::Classical);
+
+        for (const Request& r : requests) {
+            INFO("timeline frame " << r.frame << ", " << r.width << "x" << r.height);
+            REQUIRE(r.frame < info.vidDurationInFrames);
+            // The host cache is cleared, so every request reaches the render.
+            CHECK(requestOnly(harness, clip, info, ppix, r.frame, r.width, r.height, r.format, r.intent, true, prefs));
+            ++delivered;
+        }
+        harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+    }
+    const std::string log = logSince(logStart);
+
+    // ---- one comparable line per delivered frame ---------------------------------
+    const std::vector<DeliverLine> lines = deliverLines(log);
+    std::string summary;
+    for (const DeliverLine& d : lines) {
+        summary += d.text + "\n";
+    }
+    INFO("deliver lines:\n" << summary);
+    REQUIRE(lines.size() == delivered);
+    // The proxy decoded in software, as the switch asks.
+    CHECK(log.find("decodes in software (OPENOSV_IMPORTER_LRF_SOFTWARE is set)") != std::string::npos);
+    // Every frame took the host path and was compared: none claims the GPU
+    // path, none lost its rendered frame, none differs.
+    CHECK(countOf(log, "(matches the rendered frame)") == delivered);
+    CHECK(log.find("gpu path") == std::string::npos);
+    CHECK(log.find("no rendered frame held") == std::string::npos);
+    CHECK(log.find("DIFFERS") == std::string::npos);
+
+    // ---- the two numbers, and the decoder's line for each source frame --------------
+    bool sawRemapped = false;
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        const DeliverLine& d = lines[i];
+        INFO(d.text);
+        REQUIRE(d.source != 0xFFFFFFFFu);
+        // The lines come in request order; the host's number is the one asked for.
+        CHECK(d.frame == static_cast<std::uint32_t>(requests[i].frame));
+        sawRemapped = sawRemapped || d.source != d.frame;
+        // The source number is the decoder's: its 'decode:' line names it.
+        const std::string decodedAs = " frame " + std::to_string(d.source) + " crc ";
+        CHECK(anyLineWithBoth(log, "decode: track ", decodedAs));
+    }
+    // The proxy's own samples are not the original's frame numbers, so at
+    // least one line must show the two apart - the case the comparison used
+    // to miss (it looked the rendered frame up by the host's number).
+    CHECK(sawRemapped);
 }
