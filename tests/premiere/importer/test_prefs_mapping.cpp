@@ -750,6 +750,49 @@ TEST_CASE("the Scene Light and Lens Focal combos round trip and refuse garbage",
     }
 }
 
+TEST_CASE("the Hide Mount combo round trips, keeps the other fields and refuses garbage",
+          "[importer][prefs][mapping][hidemount]") {
+    // Defaults: the first entry, On - which is also the enum's 0 and every
+    // older project's byte.
+    const DialogControls shown = controlsFromPrefs(PrefsBlob::defaults());
+    REQUIRE(shown.hideMount == 0);
+    REQUIRE(prefsFromControls(shown) == PrefsBlob::defaults());
+
+    // Both choices survive the round trip, and the combo index IS the byte.
+    for (int mode = 0; mode < static_cast<int>(PrefsHideMount::Count); ++mode) {
+        PrefsBlob original = PrefsBlob::defaults();
+        original.hideMount = static_cast<std::uint8_t>(mode);
+        const DialogControls controls = controlsFromPrefs(original);
+        INFO("hide mount " << mode);
+        REQUIRE(controls.hideMount == mode);
+        REQUIRE(prefsFromControls(controls) == original);
+    }
+
+    // A dialog opened on a blob with Off keeps every other field (the base
+    // overload), and switching it back to On changes that byte alone.
+    PrefsBlob off = PrefsBlob::defaults();
+    off.hideMount = static_cast<std::uint8_t>(PrefsHideMount::Off);
+    off.parallax = static_cast<std::uint8_t>(PrefsParallax::Off);  // a field the dialog does not show
+    REQUIRE(prefsFromControls(controlsFromPrefs(off), off) == off);
+    DialogControls backOn = controlsFromPrefs(off);
+    backOn.hideMount = static_cast<int>(PrefsHideMount::On);
+    PrefsBlob expected = off;
+    expected.hideMount = static_cast<std::uint8_t>(PrefsHideMount::On);
+    REQUIRE(prefsFromControls(backOn, off) == expected);
+
+    // A combo with no selection (-1) or a corrupt index lands on On, never on
+    // a mount shown by accident, and the blob needs no repair.
+    for (const int hostile : {-1, 2, 99, std::numeric_limits<int>::min(), std::numeric_limits<int>::max()}) {
+        DialogControls bad = controlsFromPrefs(PrefsBlob::defaults());
+        bad.hideMount = hostile;
+        PrefsBlob blob = prefsFromControls(bad);
+        INFO("index " << hostile);
+        REQUIRE(blob.hideMountChoice() == PrefsHideMount::On);
+        REQUIRE(blob.hideMount == 0u);
+        REQUIRE(blob.sanitise());
+    }
+}
+
 TEST_CASE("the transfer function combo round trips and refuses garbage", "[importer][prefs][mapping][hdrtone]") {
     // [WP-HDRTONE] The combo index IS the PrefsHdrTone value; the default,
     // ACES 2 Bright, is the first entry and the zero byte of every older

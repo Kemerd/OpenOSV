@@ -286,6 +286,10 @@ struct DialogControls {
     int sceneLight = 0;
     /// Combo index = PrefsLensFocal: 0 Auto (default), 1 Camera, 2 Calibration.
     int lensFocal = 0;
+    /// Combo index = PrefsHideMount: 0 On (default, the occlusion mask), 1 Off
+    /// (the full lens overlap; the mount can show).  Enum order, so the index
+    /// is the stored value.
+    int hideMount = 0;
 };
 
 /// [WP-STEADY] The Parallax Grid choice of each dialog combo index (the

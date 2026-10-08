@@ -209,9 +209,15 @@
 #define OSV_SS_ID_SCENE_LIGHT 52
 #define OSV_SS_ID_LENS_FOCAL 53
 
-/* Total parameters excluding the input layer: 28 value controls + 2 buttons
+/* "Hide Mount": a NEW id, the next free one (54), placed inside the
+ * Stitching group right after Lens Focal (index 26); everything after it
+ * moved up by one - indices are not persisted, ids are.  The Defaults group
+ * stays last. */
+#define OSV_SS_ID_HIDE_MOUNT 54
+
+/* Total parameters excluding the input layer: 29 value controls + 2 buttons
  * + 6 group markers.  out_data->num_params is this + 1. */
-#define OSV_SOURCE_SETTINGS_PARAM_COUNT 36
+#define OSV_SOURCE_SETTINGS_PARAM_COUNT 37
 
 /* ==========================================================================
  *  Popup item strings
@@ -446,6 +452,28 @@
 #define OSV_SS_LENS_FOCAL_DEFAULT 1
 #define OSV_SS_LENS_FOCAL_HINT "Auto picks the focal each recording mode measures best. Camera trusts the recorded focal; Calibration uses each lens's own. Change it only if the seam doubles straight lines."
 
+/* "Hide Mount" - PrefsHideMount: On, Off (enum order, On first).
+ *
+ * Whether the stitch applies the occlusion polygons the camera's calibration
+ * records around its own body and mount.  "On" cuts the mount out, as every
+ * clip was stitched before the control existed.  "Off (full lens overlap)"
+ * drops the polygons: on a car, helmet or suction mount they can leave a
+ * long stretch of the seam with no overlap at all, where near objects (a
+ * roof line) step at a forced cut; Off gives the seam its overlap back there,
+ * and the mount itself can show.  The list is append-only: a project stores
+ * the popup value.  Default 1 = On, which is also an older project's zero
+ * byte. */
+#define OSV_SS_HIDE_MOUNT_ITEMS "On|Off (full lens overlap)"
+#define OSV_SS_HIDE_MOUNT_COUNT 2
+#define OSV_SS_HIDE_MOUNT_DEFAULT 1
+/* The hint the hosts that show tooltips put on the control (the importer's
+ * dialog, the OpenFX parameter).  It promises only what Off was measured to
+ * do: near edges step LESS where the mask left no overlap (a car roof line on
+ * the proxy: 0.97 -> 0.63 deg upper, 2.65 -> 2.30 deg lower), not that the
+ * step goes away - near-field disparity along the seam remains - and the
+ * mount CAN show, depending on where the seam runs. */
+#define OSV_SS_HIDE_MOUNT_HINT "On cuts the camera's mount out of the stitch. Off gives the seam the full lens overlap back where the mask left none, so near edges on a car, helmet or suction mount step less there; the mount can show."
+
 /* ==========================================================================
  *  Checkbox and slider ranges / defaults
  * ========================================================================== */
@@ -562,17 +590,18 @@ namespace osv::premiere::sourcesettings {
 ///  23    Lens Alignment           [WP-STEADY]
 ///  24    Scene Light
 ///  25    Lens Focal
-///  26  (GROUP_END, Stitching)
-///  27  Advanced           (GROUP_START, starts collapsed)
-///  28    D-Log M Curve
-///  29    Exposure
-///  30    Render Device
-///  31    Program Monitor Colour   [WP-SETTINGS]
-///  32  (GROUP_END, Advanced)
-///  33  Defaults           (GROUP_START, starts collapsed)   [WP-DEFAULTS]
-///  34    Save       [Save as Default for New Clips]
-///  35    Restore    [Restore Built-in Defaults]
-///  36  (GROUP_END, Defaults)
+///  26    Hide Mount
+///  27  (GROUP_END, Stitching)
+///  28  Advanced           (GROUP_START, starts collapsed)
+///  29    D-Log M Curve
+///  30    Exposure
+///  31    Render Device
+///  32    Program Monitor Colour   [WP-SETTINGS]
+///  33  (GROUP_END, Advanced)
+///  34  Defaults           (GROUP_START, starts collapsed)   [WP-DEFAULTS]
+///  35    Save       [Save as Default for New Clips]
+///  36    Restore    [Restore Built-in Defaults]
+///  37  (GROUP_END, Defaults)
 enum ParamIndex : int {
     kIndexColorOutput = 1,
     kIndexHdrTone = 2,          // [WP-HDRTONE]
@@ -599,13 +628,14 @@ enum ParamIndex : int {
     kIndexLensAlign = 23,       // [WP-STEADY]
     kIndexSceneLight = 24,
     kIndexLensFocal = 25,
-    kIndexStitchTopicEnd = 26,
-    kIndexAdvancedTopic = 27,
-    kIndexDlogmFit = 28,
-    kIndexExposure = 29,
-    kIndexRenderDevice = 30,
-    kIndexDirectColour = 31,
-    kIndexAdvancedTopicEnd = 32,
+    kIndexHideMount = 26,
+    kIndexStitchTopicEnd = 27,
+    kIndexAdvancedTopic = 28,
+    kIndexDlogmFit = 29,
+    kIndexExposure = 30,
+    kIndexRenderDevice = 31,
+    kIndexDirectColour = 32,
+    kIndexAdvancedTopicEnd = 33,
     // [WP-DEFAULTS] Always the last group, so its indices are written
     // relative to the Advanced terminator: a control added to an earlier
     // group moves them with it and nothing here has to be renumbered.
@@ -631,6 +661,7 @@ inline constexpr int kParamIdByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] = {
     OSV_SS_ID_LENS_SHADING,     OSV_SS_ID_SHADING_STRENGTH,  // [WP-VIGNETTE]
     OSV_SS_ID_PARALLAX_GRID,    OSV_SS_ID_LENS_ALIGN,        // [WP-STEADY]
     OSV_SS_ID_SCENE_LIGHT,      OSV_SS_ID_LENS_FOCAL,        // Scene Light, Lens Focal
+    OSV_SS_ID_HIDE_MOUNT,                                    // Hide Mount
     OSV_SS_ID_STITCH_TOPIC_END, OSV_SS_ID_ADVANCED_TOPIC,
     OSV_SS_ID_DLOGM_FIT,        OSV_SS_ID_EXPOSURE,      OSV_SS_ID_RENDER_DEVICE,
     OSV_SS_ID_DIRECT_COLOUR,    OSV_SS_ID_ADVANCED_TOPIC_END,
@@ -649,8 +680,8 @@ inline constexpr int kParamCount = OSV_SOURCE_SETTINGS_PARAM_COUNT;
 /// since the lens shading correction, [WP-HDRPEAK] one more for the HDR
 /// peak, [WP-STEADY] two more since the steady seam and lens alignment,
 /// [WP-HDRTONE] one more for the HDR transfer function, two more for Scene
-/// Light and Lens Focal).
-inline constexpr int kValueParamCount = 28;
+/// Light and Lens Focal, one more for Hide Mount).
+inline constexpr int kValueParamCount = 29;
 
 /// The parameter names, in index order, so a test can compare the built
 /// module's list without repeating the strings.
@@ -669,6 +700,7 @@ inline constexpr const char* kParamNameByIndex[OSV_SOURCE_SETTINGS_PARAM_COUNT] 
     "Lens Shading",   "Shading Strength",  // [WP-VIGNETTE]
     "Parallax Grid",  "Lens Alignment",    // [WP-STEADY]
     "Scene Light",    "Lens Focal",
+    "Hide Mount",
     "",               "Advanced",     "D-Log M Curve",
     "Exposure",       "Render Device", "Program Monitor Colour", "",
     // [WP-DEFAULTS]

@@ -722,6 +722,46 @@ void sceneWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
 // ---- [/Scene Light and Lens Focal] ---------------------------------------------
 
 // ---------------------------------------------------------------------------
+//  Hide Mount row
+// ---------------------------------------------------------------------------
+// One combo row appended below the Scene Light and Lens Focal rows, the same
+// way, with the same tooltip the OpenFX parameter carries.  Ids clear of
+// resource.h and of every block above (1040-1049, 1070, 1080-1081, 1090-1091
+// and their 11xx labels).
+constexpr int kIdcHideMount = 1092;
+constexpr int kIdcStaticHideMount = 1192;
+
+/// Append the Hide Mount row and load `c` into it.  The list is in enum
+/// order (On first, the default), so the combo index is the stored value.
+void addHideMountRow(HWND dialog, const DialogControls& c) noexcept {
+    const int row = growDialogForRows(dialog, 1);
+    static const wchar_t* const kModes[] = {L"On (default)", L"Off (full lens overlap; the mount can show)"};
+    static_assert(std::size(kModes) == static_cast<std::size_t>(PrefsHideMount::Count),
+                  "the Hide Mount combo does not list every PrefsHideMount value");
+    addDialogChild(dialog, L"STATIC", L"Hide mount:", SS_LEFT, kIdcStaticHideMount, 7, row + 3, 70, 8);
+    addDialogChild(dialog, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kIdcHideMount, 82, row, 179,
+                   60);
+    fillCombo(dialog, kIdcHideMount, kModes, static_cast<int>(std::size(kModes)), c.hideMount);
+    // The words the Source Settings effect cannot show (Premiere's panel has
+    // no tooltips); the same hint as OSV_SS_HIDE_MOUNT_HINT, word for word.
+    // Off makes near edges step LESS, not vanish, so the hint says exactly
+    // that and no more.
+    addRowTooltip(dialog, kIdcHideMount, kIdcStaticHideMount,
+                  L"On cuts the camera's mount out of the stitch. Off gives the seam the full lens overlap back where "
+                  L"the mask left none, so near edges on a car, helmet or suction mount step less there; the mount "
+                  L"can show.");
+}
+
+/// Read the Hide Mount row back; a missing row keeps what the dialog opened
+/// with.
+void hideMountWidgetsToControls(HWND dialog, DialogControls& c) noexcept {
+    if (::GetDlgItem(dialog, kIdcHideMount)) {
+        c.hideMount = comboSelection(dialog, kIdcHideMount);
+    }
+}
+// ---- [/Hide Mount] ---------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 //  [WP-DEFAULTS] "Save as Default"
 // ---------------------------------------------------------------------------
 // The template puts the button and its status line at the left of the OK /
@@ -897,6 +937,7 @@ void widgetsToControls(HWND dialog, DialogControls& c) noexcept {
     hdrPeakWidgetsToControls(dialog, c);  // [WP-HDRPEAK]
     steadyWidgetsToControls(dialog, c);    // [WP-STEADY]
     sceneWidgetsToControls(dialog, c);     // Scene Light and Lens Focal
+    hideMountWidgetsToControls(dialog, c);  // Hide Mount
 }
 
 /// The dialog procedure.  It never throws (a C callback crossing back into
@@ -915,6 +956,7 @@ INT_PTR CALLBACK sourceSettingsProc(HWND dialog, UINT message, WPARAM wParam, LP
             addHdrPeakRow(dialog, state->controls);       // [WP-HDRPEAK]
             addSteadyRows(dialog, state->controls);       // [WP-STEADY]
             addSceneRows(dialog, state->controls);        // Scene Light and Lens Focal
+            addHideMountRow(dialog, state->controls);     // Hide Mount
         }
         addHdrToneTooltip(dialog);  // [WP-HDRTONE]
         placeDefaultsRow(dialog);  // [WP-DEFAULTS] after every block that moves OK

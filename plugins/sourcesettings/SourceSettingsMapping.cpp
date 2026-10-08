@@ -129,6 +129,9 @@ PrefsBlob prefsFromControls(const ControlValues& controls) noexcept {
     // out-of-range value keeps the default from defaults(), Auto.
     blob.sceneLight = fromPopup(controls.sceneLight, OSV_SS_SCENE_LIGHT_COUNT, blob.sceneLight);
     blob.lensFocal = fromPopup(controls.lensFocal, OSV_SS_LENS_FOCAL_COUNT, blob.lensFocal);
+    // Hide Mount: the popup is in enum order; an out-of-range value keeps the
+    // default from defaults(), On - a corrupt popup never shows the mount.
+    blob.hideMount = fromPopup(controls.hideMount, OSV_SS_HIDE_MOUNT_COUNT, blob.hideMount);
 
     // Clamp everything into range and zero the reserved bytes.  After this
     // the blob is byte-for-byte what the importer expects, which is the
@@ -207,6 +210,8 @@ ControlValues controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     // Scene Light and Lens Focal: enum order, so the popup is the value + 1.
     c.sceneLight = toPopup(clean.sceneLight, OSV_SS_SCENE_LIGHT_COUNT);
     c.lensFocal = toPopup(clean.lensFocal, OSV_SS_LENS_FOCAL_COUNT);
+    // Hide Mount: enum order too, so the popup is the value + 1.
+    c.hideMount = toPopup(clean.hideMount, OSV_SS_HIDE_MOUNT_COUNT);
     return c;
 }
 

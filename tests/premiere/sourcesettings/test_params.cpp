@@ -263,6 +263,7 @@ TEST_CASE("PARAMS_SETUP registers exactly the documented parameter list",
             {kIndexLensShading, PF_Param_POPUP},     {kIndexShadingStrength, PF_Param_FLOAT_SLIDER},  // [WP-VIGNETTE]
             {kIndexParallaxGrid, PF_Param_POPUP},    {kIndexLensAlign, PF_Param_POPUP},  // [WP-STEADY]
             {kIndexSceneLight, PF_Param_POPUP},      {kIndexLensFocal, PF_Param_POPUP},
+            {kIndexHideMount, PF_Param_POPUP},  // Hide Mount
             {kIndexStitchTopicEnd, PF_Param_GROUP_END},
             {kIndexAdvancedTopic, PF_Param_GROUP_START}, {kIndexDlogmFit, PF_Param_POPUP},
             {kIndexExposure, PF_Param_FLOAT_SLIDER}, {kIndexRenderDevice, PF_Param_POPUP},
@@ -298,6 +299,7 @@ TEST_CASE("every value-carrying control refuses to vary over time", "[sourcesett
         kIndexLensShading, kIndexShadingStrength,  // [WP-VIGNETTE]
         kIndexParallaxGrid, kIndexLensAlign,       // [WP-STEADY]
         kIndexSceneLight, kIndexLensFocal,         // Scene Light, Lens Focal
+        kIndexHideMount,                           // Hide Mount
     };
     for (const int index : valueIndices) {
         REQUIRE(index >= 1);  // a short initialiser list would leave zeros behind
@@ -362,7 +364,7 @@ TEST_CASE("the two groups are balanced and every control is inside the intended 
                             kIndexPhotoStrength, kIndexSeamInset, kIndexSeamBlend, kIndexParallaxBlend,
                             kIndexSeamSmoothing, kIndexNearOffset, kIndexFarOffset, kIndexLensShading,
                             kIndexShadingStrength, kIndexParallaxGrid, kIndexLensAlign,  // [WP-STEADY]
-                            kIndexSceneLight, kIndexLensFocal,
+                            kIndexSceneLight, kIndexLensFocal, kIndexHideMount,
                             kIndexDlogmFit, kIndexExposure, kIndexRenderDevice, kIndexDirectColour}) {
         INFO("grouped index " << index);
         CHECK(depthAt[static_cast<std::size_t>(index)] == 1);
@@ -392,6 +394,7 @@ TEST_CASE("the popup item lists are the documented ones", "[sourcesettings][para
         {kIndexLensAlign, OSV_SS_LENS_ALIGN_ITEMS},        // [WP-STEADY]
         {kIndexSceneLight, OSV_SS_SCENE_LIGHT_ITEMS},
         {kIndexLensFocal, OSV_SS_LENS_FOCAL_ITEMS},
+        {kIndexHideMount, OSV_SS_HIDE_MOUNT_ITEMS},
     };
     for (const auto& [index, items] : expected) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");
@@ -408,6 +411,11 @@ TEST_CASE("the popup item lists are the documented ones", "[sourcesettings][para
           "ACES 2 - Bright (outdoor)|ACES 2 - Detailed (indoor)|BT.2408 - Deep Blacks + Natural|"
           "BT.2408 - Deep Blacks + Punchy|BT.2408 - Neutral");
     CHECK(std::string(params[kIndexHdrTone - 1].PF_DEF_NAME) == "Transfer Function (HDR)");
+    // Hide Mount spelled out: a project stores the popup value, so On must
+    // stay item 1 (the mask every older project rendered with) and Off item 2.
+    CHECK(popupItems(params[kIndexHideMount - 1]) == "On|Off (full lens overlap)");
+    CHECK(std::string(params[kIndexHideMount - 1].PF_DEF_NAME) == "Hide Mount");
+    CHECK(params[kIndexHideMount - 1].uu.id == OSV_SS_ID_HIDE_MOUNT);
 }
 
 TEST_CASE("the Exposure slider's valid range is the blob's own clamp range",
@@ -457,6 +465,9 @@ TEST_CASE("every control's default is PrefsBlob::defaults()", "[sourcesettings][
     CHECK(params[kIndexRec709Look - 1].u.pd.dephault == static_cast<A_long>(defaults.look) + 1);  // [WP-LOOK]
     CHECK(params[kIndexHdrPeak - 1].u.pd.dephault == static_cast<A_long>(defaults.hdrPeak) + 1);  // [WP-HDRPEAK]
     CHECK(params[kIndexHdrTone - 1].u.pd.dephault == static_cast<A_long>(defaults.hdrTone) + 1);  // [WP-HDRTONE]
+    // Hide Mount: item 1, On - the mask every older project rendered with.
+    CHECK(params[kIndexHideMount - 1].u.pd.dephault == static_cast<A_long>(defaults.hideMount) + 1);
+    CHECK(params[kIndexHideMount - 1].u.pd.dephault == 1);
 
     CHECK(params[kIndexSeamSearch - 1].u.bd.dephault == static_cast<A_long>(defaults.seamSearch));
     CHECK(params[kIndexGainMatch - 1].u.bd.dephault == static_cast<A_long>(defaults.gainMatch));
@@ -505,6 +516,7 @@ TEST_CASE("the popups list every value of their prefs enum", "[sourcesettings][p
         {kIndexLensAlign, static_cast<int>(PrefsLensAlign::Count)},        // [WP-STEADY]
         {kIndexSceneLight, static_cast<int>(PrefsSceneLight::Count)},
         {kIndexLensFocal, static_cast<int>(PrefsLensFocal::Count)},
+        {kIndexHideMount, static_cast<int>(PrefsHideMount::Count)},
     };
     for (const auto& [index, count] : expected) {
         INFO("index " << index << " (" << kParamNameByIndex[index - 1] << ")");

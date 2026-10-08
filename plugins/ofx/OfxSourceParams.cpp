@@ -161,6 +161,12 @@ void describe(OfxParamSetHandle set, HostProfile profile) noexcept {
                  OSV_SS_SCENE_LIGHT_ITEMS, OSV_SS_SCENE_LIGHT_DEFAULT - 1);
     defineChoice(set, kLensFocal, {"Lens Focal", OSV_SS_LENS_FOCAL_HINT, kStitchGroup, kStatic},
                  OSV_SS_LENS_FOCAL_ITEMS, OSV_SS_LENS_FOCAL_DEFAULT - 1);
+    // Hide Mount: the same items and hint as the Source Settings effect and
+    // the importer's dialog.  Last in the Stitching group, where a car or
+    // helmet user looking for the seam's fix finds it next to the other
+    // per-clip stitch choices.
+    defineChoice(set, kHideMount, {"Hide Mount", OSV_SS_HIDE_MOUNT_HINT, kStitchGroup, kStatic},
+                 OSV_SS_HIDE_MOUNT_ITEMS, OSV_SS_HIDE_MOUNT_DEFAULT - 1);
 
     // ---- Advanced (collapsed) ---------------------------------------------------
     defineGroup(set, kAdvancedGroup, {"Advanced", nullptr, nullptr, true}, false);
@@ -245,6 +251,9 @@ ControlValues read(OfxParamSetHandle set, OfxTime time) noexcept {
     c.lensAlign = popup(kLensAlignment, c.lensAlign);
     c.sceneLight = popup(kSceneLight, c.sceneLight);
     c.lensFocal = popup(kLensFocal, c.lensFocal);
+    // A project saved before the control existed has no value for it: the
+    // host answers with the default (On), the mask the clip always had.
+    c.hideMount = popup(kHideMount, c.hideMount);
 
     c.dlogmFit = popup(kDlogmCurve, c.dlogmFit);
     c.exposureStops = doubleAt(set, kExposure, time, c.exposureStops);

@@ -854,8 +854,16 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
             // must not depend on whether a neural model happens to be present.
             render::ParallaxWarpParams rp;
             rp.backend = render::FlowBackendKind::ClassicalCuda;
+            // Always through the calibration's occlusion mask, whatever
+            // Hide Mount says for the stitch: the rotation is a property of
+            // the rig, its cache key (rotationKey) names the file and the rig
+            // only, and a mount in the overlap is exactly the near-field
+            // parallax the fit must not chase.  With Hide Mount On (the
+            // default) this is the blend the request carries, unchanged.
+            geom::BlendParams rotationBlend = job.blend;
+            rotationBlend.useOcclusionMask = true;
             const auto t0 = Clock::now();
-            auto measured = render::measureLensRotation(job.baseRig, job.blend, frames, source, rp,
+            auto measured = render::measureLensRotation(job.baseRig, rotationBlend, frames, source, rp,
                                                         render::LensRotationParams{}, ensurePool(), cancelled,
                                                         alternatesFor(job, frames));
             const double ms = msSince(t0);

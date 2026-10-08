@@ -166,6 +166,9 @@ DialogControls controlsFromPrefs(const PrefsBlob& prefs) noexcept {
     // combo index is the choice.
     c.sceneLight = static_cast<int>(prefs.sceneLightChoice());
     c.lensFocal = static_cast<int>(prefs.lensFocalChoice());
+    // Hide Mount: On is the enum's first value, so the combo index is the
+    // choice (an unsanitised byte reads as On through the accessor).
+    c.hideMount = static_cast<int>(prefs.hideMountChoice());
     return c;
 }
 
@@ -241,6 +244,10 @@ PrefsBlob prefsFromControls(const DialogControls& controls, const PrefsBlob& bas
                            static_cast<std::uint8_t>(PrefsSceneLight::Auto));
     blob.lensFocal = pick(controls.lensFocal, static_cast<int>(PrefsLensFocal::Count),
                           static_cast<std::uint8_t>(PrefsLensFocal::Auto));
+    // Hide Mount: an out-of-range index (a combo with no selection reports
+    // -1) lands on On, the default - never on a mount shown by accident.
+    blob.hideMount = pick(controls.hideMount, static_cast<int>(PrefsHideMount::Count),
+                          static_cast<std::uint8_t>(PrefsHideMount::On));
 
     blob.sanitise();
     return blob;

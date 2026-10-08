@@ -216,10 +216,12 @@ TEST_CASE("PrefsBlob layout is fixed at 128 bytes", "[common][prefs]") {
     static_assert(offsetof(PrefsBlob, hdrPeak) == 54, "hdrPeak sits at 54");
     static_assert(offsetof(PrefsBlob, hdrTone) == 55, "hdrTone sits at 55");
     // Scene Light and Lens Focal at 56-57, from the front of the reserved
-    // block, which now starts at 58.
+    // block; Hide Mount at 58 the same way, so the reserved block now starts
+    // at 59.
     static_assert(offsetof(PrefsBlob, sceneLight) == 56, "sceneLight sits at 56");
     static_assert(offsetof(PrefsBlob, lensFocal) == 57, "lensFocal sits at 57");
-    static_assert(offsetof(PrefsBlob, reserved) == 58, "reserved fills the rest");
+    static_assert(offsetof(PrefsBlob, hideMount) == 58, "hideMount sits at 58");
+    static_assert(offsetof(PrefsBlob, reserved) == 59, "reserved fills the rest");
     static_assert(std::is_trivially_copyable_v<PrefsBlob>, "the blob is memcpy'd to and from the host");
 
     REQUIRE(sizeof(PrefsBlob) == PrefsBlob::kSize);
@@ -314,6 +316,76 @@ TEST_CASE("Scene Light and Lens Focal: zero is Auto, garbage lands on Auto, ever
             CHECK(static_cast<int>(back.lensFocalChoice()) == v);
             CHECK((back == base) == (v == 0));
         }
+    }
+}
+
+TEST_CASE("Hide Mount: zero is On, garbage lands on On, every choice round-trips through the bytes",
+          "[common][prefs][hidemount]") {
+    // The byte came out of the reserved block, so a project saved before it
+    // holds a zero there - which must read as On, the occlusion mask every
+    // clip was stitched with before the choice existed.  A fresh blob is On
+    // too, so the default render of every clip is the one it always was.
+    SECTION("an older blob's zero and a fresh blob are On, the same bytes") {
+        PrefsBlob old = PrefsBlob::defaults();
+        old.hideMount = 0;  // what an older build's reserved byte holds
+        REQUIRE(old.isValid());
+        REQUIRE(old.sanitise());  // zero is valid: nothing to rewrite
+        CHECK(old.hideMountChoice() == PrefsHideMount::On);
+        const PrefsBlob fresh = PrefsBlob::defaults();
+        CHECK(fresh.hideMount == 0u);
+        CHECK(fresh.hideMountChoice() == PrefsHideMount::On);
+        CHECK(fresh == old);
+        // The version is unchanged, so a blob written before the byte existed
+        // is still recognised as ours rather than replaced by the defaults.
+        CHECK(PrefsBlob::kVersion == 1u);
+    }
+
+    SECTION("an out-of-range byte reads as On and sanitise() stores On") {
+        for (const std::uint8_t hostile : {std::uint8_t{2}, std::uint8_t{7}, std::uint8_t{0x80}, std::uint8_t{0xFF}}) {
+            PrefsBlob p = PrefsBlob::defaults();
+            p.hideMount = hostile;
+            INFO("byte " << static_cast<int>(hostile));
+            // The accessor guards an unsanitised blob: never a mount shown by
+            // accident.
+            CHECK(p.hideMountChoice() == PrefsHideMount::On);
+            CHECK_FALSE(p.sanitise());
+            CHECK(p.hideMount == 0u);
+            CHECK(p == PrefsBlob::defaults());  // one meaning, one byte pattern, one cache key
+        }
+        // The same through fromBytes(), the path every host blob takes.
+        PrefsBlob raw = PrefsBlob::defaults();
+        raw.hideMount = 0xFF;
+        const PrefsBlob read = PrefsBlob::fromBytes(&raw, PrefsBlob::kSize);
+        CHECK(read.hideMount == 0u);
+        CHECK(read == PrefsBlob::defaults());
+    }
+
+    SECTION("every choice survives the bytes, changes the cache key and touches no other byte") {
+        const PrefsBlob base = PrefsBlob::defaults();
+        for (int v = 0; v < static_cast<int>(PrefsHideMount::Count); ++v) {
+            PrefsBlob p = base;
+            p.hideMount = static_cast<std::uint8_t>(v);
+            INFO("hide mount " << v);
+            REQUIRE(p.sanitise());
+            const PrefsBlob back = PrefsBlob::fromBytes(&p, PrefsBlob::kSize);
+            CHECK(static_cast<int>(back.hideMountChoice()) == v);
+            // The whole blob is the PPix cache key: Off is a different key,
+            // so flipping the setting never hits a frame cached for the other.
+            CHECK((std::memcmp(back.cacheKey(), base.cacheKey(), PrefsBlob::kSize) == 0) == (v == 0));
+            // Exactly one byte differs from the defaults, and it is offset 58.
+            const auto* a = reinterpret_cast<const unsigned char*>(&back);
+            const auto* b = reinterpret_cast<const unsigned char*>(&base);
+            for (std::size_t i = 0; i < PrefsBlob::kSize; ++i) {
+                if (i != offsetof(PrefsBlob, hideMount)) {
+                    CHECK(a[i] == b[i]);
+                }
+            }
+        }
+        // Off, spelled out: the value a Source Settings UI stores for it.
+        PrefsBlob off = base;
+        off.hideMount = static_cast<std::uint8_t>(PrefsHideMount::Off);
+        REQUIRE(off.sanitise());
+        CHECK(PrefsBlob::fromBytes(&off, PrefsBlob::kSize).hideMountChoice() == PrefsHideMount::Off);
     }
 }
 

@@ -811,6 +811,87 @@ TEST_CASE("osvtool render uses the plug-ins' engine by default; --engine classic
     CHECK(bogus.exitCode != 0);
 }
 
+// osvtool render --occlusion / --no-occlusion on the plug-ins' engine is
+// Source Settings "Hide Mount" (On / Off).  The engine used to refuse the pair
+// as a classic-only research option, so the Off picture Premiere, Resolve and
+// VEGAS render could not be reproduced from the command line at all.  This
+// pins the three promises of the mapping:
+//   * --no-occlusion is accepted and really renders Off (the engine says so,
+//     and the frame changes where the calibration's polygons cut the lenses);
+//   * --occlusion is On, which is the built-in default, bit for bit;
+//   * a render that names neither stays the default and logs nothing about it.
+// CPU renderer and the classical flow (the solver the plug-ins ship), at a
+// small size: the mapping is under test here, not the stitch's quality.
+TEST_CASE("osvtool render --occlusion / --no-occlusion is Hide Mount On / Off on the plug-ins' engine",
+          "[cli][engine][hidemount][sample]") {
+    OSV_REQUIRE_SAMPLE();
+    if (std::string(kToolPath).empty() || !std::filesystem::exists(kToolPath)) {
+        SKIP("osvtool not built");
+    }
+    const std::string clip = quoted(osvtest::sampleOsv());
+    // One frame, an equirect so the mount-side seam is in the picture
+    // whatever the view, and the settings every render below shares.
+    const std::string common =
+        " --frame 0 --mode equirect --size 512x256 --device cpu --flow-backend classical --no-flare --out ";
+
+    // Render once and read the still back; a failed run or an unreadable
+    // still fails the test with osvtool's own output attached.
+    const auto renderTo = [&](const std::string& extra, const char* name, RunResult& run) {
+        const auto path = osvtest::tempDir() / name;
+        std::error_code ec;
+        std::filesystem::remove(path, ec);  // never compare against a stale still
+        run = runTool("render " + clip + extra + common + quoted(path));
+        INFO(run.output);
+        REQUIRE(run.exitCode == 0);
+        auto image = osv::io::readImage(path);
+        REQUIRE(image.ok());
+        REQUIRE(image.value().w == 512u);
+        REQUIRE(image.value().h == 256u);
+        REQUIRE(image.value().data.size() == std::size_t{4} * 512u * 256u);
+        return std::move(image).value();
+    };
+
+    // ---- the default: Hide Mount On, and nothing logged about it ----------
+    RunResult plainRun;
+    const auto plain = renderTo("", "cli_hidemount_default.tif", plainRun);
+    CHECK(plainRun.output.find("plug-in clip engine") != std::string::npos);
+    CHECK(plainRun.output.find("hide mount:") == std::string::npos);
+
+    // ---- --occlusion: On, the default bit for bit --------------------------
+    RunResult onRun;
+    const auto on = renderTo(" --occlusion", "cli_hidemount_on.tif", onRun);
+    CHECK(onRun.output.find("hide mount:") == std::string::npos);
+    CHECK(on.data == plain.data);
+
+    // ---- --no-occlusion: Off, accepted and in force ------------------------
+    RunResult offRun;
+    const auto off = renderTo(" --no-occlusion", "cli_hidemount_off.tif", offRun);
+    INFO(offRun.output);
+    // Accepted on the default engine, never sent to the classic pipeline.
+    CHECK(offRun.output.find("belongs to the classic pipeline") == std::string::npos);
+    CHECK(offRun.output.find("plug-in clip engine") != std::string::npos);
+    // The engine's own line for an explicit Off (rebuildRig).
+    CHECK(offRun.output.find("hide mount:") != std::string::npos);
+    CHECK(offRun.output.find("Off - the calibration's occlusion polygons are not applied") != std::string::npos);
+    // And the picture follows: pixels inside the polygons now come from the
+    // lens the mask used to cut, and the seam gains are measured over the
+    // full overlap, so the frame is not the On frame.  A pixel counts once
+    // however many of its channels moved.  Measured on the sample at this
+    // size: 75,509 of 131,072 pixels change; the bound is the one the
+    // importer's [hidemount] test uses, far below that and far above noise.
+    std::size_t changed = 0;
+    for (std::size_t i = 0; i + 3 < off.data.size(); i += 4) {
+        for (std::size_t ch = 0; ch < 4; ++ch) {
+            if (off.data[i + ch] != plain.data[i + ch]) {
+                ++changed;
+                break;
+            }
+        }
+    }
+    INFO(changed << " of " << (off.data.size() / 4) << " pixels differ between Off and On");
+    CHECK(changed > 1000u);
+}
+
 // osvtool render --alpha: the coverage alpha a host composites with, written
 // into the stills as a 4th channel - and only when asked, so every render
 // without the flag stays byte-for-byte what it was.  Without it, a band of

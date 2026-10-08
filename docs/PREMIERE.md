@@ -576,7 +576,7 @@ absent, so that fact cannot be forgotten.
 
 As in the reframe effect, `PF_ADD_TOPIC` and `PF_END_TOPIC` each issue their
 own `PF_ADD_PARAM`, so a group occupies two real parameter slots and the
-`GROUP_END` slot sits in the MIDDLE of the list. There are 36 parameters: 28
+`GROUP_END` slot sits in the MIDDLE of the list. There are 37 parameters: 29
 value controls, 2 buttons and 6 group markers. `SourceSettingsParams.h`
 spells the index table out literally. Ids are permanent and only ever
 appended; indices moved when a control joined a group (the ids did not).
@@ -617,26 +617,31 @@ meaning; forcing the bare-lens set is new and therefore last.
 | 23 | 41 | Lens Alignment | popup | Auto (fit per clip) \| Off (calibration only) | Auto | `lensAlign` |
 | 24 | 52 | Scene Light | popup | Auto \| Day \| Night | Auto | `sceneLight` |
 | 25 | 53 | Lens Focal | popup | Auto \| Camera (recorded focal) \| Calibration (each lens) | Auto | `lensFocal` |
-| 26 | 8 | (closes Stitching) | GROUP_END | | | |
-| 27 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
-| 28 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 \| Osmo 360 | Osmo 360 | `dlogmFit` |
-| 29 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
-| 30 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
-| 31 | 14 | Program Monitor Colour | popup | Sequence space (fast) \| Match Source monitor | Sequence space | `directColour` |
-| 32 | 13 | (closes Advanced) | GROUP_END | | | |
-| 33 | 30 | Defaults | topic (GROUP_START, starts collapsed) | | | |
-| 34 | 31 | Save | button, `PF_ParamFlag_SUPERVISE` | "Save as Default for New Clips" | | writes the user defaults file |
-| 35 | 32 | Restore | button, `PF_ParamFlag_SUPERVISE` | "Restore Built-in Defaults" | | removes it |
-| 36 | 33 | (closes Defaults) | GROUP_END | | | |
+| 26 | 54 | Hide Mount | popup | On \| Off (full lens overlap) | On | `hideMount` |
+| 27 | 8 | (closes Stitching) | GROUP_END | | | |
+| 28 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
+| 29 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 \| Osmo 360 | Osmo 360 | `dlogmFit` |
+| 30 | 11 | Exposure | float slider | valid -6..+6, slider -3..+3, tenths, stops | 0 | `exposureStops` |
+| 31 | 12 | Render Device | popup | Auto \| CPU \| CUDA \| OpenCL | Auto | `renderDevice` |
+| 32 | 14 | Program Monitor Colour | popup | Sequence space (fast) \| Match Source monitor | Sequence space | `directColour` |
+| 33 | 13 | (closes Advanced) | GROUP_END | | | |
+| 34 | 30 | Defaults | topic (GROUP_START, starts collapsed) | | | |
+| 35 | 31 | Save | button, `PF_ParamFlag_SUPERVISE` | "Save as Default for New Clips" | | writes the user defaults file |
+| 36 | 32 | Restore | button, `PF_ParamFlag_SUPERVISE` | "Restore Built-in Defaults" | | removes it |
+| 37 | 33 | (closes Defaults) | GROUP_END | | | |
 
 The Defaults group is always last and its indices are defined relative to
 the Advanced terminator, so a control added to an earlier group moves them
 without renumbering; ids 20-29 are left to the Stitching group. The lens
 shading correction's ids (34-35) come after every id already shipped, the
 steady seam's (40-41) after those, the HDR peak's (46) after those, the
-transfer function's (50) after those, and Scene Light and Lens Focal (52-53)
-after those.
+transfer function's (50) after those, Scene Light and Lens Focal (52-53)
+after those, and Hide Mount (54) after those.
 See "User defaults for new clips" below.
+
+**Hide Mount (id 54).** Car, helmet or suction mount and a step at the seam: set Hide Mount to Off.
+Off drops the calibration's occlusion polygons, so the mount can show; On is the default and what every
+older project reads (`PrefsBlob` offset 58), and `osvtool render --no-occlusion` renders Off.
 
 An effect saved before ids 15-19 (or 34-35, or 40-41) existed has no stored
 value for them, so it picks up the control defaults above (DJI look, ghost

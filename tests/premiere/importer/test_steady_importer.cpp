@@ -17,7 +17,10 @@
 //     fixed sample frames, never from what Premiere asked for first;
 //   * a project saved before the controls existed renders exactly as it did,
 //     even in a process that has already measured and cached this clip's
-//     rotation and clip correction for newer settings.
+//     rotation and clip correction for newer settings;
+//   * Hide Mount (the calibration's occlusion mask) switched on a live clip
+//     renders what a clip opened with that setting renders, both ways, and
+//     the per-clip rotation it caches does not depend on it.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -346,6 +349,129 @@ TEST_CASE("a project saved before the steady corrections renders exactly as it d
     const Pixels again = renderOnce(legacy, 3203);
     INFO(differing(first, again) << " pixels differ");
     CHECK(again == first);
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
+// ---- Hide Mount: the calibration's occlusion mask as a Source Setting ---------
+
+/// steadyOnlyPrefs on the CPU renderer and the per-moment schedule, with the
+/// given Hide Mount.  CPU so the test never renders on the GPU; per moment so
+/// the only per-clip measurement is the lens rotation, which is exactly what
+/// the second test below is about.  `photometric` switches the sky seam fix
+/// and the lens shading correction back on (their defaults): both keep
+/// per-bucket measurements across a Source Settings change, measured through
+/// the analysis blend's occlusion mask.
+[[nodiscard]] static PrefsBlob hideMountPrefs(PrefsHideMount mode, bool photometric) {
+    PrefsBlob p = steadyOnlyPrefs();
+    p.renderDevice = static_cast<std::uint8_t>(PrefsRenderDevice::Cpu);
+    p.parallaxGrid = static_cast<std::uint8_t>(PrefsParallaxGrid::FollowsScene);
+    if (photometric) {
+        p.photoSeam = static_cast<std::uint8_t>(PrefsPhotoSeam::RimAndGain);
+        p.lensShading = static_cast<std::uint8_t>(PrefsLensShading::Auto);
+    }
+    p.hideMount = static_cast<std::uint8_t>(mode);
+    REQUIRE(p.sanitise());
+    REQUIRE(p.hideMountChoice() == mode);
+    return p;
+}
+
+TEST_CASE("Hide Mount switched on a live clip renders exactly what a clip opened with it renders",
+          "[importer][hidemount][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    // Every instance measures everything itself: what one renders cannot come
+    // from another instance's caches, only from its own history.
+    ScopedEnv noSharing("OPENOSV_STEADY_NO_SHARED_CACHE", "1");
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+    const PrefsBlob on = hideMountPrefs(PrefsHideMount::On, true);
+    const PrefsBlob off = hideMountPrefs(PrefsHideMount::Off, true);
+
+    // Instance X: On, then Off, then On again - Source Settings changes
+    // arriving on one live clip.
+    Pixels a;
+    Pixels b;
+    Pixels c;
+    {
+        auto clip = harness.openClip(sampleClipPath(), 3301);
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info, &on) == imNoErr);
+        harness.host().clearCache();
+        a = render(harness, clip, ppix, requestFor(20, imRenderIntent_Export), on);
+        harness.host().clearCache();
+        b = render(harness, clip, ppix, requestFor(20, imRenderIntent_Export), off);
+        harness.host().clearCache();
+        c = render(harness, clip, ppix, requestFor(20, imRenderIntent_Export), on);
+    }
+    // Instance Y: opened with Off from the start.
+    Pixels offFresh;
+    {
+        auto clip = harness.openClip(sampleClipPath(), 3302);
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info, &off) == imNoErr);
+        harness.host().clearCache();
+        offFresh = render(harness, clip, ppix, requestFor(20, imRenderIntent_Export), off);
+    }
+
+    // Off changes the frame where the occlusion polygons cut the lenses (the
+    // sample's mount sits there): the switch is not vacuous ...
+    const std::size_t changed = differing(a, b);
+    INFO(changed << " pixels differ between On and Off");
+    CHECK(changed > 1000u);
+    // ... nothing measured through the mask (the photometric field, the lens
+    // shading models, the per-bucket analyses) leaks into the Off frame ...
+    INFO(differing(b, offFresh) << " pixels differ between Off after On and Off from the start");
+    CHECK(b == offFresh);
+    // ... and back On, nothing measured without it leaks into the masked
+    // frame: it is the first frame, bit for bit.
+    INFO(differing(a, c) << " pixels differ between the first On render and the On render after Off");
+    CHECK(c == a);
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
+TEST_CASE("the lens rotation cached by a Hide Mount Off clip is the one an On clip measures",
+          "[importer][hidemount][steady][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    // The rotation cache is keyed by the file and the rig alone, so the
+    // rotation must not depend on Hide Mount: it is always measured through
+    // the calibration's mask.  Otherwise an On clip opened after an Off one
+    // would stitch with a rotation fitted to the mount's parallax.
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+    const PrefsBlob on = hideMountPrefs(PrefsHideMount::On, false);
+    const PrefsBlob off = hideMountPrefs(PrefsHideMount::Off, false);
+
+    const auto renderOnce = [&](const PrefsBlob& prefs, csSDK_int32 id) {
+        auto clip = harness.openClip(sampleClipPath(), id);
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+        harness.host().clearCache();
+        return render(harness, clip, ppix, requestFor(32, imRenderIntent_Export), prefs);
+    };
+    // A: On, measuring its own rotation and sharing nothing.
+    Pixels fresh;
+    {
+        ScopedEnv noSharing("OPENOSV_STEADY_NO_SHARED_CACHE", "1");
+        fresh = renderOnce(on, 3311);
+    }
+    // B: Off with the process-wide caches on - it measures the clip's
+    // rotation and leaves it there for every later instance ...
+    const Pixels unmasked = renderOnce(off, 3312);
+    CHECK(differing(fresh, unmasked) > 1000u);  // the test is not vacuous
+    // ... C: On, served that rotation from the cache: the frame A rendered.
+    const Pixels cached = renderOnce(on, 3313);
+    INFO(differing(fresh, cached) << " pixels differ");
+    CHECK(cached == fresh);
 
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }

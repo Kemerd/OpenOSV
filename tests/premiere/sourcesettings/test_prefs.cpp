@@ -382,6 +382,21 @@ TEST_CASE("every field round-trips through the translated blob", "[sourcesetting
         fixture.setPopup(kIndexLensFocal, 3);
         CHECK(translate(fixture, calibration).lensFocalChoice() == PrefsLensFocal::Calibration);
     }
+    SECTION("Hide Mount") {
+        // "On" -> On, "Off (full lens overlap)" -> Off: the popup is in enum
+        // order, through the BUILT module's TRANSLATE_PARAMS_TO_PREFS.
+        for (int item = 1; item <= OSV_SS_HIDE_MOUNT_COUNT; ++item) {
+            PrefsBuffer buffer;
+            fixture.setPopup(kIndexHideMount, item);
+            INFO("popup value " << item);
+            CHECK(translate(fixture, buffer).hideMountChoice() == static_cast<PrefsHideMount>(item - 1));
+        }
+        PrefsBuffer off;
+        fixture.setPopup(kIndexHideMount, 2);
+        const PrefsBlob blob = translate(fixture, off);
+        CHECK(blob.hideMountChoice() == PrefsHideMount::Off);
+        CHECK(blob.hideMount == 1u);  // the byte the importer keys its rig rebuild on
+    }
     SECTION("Shading Strength") {  // [WP-VIGNETTE]
         for (const double percent : {0.0, 1.0, 42.0, 99.0, 100.0}) {
             PrefsBuffer buffer;
@@ -1111,6 +1126,44 @@ TEST_CASE("the pure mapping's defaults are the blob's defaults", "[sourcesetting
     // Scene Light and Lens Focal: item 1, Auto.
     CHECK(c.sceneLight == OSV_SS_SCENE_LIGHT_DEFAULT);
     CHECK(c.lensFocal == OSV_SS_LENS_FOCAL_DEFAULT);
+    // Hide Mount: item 1, On.
+    CHECK(c.hideMount == OSV_SS_HIDE_MOUNT_DEFAULT);
+}
+
+TEST_CASE("the pure mapping round-trips Hide Mount", "[sourcesettings][mapping][hidemount]") {
+    // Both items, both ways.  The list is in enum order, so item N selects
+    // enum value N - 1: item 1 = On, item 2 = Off.
+    for (int item = 1; item <= OSV_SS_HIDE_MOUNT_COUNT; ++item) {
+        ControlValues c;
+        c.hideMount = item;
+        const PrefsBlob blob = prefsFromControls(c);
+        INFO("hide mount item " << item);
+        REQUIRE(blob.isValid());
+        CHECK(blob.hideMountChoice() == static_cast<PrefsHideMount>(item - 1));
+        CHECK(blob.hideMount == static_cast<std::uint8_t>(item - 1));
+        CHECK(controlsFromPrefs(blob).hideMount == item);
+    }
+    // The untouched control is the defaults' blob, byte for byte: a project
+    // whose Source Settings never saw the control renders as it always did.
+    CHECK(prefsFromControls(ControlValues{}) == PrefsBlob::defaults());
+    // Hostile popup values: On, never a blob needing repair.
+    for (const int hostile : {std::numeric_limits<int>::min(), -1, 0, 3, 77, std::numeric_limits<int>::max()}) {
+        ControlValues c;
+        c.hideMount = hostile;
+        PrefsBlob blob = prefsFromControls(c);
+        INFO("hostile popup value " << hostile);
+        CHECK(blob.hideMountChoice() == PrefsHideMount::On);
+        CHECK(blob.hideMount == 0u);
+        CHECK(blob.sanitise());
+    }
+    // An older project's blob (a zero byte) shows item 1, On - which is what
+    // it renders with; a corrupt byte shows On too.
+    PrefsBlob old = PrefsBlob::defaults();
+    old.hideMount = 0;
+    CHECK(controlsFromPrefs(old).hideMount == 1);
+    PrefsBlob corrupt = PrefsBlob::defaults();
+    corrupt.hideMount = 0xEE;
+    CHECK(controlsFromPrefs(corrupt).hideMount == 1);
 }
 
 TEST_CASE("the pure mapping round-trips Scene Light and Lens Focal", "[sourcesettings][mapping][scenelight]") {
@@ -1284,6 +1337,7 @@ TEST_CASE("the pure mapping never produces a blob that needs repair",
         c.photoStrengthPercent = static_cast<double>(v);
         c.seamInsetDeg = static_cast<double>(v);
         c.exposureStops = static_cast<double>(v);
+        c.hideMount = v;                                // Hide Mount
         PrefsBlob blob = prefsFromControls(c);
         INFO("hostile control value " << v);
         CHECK(blob.isValid());
