@@ -743,10 +743,13 @@ void addHideMountRow(HWND dialog, const DialogControls& c) noexcept {
                    60);
     fillCombo(dialog, kIdcHideMount, kModes, static_cast<int>(std::size(kModes)), c.hideMount);
     // The words the Source Settings effect cannot show (Premiere's panel has
-    // no tooltips); the same hint as OSV_SS_HIDE_MOUNT_HINT.
+    // no tooltips); the same hint as OSV_SS_HIDE_MOUNT_HINT, word for word.
+    // Off makes near edges step LESS, not vanish, so the hint says exactly
+    // that and no more.
     addRowTooltip(dialog, kIdcHideMount, kIdcStaticHideMount,
-                  L"On cuts the camera's mount out of the stitch. Off keeps the full lens overlap: the mount shows, "
-                  L"and the seam stops stepping on a car, helmet or suction mount.");
+                  L"On cuts the camera's mount out of the stitch. Off gives the seam the full lens overlap back where "
+                  L"the mask left none, so near edges on a car, helmet or suction mount step less there; the mount "
+                  L"can show.");
 }
 
 /// Read the Hide Mount row back; a missing row keeps what the dialog opened

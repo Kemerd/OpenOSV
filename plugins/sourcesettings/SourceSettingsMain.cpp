@@ -809,9 +809,10 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     // ---- 26. Hide Mount ----------------------------------------------------
     // Whether the calibration's occlusion polygons cut the camera's mount
     // out of the stitch (On, the default and what every older project
-    // renders with) or the seam keeps the full lens overlap (Off: a car,
-    // helmet or suction mount stops stepping at a forced cut; the mount
-    // shows).
+    // renders with) or the seam keeps the full lens overlap (Off: on a car,
+    // helmet or suction mount the near edges step less where the mask used
+    // to force a cut, though along-seam disparity remains; the mount can
+    // show).
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Hide Mount", OSV_SS_HIDE_MOUNT_COUNT, OSV_SS_HIDE_MOUNT_DEFAULT, OSV_SS_HIDE_MOUNT_ITEMS,
                   kStaticFlags, OSV_SS_ID_HIDE_MOUNT);

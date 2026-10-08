@@ -467,8 +467,12 @@
 #define OSV_SS_HIDE_MOUNT_COUNT 2
 #define OSV_SS_HIDE_MOUNT_DEFAULT 1
 /* The hint the hosts that show tooltips put on the control (the importer's
- * dialog, the OpenFX parameter). */
-#define OSV_SS_HIDE_MOUNT_HINT "On cuts the camera's mount out of the stitch. Off keeps the full lens overlap: the mount shows, and the seam stops stepping on a car, helmet or suction mount."
+ * dialog, the OpenFX parameter).  It promises only what Off was measured to
+ * do: near edges step LESS where the mask left no overlap (a car roof line on
+ * the proxy: 0.97 -> 0.63 deg upper, 2.65 -> 2.30 deg lower), not that the
+ * step goes away - near-field disparity along the seam remains - and the
+ * mount CAN show, depending on where the seam runs. */
+#define OSV_SS_HIDE_MOUNT_HINT "On cuts the camera's mount out of the stitch. Off gives the seam the full lens overlap back where the mask left none, so near edges on a car, helmet or suction mount step less there; the mount can show."
 
 /* ==========================================================================
  *  Checkbox and slider ranges / defaults

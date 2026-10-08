@@ -1004,7 +1004,7 @@ plugin org.openosv.OSVSource
       OfxParamPropAnimates : int = [0]
       OfxParamPropChoiceOption : string = ["On", "Off (full lens overlap)"]
       OfxParamPropDefault : int = [0]
-      OfxParamPropHint : string = ["On cuts the camera's mount out of the stitch. Off keeps the full lens overlap: the mount shows, and the seam stops stepping on a car, helmet or suction mount."]
+      OfxParamPropHint : string = ["On cuts the camera's mount out of the stitch. Off gives the seam the full lens overlap back where the mask left none, so near edges on a car, helmet or suction mount step less there; the mount can show."]
       OfxParamPropParent : string = ["stitchGroup"]
       OfxParamPropScriptName : string = ["hideMount"]
       OfxParamPropType : string = ["OfxParamTypeChoice"]
