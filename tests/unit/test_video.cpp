@@ -18,6 +18,8 @@
 #include "osv/core/Result.h"
 #include "osv/meta/FormatInfo.h"
 #include "osv/meta/MetadataTrack.h"
+#include "osv/render/ParallaxWarp.h"
+#include "osv/render/SeamAnalysis.h"
 #include "osv/video/Decoder.h"
 #include "osv/video/DualStreamReader.h"
 #include "osv/video/HwAccel.h"
@@ -1805,6 +1807,65 @@ TEST_CASE("the decoder's Debug line carries the picture's fingerprint", "[video]
     CHECK(line.find("'" + osvtest::sampleLrf().filename().string() + "'") != std::string::npos);
     // The open itself is at Debug too, and now reaches a sink.
     CHECK(captured.count("video: opened track 1 of ") == 1u);
+}
+
+TEST_CASE("a refused parallax measurement's consistent share is rebuilt exactly from its cell counts",
+          "[verify][parallax]") {
+    // The importer's per-bucket refusal line reports the share of consistent
+    // flow, but a refusal returns an Error, not the grid that held it.  It is
+    // rebuilt from what parallaxFromBands hands out on the side: the sum of
+    // the per-cell consistent pixel counts over the band pixels both lenses
+    // cover.  That must be EXACTLY the grid's own consistentFraction(), which
+    // an accepted measurement lets this test compare.
+    constexpr std::uint32_t kW = 1024;
+    constexpr std::uint32_t kH = 64;
+    render::LensBands bands;
+    bands.w = kW;
+    bands.h = kH;
+    bands.mapH = 1024;
+    bands.rowOffset = (bands.mapH - kH) / 2u;
+    const std::size_t n = static_cast<std::size_t>(kW) * kH;
+    for (int lens = 0; lens < 2; ++lens) {
+        bands.luma[lens].assign(n, 0.0f);
+        bands.alpha[lens].assign(n, 1.0f);
+    }
+    // Smooth texture (sums of incommensurate sines) the classical solver can
+    // lock onto; lens 1 sees it two columns further on - a pure parallax.
+    const auto texture = [](double x, double y) {
+        return static_cast<float>(0.5 + 0.18 * std::sin(x * 0.21 + y * 0.07) + 0.12 * std::sin(x * 0.053 - y * 0.31) +
+                                  0.08 * std::sin((x + y) * 0.137));
+    };
+    for (std::uint32_t y = 0; y < kH; ++y) {
+        for (std::uint32_t x = 0; x < kW; ++x) {
+            const std::size_t i = static_cast<std::size_t>(y) * kW + x;
+            bands.luma[0][i] = texture(x, y);
+            bands.luma[1][i] = texture(static_cast<double>(x) + 2.0, y);
+            // A stretch only one lens covers, so co-visible != all pixels.
+            if (x < 96) {
+                bands.alpha[1][i] = 0.0f;
+            }
+        }
+    }
+    render::ParallaxWarpParams params;
+    params.backend = render::FlowBackendKind::Classical;
+    render::ParallaxCellStats cells;
+    auto grid = render::parallaxFromBands(bands, params, nullptr, 0.0, &cells);
+    INFO((grid.ok() ? std::string("accepted") : grid.error().message));
+    REQUIRE(grid.ok());
+    REQUIRE(cells.valid());
+    // ---- the rebuild, as the importer does it -----------------------------------------
+    std::uint64_t covisible = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        covisible += (bands.alpha[0][i] > 0.5f && bands.alpha[1][i] > 0.5f) ? 1u : 0u;
+    }
+    std::uint64_t consistent = 0;
+    for (const std::uint32_t p : cells.pixels) {
+        consistent += p;
+    }
+    CHECK(covisible == grid.value().totalPixels);
+    CHECK(consistent == grid.value().consistentPixels);
+    CHECK(static_cast<double>(consistent) / static_cast<double>(covisible) == grid.value().consistentFraction());
+    CHECK(covisible < n);  // the one-lens stretch really was left out
 }
 
 // -----------------------------------------------------------------------------
