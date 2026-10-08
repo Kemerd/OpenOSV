@@ -271,7 +271,8 @@ void hashMountParams(Hasher& h, const render::MountMaskParams& p) noexcept {
 
 /// Cache key of a clip correction: the file, the rig it is measured through
 /// (rotation and mount mask included), the blend, the sample frames and the
-/// parameters.
+/// parameters.  c2: the clip grid carries the per-column guard and its table
+/// share (ClipSteady::gridTable), which a c1 correction never had.
 [[nodiscard]] std::string clipKey(const FileIdentity& id, const geom::LensRig& rig, const geom::BlendParams& blend,
                                   const std::vector<std::uint32_t>& frames, const render::ClipSteadyParams& params) {
     Hasher h;
@@ -282,7 +283,7 @@ void hashMountParams(Hasher& h, const render::MountMaskParams& p) noexcept {
         h.u64(f);
     }
     hashClipParams(h, params);
-    return std::format("c1|{}|{}|{}|{}", id.size, id.mtime, hex64(h.value()), id.path);
+    return std::format("c2|{}|{}|{}|{}", id.size, id.mtime, hex64(h.value()), id.path);
 }
 
 // =============================================================================
@@ -1407,13 +1408,18 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
             std::lock_guard<std::mutex> lock(m_mutex);
             return msSince(m_requestedAt);
         }();
+        // The grid's line says how many of its columns the per-column guard
+        // handed to the seam table (render::guardGridWithTable).
+        const std::string gridWords =
+            clip->grid ? std::format("yes ({} of {} columns to the seam table)", clip->guardedColumns, clip->grid->w)
+                       : std::string("no");
         PluginLog::info("steady: '{}': clip correction ready {:.0f} ms after the first request ({}; {} sample frames "
                         "{}, {} grids accepted; decode {:.0f} / measure {:.0f} / finish {:.0f} ms): grid {}, seam "
                         "table {}, seam {}; Auto: {}{}",
                         clipName, sinceRequest, produce ? std::format("measured in {:.0f} ms", msSince(tJob))
                                                         : std::string("another instance measured it"),
                         clip->frames.size(), frameList(clip->frames), clip->acceptedGrids, clip->decodeMs,
-                        clip->measureMs, clip->finishMs, clip->grid ? "yes" : "no", clip->seamTable ? "yes" : "no",
+                        clip->measureMs, clip->finishMs, gridWords, clip->seamTable ? "yes" : "no",
                         clip->seam ? "yes" : "no", render::describeSteadyDecision(clip->decision),
                         notesSuffix(clip->sampleNotes));
     }

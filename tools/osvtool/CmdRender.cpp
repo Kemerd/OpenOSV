@@ -951,8 +951,14 @@ int runRender(const RenderOptions& o) {
     const auto t0 = std::chrono::steady_clock::now();
     int exitCode = kExitOk;
     std::vector<float> seamTable;
-    render::ParallaxWarpGrid warpGrid;
+    std::vector<float> seamConfidence;  // the table's per-column confidence (the per-column guard's)
+    render::ParallaxWarpGrid warpGrid;  // as measured
     bool haveWarp = false;
+    // The grid as it renders - after the per-column guard with the frame's
+    // seam table (render::guardGridWithTable) - and the table share under
+    // it, exactly as the importer builds a bucket's correction.
+    render::ParallaxWarpGrid appliedGrid;
+    std::vector<float> gridTable;
     render::BlendSeam blendSeam;  // the carved seam in force (--seam-carve)
     // [WP-PHOTO] --photo: the parameters, the per-clip field history (EMA,
     // cross-fade, the rim median over the run of buckets - exactly the
@@ -1070,12 +1076,13 @@ int runRender(const RenderOptions& o) {
         const bool analyse = (o.seamSearch || o.gain || o.parallax || o.seamCarve) &&
                              ((tf - first) % static_cast<std::uint32_t>(std::max(1, o.seamInterval)) == 0);
         // 2-D parallax correction first.  When it yields a grid, the grid
-        // REPLACES the seam table rather than composing with it - the same
-        // policy as the Premiere importer, so this command's A/B shows the
-        // picture a user actually gets there.  Measured on the sample clip
-        // (whole-band overlap NCC, frames 0 / 32 / 64): table alone
-        // 0.897 / 0.902 / 0.900, grid alone 0.916 / 0.918 / 0.921, table +
-        // grid 0.906 / 0.902 / 0.909.  See ImporterInstance::renderFrame.
+        // REPLACES the seam table rather than composing with it - except in
+        // the columns the grid could not measure, where the table is sure and
+        // found a disparity the grid missed, which the per-column guard hands
+        // to the table - the same policy as the Premiere importer, so this
+        // command's A/B shows the picture a user actually gets there.  Composing the two everywhere costs the
+        // 6K sample (whole-band overlap NCC, OSV frame 60: grid alone 0.9197,
+        // table + grid 0.9128).  See ImporterInstance::applyAnalyses.
         //
         // A refused grid is NOT fatal: on featureless content the flow cannot
         // be trusted and buildParallaxWarp says so, and the seam table (when
@@ -1103,15 +1110,45 @@ int runRender(const RenderOptions& o) {
         }
         const bool useWarp = o.parallax && haveWarp;
 
-        if (analyse && o.seamSearch && !useWarp) {
+        // The seam table: the correction where the grid is refused or off,
+        // and under an accepted grid the per-column guard's - so it is
+        // measured on every analysed frame, as the importer measures it for
+        // every bucket with Seam Search on.
+        if (analyse && o.seamSearch) {
             render::SeamSearchParams sp;
             auto profile = render::searchSeam(P.rig, pair.value(), P.blendParams, sp, *P.pool);
             if (profile.ok()) {
-                seamTable = profile.value().shiftDeg;
-                log::debug("frame {}: seam meanNcc {:.3f}, accepted {}", f, profile.value().meanNcc,
-                           profile.value().acceptedColumns);
+                render::SeamProfile& p = profile.value();
+                log::debug("frame {}: seam meanNcc {:.3f}, accepted {}", f, p.meanNcc, p.acceptedColumns);
+                seamTable = std::move(p.shiftDeg);
+                seamConfidence = std::move(p.confidence);
             } else {
                 log::warn("frame {}: seam search failed: {}", f, profile.error().message);
+            }
+        }
+        // The grid as it renders: the per-column guard with this frame's
+        // table hands the table the columns the grid could not measure where
+        // the table is sure and found a disparity the grid missed, and leaves
+        // the table's share under the grid (1 - strength plus those columns).
+        // Without a table, the grid alone.
+        if (analyse && useWarp) {
+            appliedGrid = warpGrid;
+            gridTable.clear();
+            if (o.seamSearch && !seamTable.empty()) {
+                auto guarded = render::guardGridWithTable(warpGrid, seamTable, seamConfidence);
+                if (guarded.ok()) {
+                    render::GuardedCorrection& g = guarded.value();
+                    log::info("frame {}: the seam table under the parallax grid takes {} of {} grid columns (mean "
+                              "weight {:.2f})",
+                              f, g.guardedColumns, warpGrid.w, g.meanGuard);
+                    if (g.changed) {
+                        appliedGrid = std::move(g.grid);
+                    }
+                    gridTable = std::move(g.table);
+                } else {
+                    log::warn("frame {}: per-column guard refused ({}); the grid alone", f,
+                              log::safe(guarded.error().message));
+                }
             }
         }
         // [WP-VIGNETTE] The lens shading correction for this frame, FIRST:
@@ -1186,12 +1223,17 @@ int runRender(const RenderOptions& o) {
             render::WarpGridView warpView;
             render::SeamCorrection correction;
             if (useWarp) {
-                warpView.uv = warpGrid.uv.data();
-                warpView.w = warpGrid.w;
-                warpView.h = warpGrid.h;
-                warpView.latMinRad = warpGrid.latMinRad;
-                warpView.latMaxRad = warpGrid.latMaxRad;
+                // The correction on screen: the guarded grid and the table
+                // share under it.
+                warpView.uv = appliedGrid.uv.data();
+                warpView.w = appliedGrid.w;
+                warpView.h = appliedGrid.h;
+                warpView.latMinRad = appliedGrid.latMinRad;
+                warpView.latMaxRad = appliedGrid.latMaxRad;
                 correction.warp = &warpView;
+                if (!gridTable.empty()) {
+                    correction.seamShiftDeg = &gridTable;
+                }
             } else if (o.seamSearch && !seamTable.empty()) {
                 correction.seamShiftDeg = &seamTable;
             }
@@ -1231,10 +1273,11 @@ int runRender(const RenderOptions& o) {
             }
         }
         // The builder persists across frames, so both corrections are set
-        // explicitly every frame: whichever is in force, the other is off.
+        // explicitly every frame: the guarded grid and the table share under
+        // it (none when empty), or the table alone.
         if (useWarp) {
-            builder.warp(warpGrid.uv, warpGrid.w, warpGrid.h, warpGrid.latMinRad, warpGrid.latMaxRad);
-            builder.seam(std::vector<float>{});
+            builder.warp(appliedGrid.uv, appliedGrid.w, appliedGrid.h, appliedGrid.latMinRad, appliedGrid.latMaxRad);
+            builder.seam(gridTable);
         } else {
             builder.clearWarp();
             if (o.seamSearch) {
@@ -1246,7 +1289,7 @@ int runRender(const RenderOptions& o) {
             // [WP-SEAMTOOLS] Near / Far Offset into the warp grid in force,
             // Seam Smoothing on the seam - both no-ops at their defaults.
             if (tools.offsetOn()) {
-                auto shifted = render::seamOffsetGrid(useWarp ? &warpGrid : nullptr, blendSeam, tools.nearOffsetDeg,
+                auto shifted = render::seamOffsetGrid(useWarp ? &appliedGrid : nullptr, blendSeam, tools.nearOffsetDeg,
                                                       tools.farOffsetDeg);
                 if (shifted.ok()) {
                     const render::ParallaxWarpGrid& g = shifted.value();

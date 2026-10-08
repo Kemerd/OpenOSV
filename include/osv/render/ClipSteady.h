@@ -37,7 +37,11 @@
 //
 //   grid        the per-cell, per-component median of the samples' accepted
 //               grids (a cell the benefit gate zeroed in most samples stays
-//               zero, since zero is then the median);
+//               zero, since zero is then the median), then the per-column
+//               guard with the median of every sample's table: the columns
+//               most samples could not measure go to the table where it is
+//               sure and found a disparity the grid missed (ParallaxWarp.h,
+//               guardGridWithTable);
 //   seam table  the per-column median of the samples' tables;
 //   seam        each sample's bands carved through the CLIP correction with
 //               no temporal prior, then the per-column median of the carves
@@ -223,8 +227,10 @@ struct LensRotationMeasurement {
 /// Every grid must share one layout.  The diagnostics describe the median
 /// (disparities over the whole grid) and the summed cost and pixel counts of
 /// the samples; the strength is the median of the samples' strengths (a
-/// non-finite one counts as 0).  InvalidArgument for no grid or mismatched
-/// layouts.
+/// non-finite one counts as 0), and the untrusted share of each column
+/// (ParallaxWarpGrid::untrustedShare) the median of the samples' - empty
+/// unless every sample carries one per column.  InvalidArgument for no grid
+/// or mismatched layouts.
 [[nodiscard]] Result<ParallaxWarpGrid> clipParallaxGrid(const std::vector<const ParallaxWarpGrid*>& grids);
 
 /// The per-column median of 1-D seam tables (null entries skipped; equal
@@ -343,8 +349,9 @@ struct SteadyDecision {
 struct ClipSteadyParams {
     ParallaxWarpParams parallax;  ///< The per-sample grid, exactly as the importer measures one.
     bool parallaxOn = true;       ///< Measure the grid at all.
-    /// The seam: a table for the samples without an accepted grid, and the
-    /// carve.  Off leaves both out (the importer's Seam Search off).
+    /// The seam: every sample's table (the correction of the samples without
+    /// an accepted grid, and the per-column guard's under the clip grid) and
+    /// the carve.  Off leaves all of it out (the importer's Seam Search off).
     bool seamOn = true;
     SeamSearchParams seamSearch;  ///< The per-sample seam-shift table.
     SeamCarveParams carve;        ///< The carve (the importer's widths; its penalty is not used).
@@ -374,14 +381,25 @@ struct ClipSteady {
     /// One line per planned sample that could not be decoded (what replaced
     /// it, or that it was skipped); empty when every one decoded.
     std::vector<std::string> sampleNotes;
-    /// Clip grid; null when not measured or refused.  Its strength (the
-    /// median of the accepted samples' structured-gate strengths,
-    /// ParallaxWarpGrid::strength) below 1 means the clip seam table fills
-    /// the rest (render::seamTableUnderGrid), as the importer renders it.
+    /// Clip grid as it renders; null when not measured or refused.  The
+    /// per-cell median of the accepted samples' grids, after the per-column
+    /// guard (render::guardGridWithTable) with the median of every sample's
+    /// table and confidence when the seam is on: the columns most samples
+    /// could not measure, where the tables are sure and found a disparity the
+    /// grid missed, are given up to the table.  Its strength is the median
+    /// of the samples' structured-gate strengths (ParallaxWarpGrid::strength).
     std::shared_ptr<const ParallaxWarpGrid> grid;
+    /// The seam table share that renders WITH the clip grid: 1 - its
+    /// strength everywhere plus the columns the guard handed over (the
+    /// GuardedCorrection's table).  Null or empty when nothing of the table
+    /// applies under the grid (a fully trusted grid that guarded no column,
+    /// no table, or no grid).
+    std::shared_ptr<const std::vector<float>> gridTable;
+    std::uint32_t guardedColumns = 0;                    ///< Clip grid columns handed to the table (diagnostics).
     std::uint32_t acceptedGrids = 0;                     ///< Samples whose own grid was accepted.
-    /// Clip seam table: the median of the tables of the samples without a
-    /// grid or with a partly trusted one; null when none was needed or found.
+    /// Clip seam table where there is no clip grid: the median of the tables
+    /// of the samples without a grid or with a partly trusted one; null when
+    /// none was needed or found.
     std::shared_ptr<const std::vector<float>> seamTable;
     std::shared_ptr<const BlendSeam> seam;               ///< Clip carved seam; null when seamOn is off or it failed.
     SteadyDecision decision;                             ///< The Auto rule's verdict.

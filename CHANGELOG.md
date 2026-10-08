@@ -79,11 +79,22 @@ classical flow and the seam-shift table, not osvtool's neural default.
   from two different moments of the drive score 10-28 % and are all
   refused (the bar is 30 %). The 6K sample and the night drive render byte for byte as
   before; the lamp pole beside the 8K day drive's seam stays straight (0.18
-  px RMS) now that the correction applies there. Known: where the proxy now
-  uses the correction instead of the table, the car's hood matches less well
-  across the seam (overlap NCC 0.93-0.96 against the table's 0.96-0.97);
-  keeping the table under the correction scores 0.98-0.99 and is the next
-  step.
+  px RMS) now that the correction applies there. Where the proxy uses the
+  correction instead of the seam table, the car's hood matched less well
+  across the seam (overlap NCC 0.91-0.97 against the table's 0.96-0.97): the
+  flow does not follow the hood's 2.5° offset. Keeping the table under the
+  whole correction scores 0.98-0.99 there but costs the 6K sample (OSV frame
+  60: 0.913 against 0.920), so instead the seam table now takes over only
+  the stretches of the seam the correction could not measure, where the
+  table is sure of its match and found an offset the correction missed. The
+  hood goes to 0.94-0.98 (median of 15 moments 0.967, from 0.951) and the
+  whole seam band to 0.988-0.996 (median 0.993, from 0.989); the 8K
+  original gains on its car body too, the night drive holds, and the 6K
+  sample renders byte for byte as before (no stretch qualifies there). Where
+  a moment hands a stretch between the correction and the table, the table
+  now glides with the correction instead of stepping at the moment's first
+  frame: on the car body the change at bucket starts stays within 1.11x the
+  change inside buckets (1.05x before, 1.11x with no correction at all).
 * A hardware-decoded picture that FFmpeg flags as damaged, or that is
   predicted from one, is decoded again in software instead of being
   delivered. As with any other hardware decode failure, on the importer's

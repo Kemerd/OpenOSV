@@ -518,6 +518,52 @@ TEST_CASE("a per-clip measurement skips a sample it cannot decode and fails only
     }
 }
 
+TEST_CASE("with the seam on, the clip grid renders after the per-column guard and the fallback table is unchanged",
+          "[steady][clip][synthetic][guard]") {
+    // One picture of a textured sky seen by both lenses with no parallax:
+    // every sample's grid measures every column, so the guard has nothing to
+    // hand over and the clip correction is the grid alone - exactly what it
+    // was before every sample also measured a seam table.
+    ThreadPool pool;
+    auto rig = makeSyntheticRig(1024);
+    REQUIRE(rig.ok());
+    const SynthPair frame = synthPair(rig.value(), texturedSky, pool);
+    geom::BlendParams blend;
+    blend.useOcclusionMask = false;
+    const std::vector<std::uint32_t> frames = render::clipSampleFrames(65, {}, 9);
+    const render::ClipFrameSource source = [&frame](std::uint32_t f) -> Result<video::FramePair> {
+        video::FramePair p = frame.pair;
+        p.index = f;
+        return p;
+    };
+    render::ClipSteadyParams params;
+    params.parallax.backend = render::FlowBackendKind::Classical;
+    params.seamOn = true;
+
+    auto measured = render::measureClipSteady(rig.value(), blend, frames, source, params, pool);
+    REQUIRE(measured.ok());
+    const render::ClipSteady& c = measured.value();
+    INFO("accepted " << c.acceptedGrids << " of " << c.frames.size() << ", guarded columns " << c.guardedColumns);
+    REQUIRE(c.grid != nullptr);
+    REQUIRE(c.grid->valid());
+    // The clip grid carries the median untrusted share the guard read.
+    REQUIRE(c.grid->untrustedShare.size() == c.grid->w);
+    CHECK(c.guardedColumns <= c.grid->w);
+    if (c.acceptedGrids == c.frames.size() && c.grid->strength >= 1.0) {
+        // Every sample accepted at full strength: no refused sample, so no
+        // fallback table - as before - and nothing of a table under the grid
+        // unless the guard handed it columns.
+        CHECK(c.seamTable == nullptr);
+        if (c.guardedColumns == 0u) {
+            CHECK((c.gridTable == nullptr || c.gridTable->empty()));
+        }
+    }
+    // Whatever the guard decided, its share has the table's width.
+    if (c.gridTable) {
+        CHECK(c.gridTable->size() == static_cast<std::size_t>(params.seamSearch.band.equirectW));
+    }
+}
+
 TEST_CASE("the clip correction's medians are medians, and a median seam is a valid seam", "[steady][clip]") {
     SECTION("grid") {
         render::ParallaxWarpGrid a;

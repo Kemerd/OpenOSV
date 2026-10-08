@@ -490,6 +490,25 @@ Result<ParallaxWarpGrid> clipParallaxGrid(const std::vector<const ParallaxWarpGr
     }
     out.measuredCells = static_cast<std::uint32_t>(std::lround(medianOf(measured)));
     out.gatedCells = static_cast<std::uint32_t>(std::lround(medianOf(gated)));
+    // ---- the untrusted share per column: the median of the samples' ----------------
+    // A column most samples could not measure is one the clip grid did not
+    // measure either (its cells are medians of filled or gated values), which
+    // is what the per-column guard asks.  Only when every sample says it.
+    out.untrustedShare.clear();
+    bool allShares = true;
+    for (const ParallaxWarpGrid* g : in) {
+        allShares = allShares && g->untrustedShare.size() == out.w;
+    }
+    if (allShares) {
+        out.untrustedShare.assign(out.w, 0.0f);
+        for (std::uint32_t c = 0; c < out.w; ++c) {
+            for (std::size_t k = 0; k < in.size(); ++k) {
+                const float v = in[k]->untrustedShare[c];
+                column[k] = std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;  // not a number: trusted
+            }
+            out.untrustedShare[c] = medianInPlace(column);
+        }
+    }
     // Each sample's grid already carries its own structured-gate strength, so
     // the per-cell median is a median of scaled corrections; its strength is
     // the median of the samples' - all 1 gives exactly 1, and the clip seam
@@ -763,13 +782,15 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
 
     // ---- one pass over the samples ------------------------------------------------
     // Per sample: its uncorrected bands (kept for the carve and the verdict),
-    // its own grid, its own seam table (only where it has no grid), and the
-    // usable rim the carve is steered by.
+    // its own grid, its own seam table and the table's per-column confidence
+    // (the correction where it has no grid, the per-column guard's under its
+    // grid), and the usable rim the carve is steered by.
     struct Sample {
         std::uint32_t frame = 0;
         LensBands bands;
         std::shared_ptr<const ParallaxWarpGrid> grid;
         std::shared_ptr<const std::vector<float>> table;
+        std::shared_ptr<const std::vector<float>> confidence;  ///< Same length as `table`, or null.
         std::shared_ptr<const PhotoSeamField> rim;
     };
     std::vector<Sample> samples;
@@ -811,13 +832,20 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
                 onSampleGrid(frame, s.grid);
             }
         }
-        if (params.seamOn && (!s.grid || s.grid->strength < 1.0)) {
+        if (params.seamOn) {
             // The seam table is the correction of a sample without a grid,
-            // and the remaining share under a partly trusted one - exactly
-            // as the importer builds a bucket's correction.
+            // the remaining share under a partly trusted one, and the
+            // per-column guard's under an accepted one - exactly as the
+            // importer builds a bucket's correction, which measures the table
+            // for every bucket with Seam Search on.
             auto profile = searchSeam(rig, pair, blend, params.seamSearch, pool);
             if (profile.ok() && !profile.value().shiftDeg.empty()) {
-                s.table = std::make_shared<const std::vector<float>>(std::move(profile).value().shiftDeg);
+                SeamProfile& p = profile.value();
+                // The confidence only when it is the table's, column for column.
+                if (p.confidence.size() == p.shiftDeg.size()) {
+                    s.confidence = std::make_shared<const std::vector<float>>(std::move(p.confidence));
+                }
+                s.table = std::make_shared<const std::vector<float>>(std::move(p.shiftDeg));
             }
         }
         if (params.seamOn && params.rimCost) {
@@ -868,9 +896,12 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
     }
 
     // ---- the clip seam table (the fallback where there is no clip grid) -------------
+    // The median of the tables of the samples without a grid or with a partly
+    // trusted one, as before every sample measured a table: the samples a
+    // refused clip grid would have rendered with their tables.
     std::vector<const std::vector<float>*> tables;
     for (const Sample& s : samples) {
-        if (s.table) {
+        if (s.table && (!s.grid || s.grid->strength < 1.0)) {
             tables.push_back(s.table.get());
         }
     }
@@ -881,20 +912,52 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
         }
     }
 
+    // ---- the per-column guard on the clip grid --------------------------------------------
+    // Every sample's table and confidence, as the per-column median, against
+    // the clip grid's per-column untrusted share (the median of the
+    // samples'): the columns most samples could not measure, where the
+    // tables are sure and found a disparity the grid missed, go to the table.
+    // What renders is the guarded grid and the table share under it (1 -
+    // strength everywhere plus those columns); without tables (seam off, or
+    // none measured) the grid renders alone.
+    if (out.grid && params.seamOn) {
+        std::vector<const std::vector<float>*> allTables;
+        std::vector<const std::vector<float>*> allConfidences;
+        for (const Sample& s : samples) {
+            // A table counts only with its confidence, so the two medians
+            // are over the same samples.
+            if (s.table && s.confidence) {
+                allTables.push_back(s.table.get());
+                allConfidences.push_back(s.confidence.get());
+            }
+        }
+        if (!allTables.empty()) {
+            auto table = clipSeamTable(allTables);
+            auto confidence = clipSeamTable(allConfidences);  // the same per-column median
+            if (table.ok() && confidence.ok()) {
+                OSV_TRY_ASSIGN(GuardedCorrection guarded,
+                               guardGridWithTable(*out.grid, table.value(), confidence.value()));
+                out.guardedColumns = guarded.guardedColumns;
+                if (guarded.changed) {
+                    out.grid = std::make_shared<const ParallaxWarpGrid>(std::move(guarded.grid));
+                }
+                if (!guarded.table.empty()) {
+                    out.gridTable = std::make_shared<const std::vector<float>>(std::move(guarded.table));
+                }
+            }
+        }
+    }
+
     // ---- the correction the clip renders with -------------------------------------------
-    // The importer's rule: the grid when there is one, else the table - and
-    // under a partly trusted grid (strength < 1) the table's remaining share
-    // as well (seamTableUnderGrid), as the importer applies the clip grid.
+    // The importer's rule: the grid when there is one, with the table share
+    // the guard leaves under it (gridTable), else the table - exactly as the
+    // importer applies it.
     const WarpGridView clipView = viewOf(out.grid.get());
     SeamCorrection clipCorrection;
-    std::vector<float> clipTableShare;
     if (clipView.valid()) {
         clipCorrection.warp = &clipView;
-        if (out.seamTable && out.grid->strength < 1.0) {
-            seamTableUnderGrid(*out.seamTable, out.grid->strength, clipTableShare);
-            if (!clipTableShare.empty()) {
-                clipCorrection.seamShiftDeg = &clipTableShare;
-            }
+        if (out.gridTable && !out.gridTable->empty()) {
+            clipCorrection.seamShiftDeg = out.gridTable.get();
         }
     } else if (out.seamTable) {
         clipCorrection.seamShiftDeg = out.seamTable.get();
@@ -904,9 +967,10 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
     {
         std::vector<WarpGridView> ownViews(samples.size());
         // Each sample's own correction exactly as a bucket measured on it
-        // renders in the importer: its grid, its table where it has none, and
-        // the table's remaining share under a partly trusted grid.
-        std::vector<std::vector<float>> ownTableShares(samples.size());
+        // renders in the importer: its grid after the per-column guard with
+        // its own table, the table share under it (1 - strength plus the
+        // columns handed over), and its table where it has no grid.
+        std::vector<GuardedCorrection> ownGuarded(samples.size());
         std::vector<SteadySample> judged;
         judged.reserve(samples.size());
         for (std::size_t i = 0; i < samples.size(); ++i) {
@@ -916,10 +980,18 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
             ownViews[i] = viewOf(samples[i].grid.get());
             if (ownViews[i].valid()) {
                 ss.own.warp = &ownViews[i];
-                if (samples[i].table && samples[i].grid->strength < 1.0) {
-                    seamTableUnderGrid(*samples[i].table, samples[i].grid->strength, ownTableShares[i]);
-                    if (!ownTableShares[i].empty()) {
-                        ss.own.seamShiftDeg = &ownTableShares[i];
+                if (samples[i].table) {
+                    // Without a confidence the guard keeps the rule before it
+                    // (the 1 - strength share of the table).
+                    static const std::vector<float> kNoConfidence;
+                    OSV_TRY_ASSIGN(ownGuarded[i],
+                                   guardGridWithTable(*samples[i].grid, *samples[i].table,
+                                                      samples[i].confidence ? *samples[i].confidence : kNoConfidence));
+                    if (ownGuarded[i].changed) {
+                        ownViews[i] = viewOf(&ownGuarded[i].grid);  // the vector never grows: stable
+                    }
+                    if (!ownGuarded[i].table.empty()) {
+                        ss.own.seamShiftDeg = &ownGuarded[i].table;
                     }
                 }
             } else if (samples[i].table) {
