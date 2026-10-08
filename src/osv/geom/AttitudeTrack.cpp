@@ -37,8 +37,10 @@ const char* worldUpName(WorldUp up) noexcept {
 }
 
 std::string attitudeConventionName(const AttitudeConvention& convention) {
-    return std::format("{}/{}/{}", quatOrderName(convention.order), attitudeSenseName(convention.sense),
-                       worldUpName(convention.up));
+    // The "/rig" suffix keeps the relabelled reading apart from the plain
+    // reading with the same order / sense / up in every log line.
+    return std::format("{}/{}/{}{}", quatOrderName(convention.order), attitudeSenseName(convention.sense),
+                       worldUpName(convention.up), convention.rigAxes ? "/rig" : "");
 }
 
 Vec3d worldUpVector(WorldUp up) noexcept {
@@ -51,11 +53,42 @@ Vec3d worldUpVector(WorldUp up) noexcept {
     return Vec3d{0.0, 0.0, 1.0};
 }
 
+/**
+ * @brief Read one stored attitude quaternion as a body -> world rotation.
+ *
+ * Three steps, each a switch of @p convention:
+ *
+ *   1. component order: the four stored floats f0..f3 become a unit
+ *      quaternion (XYZW: (w; x, y, z) = (f3; f0, f1, f2)).  extrinsicQuat()
+ *      already turns an absent, non-finite or zero record into identity;
+ *   2. sense: a world -> body rotation is inverted, so the result always
+ *      maps body directions into the world;
+ *   3. rigAxes: the IMU's axes are relabelled into the rig's on both sides,
+ *      K * R * K^T with K: (x, y, z) -> (y, -z, -x).  K is a proper
+ *      rotation (det +1), so the conjugated rotation's quaternion is the
+ *      same scalar part with K applied to the vector part:
+ *      (w; x, y, z) -> (w; y, -z, -x).
+ *
+ * With the default (XYZW, WorldToBody, rigAxes) the three steps give
+ *   (f3; f0, f1, f2) -> (f3; -f0, -f1, -f2) -> (f3; -f1, f2, f0),
+ * the reading that levels the car clips against their lamp poles and keeps
+ * the sunset sun at a steady 6-10 deg through a 106 deg turn.
+ *
+ * @param q          The stored floats as decoded from the metadata.
+ * @param convention How to read them.
+ * @return worldFromBody, unit length; identity for absent / degenerate input.
+ */
 Quatd worldFromBodyQuat(const meta::Quaternion& q, const AttitudeConvention& convention) noexcept {
-    // Reuse the extrinsic reader for the component order / sanitising.
+    // ---- 1. order: reuse the extrinsic reader for the order and sanitising --------
     const Quatd raw = extrinsicQuat(q, convention.order);
-    // A world->body rotation is inverted so the track always stores body->world.
-    return (convention.sense == AttitudeSense::WorldToBody) ? raw.conj() : raw;
+    // ---- 2. sense: a world->body rotation is inverted (body->world stored) ---------
+    const Quatd worldFromBody = (convention.sense == AttitudeSense::WorldToBody) ? raw.conj() : raw;
+    if (!convention.rigAxes) {
+        return worldFromBody;
+    }
+    // ---- 3. rig axes: conjugate by K, i.e. permute and negate the vector part -----
+    // Identity stays identity, and a unit quaternion stays unit (K preserves length).
+    return Quatd{worldFromBody.w, worldFromBody.y, -worldFromBody.z, -worldFromBody.x};
 }
 
 Mat3d bodyFromWorldMatrix(const meta::Quaternion& q, const AttitudeConvention& convention) noexcept {

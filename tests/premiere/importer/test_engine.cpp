@@ -451,8 +451,15 @@ TEST_CASE("every stabilisation mode reaches the engine's frame, Smooth + Horizon
     REQUIRE(file.ok());
     auto track = osv::meta::MetadataTrack::load(file.value());
     REQUIRE(track.ok());
+    // `auto` is the 0.5.1 reading (q' = (f3; -f1, f2, f0), +Z up) with no
+    // measured up: the accelerometer is only a logged canary.  Pinned here
+    // so a change of rule shows up in this mirror as well as in the engine.
     osv::geom::AttitudeTrack::Options attOpt;
     osv::geom::ConventionProbe::autoDetect(track.value()).applyTo(attOpt);
+    REQUIRE(attOpt.conv.rigAxes);
+    REQUIRE(attOpt.conv.sense == osv::geom::AttitudeSense::WorldToBody);
+    REQUIRE(attOpt.conv.up == osv::geom::WorldUp::Z);
+    REQUIRE(attOpt.measuredUp.norm() == 0.0);
     auto built = osv::geom::AttitudeTrack::build(track.value(), attOpt);
     REQUIRE(built.ok());
     const osv::geom::AttitudeTrack& attitude = built.value();

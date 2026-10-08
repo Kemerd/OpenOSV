@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The OpenOSV Contributors
 //
-// ConventionProbe: gravity-direction scoring of the attitude conventions.
+// ConventionProbe: gravity-direction scoring of the attitude conventions, and
+// the `auto` reading with its accelerometer canary.
 
 #include "osv/geom/ConventionProbe.h"
 
+#include "osv/core/Log.h"
 #include "osv/meta/MetadataTrack.h"
 
 #include <algorithm>
@@ -16,12 +18,15 @@ namespace osv::geom {
 
 std::vector<AttitudeConvention> ConventionProbe::candidates() {
     std::vector<AttitudeConvention> out;
-    out.reserve(8);
-    // Fixed enumeration order: order-major, then sense, then up axis.
+    out.reserve(16);
+    // Fixed enumeration order: order-major, then sense, then up axis.  The
+    // candidates are the plain readings (the IMU's axes taken as the rig's):
+    // the score compares the body-frame gravity with camera_acc in its own
+    // axes, which only means something when both use the same axes.
     for (const QuatOrder order : {QuatOrder::WXYZ, QuatOrder::XYZW}) {
         for (const AttitudeSense sense : {AttitudeSense::WorldToBody, AttitudeSense::BodyToWorld}) {
             for (const WorldUp up : {WorldUp::Y, WorldUp::Z, WorldUp::NegY, WorldUp::NegZ}) {
-                out.push_back(AttitudeConvention{order, sense, up});
+                out.push_back(AttitudeConvention{order, sense, up, false});
             }
         }
     }
@@ -131,92 +136,126 @@ ConventionScore ConventionProbe::best(const meta::MetadataTrack& track, std::siz
 //  autoDetect: the reading `auto` resolves to
 // -----------------------------------------------------------------------------
 //
-//  camera_acc is the specific force in the accelerometer's world frame.  A
-//  camera at rest, cruising or riding a car feels 1 g straight up, so the
-//  mean of the samples IS the up direction there; one fixed quarter turn
-//  about Y carries it into the verified reading's world frame (see
-//  AutoConvention).  Order and sense cannot be measured this way and keep the
-//  verified default.
+//  The default reading's world is level (+Z up) by construction, so `auto`
+//  levels on the attitude alone, on every clip, whatever its accelerometer
+//  says.  camera_acc is kept as a canary: on a car, a tripod or a hand-held
+//  walk its clip mean is the gravity reaction in the body, and that must
+//  agree with the body up the reading gives.  A large disagreement on a
+//  clean gravity reaction means the reading does not describe this camera
+//  (another body or firmware storing its attitude differently), which is
+//  worth a warning in every host's log, never a silent re-levelling.
 namespace {
 
-/// The accelerometer's world frame -> the verified reading's world frame.
-/// R = [[0,0,1],[0,1,0],[-1,0,0]], a quarter turn about +Y.
-[[nodiscard]] Vec3d accelerometerToWorld(const Vec3d& a) noexcept { return Vec3d{a.z, a.y, -a.x}; }
+/// camera_acc in its own axes -> the rig's body axes (X right, Y forward,
+/// Z up): (a_y, a_x, -a_z).  The matrix [[0,1,0],[1,0,0],[0,0,-1]] is a
+/// proper rotation (det +1), a half turn about (1, 1, 0) / sqrt(2).
+/// Measured on the car clips: the clip mean lands within 1 deg of the
+/// default reading's body up there.
+[[nodiscard]] Vec3d accelerometerToRig(const Vec3d& a) noexcept { return Vec3d{a.y, a.x, -a.z}; }
+
+/// Fewer frames than this are not a measurement.
+constexpr std::size_t kCanaryMinFrames = 8;
+/// A clean gravity reaction: the mean near 1 g and every frame within a few
+/// tens of degrees of it.  A car or a hand-held walk passes; an aerobatic
+/// clip (the airborne sample swings 0.4..3.4 g, spread 59-61 deg) does not,
+/// and its canary is reported without a verdict.
+constexpr double kCanaryMinG = 0.6;
+constexpr double kCanaryMaxG = 1.4;
+constexpr double kCanaryMaxSpreadDeg = 35.0;
 
 }  // namespace
 
 AutoConvention ConventionProbe::autoDetect(const std::vector<ProbeSample>& samples) {
     AutoConvention out;
+    // The reading is fixed: the levelling never depends on the accelerometer.
     out.conv = AttitudeConvention{};
+    out.measuredUp = Vec3d{0.0, 0.0, 0.0};
+    const Vec3d worldUp = worldUpVector(out.conv.up);
+    const std::string level = std::string("level on the attitude's own up (") + worldUpName(out.conv.up) + ")";
 
-    // ---- mean specific force over every usable sample ------------------------
-    Vec3d sum{0.0, 0.0, 0.0};
+    // ---- the frames the canary can use: an attitude and a usable acc ---------
+    // Both clip means run over the same frames, so a clip whose attitude
+    // drops out for a while cannot bias one side of the comparison.
+    Vec3d accSum{0.0, 0.0, 0.0};
+    Vec3d upSum{0.0, 0.0, 0.0};
     std::vector<Vec3d> accs;
     accs.reserve(samples.size());
     for (const ProbeSample& s : samples) {
-        const Vec3d acc = s.acc.toDouble();
+        if (!s.attitude.present) {
+            continue;
+        }
+        const Vec3d acc = accelerometerToRig(s.acc.toDouble());
         if (!acc.isFinite() || !(acc.norm() > 1e-6)) {
             continue;
         }
-        sum += acc;
+        // The reading's up seen from the body: R(t)^T * up.
+        const Vec3d bodyUp = bodyFromWorldMatrix(s.attitude, out.conv) * worldUp;
+        if (!bodyUp.isFinite()) {
+            continue;
+        }
+        accSum += acc;
+        upSum += bodyUp;
         accs.push_back(acc);
     }
     out.framesUsed = accs.size();
 
-    // A handful of frames is not a measurement; keep the default.
-    constexpr std::size_t kMinFrames = 8;
-    if (out.framesUsed < kMinFrames) {
-        out.reason = "level on -Y (the clip carries " + std::to_string(out.framesUsed) +
-                     " accelerometer frames, too few to measure gravity)";
+    // ---- too little data: level anyway, say why there is no canary -------------
+    if (out.framesUsed < kCanaryMinFrames) {
+        out.reason = level + "; no accelerometer canary: " + std::to_string(out.framesUsed) +
+                     " frames carry both an attitude and an acceleration, " + std::to_string(kCanaryMinFrames) +
+                     " needed";
         return out;
     }
-    const Vec3d mean = sum / static_cast<double>(out.framesUsed);
-    out.meanAccG = mean.norm();
-    if (!(out.meanAccG > 1e-6)) {
-        out.reason = "level on -Y (the accelerometer averages to zero)";
+    const Vec3d accMean = accSum / static_cast<double>(out.framesUsed);
+    out.meanAccG = accMean.norm();
+    const double upNorm = upSum.norm();
+    if (!(out.meanAccG > 1e-6) || !(upNorm > 1e-6) || !std::isfinite(out.meanAccG) || !std::isfinite(upNorm)) {
+        out.reason = level + "; no accelerometer canary: the acceleration or the body up averages to zero";
         return out;
     }
-    const Vec3d meanDir = mean / out.meanAccG;
+    const Vec3d accDir = accMean / out.meanAccG;
+    const Vec3d upDir = upSum / upNorm;
 
-    // ---- how steady the direction is -------------------------------------------
+    // ---- how steady the acceleration is (is it gravity at all?) ----------------
     double spread = 0.0;
     for (const Vec3d& a : accs) {
-        spread += rad2deg(a.angleTo(meanDir));
+        spread += rad2deg(a.angleTo(accDir));
     }
     out.spreadDeg = spread / static_cast<double>(out.framesUsed);
 
-    // ---- the measured up in the verified world frame ---------------------------
-    const Vec3d up = accelerometerToWorld(meanDir).normalized();
-    const Vec3d axis = worldUpVector(out.conv.up);
-    out.tiltDeg = rad2deg(up.angleTo(axis));
+    // ---- the canary: the accelerometer's gravity against the reading's up -------
+    out.canaryDeg = rad2deg(accDir.angleTo(upDir));
+    out.canaryMeasured = std::isfinite(out.canaryDeg);
+    out.canaryJudged = out.canaryMeasured && out.meanAccG >= kCanaryMinG && out.meanAccG <= kCanaryMaxG &&
+                       out.spreadDeg <= kCanaryMaxSpreadDeg;
+    out.canaryWarning = out.canaryJudged && out.canaryDeg > kAttitudeCanaryWarnDeg;
 
-    // ---- accept only a clean gravity reaction ----------------------------------
-    // Thresholds: a car or a hand-held walk keeps the mean near 1 g and every
-    // frame within a few tens of degrees; an aerobatic clip (the airborne
-    // sample swings 0.4..3.4 g) does not, and then -Y stands.  The frame tilt
-    // measured so far is 9..29 deg; past 60 deg the reading is not trusted.
-    constexpr double kMinG = 0.6;
-    constexpr double kMaxG = 1.4;
-    constexpr double kMaxSpreadDeg = 35.0;
-    constexpr double kMaxTiltDeg = 60.0;
-    const bool clean = out.meanAccG >= kMinG && out.meanAccG <= kMaxG && out.spreadDeg <= kMaxSpreadDeg &&
-                       out.tiltDeg <= kMaxTiltDeg && up.isFinite();
-    char numbers[192];
-    std::snprintf(numbers, sizeof(numbers), "mean %.2f g, spread %.1f deg, %.1f deg from -Y, %zu frames",
-                  out.meanAccG, out.spreadDeg, out.tiltDeg, out.framesUsed);
-    if (!clean) {
-        out.reason = std::string("level on -Y (accelerometer not a clean gravity reaction: ") + numbers + ")";
+    // ---- one line for every host's log ----------------------------------------
+    char numbers[160];
+    std::snprintf(numbers, sizeof(numbers), "mean %.2f g, spread %.1f deg, %zu frames", out.meanAccG,
+                  out.spreadDeg, out.framesUsed);
+    char canary[96];
+    std::snprintf(canary, sizeof(canary), "gravity %.1f deg from the reading's up", out.canaryDeg);
+    if (!out.canaryJudged) {
+        out.reason = level + "; accelerometer canary not judged (not a clean gravity reaction: " + numbers +
+                     "; " + canary + ")";
         return out;
     }
-    out.measuredUp = up;
-    out.upFromAccelerometer = true;
-    out.reason = std::string("level on the measured gravity (") + numbers + ")";
+    if (out.canaryWarning) {
+        char limit[32];
+        std::snprintf(limit, sizeof(limit), "%.0f", kAttitudeCanaryWarnDeg);
+        out.reason = level + "; WARNING accelerometer canary: " + canary + ", more than " + limit +
+                     " deg: this camera may store its attitude differently, check the horizon (" + numbers + ")";
+        log::warn("attitude: {}", out.reason);
+        return out;
+    }
+    out.reason = level + "; accelerometer canary: " + canary + " (" + numbers + ")";
     return out;
 }
 
 AutoConvention ConventionProbe::autoDetect(const meta::MetadataTrack& track, std::size_t maxFrames) {
     // Even sampling over the whole clip, so a launch or a hard brake in the
-    // first seconds cannot dominate the mean.
+    // first seconds cannot dominate the canary's means.
     std::vector<ProbeSample> samples;
     const std::size_t count = static_cast<std::size_t>(track.frameCount());
     if (count == 0 || maxFrames == 0) {
@@ -232,7 +271,9 @@ AutoConvention ConventionProbe::autoDetect(const meta::MetadataTrack& track, std
             continue;
         }
         const meta::FrameMeta& f = frame.value();
-        if (!f.camera.accPresent) {
+        // The canary compares the two per frame: a frame missing either has
+        // nothing to say.
+        if (!f.camera.accPresent || !f.camera.attitude.present) {
             continue;
         }
         samples.push_back(ProbeSample{f.camera.attitude, f.camera.acc});

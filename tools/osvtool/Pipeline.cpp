@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <string_view>
 
 namespace osvtool {
 
@@ -26,14 +27,40 @@ std::string lower(std::string s) {
     return s;
 }
 
-/// "xyzw-w2b-y" -> AttitudeConvention.  Returns false for unknown text.
+/**
+ * @brief Parse an explicit `--attitude-convention` reading.
+ *
+ * Grammar: `<order>-<sense>-<up>[-rig]`
+ *   - order: wxyz | xyzw
+ *   - sense: w2b (stored world -> body) | b2w (stored body -> world)
+ *   - up:    y | z | ny | nz (ny / nz = the negative axes)
+ *   - -rig:  relabel the IMU's axes into the rig's (AttitudeConvention::rigAxes)
+ *
+ * `xyzw-w2b-z-rig` is the reading `auto` resolves to (0.5.1 onwards);
+ * `xyzw-b2w-ny` is the plain reading 0.4.x / 0.5.0 levelled with, kept for
+ * comparisons.  Without the suffix every token is a plain reading, never
+ * the rig relabelling, so the old tokens still mean exactly what they meant.
+ *
+ * @param text The option value (case-insensitive).
+ * @param out  Receives the reading; untouched on failure.
+ * @return false for unknown or malformed text.
+ */
 bool parseAttitudeConvention(const std::string& text, geom::AttitudeConvention& out) {
-    const std::string t = lower(text);
+    std::string t = lower(text);
+    // An optional "-rig" suffix switches the axis relabelling on; it is cut
+    // off first so the up-axis parse below sees the plain grammar.
+    constexpr std::string_view kRigSuffix = "-rig";
+    bool rigAxes = false;
+    if (t.size() > kRigSuffix.size() && t.compare(t.size() - kRigSuffix.size(), kRigSuffix.size(), kRigSuffix) == 0) {
+        rigAxes = true;
+        t.resize(t.size() - kRigSuffix.size());
+    }
     // order-sense-up
     if (t.size() < 8) {
         return false;
     }
     geom::AttitudeConvention c;
+    c.rigAxes = rigAxes;
     if (t.rfind("wxyz", 0) == 0) {
         c.order = geom::QuatOrder::WXYZ;
     } else if (t.rfind("xyzw", 0) == 0) {
@@ -113,7 +140,9 @@ void addPipelineOptions(CLI::App* sub, PipelineOptions& opt) {
     auto* stabGroup = sub->add_option_group("Stabilisation");
     stabGroup->add_option("--stab", opt.stab, "off|horizon|full|smooth|smooth-horizon")->default_str("off");
     stabGroup->add_option("--attitude-convention", opt.attitudeConvention,
-                          "auto | <order>-<sense>-<up> e.g. xyzw-b2w-ny (default), wxyz-w2b-z; up = y|z|ny|nz")->default_str("auto");
+                          "auto (= xyzw-w2b-z-rig) | <order>-<sense>-<up>[-rig] e.g. xyzw-b2w-ny (the 0.5.0 "
+                          "reading), wxyz-w2b-z; up = y|z|ny|nz; -rig relabels the IMU axes into the rig's")
+        ->default_str("auto");
     stabGroup->add_option("--smooth-sigma", opt.smoothSigmaFrames,
                           "Gaussian sigma in frames for --stab smooth and smooth-horizon")->default_val(15.0);
 
@@ -369,9 +398,9 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     if (p->stabParams.mode != geom::StabilizationMode::Off) {
         geom::AttitudeTrack::Options attOpt;
         if (lower(options.attitudeConvention) == "auto") {
-            // The verified reading, with the world-up axis measured from the
-            // accelerometer's world-frame gravity reaction when it is clean
-            // (the same rule the importer's horizon lock uses).
+            // The verified reading, levelled on its own +Z, with the
+            // accelerometer canary in the note (the same rule the importer's
+            // horizon lock uses).
             const geom::AutoConvention detected = geom::ConventionProbe::autoDetect(p->track);
             detected.applyTo(attOpt);
             p->notes.push_back("attitude convention (auto): " + geom::attitudeConventionName(detected.conv) + ", " +

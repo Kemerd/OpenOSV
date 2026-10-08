@@ -587,6 +587,18 @@ removal is its own single-lens detector and parametric fit
   <https://doi.org/10.1080/00401706.1962.10490022>
   - Implemented: running statistics in the attitude convention probe
     (`src/osv/geom/ConventionProbe.cpp`).
+- Robert T. Collins, Richard S. Weiss. **Vanishing Point Calculation as a
+  Statistical Inference on the Unit Sphere.** *ICCV 1990*, 1990.
+  <https://doi.org/10.1109/ICCV.1990.139560>
+  - Evaluated: the zenith of a Horizon Lock render fitted to traced
+    verticals, as the smallest eigenvector of their great-circle normals
+    (verification scripts); it settled the 0.5.1 attitude reading
+    (`docs/GEOMETRY.md`).
+- Jean Meeus. **Astronomical Algorithms.** 2nd ed., Willmann-Bell, 1998.
+  ISBN 0-943396-61-1.
+  - Evaluated: the sun's elevation (NOAA's form of the chapter 25 solar
+    coordinates, verification scripts) that the levelled sunset frames are
+    checked against (`docs/GEOMETRY.md`).
 - Bruce D. Lucas, Takeo Kanade. **An Iterative Image Registration Technique
   with an Application to Stereo Vision.** *IJCAI '81*, 1981.
   <https://www.ijcai.org/Proceedings/81-2/Papers/017.pdf>

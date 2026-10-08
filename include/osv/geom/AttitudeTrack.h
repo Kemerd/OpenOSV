@@ -14,10 +14,14 @@
 //               the sample clip, i.e. entry 4 is the exposure-time sample.
 //
 // The quaternion interpretation (component order, rotation sense, which
-// world axis is up) is switchable through AttitudeConvention; the default is
-// the reading best supported by the accelerometer check in ConventionProbe:
-// (x, y, z, w), R = world -> body, Y-up world.  Whatever the convention, the
-// track stores and returns worldFromBody: d_world = q * d_body * q^-1.
+// world axis is up, and whether the IMU's axes are relabelled into the rig's)
+// is switchable through AttitudeConvention.  The default is the reading that
+// levels every clip measured so far against image truth (lamp poles, the
+// sun's elevation through a 106 deg turn, the airborne sample's horizon):
+// the stored floats f0..f3 give q' = (w = f3; x = -f1, y = f2, z = f0), a
+// body -> world rotation into a world whose +Z is up (docs/GEOMETRY.md).
+// Whatever the convention, the track stores and returns worldFromBody:
+// d_world = q * d_body * q^-1.
 #pragma once
 
 #include "osv/core/Math.h"
@@ -37,7 +41,7 @@ namespace osv::geom {
 
 /// Direction of the stored attitude rotation.
 enum class AttitudeSense {
-    WorldToBody,  ///< R(q) * d_world = d_body   (best supported on the Osmo 360)
+    WorldToBody,  ///< R(q) * d_world = d_body   (the Osmo 360, with rigAxes)
     BodyToWorld   ///< R(q) * d_body = d_world
 };
 
@@ -45,19 +49,37 @@ enum class AttitudeSense {
 enum class WorldUp { Y, Z, NegY, NegZ };
 
 /// How the stored quaternion floats are turned into a rotation.
+///
+/// The default is the Osmo 360's reading: the floats read (x, y, z, w) are a
+/// world -> body rotation in the IMU's own axes, which are relabelled into
+/// the rig's axes (rigAxes), and the world's +Z is up.  Together that is
+/// q' = (w = f3; x = -f1, y = f2, z = f0) body -> world.
+///
+/// The reading 0.4.x / 0.5.0 used (XYZW, body -> world, -Y up) is the
+/// transpose of that rotation with its axes relabelled.  It was checked only
+/// on the airborne sample, whose attitude barely changes (4.9 deg over the
+/// clip): at that one pose the two readings agree within 0.1-0.5 deg, so the
+/// sample could not tell them apart.  On car clips that turn it leaves the
+/// horizon 7-28 deg off (lamp poles lean, the sunset sun sits at +35 deg).
+/// It stays reachable for comparisons (osvtool --attitude-convention
+/// xyzw-b2w-ny), as do the other plain readings.
 struct AttitudeConvention {
-    /// Verified empirically on the sample clip (horizon lock levels the
-    /// picture upright only with body->world and a -Y world up); the
-    /// component order cannot be told apart on a static clip and stays XYZW.
-    QuatOrder order = QuatOrder::XYZW;
-    AttitudeSense sense = AttitudeSense::BodyToWorld;
-    WorldUp up = WorldUp::NegY;
+    QuatOrder order = QuatOrder::XYZW;                ///< Component order of the stored floats.
+    AttitudeSense sense = AttitudeSense::WorldToBody; ///< Direction of the stored rotation.
+    WorldUp up = WorldUp::Z;                          ///< Up axis of the (relabelled) world frame.
+    /// Relabel the IMU's axes into the rig's (body X right, Y forward, Z up)
+    /// on both sides of the rotation: K * R * K^T with K: (x, y, z) ->
+    /// (y, -z, -x), a proper rotation.  For a quaternion (w, v) that is
+    /// (w, K v) = (w; v.y, -v.z, -v.x).  false = the plain reading, the
+    /// IMU's axes taken as the rig's (every reading before 0.5.1).
+    bool rigAxes = true;
 };
 
 /// Stable names for logs / JSON.
 [[nodiscard]] const char* attitudeSenseName(AttitudeSense sense) noexcept;
 [[nodiscard]] const char* worldUpName(WorldUp up) noexcept;
-/// Short compound name such as "XYZW/WorldToBody/Y".
+/// Short compound name such as "XYZW/WorldToBody/Y"; a reading with the
+/// rig's axes carries a "/rig" suffix ("XYZW/WorldToBody/Z/rig").
 [[nodiscard]] std::string attitudeConventionName(const AttitudeConvention& convention);
 
 /// Unit vector of the world-up axis for a convention.
@@ -79,10 +101,10 @@ public:
         bool dense = false;           ///< Use every IMU batch sample instead of one per frame.
         int batchAnchorIndex = 4;     ///< Batch entry that coincides with the frame timestamp.
         double extraOffsetUs = 0.0;   ///< Additional time offset applied to dense samples (us).
-        /// Measured world-up direction in the convention's world frame.  The
-        /// IMU's world frame is not always level (car-mounted clips sit 9 to
-        /// 29 deg off -Y), so `auto` measures the true up from the
-        /// accelerometer and passes it here.  Zero length = conv.up.
+        /// An externally measured world-up direction in the convention's
+        /// world frame, overriding conv.up.  Zero length = conv.up, which is
+        /// what `auto` passes: under the default reading the world frame is
+        /// level by construction (its +Z is up).
         Vec3d measuredUp{0.0, 0.0, 0.0};
     };
 
