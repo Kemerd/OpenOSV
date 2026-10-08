@@ -479,11 +479,10 @@ template in the `.rc`, owner = host main window). Cancel returns `imCancel`.
 The dialog's "Save as De&fault" button stores what it shows as the user
 defaults without closing it. The blob is part of every PPix cache key so
 changed settings never hit stale frames. `imGetInstancePrefs` mirrors it.
-For a clip whose settings live in the Source Settings effect neither has
-allocated a block in any Premiere session logged since 0.2.2; for those clips
-`imGetInfo8` hands Premiere the 128-byte block itself
-(see "Importer side" under "Source Settings effect design"), and a block
-shorter than 128 bytes is read only as far as it goes and upgraded.
+For a clip whose settings live in the Source Settings effect, no Premiere
+session logged since 0.2.2 accepted either dialog and no clip had a settings
+block; for those clips `imGetInfo8` offers Premiere the 128-byte block itself
+(see "Importer side" under "Source Settings effect design").
 
 ### Concurrency
 
@@ -1127,25 +1126,31 @@ ends up showing "2560 x 1280" while decoding at 6000 x 3000.
 * `imGetInfo8` also owns **the clip's settings block** (`imFileInfoRec8::prefs`,
   `syncClipPrefsBlock` in `SourceSettingsDialog.cpp`). Premiere keeps one
   opaque block per clip, stores it in the project and hands it to the effect's
-  `PF_Cmd_TRANSLATE_PARAMS_TO_PREFS`; but it allocates that block itself only
-  in the dialog route (after the `imGetPrefs8` size handshake), which it never
-  takes for a clip with a Source Settings effect. So:
+  `PF_Cmd_TRANSLATE_PARAMS_TO_PREFS`. The SDK guide describes the host
+  allocating that block in the dialog route, from the size the `imGetPrefs8`
+  handshake answers. In every Premiere session logged since 0.2.2 no dialog
+  was accepted for a clip with the Source Settings effect and no clip had a
+  block: 0.5.0 and 0.5.1 logged "TRANSLATE_PARAMS_TO_PREFS with no prefs
+  buffer" in both sessions, imGetInfo8 was told "the host gave it no
+  settings" even for a clip reopened from a saved project, and no project
+  file held settings for an OpenOSV clip. So:
   * **no block**: the clip keeps the settings it was seeded with (the user
-    defaults), and the importer hands Premiere a new 128-byte block holding
-    exactly those (`piSuites->memFuncs->newPtrClear`; Premiere owns and frees
-    it). Without it the effect's controls had nowhere to go - 0.5.0 and 0.5.1
-    logged "TRANSLATE_PARAMS_TO_PREFS with no prefs buffer" in every Premiere
-    session, imGetInfo8 was told "the host gave it no settings" even for a
-    clip reopened from a saved project, and no project file held settings for
-    an OpenOSV clip. Not for an `.LRF` beside its `.OSV`, whose settings follow
-    the original's live instance ([PROXY]); a stored block would freeze them;
-  * **a full block** is the clip's settings and is applied, as always;
-  * **a shorter block** (its real size from `memFuncs->getPtrSize`) is read
-    only as far as it goes - never past its end - and, when it is ours,
-    `PrefsBlob::fromStoredBytes` reads its missing tail as zero (each later
-    field's old behaviour: Hide Mount On), grows it in place to the full blob
-    with `setPtrSize` and stores the upgraded settings in it. A shorter block
-    that is not ours is left exactly as it is.
+    defaults), and the importer offers Premiere a new 128-byte block holding
+    exactly those (`piSuites->memFuncs->newPtrClear`; the host owns and frees
+    it). This is the route an Adobe developer-forum thread gives for an
+    importer with a Source Settings effect, not one the SDK guide documents;
+    that Premiere keeps the block still needs confirming in a live session.
+    Not for an `.LRF` beside its `.OSV`, whose settings follow the original's
+    live instance ([PROXY]); a stored block would freeze them;
+  * **a block** is the clip's settings and is applied, read as 128 bytes as
+    every release has read it (the blob has been 128 bytes since 0.1.0, and
+    `imGetPrefs8` has always asked for exactly that). It is never resized or
+    rewritten here.
+  Both cases log a debug line on every call ("the host holds no settings
+  block for the clip; handed it a new 128-byte one" / "the host holds a
+  settings block for the clip (ours, applied)"), so a session log shows
+  whether Premiere keeps the block: a clip whose later calls still say "no
+  settings block" means it does not.
   After installing a build that changes this, launch Premiere once with
   **Shift** held so it rescans the plug-ins and reads the effect's new version.
 * `imGetPrefs8` / `imGetInstancePrefs` log every call at debug level (the
@@ -1249,8 +1254,13 @@ A new clip is logged once, with the file: `new clip 'DJI_....OSV'
 (imGetInfo8): no stored Source Settings; starting from the user defaults in
 C:\...\defaults.json - colourOutput rec709, ...`. Nothing is logged for the
 built-in defaults. A clip Premiere holds no settings for at all is, by this
-rule, a new clip; with the Source Settings effect installed every clip has a
-stored blob after its first `PF_Cmd_TRANSLATE_PARAMS_TO_PREFS`.
+rule, a new clip. In the logged 0.5.0 and 0.5.1 Premiere sessions that was
+every clip with the Source Settings effect, on every open: no clip had a
+settings block, so a clip already in a project was re-seeded from the
+CURRENT user defaults each time it was opened. Since 0.5.2 `imGetInfo8` offers the host a block holding the seed
+(see "Importer side" under "Source Settings effect design"); once Premiere
+keeps it, a clip keeps the settings it was first opened with, and Save as
+Default changes new clips only, as intended - not clips already in a project.
 
 ### The file
 
