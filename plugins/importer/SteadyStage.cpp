@@ -179,6 +179,12 @@ void hashClipParams(Hasher& h, const render::ClipSteadyParams& p) noexcept {
                            w.requiredImprovement, w.minResidual}) {
         h.f64(v);
     }
+    // The structured gate (ParallaxWarp.h): a different floor or ramp changes
+    // every sample's strength, so a cached clip must not outlive them.
+    h.f64(w.minStructureGradient);
+    h.u64(w.minStructuredPixels);
+    h.f64(w.minStructuredConsistent);
+    h.f64(w.fullStructuredConsistent);
     h.u64(p.parallaxOn ? 1u : 0u);
     h.u64(p.seamOn ? 1u : 0u);
     h.u64(p.seamSearch.band.equirectW);
@@ -247,8 +253,10 @@ void hashMountParams(Hasher& h, const render::MountMaskParams& p) noexcept {
 /// verdict), the blend's geometry (the bands' field of view; the occlusion
 /// switch is not part of it - the bands never use the mask) and the rule's
 /// parameters.  Bump the leading version when the measurement or the meaning
-/// of a stored state changes: m2 decides the clean lens per window and adds
-/// "kept, no clamp" (state 3); an m1 line named one lens per kept run.
+/// of a stored state changes: m3 releases a whole run of flat windows between
+/// released textured ones (m2 only a single one); m2 decided the clean lens
+/// per window and added "kept, no clamp" (state 3); an m1 line named one lens
+/// per kept run.
 [[nodiscard]] std::string mountKey(const FileIdentity& id, const geom::LensRig& baseRig,
                                    const geom::BlendParams& blend, const render::MountMaskParams& params) {
     Hasher h;
@@ -258,7 +266,7 @@ void hashMountParams(Hasher& h, const render::MountMaskParams& p) noexcept {
     h.f64(blend.occlusionFeatherPx);
     h.f64(blend.seamShiftDeg);
     hashMountParams(h, params);
-    return std::format("m2|{}|{}|{}|{}", id.size, id.mtime, hex64(h.value()), id.path);
+    return std::format("m3|{}|{}|{}|{}", id.size, id.mtime, hex64(h.value()), id.path);
 }
 
 /// Cache key of a clip correction: the file, the rig it is measured through
@@ -525,7 +533,7 @@ void appendDisk(const std::string& key, const LensAlignVerdict& v) noexcept {
 
 /// Load every well-formed line of the mount cache into `g.mounts`.  Lines:
 ///   1 TAB key-without-path TAB columns TAB arc TAB released TAB states TAB path
-/// where the key part is "m2|size|mtime|hash" and `states` is
+/// where the key part is "m3|size|mtime|hash" and `states` is
 /// render::encodeMountColumns' text.  Anything malformed (a truncated last
 /// line, another version - an m1 line's per-run lens choice included -,
 /// states that do not cover the ring) is skipped.
@@ -558,7 +566,7 @@ void loadMountDisk(Global& g) noexcept {
                 f.push_back(line.substr(start, tab - start));
                 start = tab + 1;
             }
-            if (f.size() != 6 || f[0] != "1" || start >= line.size() || !f[1].starts_with("m2|")) {
+            if (f.size() != 6 || f[0] != "1" || start >= line.size() || !f[1].starts_with("m3|")) {
                 continue;
             }
             std::uint32_t columns = 0;

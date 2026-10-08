@@ -1896,12 +1896,13 @@ TEST_CASE("a demuxer's FFmpeg lines name the clip they are about", "[video][samp
 
 TEST_CASE("a refused parallax measurement's consistent share is rebuilt exactly from its cell counts",
           "[verify][parallax]") {
-    // The importer's per-bucket refusal line reports the share of consistent
-    // flow, but a refusal returns an Error, not the grid that held it.  It is
-    // rebuilt from what parallaxFromBands hands out on the side: the sum of
-    // the per-cell consistent pixel counts over the band pixels both lenses
-    // cover.  That must be EXACTLY the grid's own consistentFraction(), which
-    // an accepted measurement lets this test compare.
+    // A refusal returns an Error, not the grid that held it, and the
+    // importer prints the shares straight from the refusal message.  Any
+    // diagnostic that rebuilds the share from what parallaxFromBands hands
+    // out on the side (the sum of the per-cell consistent pixel counts over
+    // the band pixels both lenses cover - osvtool's seam JSON does) must get
+    // EXACTLY the grid's own consistentFraction(), which an accepted
+    // measurement lets this test compare.
     constexpr std::uint32_t kW = 1024;
     constexpr std::uint32_t kH = 64;
     render::LensBands bands;

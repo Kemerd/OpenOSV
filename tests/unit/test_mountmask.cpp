@@ -331,19 +331,35 @@ TEST_CASE("Hide Mount Auto: a flat window is released only between two released 
     CHECK(mask.windows[1].flat);
     CHECK(mask.windows[1].released);   // between two released textured windows
     CHECK(mask.windows[2].released);
-    CHECK_FALSE(mask.windows[3].released);  // a flat neighbour is not a released textured one
-    CHECK_FALSE(mask.windows[4].released);
+    CHECK(mask.windows[3].released);  // a run of flat windows bounded by released textured ones
+    CHECK(mask.windows[4].released);
     CHECK(mask.windows[5].released);
     CHECK_FALSE(mask.windows[6].released);  // disagrees: the mount
+    // The same run with its right bound disagreeing (T F T F F K K): the
+    // run ends at a kept textured window, so it stays kept.
+    {
+        std::vector<std::vector<MountWindowScore>> bounded = frames;
+        for (auto& frame : bounded) {
+            frame[5].ncc = frame[5].upper = frame[5].lower = 0.2f;
+        }
+        auto decidedBounded = decideMountMask(arc, windows, bounded, params);
+        REQUIRE(decidedBounded.ok());
+        CHECK(decidedBounded.value().windows[1].released);
+        CHECK_FALSE(decidedBounded.value().windows[3].released);
+        CHECK_FALSE(decidedBounded.value().windows[4].released);
+        CHECK_FALSE(decidedBounded.value().windows[5].released);
+    }
     // The arc's first window has no arc neighbour on its left: a flat window
-    // there would stay kept.  Make window 0 flat and check.
+    // there stays kept, and so does a flat run that reaches the arc's edge.
+    // Make window 0 flat and check.
     for (auto& frame : frames) {
         frame[0].sigma0 = frame[0].sigma1 = 0.004f;
     }
     auto again = decideMountMask(arc, windows, frames, params);
     REQUIRE(again.ok());
     CHECK_FALSE(again.value().windows[0].released);
-    CHECK_FALSE(again.value().windows[1].released);  // its left neighbour is now flat
+    CHECK_FALSE(again.value().windows[1].released);  // its run now reaches the arc's edge
+    CHECK(again.value().windows[3].released);        // still bounded by windows 2 and 5
 }
 
 TEST_CASE("Hide Mount Auto: too few scored frames keep the window, and the clean lens follows the halves",

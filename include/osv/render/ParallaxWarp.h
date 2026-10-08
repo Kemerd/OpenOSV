@@ -265,10 +265,12 @@ struct ParallaxWarpParams {
     /// night drive 0.66-0.82, the airborne sample 0.88-0.97 - all at full
     /// strength), where the all-pixel share of the same frames was
     /// 0.17-0.54.  Deliberately unrelated pairs (lens 0 of one moment of a
-    /// car drive against lens 1 of another) 0.10-0.28: 7 of 9 refused, the
-    /// other two at strength 0.04 and 0.10 - on a rigid mount the car body
-    /// is the same at both moments, so part of such a pair is not unrelated.
-    double minStructuredConsistent = 0.25;
+    /// car drive against lens 1 of another) scored 0.10-0.28 - on a rigid
+    /// mount the car body is the same at both moments, so part of such a
+    /// pair is not unrelated - and the floor sits at 0.30 so that every one
+    /// of them is refused while the lowest real frame (0.43) keeps its full
+    /// strength.
+    double minStructuredConsistent = 0.30;
     /// See minStructuredConsistent: the share from which the grid applies at
     /// full strength.  Must not be below minStructuredConsistent.
     double fullStructuredConsistent = 0.40;

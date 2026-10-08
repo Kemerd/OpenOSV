@@ -1067,14 +1067,22 @@ TEST_CASE("structured pixels are the smaller lens's luma gradient, and a coverag
 
 TEST_CASE("the structured gate's strength is 0 at the gate, 1 at full trust and smooth between",
           "[render][parallax][gate]") {
-    render::ParallaxWarpParams p;  // 0.25 / 0.40
+    render::ParallaxWarpParams p;  // the shipped gate: 0.30 refuses, 0.40 is full trust
+    const double lo = p.minStructuredConsistent;
+    const double hi = p.fullStructuredConsistent;
+    REQUIRE(lo == 0.30);
+    REQUIRE(hi == 0.40);
     CHECK(render::parallaxGateStrength(0.0, p) == 0.0);
-    CHECK(render::parallaxGateStrength(0.25, p) == 0.0);
-    CHECK(render::parallaxGateStrength(0.40, p) == 1.0);
+    CHECK(render::parallaxGateStrength(lo, p) == 0.0);
+    CHECK(render::parallaxGateStrength(hi, p) == 1.0);
     CHECK(render::parallaxGateStrength(0.97, p) == 1.0);
-    CHECK(render::parallaxGateStrength(0.325, p) == Catch::Approx(0.5).margin(1e-12));
+    CHECK(render::parallaxGateStrength(0.5 * (lo + hi), p) == Catch::Approx(0.5).margin(1e-12));
+    // Every unrelated pair measured on the car drives (0.10-0.28) is refused;
+    // the lowest real frame (0.43) applies at full strength.
+    CHECK(render::parallaxGateStrength(0.28, p) == 0.0);
+    CHECK(render::parallaxGateStrength(0.43, p) == 1.0);
     // Monotone and without a step anywhere: the largest change over a 0.001
-    // step of the share is the smoothstep's peak slope (1.5 / 0.15) x 0.001.
+    // step of the share is the smoothstep's peak slope (1.5 / (hi - lo)) x 0.001.
     double previous = render::parallaxGateStrength(0.2, p);
     double maxStep = 0.0;
     for (int k = 201; k <= 450; ++k) {
@@ -1083,7 +1091,7 @@ TEST_CASE("the structured gate's strength is 0 at the gate, 1 at full trust and 
         maxStep = std::max(maxStep, s - previous);
         previous = s;
     }
-    CHECK(maxStep <= 1.5 / 0.15 * 0.001 + 1e-9);
+    CHECK(maxStep <= 1.5 / (hi - lo) * 0.001 + 1e-9);
     // Defensive: no trust in a share that is not a number, or in a gate whose
     // full-strength share sits below its refusal share; equal shares step.
     CHECK(render::parallaxGateStrength(std::numeric_limits<double>::quiet_NaN(), p) == 0.0);
@@ -1093,8 +1101,8 @@ TEST_CASE("the structured gate's strength is 0 at the gate, 1 at full trust and 
     CHECK(render::parallaxGateStrength(0.9, bad) == 0.0);
     render::ParallaxWarpParams step = p;
     step.fullStructuredConsistent = step.minStructuredConsistent;
-    CHECK(render::parallaxGateStrength(0.2499, step) == 0.0);
-    CHECK(render::parallaxGateStrength(0.25, step) == 1.0);
+    CHECK(render::parallaxGateStrength(lo - 0.0001, step) == 0.0);
+    CHECK(render::parallaxGateStrength(lo, step) == 1.0);
 }
 
 TEST_CASE("the structured gate accepts at full strength bit for bit, scales a partial trust, and refuses the rest",

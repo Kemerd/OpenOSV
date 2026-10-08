@@ -76,8 +76,8 @@ classical flow and the seam-shift table, not osvtool's neural default.
   71-82 % on the same moments, all 12 used, and 43-97 % on every measured
   frame of the day, night and sample clips. A moment close to the bar fades
   its correction out and the seam table in, instead of switching. Lens pairs
-  from two different moments of the drive score 10-28 %: refused, or kept at
-  4-10 % strength. The 6K sample and the night drive render byte for byte as
+  from two different moments of the drive score 10-28 % and are all
+  refused (the bar is 30 %). The 6K sample and the night drive render byte for byte as
   before; the lamp pole beside the 8K day drive's seam stays straight (0.18
   px RMS) now that the correction applies there. Known: where the proxy now
   uses the correction instead of the table, the car's hood matches less well
@@ -132,7 +132,7 @@ classical flow and the seam-shift table, not osvtool's neural default.
 ### Added
 
 * **Hide Mount** (Source Settings, and the OpenOSV Source generator in
-  Resolve and VEGAS: On, Off). Off stops the calibration's occlusion polygons
+  Resolve and VEGAS: On, Off, Auto). Off stops the calibration's occlusion polygons
   from cutting the seam, so the two lenses keep their full overlap where the
   mask used to leave none. Car, helmet or suction mount and a step at the
   seam: set it to Off. The mount itself can show. On is the default and what

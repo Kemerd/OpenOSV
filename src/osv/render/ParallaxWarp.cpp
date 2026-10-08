@@ -1117,15 +1117,22 @@ double parallaxGateStrength(double structuredFraction, const ParallaxWarpParams&
 }
 
 void seamTableUnderGrid(const std::vector<float>& table, double gridStrength, std::vector<float>& out) {
-    out.clear();
     // A non-finite strength is no trust in the grid: the whole table.
     const double s = std::isfinite(gridStrength) ? std::clamp(gridStrength, 0.0, 1.0) : 0.0;
     const double share = 1.0 - s;
+    // The caller may hand the same vector in as table and out (scale in
+    // place): clearing `out` first would then wipe the table before it is
+    // read, so the output is only cleared once it is known to be distinct,
+    // and an in-place call scales the columns where they are.
+    const bool inPlace = (&table == &out);
     if (table.empty() || !(share > 0.0)) {
-        return;  // nothing to fill: no table, or a grid trusted in full
+        out.clear();  // nothing to fill: no table, or a grid trusted in full
+        return;
     }
-    out.resize(table.size());
-    for (std::size_t i = 0; i < table.size(); ++i) {
+    if (!inPlace) {
+        out.resize(table.size());
+    }
+    for (std::size_t i = 0; i < out.size(); ++i) {
         const double v = static_cast<double>(table[i]);
         // share == 1 multiplies exactly, so a refused grid's table is the
         // table bit for bit (non-finite columns aside, which shift nothing).

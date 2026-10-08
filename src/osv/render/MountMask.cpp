@@ -570,7 +570,11 @@ Result<MountMask> decideMountMask(const MountArc& arc, const std::vector<std::ui
     }
     // ---- flat windows only between two released textured windows ---------------------------
     // A flat window agrees with anything, the open sky beside a selfie stick
-    // included, so its own correlation says nothing.  Its neighbours do.
+    // included, so its own correlation says nothing.  Its neighbours do: a
+    // RUN of flat windows (a stretch of open sky is wider than one window)
+    // is released when the first textured window on either side of the run
+    // is a released one, and kept when either side ends at a kept textured
+    // window or at the edge of the arc.
     const auto windowAt = [&](long long col0) -> std::optional<std::size_t> {
         const std::uint32_t c = ringColumn(col0, W);
         const auto it = std::find(windowStarts.begin(), windowStarts.end(), c);
@@ -579,13 +583,29 @@ Result<MountMask> decideMountMask(const MountArc& arc, const std::vector<std::ui
         }
         return static_cast<std::size_t>(it - windowStarts.begin());
     };
+    // The first textured window `direction` (-1 left, +1 right) of window w,
+    // skipping flat ones; nothing when the arc ends first, or when every
+    // window on the ring is flat (the walk would otherwise come back round).
+    const auto texturedBeside = [&](std::size_t w, long long direction) -> std::optional<std::size_t> {
+        long long col = static_cast<long long>(windowStarts[w]);
+        for (std::size_t step = 0; step < windowStarts.size(); ++step) {
+            col += direction * static_cast<long long>(params.windowCols);
+            const auto next = windowAt(col);
+            if (!next) {
+                return std::nullopt;  // off the arc
+            }
+            if (!mask.windows[*next].flat) {
+                return next;
+            }
+        }
+        return std::nullopt;  // all flat: a ring of nothing but sky says nothing
+    };
     for (std::size_t w = 0; w < windowStarts.size(); ++w) {
         if (!mask.windows[w].flat) {
             continue;
         }
-        const long long c0 = static_cast<long long>(windowStarts[w]);
-        const auto left = windowAt(c0 - static_cast<long long>(params.windowCols));
-        const auto right = windowAt(c0 + static_cast<long long>(params.windowCols));
+        const auto left = texturedBeside(w, -1);
+        const auto right = texturedBeside(w, +1);
         mask.windows[w].released = left && right && texturedRelease[*left] && texturedRelease[*right];
     }
 
