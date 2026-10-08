@@ -20,12 +20,15 @@ All notable changes to OpenOSV are documented here. The format follows
   corrected by the seam table, so it reaches both the fine texture of an
   aerial clip and the large offset of a car body a metre away. On the car
   drives (band-level, plug-in engine, classical flow) detected lines bend
-  4-14 times less than with 0.5.1 (0.016-0.029 px RMS against 0.16-0.20 px
+  7-14 times less than with 0.5.1 (0.016-0.029 px RMS against 0.16-0.20 px
   on the day frames), the car body lines up better (0.990-0.994 against
   0.967-0.978) and the whole seam a little better (0.997 against 0.993 on
-  the day proxy); it costs 11-15 ms of CPU per measured bucket. Available in
-  `osvtool seam --mesh` (with `--temporal N` for consecutive buckets) for
-  now; the plug-ins switch to it in the next step.
+  the day proxy); it costs 11-15 ms of CPU per measured bucket. Where
+  nothing can be measured at all - the stick strip of the aerial sample, the
+  thin overlap beside a car mount's blind arc at night - 0.5.1's copied
+  correction still scores a little higher (sample frame 60: 0.915 against
+  0.920). Available in `osvtool seam --mesh` (with `--temporal N` for
+  consecutive buckets) for now; the plug-ins switch to it in the next step.
 
 ## [0.5.1] - 2026-10-07
 
