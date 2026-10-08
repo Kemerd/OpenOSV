@@ -16,7 +16,11 @@
 //   * an unknown or a daylight EV100 leaves the stage exactly as it was: the
 //     sample's ghosts are measured and handed over;
 //   * the dark answer comes before the sun check: a pair the check would
-//     refuse is answered without complaint.
+//     refuse is answered without complaint;
+//   * [WP-M] a bucket's anchored seam is steered by its ANCHOR's ghosts:
+//     settled by an Exact answer on the anchor's frames or by a look-up once
+//     the anchor's own render (or a model that fits its recorded sun)
+//     settled it, never by whichever frame of the bucket was asked first.
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
@@ -34,15 +38,18 @@
 #include "osv/meta/FormatDetector.h"
 #include "osv/meta/MetadataTrack.h"
 #include "osv/render/Flare.h"
+#include "osv/render/ParallaxWarp.h"  // parallaxBucket: the anchor of a frame's bucket
 #include "osv/render/RenderParamsBuilder.h"
 #include "osv/render/SeamAnalysis.h"
 #include "osv/video/DualStreamReader.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace osv;
@@ -186,6 +193,113 @@ TEST_CASE("a frame metered too dark for the sun gets nothing, and an unknown bri
         REQUIRE_FALSE(seamPenaltyActive(stage));
         // And the frame's own answer is still there for a known daylight value.
         REQUIRE(applyExact(stage, kFrame, s, 9.05, pool).applied);
+    }
+}
+
+namespace {
+
+/// True when a carve hook over `penalty` would steer a carve (the hook
+/// answers for a band of a size it accepts only while a model with a sun is
+/// held) - seamPenaltyActive for a penalty the caller owns.
+[[nodiscard]] bool penaltyActive(render::FlareSeamPenalty& penalty) {
+    render::LensBands bands;
+    bands.w = 64;
+    bands.h = 8;
+    bands.mapH = 512;
+    bands.rowOffset = 252;
+    std::vector<float> slave(static_cast<std::size_t>(bands.w) * bands.h, 0.0f);
+    std::vector<float> master(slave.size(), 0.0f);
+    return render::FlareSeamPenalty::hook(bands, slave, master, &penalty);
+}
+
+}  // namespace
+
+TEST_CASE("a bucket's anchored seam is steered by its ANCHOR's ghosts, whichever frame asks", "[flare][sample]") {
+    // [WP-M] The anchored seam of a bucket is carved once and reused by every
+    // frame of the bucket, in playback and parked alike, so the ghosts that
+    // steer it must be the anchor's - settled by an Exact answer of the
+    // anchor, or looked up once the anchor's own render (or a model that
+    // fits its sun) settled them - never the latest frame's.
+    OSV_REQUIRE_SAMPLE();
+    auto openedAnchor = openSample(0);  // frame 3's bucket anchor
+    REQUIRE(openedAnchor.ok());
+    const SampleFrame& a = openedAnchor.value();
+    auto openedFrame = openSample(kFrame);
+    REQUIRE(openedFrame.ok());
+    const SampleFrame& f = openedFrame.value();
+    REQUIRE(render::parallaxBucket(kFrame) == render::parallaxBucket(0u));
+    ThreadPool pool;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+
+    SECTION("a look-up knows nothing until the anchor is answered; Exact answers it on its own frames") {
+        FlareStage stage;
+        render::FlareSeamPenalty penalty;
+        REQUIRE_FALSE(stage.anchorSeamPenalty(0, nullptr, a.rig, pqColor(), nan, true, pool, "sample", penalty));
+        REQUIRE_FALSE(penaltyActive(penalty));
+        // Exact: the anchor's sun is checked and its ghosts measured now.
+        REQUIRE(stage.anchorSeamPenalty(0, &a.pair, a.rig, pqColor(), nan, true, pool, "sample", penalty));
+        REQUIRE(penaltyActive(penalty));
+        // Now settled for every later look-up, and the anchor's own render
+        // subtracts the very model the seam was steered by.
+        render::FlareSeamPenalty again;
+        REQUIRE(stage.anchorSeamPenalty(0, nullptr, a.rig, pqColor(), nan, true, pool, "sample", again));
+        REQUIRE(penaltyActive(again));
+        REQUIRE(applyExact(stage, 0, a, nan, pool).applied);
+    }
+
+    SECTION("a frame of the bucket rendered first does not answer for its anchor") {
+        FlareStage stage;
+        // Frame 3 is measured (Exact): ITS ghosts steer a seam carved on it...
+        REQUIRE(applyExact(stage, kFrame, f, nan, pool).applied);
+        REQUIRE(seamPenaltyActive(stage));
+        // ...but the anchor has no answer of its own yet: a look-up is not
+        // settled, so a playback frame does not carve the anchored seam with
+        // frame 3's model.
+        render::FlareSeamPenalty penalty;
+        REQUIRE_FALSE(stage.anchorSeamPenalty(0, nullptr, f.rig, pqColor(), nan, true, pool, "sample", penalty));
+        REQUIRE_FALSE(penaltyActive(penalty));
+        // The anchor answered on its own frames (Exact) is settled for good.
+        REQUIRE(stage.anchorSeamPenalty(0, &a.pair, a.rig, pqColor(), nan, true, pool, "sample", penalty));
+        REQUIRE(penaltyActive(penalty));
+    }
+
+    SECTION("an Interactive render of the anchor records its sun; the model that lands settles the look-up") {
+        FlareStage stage;
+        render::RenderParamsBuilder builder;
+        // No model yet: the anchor's Interactive render goes without removal
+        // and queues the analysis - not final, and the look-up waits.
+        const FlareStage::Outcome first =
+            stage.apply(0, a.pair, a.rig, pqColor(), nan, true, false, /*exactWanted=*/false, pool, builder, "sample");
+        REQUIRE_FALSE(first.exact);
+        render::FlareSeamPenalty penalty;
+        bool settled = stage.anchorSeamPenalty(0, nullptr, a.rig, pqColor(), nan, true, pool, "sample", penalty);
+        // The worker lands the model; the look-up then adopts it for the
+        // anchor from the sun check its render recorded - no decode, no
+        // measurement - exactly as the anchor's next render adopts it.
+        for (int i = 0; i < 600 && !settled; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            settled = stage.anchorSeamPenalty(0, nullptr, a.rig, pqColor(), nan, true, pool, "sample", penalty);
+        }
+        REQUIRE(settled);
+        REQUIRE(penaltyActive(penalty));
+        const FlareStage::Outcome later =
+            stage.apply(0, a.pair, a.rig, pqColor(), nan, true, false, /*exactWanted=*/false, pool, builder, "sample");
+        REQUIRE(later.exact);
+        REQUIRE(later.applied);
+    }
+
+    SECTION("removal off, a dark anchor, a passthrough output: settled with nothing to steer around") {
+        FlareStage stage;
+        render::FlareSeamPenalty penalty;
+        REQUIRE(stage.anchorSeamPenalty(0, nullptr, a.rig, pqColor(), nan, /*enabled=*/false, pool, "sample",
+                                        penalty));
+        REQUIRE_FALSE(penaltyActive(penalty));
+        REQUIRE(stage.anchorSeamPenalty(0, nullptr, a.rig, pqColor(), 2.5, true, pool, "sample", penalty));
+        REQUIRE_FALSE(penaltyActive(penalty));
+        const OsvColorParams passthrough =
+            color::makeColorParams(color::kDefaultDlogMFit, color::OutputTransfer::Passthrough, 0.0f);
+        REQUIRE(stage.anchorSeamPenalty(0, nullptr, a.rig, passthrough, nan, true, pool, "sample", penalty));
+        REQUIRE_FALSE(penaltyActive(penalty));
     }
 }
 

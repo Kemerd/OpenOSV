@@ -2182,10 +2182,23 @@ Result<ImporterInstance::ParallaxJob> ImporterInstance::prepareMeshJobLocked(std
 
 ImporterInstance::MeshJobResult ImporterInstance::solveMeshJob(const ParallaxJob& job, ThreadPool* pool) noexcept {
     MeshJobResult r;
+    // A measurement that fails still leaves the bucket ONE field when its
+    // seam table was measured: the table's lift - exactly the field the mesh
+    // returns when it has nothing to measure - so turning Parallax Grid on
+    // never leaves a bucket with less correction than its seam table gives
+    // (0.5.1 fell back to the table the same way).  Without a table: none.
+    // Copying a shared pointer cannot throw, so this is safe in the catch.
+    const auto fallBackToLift = [&]() noexcept {
+        if (job.prior && job.prior->valid()) {
+            r.field = job.prior;
+            r.alone = job.prior;
+        }
+    };
     try {
         if (!job.bands) {
             r.failure = "no bands to measure";
             r.summary = r.failure;
+            fallBackToLift();
             return r;
         }
         const auto t0 = std::chrono::steady_clock::now();
@@ -2210,6 +2223,7 @@ ImporterInstance::MeshJobResult ImporterInstance::solveMeshJob(const ParallaxJob
         if (!mesh.ok()) {
             r.failure = mesh.error().message;
             r.summary = r.failure;
+            fallBackToLift();
             return r;
         }
         render::MeshWarpResult& m = mesh.value();
@@ -2225,10 +2239,12 @@ ImporterInstance::MeshJobResult ImporterInstance::solveMeshJob(const ParallaxJob
         r = MeshJobResult{};
         r.failure = std::string("exception: ") + e.what();
         r.summary = r.failure;
+        fallBackToLift();
     } catch (...) {
         r = MeshJobResult{};
         r.failure = "unknown exception";
         r.summary = r.failure;
+        fallBackToLift();
     }
     return r;
 }
@@ -2256,7 +2272,7 @@ bool ImporterInstance::storeMeshResult(const ParallaxJob& job, const MeshJobResu
                 }
                 if (job.finalizes && !e.final) {
                     e.final = true;
-                    e.field = result.field;  // nullptr: failed, the bucket renders uncorrected
+                    e.field = result.field;  // nullptr: failed with no table, the bucket renders uncorrected
                 }
                 trimAnalysisCache(m_meshes, kMaxParallaxCache, job.bucket);
             }
@@ -2286,10 +2302,10 @@ bool ImporterInstance::storeMeshResult(const ParallaxJob& job, const MeshJobResu
                              anchor, clipLogName(m_path), kind, prior, background ? " in the background" : "",
                              result.summary, stored ? "" : " - discarded, settings changed");
         } else {
-            PluginLog::debug("frame {} (bucket {}, {} {}) of '{}': mesh failed{} ({}); the bucket renders "
-                             "uncorrected{}",
+            PluginLog::debug("frame {} (bucket {}, {} {}) of '{}': mesh failed{} ({}); the bucket renders {}{}",
                              frame, job.bucket, lane, anchor, clipLogName(m_path),
                              background ? " in the background" : "", result.failure,
+                             result.field ? "the seam table's lift" : "uncorrected",
                              stored ? "" : " - discarded, settings changed");
         }
     } catch (...) {
@@ -2332,9 +2348,12 @@ void ImporterInstance::measureMeshOnAnchorLocked(std::uint32_t bucket, std::uint
         source = &pair;  // an Exact frame never loses its own bucket's correction
     }
     // A measurement that cannot be made is STORED as a failed one, so the
-    // next bucket's temporal prior is settled (none) and an Exact frame
-    // always ends with this bucket known.
-    const auto storeFailure = [&](const std::string& why) {
+    // next bucket's temporal prior is settled and an Exact frame always ends
+    // with this bucket known.  With a measured seam table the failed bucket
+    // still renders one field - the table's lift, what the mesh returns with
+    // nothing to measure (solveMeshJob's rule) - which is also its field
+    // alone; without one, nothing (no prior for the next bucket either).
+    const auto storeFailure = [&](const std::string& why, const std::vector<float>* tableDeg) {
         ParallaxJob failed;
         failed.bucket = bucket;
         failed.standIn = false;
@@ -2342,17 +2361,24 @@ void ImporterInstance::measureMeshOnAnchorLocked(std::uint32_t bucket, std::uint
         MeshJobResult r;
         r.failure = why;
         r.summary = why;
+        if (tableDeg != nullptr && !tableDeg->empty()) {
+            auto lift = render::liftSeamTable(*tableDeg, meshParamsLocked());
+            if (lift.ok()) {
+                r.field = std::make_shared<const render::ParallaxWarpGrid>(std::move(lift).value());
+                r.alone = r.field;
+            }
+        }
         (void)storeMeshResult(failed, r, index, anchorIndex, false);
     };
     if (source == nullptr) {
-        storeFailure("the anchor could not be decoded");
+        storeFailure("the anchor could not be decoded", nullptr);
         return;
     }
     // The bucket's anchored seam table: the mesh's prior (Seam Search on).
     const SeamTableEntry* table = wantSeam ? anchoredSeamTableLocked(bucket, *source, pool) : nullptr;
     auto job = prepareMeshJobLocked(bucket, *source, table != nullptr ? &table->shiftDeg : nullptr, false, pool);
     if (!job.ok()) {
-        storeFailure("bands: " + job.error().message);
+        storeFailure("bands: " + job.error().message, table != nullptr ? &table->shiftDeg : nullptr);
         return;
     }
     const MeshJobResult result = solveMeshJob(job.value(), &pool);
@@ -2375,6 +2401,18 @@ void ImporterInstance::measureMeshNowLocked(std::uint32_t bucket, std::uint32_t 
         }
         if (!previousMeasured) {
             measureMeshOnAnchorLocked(bucket - 1u, index, pair, wantSeam, /*ownFallback=*/false, pool);
+            // An anchor older than the frame's glide partner (a cold Exact
+            // landing measures bucket - 2 for its field alone) is needed for
+            // nothing else this frame does - the carve, the gains and the
+            // photometric field read the frame's own bucket and its partner
+            // - so it goes now instead of with the frame: an 8K pair is
+            // ~180 MB of host memory (or a pinned decoder surface).
+            const std::uint32_t previous = bucket - 1u;
+            const std::uint32_t frameBucket = render::parallaxBucket(index);
+            const std::uint32_t previousAnchor = previous * render::kParallaxBucketFrames;
+            if (previous + 1u < frameBucket && previousAnchor != index) {
+                m_analysisFrames.erase(previousAnchor);
+            }
         }
     }
     // ---- 2. this bucket on its anchor, with that prior ------------------------------
@@ -3516,24 +3554,22 @@ std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::
             correction.seamShiftDeg = &c.table;
         }
         render::SeamCarveParams params;
-        // [WP-FLARE] Steer away from this frame's ghosts - in its own bucket
-        // only: a glide partner carved now is cached for that bucket's frames,
-        // and must not keep another bucket's ghosts.
-        if (b == bucket) {
-            params.penalty = m_flare.seamPenalty();
-        }
         // [WP-SEAMTOOLS] Seam Blend / Parallax Blend: the feather widths only
         // (the seam's path is measured over its own window).  Default prefs
         // leave the parameters exactly at their defaults.
         render::applySeamBlendWidths(seamToolsLocked(), params);
         const render::BandParams band = render::ParallaxWarpParams{}.band;
+        // Which ghosts steered the carve, for its log line.
+        const char* flareNote = "no ghosts";
         const auto logCarve = [&](const render::BlendSeam& s, const char* on, std::uint32_t from) {
-            PluginLog::debug("frame {} (bucket {}, {} {}): seam carved in {:.1f} ms through {}, latitude mean {:+.2f} / "
-                             "max {:.2f} deg, feather {:.2f} deg mean, {} narrow / {} forced columns",
+            PluginLog::debug("frame {} (bucket {}, {} {}): seam carved in {:.1f} ms through {}, steered by {}, "
+                             "latitude mean {:+.2f} / max {:.2f} deg, feather {:.2f} deg mean, {} narrow / {} forced "
+                             "columns",
                              index, b, on, from, s.carveMs,
                              correction.warp ? "the mesh field"
                                              : (correction.seamShiftDeg ? "the seam table" : "no correction"),
-                             s.meanLatDeg, s.maxAbsLatDeg, s.meanHalfWidthDeg, s.narrowColumns, s.forcedColumns);
+                             flareNote, s.meanLatDeg, s.maxAbsLatDeg, s.meanHalfWidthDeg, s.narrowColumns,
+                             s.forcedColumns);
         };
 
         // ---- the anchored seam: the final correction, carved on the anchor ------------
@@ -3546,10 +3582,12 @@ std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::
                 bands = it->second;
             }
             const video::FramePair* anchor = nullptr;
+            bool carvedOnFrame = false;  // the Exact fallback: the anchor could not be decoded
             if (!bands) {
                 anchor = anchorPairLocked(b, index, pair, how == AnchorMeasure::Now);
                 if (anchor == nullptr && how == AnchorMeasure::Now && b == bucket) {
                     anchor = &pair;  // an Exact frame never loses its own bucket's seam
+                    carvedOnFrame = true;
                 }
             }
             // [WP-PHOTO] The usable rim of the ANCHOR as the Rim cost - what a
@@ -3559,7 +3597,62 @@ std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::
             // its seam is the one an Exact frame carves.
             const bool rimOn = photoParams.mode != render::PhotoSeamMode::Off;
             const bool rimReady = !rimOn || !interactive || m_photo.measured(b);
-            if ((bands || anchor != nullptr) && rimReady) {
+            // [WP-FLARE] The ghosts of the ANCHOR steer the carve, for the
+            // same reason: the seam is cached for every frame of the bucket,
+            // so it must not depend on which of them carved it.  Steered by
+            // the asking frame's model (FlareStage::seamPenalty), playback
+            // carved it at whichever frame first found the field final -
+            // with no ghosts at all when that frame's model was still being
+            // measured - and an Exact frame got the ghosts of whichever frame
+            // of its bucket was rendered first.  The anchor's answer is what
+            // a sequential render carves with (the anchor is the first frame
+            // of its bucket there).  Exact answers the anchor now (decoded,
+            // measured when no model fits its sun); Interactive only looks it
+            // up and carves once it is settled.  A glide partner carved now
+            // gets ITS anchor's ghosts, never this frame's.
+            const std::uint32_t anchorIndex = b * render::kParallaxBucketFrames;
+            const bool flareOn = m_prefs.flareRemoval != 0;
+            const double anchorEv100 =
+                flareOn ? FlareStage::sceneEv100(m_track, anchorIndex) : std::numeric_limits<double>::quiet_NaN();
+            const std::string clipName = m_path.filename().string();
+            render::FlareSeamPenalty anchorFlare;  // outlives the carve below
+            bool flareReady = carvedOnFrame;       // the fallback carves with the frame's own ghosts
+            if (!carvedOnFrame) {
+                flareReady = m_flare.anchorSeamPenalty(anchorIndex, nullptr, m_rig, m_color, anchorEv100, flareOn,
+                                                       pool, clipName, anchorFlare);
+                if (!flareReady && how == AnchorMeasure::Now) {
+                    // Exact: answer the anchor on its own frames (decoded for
+                    // the mesh already, in the common case).
+                    const video::FramePair* anchorFrames = anchor != nullptr
+                                                               ? anchor
+                                                               : anchorPairLocked(b, index, pair, /*decode=*/true);
+                    if (anchorFrames != nullptr) {
+                        flareReady = m_flare.anchorSeamPenalty(anchorIndex, anchorFrames, m_rig, m_color, anchorEv100,
+                                                               flareOn, pool, clipName, anchorFlare);
+                    }
+                    if (!flareReady) {
+                        // Undecodable, or its analysis failed: an Exact frame
+                        // still gets its seam, steered by no ghosts.
+                        PluginLog::debug("frame {} (bucket {}): the anchor's sun ghosts are unknown; the seam is "
+                                         "carved without them",
+                                         index, b);
+                        anchorFlare.clear();
+                        flareReady = true;
+                    }
+                }
+            }
+            if (carvedOnFrame) {
+                params.penalty = m_flare.seamPenalty();  // carved on the frame: the frame's own ghosts
+                flareNote = "this frame's ghosts";
+            } else {
+                render::SeamPenaltyHook hook;
+                hook.fn = &render::FlareSeamPenalty::hook;
+                hook.user = &anchorFlare;
+                hook.weight = 1.0;
+                params.penalty = hook;
+                flareNote = "the anchor's ghosts";
+            }
+            if ((bands || anchor != nullptr) && rimReady && flareReady) {
                 std::shared_ptr<const render::PhotoSeamField> rim;
                 if (rimOn) {
                     rim = m_photo.fieldFor(b * render::kParallaxBucketFrames, photoParams);
@@ -3600,7 +3693,10 @@ std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::
         }
         // Nothing anchored for this bucket's seam or the one before it: carved
         // on the frame itself, through the correction this frame renders, with
-        // its own rim (the scope preparePhotoSeam installed).
+        // its own rim (the scope preparePhotoSeam installed) and [WP-FLARE]
+        // its own ghosts (the model its apply() just handed over).
+        params.penalty = m_flare.seamPenalty();
+        flareNote = "this frame's ghosts";
         auto carved = render::carveSeam(m_rig, pair, m_blend, band, correction, params, nullptr, pool);
         if (!carved.ok()) {
             PluginLog::debug("frame {} (bucket {}): stand-in seam carve failed ({}); keeping the feather blend", index,

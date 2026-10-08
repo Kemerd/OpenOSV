@@ -145,8 +145,40 @@ public:
     /// The hook for WP-SEAM's carve (SeamCarveParams::penalty): it makes
     /// the lens showing the model applied by the latest apply() expensive
     /// where its ghosts and sun are, and contributes nothing when that frame
-    /// had no model.  Valid for this stage's lifetime.
+    /// had no model.  Valid for this stage's lifetime.  For a seam carved on
+    /// the frame itself only (the stand-in lane): a bucket's ANCHORED seam
+    /// takes its anchor's model (anchorSeamPenalty), whichever frame carves it.
     [[nodiscard]] render::SeamPenaltyHook seamPenalty() noexcept;
+
+    /// @brief The removal of a bucket's ANCHOR frame, for the carve of that
+    /// bucket's anchored seam: installed into `penalty` (cleared when the
+    /// anchor has nothing to remove).
+    ///
+    /// WHY.  A bucket's anchored seam is carved once and then reused by every
+    /// frame of the bucket, in playback and parked alike.  Steered by the
+    /// model of whichever frame carved it (seamPenalty(), the latest apply()),
+    /// it depended on which frame of the bucket happened to be asked first -
+    /// and an Interactive frame without a model yet carved it with none at
+    /// all.  Steered by the anchor's own answer it is the seam a sequential
+    /// render carves (there the anchor is the first frame of its bucket),
+    /// whichever frame asks.
+    ///
+    /// With `pair` - the ANCHOR's frames, never another frame's - the anchor
+    /// is answered as an Exact apply() would answer it: the cached answer, a
+    /// usable model adopted, or one measured now.  Without, it is only looked
+    /// up: its own answer, or a model that now fits the sun an earlier
+    /// Interactive render of it saw (recorded then); nothing is decoded or
+    /// measured.  Arguments as for apply(); `sceneEv100` is the ANCHOR's.
+    ///
+    /// @return true when the anchor's answer is settled (`penalty` then holds
+    ///         it - possibly nothing: no sun, too dark, removal off, a D-Log M
+    ///         passthrough output, a failed sun check); false when it is not
+    ///         known yet (a look-up with no answer, or an analysis that
+    ///         failed), `penalty` then cleared.  Never throws.
+    [[nodiscard]] bool anchorSeamPenalty(std::uint32_t anchor, const video::FramePair* pair,
+                                         const geom::LensRig& rig, const OsvColorParams& color, double sceneEv100,
+                                         bool enabled, ThreadPool& pool, const std::string& clip,
+                                         render::FlareSeamPenalty& penalty) noexcept;
 
     /// Forget every model, drop the pending job and bump the generation, so
     /// a measurement still running for the old settings is discarded
@@ -193,7 +225,36 @@ private:
     struct Bucket {
         std::vector<EntryPtr> entries;
         std::map<std::uint32_t, EntryPtr> frames;
+        /// The sun check of frames checked but not answered yet (an
+        /// Interactive miss: no model fitted, one being measured), so a
+        /// look-up (anchorSeamPenalty without frames) can adopt a model that
+        /// fits them once one lands.  At most one per frame of the bucket;
+        /// a frame's entry goes when it is answered (assignLocked).
+        std::map<std::uint32_t, render::FlareSunFixes> checked;
     };
+
+    /// What one frame's removal is, and whether that answer is final.
+    struct Decision {
+        /// exact: the answer is settled (false: an Interactive miss, a
+        /// look-up with no answer, a failed analysis).  applied: unused here
+        /// (apply() sets it when it hands a model over).
+        Outcome outcome;
+        /// The model to subtract (null: nothing to remove).
+        EntryPtr entry;
+    };
+
+    /// The schedule of apply() without its two side effects (the builder and
+    /// the carve's latest-model hook): the answer for frame `index`.  `pair`
+    /// null makes it a look-up (see anchorSeamPenalty).  Never throws.
+    [[nodiscard]] Decision decide(std::uint32_t index, const video::FramePair* pair, const geom::LensRig& rig,
+                                  const OsvColorParams& color, double sceneEv100, bool enabled, bool draft,
+                                  bool exactWanted, ThreadPool& pool, const std::string& clip) noexcept;
+
+    /// A usable model for a frame of `bucket` whose sun check is `suns`: the
+    /// bucket's own models first, then its neighbours' (nearest first,
+    /// earlier first, within kBorrowBuckets).  Caller holds m_mutex.
+    [[nodiscard]] EntryPtr findUsableLocked(std::uint32_t bucket, const render::FlareSunFixes& suns,
+                                            double tolerancePx) const;
 
     /// Store `entry` under `bucket` (caller holds m_mutex), bounded per
     /// bucket and in buckets.  A model already there is not stored twice.

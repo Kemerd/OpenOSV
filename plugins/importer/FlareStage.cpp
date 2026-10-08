@@ -167,8 +167,32 @@ void FlareStage::storeLocked(std::uint32_t bucket, const EntryPtr& entry) {
 }
 
 void FlareStage::assignLocked(std::uint32_t bucket, std::uint32_t frame, const EntryPtr& entry) {
-    m_models[bucket].frames[frame] = entry;
+    Bucket& b = m_models[bucket];
+    b.frames[frame] = entry;
+    b.checked.erase(frame);  // answered: its pending sun check is no longer needed
     trimBuckets(m_models, kMaxBuckets, bucket);
+}
+
+FlareStage::EntryPtr FlareStage::findUsableLocked(std::uint32_t bucket, const render::FlareSunFixes& suns,
+                                                  double tolerancePx) const {
+    // A model describes every frame whose sun is where the model's frame had
+    // it, whichever bucket that frame is in: this bucket's own models first,
+    // then its neighbours' (nearest first, earlier first).
+    EntryPtr own;
+    if (const auto it = m_models.find(bucket); it != m_models.end()) {
+        own = bestMatch(it->second.entries, suns, tolerancePx);
+    }
+    for (std::uint32_t d = 1; d <= kBorrowBuckets && !own; ++d) {
+        for (const std::uint32_t b : {bucket >= d ? bucket - d : bucket, bucket + d}) {
+            if (b == bucket || own) {
+                continue;
+            }
+            if (const auto it = m_models.find(b); it != m_models.end()) {
+                own = bestMatch(it->second.entries, suns, tolerancePx);
+            }
+        }
+    }
+    return own;
 }
 
 Result<render::FlareModel> FlareStage::analyse(const std::array<render::FlareImage, 2>& images,
@@ -254,33 +278,33 @@ void FlareStage::logReasonOnce(int reason, const std::string& text) noexcept {
 //  Per frame
 // ---------------------------------------------------------------------------
 
-FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePair& pair, const geom::LensRig& rig,
-                                      const OsvColorParams& color, double sceneEv100, bool enabled, bool draft,
-                                      bool exactWanted, ThreadPool& pool, render::RenderParamsBuilder& builder,
-                                      const std::string& clip) noexcept {
-    Outcome out;
+FlareStage::Decision FlareStage::decide(std::uint32_t index, const video::FramePair* pair, const geom::LensRig& rig,
+                                        const OsvColorParams& color, double sceneEv100, bool enabled, bool draft,
+                                        bool exactWanted, ThreadPool& pool, const std::string& clip) noexcept {
+    // The answer starts as "settled, nothing to remove"; every early return
+    // below keeps it (apply() then clears the carve's hook, as before).
+    Decision d;
+    Outcome& out = d.outcome;
     try {
         // ---- wanted at all? ------------------------------------------------
         if (!enabled || draft) {
             // A frame without removal must not steer the seam either.
-            m_penalty.clear();
             if (!enabled) {
                 logReasonOnce(kReasonOff, std::format("flare: '{}': sun ghost removal is off in Source Settings",
                                                       clip));
             }
-            return out;
+            return d;
         }
         // The D-Log M passthrough output blends in log code, where the kernel
         // has no linear light to subtract from (osv_kernel.h skips the
         // removal there), so a measurement would cost an analysis per sun
         // position and change nothing.
         if (color.transfer == OSV_TRANSFER_PASSTHROUGH) {
-            m_penalty.clear();
             logReasonOnce(kReasonPassthrough,
                           std::format("flare: '{}': the D-Log M passthrough output is not treated (it blends in log "
                                       "code); rendering without ghost removal",
                                       clip));
-            return out;
+            return d;
         }
         // The frame's exposure travels with the parameters, so the sun check
         // and the fits (here or on the worker) also hold the image's own
@@ -298,16 +322,20 @@ FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePai
         // frame costs nothing and nothing measured earlier reaches it.  The
         // value is the frame's own metadata, so the answer is final (exact).
         if (render::flareSceneTooDark(sceneEv100, params)) {
-            m_penalty.clear();
             logReasonOnce(kReasonDark,
                           std::format("flare: '{}': scene metered at EV100 {:.1f} at frame {}, too dark for the sun "
                                       "to be in view; nothing to remove",
                                       clip, sceneEv100, index));
-            return out;
+            return d;
         }
         const std::uint32_t bucket = render::parallaxBucket(index);
+        const double tolerance = render::flareSunTolerancePx(static_cast<std::uint32_t>(std::max(rig.streamW, 0)));
 
         // ---- a frame already answered keeps its answer -------------------------
+        // A look-up without the frame (pair null) may also answer it from the
+        // sun check an earlier Interactive render of it recorded: a model
+        // that fits that sun now is adopted exactly as that render would
+        // adopt it on its next request.
         {
             std::optional<EntryPtr> known;
             {
@@ -315,30 +343,38 @@ FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePai
                 if (const auto it = m_models.find(bucket); it != m_models.end()) {
                     if (const auto f = it->second.frames.find(index); f != it->second.frames.end()) {
                         known = f->second;
+                    } else if (pair == nullptr) {
+                        if (const auto c = it->second.checked.find(index); c != it->second.checked.end()) {
+                            const render::FlareSunFixes recorded = c->second;
+                            if (EntryPtr fit = findUsableLocked(bucket, recorded, tolerance)) {
+                                // Adopt it into this bucket and give it to the frame for good.
+                                storeLocked(bucket, fit);
+                                assignLocked(bucket, index, fit);
+                                known = fit;
+                            }
+                        }
                     }
                 }
             }
             if (known) {
-                if (*known && (*known)->model.any()) {
-                    builder.flare((*known)->model);
-                    m_penalty.update((*known)->model, rig);
-                    out.applied = true;
-                } else {
-                    m_penalty.clear();  // no sun in this frame
-                }
-                return out;
+                d.entry = *known;  // null: no sun in this frame
+                return d;
             }
+        }
+        if (pair == nullptr) {
+            // A look-up with no answer: not settled, nothing decoded or measured.
+            out.exact = false;
+            return d;
         }
 
         // ---- where is the sun in this frame? --------------------------------
         const auto tCheck = std::chrono::steady_clock::now();
-        auto checked = render::locateSuns(rig, pair, color, params, pool);
+        auto checked = render::locateSuns(rig, *pair, color, params, pool);
         if (!checked.ok()) {
-            m_penalty.clear();
             logReasonOnce(kReasonCheck,
                           std::format("flare: '{}': the sun check failed ({}); rendering without ghost removal", clip,
                                       checked.error().message));
-            return out;
+            return d;
         }
         const render::FlareSunFixes suns = checked.value();
         const double checkMs =
@@ -349,12 +385,10 @@ FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePai
                 std::lock_guard<std::mutex> lock(m_mutex);
                 assignLocked(bucket, index, nullptr);
             }
-            m_penalty.clear();
             logReasonOnce(kReasonNoSun,
                           std::format("flare: '{}': no sun in either lens at frame {}; nothing to remove", clip, index));
-            return out;
+            return d;
         }
-        const double tolerance = render::flareSunTolerancePx(static_cast<std::uint32_t>(std::max(rig.streamW, 0)));
 
         // ---- what is known ------------------------------------------------------
         // A model describes every frame whose sun is where the model's frame
@@ -368,19 +402,7 @@ FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePai
         bool inHand = false;  // the worker already has this bucket at this sun
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            if (const auto it = m_models.find(bucket); it != m_models.end()) {
-                own = bestMatch(it->second.entries, suns, tolerance);
-            }
-            for (std::uint32_t d = 1; d <= kBorrowBuckets && !own; ++d) {
-                for (const std::uint32_t b : {bucket >= d ? bucket - d : bucket, bucket + d}) {
-                    if (b == bucket || own) {
-                        continue;
-                    }
-                    if (const auto it = m_models.find(b); it != m_models.end()) {
-                        own = bestMatch(it->second.entries, suns, tolerance);
-                    }
-                }
-            }
+            own = findUsableLocked(bucket, suns, tolerance);
             if (own) {
                 // Adopt it into this bucket and give it to this frame for good.
                 storeLocked(bucket, own);
@@ -402,7 +424,7 @@ FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePai
                 if (!suns[static_cast<std::size_t>(i)].found) {
                     continue;
                 }
-                auto image = render::flareDownsampleLens(pair, i, color, params.factor, pool);
+                auto image = render::flareDownsampleLens(*pair, i, color, params.factor, pool);
                 if (image.ok()) {
                     images[static_cast<std::size_t>(i)] = std::move(image).value();
                 } else {
@@ -482,21 +504,46 @@ FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePai
         // direct path relies on an Exact frame being the same whatever was
         // rendered before it.  One model per sun position is also what keeps
         // a steady shot's ghosts from shimmering between bucket fits.
-        std::optional<render::FlareModel> chosen;
         if (own) {
-            chosen = own->model;
+            d.entry = own;
         } else {
             // Nothing measured for this sun yet, and an Interactive request
             // does not wait: the frame goes without removal and is not final.
             out.exact = false;
+            if (!exactWanted) {
+                // Its sun check, for a look-up that may answer it once a model
+                // fitting this sun lands (anchorSeamPenalty).
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_models[bucket].checked[index] = suns;
+                trimBuckets(m_models, kMaxBuckets, bucket);
+            }
         }
+        return d;
+    } catch (const std::exception& e) {
+        // A frame never fails because of the removal.
+        PluginLog::warn("flare: frame {}: {}; rendering without ghost removal", index, e.what());
+        return Decision{};
+    } catch (...) {
+        return Decision{};
+    }
+}
 
-        // ---- hand it over ---------------------------------------------------------
-        if (chosen && chosen->any()) {
-            builder.flare(*chosen);
-            m_penalty.update(*chosen, rig);
+FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePair& pair, const geom::LensRig& rig,
+                                      const OsvColorParams& color, double sceneEv100, bool enabled, bool draft,
+                                      bool exactWanted, ThreadPool& pool, render::RenderParamsBuilder& builder,
+                                      const std::string& clip) noexcept {
+    // The schedule decides; this hands its answer to the frame and to the
+    // carve of a seam on this frame (the latest-model hook).
+    const Decision d = decide(index, &pair, rig, color, sceneEv100, enabled, draft, exactWanted, pool, clip);
+    Outcome out = d.outcome;
+    try {
+        if (d.entry && d.entry->model.any()) {
+            builder.flare(d.entry->model);
+            m_penalty.update(d.entry->model, rig);
             out.applied = true;
         } else {
+            // No sun, nothing measured yet, or removal not wanted: a frame
+            // without removal must not steer the seam either.
             m_penalty.clear();
         }
         return out;
@@ -509,6 +556,28 @@ FlareStage::Outcome FlareStage::apply(std::uint32_t index, const video::FramePai
         m_penalty.clear();
         return Outcome{};
     }
+}
+
+bool FlareStage::anchorSeamPenalty(std::uint32_t anchor, const video::FramePair* pair, const geom::LensRig& rig,
+                                   const OsvColorParams& color, double sceneEv100, bool enabled, ThreadPool& pool,
+                                   const std::string& clip, render::FlareSeamPenalty& penalty) noexcept {
+    // With the anchor's frames: answered as an Exact request answers it
+    // (measured now when nothing fits).  Without: a look-up only.  Never a
+    // draft - the carve does not run for one.
+    const Decision d = decide(anchor, pair, rig, color, sceneEv100, enabled, /*draft=*/false,
+                              /*exactWanted=*/pair != nullptr, pool, clip);
+    try {
+        if (d.outcome.exact && d.entry && d.entry->model.any()) {
+            penalty.update(d.entry->model, rig);
+        } else {
+            penalty.clear();  // nothing to steer around, or not settled yet
+        }
+    } catch (...) {
+        // Copying the model or the rig can only fail on allocation: carve
+        // without the ghosts rather than with a half-installed model.
+        penalty.clear();
+    }
+    return d.outcome.exact;
 }
 
 // ---------------------------------------------------------------------------

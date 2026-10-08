@@ -236,6 +236,17 @@ void hashClipParams(Hasher& h, const render::ClipSteadyParams& p) noexcept {
                            m.temporalWeight, m.temporalFloor, m.temporalScalePx}) {
         h.f64(v);
     }
+    // The band line detector (render::detectSeamLines) whose segments the
+    // samples' meshes and the clip field keep straight: measureClipSteady
+    // runs it at its defaults, so a later tuning of those defaults changes
+    // every clip field and must not be served from a correction cached
+    // before it.
+    const render::LineDetectParams lines{};
+    h.u64(lines.blurPasses);
+    for (const double v : {lines.angleToleranceDeg, lines.gradientQuantization, lines.logEpsilon, lines.minDensity,
+                           lines.minLengthPx}) {
+        h.f64(v);
+    }
 }
 
 /// Hide Mount Auto's parameters (every field changes the verdict).

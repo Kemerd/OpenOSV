@@ -959,8 +959,11 @@ private:
 
     /// What one mesh measurement produced (solveMeshJob).
     struct MeshJobResult {
-        std::shared_ptr<const render::ParallaxWarpGrid> field;  ///< Null when it failed.
-        std::shared_ptr<const render::ParallaxWarpGrid> alone;  ///< Null when it failed.
+        /// The field; when the measurement failed, the seam table's lift if
+        /// the bucket's table was measured (the field "nothing measured"
+        /// gives), else null.
+        std::shared_ptr<const render::ParallaxWarpGrid> field;
+        std::shared_ptr<const render::ParallaxWarpGrid> alone;  ///< The field alone; as `field` on failure.
         std::string summary;  ///< MeshWarpReport::summary(), or why it failed.
         std::string failure;  ///< Non-empty when it failed.
         double ms = 0.0;      ///< Lines + flows + solve.
