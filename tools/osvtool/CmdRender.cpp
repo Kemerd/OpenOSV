@@ -104,7 +104,9 @@ struct RenderOptions {
     /// non-final frame) | playback (the playback == parked check: the first
     /// frame parked, the range played twice, the SECOND pass written - each
     /// frame of it re-asked until final, as Premiere re-asks a frame that
-    /// stayed out of its cache).
+    /// stayed out of its cache) | play (what a viewer sees while Premiere
+    /// plays from a parked frame: the first frame parked, then ONE
+    /// Interactive pass, every frame written as it came back, final or not).
     std::string purpose = "exact";
     /// Scene Light, both engines: auto | day | night.  Empty = the engine's
     /// default - the Source Settings defaults' (Auto) for the plug-in engine,
@@ -1790,8 +1792,13 @@ int runEngineRender(const RenderOptions& o, const CLI::App& sub) {
     // Premiere's playback asks, never waiting for an analysis (see --purpose).
     const bool interactivePass = o.purpose == "interactive";
     const bool playbackCheck = o.purpose == "playback";
-    if (!interactivePass && !playbackCheck && o.purpose != "exact") {
-        std::fprintf(stderr, "error: unknown --purpose '%s' (exact | interactive | playback)\n",
+    // play: the first frame parked (Exact, as Premiere renders the frame the
+    // playhead rests on), every later frame Interactive and written as it
+    // came back - the pictures a viewer sees during playback, non-final
+    // stand-ins included, which the playback check never writes.
+    const bool playOnce = o.purpose == "play";
+    if (!interactivePass && !playbackCheck && !playOnce && o.purpose != "exact") {
+        std::fprintf(stderr, "error: unknown --purpose '%s' (exact | interactive | playback | play)\n",
                      log::safe(o.purpose).c_str());
         return kExitUsage;
     }
@@ -1866,7 +1873,9 @@ int runEngineRender(const RenderOptions& o, const CLI::App& sub) {
     for (std::uint32_t f = first; f <= last && !sink.failed() && exitCode == kExitOk; ++f) {
         render::ImageRGBAf frame;
         bool final = false;
-        if (!renderOne(f, purpose, &frame, final)) {
+        // play: the parked first frame is Exact, the rest as playback asks.
+        const pr::RenderPurpose framePurpose = (playOnce && f == first) ? pr::RenderPurpose::Exact : purpose;
+        if (!renderOne(f, framePurpose, &frame, final)) {
             exitCode = kExitRuntime;
             break;
         }
@@ -1891,7 +1900,7 @@ int runEngineRender(const RenderOptions& o, const CLI::App& sub) {
             }
         } else {
             finalAtOnce += final ? 1u : 0u;
-            neverFinal += (!final && interactivePass) ? 1u : 0u;
+            neverFinal += (!final && (interactivePass || playOnce)) ? 1u : 0u;
         }
         sink.push(f, std::move(frame));
 
@@ -1902,11 +1911,12 @@ int runEngineRender(const RenderOptions& o, const CLI::App& sub) {
                          sec > 0 ? done / sec : 0.0, clip->rendererName().c_str());
         }
     }
-    if (playbackCheck || interactivePass) {
+    if (playbackCheck || interactivePass || playOnce) {
         log::info("{}: {} of {} frames final at once, {} after waiting for the background measurements, {} not "
                   "final",
-                  playbackCheck ? "playback check, second pass" : "interactive pass", finalAtOnce,
-                  last - first + 1, finalAfterWait, neverFinal);
+                  playbackCheck ? "playback check, second pass"
+                                : (playOnce ? "play (parked first frame, one Interactive pass)" : "interactive pass"),
+                  finalAtOnce, last - first + 1, finalAfterWait, neverFinal);
     }
     exitCode = sink.finish(exitCode);
 
@@ -1948,9 +1958,10 @@ void registerRenderCommand(CLI::App& app, CommandContext& ctx) {
                      "plugin engine: exact (default; export or a parked frame - every analysis made first) | "
                      "interactive (playback: never waits for an analysis) | playback (the playback == parked check: "
                      "the first frame parked, the range played twice, the second pass written, each frame re-asked "
-                     "until final)")
+                     "until final) | play (the first frame parked, then one Interactive pass written as it came "
+                     "back: what a viewer sees during playback)")
         ->default_str("exact")
-        ->check(CLI::IsMember({"exact", "interactive", "playback"}));
+        ->check(CLI::IsMember({"exact", "interactive", "playback", "play"}));
     engine->add_option("--scene-light", opt->sceneLight,
                        "auto | day | night: the photometric profile (night: a short, narrow sky seam field, no "
                        "exposure match, no lens shading).  Default: auto with the plugin engine (the camera's "
