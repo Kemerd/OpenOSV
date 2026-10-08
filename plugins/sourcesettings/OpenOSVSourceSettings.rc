@@ -22,8 +22,8 @@
 #include <winver.h>
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION 1,1,0,0
+ PRODUCTVERSION 1,1,0,0
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -43,12 +43,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "The OpenOSV Contributors"
             VALUE "FileDescription",  "OpenOSV Source Settings - master clip stitch options for Adobe Premiere Pro"
-            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "FileVersion",      "1.1.0.0"
             VALUE "InternalName",     "OpenOSVSourceSettings"
             VALUE "LegalCopyright",   "Copyright (C) 2026 The OpenOSV Contributors. Apache-2.0."
             VALUE "OriginalFilename", "OpenOSVSourceSettings.aex"
             VALUE "ProductName",      "OpenOSV"
-            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "ProductVersion",   "1.1.0.0"
         END
     END
     BLOCK "VarFileInfo"

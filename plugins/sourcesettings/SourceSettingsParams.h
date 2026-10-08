@@ -60,19 +60,31 @@
 /* ==========================================================================
  *  Version
  * ========================================================================== */
+/* The version moves whenever the PARAMETER LIST changes (a control added,
+ * moved or re-typed), so the host's plug-in cache and a project's stored
+ * instance can tell one list from the other.  A project stores every
+ * parameter by its permanent id, and the host matches those ids to the
+ * current list, so an older instance keeps every value and a new control
+ * starts at its default.
+ *
+ *   1.0.0  0.2.x - 0.5.0   up to 36 parameters (Lens Focal the last added)
+ *   1.1.0  0.5.2           37 parameters: Hide Mount (id 54, index 26),
+ *                          which 0.5.1 shipped without moving the number */
 #define OSV_SOURCE_SETTINGS_VERSION_MAJOR 1
-#define OSV_SOURCE_SETTINGS_VERSION_MINOR 0
+#define OSV_SOURCE_SETTINGS_VERSION_MINOR 1
 #define OSV_SOURCE_SETTINGS_VERSION_BUG 0
 
 /* PF_VERSION(MAJOR, MINOR, BUG, STAGE, BUILD) packed by hand:
  *     ((MAJOR << 19) | (MINOR << 15) | (BUG << 11) | (STAGE << 9) | BUILD)
- * Stage 3 = PF_Stage_RELEASE, build 0, so 1.0.0 release packs to
- *     (1 << 19) | (3 << 9) = 524288 + 1536 = 525824.
+ * Stage 3 = PF_Stage_RELEASE, build 0, so 1.1.0 release packs to
+ *     (1 << 19) | (1 << 15) | (3 << 9) = 524288 + 32768 + 1536 = 558592
+ * (1.0.0 was 525824).
  * A bare decimal literal, for the PiPLtool reason in the file header; a
- * static_assert in SourceSettingsMain.cpp ties it to PF_VERSION(). */
+ * static_assert in SourceSettingsMain.cpp ties it to PF_VERSION(), and
+ * OpenOSVSourceSettings.rc spells the same numbers out for VERSIONINFO. */
 #define OSV_SOURCE_SETTINGS_STAGE 3
 #define OSV_SOURCE_SETTINGS_BUILD 0
-#define OSV_SOURCE_SETTINGS_PIPL_VERSION 525824
+#define OSV_SOURCE_SETTINGS_PIPL_VERSION 558592
 
 /* ==========================================================================
  *  Global out-flags (PiPL <-> PF_Cmd_GLOBAL_SETUP)

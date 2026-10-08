@@ -32,6 +32,7 @@ add_executable(osv_source_settings_tests
   test_prefs.cpp
   test_pipl.cpp
   test_defaults.cpp   # [WP-DEFAULTS] the Defaults group and new-clip seeding
+  test_compat.cpp     # an older project's stored instance restores by id; the version moved with the list
   # Compiled here too so the tests can exercise the mapping directly; the
   # .aex contains the identical object.
   "${_osv_ss_src}/SourceSettingsMapping.cpp"
