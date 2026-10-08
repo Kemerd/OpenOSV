@@ -2603,19 +2603,27 @@ lines):
   px, energy e0 -> e1, 2 solves, temporal |dV| v deg, t ms` - each moment's
   correction (Debug). `matches` is how much of the flow it followed (on the
   raw picture and on the picture already corrected by the seam table), `s`
-  the structured gate's weight on them (0 on open sky: the field is then
-  the seam table's shift, exactly), `lines` the straight edges it kept
-  straight and how straight, `|dV|` how far it moved from the moment
-  before, `t` the solve's cost. `field alone (its temporal prior is not
-  measured)` is a moment measured before the one ahead of it (playback that
-  started without a parked frame): not final, measured again once the
-  moment before is known. `stand-in field` is a moment measured on the
-  frame itself because nothing around it was measured yet: not final
-  either. `mesh failed (...)` renders that moment uncorrected.
+  the structured gate's weight on them (0 on open sky: nothing is
+  followed, and the field is the seam table's shift only for the clip's
+  first moment with no straight edge in the band - otherwise it is still
+  held toward the moment before and bent by the edges it keeps straight),
+  `lines` the straight edges it kept straight and how straight, `|dV|` how
+  far it moved from the moment before, `t` the solve's cost (10-14 ms on
+  four CPU threads, the field alone included). `field alone (its temporal
+  prior is not measured)` is a moment measured before the one ahead of it
+  (playback that started without a parked frame): not final, measured
+  again once the moment before is known. `stand-in field` is a moment
+  measured on the frame itself because nothing around it was measured yet:
+  not final either. `mesh failed (...); the bucket renders the seam table's
+  lift` falls back to the seam table's shift for that moment (`uncorrected`
+  when its table could not be measured either).
 * `frame N (bucket B, anchor bands A): seam carved ... through the mesh
-  field` - the blend line carved from the first frame's analysis bands that
-  the measurement kept, so a frame after it carves exactly what a parked
-  frame carves.
+  field, steered by the anchor's ghosts` - the blend line carved from the
+  first frame's analysis bands that the measurement kept, steered around
+  the sun ghosts of that first frame, so a frame after it carves exactly
+  what a parked frame carves. `this frame's ghosts` marks a seam carved on
+  the frame itself (a stand-in, or an export whose first frame of the
+  moment could not be decoded).
 
 **What to send** when the seam is still wrong: the clip's name and recording
 mode (4K / 6K / 8K), the frame number or timecode of the moment, the Source
