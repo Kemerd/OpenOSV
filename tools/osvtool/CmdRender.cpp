@@ -431,6 +431,53 @@ int selectFrames(const RenderOptions& o, std::uint32_t total, std::uint32_t& fir
     return kExitOk;
 }
 
+/**
+ * @brief Where timeline frame `first` sits in the source's sound, in seconds.
+ *
+ * An .mp4 of frames A..B copies the source audio; it must start with the
+ * sound recorded with frame A, not the sound at 0:00.  Frames count the
+ * clip's TIMELINE (see the file comment): constant-rate frames at the
+ * nominal period, a dropped frame held rather than skipped, so timeline
+ * frame k is k nominal periods into the recording on a clip with or without
+ * dropped frames - the same clock the audio runs on.
+ *
+ * The exact rational rate is used (frame x denominator / numerator: 25000 /
+ * 1000 ticks, or 30000 / 1001 for 29.97), never a rounded fps, so frame
+ * 107892 of a 29.97 clip is 3599.9964 s and not 3600.
+ *
+ * @param first        The first rendered timeline frame.
+ * @param rateNum      The timeline's rate numerator (ticks per second), 0 when unknown.
+ * @param rateDen      The timeline's rate denominator (ticks per frame), 0 when unknown.
+ * @param fallbackFps  The rate the video is written at, used only when the
+ *                     rational is unknown.
+ * @return  The moment in seconds (>= 0); 0 for frame 0, and 0 - the audio
+ *          copied from the start, as before - when no rate is usable (a
+ *          video cannot open without a rate, so that case never plays).
+ */
+[[nodiscard]] double audioStartSecondsFor(std::uint32_t first, std::uint32_t rateNum, std::uint32_t rateDen,
+                                          double fallbackFps) {
+    // Frame 0 is the start of the recording: no seek, the old command line.
+    if (first == 0) {
+        return 0.0;
+    }
+    // The clip's own rational rate: exact for every rate a camera records.
+    if (rateNum > 0 && rateDen > 0) {
+        return static_cast<double>(first) * static_cast<double>(rateDen) / static_cast<double>(rateNum);
+    }
+    // No rational (a table without durations): the rate the video is written
+    // at, which is the rate the frames were counted at.  Debug lines only:
+    // this runs for stills too, where there is no sound to place.
+    if (std::isfinite(fallbackFps) && fallbackFps > 0.0) {
+        log::debug("audio: no rational frame rate; frame {} placed at {:.6f} s from {:.3f} fps", first,
+                   static_cast<double>(first) / fallbackFps, fallbackFps);
+        return static_cast<double>(first) / fallbackFps;
+    }
+    // Nothing to place the frame with (a video then fails to open on its
+    // rate anyway): copy from the start.
+    log::debug("audio: no usable frame rate; frame {} cannot be placed, the sound starts at 0", first);
+    return 0.0;
+}
+
 /// The virtual camera of --mode reframe: --preset, --proj, --fov,
 /// --distortion, --yaw / --pitch / --roll and --correction, at `w` x `h`.
 /// Both engines frame with it, so a view is the same view whichever one
@@ -504,10 +551,13 @@ public:
 
     /// Open the pipe (video) or pick the image format (stills) for frames of
     /// `w` x `h` at `fps` encoded with `transfer`; `pqPeakNits` is what a PQ
-    /// still records as its peak.  Starts the writer thread.  kExitOk, or
-    /// the exit code after the message was printed.
+    /// still records as its peak.  `audioStartSeconds` is where a video's
+    /// copied source audio starts - the moment of the first rendered frame
+    /// (audioStartSecondsFor) - so a ranged .mp4 plays its own frames' sound.
+    /// Starts the writer thread.  kExitOk, or the exit code after the
+    /// message was printed.
     int open(const RenderOptions& o, int w, int h, double fps, color::OutputTransfer transfer, float pqPeakNits,
-             bool multi) {
+             bool multi, double audioStartSeconds) {
         m_out = o.out;
         m_multi = multi;
         const bool toVideo = std::filesystem::path(o.out).extension() == ".mp4" ||
@@ -542,6 +592,14 @@ public:
                                                                       : io::PipeTransfer::PQ;
             if (!o.noAudio) {
                 fo.audioSource = o.pipeline.input;
+                // The sound of the first rendered frame, not of 0:00.  A value
+                // that is not a time is the pipe's to refuse (it logs and
+                // copies from the start); a real one is worth a line here.
+                fo.audioStartSeconds = audioStartSeconds;
+                if (std::isfinite(audioStartSeconds) && audioStartSeconds > 0.0) {
+                    log::info("audio: copied from {:.6f} s of the source, the moment of the first rendered frame",
+                              audioStartSeconds);
+                }
             }
             auto pw = io::FfmpegPipeWriter::open(fo, o.out);
             if (!pw.ok()) {
@@ -834,7 +892,12 @@ int runRender(const RenderOptions& o) {
     // the decoder's rate, which is the same number.
     FrameSink sink;
     const double sinkFps = timeline.identity() ? P.fps() : timeline.fps();
-    if (const int opened = sink.open(o, w, h, sinkFps, P.outputTransfer, color::hdrPeakNitsOf(P.color), multi);
+    // The copied audio starts at the first rendered frame's moment, from the
+    // timeline's exact rational rate (timescale / nominal ticks; both 0 when
+    // the track has no usable table, and then the rate the video is written at).
+    const double audioStart = audioStartSecondsFor(first, timeline.timescale, timeline.nominalTicks, sinkFps);
+    if (const int opened =
+            sink.open(o, w, h, sinkFps, P.outputTransfer, color::hdrPeakNitsOf(P.color), multi, audioStart);
         opened != kExitOk) {
         return opened;
     }
@@ -1638,8 +1701,13 @@ int runEngineRender(const RenderOptions& o, const CLI::App& sub) {
     const OsvColorParams frameColor = clip->colorParams();
     const color::OutputTransfer transfer = transferOf(settings.color());
     FrameSink sink;
+    // The copied audio starts at the first rendered frame's moment on the
+    // clip's own timeline, from its exact rational rate - the one clip->fps()
+    // divides out, which on a clip that dropped frames is its nominal rate.
+    const double audioStart =
+        audioStartSecondsFor(first, clip->rateNumerator(), clip->rateDenominator(), clip->fps());
     if (const int sinkOpened = sink.open(o, geometry.width, geometry.height, clip->fps(), transfer,
-                                         color::hdrPeakNitsOf(frameColor), multi);
+                                         color::hdrPeakNitsOf(frameColor), multi, audioStart);
         sinkOpened != kExitOk) {
         return sinkOpened;
     }

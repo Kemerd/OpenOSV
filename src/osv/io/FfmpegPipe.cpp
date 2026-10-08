@@ -5,8 +5,11 @@
 #include "osv/core/Log.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <sstream>
 #include <vector>
 
@@ -182,9 +185,58 @@ std::filesystem::path searchPath(const char* name) {
 }
 #endif
 
-/// Build the ffmpeg argument vector for the given codec.
-std::vector<std::string> buildArgs(const FfmpegPipeOptions& o, const std::string& codec,
-                                   const std::filesystem::path& out) {
+/// Largest audio seek, in microseconds, that still fits ffmpeg's own time
+/// unit (AV_TIME_BASE, a signed 64-bit microsecond count) with room to
+/// spare: about 285 000 years, so only a garbage value ever reaches it.
+constexpr double kMaxAudioSeekUs = 9.0e18;
+
+/**
+ * @brief The audio input's seek in whole microseconds (ffmpeg's time unit).
+ *
+ * The seek is carried as an integer so the argument is an exact decimal:
+ * a double formatted straight to text could print 12.499999 for 12.5.
+ *
+ * @param seconds  FfmpegPipeOptions::audioStartSeconds as the caller set it.
+ * @return  The seek rounded to the nearest microsecond; 0 when it rounds
+ *          to nothing (no seek at all); -1 when `seconds` is NaN, infinite,
+ *          negative or beyond kMaxAudioSeekUs (not a time - the caller
+ *          treats it as 0 and open() says so).
+ */
+[[nodiscard]] std::int64_t audioSeekMicroseconds(double seconds) noexcept {
+    // Anything that is not a finite, non-negative time is refused outright.
+    if (!std::isfinite(seconds) || seconds < 0.0) {
+        return -1;
+    }
+    const double us = seconds * 1.0e6;
+    // A value llround could not represent is garbage, not a clip position.
+    if (!(us < kMaxAudioSeekUs)) {
+        return -1;
+    }
+    return static_cast<std::int64_t>(std::llround(us));
+}
+
+/**
+ * @brief Seconds as ffmpeg's `-ss` reads them, from whole microseconds.
+ *
+ * Integer arithmetic gives exactly six decimals ("12.500000"), with no
+ * locale or binary-fraction surprises.
+ *
+ * @param us  A positive microsecond count (audioSeekMicroseconds() > 0).
+ * @return    "<seconds>.<6 digits>".
+ */
+[[nodiscard]] std::string seekArgument(std::int64_t us) {
+    // Defensive: a negative count never reaches here, but never prints "-0.x".
+    if (us < 0) {
+        us = 0;
+    }
+    return std::format("{}.{:06}", us / 1000000, us % 1000000);
+}
+
+}  // namespace
+
+/// Build the ffmpeg argument vector for the given codec (see the header).
+std::vector<std::string> buildFfmpegArgs(const FfmpegPipeOptions& o, const std::string& codec,
+                                         const std::filesystem::path& out) {
     std::vector<std::string> a;
     a.push_back("-hide_banner");
     a.push_back("-loglevel");
@@ -209,6 +261,17 @@ std::vector<std::string> buildArgs(const FfmpegPipeOptions& o, const std::string
     // Input 1: audio source (optional).
     const bool audio = !o.audioSource.empty();
     if (audio) {
+        // Where the copy starts: the moment of the first rendered frame.  An
+        // input-side seek (before this input's -i, after the stdin one) moves
+        // the audio input alone and rebases its timestamps to 0, so it lines
+        // up with the first piped frame.  No seek at 0, so a render from the
+        // clip's start keeps its exact command line.  A value that is not a
+        // time is copied from the start (open() has logged it).
+        const std::int64_t seekUs = audioSeekMicroseconds(o.audioStartSeconds);
+        if (seekUs > 0) {
+            a.push_back("-ss");
+            a.push_back(seekArgument(seekUs));
+        }
         a.push_back("-i");
         a.push_back(o.audioSource.string());
         a.push_back("-map");
@@ -290,8 +353,6 @@ std::vector<std::string> buildArgs(const FfmpegPipeOptions& o, const std::string
     a.push_back(out.string());
     return a;
 }
-
-}  // namespace
 
 struct FfmpegPipeWriter::Impl {
     std::string commandLine;
@@ -574,17 +635,24 @@ Result<FfmpegPipeWriter> FfmpegPipeWriter::open(const FfmpegPipeOptions& options
     if (options.width == 0 || options.height == 0 || options.fps <= 0.0) {
         return Error{ErrorCode::InvalidArgument, "FfmpegPipeWriter: invalid size or fps"};
     }
+    // An audio start that is not a time (NaN, infinite, negative) must not
+    // reach the command line: buildFfmpegArgs copies from the start instead,
+    // and this is the one place that says so (it builds twice on a fallback).
+    if (!options.audioSource.empty() && audioSeekMicroseconds(options.audioStartSeconds) < 0) {
+        log::warn("ffmpeg: audio start {} s is not a usable time; copying the audio from the start of the file",
+                  options.audioStartSeconds);
+    }
     const std::filesystem::path exe = resolveExecutable(options.ffmpegExe);
     FfmpegPipeWriter w;
     std::string error;
-    const auto args = buildArgs(options, options.codec, out);
+    const auto args = buildFfmpegArgs(options, options.codec, out);
     if (w.m_impl->start(exe, args, 1500, &error)) {
         log::info("ffmpeg: {}", w.m_impl->commandLine);
         return w;
     }
     log::warn("ffmpeg with {} failed ({}), retrying with {}", options.codec, error, options.fallbackCodec);
     if (!options.fallbackCodec.empty() && options.fallbackCodec != options.codec) {
-        const auto fallback = buildArgs(options, options.fallbackCodec, out);
+        const auto fallback = buildFfmpegArgs(options, options.fallbackCodec, out);
         if (w.m_impl->start(exe, fallback, 1500, &error)) {
             log::info("ffmpeg: {}", w.m_impl->commandLine);
             return w;
