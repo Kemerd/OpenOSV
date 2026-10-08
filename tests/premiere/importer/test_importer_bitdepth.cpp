@@ -513,8 +513,9 @@ namespace {
 }
 
 /// How two renders of one frame differ, inside and outside the overlap band
-/// (|seam latitude| <= 9.5 deg: the parallax grid's span plus margin, and
-/// far beyond the seam blend's 4 degree feather).
+/// (|seam latitude| <= 9.5 deg by default: far beyond the seam blend's 4
+/// degree feather; a caller widens it to an analysis' own reach, e.g. the
+/// mesh field's 12 deg rows).
 struct PathDifference {
     std::uint64_t pixelsInside = 0;    ///< Band pixels with any channel different.
     std::uint64_t pixelsOutside = 0;   ///< Same, outside the band.
@@ -634,7 +635,10 @@ TEST_CASE("with an analysis on, the two frame paths differ only by that analysis
         // 20 deg beyond them: nothing past 29 deg may differ.
         // [WP-VIGNETTE] the correction starts 76 deg from a lens axis, so
         // it reaches 14 deg from the seam plus the axes' tilt: 16 deg.
-        const PathDifference d = pathDifference(gpu, host, c.photo ? 30.0 : (c.shading ? 16.0 : 9.5));
+        // The mesh field's rows run to +-12 deg (its pinned edge rows), half
+        // a degree of margin on top: nothing past 12.5 deg may differ.
+        const double bandDeg = c.photo ? 30.0 : (c.shading ? 16.0 : (c.parallax ? 12.5 : 9.5));
+        const PathDifference d = pathDifference(gpu, host, bandDeg);
         INFO(c.name << ": band pixels differing " << d.pixelsInside << " / " << d.bandPixels << " (worst "
                     << d.worstInside << ", mean " << d.meanInside << "), outside the band " << d.pixelsOutside
                     << " (worst " << d.worstOutside << ")");
