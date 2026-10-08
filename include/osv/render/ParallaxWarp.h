@@ -208,13 +208,70 @@ struct ParallaxWarpParams {
     /// fix.  Bounding the output means the worst case is an under-correction.
     double maxCorrectionDeg = 3.0;
 
-    /// Fraction of the band's flow that must pass the forward-backward
-    /// consistency check for the result to be used at all, in [0, 1].
+    /// The retired all-pixel threshold, in [0, 1]: kept for diagnostics only.
     ///
-    /// Below this the measurement is not trustworthy enough to act on and
-    /// the grid is reported as unusable, so the caller renders uncorrected
-    /// rather than applying a field that is mostly repaired guesses.
+    /// Up to 0.5.0 a grid was refused when fewer than this fraction of ALL
+    /// co-visible band pixels passed the forward-backward check.  That share
+    /// mostly measured how much of the band was sky: measured on a
+    /// car-mounted day clip, 47-85 % of the co-visible pixels are flat, flat
+    /// pixels come out only 9-15 % consistent whatever the solver does (it
+    /// solves noise there), textured ones 49-80 %.  So the share sat at
+    /// 0.19-0.35 and the verdict flipped between consecutive buckets (7 of
+    /// 12 accepted on the day proxy, frames 5992-6080), switching the seam
+    /// between the grid and the table every few buckets.  The gate is now
+    /// the STRUCTURED share
+    /// below (minStructuredConsistent and its neighbours); nothing refuses
+    /// on this number any more.  osvtool seam still reports whether the
+    /// all-pixel share would have met it, for before/after comparisons.
     double minConsistentFraction = 0.25;
+
+    /// Smallest luma gradient (0..1 code scale, per band pixel) for a
+    /// co-visible pixel to count as STRUCTURED: two 8-bit code steps.
+    ///
+    /// The measure is the magnitude of the central-difference gradient
+    /// (half the difference of the two neighbours, along and across the
+    /// band), taken in each lens and the SMALLER of the two kept - a match
+    /// needs structure in both.  A neighbour the lens does not cover, or one
+    /// beyond the band's top or bottom row, stands in with the centre pixel,
+    /// so a coverage edge (a rim, an occlusion polygon) cannot pose as
+    /// structure; longitude wraps, because the band is a ring.  Both rules
+    /// are the seam table's texture term's (SeamSearchParams::confTextureLo);
+    /// that term differences along the meridian only, because its search is
+    /// 1-D along it, where the flow here is 2-D and an edge across the band
+    /// (a pole crossing the seam) is structure it measures.  The flow solver
+    /// has something to lock onto at such a pixel, and its forward-backward
+    /// verdict there says something about the measurement rather than about
+    /// the sky.
+    double minStructureGradient = 2.0 / 255.0;
+
+    /// Below this many structured co-visible pixels the measurement is
+    /// refused outright: 1500 is about 1 % of a 2048 x 68 band, a few
+    /// centimetres of edge at the seam.  Fog, a night sky or open water fall
+    /// below it and render with the seam table, which is the intent.
+    std::uint64_t minStructuredPixels = 1500;
+
+    /// The structured gate, in [0, 1]: the share of STRUCTURED co-visible
+    /// pixels whose flow passed the forward-backward check.
+    ///
+    /// Below minStructuredConsistent the grid is refused (Unsupported);
+    /// from fullStructuredConsistent on it applies at full strength; in
+    /// between it applies at strength s = smoothstep from the one to the
+    /// other, and the caller fills the rest with the seam table (the
+    /// importer's per-bucket and per-clip corrections both do), so the
+    /// correction moves continuously as the share drifts across the gate
+    /// instead of flipping between grid and table.  Measured on the
+    /// structured share with the classical solver: real frames 0.43-0.97
+    /// (car-mounted day proxy 0.71-0.90, its 8K original 0.43-0.77, the
+    /// night drive 0.66-0.82, the airborne sample 0.88-0.97 - all at full
+    /// strength), where the all-pixel share of the same frames was
+    /// 0.17-0.54.  Deliberately unrelated pairs (lens 0 of one moment of a
+    /// car drive against lens 1 of another) 0.10-0.28: 7 of 9 refused, the
+    /// other two at strength 0.04 and 0.10 - on a rigid mount the car body
+    /// is the same at both moments, so part of such a pair is not unrelated.
+    double minStructuredConsistent = 0.25;
+    /// See minStructuredConsistent: the share from which the grid applies at
+    /// full strength.  Must not be below minStructuredConsistent.
+    double fullStructuredConsistent = 0.40;
 
     /// Fraction by which a cell's correction must REDUCE the disagreement
     /// between the two lenses before it is applied at full strength, in
@@ -260,25 +317,48 @@ struct ParallaxWarpGrid {
     /// direction (the slave takes the negation).
     std::vector<float> uv;
 
+    /// The structured gate's strength s in [0, 1] (ParallaxWarpParams::
+    /// minStructuredConsistent): `uv` already carries it - every cell is s
+    /// times the measured correction - and the caller fills the remaining
+    /// 1 - s with the seam table.  1 for a fully trusted measurement, and
+    /// for a grid gridFromFlow() built directly (no gate ran).  A clip grid
+    /// (render::clipParallaxGrid) holds the median of its samples'.
+    double strength = 1.0;
+
     // ---- diagnostics -------------------------------------------------------
     FlowBackendKind usedBackend = FlowBackendKind::Classical;
     std::uint64_t consistentPixels = 0;  ///< Co-visible pixels whose flow passed the check.
     std::uint64_t totalPixels = 0;       ///< Co-visible pixels examined.
+    /// Co-visible pixels with structure in both lenses (see
+    /// ParallaxWarpParams::minStructureGradient).
+    std::uint64_t structuredPixels = 0;
+    /// Of those, the ones whose flow passed the check.
+    std::uint64_t consistentStructuredPixels = 0;
     double bandMs = 0.0;                 ///< Time spent rendering the two lens bands.
     double flowMs = 0.0;                 ///< Time spent in the flow backend.
     double gridMs = 0.0;                 ///< Time spent turning flow into the grid.
     std::uint32_t measuredCells = 0;     ///< Grid cells that received consistent flow.
     std::uint32_t gatedCells = 0;        ///< Of those, cells the benefit gate switched fully off.
-    double meanAbsCorrectionDeg = 0.0;   ///< Mean FULL disparity corrected, measured rows (deg).
-    double maxAbsCorrectionDeg = 0.0;    ///< Largest FULL disparity corrected, after clamping (deg).
+    double meanAbsCorrectionDeg = 0.0;   ///< Mean FULL disparity corrected, measured rows (deg), after strength.
+    double maxAbsCorrectionDeg = 0.0;    ///< Largest FULL disparity corrected, after clamping and strength (deg).
 
     [[nodiscard]] bool valid() const noexcept {
         return w > 0 && h > 0 && uv.size() == static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 2u;
     }
 
-    /// Fraction of flow pixels that passed the consistency check, in [0, 1].
+    /// Fraction of ALL co-visible flow pixels that passed the consistency
+    /// check, in [0, 1] - the retired gate's number, kept for diagnostics.
     [[nodiscard]] double consistentFraction() const noexcept {
         return totalPixels ? static_cast<double>(consistentPixels) / static_cast<double>(totalPixels) : 0.0;
+    }
+
+    /// Fraction of the STRUCTURED co-visible pixels that passed the
+    /// consistency check, in [0, 1]: the number the gate judges.  0 when no
+    /// pixel had structure.
+    [[nodiscard]] double structuredFraction() const noexcept {
+        return structuredPixels ? static_cast<double>(consistentStructuredPixels) /
+                                      static_cast<double>(structuredPixels)
+                                : 0.0;
     }
 };
 
@@ -314,6 +394,15 @@ struct ParallaxCellStats {
     /// reduced the lens-to-lens residual here.  All 1 when the gate is off.
     std::vector<float> gate;
 
+    // ---- the band-wide counts the structured gate judges ------------------
+    // The same four numbers ParallaxWarpGrid carries, set together with the
+    // cells - so a caller of parallaxFromBands() can still report them when
+    // the measurement is refused and no grid comes back.
+    std::uint64_t covisiblePixels = 0;             ///< == ParallaxWarpGrid::totalPixels.
+    std::uint64_t consistentPixels = 0;            ///< == ParallaxWarpGrid::consistentPixels.
+    std::uint64_t structuredPixels = 0;            ///< == ParallaxWarpGrid::structuredPixels.
+    std::uint64_t consistentStructuredPixels = 0;  ///< == ParallaxWarpGrid::consistentStructuredPixels.
+
     /// True when every per-cell array matches w * rows.
     [[nodiscard]] bool valid() const noexcept {
         const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(rows);
@@ -337,10 +426,14 @@ struct ParallaxCellStats {
 /// `osvtool render` pass nullptr and use the grid INSTEAD of the table,
 /// keeping the table only as the fallback when a grid is refused.
 ///
-/// Returns Unsupported when the flow was measured but too little of it passed
-/// the consistency check (see minConsistentFraction) - a normal outcome on
-/// featureless content such as open sky, which the caller handles by
-/// rendering uncorrected.  Returns InvalidArgument for malformed parameters.
+/// Returns Unsupported when the flow was measured but the structured gate
+/// refused it (too few structured pixels, or too small a consistent share of
+/// them: see minStructuredConsistent) - a normal outcome on featureless
+/// content such as fog or open sky, which the caller handles with the seam
+/// table or by rendering uncorrected; the message carries the structured and
+/// the all-pixel shares.  An accepted grid between the gate's two shares
+/// comes back scaled by its strength (ParallaxWarpGrid::strength).  Returns
+/// InvalidArgument for malformed parameters.
 [[nodiscard]] Result<ParallaxWarpGrid> buildParallaxWarp(const geom::LensRig& rig, const video::FramePair& frames,
                                                          const geom::BlendParams& blend,
                                                          const ParallaxWarpParams& params,
@@ -374,15 +467,37 @@ struct ParallaxCellStats {
 /// grid purely for diagnostics.
 ///
 /// Returns exactly what buildParallaxWarp returns for the same bands,
-/// including Unsupported for a measurement too inconsistent to use.
+/// including Unsupported for a measurement the structured gate refuses, and
+/// a grid scaled by its strength between the gate's two shares.
 ///
-/// `cells` (optional) receives the raw per-cell measurement
-/// (ParallaxCellStats) - filled whenever the grid itself was built, so also
-/// when the grid is then refused as too inconsistent.  Passing it changes
+/// `cells` (optional) receives the raw per-cell measurement and the gate's
+/// band-wide counts (ParallaxCellStats) - filled whenever the grid itself
+/// was built, so also when the gate then refuses it.  Passing it changes
 /// nothing about the grid.
 [[nodiscard]] Result<ParallaxWarpGrid> parallaxFromBands(const LensBands& bands, const ParallaxWarpParams& params,
                                                          ThreadPool* pool, double bandMs = 0.0,
                                                          ParallaxCellStats* cells = nullptr);
+
+/// The structured gate's strength for a measured structured share (see
+/// ParallaxWarpParams::minStructuredConsistent): 0 at or below
+/// `params.minStructuredConsistent`, 1 at or above
+/// `params.fullStructuredConsistent`, smoothstep between - so the strength,
+/// and with it the applied correction, has no step anywhere.  Equal shares
+/// make it a plain step at that share.  A non-finite share, or a malformed
+/// pair of shares (non-finite, or full below min), gives 0: no trust.
+[[nodiscard]] double parallaxGateStrength(double structuredFraction, const ParallaxWarpParams& params) noexcept;
+
+/// The share of a seam table that fills in under a grid of strength
+/// `gridStrength` (ParallaxWarpGrid::strength), into `out` (its capacity is
+/// reused): every column times 1 - gridStrength, so a fully trusted grid
+/// leaves no table (empty `out`), a refused measurement's strength of 0 the
+/// whole table bit for bit, and a partly trusted grid the rest - the grid
+/// and the table then add up to one correction, as the kernel applies the
+/// table first and the warp on top.  The strength is clamped to [0, 1]; a
+/// non-finite one counts as 0 (the grid is not trusted, the table is the
+/// correction).  Non-finite entries become 0.  An empty table gives an empty
+/// `out`.
+void seamTableUnderGrid(const std::vector<float>& table, double gridStrength, std::vector<float>& out);
 
 // ===========================================================================
 //  Temporal schedule: measure once per bucket of frames, glide between them
@@ -546,6 +661,12 @@ void blendSeamTables(const std::vector<float>* from, const std::vector<float>* t
 ///
 /// `cells` (optional) receives the raw per-cell measurement before the grid
 /// is shaped (ParallaxCellStats); the grid is identical with or without it.
+///
+/// The grid's pixel counts (consistent, structured - see
+/// ParallaxWarpParams::minStructureGradient) are filled here, but no gate is
+/// applied: the returned grid always has strength 1, and refusal and
+/// strength are parallaxFromBands' decisions.  Bands without luma planes of
+/// the band's size count no structured pixel.
 [[nodiscard]] Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& flow,
                                                     const ParallaxWarpParams& params, ThreadPool* pool = nullptr,
                                                     ParallaxCellStats* cells = nullptr);

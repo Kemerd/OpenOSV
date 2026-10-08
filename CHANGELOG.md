@@ -66,6 +66,24 @@ classical flow and the seam-shift table, not osvtool's neural default.
   clip's seam band and the 6K sample hold or improve (sample OSV frame 60:
   0.917 to 0.920). The flow solve costs about 10 ms more per bucket on four
   CPU threads (~35 to ~44 ms).
+* **The parallax correction no longer switches on and off from one moment
+  to the next.** Whether a moment used its 2-D correction depended on how
+  much of the whole seam band's flow checked out, and on a car mount most of
+  that band is sky, where no solver can measure anything. The share hovered
+  around its 25 % bar (19-35 % on the day drive's proxy), so the seam flipped
+  between the correction and the seam table: 7 of 12 consecutive moments
+  used it. The check now counts only the pixels with detail in both lenses:
+  71-82 % on the same moments, all 12 used, and 43-97 % on every measured
+  frame of the day, night and sample clips. A moment close to the bar fades
+  its correction out and the seam table in, instead of switching. Lens pairs
+  from two different moments of the drive score 10-28 %: refused, or kept at
+  4-10 % strength. The 6K sample and the night drive render byte for byte as
+  before; the lamp pole beside the 8K day drive's seam stays straight (0.18
+  px RMS) now that the correction applies there. Known: where the proxy now
+  uses the correction instead of the table, the car's hood matches less well
+  across the seam (overlap NCC 0.93-0.96 against the table's 0.96-0.97);
+  keeping the table under the correction scores 0.98-0.99 and is the next
+  step.
 * A hardware-decoded picture that FFmpeg flags as damaged, or that is
   predicted from one, is decoded again in software instead of being
   delivered. As with any other hardware decode failure, on the importer's
@@ -137,7 +155,11 @@ classical flow and the seam-shift table, not osvtool's neural default.
   differ for an .LRF presented as its .OSV's proxy and for a clip that
   dropped frames.
 * The per-bucket parallax lines in the log name the clip, and a refusal says
-  how much of the flow was consistent.
+  how much of the flow was consistent, over the pixels with detail in both
+  lenses and over all of them; an accepted line adds the strength it applies
+  at. `osvtool seam --parallax --json` reports the same numbers, on a
+  refusal too, and scores `--region` uncorrected and with the seam table
+  whether or not the correction is refused.
 * The OpenFX generator's log records each instance's output bounds against
   its region of definition, the project's pixel aspect and field order, and
   the first single-field render of an interlaced project.

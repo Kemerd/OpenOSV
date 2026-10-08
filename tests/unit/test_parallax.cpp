@@ -26,6 +26,12 @@
 //   * THE BENEFIT GATE.  A correction that does not make the lenses agree
 //     is not applied - the sample clip's wingtip, where the two lenses see
 //     different objects, is the real-world case and has its own test.
+//
+//   * THE STRUCTURED GATE.  A whole measurement is judged on the pixels with
+//     structure in both lenses, refused below its floor and share, and
+//     otherwise applied at a strength that scales it uniformly - with the
+//     seam table's share under a partly trusted grid, and a fully trusted
+//     grid left exactly as it was.
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -43,6 +49,7 @@
 #include "osv/meta/CalibrationSelector.h"
 #include "osv/meta/FormatDetector.h"
 #include "osv/meta/MetadataTrack.h"
+#include "osv/render/ClipSteady.h"
 #include "osv/render/CpuRenderer.h"
 #include "osv/render/ImageRGBAf.h"
 #include "osv/render/ParallaxWarp.h"
@@ -905,10 +912,388 @@ TEST_CASE("gridFromFlow is bit-identical with and without a pool", "[render][par
         CHECK(q.uv == s.uv);
         CHECK(q.consistentPixels == s.consistentPixels);
         CHECK(q.totalPixels == s.totalPixels);
+        // The structured gate's counts are summed per task too.
+        CHECK(q.structuredPixels == s.structuredPixels);
+        CHECK(q.consistentStructuredPixels == s.consistentStructuredPixels);
         CHECK(q.measuredCells == s.measuredCells);
         CHECK(q.gatedCells == s.gatedCells);
         CHECK(q.meanAbsCorrectionDeg == s.meanAbsCorrectionDeg);
         CHECK(q.maxAbsCorrectionDeg == s.maxAbsCorrectionDeg);
+    }
+}
+
+// ===========================================================================
+//  The structured gate (ParallaxWarpParams::minStructuredConsistent)
+// ===========================================================================
+//
+// The 0.5.0 gate refused a whole measurement when under 25 % of ALL
+// co-visible pixels passed the forward-backward check.  On a car-mounted
+// clip most of the band is sky, where any solver solves noise, so the share
+// sat at the gate and the seam flipped between the grid and the table from
+// one bucket to the next.  What is pinned here: which pixels count as
+// structured (an independent re-implementation of the documented rule), the
+// strength curve, and the three outcomes of a whole measurement - accepted at
+// full strength bit for bit, accepted at a strength that scales the grid
+// uniformly, refused with both shares in the message.
+
+namespace {
+
+/// The structured rule, written out independently of ParallaxWarp.cpp: the
+/// squared central-difference gradient of one lens at (r, c), a neighbour
+/// the lens does not cover (or beyond the band's top or bottom row) standing
+/// in as the centre, longitude wrapping.
+double referenceGradientSq(const render::LensBands& b, int lens, std::uint32_t r, std::uint32_t c) {
+    const auto value = [&](std::uint32_t rr, std::uint32_t cc) {
+        return static_cast<double>(b.luma[lens][static_cast<std::size_t>(rr) * b.w + cc]);
+    };
+    const auto covered = [&](std::uint32_t rr, std::uint32_t cc) {
+        return b.alpha[lens][static_cast<std::size_t>(rr) * b.w + cc] > 0.5f;
+    };
+    const double centre = value(r, c);
+    const std::uint32_t cl = (c + b.w - 1u) % b.w;
+    const std::uint32_t cr = (c + 1u) % b.w;
+    const double left = covered(r, cl) ? value(r, cl) : centre;
+    const double right = covered(r, cr) ? value(r, cr) : centre;
+    const double up = (r > 0 && covered(r - 1u, c)) ? value(r - 1u, c) : centre;
+    const double down = (r + 1u < b.h && covered(r + 1u, c)) ? value(r + 1u, c) : centre;
+    const double gx = 0.5 * (right - left);
+    const double gy = 0.5 * (down - up);
+    return gx * gx + gy * gy;
+}
+
+}  // namespace
+
+TEST_CASE("structured pixels are the smaller lens's luma gradient, and a coverage edge is not structure",
+          "[render][parallax][gate]") {
+    constexpr std::uint32_t W = 256, H = 24, mapH = 128;
+    // Lens 0 textured everywhere; lens 1 textured only in the left half and
+    // flat (a sky) in the right half - so the right half has structure in
+    // ONE lens only, which must not count.
+    const auto a = [](std::uint32_t x, std::uint32_t y) { return bandTexture(x, y, W); };
+    const auto b = [](std::uint32_t x, std::uint32_t y) {
+        return x < W / 2 ? bandTexture(static_cast<double>(x) - 1.0, y, W) : 0.5;
+    };
+    render::LensBands bands = makeBands(W, H, mapH, a, b);
+    // A stretch lens 1 does not cover, black beyond its edge as a rendered
+    // band is: the pixels next to it must not read the black as structure.
+    for (std::uint32_t y = 0; y < H; ++y) {
+        for (std::uint32_t x = 40; x < 60; ++x) {
+            const std::size_t i = static_cast<std::size_t>(y) * W + x;
+            bands.alpha[1][i] = 0.0f;
+            bands.luma[1][i] = 0.0f;
+        }
+    }
+    // Every fifth pixel failed the consistency check.
+    render::BidirFlow flow = uniformFlow(W, H, 1.0f, 0.0f);
+    for (std::size_t i = 0; i < flow.ok.size(); i += 5) {
+        flow.ok[i] = 0u;
+    }
+    render::ParallaxWarpParams p;
+    p.gridW = 32;
+    p.gridRows = 8;
+    p.requiredImprovement = 0.0;  // the counts alone
+
+    // ---- the expected counts, from the documented rule ----------------------------
+    const double thr = p.minStructureGradient * p.minStructureGradient;
+    std::uint64_t covisible = 0, structured = 0, consistentStructured = 0, rightHalfStructured = 0;
+    for (std::uint32_t y = 0; y < H; ++y) {
+        for (std::uint32_t x = 0; x < W; ++x) {
+            const std::size_t i = static_cast<std::size_t>(y) * W + x;
+            if (!(bands.alpha[0][i] > 0.5f && bands.alpha[1][i] > 0.5f)) {
+                continue;
+            }
+            ++covisible;
+            const bool s = referenceGradientSq(bands, 0, y, x) >= thr && referenceGradientSq(bands, 1, y, x) >= thr;
+            structured += s ? 1u : 0u;
+            consistentStructured += (s && flow.ok[i] != 0u) ? 1u : 0u;
+            // The flat half, away from its two edges (x = W/2 and, round the
+            // ring, x = W-1 see a textured neighbour in lens 1).
+            rightHalfStructured += (s && x > W / 2 + 1 && x + 2u < W) ? 1u : 0u;
+        }
+    }
+    REQUIRE(structured > 1000u);          // the textured half really is structured
+    REQUIRE(rightHalfStructured == 0u);   // flat in one lens: not structure
+    REQUIRE(structured < covisible / 2u + W);
+
+    // ---- what gridFromFlow counted -------------------------------------------------
+    render::ParallaxCellStats cells;
+    auto grid = render::gridFromFlow(bands, flow, p, nullptr, &cells);
+    REQUIRE(grid.ok());
+    const render::ParallaxWarpGrid& g = grid.value();
+    CHECK(g.totalPixels == covisible);
+    CHECK(g.structuredPixels == structured);
+    CHECK(g.consistentStructuredPixels == consistentStructured);
+    CHECK(g.structuredFraction() ==
+          static_cast<double>(consistentStructured) / static_cast<double>(structured));
+    // gridFromFlow applies no gate: full strength.
+    CHECK(g.strength == 1.0);
+    // The same four numbers ride along with the cells.
+    CHECK(cells.covisiblePixels == g.totalPixels);
+    CHECK(cells.consistentPixels == g.consistentPixels);
+    CHECK(cells.structuredPixels == g.structuredPixels);
+    CHECK(cells.consistentStructuredPixels == g.consistentStructuredPixels);
+
+    SECTION("the black beyond a coverage edge does not count as structure") {
+        // Both lenses flat and seeing the same thing, both uncovered over the
+        // same stretch: a naive gradient would see a 0.5 step at both edges
+        // of the stretch in both lenses.
+        const auto flatSky = [](std::uint32_t, std::uint32_t) { return 0.5; };
+        render::LensBands sky = makeBands(W, H, mapH, flatSky, flatSky);
+        for (std::uint32_t y = 0; y < H; ++y) {
+            for (std::uint32_t x = 100; x < 140; ++x) {
+                const std::size_t i = static_cast<std::size_t>(y) * W + x;
+                for (int lens = 0; lens < 2; ++lens) {
+                    sky.alpha[lens][i] = 0.0f;
+                    sky.luma[lens][i] = 0.0f;
+                }
+            }
+        }
+        auto flat = render::gridFromFlow(sky, flow, p);
+        REQUIRE(flat.ok());
+        CHECK(flat.value().totalPixels > 0u);
+        CHECK(flat.value().structuredPixels == 0u);
+        CHECK(flat.value().structuredFraction() == 0.0);
+    }
+    SECTION("bands without luma planes count no structure (and the gate would refuse them)") {
+        render::LensBands noLuma = bands;
+        noLuma.luma[0].clear();
+        noLuma.luma[1].clear();
+        auto none = render::gridFromFlow(noLuma, flow, p);
+        REQUIRE(none.ok());
+        CHECK(none.value().structuredPixels == 0u);
+        CHECK(none.value().totalPixels == covisible);
+    }
+}
+
+TEST_CASE("the structured gate's strength is 0 at the gate, 1 at full trust and smooth between",
+          "[render][parallax][gate]") {
+    render::ParallaxWarpParams p;  // 0.25 / 0.40
+    CHECK(render::parallaxGateStrength(0.0, p) == 0.0);
+    CHECK(render::parallaxGateStrength(0.25, p) == 0.0);
+    CHECK(render::parallaxGateStrength(0.40, p) == 1.0);
+    CHECK(render::parallaxGateStrength(0.97, p) == 1.0);
+    CHECK(render::parallaxGateStrength(0.325, p) == Catch::Approx(0.5).margin(1e-12));
+    // Monotone and without a step anywhere: the largest change over a 0.001
+    // step of the share is the smoothstep's peak slope (1.5 / 0.15) x 0.001.
+    double previous = render::parallaxGateStrength(0.2, p);
+    double maxStep = 0.0;
+    for (int k = 201; k <= 450; ++k) {
+        const double s = render::parallaxGateStrength(k / 1000.0, p);
+        CHECK(s >= previous);
+        maxStep = std::max(maxStep, s - previous);
+        previous = s;
+    }
+    CHECK(maxStep <= 1.5 / 0.15 * 0.001 + 1e-9);
+    // Defensive: no trust in a share that is not a number, or in a gate whose
+    // full-strength share sits below its refusal share; equal shares step.
+    CHECK(render::parallaxGateStrength(std::numeric_limits<double>::quiet_NaN(), p) == 0.0);
+    CHECK(render::parallaxGateStrength(std::numeric_limits<double>::infinity(), p) == 0.0);
+    render::ParallaxWarpParams bad = p;
+    bad.fullStructuredConsistent = 0.1;
+    CHECK(render::parallaxGateStrength(0.9, bad) == 0.0);
+    render::ParallaxWarpParams step = p;
+    step.fullStructuredConsistent = step.minStructuredConsistent;
+    CHECK(render::parallaxGateStrength(0.2499, step) == 0.0);
+    CHECK(render::parallaxGateStrength(0.25, step) == 1.0);
+}
+
+TEST_CASE("the structured gate accepts at full strength bit for bit, scales a partial trust, and refuses the rest",
+          "[render][parallax][gate]") {
+    // A textured pair with a pure 2-column parallax over three quarters of
+    // the ring, and something unrelated in the last quarter: the flow is
+    // right where the lenses agree, so the structured share is high but not
+    // perfect - room for a ramp on either side of it.
+    constexpr std::uint32_t W = 512, H = 48, mapH = 512;
+    const auto a = [](std::uint32_t x, std::uint32_t y) { return bandTexture(x, y, W); };
+    const auto shifted = [](std::uint32_t x, std::uint32_t y) {
+        return x < W / 4 ? bandTexture(static_cast<double>(x) * 1.7 + 11.0, static_cast<double>(y) * 0.6, W)
+                         : bandTexture(static_cast<double>(x) + 2.0, y, W);
+    };
+    const render::LensBands bands = makeBands(W, H, mapH, a, shifted);
+    render::ParallaxWarpParams p;
+    p.backend = render::FlowBackendKind::Classical;
+    p.gridW = 64;
+    p.gridRows = 8;
+    p.decayRows = 4;
+
+    render::ParallaxCellStats cells;
+    auto full = render::parallaxFromBands(bands, p, nullptr, 0.0, &cells);
+    INFO((full.ok() ? std::string("accepted") : full.error().message));
+    REQUIRE(full.ok());
+    const render::ParallaxWarpGrid& g = full.value();
+    const double share = g.structuredFraction();
+    INFO("structured share " << share << " of " << g.structuredPixels << " px, all-pixel " << g.consistentFraction());
+    REQUIRE(share >= p.fullStructuredConsistent);
+    REQUIRE(g.structuredPixels >= p.minStructuredPixels);
+    CHECK(g.strength == 1.0);
+    // The cells carry the very counts the grid does.
+    CHECK(cells.structuredPixels == g.structuredPixels);
+    CHECK(cells.consistentStructuredPixels == g.consistentStructuredPixels);
+
+    SECTION("at full strength the grid is gridFromFlow's, untouched") {
+        // The gate set to accept anything at full strength gives the same
+        // bytes: nothing was scaled.
+        render::ParallaxWarpParams open = p;
+        open.minStructuredConsistent = 0.0;
+        open.fullStructuredConsistent = 0.0;
+        open.minStructuredPixels = 0;
+        auto same = render::parallaxFromBands(bands, open, nullptr);
+        REQUIRE(same.ok());
+        CHECK(same.value().uv == g.uv);
+        CHECK(same.value().strength == 1.0);
+    }
+    SECTION("between the gate's shares the whole grid is scaled by its strength") {
+        // Put the measured share half way up the ramp: s = smoothstep(0.5).
+        const double d = std::min({0.1, 0.5 * (1.0 - share), 0.5 * share});
+        REQUIRE(d > 0.005);
+        render::ParallaxWarpParams ramp = p;
+        ramp.minStructuredConsistent = share - d;
+        ramp.fullStructuredConsistent = share + d;
+        const double s = render::parallaxGateStrength(share, ramp);
+        REQUIRE(s == Catch::Approx(0.5).margin(1e-9));
+        auto partial = render::parallaxFromBands(bands, ramp, nullptr);
+        REQUIRE(partial.ok());
+        const render::ParallaxWarpGrid& q = partial.value();
+        CHECK(q.strength == s);
+        REQUIRE(q.uv.size() == g.uv.size());
+        bool scaledExactly = true;
+        for (std::size_t i = 0; i < g.uv.size(); ++i) {
+            scaledExactly = scaledExactly && q.uv[i] == static_cast<float>(static_cast<double>(g.uv[i]) * s);
+        }
+        CHECK(scaledExactly);
+        // The diagnostics describe what is applied.
+        CHECK(q.meanAbsCorrectionDeg == Catch::Approx(g.meanAbsCorrectionDeg * s));
+        CHECK(q.maxAbsCorrectionDeg == Catch::Approx(g.maxAbsCorrectionDeg * s));
+    }
+    SECTION("below the gate's share: refused, with both shares in the message and the counts in the cells") {
+        render::ParallaxWarpParams strict = p;
+        strict.minStructuredConsistent = std::min(1.0, share + 0.01);
+        strict.fullStructuredConsistent = 1.0;
+        render::ParallaxCellStats refusedCells;
+        auto refused = render::parallaxFromBands(bands, strict, nullptr, 0.0, &refusedCells);
+        REQUIRE_FALSE(refused.ok());
+        CHECK(refused.error().code == ErrorCode::Unsupported);
+        CHECK(refused.error().message.find("structured") != std::string::npos);
+        CHECK(refused.error().message.find("all co-visible") != std::string::npos);
+        CHECK(refusedCells.structuredPixels == g.structuredPixels);
+        CHECK(refusedCells.covisiblePixels == g.totalPixels);
+    }
+    SECTION("too few structured pixels: refused whatever their share") {
+        render::ParallaxWarpParams floor = p;
+        floor.minStructuredPixels = g.structuredPixels + 1u;
+        auto refused = render::parallaxFromBands(bands, floor, nullptr);
+        REQUIRE_FALSE(refused.ok());
+        CHECK(refused.error().code == ErrorCode::Unsupported);
+    }
+}
+
+TEST_CASE("the structured gate refuses a band with too little structure, whatever its share",
+          "[render][parallax][gate]") {
+    // Fog, a night sky, open water: what structure there is may well be
+    // measured consistently, but a few hundred pixels are not a measurement
+    // of the seam.  (Unrelated lens pairs are the other refusal the gate
+    // exists for; synthetic stand-ins for them - sums of sines - give the
+    // solver chance matches a real pair does not, so that case is measured
+    // on footage, not pinned here.)
+    constexpr std::uint32_t W = 512, H = 48, mapH = 512;
+    render::ParallaxWarpParams p;
+    p.backend = render::FlowBackendKind::Classical;
+    p.gridW = 64;
+    p.gridRows = 8;
+    p.decayRows = 4;
+
+    SECTION("a featureless band: no structure at all") {
+        const auto flat = [](std::uint32_t, std::uint32_t) { return 0.5; };
+        render::ParallaxCellStats cells;
+        auto r = render::parallaxFromBands(makeBands(W, H, mapH, flat, flat), p, nullptr, 0.0, &cells);
+        REQUIRE_FALSE(r.ok());
+        CHECK(r.error().code == ErrorCode::Unsupported);
+        CHECK(cells.covisiblePixels == static_cast<std::uint64_t>(W) * H);
+        CHECK(cells.structuredPixels == 0u);
+    }
+    SECTION("a flat sky with one narrow textured strip, seen consistently by both lenses") {
+        // 16 columns of texture (16 x 48 = 768 pixels at most) in a flat
+        // band, shifted by one column between the lenses.
+        const auto strip = [](double shift) {
+            return [shift](std::uint32_t x, std::uint32_t y) {
+                return (x >= 200 && x < 216) ? bandTexture(static_cast<double>(x) + shift, y, W) : 0.5;
+            };
+        };
+        render::ParallaxCellStats cells;
+        auto r = render::parallaxFromBands(makeBands(W, H, mapH, strip(0.0), strip(1.0)), p, nullptr, 0.0, &cells);
+        INFO("structured " << cells.structuredPixels << " px, of them consistent " << cells.consistentStructuredPixels);
+        REQUIRE_FALSE(r.ok());
+        CHECK(r.error().code == ErrorCode::Unsupported);
+        CHECK(cells.structuredPixels > 0u);
+        CHECK(cells.structuredPixels < p.minStructuredPixels);
+        // The floor alone refuses it: with no floor the same measurement passes.
+        render::ParallaxWarpParams noFloor = p;
+        noFloor.minStructuredPixels = 0;
+        noFloor.minStructuredConsistent = 0.0;
+        noFloor.fullStructuredConsistent = 0.0;
+        CHECK(render::parallaxFromBands(makeBands(W, H, mapH, strip(0.0), strip(1.0)), noFloor, nullptr).ok());
+    }
+}
+
+TEST_CASE("seamTableUnderGrid leaves the table the share its grid does not carry", "[render][parallax][gate]") {
+    const std::vector<float> table{1.0f, -2.0f, 0.5f, std::numeric_limits<float>::quiet_NaN(), 3.25f};
+    std::vector<float> out{9.0f};  // stale content must go
+
+    SECTION("a refused grid's strength of 0: the table bit for bit (a non-finite column shifts nothing)") {
+        render::seamTableUnderGrid(table, 0.0, out);
+        REQUIRE(out.size() == table.size());
+        CHECK(out[0] == 1.0f);
+        CHECK(out[1] == -2.0f);
+        CHECK(out[2] == 0.5f);
+        CHECK(out[3] == 0.0f);
+        CHECK(out[4] == 3.25f);
+    }
+    SECTION("a fully trusted grid: no table at all") {
+        render::seamTableUnderGrid(table, 1.0, out);
+        CHECK(out.empty());
+        render::seamTableUnderGrid(table, 1.7, out);  // clamped to 1
+        CHECK(out.empty());
+    }
+    SECTION("a partly trusted grid: the rest of the table") {
+        render::seamTableUnderGrid(table, 0.75, out);
+        REQUIRE(out.size() == table.size());
+        CHECK(out[0] == 0.25f);
+        CHECK(out[1] == -0.5f);
+        CHECK(out[4] == Catch::Approx(0.8125f));
+    }
+    SECTION("defensive: a strength that is not a number is no trust; no table gives none") {
+        render::seamTableUnderGrid(table, std::numeric_limits<double>::quiet_NaN(), out);
+        REQUIRE(out.size() == table.size());
+        CHECK(out[1] == -2.0f);
+        render::seamTableUnderGrid({}, 0.0, out);
+        CHECK(out.empty());
+    }
+}
+
+TEST_CASE("a clip grid carries the median of its samples' strengths and their summed counts",
+          "[render][parallax][gate][steady]") {
+    render::ParallaxWarpGrid a;
+    a.w = 8;
+    a.h = 4;
+    a.latMinRad = 0.1f;
+    a.latMaxRad = -0.1f;
+    a.uv.assign(64, 0.25f);
+    a.structuredPixels = 1000;
+    a.consistentStructuredPixels = 900;
+    render::ParallaxWarpGrid b = a, c = a;
+    SECTION("every sample fully trusted: exactly 1, as before the soft gate") {
+        auto m = render::clipParallaxGrid({&a, &b, &c});
+        REQUIRE(m.ok());
+        CHECK(m.value().strength == 1.0);
+        CHECK(m.value().structuredPixels == 3000u);
+        CHECK(m.value().consistentStructuredPixels == 2700u);
+    }
+    SECTION("mixed trust: the median; a non-finite strength counts as none") {
+        b.strength = 0.5;
+        c.strength = std::numeric_limits<double>::quiet_NaN();
+        auto m = render::clipParallaxGrid({&a, &b, &c});
+        REQUIRE(m.ok());
+        CHECK(m.value().strength == 0.5);
     }
 }
 
@@ -1029,6 +1414,24 @@ TEST_CASE("gridFromFlow rejects malformed input instead of guessing", "[render][
         REQUIRE(rejects(render::gridFromFlow(bands, flow, q)));
         q = p;
         q.minConsistentFraction = -0.1;
+        REQUIRE(rejects(render::gridFromFlow(bands, flow, q)));
+        // The structured gate: a gradient bar that is a number >= 0, and two
+        // shares inside [0, 1] that do not fall.
+        q = p;
+        q.minStructureGradient = std::numeric_limits<double>::quiet_NaN();
+        REQUIRE(rejects(render::gridFromFlow(bands, flow, q)));
+        q = p;
+        q.minStructureGradient = -1.0 / 255.0;
+        REQUIRE(rejects(render::gridFromFlow(bands, flow, q)));
+        q = p;
+        q.minStructuredConsistent = 0.5;
+        q.fullStructuredConsistent = 0.4;
+        REQUIRE(rejects(render::gridFromFlow(bands, flow, q)));
+        q = p;
+        q.fullStructuredConsistent = 1.5;
+        REQUIRE(rejects(render::gridFromFlow(bands, flow, q)));
+        q = p;
+        q.minStructuredConsistent = std::numeric_limits<double>::quiet_NaN();
         REQUIRE(rejects(render::gridFromFlow(bands, flow, q)));
     }
 }

@@ -2488,9 +2488,13 @@ library's own messages and FFmpeg's now land in the plug-in log at its level
   compare`. A WARNING `deliver: ... the host buffer does not hold the frame
   that was rendered` means the copy into Premiere's buffer, or the buffer, is
   at fault.
-* `frame N (bucket B, anchor A) of 'clip': parallax refused after ... (...,
-  consistent 18.2% (needs 25%)); ...` - the per-bucket analysis lines now name
-  the clip and, on a refusal, how much of the flow was consistent.
+* `frame N (bucket B, anchor A) of 'clip': parallax refused after ... (...:
+  structured 18.2% of 4235 px (needs 25% of at least 1500), all co-visible
+  9.6%); ...` - the per-bucket analysis lines now name the clip and say how
+  much of the flow was consistent: over the pixels with structure in both
+  lenses (the share the gate judges) and over all co-visible pixels. An
+  accepted line adds the `strength` the grid applies at; below 1.00 the seam
+  table fills the rest.
 
 **The five-minute check.** On the clip that shows the problem, over about two
 seconds around the damaged frame:

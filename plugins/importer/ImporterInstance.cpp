@@ -423,45 +423,6 @@ void ensureGpuAnalyses() noexcept {
     }
 }
 
-/// @brief "consistent 18% (needs 25%)" - the share of a parallax measurement
-/// that passed its consistency check, for a per-bucket refusal line.
-///
-/// A refusal hands back an Error, not the grid that held the share, so it is
-/// rebuilt from what parallaxFromBands() fills in on the side: the consistent
-/// pixels are the sum of the per-cell counts (every consistent pixel lands in
-/// exactly one cell), the examined ones are the band pixels both lenses cover
-/// (alpha > 0.5 in both - gridFromFlow's own test).  The result is exactly
-/// ParallaxWarpGrid::consistentFraction() of the refused grid.
-///
-/// @param cells        What gridFromFlow() saw per cell (empty when it never ran).
-/// @param bands        The bands the measurement was made on.
-/// @param minFraction  The threshold the measurement had to meet.
-/// @return The text, or "consistent n/a" when the flow never got that far.
-[[nodiscard]] std::string consistentShareText(const render::ParallaxCellStats& cells, const render::LensBands& bands,
-                                              double minFraction) {
-    // ---- the examined pixels: co-visible band pixels -------------------------
-    const std::size_t n = static_cast<std::size_t>(bands.w) * static_cast<std::size_t>(bands.h);
-    if (!cells.valid() || n == 0 || bands.alpha[0].size() < n || bands.alpha[1].size() < n) {
-        return "consistent n/a";
-    }
-    std::uint64_t covisible = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        if (bands.alpha[0][i] > 0.5f && bands.alpha[1][i] > 0.5f) {
-            ++covisible;
-        }
-    }
-    // ---- the consistent ones: the cells' pixel counts -------------------------
-    std::uint64_t consistent = 0;
-    for (const std::uint32_t p : cells.pixels) {
-        consistent += p;
-    }
-    if (covisible == 0) {
-        return "consistent n/a (no co-visible pixel)";
-    }
-    const double share = static_cast<double>(consistent) / static_cast<double>(covisible);
-    return std::format("consistent {:.1f}% (needs {:.0f}%)", 100.0 * share, 100.0 * minFraction);
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -504,20 +465,15 @@ void ImporterInstance::parallaxWorkerLoop() noexcept {
         double ms = 0.0;
         try {
             const auto t0 = std::chrono::steady_clock::now();
-            // The per-cell counts ride along so a refusal can say how much of
-            // the flow was consistent (consistentShareText); output only.
-            render::ParallaxCellStats cells;
-            auto grid = render::parallaxFromBands(job.bands, job.params, nullptr, job.bandMs, &cells);
+            // A refusal's message carries how much of the flow was consistent
+            // - the structured share the gate judged and the all-pixel one -
+            // from the measurement's own counts, so nothing is rebuilt here.
+            auto grid = render::parallaxFromBands(job.bands, job.params, nullptr, job.bandMs);
             ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             if (grid.ok()) {
                 result = std::make_shared<const render::ParallaxWarpGrid>(std::move(grid).value());
             } else {
                 refusal = grid.error().message;
-                // The consistent share walks every band pixel, and only the
-                // Debug line below prints it: below Debug it is never built.
-                if (PluginLog::enabled(PluginLog::Level::Debug)) {
-                    refusal += ", " + consistentShareText(cells, job.bands, job.params.minConsistentFraction);
-                }
             }
         } catch (const std::exception& e) {
             // Allocation failure is the realistic case.  Record it as a
@@ -551,10 +507,14 @@ void ImporterInstance::parallaxWorkerLoop() noexcept {
         // may read it without m_mutex.)
         const char* lane = job.standIn ? " (stand-in)" : "";
         if (result) {
+            // Both shares and the strength the grid applies at (the seam
+            // table fills the rest below 1).
             PluginLog::debug("parallax bucket {}{} of '{}' measured in the background in {:.0f} ms (flow {:.0f}), "
-                             "consistent {:.1f}%{}",
+                             "consistent {:.1f}%, structured {:.1f}% of {} px, strength {:.2f}{}",
                              job.bucket, lane, clipLogName(m_path), ms, result->flowMs,
-                             100.0 * result->consistentFraction(), stored ? "" : " - discarded, settings changed");
+                             100.0 * result->consistentFraction(), 100.0 * result->structuredFraction(),
+                             result->structuredPixels, result->strength,
+                             stored ? "" : " - discarded, settings changed");
         } else {
             PluginLog::debug("parallax bucket {}{} of '{}' refused in the background after {:.0f} ms ({})", job.bucket,
                              lane, clipLogName(m_path), ms, refusal);
@@ -2137,35 +2097,35 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
                                      index, bucket, clipLogName(m_path), bands.error().message);
                 } else if (now) {
                     const auto t0 = std::chrono::steady_clock::now();
-                    // Per-cell counts on the side, for the refusal line's
-                    // consistent share (output only: the grid is the same).
-                    render::ParallaxCellStats cells;
-                    auto grid = render::parallaxFromBands(bands.value(), pw, &pool, bandMs, &cells);
+                    auto grid = render::parallaxFromBands(bands.value(), pw, &pool, bandMs);
                     const double ms =
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() +
                         bandMs;
                     // The clip on every line: two clips' buckets interleave in one log.
                     if (grid.ok()) {
+                        // Both shares - all co-visible pixels, and the
+                        // structured ones the gate judges - and the strength
+                        // the grid applies at; below 1 the seam table fills
+                        // the rest.
                         const render::ParallaxWarpGrid& g = grid.value();
                         PluginLog::debug("frame {} (bucket {}, anchor {}) of '{}': parallax {} in {:.0f} ms (flow "
-                                         "{:.0f}), consistent {:.0f}%, gated {}/{}, disparity mean {:.2f} / max {:.2f} "
-                                         "deg",
+                                         "{:.0f}), consistent {:.0f}%, structured {:.0f}% of {} px, strength {:.2f}{}, "
+                                         "gated {}/{}, disparity mean {:.2f} / max {:.2f} deg",
                                          index, bucket, source->index, clipLogName(m_path),
                                          render::flowBackendName(g.usedBackend), ms, g.flowMs,
-                                         100.0 * g.consistentFraction(), g.gatedCells, g.measuredCells,
-                                         g.meanAbsCorrectionDeg, g.maxAbsCorrectionDeg);
+                                         100.0 * g.consistentFraction(), 100.0 * g.structuredFraction(),
+                                         g.structuredPixels, g.strength,
+                                         (g.strength < 1.0 && wantSeam) ? " (the seam table fills the rest)" : "",
+                                         g.gatedCells, g.measuredCells, g.meanAbsCorrectionDeg,
+                                         g.maxAbsCorrectionDeg);
                         out.grid = std::make_shared<const render::ParallaxWarpGrid>(std::move(grid).value());
                     } else {
-                        // Built only at Debug: the consistent share walks every
-                        // band pixel, and the line is the only thing that uses it.
-                        if (PluginLog::enabled(PluginLog::Level::Debug)) {
-                            PluginLog::debug("frame {} (bucket {}, anchor {}) of '{}': parallax refused after {:.0f} "
-                                             "ms ({}, {}); {}",
-                                             index, bucket, source->index, clipLogName(m_path), ms,
-                                             grid.error().message,
-                                             consistentShareText(cells, bands.value(), pw.minConsistentFraction),
-                                             wantSeam ? "using the seam table instead" : "rendering without it");
-                        }
+                        // The message carries both shares (structured and
+                        // all co-visible) from the measurement's own counts.
+                        PluginLog::debug("frame {} (bucket {}, anchor {}) of '{}': parallax refused after {:.0f} ms "
+                                         "({}); {}",
+                                         index, bucket, source->index, clipLogName(m_path), ms, grid.error().message,
+                                         wantSeam ? "using the seam table instead" : "rendering without it");
                         out.grid = nullptr;  // a stored nullptr records the refusal
                     }
                     gridKnown = true;
@@ -2216,9 +2176,15 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
         return out;  // not measured yet: unknown
     }
 
-    // ---- the seam table where there is no grid ------------------------------------------
-    // The refused bucket's fallback, and the whole correction with parallax off.
-    if (out.grid == nullptr && wantSeam) {
+    // ---- the seam table where there is no grid, or only a partly trusted one ----------
+    // The refused bucket's fallback, the whole correction with parallax off,
+    // and the remaining share under a grid the structured gate accepted at a
+    // strength below 1 (render::seamTableUnderGrid) - so as a bucket's
+    // structured share drifts down toward the gate, the table fades in
+    // instead of switching on at the refusal.  A fully trusted grid needs no
+    // table, exactly as before.
+    const bool partialGrid = out.grid != nullptr && out.grid->strength < 1.0;
+    if ((out.grid == nullptr || partialGrid) && wantSeam) {
         // The anchored table first: cached, or measured now (Exact) or from a
         // free anchor (Interactive).
         std::map<std::uint32_t, SeamTableEntry>* lane = &m_seamTables;
@@ -2257,10 +2223,17 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
             return out;  // the table is not known yet: neither is the correction
         }
         if (cached != lane->end()) {
-            out.table = cached->second.shiftDeg;
+            if (partialGrid) {
+                // Only the share the grid leaves (1 - strength).  The cache
+                // keeps the measured table; the share is this bucket's.
+                render::seamTableUnderGrid(cached->second.shiftDeg, out.grid->strength, out.table);
+            } else {
+                out.table = cached->second.shiftDeg;  // the whole table, untouched
+            }
             // Only a confidence that matches the table column for column is
-            // carried; otherwise the glide treats the table as ungated.
-            if (cached->second.confidence.size() == cached->second.shiftDeg.size()) {
+            // carried; otherwise the glide treats the table as ungated.  (The
+            // confidence is the measurement's, whatever share of it applies.)
+            if (!out.table.empty() && cached->second.confidence.size() == cached->second.shiftDeg.size()) {
                 out.tableConfidence = cached->second.confidence;
             }
         }
@@ -2298,7 +2271,11 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     // where the grid would have done better).  Replacing it also saves the
     // table's cost.  When the grid is refused - featureless content with too
     // little consistent flow - the seam table below is the fallback, so
-    // turning parallax on never leaves a frame with LESS correction.
+    // turning parallax on never leaves a frame with LESS correction.  Between
+    // the two the structured gate accepts a grid at a strength s below 1
+    // (ParallaxWarpParams::minStructuredConsistent): the grid then carries s
+    // of the correction and the table the other 1 - s, so a bucket slides
+    // from grid to table as its measurement weakens instead of flipping.
     // Every analysis is keyed by BUCKET, not frame: see the temporal
     // schedule in ParallaxWarp.h for why one measurement per
     // kParallaxBucketFrames frames loses nothing a viewer can see.
@@ -2336,6 +2313,17 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
             builder.warp(g.uv, g.w, g.h, g.latMinRad, g.latMaxRad);
             parallaxApplied = true;
             appliedGrid = clipSteady->grid;  // [WP-SEAMTOOLS]
+            // A clip grid the structured gate trusted only partly (strength
+            // below 1): the clip seam table fills the rest, as the clip
+            // correction was judged and carved (render::measureClipSteady).
+            // A fully trusted one - every clip before the soft gate - needs
+            // nothing more.
+            if (wantSeam && g.strength < 1.0 && clipSteady->seamTable && !clipSteady->seamTable->empty()) {
+                render::seamTableUnderGrid(*clipSteady->seamTable, g.strength, m_seamTableFrame);
+                if (!m_seamTableFrame.empty()) {
+                    builder.seam(m_seamTableFrame);
+                }
+            }
         }
     } else if (steadyUse == SteadyUse::StandIn) {
         // Interactive while the clip correction is being measured: the sample
@@ -2442,16 +2430,20 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
                 appliedGrid = apply;  // [WP-SEAMTOOLS]
             }
 
-            // ---- the seam table: only on the side(s) without a grid ---------------
+            // ---- the seam table: on the side(s) without a fully trusted grid -------
             // Faded by the same weight, so it comes in as the grid goes out -
             // column by column, only while the two sides agree: where they
             // differ by more than measurement noise (a near object came or
             // went between the anchors) the column steps to the newer side at
             // the anchor instead of keeping the stale table on screen for most
-            // of the bucket (render::blendSeamTables).
-            const std::vector<float>* tFrom =
-                (from != nullptr && from->grid == nullptr && !from->table.empty()) ? &from->table : nullptr;
-            const std::vector<float>* tTo = (to->grid == nullptr && !to->table.empty()) ? &to->table : nullptr;
+            // of the bucket (render::blendSeamTables).  A side's table is its
+            // whole table where it has no grid and the share its grid leaves
+            // (1 - strength) where the structured gate trusted the grid only
+            // partly (bucketCorrectionLocked), so each side's grid and table
+            // add up to one correction and the grid/table crossfade follows
+            // the strength continuously; a fully trusted grid has none.
+            const std::vector<float>* tFrom = (from != nullptr && !from->table.empty()) ? &from->table : nullptr;
+            const std::vector<float>* tTo = !to->table.empty() ? &to->table : nullptr;
             // Each table's per-column confidence gates the step: a large
             // change steps at the anchor only where both measurements are
             // sure of it (a near object arrived); matching noise on
@@ -3196,7 +3188,12 @@ std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::
             warpView.latMinRad = c.grid->latMinRad;
             warpView.latMaxRad = c.grid->latMaxRad;
             correction.warp = &warpView;
-        } else if (!c.table.empty()) {
+        }
+        // The table where there is no grid - and, under a grid the structured
+        // gate trusted only partly, the share of it the bucket renders with
+        // (bucketCorrectionLocked leaves it empty under a fully trusted one),
+        // so the seam is carved through exactly the correction on screen.
+        if (!c.table.empty()) {
             correction.seamShiftDeg = &c.table;
         }
         // [WP-PHOTO] The usable rim of the ANCHOR as the Rim cost - what a
@@ -3234,7 +3231,8 @@ std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::
         PluginLog::debug("frame {} (bucket {}, {} {}): seam carved in {:.1f} ms through {}, latitude mean {:+.2f} / "
                          "max {:.2f} deg, feather {:.2f} deg mean, {} narrow / {} forced columns",
                          index, b, intoStandIns ? "stand-in on" : "anchor", anchor->index, s.carveMs,
-                         correction.warp ? "the parallax grid"
+                         correction.warp ? (correction.seamShiftDeg ? "the parallax grid and the seam table"
+                                                                    : "the parallax grid")
                                          : (correction.seamShiftDeg ? "the seam table" : "no correction"),
                          s.meanLatDeg, s.maxAbsLatDeg, s.meanHalfWidthDeg, s.narrowColumns, s.forcedColumns);
         auto stored = std::make_shared<const render::BlendSeam>(std::move(carved).value());
