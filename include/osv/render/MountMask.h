@@ -38,18 +38,34 @@
 //      released only when both its neighbours are released textured windows
 //      - a stick over open sky stays hidden.  Every kept window is dilated by
 //      12 columns into its released neighbours.
-//   6. In each run of kept columns, the lens whose far side agrees better
+//   6. Per KEPT window - never per run of kept columns: a run can stretch
+//      from the roof over the nadir to the hood, and the lens that images
+//      the mount changes along it - the lens whose far side agrees better
 //      with the other lens's near side is the lens that does NOT image the
-//      mount there.  Where neither lens is fully trusted on the seam plane
-//      (both polygons start before it and their feathers overlap, the
-//      0.72-0.79 coverage strip on the car clip), that lens's polygon is
-//      clamped to start beyond 90.5 deg plus the occlusion feather, so it
-//      covers the seam at full weight.
+//      mount there.  The difference of the two halves is smoothed over the
+//      window and its two neighbours (a median, so one noisy window cannot
+//      flip a stretch), and a lens is named only when
+//        - the smoothed difference is at least cleanMarginNcc (0.1),
+//        - the window's own difference does not name the OTHER lens by that
+//          margin (a window that sees the mount in the would-be clean lens
+//          vetoes its neighbours), and
+//        - that lens's own half reaches cleanMinNcc (0.6) in the window.
+//      Otherwise the data cannot tell, and the window keeps the calibration's
+//      polygons unchanged (kMountKeepNoClamp).  Where a lens is named and
+//      neither lens is fully trusted on the seam plane (both polygons start
+//      before it and their feathers overlap, the 0.72-0.79 coverage strip on
+//      the car clip), that lens's polygon is clamped to start beyond 90.5 deg
+//      plus the occlusion feather, so it covers the seam at full weight.  A
+//      wrong clamp would paint the mount at full weight, so every doubt
+//      falls to "no clamp".
 //   7. applyMountMask turns the per-column verdict into polar-angle stretches
 //      of each lens's fisheye and rebuilds its polygon
 //      (geom::clipOcclusionPolygon).  The kernels and shaders are unchanged;
 //      the carve still routes around whatever polygon is left through its
-//      coverage cost.
+//      coverage cost.  The verdict's columns are the CALIBRATION rig's band
+//      columns, so a rig that carries a fitted lens rotation is rebuilt
+//      through applyMountMaskFrom (against the calibration rig, then the
+//      polygons are copied over).
 //
 // A verdict that releases nothing and clamps nothing leaves the polygons bit
 // for bit as the calibration drew them, so such a clip renders exactly as
@@ -97,6 +113,14 @@ struct MountMaskParams {
     /// The lens that does not image the mount is fully trusted up to this
     /// angle from its axis wherever neither lens was trusted on the seam.
     double clampThetaDeg = 90.5;
+    /// A kept window names the lens that does not image the mount only when
+    /// its far-side halves differ by at least this much (median over the
+    /// window and its two neighbours; the window's own difference must not
+    /// name the other lens by as much).  Below it: no clamp.
+    double cleanMarginNcc = 0.1;
+    /// ... and only when that lens's own half (its far side against the other
+    /// lens's near side) correlates at least this well in the window itself.
+    double cleanMinNcc = 0.6;
 };
 
 /// Check every field; the message names the first bad one.
@@ -110,15 +134,14 @@ struct MountMaskParams {
 inline constexpr std::uint8_t kMountKeepClean0 = 0;  ///< Polygon kept; lens 0 does not image the mount here.
 inline constexpr std::uint8_t kMountKeepClean1 = 1;  ///< Polygon kept; lens 1 does not image the mount here.
 inline constexpr std::uint8_t kMountRelease = 2;     ///< Polygons released: both lenses see the scene here.
+/// Polygons kept exactly as the calibration drew them: the data cannot tell
+/// which lens images the mount, so neither is clamped (Hide Mount On there).
+inline constexpr std::uint8_t kMountKeepNoClamp = 3;
 
 /// The polygons' footprint on the band ring (mountArcColumns).
 struct MountArc {
     std::uint32_t columns = 0;            ///< Ring width.
     std::vector<std::uint8_t> inArc;      ///< 1 where either lens's polygon reaches its usable image circle.
-    /// Per column, the lens the calibration says images the mount LESS there:
-    /// the only lens without a polygon, or the one whose polygon starts
-    /// further from its axis.  The fallback when the data cannot tell.
-    std::vector<std::uint8_t> geometricClean;
     std::uint32_t arcColumns = 0;         ///< Columns with inArc set.
 };
 
@@ -141,13 +164,22 @@ struct MountWindow {
     std::uint32_t frames = 0;  ///< Frames whose whole-window NCC was scored.
     bool flat = false;         ///< Both lenses' sigma below MountMaskParams::flatSigma.
     bool released = false;     ///< Released by the rule (before the dilation of its neighbours).
+    /// upperNcc - lowerNcc, the median over this window and its two arc
+    /// neighbours (NaN without this window's own halves); > 0 says lens 0
+    /// does not image the mount here, < 0 lens 1.
+    double cleanDiff = std::numeric_limits<double>::quiet_NaN();
+    /// The state this window's KEPT columns get: kMountKeepClean0,
+    /// kMountKeepClean1 or kMountKeepNoClamp (decided for every window, as
+    /// the dilation can keep columns of a released one).
+    std::uint8_t keep = kMountKeepNoClamp;
 };
 
 /// Hide Mount Auto's verdict for one clip.
 struct MountMask {
     std::uint32_t columns = 0;        ///< Ring width (MountMaskParams::equirectW).
-    /// Per band column: kMountKeepClean0 / kMountKeepClean1 / kMountRelease.
-    /// Columns outside the arc are kept (no polygon reaches them).
+    /// Per band column: kMountKeepClean0 / kMountKeepClean1 / kMountRelease /
+    /// kMountKeepNoClamp.  Columns outside the arc read kMountKeepNoClamp
+    /// (no polygon reaches them, so nothing there is rebuilt).
     std::vector<std::uint8_t> state;
     std::vector<MountWindow> windows;  ///< The arc's windows (diagnostics; not cached).
     std::uint32_t arcColumns = 0;      ///< Columns some polygon reaches.
@@ -161,8 +193,13 @@ struct MountMask {
     [[nodiscard]] bool valid() const noexcept { return columns > 0 && state.size() == columns; }
 };
 
-/// "released 52 of 717 arc columns (9.1 deg) in 1 stretch; 3 of 45 windows released (1 flat)".
+/// "released 52 of 717 arc columns (9.1 deg) in 1 stretch; 3 of 45 windows agree (1 flat); kept: lens 0
+/// clean 64, lens 1 clean 300, undecided 301".
 [[nodiscard]] std::string describeMountMask(const MountMask& mask);
+
+/// One column state for the logs: "lens 0 clean", "lens 1 clean", "released",
+/// "no clamp" (and "unknown" for anything else).
+[[nodiscard]] const char* describeMountKeep(std::uint8_t state) noexcept;
 
 // ===========================================================================
 //  Steps (exposed for tests and osvtool)
@@ -209,15 +246,30 @@ struct MountMaskApplied {
 };
 
 /// Rebuild `rig`'s occlusion polygons from the verdict (step 7).  `rig` must
-/// carry the calibration's polygons (the verdict is defined against them);
-/// a rotation folded into the rig is fine - the polygons live in fisheye
-/// pixels.  `blend` gives the occlusion feather and the usable field.  On
-/// failure the rig is left untouched.
+/// be the rig the verdict was measured through - the calibration's lenses,
+/// extrinsics and polygons, NO fitted lens rotation: the verdict's columns
+/// are that rig's band columns, and the arc, the seam-plane coverage strip
+/// and each column's polar angle in the fisheye are all projected through
+/// it.  A rig with a rotation folded in goes through applyMountMaskFrom.
+/// `blend` gives the occlusion feather and the usable field.  On failure the
+/// rig is left untouched.
 [[nodiscard]] Result<MountMaskApplied> applyMountMask(geom::LensRig& rig, const MountMask& mask,
                                                       const geom::BlendParams& blend, const MountMaskParams& params);
 
+/// Fold the verdict into `rig`, a rig derived from `calibrationRig` (the rig
+/// the verdict was measured through) that may carry a fitted lens rotation.
+/// The polygons are rebuilt against `calibrationRig` - so the stretches sit
+/// where the verdict measured them, whatever the rotation, and the result is
+/// the same whether the rotation or the verdict settles first - and then
+/// copied into `rig` (polygons live in fisheye pixels; a rotation does not
+/// move them).  InvalidArgument when `rig` does not carry exactly
+/// `calibrationRig`'s polygons; on any failure `rig` is left untouched.
+[[nodiscard]] Result<MountMaskApplied> applyMountMaskFrom(const geom::LensRig& calibrationRig, geom::LensRig& rig,
+                                                          const MountMask& mask, const geom::BlendParams& blend,
+                                                          const MountMaskParams& params);
+
 /// The per-column states as compact text for the caches: runs of
-/// "<state>:<first>-<last>" joined by ',' (e.g. "0:0-299,2:300-351,0:352-2047").
+/// "<state>:<first>-<last>" joined by ',' (e.g. "1:0-299,2:300-351,3:352-2047").
 [[nodiscard]] std::string encodeMountColumns(const std::vector<std::uint8_t>& state);
 
 /// The inverse of encodeMountColumns for a ring of `columns`; InvalidArgument

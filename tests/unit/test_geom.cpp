@@ -24,6 +24,7 @@
 #include "osv/geom/StreamScaling.h"
 #include "osv/geom/VirtualCamera.h"
 #include "osv/meta/Types.h"
+#include "osv/render/LensAlign.h"   // applyLensRotation: a fitted rotation folded into a rig
 #include "osv/render/MountMask.h"   // Hide Mount Auto: the verdict applied to a rig
 #include "osv/render/osv_kernel.h"  // OSV_MAX_OCCLUSION_POINTS, the kernels' vertex budget
 
@@ -1540,4 +1541,85 @@ TEST_CASE("Hide Mount Auto: a verdict that keeps everything leaves the 6K rig's 
     render::MountMask shortMask = kept;
     shortMask.state.resize(10);
     CHECK_FALSE(render::applyMountMask(untouched, shortMask, blend, mp).ok());
+}
+
+TEST_CASE("Hide Mount Auto: a verdict folded into a rotated rig is the calibration rig's rebuild",
+          "[geom][rig][hidemount]") {
+    // The verdict's columns are the calibration rig's band columns.  A rig
+    // with a fitted lens rotation sees the seam at slightly other fisheye
+    // pixels, so rebuilding through it would shift every stretch by the
+    // rotation; applyMountMaskFrom rebuilds against the calibration rig and
+    // copies the polygons over, whichever of the two settled first.
+    meta::CalibrationSet set = sampleCalibration();
+    set.master = makeRecord(1043.0103f, 1042.9268f, 1908.8036f, 1918.7257f,
+                            {0.0613421f, -0.00480161f, 0.00444291f, -0.00452633f, 0.00066212f}, 0.7036960f,
+                            0.7103991f, -0.0046943f, -0.0110939f, true);
+    auto built = LensRig::build(set, sampleScaling(), FocalSource::DigitalFocalLength, kDigitalFocal,
+                                ExtrinsicConvention{});
+    REQUIRE(built.ok());
+    const LensRig rig = built.value();
+    const render::MountMaskParams mp;
+    auto arc = render::mountArcColumns(rig, mp.equirectW);
+    REQUIRE(arc.ok());
+    REQUIRE(arc.value().arcColumns > 0u);
+
+    // Release the arc's first contiguous 64 columns, the rest stays as drawn.
+    render::MountMask released;
+    released.columns = mp.equirectW;
+    released.state.assign(mp.equirectW, render::kMountKeepNoClamp);
+    std::uint32_t first = 0;
+    while (first < mp.equirectW && !arc.value().inArc[first]) {
+        ++first;
+    }
+    std::uint32_t done = 0;
+    for (std::uint32_t c = first; c < mp.equirectW && done < 64u && arc.value().inArc[c]; ++c, ++done) {
+        released.state[c] = render::kMountRelease;
+    }
+    REQUIRE(done > 16u);
+    BlendParams blend;
+    LensRig reference = rig;
+    auto direct = render::applyMountMask(reference, released, blend, mp);
+    REQUIRE(direct.ok());
+
+    // A rotation of about half a degree, the size the lens alignment fits.
+    LensRig rotated = rig;
+    REQUIRE(render::applyLensRotation(rotated, Vec3d{deg2rad(0.4), deg2rad(-0.3), deg2rad(0.2)}).ok());
+    const LensRig rotatedBefore = rotated;
+    auto folded = render::applyMountMaskFrom(rig, rotated, released, blend, mp);
+    REQUIRE(folded.ok());
+    for (int i = 0; i < kLensCount; ++i) {
+        const auto lens = static_cast<std::size_t>(i);
+        INFO("lens " << i);
+        // The calibration rig's rebuild, vertex for vertex ...
+        CHECK(sameVertices(rotated.occlusionPolyStream[lens], reference.occlusionPolyStream[lens]));
+        CHECK(folded.value().changed[i] == direct.value().changed[i]);
+        // ... and the rotation itself untouched.
+        CHECK(rotated.bodyToLens[lens].distance(rotatedBefore.bodyToLens[lens]) == 0.0);
+    }
+    CHECK(folded.value().releasedColumns == direct.value().releasedColumns);
+
+    // A "no clamp" verdict everywhere changes nothing, bit for bit.
+    render::MountMask nothing = released;
+    nothing.state.assign(mp.equirectW, render::kMountKeepNoClamp);
+    LensRig same = rotatedBefore;
+    auto kept = render::applyMountMaskFrom(rig, same, nothing, blend, mp);
+    REQUIRE(kept.ok());
+    CHECK_FALSE(kept.value().changed[0]);
+    CHECK_FALSE(kept.value().changed[1]);
+    for (int i = 0; i < kLensCount; ++i) {
+        const auto lens = static_cast<std::size_t>(i);
+        CHECK(sameVertices(same.occlusionPolyStream[lens], rig.occlusionPolyStream[lens]));
+    }
+
+    // A rig whose polygons are not the calibration's (a verdict already
+    // folded in) is refused and left untouched: rebuilding from a rebuilt
+    // outline would compound the verdict.
+    LensRig twice = rotated;
+    auto refused = render::applyMountMaskFrom(rig, twice, released, blend, mp);
+    REQUIRE_FALSE(refused.ok());
+    CHECK(refused.error().code == ErrorCode::InvalidArgument);
+    for (int i = 0; i < kLensCount; ++i) {
+        const auto lens = static_cast<std::size_t>(i);
+        CHECK(sameVertices(twice.occlusionPolyStream[lens], rotated.occlusionPolyStream[lens]));
+    }
 }

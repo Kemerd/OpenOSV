@@ -36,8 +36,21 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <initializer_list>
+#include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 
 using namespace osv::premiere;
 using namespace osv::premiere::test;
@@ -147,6 +160,77 @@ public:
 private:
     const char* m_name;
 };
+
+/// Raise the plug-in log to INFO for the lifetime of the object.  Must be
+/// constructed BEFORE the harness: the module reads the level once, when it
+/// initialises its log.  _putenv_s updates the CRT copy and the OS block, so
+/// the module sees it through either API.
+class InfoLogLevel {
+public:
+    InfoLogLevel() {
+        char* old = nullptr;
+        std::size_t length = 0;
+        if (::_dupenv_s(&old, &length, "OSV_PLUGIN_LOG_LEVEL") == 0 && old) {
+            m_previous = old;
+            m_hadPrevious = true;
+        }
+        std::free(old);
+        ::_putenv_s("OSV_PLUGIN_LOG_LEVEL", "info");
+    }
+    ~InfoLogLevel() { ::_putenv_s("OSV_PLUGIN_LOG_LEVEL", m_hadPrevious ? m_previous.c_str() : ""); }
+    InfoLogLevel(const InfoLogLevel&) = delete;
+    InfoLogLevel& operator=(const InfoLogLevel&) = delete;
+
+private:
+    std::string m_previous;
+    bool m_hadPrevious = false;
+};
+
+/// The importer's log file for this process (LOCALAPPDATA was redirected by
+/// isolatePluginLogs() in TestMain, so this is never the user's own log).
+[[nodiscard]] std::filesystem::path importerLogPath() {
+    wchar_t buffer[32768] = {};
+    const DWORD n = ::GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, static_cast<DWORD>(std::size(buffer)));
+    if (n == 0 || n >= std::size(buffer)) {
+        return {};
+    }
+    return std::filesystem::path(std::wstring(buffer, n)) / L"OpenOSV" / L"OpenOSVImporter.log";
+}
+
+/// Whole text of the importer log (empty when there is none yet).  The
+/// plug-in keeps the file open with a deny-WRITE share, which a reader is
+/// allowed through, and flushes every line.
+[[nodiscard]] std::string importerLog() {
+    const std::filesystem::path path = importerLogPath();
+    if (path.empty()) {
+        return {};
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+/// Lines of `text` that contain every one of `needles`.
+[[nodiscard]] std::size_t linesWith(const std::string& text, std::initializer_list<std::string> needles) {
+    std::size_t n = 0;
+    std::size_t begin = 0;
+    while (begin < text.size()) {
+        std::size_t end = text.find('\n', begin);
+        if (end == std::string::npos) {
+            end = text.size();
+        }
+        const std::string_view line(text.data() + begin, end - begin);
+        bool all = true;
+        for (const std::string& needle : needles) {
+            all = all && line.find(needle) != std::string_view::npos;
+        }
+        n += all ? 1u : 0u;
+        begin = end + 1;
+    }
+    return n;
+}
 
 }  // namespace
 
@@ -521,6 +605,7 @@ TEST_CASE("Hide Mount Auto: a second instance of the clip stitches with the verd
     if (proxy.empty() || !std::filesystem::exists(proxy, ec)) {
         SKIP("the .LRF proxy is not present at " << proxy.string());
     }
+    InfoLogLevel info;  // before the harness: the module reads it once; the count below reads INFO lines
     ImporterHarness harness;
     REQUIRE(harness.loaded());
     const void* suite = nullptr;
@@ -556,11 +641,22 @@ TEST_CASE("Hide Mount Auto: a second instance of the clip stitches with the verd
     // ... B measures with the shared caches on and leaves the verdict there;
     // C, a second instance of the same clip, is served it.  Both render the
     // frame A measured for itself: one verdict per clip, whoever asks.
+    const std::string logBefore = importerLog();
     const Pixels first = renderOnce(automatic, 3413);
     const Pixels second = renderOnce(automatic, 3414);
     INFO(differing(own, first) << " / " << differing(first, second) << " pixels differ");
     CHECK(first == own);
     CHECK(second == first);
+    // Served, not measured again: equal pixels alone cannot tell (the
+    // measurement is deterministic), the log can.  Between B's open and C's
+    // frame exactly one measurement of this clip's mask was logged - B's.
+    const std::string logAfter = importerLog();
+    REQUIRE(logAfter.size() >= logBefore.size());  // 4 MB rotation is far off in one test
+    const std::string logged = logAfter.substr(logBefore.size());
+    const std::size_t measurements =
+        linesWith(logged, {"hide mount: '" + proxy.filename().string() + "': Auto - ", " - measured in "});
+    INFO(logged);
+    CHECK(measurements == 1u);
 
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }

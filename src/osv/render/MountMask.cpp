@@ -268,6 +268,14 @@ Status validateMountMaskParams(const MountMaskParams& p) {
     if (!std::isfinite(p.clampThetaDeg) || p.clampThetaDeg < 45.0 || p.clampThetaDeg > 135.0) {
         return Error{ErrorCode::InvalidArgument, "mount mask: clampThetaDeg must be in [45, 135]"};
     }
+    // The clean-lens test: a margin of 0 would name a lens on noise, one of
+    // 2 or more (the widest an NCC difference can be) never names one.
+    if (!std::isfinite(p.cleanMarginNcc) || p.cleanMarginNcc <= 0.0 || p.cleanMarginNcc > 2.0) {
+        return Error{ErrorCode::InvalidArgument, "mount mask: cleanMarginNcc must be in (0, 2]"};
+    }
+    if (!std::isfinite(p.cleanMinNcc) || p.cleanMinNcc < -1.0 || p.cleanMinNcc > 1.0) {
+        return Error{ErrorCode::InvalidArgument, "mount mask: cleanMinNcc must be in [-1, 1]"};
+    }
     return okStatus();
 }
 
@@ -286,16 +294,14 @@ Result<MountArc> mountArcColumns(const geom::LensRig& rig, std::uint32_t equirec
     MountArc arc;
     arc.columns = equirectW;
     arc.inArc.assign(equirectW, 0);
-    arc.geometricClean.assign(equirectW, 0);
     for (std::uint32_t c = 0; c < equirectW; ++c) {
         Vec3d dir;
         if (!seamDirection(equirectW, static_cast<double>(c) + 0.5, dir)) {
             return Error{ErrorCode::Internal, "mountArcColumns: the ring direction is not finite"};
         }
-        // ---- where each lens's polygon starts at this column, if it reaches the image ----
-        bool reaches[2] = {false, false};
-        double thetaStart[2] = {std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
-        for (int i = 0; i < geom::kLensCount; ++i) {
+        // ---- does either lens's polygon reach the usable image at this column? ----------
+        bool reaches = false;
+        for (int i = 0; i < geom::kLensCount && !reaches; ++i) {
             const std::vector<Vec2d>& poly = rig.occlusionPolyStream[static_cast<std::size_t>(i)];
             if (poly.size() < 3) {
                 continue;  // no polygon: nothing hidden in this lens
@@ -307,30 +313,12 @@ Result<MountArc> mountArcColumns(const geom::LensRig& rig, std::uint32_t equirec
             }
             const geom::KannalaBrandt5& L = rig.lens[static_cast<std::size_t>(i)];
             const auto radii = geom::occlusionRayRadii(poly, Vec2d{L.cx, L.cy}, angle);
-            if (!radii || !(L.rMaxPx > 0.0) || radii->first >= L.rMaxPx) {
-                continue;  // the polygon misses this azimuth or starts beyond the usable circle
-            }
-            reaches[i] = true;
-            // The angle from the axis the polygon starts at (mean focal, as
-            // rMaxPx is measured), for the geometric fallback below.
-            const double fMean = 0.5 * (L.fx + L.fy);
-            const auto theta = L.thetaFromThetaD(radii->first / fMean);
-            thetaStart[i] = theta.ok() ? theta.value() : radii->first / fMean;
+            // The polygon misses this azimuth, or starts beyond the usable circle.
+            reaches = radii && L.rMaxPx > 0.0 && radii->first < L.rMaxPx;
         }
-        if (!reaches[0] && !reaches[1]) {
-            continue;
-        }
-        arc.inArc[c] = 1;
-        ++arc.arcColumns;
-        // ---- the lens the calibration says images the mount less here ------------------
-        // The only lens without a polygon here; else the one whose polygon
-        // starts further from its axis.
-        if (reaches[0] && !reaches[1]) {
-            arc.geometricClean[c] = 1;
-        } else if (reaches[1] && !reaches[0]) {
-            arc.geometricClean[c] = 0;
-        } else {
-            arc.geometricClean[c] = thetaStart[0] >= thetaStart[1] ? 0 : 1;
+        if (reaches) {
+            arc.inArc[c] = 1;
+            ++arc.arcColumns;
         }
     }
     return arc;
@@ -519,7 +507,7 @@ Result<MountMask> decideMountMask(const MountArc& arc, const std::vector<std::ui
                                   const MountMaskParams& params) {
     OSV_TRY(validateMountMaskParams(params));
     const std::uint32_t W = params.equirectW;
-    if (arc.columns != W || arc.inArc.size() != W || arc.geometricClean.size() != W) {
+    if (arc.columns != W || arc.inArc.size() != W) {
         return Error{ErrorCode::InvalidArgument, "decideMountMask: the arc is not the mount mask's ring"};
     }
     for (const std::uint32_t s : windowStarts) {
@@ -625,72 +613,78 @@ Result<MountMask> decideMountMask(const MountArc& arc, const std::vector<std::ui
         }
     }
 
-    // ---- kept runs of the arc: which lens does not image the mount ---------------------------
-    // Per run of kept arc columns: the lens whose FAR side (inside its own
-    // polygon) agrees better with the other lens's near side sees scene
-    // there, not the mount.  Without a scored half, the calibration's
-    // geometry decides (MountArc::geometricClean).
-    mask.state.assign(W, kMountKeepClean0);
-    const auto keptArc = [&](std::uint32_t c) { return arc.inArc[c] && !released[c]; };
-    std::uint32_t start = W;  // a column that is NOT a kept arc column, to start the ring walk at
-    for (std::uint32_t c = 0; c < W; ++c) {
-        if (!keptArc(c)) {
-            start = c;
-            break;
-        }
-    }
-    const auto settleRun = [&](const std::vector<std::uint32_t>& run) {
-        if (run.empty()) {
-            return;
-        }
-        std::vector<double> diffs;
-        for (std::size_t w = 0; w < windowStarts.size(); ++w) {
-            const MountWindow& win = mask.windows[w];
-            const bool overlaps = std::any_of(run.begin(), run.end(), [&](std::uint32_t c) {
-                return ringColumn(static_cast<long long>(c) - win.col0, W) < params.windowCols;
-            });
-            if (overlaps && std::isfinite(win.upperNcc) && std::isfinite(win.lowerNcc)) {
-                diffs.push_back(win.upperNcc - win.lowerNcc);
-            }
-        }
-        std::uint8_t clean = kMountKeepClean0;
-        const double diff = medianOf(diffs);
-        if (std::isfinite(diff)) {
-            clean = diff >= 0.0 ? kMountKeepClean0 : kMountKeepClean1;
-        } else {
-            const auto ones = std::count_if(run.begin(), run.end(), [&](std::uint32_t c) {
-                return arc.geometricClean[c] != 0;
-            });
-            clean = 2 * static_cast<std::size_t>(ones) > run.size() ? kMountKeepClean1 : kMountKeepClean0;
-        }
-        for (const std::uint32_t c : run) {
-            mask.state[c] = clean;
-        }
+    // ---- per window: which lens does not image the mount -------------------------------------
+    // The lens whose FAR side (inside its own polygon) agrees better with the
+    // other lens's near side sees scene there, not the mount.  Decided per
+    // WINDOW: one run of kept columns can reach from the roof over the nadir
+    // to the hood, and the lens that images the mount changes along it - a
+    // single verdict for the run clamped, on a measured car clip, the very
+    // lens that sees the suction cup across the nadir.
+    //
+    // The difference of the halves is smoothed with a median over the window
+    // and its two arc neighbours, so one noisy window cannot flip a stretch.
+    // A lens is named only when the smoothed difference clears the margin,
+    // the window's OWN difference does not name the other lens by as much
+    // (a clamp paints whatever that lens sees at full weight: a window that
+    // sees the mount in it vetoes its neighbours' majority), and that lens's
+    // own half correlates well enough to call what it sees "scene".  Every
+    // other case keeps the calibration's polygons untouched.
+    const auto halfDiff = [&](std::size_t w) {
+        const MountWindow& win = mask.windows[w];
+        return (std::isfinite(win.upperNcc) && std::isfinite(win.lowerNcc))
+                   ? win.upperNcc - win.lowerNcc
+                   : std::numeric_limits<double>::quiet_NaN();
     };
-    if (start == W) {
-        // The whole ring is one kept arc run.
-        std::vector<std::uint32_t> run(W);
-        for (std::uint32_t c = 0; c < W; ++c) {
-            run[c] = c;
+    for (std::size_t w = 0; w < windowStarts.size(); ++w) {
+        MountWindow& win = mask.windows[w];
+        win.keep = kMountKeepNoClamp;
+        const double own = halfDiff(w);
+        if (!std::isfinite(own)) {
+            continue;  // this window's own halves could not be scored: no evidence here
         }
-        settleRun(run);
-    } else {
-        std::vector<std::uint32_t> run;
-        for (std::uint32_t k = 1; k <= W; ++k) {
-            const std::uint32_t c = ringColumn(static_cast<long long>(start) + k, W);
-            if (keptArc(c)) {
-                run.push_back(c);
-            } else {
-                settleRun(run);
-                run.clear();
+        // ---- the median of the window and its arc neighbours ------------------------------
+        std::vector<double> local{own};
+        const long long c0 = static_cast<long long>(windowStarts[w]);
+        for (const long long n : {c0 - static_cast<long long>(params.windowCols),
+                                  c0 + static_cast<long long>(params.windowCols)}) {
+            if (const auto nb = windowAt(n); nb && *nb != w) {
+                local.push_back(halfDiff(*nb));  // NaN entries are dropped by medianOf
             }
         }
-        settleRun(run);
+        win.cleanDiff = medianOf(std::move(local));
+        if (!std::isfinite(win.cleanDiff) || std::abs(win.cleanDiff) < params.cleanMarginNcc) {
+            continue;  // the halves do not tell the lenses apart
+        }
+        // ---- the vetoes ---------------------------------------------------------------------
+        const bool lens0 = win.cleanDiff > 0.0;
+        if ((lens0 && own <= -params.cleanMarginNcc) || (!lens0 && own >= params.cleanMarginNcc)) {
+            continue;  // this window itself says the other lens is the clean one
+        }
+        const double cleanHalf = lens0 ? win.upperNcc : win.lowerNcc;
+        if (!(cleanHalf >= params.cleanMinNcc)) {
+            continue;  // that lens's far side does not match the other lens's view well enough
+        }
+        win.keep = lens0 ? kMountKeepClean0 : kMountKeepClean1;
     }
+
+    // ---- columns: released, or kept with their window's verdict ---------------------------------
+    // Every arc column lies in exactly one window (the windows tile the ring
+    // and list every one with an arc column).  Outside the arc nothing is
+    // rebuilt, which kMountKeepNoClamp says.
+    std::vector<std::uint8_t> windowKeep(W / params.windowCols, kMountKeepNoClamp);
+    for (std::size_t w = 0; w < windowStarts.size(); ++w) {
+        windowKeep[windowStarts[w] / params.windowCols] = mask.windows[w].keep;
+    }
+    mask.state.assign(W, kMountKeepNoClamp);
     for (std::uint32_t c = 0; c < W; ++c) {
+        if (!arc.inArc[c]) {
+            continue;
+        }
         if (released[c]) {
             mask.state[c] = kMountRelease;
             ++mask.releasedColumns;
+        } else {
+            mask.state[c] = windowKeep[c / params.windowCols];
         }
     }
     return mask;
@@ -724,7 +718,7 @@ Result<MountMask> measureMountMask(const geom::LensRig& rig, const geom::BlendPa
         // No polygon reaches the image: nothing to keep or release.
         MountMask none;
         none.columns = params.equirectW;
-        none.state.assign(params.equirectW, kMountKeepClean0);
+        none.state.assign(params.equirectW, kMountKeepNoClamp);
         none.measureMs = msSince(tAll);
         return none;
     }
@@ -791,7 +785,7 @@ Result<MountMaskApplied> applyMountMask(geom::LensRig& rig, const MountMask& mas
         return Error{ErrorCode::InvalidArgument, "applyMountMask: the verdict is not the mount mask's ring"};
     }
     for (const std::uint8_t s : mask.state) {
-        if (s > kMountRelease) {
+        if (s > kMountKeepNoClamp) {
             return Error{ErrorCode::InvalidArgument, "applyMountMask: a column has an unknown state"};
         }
     }
@@ -848,6 +842,9 @@ Result<MountMaskApplied> applyMountMask(geom::LensRig& rig, const MountMask& mas
             if (!arc.inArc[c]) {
                 continue;
             }
+            // kMountKeepNoClamp (and the other lens's clean verdict) keep the
+            // calibration's polygon in this lens: only the named clean lens
+            // is ever clamped, and only on the coverage strip.
             if (mask.state[c] == kMountRelease) {
                 st[c] = geom::OcclusionSpanState::Release;
             } else if (mask.state[c] == static_cast<std::uint8_t>(i) && strip[c]) {
@@ -992,6 +989,38 @@ Result<MountMaskApplied> applyMountMask(geom::LensRig& rig, const MountMask& mas
     return applied;
 }
 
+Result<MountMaskApplied> applyMountMaskFrom(const geom::LensRig& calibrationRig, geom::LensRig& rig,
+                                            const MountMask& mask, const geom::BlendParams& blend,
+                                            const MountMaskParams& params) {
+    // ---- `rig` must carry the calibration's polygons, vertex for vertex -------------------
+    // Anything else (a verdict already folded in, another calibration) would
+    // be rebuilt from the wrong outline; refuse rather than guess.
+    for (int i = 0; i < geom::kLensCount; ++i) {
+        const std::vector<Vec2d>& a = calibrationRig.occlusionPolyStream[static_cast<std::size_t>(i)];
+        const std::vector<Vec2d>& b = rig.occlusionPolyStream[static_cast<std::size_t>(i)];
+        const bool same = a.size() == b.size() &&
+                          std::equal(a.begin(), a.end(), b.begin(),
+                                     [](const Vec2d& x, const Vec2d& y) { return x.x == y.x && x.y == y.y; });
+        if (!same) {
+            return Error{ErrorCode::InvalidArgument,
+                         "applyMountMaskFrom: the rig does not carry the calibration rig's occlusion polygons"};
+        }
+    }
+    // ---- rebuild through the rig the verdict was measured through ----------------------------
+    // The band columns, the coverage strip and each column's polar angle in
+    // the fisheye are the calibration rig's: a fitted rotation would shift
+    // every stretch by the rotation and leave columns that only enter the
+    // arc on the rotated rig without a verdict.
+    geom::LensRig rebuilt = calibrationRig;
+    OSV_TRY_ASSIGN(MountMaskApplied applied, applyMountMask(rebuilt, mask, blend, params));
+    // ---- the polygons live in fisheye pixels: copy them over --------------------------------
+    for (int i = 0; i < geom::kLensCount; ++i) {
+        rig.occlusionPolyStream[static_cast<std::size_t>(i)] =
+            std::move(rebuilt.occlusionPolyStream[static_cast<std::size_t>(i)]);
+    }
+    return applied;
+}
+
 // =============================================================================
 //  Text form and log line
 // =============================================================================
@@ -1044,7 +1073,7 @@ Result<std::vector<std::uint8_t>> decodeMountColumns(std::string_view text, std:
         if (!number(s) || !expect(':') || !number(a) || !expect('-') || !number(b)) {
             return Error{ErrorCode::InvalidArgument, "decodeMountColumns: a run is not <state>:<first>-<last>"};
         }
-        if (s > kMountRelease || a != state.size() || b < a || b >= columns) {
+        if (s > kMountKeepNoClamp || a != state.size() || b < a || b >= columns) {
             return Error{ErrorCode::InvalidArgument, "decodeMountColumns: a run is out of order or out of range"};
         }
         state.insert(state.end(), static_cast<std::size_t>(b - a + 1), static_cast<std::uint8_t>(s));
@@ -1053,6 +1082,21 @@ Result<std::vector<std::uint8_t>> decodeMountColumns(std::string_view text, std:
         return Error{ErrorCode::InvalidArgument, "decodeMountColumns: the runs do not cover the ring"};
     }
     return state;
+}
+
+const char* describeMountKeep(std::uint8_t state) noexcept {
+    switch (state) {
+    case kMountKeepClean0:
+        return "lens 0 clean";
+    case kMountKeepClean1:
+        return "lens 1 clean";
+    case kMountRelease:
+        return "released";
+    case kMountKeepNoClamp:
+        return "no clamp";
+    default:
+        return "unknown";  // never a valid verdict; said rather than guessed
+    }
 }
 
 std::string describeMountMask(const MountMask& mask) {
@@ -1079,6 +1123,18 @@ std::string describeMountMask(const MountMask& mask) {
     if (!mask.windows.empty()) {
         text += std::format("; {} of {} windows agree ({} flat)", releasedWindows, mask.windows.size(), flatWindows);
     }
+    // The kept columns by verdict: which lens may be clamped where, and how
+    // much of the arc keeps the calibration's polygons because the data
+    // could not tell (outside the arc every column reads "no clamp" too, so
+    // that share is the arc's remainder).
+    const auto count = [&](std::uint8_t s) {
+        return static_cast<std::uint32_t>(std::count(mask.state.begin(), mask.state.end(), s));
+    };
+    const std::uint32_t clean0 = count(kMountKeepClean0);
+    const std::uint32_t clean1 = count(kMountKeepClean1);
+    const std::uint32_t named = clean0 + clean1 + mask.releasedColumns;
+    const std::uint32_t undecided = mask.arcColumns > named ? mask.arcColumns - named : 0u;
+    text += std::format("; kept: lens 0 clean {}, lens 1 clean {}, undecided {}", clean0, clean1, undecided);
     return text;
 }
 

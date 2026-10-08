@@ -184,6 +184,11 @@ public:
         /// stand-ins while the clip correction is not settled.
         std::vector<std::pair<std::uint32_t, std::shared_ptr<const render::ParallaxWarpGrid>>> samples;
         std::string failure;           ///< Why a measurement failed (empty when none did).
+        /// Why the mount mask could not be measured (empty when it was, or
+        /// was not asked for).  Its own field: the rotation and the clip
+        /// correction write `failure`, and each settle note must name its
+        /// own stage's reason, not whichever failed last.
+        std::string mountFailure;
     };
     [[nodiscard]] Snapshot snapshot() const;
 

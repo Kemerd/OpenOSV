@@ -12,6 +12,7 @@
 #include "osv/core/Math.h"
 #include "osv/render/MountMask.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <random>
@@ -69,15 +70,13 @@ float texture(int r, int c, std::uint32_t seed) {
 }
 
 /// An arc covering columns [first, first + count) of `params`'s ring.
-MountArc makeArc(const MountMaskParams& params, std::uint32_t first, std::uint32_t count, std::uint8_t clean = 0) {
+MountArc makeArc(const MountMaskParams& params, std::uint32_t first, std::uint32_t count) {
     MountArc arc;
     arc.columns = params.equirectW;
     arc.inArc.assign(params.equirectW, 0);
-    arc.geometricClean.assign(params.equirectW, 0);
     for (std::uint32_t k = 0; k < count; ++k) {
         const std::uint32_t c = (first + k) % params.equirectW;
         arc.inArc[c] = 1;
-        arc.geometricClean[c] = clean;
         ++arc.arcColumns;
     }
     return arc;
@@ -126,6 +125,8 @@ TEST_CASE("Hide Mount Auto: the shipped rule's parameters are valid and garbage 
     CHECK(shipped.searchAlongDeg == 8.0);
     CHECK(shipped.searchAcrossDeg == 2.0);
     CHECK(shipped.minFrames == kClipSteadyMinSamples);
+    CHECK(shipped.cleanMarginNcc == 0.1);
+    CHECK(shipped.cleanMinNcc == 0.6);
 
     const auto bad = [&](auto mutate) {
         MountMaskParams p;
@@ -141,6 +142,10 @@ TEST_CASE("Hide Mount Auto: the shipped rule's parameters are valid and garbage 
     CHECK(bad([](MountMaskParams& p) { p.minFrames = 0; }));
     CHECK(bad([](MountMaskParams& p) { p.clampThetaDeg = std::nan(""); }));
     CHECK(bad([](MountMaskParams& p) { p.dilateCols = 5000; }));
+    CHECK(bad([](MountMaskParams& p) { p.cleanMarginNcc = 0.0; }));  // would name a lens on noise
+    CHECK(bad([](MountMaskParams& p) { p.cleanMarginNcc = std::nan(""); }));
+    CHECK(bad([](MountMaskParams& p) { p.cleanMinNcc = 1.5; }));
+    CHECK(bad([](MountMaskParams& p) { p.cleanMinNcc = std::nan(""); }));
 }
 
 TEST_CASE("Hide Mount Auto: the cache's column text round-trips and refuses anything partial", "[mountmask]") {
@@ -148,17 +153,20 @@ TEST_CASE("Hide Mount Auto: the cache's column text round-trips and refuses anyt
     for (std::uint32_t c = 300; c < 352; ++c) {
         state[c] = kMountRelease;
     }
+    for (std::uint32_t c = 1000; c < 1100; ++c) {
+        state[c] = kMountKeepNoClamp;  // kept as the calibration drew it
+    }
     for (std::uint32_t c = 1800; c < 2048; ++c) {
         state[c] = kMountKeepClean1;
     }
     const std::string text = encodeMountColumns(state);
-    CHECK(text == "0:0-299,2:300-351,0:352-1799,1:1800-2047");
+    CHECK(text == "0:0-299,2:300-351,0:352-999,3:1000-1099,0:1100-1799,1:1800-2047");
     auto back = decodeMountColumns(text, 2048);
     REQUIRE(back.ok());
     CHECK(back.value() == state);
     // Anything that does not cover the ring exactly once, in order, with a
     // known state, is refused (a damaged cache line is only re-measured).
-    for (const char* broken : {"", "0:0-2046", "0:0-2048", "0:1-2047", "0:0-10,0:12-2047", "3:0-2047",
+    for (const char* broken : {"", "0:0-2046", "0:0-2048", "0:1-2047", "0:0-10,0:12-2047", "4:0-2047",
                                "0:0-10;0:11-2047", "x:0-2047", "0:0-1000,0:900-2047", "0:0-2047,"}) {
         INFO(broken);
         CHECK_FALSE(decodeMountColumns(broken, 2048).ok());
@@ -287,9 +295,10 @@ TEST_CASE("Hide Mount Auto: textured windows are released on their median agreem
     }
     CHECK(mask.releasedColumns == 52u);
     CHECK(mask.arcColumns == 128u);
-    // Columns outside the arc are never released.
-    CHECK(mask.state[0] == kMountKeepClean0);
-    CHECK(mask.state[1599] == kMountKeepClean0);
+    // Columns outside the arc are never released, and nothing there is
+    // rebuilt (no polygon reaches them).
+    CHECK(mask.state[0] == kMountKeepNoClamp);
+    CHECK(mask.state[1599] == kMountKeepNoClamp);
     CHECK(describeMountMask(mask).find("released 52 of 128 arc columns") != std::string::npos);
 }
 
@@ -340,7 +349,7 @@ TEST_CASE("Hide Mount Auto: a flat window is released only between two released 
 TEST_CASE("Hide Mount Auto: too few scored frames keep the window, and the clean lens follows the halves",
           "[mountmask]") {
     const MountMaskParams params;
-    const MountArc arc = makeArc(params, 2000, 96, /*clean=*/1);  // wraps past column 0
+    const MountArc arc = makeArc(params, 2000, 96);  // wraps past column 0
     const std::vector<std::uint32_t> windows = windowsOf(arc, params);
     REQUIRE(windows.size() == 6u);
     // Every window agrees, but only on 4 of 9 frames (5 needed).
@@ -360,7 +369,11 @@ TEST_CASE("Hide Mount Auto: too few scored frames keep the window, and the clean
         CHECK(std::isnan(w.agreement));
         CHECK(w.frames == 4u);
     }
-    // One kept run across the wrap; lens 0 is the clean lens everywhere in it.
+    // Every window across the wrap names lens 0 the clean lens.
+    for (const MountWindow& w : mask.windows) {
+        CHECK_THAT(w.cleanDiff, Catch::Matchers::WithinAbs(0.5, 1e-6));
+        CHECK(w.keep == kMountKeepClean0);
+    }
     for (std::uint32_t k = 0; k < 96; ++k) {
         const std::uint32_t c = (2000 + k) % 2048;
         INFO(c);
@@ -376,20 +389,114 @@ TEST_CASE("Hide Mount Auto: too few scored frames keep the window, and the clean
     REQUIRE(swapped.ok());
     CHECK(swapped.value().state[2000] == kMountKeepClean1);
     CHECK(swapped.value().state[40] == kMountKeepClean1);
-    // No halves at all: the calibration's geometry decides (lens 1 here).
+    // No halves at all: the data cannot tell which lens images the mount,
+    // so neither is clamped - the calibration's polygons stay (a clamp of
+    // the wrong lens would paint the mount at full weight).
     for (auto& frame : frames) {
         for (auto& s : frame) {
             s.upper = s.lower = std::nanf("");
         }
     }
-    auto geometric = decideMountMask(arc, windows, frames, params);
-    REQUIRE(geometric.ok());
-    CHECK(geometric.value().state[2010] == kMountKeepClean1);
+    auto blind = decideMountMask(arc, windows, frames, params);
+    REQUIRE(blind.ok());
+    for (std::uint32_t k = 0; k < 96; ++k) {
+        const std::uint32_t c = (2000 + k) % 2048;
+        INFO(c);
+        CHECK(blind.value().state[c] == kMountKeepNoClamp);
+    }
     // Mismatched inputs are refused.
     auto shortFrame = frames;
     shortFrame[3].pop_back();
     CHECK_FALSE(decideMountMask(arc, windows, shortFrame, params).ok());
     CHECK_FALSE(decideMountMask(arc, {5}, frames, params).ok());  // not on the window grid
+}
+
+TEST_CASE("Hide Mount Auto: one kept run whose windows disagree gets a clean lens per window, or none",
+          "[mountmask]") {
+    // A car clip's kept run reaches from the roof over the nadir: along the
+    // roof lens 1's far side matches lens 0's near side (lens 1 does not see
+    // the mount there), at the nadir it is the other way round, and in
+    // between the halves cannot tell.  One verdict for the whole run would
+    // clamp the lens that sees the suction cup on one of the two stretches.
+    const MountMaskParams params;
+    const MountArc arc = makeArc(params, 1888, 192);  // 12 windows, wrapping past column 0
+    const std::vector<std::uint32_t> windows = windowsOf(arc, params);
+    REQUIRE(windows.size() == 12u);
+    // Ring order of the windows (1888, 1904, ..., 2032, 0, 16, ..., 64).
+    std::vector<std::size_t> ring;
+    for (std::uint32_t k = 0; k < 12; ++k) {
+        const std::uint32_t c0 = (1888 + 16 * k) % 2048;
+        ring.push_back(static_cast<std::size_t>(std::find(windows.begin(), windows.end(), c0) - windows.begin()));
+    }
+    // Halves per ring position: R = lens 1 clean (roof), A = ambiguous,
+    // N = lens 0 clean (nadir), W = lens 0 clean but its own half too weak.
+    //   R R R R  A A  N N N N  W  N
+    //   0 1 2 3  4 5  6 7 8 9 10 11
+    const char* pattern = "RRRRAANNNNWN";
+    std::vector<std::vector<MountWindowScore>> frames;
+    for (int f = 0; f < 9; ++f) {
+        std::vector<MountWindowScore> frame(windows.size());
+        for (std::size_t k = 0; k < 12; ++k) {
+            MountWindowScore& s = frame[ring[k]];
+            s.ncc = 0.4f;  // kept: no window agrees
+            s.sigma0 = s.sigma1 = 0.05f;
+            switch (pattern[k]) {
+            case 'R':
+                s.upper = 0.30f;
+                s.lower = 0.85f;
+                break;
+            case 'A':
+                s.upper = 0.70f;
+                s.lower = 0.72f;
+                break;
+            case 'N':
+                s.upper = 0.88f;
+                s.lower = 0.35f;
+                break;
+            default:  // 'W': lens 0's far side says more than lens 1's, but matches nothing well
+                s.upper = 0.55f;
+                s.lower = 0.20f;
+                break;
+            }
+        }
+        frames.push_back(frame);
+    }
+    auto decided = decideMountMask(arc, windows, frames, params);
+    REQUIRE(decided.ok());
+    const MountMask& mask = decided.value();
+    CHECK(mask.releasedColumns == 0u);
+    // Per window: the roof names lens 1, the nadir lens 0; the ambiguous
+    // pair (smoothed |diff| 0.02) and the weak window (lens 0's own half
+    // 0.55 < 0.6) clamp nothing.
+    const std::uint8_t expected[12] = {kMountKeepClean1,  kMountKeepClean1,  kMountKeepClean1,  kMountKeepClean1,
+                                       kMountKeepNoClamp, kMountKeepNoClamp, kMountKeepClean0,  kMountKeepClean0,
+                                       kMountKeepClean0,  kMountKeepClean0,  kMountKeepNoClamp, kMountKeepClean0};
+    for (std::size_t k = 0; k < 12; ++k) {
+        INFO("ring window " << k << " (col " << windows[ring[k]] << ")");
+        CHECK(mask.windows[ring[k]].keep == expected[k]);
+        // Every column of the window carries its window's verdict.
+        for (std::uint32_t c = 0; c < params.windowCols; ++c) {
+            CHECK(mask.state[windows[ring[k]] + c] == expected[k]);
+        }
+    }
+    // Outside the arc nothing is named.
+    CHECK(mask.state[1000] == kMountKeepNoClamp);
+
+    // A window whose own halves name the OTHER lens vetoes its neighbours'
+    // majority: ring position 7 sees the mount in lens 0 (lens 1 clean)
+    // between two windows that name lens 0.  The median would name lens 0
+    // there; the window itself says that lens images the mount, so no clamp.
+    for (auto& frame : frames) {
+        frame[ring[7]].upper = 0.30f;
+        frame[ring[7]].lower = 0.90f;
+    }
+    auto vetoed = decideMountMask(arc, windows, frames, params);
+    REQUIRE(vetoed.ok());
+    INFO("position 7 smoothed difference " << vetoed.value().windows[ring[7]].cleanDiff);
+    CHECK(vetoed.value().windows[ring[7]].cleanDiff > 0.1);  // the neighbours' median names lens 0 ...
+    CHECK(vetoed.value().windows[ring[7]].keep == kMountKeepNoClamp);  // ... the window vetoes it
+    CHECK(vetoed.value().windows[ring[9]].keep == kMountKeepClean0);   // unaffected further along
+    CHECK(describeMountMask(vetoed.value()).find("undecided") != std::string::npos);
 }
 
 TEST_CASE("Hide Mount Auto: the measurement scores no frame when no polygon reaches the image", "[mountmask]") {

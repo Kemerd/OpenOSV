@@ -498,12 +498,15 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
             // info level: the sub-command runs while the options are still
             // being parsed, before a global --verbose takes effect.
             for (const render::MountWindow& w : mask.value().windows) {
-                char line[200] = {};
+                // The smoothed far-side difference and the kept columns'
+                // verdict say which lens, if any, may be clamped there.
+                char line[256] = {};
                 std::snprintf(line, sizeof(line),
-                              "hide mount: window %4u-%4u agreement %+.3f upper %+.3f lower %+.3f sigma %.4f %.4f "
-                              "frames %u%s%s",
+                              "hide mount: window %4u-%4u agreement %+.3f upper %+.3f lower %+.3f diff %+.3f (%s) "
+                              "sigma %.4f %.4f frames %u%s%s",
                               w.col0, w.col0 + mountParams.windowCols - 1, w.agreement, w.upperNcc, w.lowerNcc,
-                              w.sigma[0], w.sigma[1], w.frames, w.flat ? " flat" : "", w.released ? " released" : "");
+                              w.cleanDiff, render::describeMountKeep(w.keep), w.sigma[0], w.sigma[1], w.frames,
+                              w.flat ? " flat" : "", w.released ? " released" : "");
                 log::info("{}", line);
             }
         }

@@ -983,8 +983,10 @@ Status ImporterInstance::rebuildRig() {
     // is used here (memory, then hide-mount.tsv - microseconds); an unknown
     // clip stitches with the full polygons until the steady stage has
     // measured it on its sample frames (prepareSteadyLocked).  The verdict
-    // is defined against the CALIBRATION rig's polygons (baseRig), which the
-    // rotation does not move - they live in fisheye pixels.
+    // is defined against the CALIBRATION rig (baseRig): its band columns and
+    // its polygons.  builtRig may carry a cached rotation, which would move
+    // the columns (not the polygons, they live in fisheye pixels), so the
+    // polygons are rebuilt against baseRig and copied in.
     MountState mountState = MountState::Off;
     std::shared_ptr<const render::MountMask> mountMask;
     std::string mountNote;
@@ -995,7 +997,8 @@ Status ImporterInstance::rebuildRig() {
             mountNote = "hide mount: Auto - to be measured on the clip's sample frames";
         } else {
             mountState = MountState::Settled;
-            auto applied = render::applyMountMask(builtRig, *mountMask, blend, render::MountMaskParams{});
+            auto applied =
+                render::applyMountMaskFrom(baseRig, builtRig, *mountMask, blend, render::MountMaskParams{});
             if (applied.ok()) {
                 mountNote = "hide mount: Auto - " + render::describeMountMask(*mountMask) + " (cached)";
             } else {
@@ -3464,8 +3467,11 @@ bool ImporterInstance::applyMountMaskLocked(geom::LensRig& rig) const {
     if (!m_mountMask) {
         return true;  // the calibration's polygons: nothing to fold in
     }
+    // Rebuilt against the calibration rig the verdict was measured through,
+    // whatever rotation `rig` carries (applyMountMaskFrom).
     geom::LensRig candidate = rig;
-    auto applied = render::applyMountMask(candidate, *m_mountMask, m_blend, render::MountMaskParams{});
+    auto applied =
+        render::applyMountMaskFrom(m_baseRig, candidate, *m_mountMask, m_blend, render::MountMaskParams{});
     if (!applied.ok()) {
         PluginLog::warn("hide mount: '{}': the verdict could not be applied ({}); keeping the full mask",
                         m_path.filename().string(), applied.error().message);
@@ -3482,9 +3488,11 @@ void ImporterInstance::settleMountLocked(const std::shared_ptr<const render::Mou
     std::string note;
     if (mount) {
         // m_rig carries the calibration's polygons here (no verdict was
-        // folded in while it was pending), with or without the rotation.
+        // folded in while it was pending), with or without the rotation; the
+        // polygons are rebuilt against m_baseRig, the rig the verdict's
+        // columns belong to, and copied in.
         geom::LensRig rig = m_rig;
-        auto applied = render::applyMountMask(rig, *mount, m_blend, render::MountMaskParams{});
+        auto applied = render::applyMountMaskFrom(m_baseRig, rig, *mount, m_blend, render::MountMaskParams{});
         if (applied.ok()) {
             m_mountMask = mount;
             note = "hide mount: Auto - " + render::describeMountMask(*mount);
@@ -3605,7 +3613,7 @@ void ImporterInstance::prepareSteadyLocked(RenderPurpose purpose, bool draft) {
     // Hide Mount Auto: a mount mask that has just been answered rebuilds the
     // polygons, likewise before anything below reads m_rig.
     if (m_mountState == MountState::Pending && snap.active && snap.mountSettled) {
-        settleMountLocked(snap.mount, snap.failure);
+        settleMountLocked(snap.mount, snap.mountFailure);  // its own reason, not the rotation's
     }
     m_steadyFrame = std::move(snap);
 }
