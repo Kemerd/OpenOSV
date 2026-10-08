@@ -6,6 +6,15 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-08
+
+The seam as one field. 0.5.1 lined the car body up but bent every straight
+line that crossed the seam, and the picture changed between playing and
+parking. 0.5.2 replaces the three-part correction with one mesh warp that
+keeps lines straight and holds still between moments, renders the same
+frame playing or parked, survives a clip that lost a key picture, and
+lets the camera's .LRF stand in as Premiere's proxy.
+
 ### Added
 
 * **One correction for the seam instead of three, and it keeps straight
