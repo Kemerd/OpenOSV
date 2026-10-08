@@ -222,6 +222,20 @@ void hashClipParams(Hasher& h, const render::ClipSteadyParams& p) noexcept {
     h.f64(d.maxFailedFraction);
     h.f64(d.maxFailedLoss);
     h.u64(p.minSamples);
+    // [WP-M] The mesh solve (render/MeshWarp.h) that builds every sample's
+    // field and the clip field: every weight and the lattice change the
+    // result.  (Its measurement block is `p.parallax`, hashed above.)
+    const render::MeshWarpParams& m = p.mesh;
+    h.u64(m.meshCols);
+    h.u64(m.matchStride);
+    h.u64(static_cast<std::uint64_t>(m.irlsIterations));
+    for (const double v : {m.rowSpacingDeg, m.reachDeg, m.alignWeight, m.structureFullFactor, m.structureFloor,
+                           m.unstructuredWeight, m.sharedRefinedShare, m.robustScalePx, m.lineWeight,
+                           m.lineSampleSpacingPx, m.shapeMembrane, m.shapeBending, m.crossMeridianShapeScale,
+                           m.decayShapeBoost, m.anchorWeight, m.anchorFloor, m.anchorDataFull, m.anchorCovisibleScale,
+                           m.temporalWeight, m.temporalFloor, m.temporalScalePx}) {
+        h.f64(v);
+    }
 }
 
 /// Hide Mount Auto's parameters (every field changes the verdict).
@@ -271,8 +285,12 @@ void hashMountParams(Hasher& h, const render::MountMaskParams& p) noexcept {
 
 /// Cache key of a clip correction: the file, the rig it is measured through
 /// (rotation and mount mask included), the blend, the sample frames and the
-/// parameters.  c2: the clip grid carries the per-column guard and its table
-/// share (ClipSteady::gridTable), which a c1 correction never had.
+/// parameters.  c3: the clip correction is ONE mesh field (the median of the
+/// samples' meshes, kept line-straight) with no seam table under it; a c2
+/// correction was a guarded flow grid plus a table share (ClipSteady's old
+/// gridTable), and must never be served to the mesh path.  c2: the clip grid
+/// carried the per-column guard and its table share, which a c1 correction
+/// never had.
 [[nodiscard]] std::string clipKey(const FileIdentity& id, const geom::LensRig& rig, const geom::BlendParams& blend,
                                   const std::vector<std::uint32_t>& frames, const render::ClipSteadyParams& params) {
     Hasher h;
@@ -283,7 +301,7 @@ void hashMountParams(Hasher& h, const render::MountMaskParams& p) noexcept {
         h.u64(f);
     }
     hashClipParams(h, params);
-    return std::format("c2|{}|{}|{}|{}", id.size, id.mtime, hex64(h.value()), id.path);
+    return std::format("c3|{}|{}|{}|{}", id.size, id.mtime, hex64(h.value()), id.path);
 }
 
 // =============================================================================
@@ -1408,14 +1426,18 @@ void SteadyStage::runJob(const SteadyRequest& job, const std::string& key, std::
             std::lock_guard<std::mutex> lock(m_mutex);
             return msSince(m_requestedAt);
         }();
-        // The grid's line says how many of its columns the per-column guard
-        // handed to the seam table (render::guardGridWithTable).
+        // [WP-M] The clip field's line says how many segments of all the
+        // samples it keeps straight and how straight (the line pass over the
+        // median of the samples' meshes, render::measureClipSteady).
         const std::string gridWords =
-            clip->grid ? std::format("yes ({} of {} columns to the seam table)", clip->guardedColumns, clip->grid->w)
+            clip->grid ? std::format("yes ({} lines kept straight, residual {:.3f} -> {:.3f} px, correction mean "
+                                     "{:.2f} / max {:.2f} deg)",
+                                     clip->lines, clip->lineResidualBeforePx, clip->lineResidualAfterPx,
+                                     clip->grid->meanAbsCorrectionDeg, clip->grid->maxAbsCorrectionDeg)
                        : std::string("no");
         PluginLog::info("steady: '{}': clip correction ready {:.0f} ms after the first request ({}; {} sample frames "
-                        "{}, {} grids accepted; decode {:.0f} / measure {:.0f} / finish {:.0f} ms): grid {}, seam "
-                        "table {}, seam {}; Auto: {}{}",
+                        "{}, {} meshes solved; decode {:.0f} / measure {:.0f} / finish {:.0f} ms): mesh field {}, "
+                        "seam table {}, seam {}; Auto: {}{}",
                         clipName, sinceRequest, produce ? std::format("measured in {:.0f} ms", msSince(tJob))
                                                         : std::string("another instance measured it"),
                         clip->frames.size(), frameList(clip->frames), clip->acceptedGrids, clip->decodeMs,

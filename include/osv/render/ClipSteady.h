@@ -35,14 +35,28 @@
 // ask for first", so every frame of a clip renders the same whatever was
 // rendered before it, in every instance, on every path.
 //
-//   grid        the per-cell, per-component median of the samples' accepted
-//               grids (a cell the benefit gate zeroed in most samples stays
-//               zero, since zero is then the median), then the per-column
-//               guard with the median of every sample's table: the columns
-//               most samples could not measure go to the table where it is
-//               sure and found a disparity the grid missed (ParallaxWarp.h,
-//               guardGridWithTable);
-//   seam table  the per-column median of the samples' tables;
+//   grid        ONE correction field (MeshWarp.h): every sample's own mesh -
+//               the content-preserving mesh warp solved on the sample alone,
+//               its seam table lifted in as the prior - then the per-cell,
+//               per-component median of those meshes (a cell the benefit
+//               gate held at the prior in most samples stays there), then
+//               ONE more solve with no flow at all: the median as the prior
+//               and the line segments of EVERY sample in the line term.  A
+//               per-cell median of fields that each keep their lines
+//               straight need not keep them straight itself (neighbouring
+//               cells can take their medians from different samples); the
+//               last solve removes exactly the bend along each detected line
+//               and nothing else (the shape term spreads it over ~2 mesh
+//               columns).  Median, not one joint solve over all samples'
+//               matches: a car that passes the seam in one sample must not
+//               pull the clip field (a joint least squares averages it in,
+//               the median ignores it), while the lines - which are where
+//               the eye judges the field - are all honoured.  There is no
+//               second field: the 1-D table and the per-column guard of
+//               0.5.1 are gone from the clip correction;
+//   seam table  the per-column median of the samples' tables, rendered only
+//               where there is no clip field (Parallax Grid off, or too few
+//               samples solved);
 //   seam        each sample's bands carved through the CLIP correction with
 //               no temporal prior, then the per-column median of the carves
 //               (the median of paths that each move at most N rows per column
@@ -94,6 +108,7 @@
 #include "osv/geom/LensRig.h"
 #include "osv/render/LensAlign.h"
 #include "osv/render/LensShading.h"
+#include "osv/render/MeshWarp.h"
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"
 #include "osv/render/SeamAnalysis.h"
@@ -284,7 +299,7 @@ struct SteadyDecisionParams {
 
 /// One sample as the Auto rule sees it: its uncorrected bands (as
 /// measureParallaxBands renders them) and the correction it would render
-/// with on its own (its grid, else its table, else none).
+/// with on its own (its mesh field, else its table, else none).
 struct SteadySample {
     std::uint32_t frame = 0;
     const LensBands* bands = nullptr;
@@ -347,11 +362,19 @@ struct SteadyDecision {
 
 /// What the clip correction is built from and with.
 struct ClipSteadyParams {
-    ParallaxWarpParams parallax;  ///< The per-sample grid, exactly as the importer measures one.
-    bool parallaxOn = true;       ///< Measure the grid at all.
-    /// The seam: every sample's table (the correction of the samples without
-    /// an accepted grid, and the per-column guard's under the clip grid) and
-    /// the carve.  Off leaves all of it out (the importer's Seam Search off).
+    /// The per-sample measurement block (band, flow backend, structured and
+    /// benefit gates), exactly as the importer measures a bucket.  It is the
+    /// mesh's own measurement block: measureClipSteady copies it into
+    /// `mesh.parallax`, so the two can never disagree.
+    ParallaxWarpParams parallax;
+    /// The mesh solve (MeshWarp.h) of every sample and of the clip field;
+    /// its `parallax` member is replaced by `parallax` above.
+    MeshWarpParams mesh;
+    bool parallaxOn = true;       ///< Solve the mesh at all.
+    /// The seam: every sample's table (the mesh's prior and the bands its
+    /// refined flow is measured on, and the correction where there is no
+    /// clip field) and the carve.  Off leaves all of it out (the importer's
+    /// Seam Search off: the meshes are then solved without a prior).
     bool seamOn = true;
     SeamSearchParams seamSearch;  ///< The per-sample seam-shift table.
     SeamCarveParams carve;        ///< The carve (the importer's widths; its penalty is not used).
@@ -365,8 +388,10 @@ struct ClipSteadyParams {
     bool shadingOn = false;
     LensShadingParams shading;
     SteadyDecisionParams decision;
-    /// Accepted sample grids needed for a clip grid: fewer is a clip the
-    /// flow mostly refused (open sky), which the seam table then serves.
+    /// Solved sample meshes needed for a clip field: fewer is a clip whose
+    /// samples mostly failed to measure, which the seam table then serves.
+    /// (A mesh never refuses content - open sky gives the table's lift - so
+    /// this counts measurements that could not be made at all.)
     std::uint32_t minGrids = 3;
     /// Sample frames that must decode (substitutes count); fewer is an
     /// error.  Capped at the number of planned frames.
@@ -381,27 +406,23 @@ struct ClipSteady {
     /// One line per planned sample that could not be decoded (what replaced
     /// it, or that it was skipped); empty when every one decoded.
     std::vector<std::string> sampleNotes;
-    /// Clip grid as it renders; null when not measured or refused.  The
-    /// per-cell median of the accepted samples' grids, after the per-column
-    /// guard (render::guardGridWithTable) with the median of every sample's
-    /// table and confidence when the seam is on: the columns most samples
-    /// could not measure, where the tables are sure and found a disparity the
-    /// grid missed, are given up to the table.  Its strength is the median
-    /// of the samples' structured-gate strengths (ParallaxWarpGrid::strength).
+    /// The clip field as it renders - the WHOLE correction, the kernel's 1-D
+    /// seam shift carrying nothing under it; null when not measured.  The
+    /// per-cell median of the samples' meshes, then kept line-straight over
+    /// every sample's segments (see the header).  Its strength is the median
+    /// of the samples' structured-gate strengths, for the logs (each mesh
+    /// already carries its own as the weight of its data).
     std::shared_ptr<const ParallaxWarpGrid> grid;
-    /// The seam table share that renders WITH the clip grid: 1 - its
-    /// strength everywhere plus the columns the guard handed over (the
-    /// GuardedCorrection's table).  When the guard cannot run under a partly
-    /// trusted grid (no sample table carried its confidence), the fallback
-    /// `seamTable`'s 1 - strength share instead, the rule before the guard.
-    /// Null or empty when nothing of the table applies under the grid (a
-    /// fully trusted grid that guarded no column, no table, or no grid).
-    std::shared_ptr<const std::vector<float>> gridTable;
-    std::uint32_t guardedColumns = 0;                    ///< Clip grid columns handed to the table (diagnostics).
-    std::uint32_t acceptedGrids = 0;                     ///< Samples whose own grid was accepted.
-    /// Clip seam table where there is no clip grid: the median of the tables
-    /// of the samples without a grid or with a partly trusted one; null when
-    /// none was needed or found.
+    std::uint32_t acceptedGrids = 0;  ///< Samples whose own mesh was solved.
+    /// The line pass over the median: segments of all samples that reached
+    /// the line term, and the RMS of their collinearity residuals (band
+    /// pixels) before (the median itself) and after (the clip field).
+    std::uint32_t lines = 0;
+    double lineResidualBeforePx = 0.0;
+    double lineResidualAfterPx = 0.0;
+    /// Clip seam table where there is no clip field (Parallax Grid off, or
+    /// fewer than minGrids samples solved): the per-column median of the
+    /// samples' tables; null when none was needed or found.
     std::shared_ptr<const std::vector<float>> seamTable;
     std::shared_ptr<const BlendSeam> seam;               ///< Clip carved seam; null when seamOn is off or it failed.
     SteadyDecision decision;                             ///< The Auto rule's verdict.
@@ -410,8 +431,9 @@ struct ClipSteady {
     double finishMs = 0.0;                               ///< Medians, carves, the verdict.
 };
 
-/// Progress: each sample's own grid (null = refused) as soon as it exists,
-/// for stand-ins while the rest is measured.  Called on the measuring thread.
+/// Progress: each sample's own mesh field (null = not measurable) as soon as
+/// it exists, for stand-ins while the rest is measured.  Called on the
+/// measuring thread.
 using ClipSampleGridFn = std::function<void(std::uint32_t frame, std::shared_ptr<const ParallaxWarpGrid> grid)>;
 
 /// Measure the clip correction on `frames` through `rig` (which already

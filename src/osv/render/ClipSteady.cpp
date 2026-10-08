@@ -56,6 +56,29 @@ using Clock = std::chrono::steady_clock;
     return 0.5 * (lo + hi);
 }
 
+/// Recompute a grid's correction size from its cells - the mean and the
+/// largest |(dLon, dLat)| over every cell, as FULL disparity in degrees
+/// (twice the stored half), exactly as clipParallaxGrid reports a median -
+/// after its uv changed.  A malformed grid is left as it is.
+void refreshCorrectionStats(ParallaxWarpGrid& grid) noexcept {
+    if (!grid.valid()) {
+        return;
+    }
+    double sumAbs = 0.0;
+    double maxAbs = 0.0;
+    const std::size_t cells = static_cast<std::size_t>(grid.w) * grid.h;
+    for (std::size_t k = 0; k < cells; ++k) {
+        const double mag =
+            std::hypot(static_cast<double>(grid.uv[k * 2u]), static_cast<double>(grid.uv[k * 2u + 1u]));
+        if (std::isfinite(mag)) {
+            sumAbs += mag;
+            maxAbs = std::max(maxAbs, mag);
+        }
+    }
+    grid.meanAbsCorrectionDeg = cells ? 2.0 * rad2deg(sumAbs / static_cast<double>(cells)) : 0.0;
+    grid.maxAbsCorrectionDeg = 2.0 * rad2deg(maxAbs);
+}
+
 /// A grid as the band code needs to see it (null view for a null grid).
 [[nodiscard]] WarpGridView viewOf(const ParallaxWarpGrid* grid) noexcept {
     WarpGridView v;
@@ -782,17 +805,25 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
 
     // ---- one pass over the samples ------------------------------------------------
     // Per sample: its uncorrected bands (kept for the carve and the verdict),
-    // its own grid, its own seam table and the table's per-column confidence
-    // (the correction where it has no grid, the per-column guard's under its
-    // grid), and the usable rim the carve is steered by.
+    // its own seam table (the mesh's prior, and the correction where there is
+    // no clip field), its own mesh field - solved exactly as the importer
+    // solves one bucket on its anchor, with no temporal prior - the line
+    // segments the mesh kept straight (the clip field keeps them straight
+    // too), and the usable rim the carve is steered by.
     struct Sample {
         std::uint32_t frame = 0;
         LensBands bands;
-        std::shared_ptr<const ParallaxWarpGrid> grid;
+        std::shared_ptr<const ParallaxWarpGrid> grid;  ///< The sample's own mesh field (null: not measurable).
+        std::vector<SeamLine> lines;                   ///< Segments detected on its raw bands.
         std::shared_ptr<const std::vector<float>> table;
-        std::shared_ptr<const std::vector<float>> confidence;  ///< Same length as `table`, or null.
         std::shared_ptr<const PhotoSeamField> rim;
     };
+    // The mesh's measurement block IS the parallax block: one source of truth.
+    MeshWarpParams meshParams = params.mesh;
+    meshParams.parallax = params.parallax;
+    if (params.parallaxOn) {
+        OSV_TRY(checkMeshWarpParams(meshParams));
+    }
     std::vector<Sample> samples;
     samples.reserve(frames.size());
     for (const std::uint32_t planned : frames) {
@@ -815,37 +846,52 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
         const auto tWork = Clock::now();
         Sample s;
         s.frame = frame;
-        // The parallax band (2048 x +-6 deg) is also the carve's band, so one
-        // render serves both (SeamCarve.cpp renders exactly this for a carve).
+        // The parallax band (2048 x +-6 deg) is the mesh's raw band and also
+        // the carve's band, so one render serves the lines, the primary flow,
+        // the verdict and the carve (SeamCarve.cpp renders exactly this).
         const auto tBand = Clock::now();
         OSV_TRY_ASSIGN(s.bands, measureParallaxBands(rig, pair, blend, params.parallax, nullptr, pool));
-        const double bandMs = msSince(tBand);
+        double bandMs = msSince(tBand);
+        if (params.seamOn) {
+            // The seam table first: it is the mesh's prior (its lift) and
+            // the field the refined flow's bands are rendered with.
+            auto profile = searchSeam(rig, pair, blend, params.seamSearch, pool);
+            if (profile.ok() && !profile.value().shiftDeg.empty()) {
+                s.table = std::make_shared<const std::vector<float>>(std::move(profile.value().shiftDeg));
+            }
+        }
         if (params.parallaxOn) {
-            // The importer's rule for one measurement, through the same call:
-            // refused by the structured gate, or accepted and already scaled
-            // by its strength (ParallaxWarpGrid::strength).
-            auto grid = parallaxFromBands(s.bands, params.parallax, &pool, bandMs);
-            if (grid.ok()) {
-                s.grid = std::make_shared<const ParallaxWarpGrid>(std::move(grid).value());
+            // ---- the sample's own mesh, as the importer solves a bucket ---------------
+            // Lines on the raw bands; the table lifted into the prior; the
+            // bands rendered once more through that prior so a second flow
+            // measures only what the table left; then the one solve.
+            auto lines = detectSeamLines(s.bands, LineDetectParams{}, &pool);
+            if (lines.ok()) {
+                s.lines = std::move(lines.value().lines);
+            }
+            std::optional<ParallaxWarpGrid> prior;
+            std::optional<LensBands> warped;
+            if (s.table) {
+                auto lift = liftSeamTable(*s.table, meshParams);
+                if (lift.ok()) {
+                    prior = std::move(lift).value();
+                    const WarpGridView view = warpGridView(*prior);
+                    const auto tWarped = Clock::now();
+                    auto rendered = renderLensBands(rig, pair, blend, meshParams.parallax.band, false, nullptr, pool,
+                                                    &view);
+                    bandMs += msSince(tWarped);
+                    if (rendered.ok()) {
+                        warped = std::move(rendered).value();
+                    }
+                }
+            }
+            auto mesh = meshWarpFromBands(s.bands, warped ? &*warped : nullptr, warped ? &*prior : nullptr,
+                                          &s.lines, prior ? &*prior : nullptr, nullptr, meshParams, &pool, bandMs);
+            if (mesh.ok()) {
+                s.grid = std::make_shared<const ParallaxWarpGrid>(std::move(mesh.value().grid));
             }
             if (onSampleGrid) {
                 onSampleGrid(frame, s.grid);
-            }
-        }
-        if (params.seamOn) {
-            // The seam table is the correction of a sample without a grid,
-            // the remaining share under a partly trusted one, and the
-            // per-column guard's under an accepted one - exactly as the
-            // importer builds a bucket's correction, which measures the table
-            // for every bucket with Seam Search on.
-            auto profile = searchSeam(rig, pair, blend, params.seamSearch, pool);
-            if (profile.ok() && !profile.value().shiftDeg.empty()) {
-                SeamProfile& p = profile.value();
-                // The confidence only when it is the table's, column for column.
-                if (p.confidence.size() == p.shiftDeg.size()) {
-                    s.confidence = std::make_shared<const std::vector<float>>(std::move(p.confidence));
-                }
-                s.table = std::make_shared<const std::vector<float>>(std::move(p.shiftDeg));
             }
         }
         if (params.seamOn && params.rimCost) {
@@ -882,7 +928,7 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
     }
 
     const auto tFinish = Clock::now();
-    // ---- the clip grid ---------------------------------------------------------------
+    // ---- the clip field: the median of the samples' meshes ------------------------------
     std::vector<const ParallaxWarpGrid*> grids;
     for (const Sample& s : samples) {
         if (s.grid) {
@@ -891,97 +937,80 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
     }
     out.acceptedGrids = static_cast<std::uint32_t>(grids.size());
     if (params.parallaxOn && !grids.empty() && grids.size() >= std::max<std::uint32_t>(params.minGrids, 1u)) {
-        OSV_TRY_ASSIGN(ParallaxWarpGrid g, clipParallaxGrid(grids));
-        out.grid = std::make_shared<const ParallaxWarpGrid>(std::move(g));
-    }
-
-    // ---- the clip seam table (the fallback where there is no clip grid) -------------
-    // The median of the tables of the samples without a grid or with a partly
-    // trusted one, as before every sample measured a table: the samples a
-    // refused clip grid would have rendered with their tables.
-    std::vector<const std::vector<float>*> tables;
-    for (const Sample& s : samples) {
-        if (s.table && (!s.grid || s.grid->strength < 1.0)) {
-            tables.push_back(s.table.get());
-        }
-    }
-    if (params.seamOn && !tables.empty()) {
-        auto t = clipSeamTable(tables);
-        if (t.ok()) {
-            out.seamTable = std::make_shared<const std::vector<float>>(std::move(t).value());
-        }
-    }
-
-    // ---- the per-column guard on the clip grid --------------------------------------------
-    // Every sample's table and confidence, as the per-column median, against
-    // the clip grid's per-column untrusted share (the median of the
-    // samples'): the columns most samples could not measure, where the
-    // tables are sure and found a disparity the grid missed, go to the table.
-    // What renders is the guarded grid and the table share under it (1 -
-    // strength everywhere plus those columns); without tables (seam off, or
-    // none measured) the grid renders alone.
-    if (out.grid && params.seamOn) {
-        std::vector<const std::vector<float>*> allTables;
-        std::vector<const std::vector<float>*> allConfidences;
+        OSV_TRY_ASSIGN(ParallaxWarpGrid median, clipParallaxGrid(grids));
+        // ---- ... kept line-straight over every sample's segments ------------------------
+        // One solve with no flow: the median as the prior, the lines of all
+        // samples in the line term (see the header).  The samples share one
+        // rig, so any sample's bands give the co-visibility the anchor reads.
+        std::vector<SeamLine> allLines;
         for (const Sample& s : samples) {
-            // A table counts only with its confidence, so the two medians
-            // are over the same samples.
-            if (s.table && s.confidence) {
-                allTables.push_back(s.table.get());
-                allConfidences.push_back(s.confidence.get());
+            if (s.grid) {
+                allLines.insert(allLines.end(), s.lines.begin(), s.lines.end());
             }
         }
-        if (!allTables.empty()) {
-            auto table = clipSeamTable(allTables);
-            auto confidence = clipSeamTable(allConfidences);  // the same per-column median
-            if (table.ok() && confidence.ok()) {
-                OSV_TRY_ASSIGN(GuardedCorrection guarded,
-                               guardGridWithTable(*out.grid, table.value(), confidence.value()));
-                out.guardedColumns = guarded.guardedColumns;
-                if (guarded.changed) {
-                    out.grid = std::make_shared<const ParallaxWarpGrid>(std::move(guarded.grid));
-                }
-                if (!guarded.table.empty()) {
-                    out.gridTable = std::make_shared<const std::vector<float>>(std::move(guarded.table));
-                }
+        const Sample* coverage = nullptr;
+        for (const Sample& s : samples) {
+            if (s.grid) {
+                coverage = &s;
+                break;
             }
         }
-        // The guard could not run (no sample table carried its confidence,
-        // or the medians failed) under a partly trusted clip grid: the rule
-        // before the guard, the fallback table's 1 - strength share, so the
-        // clip grid never renders with less than its table share.
-        if (!out.gridTable && out.seamTable && out.grid->strength < 1.0) {
-            std::vector<float> share;
-            seamTableUnderGrid(*out.seamTable, out.grid->strength, share);
-            if (!share.empty()) {
-                out.gridTable = std::make_shared<const std::vector<float>>(std::move(share));
+        MeshWarpInputs in;
+        in.bands = coverage != nullptr ? &coverage->bands : nullptr;
+        in.verifyBands = in.bands;
+        in.lines = &allLines;
+        in.prior = &median;
+        auto straightened = solveMeshWarp(in, meshParams, &pool);
+        if (straightened.ok()) {
+            const MeshWarpReport& r = straightened.value().report;
+            out.lines = r.lines;
+            out.lineResidualBeforePx = r.lineResidualBeforePx;
+            out.lineResidualAfterPx = r.lineResidualAfterPx;
+            // The median's diagnostics (its samples' counts and strength),
+            // the straightened field's numbers.
+            median.uv = std::move(straightened.value().grid.uv);
+            refreshCorrectionStats(median);
+        }
+        // A pass that could not run (it never fails on valid input) leaves
+        // the median, which is still one field.
+        out.grid = std::make_shared<const ParallaxWarpGrid>(std::move(median));
+    }
+
+    // ---- the clip seam table (where there is no clip field) -----------------------------
+    // The 1-D correction of Parallax Grid off, or of a clip too few of whose
+    // samples could be solved: the per-column median of the samples' tables.
+    if (params.seamOn && !out.grid) {
+        std::vector<const std::vector<float>*> tables;
+        for (const Sample& s : samples) {
+            if (s.table) {
+                tables.push_back(s.table.get());
+            }
+        }
+        if (!tables.empty()) {
+            auto t = clipSeamTable(tables);
+            if (t.ok()) {
+                out.seamTable = std::make_shared<const std::vector<float>>(std::move(t).value());
             }
         }
     }
 
     // ---- the correction the clip renders with -------------------------------------------
-    // The importer's rule: the grid when there is one, with the table share
-    // the guard leaves under it (gridTable), else the table - exactly as the
-    // importer applies it.
+    // The clip field when there is one - the whole correction - else the
+    // table, exactly as the importer applies it.
     const WarpGridView clipView = viewOf(out.grid.get());
     SeamCorrection clipCorrection;
     if (clipView.valid()) {
         clipCorrection.warp = &clipView;
-        if (out.gridTable && !out.gridTable->empty()) {
-            clipCorrection.seamShiftDeg = out.gridTable.get();
-        }
     } else if (out.seamTable) {
         clipCorrection.seamShiftDeg = out.seamTable.get();
     }
 
     // ---- the Auto verdict -----------------------------------------------------------------
     {
-        std::vector<WarpGridView> ownViews(samples.size());
         // Each sample's own correction exactly as a bucket measured on it
-        // renders in the importer: its grid after the per-column guard with
-        // its own table, the table share under it (1 - strength plus the
-        // columns handed over), and its table where it has no grid.
-        std::vector<GuardedCorrection> ownGuarded(samples.size());
+        // renders in the importer: its own mesh field when the clip has
+        // fields at all, else its table.
+        std::vector<WarpGridView> ownViews(samples.size());
         std::vector<SteadySample> judged;
         judged.reserve(samples.size());
         for (std::size_t i = 0; i < samples.size(); ++i) {
@@ -990,22 +1019,8 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
             ss.bands = &samples[i].bands;
             ownViews[i] = viewOf(samples[i].grid.get());
             if (ownViews[i].valid()) {
-                ss.own.warp = &ownViews[i];
-                if (samples[i].table) {
-                    // Without a confidence the guard keeps the rule before it
-                    // (the 1 - strength share of the table).
-                    static const std::vector<float> kNoConfidence;
-                    OSV_TRY_ASSIGN(ownGuarded[i],
-                                   guardGridWithTable(*samples[i].grid, *samples[i].table,
-                                                      samples[i].confidence ? *samples[i].confidence : kNoConfidence));
-                    if (ownGuarded[i].changed) {
-                        ownViews[i] = viewOf(&ownGuarded[i].grid);  // the vector never grows: stable
-                    }
-                    if (!ownGuarded[i].table.empty()) {
-                        ss.own.seamShiftDeg = &ownGuarded[i].table;
-                    }
-                }
-            } else if (samples[i].table) {
+                ss.own.warp = &ownViews[i];  // the vector never grows: stable
+            } else if (!params.parallaxOn && samples[i].table) {
                 ss.own.seamShiftDeg = samples[i].table.get();
             }
             judged.push_back(ss);
