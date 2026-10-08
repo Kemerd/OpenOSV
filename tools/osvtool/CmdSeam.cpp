@@ -87,6 +87,10 @@ struct SeamOptions {
     /// mean change of the field between consecutive solves - with and without
     /// the temporal term.
     int temporal = 0;
+    /// With --mesh: score the field the PLUG-INS render for this frame's
+    /// measurement - solved with the previous bucket (frame - 8) solved alone
+    /// as its temporal prior - instead of this frame solved alone.
+    bool meshPrior = false;
     /// Tuning overrides for the mesh solve; the measurement block (band,
     /// gates, flow) is taken from the --parallax tuning above.
     render::MeshWarpParams meshTuning;
@@ -423,6 +427,7 @@ int runSeam(const SeamOptions& o) {
         render::ClipSteadyParams cp;
         cp.parallax = o.parallaxTuning;
         cp.parallax.backend = backend;
+        cp.mesh = o.meshTuning;  // [WP-M] the clip field is the mesh's (its measurement block is cp.parallax)
         cp.parallaxOn = true;
         cp.seamOn = true;
         const std::vector<std::uint32_t> frames =
@@ -445,16 +450,17 @@ int runSeam(const SeamOptions& o) {
             if (c.grid) {
                 sj["meanDisparityDeg"] = c.grid->meanAbsCorrectionDeg;
                 sj["maxDisparityDeg"] = c.grid->maxAbsCorrectionDeg;
-                // The median of the accepted samples' structured-gate
-                // strengths; below 1 the clip seam table fills the rest.
+                // The median of the samples' structured-gate strengths (for
+                // the record: each mesh already weighs its data by its own).
                 sj["gridStrength"] = c.grid->strength;
                 sj["structuredFraction"] = c.grid->structuredFraction();
             }
             sj["seamTable"] = c.seamTable != nullptr;
-            // The table share under the clip grid and the columns the
-            // per-column guard handed to it (render::guardGridWithTable).
-            sj["gridTable"] = c.gridTable != nullptr && !c.gridTable->empty();
-            sj["guardedColumns"] = c.guardedColumns;
+            // [WP-M] The line pass over the median of the samples' meshes:
+            // the segments of every sample it keeps straight, and how straight.
+            sj["lines"] = c.lines;
+            sj["lineResidualBeforePx"] = c.lineResidualBeforePx;
+            sj["lineResidualAfterPx"] = c.lineResidualAfterPx;
             sj["seam"] = c.seam != nullptr;
             sj["decision"] = {{"steady", c.decision.steady},
                               {"textured", c.decision.textured},
@@ -716,13 +722,11 @@ int runSeam(const SeamOptions& o) {
                 if (held.ok()) {
                     pj["nccAfterSteady"] = held.value();
                 }
-                // The clip correction exactly as the importer renders it: the
-                // clip grid (after the per-column guard) and the clip table
-                // share under it (ClipSteady::gridTable), not this frame's table.
-                const std::vector<float>* clipShare =
-                    (steady->gridTable && !steady->gridTable->empty()) ? steady->gridTable.get() : nullptr;
+                // The clip correction exactly as the importer renders it:
+                // [WP-M] the clip field alone, the whole correction (no
+                // table under it, and not this frame's table).
                 auto asRendered =
-                    render::overlapNcc(P.rig, pair.value(), P.blendParams, band, *P.pool, clipShare, &steadyView);
+                    render::overlapNcc(P.rig, pair.value(), P.blendParams, band, *P.pool, nullptr, &steadyView);
                 if (asRendered.ok()) {
                     pj["nccAfterClip"] = asRendered.value();
                 }
@@ -856,10 +860,42 @@ int runSeam(const SeamOptions& o) {
         mp.parallax.backend = backend;
         const std::vector<float>* table = seamHold.empty() ? nullptr : &seamHold;
         nlohmann::json mj;
+        // [WP-M] --mesh-prior: the plug-ins' temporal prior for this
+        // measurement - the previous bucket's frame (frame - 8), its own seam
+        // table, solved alone - so the field scored below is the one the
+        // plug-ins render, not this frame solved on its own.
+        render::ParallaxWarpGrid priorAlone;
+        bool havePrior = false;
+        if (o.meshPrior) {
+            const long long fp = static_cast<long long>(o.frame) - static_cast<long long>(render::kParallaxBucketFrames);
+            mj["priorFrame"] = fp;
+            if (fp < 0) {
+                mj["priorNote"] = "the clip's first bucket has no temporal prior";
+            } else if (auto pp = P.reader->read(static_cast<std::uint32_t>(fp)); !pp.ok()) {
+                mj["priorError"] = pp.error().message;
+            } else {
+                std::vector<float> tp;
+                if (table != nullptr) {
+                    auto prof = render::searchSeam(P.rig, pp.value(), P.blendParams, render::SeamSearchParams{},
+                                                   *P.pool);
+                    if (prof.ok()) {
+                        tp = prof.value().shiftDeg;
+                    }
+                }
+                auto alone = render::buildMeshWarp(P.rig, pp.value(), P.blendParams, mp, tp.empty() ? nullptr : &tp,
+                                                   !o.meshRawBands, nullptr, *P.pool);
+                if (alone.ok()) {
+                    priorAlone = std::move(alone.value().grid);
+                    havePrior = true;
+                } else {
+                    mj["priorError"] = alone.error().message;
+                }
+            }
+        }
         render::MeshWarpBuildInfo info;
         const auto t0 = std::chrono::steady_clock::now();
-        auto mesh = render::buildMeshWarp(P.rig, pair.value(), P.blendParams, mp, table, !o.meshRawBands, nullptr,
-                                          *P.pool, &info);
+        auto mesh = render::buildMeshWarp(P.rig, pair.value(), P.blendParams, mp, table, !o.meshRawBands,
+                                          havePrior ? &priorAlone : nullptr, *P.pool, &info);
         mj["buildMs"] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         int rc0 = 0, rc1 = 0;
         const bool regionAsked = !o.region.empty() && std::sscanf(o.region.c_str(), "%d-%d", &rc0, &rc1) == 2 &&
@@ -981,10 +1017,17 @@ int runSeam(const SeamOptions& o) {
             // ---- --temporal N: consecutive buckets, with and without the temporal term ----
             if (o.temporal > 1) {
                 nlohmann::json tj = nlohmann::json::array();
+                // Three schedules over the same buckets: the full chain
+                // (Jiang & Gu: each bucket on the previous bucket's result),
+                // independent solves, and [WP-M] the plug-ins' rule - each
+                // bucket on the previous bucket's field solved ALONE, so a
+                // field depends on two anchors only (playback == parked).
                 render::ParallaxWarpGrid prevTemporal = m.grid;
                 render::ParallaxWarpGrid prevIndependent = m.grid;
+                render::ParallaxWarpGrid prevPlugin = m.grid;
                 double sumT = 0.0;
                 double sumI = 0.0;
+                double sumP = 0.0;
                 int steps = 0;
                 for (int k = 1; k < o.temporal; ++k) {
                     const long long f = static_cast<long long>(o.frame) +
@@ -1009,33 +1052,52 @@ int runSeam(const SeamOptions& o) {
                     const std::vector<float>* tkp = tk.empty() ? nullptr : &tk;
                     auto withT = render::buildMeshWarp(P.rig, pk.value(), P.blendParams, mp, tkp, !o.meshRawBands,
                                                        &prevTemporal, *P.pool);
-                    auto alone = render::buildMeshWarp(P.rig, pk.value(), P.blendParams, mp, tkp, !o.meshRawBands,
-                                                       nullptr, *P.pool);
-                    if (!withT.ok() || !alone.ok()) {
-                        tj.push_back({{"frame", f}, {"error", !withT.ok() ? withT.error().message
-                                                                           : alone.error().message}});
+                    // The plug-ins' rule, with this bucket's field alone from
+                    // the same solve (MeshWarpResult::alone) - which is also
+                    // exactly the independent solve.
+                    auto plugin = render::buildMeshWarp(P.rig, pk.value(), P.blendParams, mp, tkp, !o.meshRawBands,
+                                                        &prevIndependent, *P.pool, nullptr, true);
+                    if (!withT.ok() || !plugin.ok() || !plugin.value().alone) {
+                        tj.push_back({{"frame", f},
+                                      {"error", !withT.ok()    ? withT.error().message
+                                                : !plugin.ok() ? plugin.error().message
+                                                               : std::string("no field alone")}});
                         break;
                     }
+                    const render::ParallaxWarpGrid& alone = *plugin.value().alone;
                     const double bandDeg = mp.parallax.band.bandHalfDeg;
                     auto dT = render::meanAbsGridChangeDeg(withT.value().grid, prevTemporal, bandDeg);
-                    auto dI = render::meanAbsGridChangeDeg(alone.value().grid, prevIndependent, bandDeg);
+                    auto dI = render::meanAbsGridChangeDeg(alone, prevIndependent, bandDeg);
+                    auto dP = render::meanAbsGridChangeDeg(plugin.value().grid, prevPlugin, bandDeg);
                     const double vT = dT.ok() ? dT.value() : -1.0;
                     const double vI = dI.ok() ? dI.value() : -1.0;
+                    const double vP = dP.ok() ? dP.value() : -1.0;
                     sumT += vT;
                     sumI += vI;
+                    sumP += vP;
                     ++steps;
                     tj.push_back({{"frame", f},
                                   {"meanAbsDeltaUvDeg", vT},
                                   {"meanAbsDeltaUvDegIndependent", vI},
+                                  {"meanAbsDeltaUvDegPlugin", vP},
                                   {"solveMs", withT.value().report.totalMs},
-                                  {"summary", withT.value().report.summary()}});
+                                  {"pluginSolveMs", plugin.value().report.totalMs},
+                                  {"summary", withT.value().report.summary()},
+                                  {"pluginSummary", plugin.value().report.summary()}});
                     prevTemporal = withT.value().grid;
-                    prevIndependent = alone.value().grid;
+                    prevIndependent = alone;
+                    prevPlugin = plugin.value().grid;
                 }
+                // Per frame: the glide moves 1/kParallaxBucketFrames of a
+                // bucket-to-bucket change each frame.
+                const double perFrame = 1.0 / static_cast<double>(render::kParallaxBucketFrames);
                 mj["temporal"] = {{"buckets", tj},
                                   {"steps", steps},
                                   {"meanAbsDeltaUvDeg", steps ? sumT / steps : 0.0},
-                                  {"meanAbsDeltaUvDegIndependent", steps ? sumI / steps : 0.0}};
+                                  {"meanAbsDeltaUvDegIndependent", steps ? sumI / steps : 0.0},
+                                  {"meanAbsDeltaUvDegPlugin", steps ? sumP / steps : 0.0},
+                                  {"perFrameDeltaUvDegPlugin", steps ? perFrame * sumP / steps : 0.0},
+                                  {"perFrameDeltaUvDegIndependent", steps ? perFrame * sumI / steps : 0.0}};
             }
         }
         out["mesh"] = mj;
@@ -1195,6 +1257,9 @@ void registerSeamCommand(CLI::App& app, CommandContext& ctx) {
                   "--region, and line straightness next to the table, the grid and their 0.5.1 composition");
     sub->add_flag("--mesh-raw-bands", opt->meshRawBands,
                   "Measure the mesh's flow on the raw bands instead of bands prewarped by the --search table");
+    sub->add_flag("--mesh-prior", opt->meshPrior,
+                  "With --mesh: score the field the plug-ins render - solved with the previous bucket (frame - 8) "
+                  "solved alone as its temporal prior");
     sub->add_option("--temporal", opt->temporal,
                     "With --mesh: solve N consecutive buckets with the temporal prior and report the mean change")
         ->default_val(0);
