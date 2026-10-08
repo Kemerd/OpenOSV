@@ -83,7 +83,7 @@ All notable changes to OpenOSV are documented here. The format follows
   nine frames show. Auto now holds the day drive steady and lets the 6K
   aerial sample follow the scene (the other way round in 0.5.1).
 
-Known limits: on the night drive the car body next to the mount's blind arc
+Known limits of the seam field: on the night drive the car body next to the mount's blind arc
 lines up a little worse than 0.5.1 (0.717 against 0.768 at frame 2000,
 0.924 against 0.947 at frame 3500), and the 6K sample's frame 60 0.004
 worse over the whole seam (the stick strip, where nothing can be
@@ -92,6 +92,37 @@ few hundredths of a pixel (0.20 against 0.18 px RMS on the 8K drive);
 the clip correction takes 29-36 % longer on the CPU (5.2 s against 4.1 s
 on the 6K sample in `osvtool`: every sample frame is measured twice, on
 the raw picture and through its seam table).
+
+* **The importer now offers Premiere a settings block for every clip
+  (pending a live check in Premiere).** Premiere keeps one settings block
+  per clip and hands it to the OpenOSV Source Settings effect (Effect
+  Controls, the clip's Source tab) to store the panel's controls in. In the
+  0.5.0 and 0.5.1 Premiere sessions the effect never received one: it logged
+  "TRANSLATE_PARAMS_TO_PREFS with no prefs buffer" in both, the importer was
+  told "the host gave it no settings" even for a clip reopened from a saved
+  project, and no project file held settings for an OpenOSV clip. The
+  importer now offers Premiere a 128-byte block (0 bytes before) when it
+  opens a clip that has none, holding exactly the settings the clip is
+  decoded with, so a new clip renders as before. Whether Premiere keeps that
+  block, and so whether changes in the Source tab now reach the picture and
+  the project, still has to be confirmed in Premiere. If it does: a clip
+  keeps the settings it is first opened with, so Save as Default changes new
+  clips only, as documented (until now every clip was re-seeded from the
+  current defaults on each open); and Source-tab values set under 0.5.0 or
+  0.5.1, which never reached the picture, can start to apply. An .LRF beside
+  its .OSV still follows the original's settings. Launch Premiere once with
+  Shift held after installing.
+* **Source Settings questions are answerable from the log.** The importer now
+  logs the host's settings-size request and a cancelled Source Settings
+  dialog, and at debug level whether each imGetInfo8 found a settings block
+  for the clip; before, only an accepted dialog left a line, so "did Premiere
+  ever ask?" had no answer.
+
+### Changed
+
+* **The Source Settings effect is now version 1.1.0.** 0.5.1 added Hide
+  Mount but kept 1.0.0. A 0.5.0 project restores every value by its id, as
+  it already did in 0.5.1, with Hide Mount On.
 
 ## [0.5.1] - 2026-10-07
 

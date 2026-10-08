@@ -125,7 +125,27 @@ public:
     [[nodiscard]] ClipHandle openClip(const std::filesystem::path& path, csSDK_int32 importerId = 7);
 
     /// imGetInfo8 on an open clip.  `prefs` may be null for the defaults.
+    ///
+    /// When `prefs` is null the host has no settings block for the clip, and
+    /// the importer offers it one of its own (allocated through
+    /// piSuites->memFuncs; a host that keeps it stores it as the clip's
+    /// settings and frees it).  The harness plays that host: it copies the
+    /// block into lastHostPrefs(), disposes the allocation through the same
+    /// memory functions and leaves info.prefs null, as it was before the
+    /// call, so no test leaks a mock allocation or holds a pointer into the
+    /// copy, and every test can read what was handed over.
     csSDK_int32 getInfo8(ClipHandle& clip, imFileInfoRec8& info, const PrefsBlob* prefs = nullptr);
+
+    /// imGetInfo8 with `hostPrefs` passed through untouched as info.prefs:
+    /// no copy, no disposal.  For tests that hand the importer a block the
+    /// way Premiere does (a memFuncs allocation) and then inspect what the
+    /// importer did with it.  The caller owns the block before and after the
+    /// call; the importer never resizes or replaces a block it is given.
+    csSDK_int32 getInfo8WithHostPrefs(ClipHandle& clip, imFileInfoRec8& info, void* hostPrefs);
+
+    /// The bytes of the settings block the importer handed the host in the
+    /// last getInfo8() call that passed no prefs; empty when it handed none.
+    [[nodiscard]] const std::vector<char>& lastHostPrefs() const noexcept { return m_lastHostPrefs; }
 
     /// imGetSourceVideo.  Returns the selector result; `outFrame` receives the
     /// PPix (which the caller disposes through the mock PPix suite).
@@ -161,6 +181,9 @@ private:
     imCallbackFuncs m_callbacks{};
     imImportInfoRec m_importInfo{};
     csSDK_int32 m_initResult = imOtherErr;
+    /// Copy of the last settings block the importer allocated for the host
+    /// (see getInfo8); the allocation itself is disposed at once.
+    std::vector<char> m_lastHostPrefs;
 };
 
 }  // namespace osv::premiere::test

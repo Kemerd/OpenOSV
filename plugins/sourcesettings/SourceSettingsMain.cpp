@@ -1086,16 +1086,20 @@ PF_Err userChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
 ///
 /// Three defensive rules, each of which is a real failure mode:
 ///
-///   * a null extra or a null prefsPC means the host asked without providing
-///     a buffer.  Returning PF_Err_NONE leaves the importer on its existing
-///     prefs, which is correct; writing through the null would take the host
-///     down.
+///   * a null extra or a null prefsPC means the host holds no settings block
+///     for the clip yet.  Returning PF_Err_NONE leaves the importer on its
+///     existing prefs, which is correct; writing through the null would take
+///     the host down.  Since 0.5.2 the importer offers the host a block in
+///     imGetInfo8 whenever it has none, so this is the state of a clip that
+///     has not been through imGetInfo8 with a current importer, or of a host
+///     that did not keep the block it was offered.
 ///   * prefs_sizeLu SMALLER than a PrefsBlob means the host's idea of the
-///     prefs size disagrees with ours - which happens on a project saved by
-///     an older build.  Writing 128 bytes into a smaller buffer is a heap
-///     overflow in the host's allocator, so the write is refused and logged.
-///     The importer's own two-step imGetPrefs8 protocol then re-establishes
-///     the correct size.
+///     prefs size disagrees with ours.  No release has asked for or handed
+///     over anything but 128 bytes, so this is a host fault, not an older
+///     project.  Writing 128 bytes into a smaller buffer is a heap overflow
+///     in the host's allocator, so the write is refused and logged.  The
+///     importer's own two-step imGetPrefs8 protocol then re-establishes the
+///     correct size.
 ///   * a LARGER buffer is fine and is not an error: only the first
 ///     sizeof(PrefsBlob) bytes are ours, and PrefsBlob::fromBytes on the
 ///     importer side reads exactly that many.  The tail is left untouched
@@ -1104,8 +1108,16 @@ PF_Err translateParamsToPrefs(PF_InData* in_data, PF_ParamDef* params[],
                               PF_TranslateParamsToPrefsExtra* extra) noexcept {
     (void)in_data;
     if (!extra || !extra->prefsPC) {
+        // The host has no settings block for this clip.  Since 0.5.2 the
+        // importer offers one in imGetInfo8 when the host has none; in the
+        // 0.5.0 and 0.5.1 Premiere sessions no clip had one and this line was
+        // the only trace of it, so it says which half is missing and the
+        // size the host announced.
         PluginLog::oncef("ss/translate-null", PluginLog::Level::Warn,
-                         "source settings: TRANSLATE_PARAMS_TO_PREFS with no prefs buffer");
+                         "source settings: TRANSLATE_PARAMS_TO_PREFS with no prefs buffer ({}; host size {} bytes): "
+                         "the clip has no settings block yet, so these controls cannot reach the importer",
+                         extra ? "null prefsPC" : "null extra",
+                         extra ? static_cast<unsigned>(extra->prefs_sizeLu) : 0u);
         return PF_Err_NONE;
     }
     if (extra->prefs_sizeLu < static_cast<A_u_long>(PrefsBlob::kSize)) {

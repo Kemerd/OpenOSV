@@ -129,6 +129,12 @@ ImporterGlobals& globalsImpl() noexcept {
     case imGetFileAttributes:       return "imGetFileAttributes";
     case imCreateAsyncImporter:     return "imCreateAsyncImporter";
     case imGetColorSpaceFromOpaqueData: return "imGetColorSpaceFromOpaqueData";
+    // Sent by Premiere 26.2.2 while importing a clip and answered
+    // imUnsupported; named so a session log reads without the header open.
+    case imGetMetaData:             return "imGetMetaData";
+    case imGetSubTypeNames:         return "imGetSubTypeNames";
+    case imQueryContentState:       return "imQueryContentState";
+    case imGetExtendedFormatInfo:   return "imGetExtendedFormatInfo";
     default:                        return nullptr;
     }
 }
@@ -183,11 +189,17 @@ csSDK_int32 doInit(imStdParms* stdParms, imImportInfoRec* info) {
     info->canDoContinuousTime = kPrFalse;
     info->noFile = kPrFalse;
     info->addToMenu = imMenuNone;
-    // The modal Source Settings dialog stays available (right-click > Source
-    // Settings) alongside the effect below.  Two routes to the same PrefsBlob
-    // on purpose: the dialog is muscle memory for existing users, and a
-    // machine where OpenOSVSourceSettings.aex failed to install still needs a
-    // way to reach the options.
+    // The modal Source Settings dialog (imGetPrefs8 / imGetInstancePrefs)
+    // stays declared alongside the effect below.  Two routes to the same
+    // PrefsBlob on purpose: a machine where OpenOSVSourceSettings.aex failed
+    // to install still needs a way to reach the options.  Where the effect
+    // IS attached, the clip's settings are edited in the effect (Effect
+    // Controls, the clip's Source tab).  In the Premiere sessions logged since
+    // the effect has been matched by its host name (0.2.2) no dialog was ever
+    // accepted and no project stored settings for an OpenOSV clip - the host
+    // never allocated the block the dialog route allocates - so the clip's
+    // settings block is handed to the host in imGetInfo8 instead
+    // (syncClipPrefsBlock).
     info->hasSetup = kPrTrue;
     info->setupOnDblClk = kPrFalse;
     info->dontCache = kPrFalse;

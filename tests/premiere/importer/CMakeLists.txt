@@ -34,6 +34,7 @@ add_executable(osv_importer_tests
   test_steady_importer.cpp  # [WP-STEADY] steady seam corrections and lens alignment end to end
   test_user_defaults_importer.cpp  # [WP-DEFAULTS] new clips start from the user's saved defaults
   test_vfr_importer.cpp     # [VFR] dropped-frame clips on a nominal-rate timeline
+  test_clip_prefs.cpp       # the clip's stored settings block: imGetInfo8 offers one, reads it, never resizes it
   "${CMAKE_SOURCE_DIR}/plugins/importer/PrefsMapping.cpp"
 )
 

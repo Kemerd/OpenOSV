@@ -237,6 +237,35 @@ csSDK_int32 handlePerformSourceSettingsCommand(imStdParms* stdParms, imFileAcces
 /// (SourceSettingsDialog.cpp, beside the other prefs selectors.)
 void noteNewClipDefaults(ImporterInstance* instance, const char* where) noexcept;
 
+/// imGetInfo8's half of the clip's stored Source Settings (the host's
+/// imFileInfoRec8::prefs block).  (SourceSettingsDialog.cpp, beside the
+/// other prefs selectors.)
+///
+///   * A block the host holds is the clip's settings and is applied to
+///     `instance`, read as PrefsBlob::kSize bytes exactly as every release
+///     has read it (every block a host was asked for or handed is that
+///     size).
+///   * No block: the clip keeps the settings it was seeded with, and the
+///     host is handed a new PrefsBlob-sized block (piSuites->memFuncs; the
+///     host owns and frees it) holding exactly those settings.  The SDK
+///     guide describes the host allocating the block in the dialog route
+///     (imGetPrefs8's size handshake); no logged session since 0.2.2 has
+///     accepted that dialog for a clip with the Source Settings effect, and
+///     no clip had a block, so the effect's PF_Cmd_TRANSLATE_PARAMS_TO_PREFS
+///     had nowhere to write.  Allocating it here is the route an Adobe
+///     developer-forum thread gives; that Premiere keeps the block still
+///     needs confirming live (both cases log a debug line on every call).
+///     Not done for an .LRF beside its .OSV, whose settings follow the
+///     original's live instance.
+///
+/// \param stdParms  The host's standard parameters (memory functions); may
+///                  be null, in which case no block can be handed over.
+/// \param info      The imGetInfo8 record; null is logged and ignored.
+/// \param instance  The clip's live importer instance.
+///
+/// Never throws; every failure is logged and leaves the clip decodable.
+void syncClipPrefsBlock(imStdParms* stdParms, imFileInfoRec8* info, ImporterInstance& instance) noexcept;
+
 /// The pure mapping the dialog uses, exposed so it can be unit-tested without
 /// ever creating a window.  `controls` is the state of the dialog's widgets.
 struct DialogControls {

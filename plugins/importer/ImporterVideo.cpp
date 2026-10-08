@@ -844,7 +844,10 @@ csSDK_int32 handleGetInfo8(imStdParms* stdParms, imFileAccessRec8* fileAccess, i
         return imBadFile;
     }
 
-    instance->applyPrefs(info->prefs, PrefsBlob::kSize);
+    // The clip's stored settings: applied when the host holds a block,
+    // handed to the host as a new block when it holds none (the Source
+    // Settings effect writes its controls into that block).
+    syncClipPrefsBlock(stdParms, info, *instance);
     // [WP-DEFAULTS] No stored blob here - the first prefs-carrying selector
     // after imOpenFile8 - means a new clip on the user's saved defaults;
     // say so (once per clip, and only when a defaults file supplied them).
@@ -977,9 +980,9 @@ csSDK_int32 handleGetInfo8(imStdParms* stdParms, imFileAccessRec8* fileAccess, i
     // master clip (OSV_SOURCE_SETTINGS_HOST_MATCH_NAME explains).
     //
     // The modal dialog (imGetPrefs8) is deliberately left working alongside
-    // it: right-click > Source Settings is muscle memory for a lot of users,
-    // and a machine where the .aex failed to install still needs a way to
-    // reach the options.  Both paths write the same PrefsBlob.
+    // it: a machine where the .aex failed to install still needs a way to
+    // reach the options.  Both paths write the same PrefsBlob - the effect
+    // into the block syncClipPrefsBlock() above handed to the host.
     copyUtf16(info->sourceSettingsMatchName, 256, kSourceSettingsHostMatchNameW);
 
     PluginLog::info("imGetInfo8: {} x {} equirect, {} frames, {} ticks/frame, audio {} ch", geometry.width,
