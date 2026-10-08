@@ -1105,9 +1105,15 @@ void logDialogStartsFromDefaults(ImporterInstance* instance, const imFileAccessR
     }
 }
 
-/// The clip a prefs selector is about, for its log lines: the live
-/// instance's file name, else the file the access record names, else a
-/// neutral phrase.  Never throws.
+/// The clip a prefs selector is about, for its log lines.
+///
+/// \param instance    The live importer instance, when the selector carries
+///                    one (imGetInstancePrefs); may be null.
+/// \param fileAccess  The host's file record, when it names a file; may be
+///                    null or carry an empty path.
+/// \return The live instance's file name in quotes, else the file the
+///         access record names, else the neutral phrase "a clip".  Never
+///         throws.
 [[nodiscard]] std::string prefsClipNameForLog(ImporterInstance* instance,
                                               const imFileAccessRec8* fileAccess) noexcept {
     try {
@@ -1284,24 +1290,34 @@ csSDK_int32 handleGetInstancePrefs(imStdParms* stdParms, imFileAccessRec8* fileA
 
 namespace {
 
-/// The size the host's memory functions report for `block`, or 0 when they
-/// cannot say (no function, a null block, or a pointer they did not
-/// allocate - the mock host and Premiere both answer 0 for those).
-[[nodiscard]] std::size_t hostBlockSize(PlugMemoryFuncsPtr memFuncs, void* block) noexcept {
-    if (!memFuncs || !memFuncs->getPtrSize || !block) {
-        return 0u;
-    }
-    const csSDK_int32 size = memFuncs->getPtrSize(static_cast<char*>(block));
-    return size > 0 ? static_cast<std::size_t>(size) : 0u;
-}
-
-/// The clip's file name for a log line; never throws.
+/// The clip's file name for a log line.
+///
+/// \param instance  The live importer instance whose file is named.
+/// \return The file name (no folder), or "a clip" when it cannot be
+///         formatted.  Never throws.
 [[nodiscard]] std::string clipNameForLog(const ImporterInstance& instance) noexcept {
     try {
         return userDefaultsPathForLog(instance.path().filename());
     } catch (...) {
         return "a clip";
     }
+}
+
+/// Whether the first PrefsBlob::kSize bytes at `block` are a blob of ours
+/// (magic and version) - the same test ImporterInstance::applyPrefs makes
+/// before it adopts a block.  Only used to word a log line.
+///
+/// \param block  The host's settings block; must hold at least
+///               PrefsBlob::kSize bytes, which every block the host was
+///               asked for or handed by the importer does.  May be null.
+/// \return true when the block carries our magic and version.
+[[nodiscard]] bool holdsOurBlob(const void* block) noexcept {
+    if (!block) {
+        return false;
+    }
+    PrefsBlob probe;
+    std::memcpy(&probe, block, PrefsBlob::kSize);
+    return probe.isValid();
 }
 
 }  // namespace
@@ -1318,58 +1334,20 @@ void syncClipPrefsBlock(imStdParms* stdParms, imFileInfoRec8* info, ImporterInst
     // =======================================================================
     //  1. The host holds a block for the clip: it is the clip's settings.
     // =======================================================================
+    // Read exactly as every release has read it: PrefsBlob::kSize bytes.
+    // Every block a host holds for an OpenOSV clip is that size - the
+    // imGetPrefs8 handshake has asked for 128 bytes since 0.1.0, the blob
+    // has been 128 bytes in every release (fields are taken from its zeroed
+    // reserved tail, never appended), and the block handed over below is
+    // 128 bytes.  applyPrefs ignores a block that is not ours, such as the
+    // zero-filled one of a clip with no settings yet.
     if (info->prefs) {
-        const std::size_t size = hostBlockSize(memFuncs, info->prefs);
-        // A full block, or one whose size the host cannot tell: exactly the
-        // read every release has made (applyPrefs ignores a block that is
-        // not ours, such as the zero-filled one of a clip with no settings).
-        if (size == 0u || size >= PrefsBlob::kSize) {
-            instance.applyPrefs(info->prefs, PrefsBlob::kSize);
-            return;
-        }
-
-        // A SHORTER block.  Reading kSize bytes from it would run past its
-        // end, so only its own bytes are read, and a block of ours is read
-        // with its missing tail as zero - each later field's old behaviour
-        // (Hide Mount's zero is On).
-        bool ours = false;
-        const PrefsBlob blob = PrefsBlob::fromStoredBytes(info->prefs, size, &ours);
-        if (!ours) {
-            // Not a blob of ours: no settings.  The clip keeps the ones it
-            // started from and the host's memory is left exactly as it is.
-            instance.applyPrefs(nullptr, 0u);
-            PluginLog::warn("imGetInfo8: '{}': the host's {}-byte settings block is not one of ours; the clip keeps "
-                            "its current settings",
-                            clipNameForLog(instance), size);
-            return;
-        }
-
-        // Ours: grow the host's block to the full blob and store the upgraded
-        // settings in it, so the Source Settings effect has the whole blob to
-        // write into from now on.  setPtrSize may move the block, so the
-        // record is pointed at wherever it ended up.
-        PrMemoryPtr grown = static_cast<PrMemoryPtr>(info->prefs);
-        if (memFuncs && memFuncs->setPtrSize) {
-            memFuncs->setPtrSize(&grown, kBlobSize);
-        }
-        if (grown) {
-            info->prefs = grown;
-        }
-        if (grown && hostBlockSize(memFuncs, grown) >= PrefsBlob::kSize) {
-            std::memcpy(grown, &blob, PrefsBlob::kSize);
-            instance.applyPrefs(grown, PrefsBlob::kSize);
-            PluginLog::info("imGetInfo8: '{}': stored settings upgraded from a {}-byte block to the {}-byte blob "
-                            "(the fields it did not have read as their old behaviour; Hide Mount {})",
-                            clipNameForLog(instance), size, static_cast<int>(PrefsBlob::kSize),
-                            blob.hideMountChoice() == PrefsHideMount::On ? "On" : "as stored");
-        } else {
-            // The host would not grow it: the clip still decodes with the
-            // upgraded settings; its stored block stays as the host has it.
-            instance.applyPrefs(&blob, PrefsBlob::kSize);
-            PluginLog::warn("imGetInfo8: '{}': the host's {}-byte settings block could not be grown to {} bytes; "
-                            "the clip uses the upgraded settings without storing them",
-                            clipNameForLog(instance), size, static_cast<int>(PrefsBlob::kSize));
-        }
+        // Logged on every call (debug): whether the host kept the block it
+        // was handed is the one thing a session log has to show.
+        PluginLog::debug("imGetInfo8: '{}': the host holds a settings block for the clip ({})",
+                         clipNameForLog(instance),
+                         holdsOurBlob(info->prefs) ? "ours, applied" : "not ours, the clip keeps its settings");
+        instance.applyPrefs(info->prefs, PrefsBlob::kSize);
         return;
     }
 
@@ -1380,13 +1358,18 @@ void syncClipPrefsBlock(imStdParms* stdParms, imFileInfoRec8* info, ImporterInst
     // its original's settings for a proxy) - unchanged from every release.
     instance.applyPrefs(nullptr, 0u);
 
-    // Premiere allocates the block itself only in the dialog route (after
-    // imGetPrefs8's size handshake), which no logged Premiere session has
-    // taken for a clip with the Source Settings effect.  So the importer
-    // hands it over here: without it PF_Cmd_TRANSLATE_PARAMS_TO_PREFS reaches
-    // the effect with no buffer (logged by 0.5.0 and 0.5.1 in every session),
-    // the panel's controls have nowhere to go, and the project stores no
-    // settings for the clip.
+    // The SDK guide describes one way the block comes to exist: Premiere
+    // allocates it from the size imGetPrefs8's handshake answers, in the
+    // dialog route.  No logged Premiere session since 0.2.2 accepted that
+    // dialog for a clip with the Source Settings effect, and no clip had a
+    // settings block: 0.5.0 and 0.5.1 logged "TRANSLATE_PARAMS_TO_PREFS with
+    // no prefs buffer" in every session, and no project stored settings for
+    // an OpenOSV clip.  So the importer offers the block here, the route an
+    // Adobe developer-forum thread gives for an importer with a Source
+    // Settings effect (allocate info->prefs through memFuncs in imGetInfo8
+    // when it is null; the host keeps and frees it).  That Premiere keeps it
+    // still needs confirming in a live session: the debug lines here and in
+    // case 1 show it, call by call.
     //
     // Not for an .LRF beside its .OSV: its settings come from its original's
     // live instance every time it is opened ([PROXY] in ImporterEntry.cpp),
@@ -1414,9 +1397,16 @@ void syncClipPrefsBlock(imStdParms* stdParms, imFileInfoRec8* info, ImporterInst
     std::memcpy(block, &current, PrefsBlob::kSize);
     // The host owns the block from here and frees it with the clip.
     info->prefs = block;
+    // Once per clip at info level (the line the morning check looks for) ...
     PluginLog::oncef("clip-prefs-block-" + clipNameForLog(instance), PluginLog::Level::Info,
                      "imGetInfo8: '{}' had no stored Source Settings; gave the host a {}-byte settings block holding "
-                     "the ones it is decoded with, so the Source Settings effect can store its controls in it",
+                     "the ones it is decoded with, for the Source Settings effect to store its controls in",
+                     clipNameForLog(instance), static_cast<int>(PrefsBlob::kSize));
+    // ... and on every call at debug level: a host that does not keep the
+    // block shows up as this line repeating for the same clip (each one a
+    // 128-byte allocation the host was expected to own), never followed by
+    // "the host holds a settings block".
+    PluginLog::debug("imGetInfo8: '{}': the host holds no settings block for the clip; handed it a new {}-byte one",
                      clipNameForLog(instance), static_cast<int>(PrefsBlob::kSize));
 }
 

@@ -12,21 +12,26 @@
 // PF_Cmd_TRANSLATE_PARAMS_TO_PREFS, where the effect writes the controls into
 // it.  The block only exists once something has allocated it:
 //
-//   * the modal dialog route (imGetPrefs8) makes the HOST allocate it, after
-//     the size handshake - but Premiere never sends imGetPrefs8 to a clip
-//     whose settings live in a master-clip Source Settings effect;
-//   * so with the effect, the IMPORTER must allocate it in imGetInfo8 when
-//     the host has none (newPtr through piSuites->memFuncs; the host then
-//     owns and frees it).
+//   * the SDK guide describes the modal dialog route: the HOST allocates the
+//     block from the size the imGetPrefs8 handshake answers.  No logged
+//     session since 0.2.2 accepted that dialog for a clip with the Source
+//     Settings effect, and no clip had a settings block;
+//   * so the importer now offers the block itself in imGetInfo8 when the
+//     host has none (newPtrClear through piSuites->memFuncs; the host then
+//     owns and frees it) - the route an Adobe developer-forum thread gives
+//     for an importer with a Source Settings effect.  That Premiere keeps
+//     the block still needs confirming in a live session.
 //
-// Until this was done the block never existed: Premiere's own logs show
-// "TRANSLATE_PARAMS_TO_PREFS with no prefs buffer" in every session, the
-// importer was told "the host gave it no settings" even for a clip reopened
-// from a saved project, and no project file holds any importer settings.
+// What OpenOSV's plug-in logs of the 0.5.0 and 0.5.1 Premiere sessions show
+// is that the block never existed: "TRANSLATE_PARAMS_TO_PREFS with no prefs
+// buffer" in both sessions, the importer told "the host gave it no settings"
+// even for a clip reopened from a saved project, and no project file holding
+// any importer settings for an OpenOSV clip.
 //
-// The tests below pin the whole contract, plus the answers the importer gives
-// to every selector Premiere 26.2.2 sends while importing a clip (the
-// sequence is the one recorded in the importer log of a real session).
+// The tests below pin the importer's side of that contract against the mock
+// host, plus the answers the importer gives to every selector Premiere 26.2.2
+// sends while importing a clip (the sequence is the one recorded in the
+// importer log of a real session).
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -143,79 +148,6 @@ private:
 }  // namespace
 
 // ===========================================================================
-//  PrefsBlob::fromStoredBytes - the pure rule under the upgrade
-// ===========================================================================
-
-TEST_CASE("PrefsBlob fromStoredBytes accepts a shorter blob of ours and reads the missing tail as zero",
-          "[importer][prefs][hidemount]") {
-    PrefsBlob stored = PrefsBlob::defaults();
-    stored.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::Rec709);
-    stored.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::HD2K);
-    stored.lensFocal = static_cast<std::uint8_t>(PrefsLensFocal::Calibration);
-    stored.hideMount = static_cast<std::uint8_t>(PrefsHideMount::Off);
-    REQUIRE(stored.sanitise());
-
-    SECTION("a full blob reads exactly like fromBytes") {
-        bool ours = false;
-        bool upgraded = true;
-        const PrefsBlob read = PrefsBlob::fromStoredBytes(&stored, sizeof(stored), &ours, &upgraded);
-        CHECK(ours);
-        CHECK_FALSE(upgraded);
-        CHECK(read == stored);
-        CHECK(read == PrefsBlob::fromBytes(&stored, sizeof(stored)));
-    }
-
-    SECTION("a blob that ends before Hide Mount keeps its bytes and reads Hide Mount as On") {
-        // Even though the full blob says Off: the shorter block simply does
-        // not reach byte 58, and a missing byte is the old behaviour.
-        bool ours = false;
-        bool upgraded = false;
-        const std::size_t length = offsetof(PrefsBlob, hideMount);
-        const PrefsBlob read = PrefsBlob::fromStoredBytes(&stored, length, &ours, &upgraded);
-        CHECK(ours);
-        CHECK(upgraded);
-        CHECK(std::memcmp(&read, &stored, length) == 0);
-        CHECK(read.hideMountChoice() == PrefsHideMount::On);
-        CHECK(read.lensFocalChoice() == PrefsLensFocal::Calibration);
-        // Already clean: nothing for the importer to repair.
-        PrefsBlob copy = read;
-        CHECK(copy.sanitise());
-    }
-
-    SECTION("the first release's 20-byte blob is the shortest one accepted") {
-        bool ours = false;
-        const PrefsBlob read = PrefsBlob::fromStoredBytes(&stored, PrefsBlob::kOriginalFieldsSize, &ours);
-        CHECK(ours);
-        CHECK(read.colorOutput == stored.colorOutput);
-        CHECK(read.outputSize == stored.outputSize);
-        // Every later field at its zero meaning, e.g. Scene Light Auto.
-        CHECK(read.sceneLightChoice() == PrefsSceneLight::Auto);
-        CHECK(read.hideMountChoice() == PrefsHideMount::On);
-
-        bool shortOurs = true;
-        CHECK(PrefsBlob::fromStoredBytes(&stored, PrefsBlob::kOriginalFieldsSize - 1u, &shortOurs) ==
-              PrefsBlob::defaults());
-        CHECK_FALSE(shortOurs);
-    }
-
-    SECTION("null, foreign or garbage blocks give the defaults and say so") {
-        bool ours = true;
-        CHECK(PrefsBlob::fromStoredBytes(nullptr, 64u, &ours) == PrefsBlob::defaults());
-        CHECK_FALSE(ours);
-        std::vector<char> garbage(64u, 0x5A);
-        ours = true;
-        CHECK(PrefsBlob::fromStoredBytes(garbage.data(), garbage.size(), &ours) == PrefsBlob::defaults());
-        CHECK_FALSE(ours);
-        // A longer block contributes only its first kSize bytes.
-        std::vector<char> longer(PrefsBlob::kSize + 32u, 0x77);
-        std::memcpy(longer.data(), &stored, PrefsBlob::kSize);
-        ours = false;
-        CHECK(PrefsBlob::fromStoredBytes(longer.data(), longer.size(), &ours) == stored);
-        CHECK(ours);
-    }
-}
-
-// ===========================================================================
 //  imGetInfo8 and the clip's settings block
 // ===========================================================================
 
@@ -224,9 +156,18 @@ TEST_CASE("imGetInfo8 gives a clip with no stored settings a block of its own",
     CLIP_PREFS_REQUIRE_SAMPLE_CLIP();
     DebugLogLevel debug;  // before the harness: the module reads it at imInit
     // Counted from here: every test case of this process shares one log.
-    const std::string announced =
-        "imGetInfo8: '" + sampleClipPath().filename().string() + "' had no stored Source Settings";
-    const std::size_t announcedBefore = countOf(importerLog(), announced);
+    const std::string clipName = sampleClipPath().filename().string();
+    const std::string announced = "imGetInfo8: '" + clipName + "' had no stored Source Settings";
+    // The per-call debug lines: one for each call that found no block (and
+    // handed one over), one for each call that found ours.
+    const std::string handedEach = "imGetInfo8: '" + clipName +
+                                   "': the host holds no settings block for the clip; handed it a new 128-byte one";
+    const std::string heldOurs =
+        "imGetInfo8: '" + clipName + "': the host holds a settings block for the clip (ours, applied)";
+    const std::string beforeLog = importerLog();
+    const std::size_t announcedBefore = countOf(beforeLog, announced);
+    const std::size_t handedBefore = countOf(beforeLog, handedEach);
+    const std::size_t heldBefore = countOf(beforeLog, heldOurs);
     ImporterHarness harness;
     REQUIRE(harness.loaded());
     auto clip = harness.openClip(sampleClipPath());
@@ -269,10 +210,13 @@ TEST_CASE("imGetInfo8 gives a clip with no stored settings a block of its own",
     CHECK(std::memcmp(stored, &handed, PrefsBlob::kSize) == 0);
     mem->disposePtr(static_cast<char*>(again.prefs));
 
-    // One line says the block was handed over, naming the clip.
+    // One info line says the block was handed over, naming the clip; the
+    // debug lines record each call: one block handed over, then one found.
     const std::string log = importerLog();
     INFO(log);
     CHECK(countOf(log, announced) == announcedBefore + 1u);
+    CHECK(countOf(log, handedEach) == handedBefore + 1u);
+    CHECK(countOf(log, heldOurs) == heldBefore + 1u);
 }
 
 TEST_CASE("a settings block the host hands back is read and left in place",
@@ -306,9 +250,20 @@ TEST_CASE("a settings block the host hands back is read and left in place",
     mem->disposePtr(static_cast<char*>(info.prefs));
 }
 
-TEST_CASE("a smaller stored block of ours is accepted and upgraded",
+TEST_CASE("a stored block is never resized or rewritten by imGetInfo8, ours or not",
           "[importer][prefs][sourcesettings][hidemount][sample]") {
     CLIP_PREFS_REQUIRE_SAMPLE_CLIP();
+    DebugLogLevel debug;  // before the harness: the module reads it at imInit
+    // Counted from here: every test case of this process shares one log.
+    const std::string clipName = sampleClipPath().filename().string();
+    const std::string heldOurs =
+        "imGetInfo8: '" + clipName + "': the host holds a settings block for the clip (ours, applied)";
+    const std::string heldForeign =
+        "imGetInfo8: '" + clipName + "': the host holds a settings block for the clip (not ours";
+    const std::string beforeLog = importerLog();
+    const std::size_t oursBefore = countOf(beforeLog, heldOurs);
+    const std::size_t foreignBefore = countOf(beforeLog, heldForeign);
+
     ImporterHarness harness;
     REQUIRE(harness.loaded());
     auto clip = harness.openClip(sampleClipPath());
@@ -316,62 +271,57 @@ TEST_CASE("a smaller stored block of ours is accepted and upgraded",
 
     PlugMemoryFuncsPtr mem = hostMemory(harness);
     REQUIRE(mem);
-    REQUIRE(mem->setPtrSize);
+    REQUIRE(mem->newPtr);
+    REQUIRE(mem->getPtrSize);
+    REQUIRE(mem->disposePtr);
 
-    SECTION("a block that ends before Hide Mount reads it as On and grows to the full blob") {
-        // The first 58 bytes: everything up to and including Lens Focal - a
-        // blob written before Hide Mount existed.  The byte Hide Mount took
-        // (offset 58) is simply not there, which must read as On, the mask
-        // every older clip was stitched with.
-        constexpr std::size_t kOldLength = 58;
-        static_assert(kOldLength == offsetof(PrefsBlob, hideMount), "the old block ends right before Hide Mount");
-        const PrefsBlob stored = someStoredSettings();
-        char* block = mem->newPtr(static_cast<csSDK_uint32>(kOldLength));
+    SECTION("a blob stored before Hide Mount existed is adopted as it is, Hide Mount On") {
+        // Every release stored 128 bytes; an older one simply left Hide
+        // Mount's byte (offset 58) at the zero of the reserved tail, which
+        // is On - the mask every older clip was stitched with.
+        PrefsBlob stored = someStoredSettings();
+        stored.hideMount = 0u;
+        char* block = mem->newPtr(static_cast<csSDK_uint32>(PrefsBlob::kSize));
         REQUIRE(block);
-        std::memcpy(block, &stored, kOldLength);
+        std::memcpy(block, &stored, PrefsBlob::kSize);
 
         imFileInfoRec8 info{};
         REQUIRE(harness.getInfo8WithHostPrefs(clip, info, block) == imNoErr);
-        REQUIRE(info.prefs != nullptr);
-
-        // Measured value for the report: the block's size after the call.
-        const csSDK_int32 grown = mem->getPtrSize(static_cast<char*>(info.prefs));
-        WARN("a " << kOldLength << "-byte stored block after imGetInfo8: " << grown << " bytes");
-        CHECK(grown == static_cast<csSDK_int32>(PrefsBlob::kSize));
-
-        PrefsBlob upgraded{};
-        if (grown >= static_cast<csSDK_int32>(PrefsBlob::kSize)) {
-            std::memcpy(&upgraded, info.prefs, PrefsBlob::kSize);
-        }
-        CHECK(upgraded.isValid());
-        // Every byte the old writer wrote is kept ...
-        CHECK(std::memcmp(&upgraded, &stored, kOldLength) == 0);
-        // ... and the missing tail reads as each later field's old meaning.
-        CHECK(upgraded.hideMountChoice() == PrefsHideMount::On);
-        CHECK(upgraded.hideMount == 0u);
-        // The clip adopted the stored settings (2K output).
+        // The same allocation, the same size, the same bytes.
+        CHECK(info.prefs == block);
+        CHECK(mem->getPtrSize(block) == static_cast<csSDK_int32>(PrefsBlob::kSize));
+        CHECK(std::memcmp(block, &stored, PrefsBlob::kSize) == 0);
+        // The clip adopted it: 2K output, Hide Mount On.
         CHECK(info.vidInfo.imageWidth == 1920);
-        CHECK(askImporter(harness, clip).outputSize == static_cast<std::uint8_t>(PrefsOutputSize::HD2K));
-        CHECK(askImporter(harness, clip).hideMountChoice() == PrefsHideMount::On);
-        mem->disposePtr(static_cast<char*>(info.prefs));
+        const PrefsBlob reported = askImporter(harness, clip);
+        CHECK(reported.outputSize == static_cast<std::uint8_t>(PrefsOutputSize::HD2K));
+        CHECK(reported.hideMountChoice() == PrefsHideMount::On);
+        // One debug line for the call, saying the block was ours.
+        const std::string log = importerLog();
+        INFO(log);
+        CHECK(countOf(log, heldOurs) == oursBefore + 1u);
+        mem->disposePtr(block);
     }
 
-    SECTION("a smaller block that is not ours is never read past its end nor rewritten") {
-        constexpr std::size_t kLength = 40;
-        char* block = mem->newPtr(static_cast<csSDK_uint32>(kLength));
+    SECTION("a full-size block that is not ours is left exactly as it is") {
+        char* block = mem->newPtr(static_cast<csSDK_uint32>(PrefsBlob::kSize));
         REQUIRE(block);
-        std::memset(block, 0x5A, kLength);
+        std::memset(block, 0x5A, PrefsBlob::kSize);
 
         imFileInfoRec8 info{};
         REQUIRE(harness.getInfo8WithHostPrefs(clip, info, block) == imNoErr);
-        // Not ours: the host's memory is left exactly as it was ...
+        // Not ours: the host's memory is untouched ...
         CHECK(info.prefs == block);
-        CHECK(mem->getPtrSize(block) == static_cast<csSDK_int32>(kLength));
-        for (std::size_t i = 0; i < kLength; ++i) {
+        CHECK(mem->getPtrSize(block) == static_cast<csSDK_int32>(PrefsBlob::kSize));
+        for (std::size_t i = 0; i < PrefsBlob::kSize; ++i) {
             CHECK(static_cast<unsigned char>(block[i]) == 0x5Au);
         }
-        // ... and the clip stays on the settings it started from.
+        // ... the clip stays on the settings it started from ...
         CHECK(askImporter(harness, clip) == PrefsBlob::defaults());
+        // ... and the call's debug line says the block was not ours.
+        const std::string log = importerLog();
+        INFO(log);
+        CHECK(countOf(log, heldForeign) == foreignBefore + 1u);
         mem->disposePtr(block);
     }
 }

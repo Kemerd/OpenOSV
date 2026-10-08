@@ -127,20 +127,20 @@ public:
     /// imGetInfo8 on an open clip.  `prefs` may be null for the defaults.
     ///
     /// When `prefs` is null the host has no settings block for the clip, and
-    /// the importer gives it one of its own (allocated through
-    /// piSuites->memFuncs; Premiere keeps it as the clip's stored settings
-    /// and frees it).  The harness plays that host: it copies the block into
-    /// lastHostPrefs(), disposes the allocation through the same memory
-    /// functions and leaves info.prefs pointing at the copy, so no test leaks
-    /// a mock allocation and every test can read what was handed over.
+    /// the importer offers it one of its own (allocated through
+    /// piSuites->memFuncs; a host that keeps it stores it as the clip's
+    /// settings and frees it).  The harness plays that host: it copies the
+    /// block into lastHostPrefs(), disposes the allocation through the same
+    /// memory functions and leaves info.prefs null, as it was before the
+    /// call, so no test leaks a mock allocation or holds a pointer into the
+    /// copy, and every test can read what was handed over.
     csSDK_int32 getInfo8(ClipHandle& clip, imFileInfoRec8& info, const PrefsBlob* prefs = nullptr);
 
     /// imGetInfo8 with `hostPrefs` passed through untouched as info.prefs:
     /// no copy, no disposal.  For tests that hand the importer a block the
-    /// way Premiere does (a memFuncs allocation of a given size) and then
-    /// inspect what the importer did with it.  The caller owns whatever
-    /// info.prefs points at afterwards - it may be a different (grown)
-    /// allocation than the one passed in.
+    /// way Premiere does (a memFuncs allocation) and then inspect what the
+    /// importer did with it.  The caller owns the block before and after the
+    /// call; the importer never resizes or replaces a block it is given.
     csSDK_int32 getInfo8WithHostPrefs(ClipHandle& clip, imFileInfoRec8& info, void* hostPrefs);
 
     /// The bytes of the settings block the importer handed the host in the

@@ -230,8 +230,10 @@ csSDK_int32 ImporterHarness::getInfo8(ClipHandle& clip, imFileInfoRec8& info, co
         if (memFuncs && memFuncs->disposePtr) {
             memFuncs->disposePtr(block);
         }
-        // Never leave the record pointing at freed memory.
-        info.prefs = m_lastHostPrefs.empty() ? nullptr : m_lastHostPrefs.data();
+        // Never leave the record pointing at freed memory, nor at the copy
+        // (the next getInfo8 clears it): the record says "no block", as it
+        // did before the call, and lastHostPrefs() holds what was handed over.
+        info.prefs = nullptr;
     }
     return result;
 }
@@ -240,7 +242,7 @@ csSDK_int32 ImporterHarness::getInfo8WithHostPrefs(ClipHandle& clip, imFileInfoR
     std::memset(&info, 0, sizeof(info));
     info.privatedata = clip.privateData();
     // Passed through exactly as given: the test owns the block before and
-    // after the call (the importer may have grown it into a new one).
+    // after the call, and the importer never resizes or replaces it.
     info.prefs = hostPrefs;
     info.streamIdx = 0;
     info.vidInfo.importerID = clip.importerId();
