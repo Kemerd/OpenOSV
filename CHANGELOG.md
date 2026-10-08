@@ -20,7 +20,10 @@ All notable changes to OpenOSV are documented here. The format follows
   checks every hardware-decoded proxy picture against a software decode and
   delivers the software one on a mismatch. `OPENOSV_IMPORTER_LRF_SOFTWARE=1`
   decodes the proxy in software only. `OPENOSV_VERIFY_DELIVERY=1` checks that
-  the frame handed to Premiere is the frame that was rendered.
+  the frame handed to Premiere is the frame that was rendered; its line names
+  both the host's frame and the clip's own frame rendered for it, which
+  differ for an .LRF presented as its .OSV's proxy and for a clip that
+  dropped frames.
 * The per-bucket parallax lines in the log name the clip, and a refusal says
   how much of the flow was consistent.
 
@@ -28,7 +31,13 @@ All notable changes to OpenOSV are documented here. The format follows
 
 * A hardware-decoded picture that FFmpeg flags as damaged, or that is
   predicted from one, is decoded again in software instead of being
-  delivered.
+  delivered. As with any other hardware decode failure, on the importer's
+  host path the clip then stays on software decoding until its importer
+  instance closes: about 1 s per random-access landing on an 8K .OSV, a few
+  ms a frame on a proxy. On the GPU frame path the frame takes the host path,
+  and three such frames in a row move the clip to it. A software decode of a
+  damaged recording sees the same damage, so this only helps when the
+  hardware decoder is at fault.
 
 ## [0.5.0] - 2026-10-07
 

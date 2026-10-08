@@ -2431,12 +2431,17 @@ see a change):
 
 | Variable | Effect | Cost |
 | --- | --- | --- |
-| `OSV_PLUGIN_LOG_LEVEL=debug` | Debug log, including the per-frame lines below | ~1 ms per proxy frame |
-| `OPENOSV_VERIFY_HW_DECODE=1` | Every hardware-decoded proxy picture is decoded again in software and compared; a mismatch is logged, the software picture is delivered instead, and both luma planes are written to `%LOCALAPPDATA%\OpenOSV\decode-mismatch\` (16-bit PGM, the first mismatch of each GOP, 16 pairs at most) | doubles the proxy decode (~3 ms a frame) |
+| `OSV_PLUGIN_LOG_LEVEL=debug` | Debug log, including the per-frame lines below (the `deliver:` check included) | ~0.6 ms per proxy picture for the decode fingerprint, plus the `deliver:` check's cost |
+| `OPENOSV_VERIFY_HW_DECODE=1` | Every hardware-decoded proxy picture is decoded again in software and compared; a mismatch is logged, the software picture is delivered instead, and both luma planes are written to `%LOCALAPPDATA%\OpenOSV\decode-mismatch\` (16-bit PGM, the first mismatch of each GOP, 16 pairs per session at most) | doubles the proxy decode (~3 ms a frame) |
 | `OPENOSV_IMPORTER_LRF_SOFTWARE=1` | The proxy decodes in software only (never D3D11VA) | ~1.3-3.5 ms a frame; a landing at the end of a GOP ~25-70 ms |
-| `OPENOSV_VERIFY_DELIVERY=1` | The `deliver:` line for every frame even below Debug | a few ms a frame |
+| `OPENOSV_VERIFY_DELIVERY=1` | The `deliver:` line for every frame even below Debug | ~7 ms per 2000x1000 32-bit frame, 3.5 ms at 8-bit (measured on 4 CPU cores); grows with the frame size |
 
-None of them touches the native .OSV streams' decoding.
+The two decode switches act on the proxy only. The Debug fingerprints and
+the `deliver:` check also run on .OSV frames, where they cost more: a
+fingerprint per decoded lens picture (~2.5 ms per 6K lens and ~4 ms per 8K
+lens decoded in software, about twice that for a hardware picture), and a
+`deliver:` check that grows with the frame (an 8K frame holds 15 times the
+pixels of a 2000x1000 one).
 
 **What the log says** (`%LOCALAPPDATA%\OpenOSV\OpenOSVImporter.log`). The
 library's own messages and FFmpeg's now land in the plug-in log at its level
@@ -2445,7 +2450,9 @@ library's own messages and FFmpeg's now land in the plug-in log at its level
 * `video: opened track 1 of 'CAM_..._D.LRF': 2048x1024 ..., hw d3d11va` and
   `video: track 1 open took ...` - each decoder that opens (Debug).
 * `ffmpeg: [h264 'CAM_..._D.LRF'] ...` - FFmpeg's own warnings and errors,
-  naming the codec and the clip they are about.
+  naming the codec and the clip they are about. They go to the log of the
+  plug-in that set up FFmpeg's callback last, which can be
+  `Open360Reframe.log` once the reframe effect has opened decoders of its own.
 * `decode: track 1 frame N crc C hw H key K 'clip'` - one line per decoded
   picture (Debug): a fingerprint of every 4th row, the same for a hardware and
   a software decode of the same picture. With the verifier on, each frame gets
@@ -2456,12 +2463,17 @@ library's own messages and FFmpeg's now land in the plug-in log at its level
   WARNING from the verifier. It names the frame, its distance from the GOP's
   sync sample, the first bad row, and whether the software decode was clean
   ("the hardware decode is at fault") or saw damage in the recording itself.
-* `deliver: clip 'clip' frame N WxH 32f crc T/B (matches the rendered frame)`
-  - one line per delivered frame (Debug): the CRCs of the top and bottom half
-  of the frame buffer handed to Premiere and, on the importer's host path,
-  whether it equals the rendered frame converted again. A WARNING
-  `deliver: ... the host buffer does not hold the frame that was rendered`
-  means the copy into Premiere's buffer, or the buffer, is at fault.
+* `deliver: clip 'clip' frame N (source S) WxH 32f crc T/B (matches the
+  rendered frame)` - one line per delivered frame (Debug): the CRCs of the top
+  and bottom half of the frame buffer handed to Premiere and, on the
+  importer's host path, whether it equals the rendered frame converted again.
+  N is Premiere's frame number; S is the clip's own frame rendered for it,
+  the number the `decode:` lines carry. The two differ for an .LRF presented
+  as its .OSV's proxy (N counts the original's frames) and for a clip that
+  dropped frames. On the GPU frame path the line says `gpu path, nothing to
+  compare`. A WARNING `deliver: ... the host buffer does not hold the frame
+  that was rendered` means the copy into Premiere's buffer, or the buffer, is
+  at fault.
 * `frame N (bucket B, anchor A) of 'clip': parallax refused after ... (...,
   consistent 18.2% (needs 25%)); ...` - the per-bucket analysis lines now name
   the clip and, on a refusal, how much of the flow was consistent.
@@ -2478,7 +2490,12 @@ seconds around the damaged frame:
 4. Source Settings: Render Device = CPU, and scrub again.
 5. Close Premiere, start it again with `set OPENOSV_IMPORTER_LRF_SOFTWARE=1`
    added, and repeat step 2.
-6. Send the log (and anything in `decode-mismatch\`).
+6. Send every log in `%LOCALAPPDATA%\OpenOSV\` (`OpenOSVImporter.log`,
+   `Open360Reframe.log` and any other `OpenOSV*` log), and anything in
+   `decode-mismatch\`. FFmpeg reports through one callback per process,
+   and the plug-in that installed it last receives every FFmpeg line: once
+   the reframe effect has opened its own decoders, the proxy's FFmpeg lines
+   can land in the effect's log instead of the importer's.
 
 **Reading it.**
 
