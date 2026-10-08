@@ -494,6 +494,27 @@ struct ParallaxCellStats {
                                                          ThreadPool* pool, double bandMs = 0.0,
                                                          ParallaxCellStats* cells = nullptr);
 
+/// Squared central-difference luma gradient of one lens at band pixel
+/// (r, c), on the 0..1 code scale: the structured gate's measure
+/// (ParallaxWarpParams::minStructureGradient documents the rule).  A pixel is
+/// structured when this is at least minStructureGradient^2 in BOTH lenses.
+///
+/// Half the difference of the two neighbours along the band (longitude,
+/// wrapping: the band is a ring) and across it (latitude).  A neighbour this
+/// lens does not cover (alpha <= 0.5), a non-finite one, or one beyond the
+/// band's top or bottom row is replaced by the centre pixel - a one-sided
+/// half difference, the same as edge padding - so the black beyond a rim or
+/// an occlusion polygon never reads as structure.  NaN for a non-finite
+/// centre, which then fails every comparison: no structure.
+///
+/// Shared by gridFromFlow and the mesh warp (MeshWarp.h), so both count the
+/// same pixels as structured.
+///
+/// @pre r < h, c < w, both planes w * h (the callers check the sizes).
+[[nodiscard]] double bandLumaGradientSq(const std::vector<float>& luma, const std::vector<float>& alpha,
+                                        std::uint32_t w, std::uint32_t h, std::uint32_t r,
+                                        std::uint32_t c) noexcept;
+
 /// The structured gate's strength for a measured structured share (see
 /// ParallaxWarpParams::minStructuredConsistent): 0 at or below
 /// `params.minStructuredConsistent`, 1 at or above
