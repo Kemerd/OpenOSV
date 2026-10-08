@@ -120,7 +120,9 @@ public:
     /// give it to `builder`.
     ///
     /// `enabled` is the Source Settings switch (PrefsBlob::flareRemoval);
-    /// `draft` a draft request, which never pays for the analysis;
+    /// `draft` a draft request, which never pays for the analysis (not even
+    /// the sun check) and only subtracts a model already fitted for the
+    /// frame - non-final without one;
     /// `exactWanted` the request's purpose.  `color` is the clip's block:
     /// the analysis reads only its input decode (it works in native linear
     /// light), and a passthrough output (D-Log M) switches the removal off,

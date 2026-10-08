@@ -336,6 +336,34 @@ struct FormatChoice {
     return g;
 }
 
+/// Whether a clip advertises its native size only (no half or quarter
+/// step): the camera's .LRF, as its .OSV's proxy or on its own.  It is
+/// already the small picture - a 2000x1000 equirect as the proxy of a 6K
+/// original, 2048x1024 alone - and Premiere's reduced playback resolutions
+/// ask it for half and quarter of THAT (1000x500, 500x250), which the
+/// reframe then magnifies ten to fifty times at a 60 degree view: the
+/// blocky, smeared playback the proxy workflow was reported with.  The host
+/// scales a native frame down far better than it scales a quarter frame up,
+/// and the .LRF's native frame costs next to nothing to deliver.
+[[nodiscard]] bool advertisesNativeOnly(const ImporterInstance& instance) noexcept {
+    if (instance.isProxy()) {
+        return true;
+    }
+    // A lone .LRF: by its extension, compared without case (the camera
+    // writes ".LRF", a copy may not).
+    try {
+        std::wstring ext = instance.path().extension().wstring();
+        for (wchar_t& c : ext) {
+            if (c >= L'A' && c <= L'Z') {
+                c = static_cast<wchar_t>(c - L'A' + L'a');
+            }
+        }
+        return ext == L".lrf";
+    } catch (...) {
+        return false;  // an unrepresentable path: the ordinary ladder
+    }
+}
+
 /// Snap a requested size to the nearest advertised one for this clip.
 [[nodiscard]] OutputGeometry nearestAdvertisedSize(const ImporterInstance& instance, const PrefsBlob& prefs,
                                                    std::int32_t wantW, std::int32_t wantH) noexcept {
@@ -344,6 +372,10 @@ struct FormatChoice {
         return base;
     }
     if (wantW <= 0 && wantH <= 0) {
+        return base;
+    }
+    // A proxy answers every size with its native one (advertisesNativeOnly).
+    if (advertisesNativeOnly(instance)) {
         return base;
     }
     // Compare on height: the output is always 2:1 so height decides.
@@ -364,9 +396,14 @@ struct FormatChoice {
     return best;
 }
 
-/// True when this request should skip the seam search: draft quality, or a
-/// scrubbing / playing intent whose playback ratio already says the host is
-/// struggling.
+/// True when this request is a DRAFT - one that must not pay for any
+/// analysis (ImporterInstance::renderFrame: it applies what the caches hold
+/// for its bucket and measures nothing): draft quality, a thumbnail or a
+/// prefetch, or a scrubbing / playing intent whose playback ratio already
+/// says the host is struggling.  Premiere plays at 1/2 and 1/4 resolution
+/// with a ratio below 1, so every frame of such playback is a draft - which
+/// is exactly why a draft renders the measured corrections rather than
+/// none: the picture must not change between playing and parked.
 [[nodiscard]] bool isDraftRequest(const imSourceVideoRec& rec) noexcept {
     if (rec.inQuality != kPrRenderQuality_Invalid && rec.inQuality <= kPrRenderQuality_Low) {
         return true;
@@ -1065,6 +1102,17 @@ csSDK_int32 handleGetPreferredFrameSize(imStdParms* stdParms, imPreferredFrameSi
     // for the next one; imOtherErr ends the enumeration.
     if (rec->inIndex < 0 || rec->inIndex > 2) {
         return imOtherErr;
+    }
+    // A proxy (.LRF) advertises its native size and nothing smaller, so the
+    // host's reduced playback resolutions never ask it for a quarter of an
+    // already small picture (advertisesNativeOnly).
+    if (advertisesNativeOnly(*instance)) {
+        if (rec->inIndex != 0) {
+            return imOtherErr;
+        }
+        rec->outWidth = base.width;
+        rec->outHeight = base.height;
+        return imNoErr;
     }
     const OutputGeometry g = scaledGeometry(base, rec->inIndex);
     if (!g.valid()) {

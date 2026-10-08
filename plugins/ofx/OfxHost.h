@@ -221,8 +221,9 @@ struct RenderMode {
     /// The user is playing or scrubbing: never block on an analysis (the
     /// importer's RenderPurpose::Interactive).
     bool interactive = false;
-    /// A draft will do: no seam search, parallax correction, ghost fit or
-    /// carved seam for this frame.
+    /// A draft will do: the frame pays for no analysis (no seam search,
+    /// parallax solve, ghost fit or carve) and renders with whatever the
+    /// engine has already measured for its bucket.
     bool draft = false;
     /// A VEGAS playback frame (Draft or Preview quality): the generator may
     /// serve it from the camera's .LRF proxy (OfxSource.cpp).

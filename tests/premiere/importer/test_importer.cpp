@@ -2455,14 +2455,47 @@ TEST_CASE("parallax correction changes only the overlap band, and only when aske
     REQUIRE(changedOutside == 0);
     REQUIRE(changedInside > 10000);
 
-    SECTION("a draft request never pays for it") {
-        // Low quality is a draft request (isDraftRequest), the same rule that
-        // already skips the seam search during struggling playback.
-        harness.host().clearCache();
+    SECTION("a draft never pays for it, and renders what is already measured") {
+        // Low quality is a draft request (isDraftRequest), the same rule as
+        // reduced-resolution playback.  A draft decodes no anchor and solves
+        // nothing: on a clip nothing has been measured on yet it renders
+        // uncorrected - bit for bit the correction-off frame.
         ImporterHarness::SourceVideoRequest draft = request;
         draft.quality = kPrRenderQuality_Low;
+        // The per-CLIP analyses an Exact frame measures and waits for - the
+        // lens alignment, the lens shading, the photometric field, the mount
+        // mask - are pinned off for the cold comparison, so the only thing
+        // the two renders could differ by is the parallax field (the sample's
+        // Scene Light is Day either way; pinned so nothing is measured).
+        PrefsBlob bare = off;
+        bare.lensAlign = static_cast<std::uint8_t>(PrefsLensAlign::Off);
+        bare.lensShading = static_cast<std::uint8_t>(PrefsLensShading::Off);
+        bare.photoSeam = static_cast<std::uint8_t>(PrefsPhotoSeam::Off);
+        bare.hideMount = static_cast<std::uint8_t>(PrefsHideMount::On);
+        bare.sceneLight = static_cast<std::uint8_t>(PrefsSceneLight::Day);
+        PrefsBlob bareOn = bare;
+        bareOn.parallax = static_cast<std::uint8_t>(PrefsParallax::On);
+        auto coldOff = harness.openClip(sampleClipPath(), /*importerId=*/8);
+        REQUIRE(coldOff.open());
+        harness.host().clearCache();
+        const DecodedFrame frameBareOff = renderFrame(harness, coldOff, ppix, request, bare);
+        auto cold = harness.openClip(sampleClipPath(), /*importerId=*/9);
+        REQUIRE(cold.open());
+        harness.host().clearCache();
+        const DecodedFrame frameColdDraft = renderFrame(harness, cold, ppix, draft, bareOn);
+        REQUIRE(maxChannelDiff(frameColdDraft, frameBareOff) == 0.0f);
+
+        // Once an Exact frame has measured the bucket, the same draft renders
+        // with that field: the parked picture, so playback at a reduced
+        // resolution (every frame of it is a draft) shows the seam the parked
+        // frame shows.  Compared with an Exact render taken just before it,
+        // so the per-clip analyses are in the same state for both.
+        harness.host().clearCache();
+        const DecodedFrame frameParked = renderFrame(harness, clip, ppix, request, on);
+        harness.host().clearCache();
         const DecodedFrame frameDraft = renderFrame(harness, clip, ppix, draft, on);
-        REQUIRE(maxChannelDiff(frameDraft, frameOff) == 0.0f);
+        REQUIRE(maxChannelDiff(frameDraft, frameParked) == 0.0f);
+        REQUIRE(maxChannelDiff(frameDraft, frameOff) > 0.0f);
     }
 
     SECTION("a project saved before the option existed renders with it off") {

@@ -188,15 +188,21 @@ struct RenderedFrame {
     std::uint32_t frameIndex = kNoFrame;
     OutputGeometry geometry;
     PrefsBlob prefs = PrefsBlob::defaults();
-    bool seamApplied = false;   ///< Whether the seam search ran for this frame.
-    /// Whether the parallax correction was WANTED for this frame (prefs on and
-    /// not a draft request) - part of the cache key for the same reason
-    /// seamApplied is: the prefs blob alone does not distinguish a draft
-    /// render from a full one, and a draft must never be served in its place.
+    bool seamApplied = false;   ///< Whether the seam correction was wanted (Seam Search on).
+    /// Whether the parallax correction was WANTED for this frame (Parallax
+    /// Grid on) - part of the cache key with seamApplied and flareWanted so
+    /// a prefs change that touches nothing else still misses.
     bool parallaxWanted = false;
-    /// [WP-FLARE] Whether sun ghost removal was WANTED (prefs on and not a
-    /// draft) - keyed for the same reason as parallaxWanted.
+    /// [WP-FLARE] Whether sun ghost removal was WANTED (prefs on) - keyed for
+    /// the same reason as parallaxWanted.
     bool flareWanted = false;
+    /// Whether this was a DRAFT render (renderFrame's `draft`): one that
+    /// applied what the caches already held but measured nothing.  Part of
+    /// the key because the prefs blob alone does not distinguish a draft from
+    /// a full render of the same frame, and the two differ in what they DO
+    /// (a full Interactive render queues its bucket's measurement, a draft
+    /// never does) even when their pixels agree.
+    bool draft = false;
     /// False when an Interactive render made do with a stand-in analysis -
     /// a neighbouring bucket's grid, or none while its own was still being
     /// measured.  An Exact request must never be served such a frame, or a
@@ -212,10 +218,11 @@ struct RenderedFrame {
     render::ImageRGBAf image;
 
     [[nodiscard]] bool matches(std::uint32_t index, const OutputGeometry& geom, const PrefsBlob& blob, bool wantSeam,
-                               bool wantParallax, bool wantFlare, bool needExact, int transfer) const noexcept {
+                               bool wantParallax, bool wantFlare, bool isDraft, bool needExact,
+                               int transfer) const noexcept {
         return image.valid() && frameIndex == index && geometry == geom && prefs == blob && seamApplied == wantSeam &&
-               parallaxWanted == wantParallax && flareWanted == wantFlare && (exact || !needExact) &&
-               outputTransfer == transfer;
+               parallaxWanted == wantParallax && flareWanted == wantFlare && draft == isDraft &&
+               (exact || !needExact) && outputTransfer == transfer;
     }
 };
 
@@ -441,11 +448,15 @@ public:
     [[nodiscard]] OsvColorParams colorParams() const;
 
     // ---- rendering ---------------------------------------------------------
-    /// Decode + stitch frame `index` at `geometry`.  `draft` disables the
-    /// seam search and the parallax correction for this frame regardless of
-    /// the prefs (scrubbing and low quality requests).  `purpose` decides
-    /// whether a missing parallax measurement is made now (Exact) or queued
-    /// for the background worker (Interactive) - see RenderPurpose.
+    /// Decode + stitch frame `index` at `geometry`.  `draft` (a thumbnail, a
+    /// prefetch, low quality, playback that is already falling behind) means
+    /// the frame MEASURES nothing - no anchor is decoded, no analysis solved
+    /// or queued - but renders with every correction the caches already hold
+    /// for its bucket and its glide partner, so it looks like a parked frame
+    /// of the same bucket once that bucket is measured, and is never final
+    /// while anything it needs is missing.  `purpose` decides whether a
+    /// missing measurement is made now (Exact) or queued for the background
+    /// worker (Interactive) - see RenderPurpose.
     ///
     /// The returned image is owned by the instance's frame cache and stays
     /// valid until the next renderFrame() call on this instance, so the
@@ -819,8 +830,8 @@ private:
     /// correction field of the seam band (the mesh warp, bucketed, measured
     /// synchronously for an Exact request and in the background for an
     /// Interactive one; with Parallax Grid off, the 1-D seam table instead),
-    /// and the exposure gains.  `draft` turns the seam search and the
-    /// parallax correction off exactly as renderFrame documents.
+    /// and the exposure gains.  `draft` measures nothing and applies what
+    /// the caches hold, exactly as renderFrame documents.
     ///
     /// `pair` may hold host frames (the equirect path) or device-resident
     /// frames (the direct GPU path); the analyses shade their bands from
@@ -928,7 +939,9 @@ private:
         /// bucket or the one before it, measure on the frame itself into the
         /// stand-in lane (see the [WP-M] note above).
         IfFree,
-        LookUp,  ///< Interactive glide partner: what is cached, the stand-in lane included.
+        /// Interactive glide partner, and EVERY bucket of a draft: what is
+        /// cached, the stand-in lane included - never a measurement.
+        LookUp,
         Cached,  ///< Exact, already measured: what the anchored caches hold, nothing more.
     };
 
@@ -1315,13 +1328,15 @@ private:
     /// cannot be carved yet (its mesh field is still being measured) borrows
     /// the previous bucket's seam, and only with nothing anchored for this
     /// bucket or the one before it does it carve on itself into the stand-in
-    /// lane; both clear `frameExact`.  Called by applyAnalyses with m_mutex held;
+    /// lane; both clear `frameExact`.  A `draft` carves nothing at all: it
+    /// applies the seams the caches hold (glided when both are there) and
+    /// is non-final otherwise.  Called by applyAnalyses with m_mutex held;
     /// takes m_parallaxMutex itself.  Failures are logged and leave the frame
     /// on the ordinary feather.  [WP-SEAMTOOLS] Carves with the Source
     /// Settings Seam Blend / Parallax Blend, and returns the seam it applied
     /// (null when none) for the seam tools that follow it.
     std::shared_ptr<const render::BlendSeam> applyCarvedSeam(std::uint32_t index, const video::FramePair& pair,
-                                                             bool wantParallax, RenderPurpose purpose,
+                                                             bool wantParallax, RenderPurpose purpose, bool draft,
                                                              ThreadPool& pool, render::RenderParamsBuilder& builder,
                                                              bool& frameExact);
     // ---- [/WP-SEAM] ----------------------------------------------------------

@@ -130,7 +130,8 @@ struct Frame {
     r.intent = intent;
     r.quality = quality;
     // Real-time playback: below 1.0 a Playing request is a DRAFT, which
-    // skips the removal altogether and would never exercise the worker.
+    // never measures (it only looks a model up) and would never exercise
+    // the worker.
     r.playbackRatio = 1.0;
     PPixHand hand = nullptr;
     REQUIRE(harness.getSourceVideo(clip, r, prefs, hand) == imNoErr);
@@ -399,10 +400,38 @@ TEST_CASE("sun ghost removal changes only the fitted ghosts, and off renders exa
         REQUIRE(changedPixels(render(harness, clip, ppix, kFrame, imRenderIntent_Export, old), frameOff) == 0);
     }
 
-    SECTION("a draft request never pays for it") {
+    SECTION("a draft never pays for it, and subtracts a model already fitted") {
+        // On a clip nothing has been fitted on, a draft (Low quality) does
+        // not even run the sun check: it renders untreated, bit for bit the
+        // removal-off frame.  The per-CLIP analyses an Exact frame measures
+        // and waits for (lens alignment, lens shading, the photometric field,
+        // the mount mask) are pinned off for this comparison, so the only
+        // thing the two cold renders could differ by is the removal.
+        PrefsBlob bare = off;
+        bare.lensAlign = static_cast<std::uint8_t>(PrefsLensAlign::Off);
+        bare.lensShading = static_cast<std::uint8_t>(PrefsLensShading::Off);
+        bare.photoSeam = static_cast<std::uint8_t>(PrefsPhotoSeam::Off);
+        bare.hideMount = static_cast<std::uint8_t>(PrefsHideMount::On);
+        bare.sceneLight = static_cast<std::uint8_t>(PrefsSceneLight::Day);
+        PrefsBlob bareOn = bare;
+        bareOn.flareRemoval = 1u;
+        auto coldOff = harness.openClip(sampleClipPath(), /*importerId=*/8);
+        REQUIRE(coldOff.open());
+        harness.host().clearCache();
+        const Frame bareOff = render(harness, coldOff, ppix, kFrame, imRenderIntent_Export, bare);
+        auto cold = harness.openClip(sampleClipPath(), /*importerId=*/9);
+        REQUIRE(cold.open());
+        harness.host().clearCache();
+        const Frame coldDraft =
+            render(harness, cold, ppix, kFrame, imRenderIntent_Export, bareOn, kPrRenderQuality_Low);
+        REQUIRE(changedPixels(coldDraft, bareOff) == 0);
+        // On the clip the Exact render above fitted the model on, the same
+        // draft subtracts it: reduced-resolution playback (every frame of it
+        // is a draft) shows the ghosts removed as the parked frame does.
         harness.host().clearCache();
         const Frame draft = render(harness, clip, ppix, kFrame, imRenderIntent_Export, on, kPrRenderQuality_Low);
-        REQUIRE(changedPixels(draft, frameOff) == 0);
+        REQUIRE(changedPixels(draft, frameOn) == 0);
+        REQUIRE(changedPixels(draft, frameOff) > 0);
     }
 
     SECTION("the D-Log M passthrough output is left alone, and the analysis says so") {

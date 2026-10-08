@@ -287,13 +287,20 @@ FlareStage::Decision FlareStage::decide(std::uint32_t index, const video::FrameP
     Outcome& out = d.outcome;
     try {
         // ---- wanted at all? ------------------------------------------------
-        if (!enabled || draft) {
+        if (!enabled) {
             // A frame without removal must not steer the seam either.
-            if (!enabled) {
-                logReasonOnce(kReasonOff, std::format("flare: '{}': sun ghost removal is off in Source Settings",
-                                                      clip));
-            }
+            logReasonOnce(kReasonOff, std::format("flare: '{}': sun ghost removal is off in Source Settings", clip));
             return d;
+        }
+        // ---- a draft is a look-up ---------------------------------------------
+        // A draft never pays for the analysis - not even for the sun check -
+        // but subtracts a model already fitted for this frame (or adopted
+        // from the sun check an earlier render of it recorded), so a
+        // reduced-resolution playback frame shows the ghosts removed exactly
+        // as the parked frame does once the model is in.  Without one it
+        // renders untreated and is not final, like any look-up.
+        if (draft) {
+            pair = nullptr;
         }
         // The D-Log M passthrough output blends in log code, where the kernel
         // has no linear light to subtract from (osv_kernel.h skips the

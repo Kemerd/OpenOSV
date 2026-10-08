@@ -6,6 +6,26 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+* **Playback shows the seam correction the parked frame shows.** Every
+  frame Premiere asks for at 1/2 or 1/4 playback resolution is a draft
+  request (its playback ratio is below 1), and a draft rendered with no seam
+  correction, no parallax field, no carved seam and no ghost removal at all:
+  the seam band jumped between playing and parked, and a measured bucket's
+  correction was thrown away for the frames most people look at. A draft now
+  renders with everything already measured for its bucket and its glide
+  partner, and still pays for nothing: no anchor is decoded, no analysis is
+  solved or queued, and a frame whose bucket is not measured yet stays
+  non-final so it never lands in the host's cache. Thumbnails and prefetch
+  behave the same.
+* **The .LRF proxy delivers its native size.** The camera's proxy is a
+  2000x1000 picture, and reduced playback resolutions asked it for half and
+  quarter of that; a 60 degree reframe then magnified a 500x250 frame
+  forty-odd times, which is the blocky, smeared playback reported for a
+  proxy on the timeline. A proxy now advertises its native size only, so the
+  host scales the whole picture down instead of a quarter of it up.
+
 ## [0.5.2] - 2026-10-08
 
 The seam as one field. 0.5.1 lined the car body up but bent every straight

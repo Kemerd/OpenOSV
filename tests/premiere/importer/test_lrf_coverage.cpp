@@ -17,7 +17,8 @@
 // sample .LRF as the proxy of its .OSV and on its own, over several frames
 // and intents, and demands of every delivered frame:
 //
-//   * the size the importer advertises nearest to the request;
+//   * the .LRF's native size, whatever was asked (an .LRF advertises no
+//     half or quarter step: it is the small picture already);
 //   * every row opaque (alpha >= 0.5) over at least 95 % of its columns -
 //     ALL columns, read independently of the importer's own self-check;
 //   * no row whose B, G and R are zero in every column;
@@ -224,31 +225,19 @@ struct HostRequest {
     const char* label = "";
 };
 
-/// The size the importer must deliver for a request on a clip that
-/// advertises `baseW` x `baseH`: the nearest by height of native, half and
-/// quarter (2:1 each), native for "any" - the documented rule, restated here
-/// as the test's own oracle.
+/// The size the importer must deliver for a request on an .LRF that
+/// advertises `baseW` x `baseH`: that size, whatever was asked.  An .LRF is
+/// the small picture already (2000 x 1000 as a 6K original's proxy, 2048 x
+/// 1024 alone), so it advertises no half or quarter step and a request for
+/// less - a 1/2 playback resolution, a scrub draft, a thumbnail - is
+/// delivered at its native size for the host to scale down.  (An .OSV keeps
+/// the native / half / quarter ladder; test_importer.cpp holds that rule.)
+/// The documented rule, restated here as the test's own oracle.
 void expectedSize(std::int32_t baseW, std::int32_t baseH, const HostRequest& request, std::int32_t& outW,
                   std::int32_t& outH) {
+    (void)request;  // every request, "any" size included, gets the native frame
     outW = baseW;
     outH = baseH;
-    if (request.width <= 0 && request.height <= 0) {
-        return;
-    }
-    const std::int64_t target = request.height > 0 ? request.height : request.width / 2;
-    std::int64_t best = std::llabs(static_cast<std::int64_t>(baseH) - target);
-    for (std::int32_t divisor : {2, 4}) {
-        const std::int32_t h = baseH / divisor;
-        if (h < 16) {
-            break;
-        }
-        const std::int64_t d = std::llabs(static_cast<std::int64_t>(h) - target);
-        if (d < best) {
-            best = d;
-            outH = h;
-            outW = h * 2;
-        }
-    }
 }
 
 /// The host layout of a PrPixelFormat the importer delivers.
@@ -311,7 +300,7 @@ void requestAndCheck(ImporterHarness& harness, ImporterHarness::ClipHandle& clip
     REQUIRE(hand != nullptr);
     ++rendered;
 
-    // ---- the size: the advertised one nearest to the request -------------------
+    // ---- the size: an .LRF's native size, whatever was asked --------------------
     const auto pinfo = harness.host().inspect(hand);
     REQUIRE(pinfo.has_value());
     std::int32_t wantW = 0;
@@ -637,8 +626,8 @@ TEST_CASE("at Debug the row self-check covers the first frames of every delivere
         REQUIRE(clip.open());
         imFileInfoRec8 info{};
         REQUIRE(harness.getInfo8(clip, info) == imNoErr);
-        // The proxy of the 6K original advertises 2000 x 1000 (and half,
-        // quarter).
+        // The proxy of the 6K original advertises 2000 x 1000, and that size
+        // only: a request for less is delivered at it (the host scales).
         REQUIRE(info.vidInfo.imageWidth == 2000);
         REQUIRE(info.vidInfo.imageHeight == 1000);
         REQUIRE(info.vidInfo.frameRate > 0);
@@ -664,7 +653,10 @@ TEST_CASE("at Debug the row self-check covers the first frames of every delivere
             CHECK(requestOnly(harness, clip, info, ppix, frame, 2000, 1000, PrPixelFormat_BGRA_4444_32f,
                               imRenderIntent_Export, true, prefs));
         }
-        // ---- a size and format first asked for after that: its own budget ------
+        // ---- a format first asked for after that: its own budget ---------------
+        // Asked at half the proxy's size, as a 1/2 playback resolution asks:
+        // a proxy never sub-sizes (it is the small picture already), so these
+        // are delivered at 2000 x 1000 16u - a new format, hence a new budget.
         for (std::int64_t frame = 6; frame < 8; ++frame) {
             INFO("1000 x 500 16u, frame " << frame);
             CHECK(requestOnly(harness, clip, info, ppix, frame, 1000, 500, PrPixelFormat_BGRA_4444_16u,
@@ -696,9 +688,12 @@ TEST_CASE("at Debug the row self-check covers the first frames of every delivere
     countLines(log, " row check 2000x1000 32f:", ", draft", advertised, advertisedDrafts);
     CHECK(advertisedDrafts == rowcheck::kFramesPerGeometry);
     CHECK(advertised - advertisedDrafts == rowcheck::kFramesPerGeometry);
-    // The size and format asked for late: still checked, every frame of its
-    // (smaller than the budget) run.
-    CHECK(countOf(log, " row check 1000x500 16u:") == 2u);
+    // The format asked for late: still checked, every frame of its (smaller
+    // than the budget) run - at the proxy's native size, never at the half
+    // size asked for.
+    CHECK(countOf(log, " row check 2000x1000 16u:") == 2u);
+    CHECK(countOf(log, " row check 1000x500 16u:") == 0u);
+    CHECK(countOf(log, "requested 1000x500 BGRA 16u; delivering 2000x1000") == 1u);
     CHECK(log.find("came out") == std::string::npos);
     // Every mismatched size on record exactly once, the two past the memo's
     // slots included.
@@ -707,6 +702,115 @@ TEST_CASE("at Debug the row self-check covers the first frames of every delivere
                                  " BGRA 32f; delivering 2000x1000";
         INFO(line);
         CHECK(countOf(log, line) == 1u);
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  An .LRF advertises its native size only
+// -----------------------------------------------------------------------------
+// The camera's .LRF is the small picture already (2000 x 1000 as a 6K
+// original's proxy, 2048 x 1024 on its own).  Premiere's 1/2 and 1/4 playback
+// resolutions ask a clip for the half and quarter sizes it advertises, and a
+// 500 x 250 frame magnified forty-odd times by a 60 degree reframe is the
+// blocky, smeared playback a proxy on the timeline was reported with.  So an
+// .LRF enumerates one size (imGetPreferredFrameSize) and delivers a smaller
+// request at its native size, which the host scales down.
+TEST_CASE("an .LRF advertises its native size only, as a proxy and on its own",
+          "[importer][lrf][proxy][format][sample]") {
+    const std::filesystem::path proxyPath = sampleProxyPath();
+    std::error_code ec;
+    if (proxyPath.empty() || !std::filesystem::exists(proxyPath, ec)) {
+        SKIP("the .LRF proxy is not present at " << proxyPath.string());
+    }
+    std::filesystem::path original = proxyPath;
+    original.replace_extension(".OSV");
+    if (!std::filesystem::exists(original, ec)) {
+        SKIP("the sample .LRF is not beside its .OSV: " << original.string());
+    }
+
+    /// The sizes `clip` enumerates: index 0 is the native size and ends the
+    /// enumeration (imNoErr, not imIterateFrameSizes); index 1 is refused.
+    const auto checkLadder = [](ImporterHarness& harness, ImporterHarness::ClipHandle& clip, std::int32_t nativeW,
+                                std::int32_t nativeH) {
+        PrefsBlob prefs = PrefsBlob::defaults();
+        prefs.outputSize = static_cast<std::uint8_t>(PrefsOutputSize::Native);
+        imPreferredFrameSizeRec first{};
+        first.inPrivateData = clip.privateData();
+        first.inPrefs = &prefs;
+        first.inPixelFormat = PrPixelFormat_BGRA_4444_32f;
+        first.inIndex = 0;
+        REQUIRE(harness.send(imGetPreferredFrameSize, &first, nullptr) == imNoErr);
+        CHECK(first.outWidth == nativeW);
+        CHECK(first.outHeight == nativeH);
+        imPreferredFrameSizeRec half{};
+        half.inPrivateData = clip.privateData();
+        half.inPrefs = &prefs;
+        half.inPixelFormat = PrPixelFormat_BGRA_4444_32f;
+        half.inIndex = 1;
+        REQUIRE(harness.send(imGetPreferredFrameSize, &half, nullptr) == imOtherErr);
+    };
+
+    /// A request for `askW` x `askH` of frame 0 is delivered as a PPix of
+    /// `nativeW` x `nativeH`.
+    const auto checkDelivery = [](ImporterHarness& harness, ImporterHarness::ClipHandle& clip,
+                                  const imFileInfoRec8& info, std::int32_t askW, std::int32_t askH,
+                                  std::int32_t nativeW, std::int32_t nativeH) {
+        const void* suite = nullptr;
+        REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) ==
+                kSPNoError);
+        const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+        harness.host().clearCache();
+        ImporterHarness::SourceVideoRequest source;
+        source.frameTime = 0;
+        source.format = PrPixelFormat_BGRA_4444_16u;
+        source.width = askW;
+        source.height = askH;
+        source.intent = imRenderIntent_Playing;
+        source.playbackRatio = 0.5;  // a 1/2-resolution playback frame, as Premiere asks
+        PPixHand hand = nullptr;
+        REQUIRE(harness.getSourceVideo(clip, source, PrefsBlob::defaults(), hand) == imNoErr);
+        REQUIRE(hand != nullptr);
+        const auto delivered = harness.host().inspect(hand);
+        REQUIRE(delivered.has_value());
+        CHECK(delivered->width == static_cast<std::uint32_t>(nativeW));
+        CHECK(delivered->height == static_cast<std::uint32_t>(nativeH));
+        ppix->Dispose(hand);
+        harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+        (void)info;
+    };
+
+    SECTION("as the proxy of its .OSV: 2000 x 1000, and a half-size request is delivered at it") {
+        ImporterHarness harness;
+        REQUIRE(harness.loaded());
+        auto clip = harness.openClip(proxyPath);
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info) == imNoErr);
+        REQUIRE(info.vidInfo.imageWidth == 2000);
+        REQUIRE(info.vidInfo.imageHeight == 1000);
+        checkLadder(harness, clip, 2000, 1000);
+        checkDelivery(harness, clip, info, 1000, 500, 2000, 1000);
+        checkDelivery(harness, clip, info, 500, 250, 2000, 1000);
+    }
+    SECTION("on its own: 2048 x 1024, and a half-size request is delivered at it") {
+        const std::filesystem::path alone =
+            std::filesystem::temp_directory_path() / "openosv-lrf-native-only" / proxyPath.filename();
+        std::filesystem::create_directories(alone.parent_path(), ec);
+        std::filesystem::copy_file(proxyPath, alone, std::filesystem::copy_options::overwrite_existing, ec);
+        REQUIRE_FALSE(ec);
+        {
+            ImporterHarness harness;
+            REQUIRE(harness.loaded());
+            auto clip = harness.openClip(alone);
+            REQUIRE(clip.open());
+            imFileInfoRec8 info{};
+            REQUIRE(harness.getInfo8(clip, info) == imNoErr);
+            REQUIRE(info.vidInfo.imageWidth == 2048);
+            REQUIRE(info.vidInfo.imageHeight == 1024);
+            checkLadder(harness, clip, 2048, 1024);
+            checkDelivery(harness, clip, info, 1024, 512, 2048, 1024);
+        }
+        std::filesystem::remove_all(alone.parent_path(), ec);
     }
 }
 

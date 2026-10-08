@@ -2701,11 +2701,22 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     // guards the seam and gain caches below; the parallax state has its own
     // m_parallaxMutex because the background worker touches it.
     //
-    // The same three conditions renderFrame uses for its cache key, derived
-    // from the same inputs so the two can never disagree.
-    const bool wantSeam = m_prefs.seamSearch != 0 && !draft;
-    const bool wantParallax = m_prefs.parallaxEnabled() && !draft;
+    // The same conditions renderFrame uses for its cache key, derived from
+    // the same inputs so the two can never disagree.
+    const bool wantSeam = m_prefs.seamSearch != 0;
+    const bool wantParallax = m_prefs.parallaxEnabled();
     const bool exactWanted = purpose == RenderPurpose::Exact;
+    // ---- a draft applies, never measures ------------------------------------
+    // A draft (a thumbnail, a prefetch, low quality, playback that is already
+    // falling behind) decodes no anchor, solves nothing and queues nothing;
+    // every bucket it touches is a LookUp of what the caches hold, and it is
+    // non-final while anything it needs is missing.  Until 0.5.2 a draft
+    // dropped the seam corrections altogether instead - and EVERY frame
+    // Premiere asks for during 1/2-resolution playback is a draft (its
+    // playback ratio is below 1), so the seam band rendered uncorrected
+    // while playing and corrected when parked: the picture changed between
+    // the two.  Now a measured bucket looks the same in both.
+    const bool measure = !draft;
 
     // ---- [WP-M] the seam correction: ONE field ----------------------------------
     // With Parallax Grid on, the correction of the seam band is ONE field: the
@@ -2797,14 +2808,17 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
         // partner's field alone), so every anchor is measured once.  An
         // Interactive frame measures its own bucket from a free anchor (the
         // expensive half in the background) and takes its partner from the
-        // caches.
+        // caches.  A draft takes BOTH from the caches.
         const bool hasPartner = bucket > 0;
+        const bool measureNow = exactWanted && measure;  // Exact and not a draft: decode and solve here
         BucketCorrection partner;
         if (hasPartner) {
             partner = bucketCorrectionLocked(bucket - 1, index, pair, wantParallax, wantSeam,
-                                             exactWanted ? AnchorMeasure::Now : AnchorMeasure::LookUp, pool);
+                                             measureNow ? AnchorMeasure::Now : AnchorMeasure::LookUp, pool);
         }
-        const AnchorMeasure ownHow = exactWanted ? AnchorMeasure::Now : AnchorMeasure::IfFree;
+        const AnchorMeasure ownHow = !measure      ? AnchorMeasure::LookUp
+                                     : exactWanted ? AnchorMeasure::Now
+                                                   : AnchorMeasure::IfFree;
         const BucketCorrection own =
             bucketCorrectionLocked(bucket, index, pair, wantParallax, wantSeam, ownHow, pool);
         // A non-final side (Interactive only) makes the frame non-final.
@@ -2825,9 +2839,10 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
             if (hasPartner && partner.known) {
                 from = &partner;
                 w = render::parallaxCrossfadeWeight(index);
-            } else if (hasPartner && !exactWanted) {
-                // Interactive without its partner yet: its own correction alone,
-                // which an Exact request would glide - not final.
+            } else if (hasPartner && !measureNow) {
+                // Interactive (or a draft) without its partner yet: its own
+                // correction alone, which an Exact request would glide - not
+                // final.
                 frameExact = false;
             }
         } else {
@@ -2922,8 +2937,9 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     // Before the carve, which reads this frame's model through the penalty.
     // The frame's metered scene brightness (ISO, shutter, aperture) tells the
     // stage when the sun cannot be in view; read only when the stage will
-    // look (NaN, "not recorded", otherwise).
-    const bool flareWanted = m_prefs.flareRemoval != 0 && !draft;
+    // look (NaN, "not recorded", otherwise).  A draft looks too - at the
+    // models already fitted, never at the picture (FlareStage::decide).
+    const bool flareWanted = m_prefs.flareRemoval != 0;
     const double sceneEv100 =
         flareWanted ? FlareStage::sceneEv100(m_track, index) : std::numeric_limits<double>::quiet_NaN();
     const FlareStage::Outcome flare = m_flare.apply(index, pair, m_rig, m_color, sceneEv100,
@@ -2942,7 +2958,7 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
             carvedSeam = clipSteady->seam;
         }
     } else if (wantSeam && steadyUse == SteadyUse::PerBucket) {
-        carvedSeam = applyCarvedSeam(index, pair, wantParallax, purpose, pool, builder, frameExact);
+        carvedSeam = applyCarvedSeam(index, pair, wantParallax, purpose, draft, pool, builder, frameExact);
     }
     // (StandIn: the feather blend until the clip's seam is carved.)
     // ---- [WP-SEAMTOOLS] Near / Far Offset and Seam Smoothing, on that seam ---
@@ -3570,11 +3586,13 @@ bool ImporterInstance::applyLensShading(render::RenderParamsBuilder& builder) {
 std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::uint32_t index,
                                                                            const video::FramePair& pair,
                                                                            bool wantParallax, RenderPurpose purpose,
-                                                                           ThreadPool& pool,
+                                                                           bool draft, ThreadPool& pool,
                                                                            render::RenderParamsBuilder& builder,
                                                                            bool& frameExact) {
     const std::uint32_t bucket = render::parallaxBucket(index);
-    const bool exact = purpose == RenderPurpose::Exact;
+    // A draft never carves (not even on itself): it is a look-up of the
+    // cached seams, Exact or not, and non-final where one is missing.
+    const bool exact = purpose == RenderPurpose::Exact && !draft;
     // Set when the frame renders a seam from the stand-in lane (Interactive).
     bool usedStandIn = false;
     const render::PhotoSeamParams photoParams = photoParamsLocked();
@@ -3804,8 +3822,8 @@ std::shared_ptr<const render::BlendSeam> ImporterInstance::applyCarvedSeam(std::
     // anchored seam exists, this bucket's stand-in rule defers to it.
     const std::shared_ptr<const render::BlendSeam> previous =
         bucket > 0 ? seamFor(bucket - 1, exact ? AnchorMeasure::Now : AnchorMeasure::LookUp) : nullptr;
-    const std::shared_ptr<const render::BlendSeam> own =
-        seamFor(bucket, exact ? AnchorMeasure::Now : AnchorMeasure::IfFree);
+    const AnchorMeasure ownHow = draft ? AnchorMeasure::LookUp : exact ? AnchorMeasure::Now : AnchorMeasure::IfFree;
+    const std::shared_ptr<const render::BlendSeam> own = seamFor(bucket, ownHow);
     if (usedStandIn) {
         frameExact = false;  // a seam measured on another frame than its anchor
     }
@@ -4263,14 +4281,14 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     // share the cache key (and the pixels) of an ordinary request.
     const int transfer = (outputTransfer >= 0 && outputTransfer != m_color.transfer) ? outputTransfer : -1;
 
-    const bool wantSeam = m_prefs.seamSearch != 0 && !draft;
+    const bool wantSeam = m_prefs.seamSearch != 0;
     // The parallax correction runs under exactly the conditions the seam
-    // search does - never for a draft request (thumbnails, prefetch, playback
-    // that is already falling behind).  Its cost is amortised: one
-    // measurement per bucket of frames, off the render thread for an
-    // Interactive request (see RenderPurpose and the block below).
-    const bool wantParallax = m_prefs.parallaxEnabled() && !draft;
-    const bool wantFlare = m_prefs.flareRemoval != 0 && !draft;  // [WP-FLARE]
+    // search does.  Its cost is amortised: one measurement per bucket of
+    // frames, off the render thread for an Interactive request, and none at
+    // all for a draft, which applies what is measured (see RenderPurpose,
+    // applyAnalyses and the block below).
+    const bool wantParallax = m_prefs.parallaxEnabled();
+    const bool wantFlare = m_prefs.flareRemoval != 0;  // [WP-FLARE]
     const bool exactWanted = purpose == RenderPurpose::Exact;
 
     // [WP-STEADY] A stand-in frame is stale once the per-clip analyses have
@@ -4285,7 +4303,8 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     // Cache hit: the host asked for the same frame twice (it does, once per
     // requested pixel format while scrubbing).  An Exact request is never
     // served a frame an Interactive render built with a stand-in analysis.
-    if (m_lastFrame.matches(index, geometry, m_prefs, wantSeam, wantParallax, wantFlare, exactWanted, transfer)) {
+    if (m_lastFrame.matches(index, geometry, m_prefs, wantSeam, wantParallax, wantFlare, draft, exactWanted,
+                            transfer)) {
         m_lastRenderExact = m_lastFrame.exact;  // [WP-STEADY]
         return &m_lastFrame.image;
     }
@@ -4368,6 +4387,7 @@ Result<const render::ImageRGBAf*> ImporterInstance::renderFrame(std::uint32_t in
     m_lastFrame.seamApplied = wantSeam;
     m_lastFrame.parallaxWanted = wantParallax;
     m_lastFrame.flareWanted = wantFlare;  // [WP-FLARE]
+    m_lastFrame.draft = draft;
     m_lastFrame.exact = frameExact;
     m_lastFrame.outputTransfer = transfer;
     m_lastFrameSteadySerial = m_steadyFrame.serial;  // [WP-STEADY] what the stand-in test compares
