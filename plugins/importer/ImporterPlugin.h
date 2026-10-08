@@ -237,6 +237,27 @@ csSDK_int32 handlePerformSourceSettingsCommand(imStdParms* stdParms, imFileAcces
 /// (SourceSettingsDialog.cpp, beside the other prefs selectors.)
 void noteNewClipDefaults(ImporterInstance* instance, const char* where) noexcept;
 
+/// imGetInfo8's half of the clip's stored Source Settings (the host's
+/// imFileInfoRec8::prefs block).  (SourceSettingsDialog.cpp, beside the
+/// other prefs selectors.)
+///
+///   * A block the host holds is the clip's settings and is applied to
+///     `instance`.  A block SHORTER than a PrefsBlob is read only as far as
+///     it goes; one of ours has its missing tail read as zero (each later
+///     field's old behaviour) and is grown in place to the full blob.
+///   * No block: the clip keeps the settings it was seeded with, and the
+///     host is handed a new PrefsBlob-sized block (piSuites->memFuncs; the
+///     host owns and frees it) holding exactly those settings.  Premiere
+///     allocates the block itself only in the dialog route (imGetPrefs8's
+///     size handshake), which no logged session has taken for a clip with
+///     the Source Settings effect; without this block the effect's
+///     PF_Cmd_TRANSLATE_PARAMS_TO_PREFS has nowhere to write.
+///     Not done for an .LRF beside its .OSV, whose settings follow the
+///     original's live instance.
+///
+/// Never throws; every failure is logged and leaves the clip decodable.
+void syncClipPrefsBlock(imStdParms* stdParms, imFileInfoRec8* info, ImporterInstance& instance) noexcept;
+
 /// The pure mapping the dialog uses, exposed so it can be unit-tested without
 /// ever creating a window.  `controls` is the state of the dialog's widgets.
 struct DialogControls {

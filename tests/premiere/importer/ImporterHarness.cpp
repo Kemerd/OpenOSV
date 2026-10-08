@@ -212,6 +212,42 @@ csSDK_int32 ImporterHarness::getInfo8(ClipHandle& clip, imFileInfoRec8& info, co
     imFileAccessRec8 access{};
     access.filetype = 'OSV_';
     access.fileref = clip.fileRef();
+    const csSDK_int32 result = send(imGetInfo8, &access, &info);
+
+    // ---- play the host's side of the clip's settings block ------------------
+    // A pointer that is neither null nor the caller's own copy was allocated
+    // by the importer for the host.  Premiere would keep it as the clip's
+    // stored settings and free it later; the harness copies it out and frees
+    // it now, through the very memory functions the importer used.
+    m_lastHostPrefs.clear();
+    if (info.prefs && info.prefs != static_cast<void*>(&blobCopy)) {
+        PlugMemoryFuncsPtr memFuncs = m_stdParms.piSuites ? m_stdParms.piSuites->memFuncs : nullptr;
+        char* block = static_cast<char*>(info.prefs);
+        const csSDK_int32 size = memFuncs && memFuncs->getPtrSize ? memFuncs->getPtrSize(block) : 0;
+        if (size > 0) {
+            m_lastHostPrefs.assign(block, block + size);
+        }
+        if (memFuncs && memFuncs->disposePtr) {
+            memFuncs->disposePtr(block);
+        }
+        // Never leave the record pointing at freed memory.
+        info.prefs = m_lastHostPrefs.empty() ? nullptr : m_lastHostPrefs.data();
+    }
+    return result;
+}
+
+csSDK_int32 ImporterHarness::getInfo8WithHostPrefs(ClipHandle& clip, imFileInfoRec8& info, void* hostPrefs) {
+    std::memset(&info, 0, sizeof(info));
+    info.privatedata = clip.privateData();
+    // Passed through exactly as given: the test owns the block before and
+    // after the call (the importer may have grown it into a new one).
+    info.prefs = hostPrefs;
+    info.streamIdx = 0;
+    info.vidInfo.importerID = clip.importerId();
+
+    imFileAccessRec8 access{};
+    access.filetype = 'OSV_';
+    access.fileref = clip.fileRef();
     return send(imGetInfo8, &access, &info);
 }
 

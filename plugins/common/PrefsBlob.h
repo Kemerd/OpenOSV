@@ -380,6 +380,13 @@ struct PrefsBlob {
     static constexpr std::uint32_t kVersion = 1u;
     /// Fixed size of the blob in bytes (what imGetPrefs8 reports).
     static constexpr std::size_t kSize = 128u;
+    /// The bytes every release has written: the header (magic, version), the
+    /// eight original one-byte fields and exposureStops - the whole blob of
+    /// the first release, before any field was taken from the reserved block.
+    /// The least a stored block must hold before fromStoredBytes() reads it:
+    /// every field after it defines its zero byte as the old behaviour, none
+    /// before it does.
+    static constexpr std::size_t kOriginalFieldsSize = 20u;
     /// Exposure range accepted by sanitise(), in stops.
     static constexpr float kMinExposureStops = -6.0f;
     static constexpr float kMaxExposureStops = 6.0f;
@@ -639,6 +646,59 @@ struct PrefsBlob {
         if (!p.isValid()) {
             return defaults();
         }
+        p.sanitise();
+        return p;
+    }
+
+    /// Read a clip's stored settings block whose real size the host knows,
+    /// accepting a block SHORTER than kSize when it is one of ours.
+    ///
+    /// Every field after the header was taken from the front of the zeroed
+    /// reserved block when it was added, and each one defines its zero byte
+    /// as the behaviour clips had before it existed (Hide Mount's zero is On,
+    /// the mask every older clip was stitched with; Scene Light's is Auto;
+    /// and so on).  A block that ends early therefore reads correctly when
+    /// the bytes it does not have are taken as zero - which is exactly what
+    /// an older writer left in them.  Nothing past `length` is ever read.
+    ///
+    /// \param bytes     The stored block (may be null).
+    /// \param length    Its real size in bytes, as the host reports it.
+    /// \param isOurs    Optional out: true when the block carried our magic
+    ///                  and version (and so the result is its content).
+    /// \param upgraded  Optional out: true when the block was shorter than
+    ///                  kSize and its missing tail was read as zero.
+    /// \return The sanitised blob, or defaults() when the block is null,
+    ///         shorter than kOriginalFieldsSize or not ours.
+    [[nodiscard]] static PrefsBlob fromStoredBytes(const void* bytes, std::size_t length, bool* isOurs = nullptr,
+                                                   bool* upgraded = nullptr) noexcept {
+        // Report "not ours, not upgraded" unless proven otherwise below.
+        if (isOurs) {
+            *isOurs = false;
+        }
+        if (upgraded) {
+            *upgraded = false;
+        }
+        // Too short to carry even the fields the first release wrote: a zero
+        // there would not mean "older", it would mean "missing".
+        if (!bytes || length < kOriginalFieldsSize) {
+            return defaults();
+        }
+        // Zero first, then copy only the bytes the block really has, so the
+        // missing tail reads as zero and nothing past the end is touched.
+        PrefsBlob p;
+        std::memset(&p, 0, sizeof(p));
+        const std::size_t take = length < kSize ? length : kSize;
+        std::memcpy(&p, bytes, take);
+        if (!p.isValid()) {
+            return defaults();
+        }
+        if (isOurs) {
+            *isOurs = true;
+        }
+        if (upgraded) {
+            *upgraded = take < kSize;
+        }
+        // Clamp every field into range and zero the reserved bytes.
         p.sanitise();
         return p;
     }
@@ -1125,6 +1185,11 @@ static_assert(offsetof(PrefsBlob, exposureStops) == 16, "PrefsBlob layout drifte
 // reads as "parallax disabled" rather than silently changing how an existing
 // project renders.  A new blob gets On from defaults().
 static_assert(offsetof(PrefsBlob, parallax) == 20, "PrefsBlob layout drifted");
+// fromStoredBytes() relies on this: every byte from kOriginalFieldsSize on was
+// taken from the reserved block after the first release, its zero meaning the
+// behaviour clips had before it existed.
+static_assert(offsetof(PrefsBlob, parallax) == PrefsBlob::kOriginalFieldsSize,
+              "the first appended field must start right after the original ones");
 static_assert(offsetof(PrefsBlob, flowBackend) == 21, "PrefsBlob layout drifted");
 // calibrationForceNative was taken from the front of the reserved block the
 // same way.  Its zero in an old blob means "calibration 0 is Auto", which is
