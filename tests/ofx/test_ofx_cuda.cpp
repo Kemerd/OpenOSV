@@ -1025,14 +1025,16 @@ bool sameOutside(const HostImage& a, const HostImage& b, const OfxRectI& area) {
 }
 
 /// One VEGAS filter instance: a panorama in `format` on its Source (order
-/// labelled on the image, as VEGAS does), a `format` Output.
+/// labelled on the image, as VEGAS does), a `format` Output.  [WP-PAR]
+/// `pixelAspect` is the project's pixel aspect (kW stays the pixel width).
 struct VegasFilter {
     std::unique_ptr<Effect> effect;
     HostImage source;
 
-    VegasFilter(const VegasFormat& format, bool negativeSource, int padSource, double pan) {
+    VegasFilter(const VegasFormat& format, bool negativeSource, int padSource, double pan, double pixelAspect = 1.0) {
         OfxStatus st = kOfxStatFailed;
-        effect = Fixture::get().reframe.createInstance(kOfxImageEffectContextFilter, kW, kH, 29.97, &st);
+        effect = Fixture::get().reframe.createInstance(kOfxImageEffectContextFilter, kW, kH, 29.97, &st,
+                                                       pixelAspect);
         REQUIRE(st == kOfxStatOK);
         effect->params.find(cam::kPan)->d = pan;
         effect->params.find(cam::kTilt)->d = -14.0;
@@ -1107,6 +1109,53 @@ TEST_CASE("VEGAS: the own GPU filter frames every format like the CPU path", "[o
             const OfxRectI area = clipRect(window, bounds);
             checkGpuMatchesCpu(gpu, cpu, area);
             CHECK(sameOutside(gpu, cpu, area));
+        }
+    }
+    CHECK(MockHost::instance().imagesOut == 0);
+}
+
+TEST_CASE("VEGAS: the own GPU filter frames a non-square project like the CPU path",
+          "[ofx][.vegas][cuda][ofxgpu][par]") {
+    // [WP-PAR] Both GPU kernels - the float sampler (osvReframeEquirectPixel)
+    // and the 8-bit one of OfxReframeKernel.cu - take a pixel's display
+    // width from the camera block; the CPU loop is held to the square-pixel
+    // picture by test_ofx_vegas.cpp, so GPU == CPU here closes the loop.
+    REQUIRE_VEGAS_AND_CUDA();
+    popAllContexts();
+    const OfxRectI bounds{0, 0, kW, kH};
+    const double kAspects[] = {4.0 / 3.0, 0.5};
+    for (const double aspect : kAspects) {
+        for (const VegasFormat& format : kVegasFormats) {
+            INFO(vegasFormatName(format) << ", pixel aspect " << aspect);
+            VegasFilter filter(format, false, 0, 37.0, aspect);
+
+            HostImage cpu = makeImage(bounds, false, 0, format.depth, format.order);
+            cpu.labelOrder = true;
+            cpu.fill(-7.0f);
+            {
+                GpuSwitch off("0");
+                REQUIRE(filter.render(cpu, bounds) == kOfxStatOK);
+            }
+            HostImage gpu = makeImage(bounds, false, 0, format.depth, format.order);
+            gpu.labelOrder = true;
+            gpu.fill(-7.0f);
+            {
+                GpuSwitch on("1");
+                REQUIRE(filter.render(gpu, bounds) == kOfxStatOK);
+            }
+            checkGpuMatchesCpu(gpu, cpu, bounds);
+
+            // And the pixel aspect really changed the picture: the same
+            // instance in a square project frames differently.
+            VegasFilter squareFilter(format, false, 0, 37.0, 1.0);
+            HostImage square = makeImage(bounds, false, 0, format.depth, format.order);
+            square.labelOrder = true;
+            square.fill(-7.0f);
+            {
+                GpuSwitch on("1");
+                REQUIRE(squareFilter.render(square, bounds) == kOfxStatOK);
+            }
+            CHECK(maxDifference(gpu, square, bounds) > 0.01);
         }
     }
     CHECK(MockHost::instance().imagesOut == 0);

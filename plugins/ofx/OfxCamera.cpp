@@ -173,10 +173,37 @@ void presetToCustom(OfxParamSetHandle set, OfxTime t) noexcept {
 }
 
 /// The frame shape the DJI numbers are computed for (framingAspectFor()).
-[[nodiscard]] double aspectFor(OfxParamSetHandle set, OfxTime t, SizePx project) noexcept {
+///
+/// [WP-PAR] As DISPLAYED: "Match Timeline" takes the project's shape, which
+/// projectSize() gives in pixels, so with non-square pixels it is widened by
+/// the pixel aspect - the shape reframe::buildView() frames the picture for.
+/// A named Output Resolution is a square-pixel size already, and an unknown
+/// project keeps framingAspect()'s 16:9 fallback; both are left as they are,
+/// and square pixels skip the multiply altogether.
+///
+/// The pixel aspect is honoured over exactly the range the camera is built
+/// for: buildView() renders a ratio outside [OSV_PIXEL_ASPECT_MIN,
+/// OSV_PIXEL_ASPECT_MAX] (or a non-finite one) as square pixels, so such a
+/// ratio is square here too - otherwise an absurd host value would turn the
+/// Zoom read-out and the presets into numbers for a shape the render never
+/// shows.  projectPixelAspect() itself stays the host's raw ratio: it also
+/// converts canonical coordinates to pixels (projectSize(), the camera
+/// frame), and that conversion must follow whatever the host reports.
+[[nodiscard]] double aspectFor(OfxParamSetHandle set, OfxTime t, SizePx project, double pixelAspect) noexcept {
     const Resolution resolution =
         sanitiseResolution(intAt(set, kOutputResolution, t, OSV_REFRAME_RESOLUTION_DEFAULT - 1) + 1);
-    return framingAspect(resolution, project);
+    const double aspect = framingAspect(resolution, project);
+    // resolveOutputSize() answers a fixed table entry without any size given,
+    // and only a fixed entry: that is what tells a named size from Match.
+    const bool named = resolveOutputSize(resolution, SizePx{}, SizePx{}).valid();
+    // The same predicate (and the same float-to-double bounds) as the camera
+    // builder's sanitiser in ReframeCpu.cpp, so the two always agree.
+    const bool usable = std::isfinite(pixelAspect) && pixelAspect >= static_cast<double>(OSV_PIXEL_ASPECT_MIN) &&
+                        pixelAspect <= static_cast<double>(OSV_PIXEL_ASPECT_MAX);
+    if (usable && pixelAspect != 1.0 && !named && project.valid()) {
+        return aspect * pixelAspect;
+    }
+    return aspect;
 }
 
 [[nodiscard]] ClassicLens classicLensOf(OfxParamSetHandle set, OfxTime t) noexcept {
@@ -409,10 +436,7 @@ SizePx projectSize(OfxImageEffectHandle effect) noexcept {
         return SizePx{};
     }
     // Canonical coordinates are pixels times the pixel aspect ratio in x.
-    double par = getDouble(props, kOfxImageEffectPropProjectPixelAspectRatio, 0, 1.0);
-    if (!(par > 0.0) || !std::isfinite(par)) {
-        par = 1.0;
-    }
+    const double par = projectPixelAspect(effect);
     const double w = size[0] / par;
     const double h = size[1];
     // A corrupt or absurd size is "unknown", never a camera dimension (the
@@ -421,6 +445,23 @@ SizePx projectSize(OfxImageEffectHandle effect) noexcept {
         return SizePx{};
     }
     return SizePx{static_cast<int>(std::lround(w)), static_cast<int>(std::lround(h))};
+}
+
+double projectPixelAspect(OfxImageEffectHandle effect) noexcept {
+    // No effect, no property or a value no host means: square pixels, the
+    // only reading that can never stretch a picture the host did not.
+    if (!effect) {
+        return 1.0;
+    }
+    OfxPropertySetHandle props = effectProps(effect);
+    if (!props) {
+        return 1.0;
+    }
+    const double par = getDouble(props, kOfxImageEffectPropProjectPixelAspectRatio, 0, 1.0);
+    if (!(par > 0.0) || !std::isfinite(par)) {
+        return 1.0;
+    }
+    return par;
 }
 
 // ===========================================================================
@@ -532,7 +573,8 @@ void applyVisibilityOnCreate(OfxParamSetHandle set) noexcept {
 //  instanceChanged (EffectMain.cpp userChangedParam())
 // ===========================================================================
 
-bool instanceChanged(OfxParamSetHandle set, const char* name, OfxTime time, SizePx project) noexcept {
+bool instanceChanged(OfxParamSetHandle set, const char* name, OfxTime time, SizePx project,
+                     double pixelAspect) noexcept {
     if (!set || !name) {
         return false;
     }
@@ -551,7 +593,7 @@ bool instanceChanged(OfxParamSetHandle set, const char* name, OfxTime time, Size
         writeDouble(set, kTilt, entry->tiltDeg, t);
         // DJI's numbers for the same look, for this frame's shape, and the
         // switch to the DJI lens that makes them the picture.
-        const double aspect = aspectFor(set, t, project);
+        const double aspect = aspectFor(set, t, project, pixelAspect);
         const DjiLens lens = sanitiseDjiLens(DjiLens{djiPresetFovDeg(*entry, aspect), entry->correction});
         writeDjiLens(set, lens, aspect, true, true, t);
         writeLens(set, CameraModel::Dji, t);
@@ -578,7 +620,7 @@ bool instanceChanged(OfxParamSetHandle set, const char* name, OfxTime time, Size
     // ---- a DJI control ------------------------------------------------------------
     if (is(name, kDjiFov) || is(name, kCorrection)) {
         EditGroup group(set, "DJI lens");
-        const double aspect = aspectFor(set, t, project);
+        const double aspect = aspectFor(set, t, project, pixelAspect);
         DjiLens lens = djiLensOf(set, t);
         const bool fovEdited = is(name, kDjiFov);
         if (selectedLens(set, t) != CameraModel::Dji) {
@@ -601,7 +643,7 @@ bool instanceChanged(OfxParamSetHandle set, const char* name, OfxTime time, Size
     // ---- Zoom: move along DJI Studio's zoom path ------------------------------
     if (is(name, kZoom)) {
         EditGroup group(set, "Zoom");
-        const double aspect = aspectFor(set, t, project);
+        const double aspect = aspectFor(set, t, project, pixelAspect);
         const double target = doubleAt(set, kZoom, t, OSV_REFRAME_ZOOM_DEFAULT);
         const DjiLens from = (selectedLens(set, t) == CameraModel::Dji) ? djiLensOf(set, t)
                                                                        : djiFromClassic(classicLensOf(set, t), aspect);
@@ -623,7 +665,7 @@ bool instanceChanged(OfxParamSetHandle set, const char* name, OfxTime time, Size
         writeLens(set, requested, t);  // brings the mirror into step
         const bool switched = (requested != previous);
         if (switched) {
-            carryLookTo(set, requested, aspectFor(set, t, project), t);
+            carryLookTo(set, requested, aspectFor(set, t, project, pixelAspect), t);
         }
         // Classic always travels with "Custom", exactly as in Premiere.
         if (switched || requested == CameraModel::Classic) {

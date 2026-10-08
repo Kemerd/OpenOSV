@@ -187,6 +187,11 @@ struct Instance {
     PrefsBlob clipPrefs = PrefsBlob::defaults();///< The settings `clip` was opened with.
     std::string lastProblem;                    ///< The last message shown, so it is shown once.
     bool loggedTiming = false;                  ///< The first render's timing has been logged.
+    /// [WP-PAR] The first FIELD render (upper or lower) has been logged with
+    /// its image bounds against the RoD.  An interlaced project's fields are
+    /// rendered as whole frames today; the line is what tells, from a user's
+    /// log, whether a host ever hands a half-height field image instead.
+    bool loggedField = false;
 
     // ---- [VEGAS playback] the .LRF proxy that serves Draft / Preview frames ----
     /// The proxy engine, or null when the .OSV has none worth using.  Held
@@ -510,7 +515,8 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
         }
         return kOfxStatOK;
     }
-    if (camera::instanceChanged(params, name.c_str(), time, camera::projectSize(effect))) {
+    if (camera::instanceChanged(params, name.c_str(), time, camera::projectSize(effect),
+                                camera::projectPixelAspect(effect))) {
         return kOfxStatOK;
     }
     return kOfxStatReplyDefault;
@@ -544,6 +550,34 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
         return "absent";
     }
     return "'" + getString(set, name) + "'";
+}
+
+/// [WP-PAR] A clip's region of definition at `time` in canonical
+/// coordinates as "[x1, y1, x2, y2]", or "unknown" when the host cannot say.
+/// Only for the log lines: what the camera frame is derived from, next to
+/// the image bounds the host hands out (cameraFrame(), OfxRender.h).
+[[nodiscard]] std::string rodText(OfxImageClipHandle clip, OfxTime time) {
+    const OfxImageEffectSuiteV1* es = suites().effect;
+    if (!es || !clip || !es->clipGetRegionOfDefinition || !std::isfinite(time)) {
+        return "unknown";
+    }
+    OfxRectD rod{0, 0, 0, 0};
+    if (es->clipGetRegionOfDefinition(clip, time, &rod) != kOfxStatOK) {
+        return "unknown";
+    }
+    return std::format("[{}, {}, {}, {}]", rod.x1, rod.y1, rod.x2, rod.y2);
+}
+
+/// [WP-PAR] An integer rectangle as "[x1, y1, x2, y2]", for the log lines.
+[[nodiscard]] std::string rectText(const OfxRectI& r) {
+    return std::format("[{}, {}, {}, {}]", r.x1, r.y1, r.x2, r.y2);
+}
+
+/// [WP-PAR] True for a render of ONE field of an interlaced frame (upper or
+/// lower), as kOfxImageEffectPropFieldToRender names it.  "none" (a
+/// progressive project) and "both" (a whole interlaced frame) are not.
+[[nodiscard]] bool isSingleField(const std::string& field) noexcept {
+    return field == kOfxImageFieldUpper || field == kOfxImageFieldLower;
 }
 
 OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
@@ -586,7 +620,10 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     // outside VEGAS; the Output Levels control in VEGAS.
     const OutputLevels levels = source_params::outputLevelsAt(params, time, profile);
     OfxPropertySetHandle effectPropSet = effectProps(effect);
-    const double par = getDouble(effectPropSet, kOfxImageEffectPropProjectPixelAspectRatio, 0, 1.0);
+    // [WP-PAR] The project's pixel aspect: it turns the canonical RoD into
+    // pixels here, and the camera below is built for it, so a non-square
+    // project (HDV, DV) is framed as the host displays it, not stretched.
+    const double par = camera::projectPixelAspect(effect);
     const OfxRectI frame = cameraFrame(outputClip, time, sx, sy, par, output.bounds);
     const int frameW = frame.x2 - frame.x1;
     const int frameH = frame.y2 - frame.y1;
@@ -645,6 +682,19 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
                     haveRange ? "known" : "unknown", range[0], range[1], hostFps, index,
                     hostQualityName(renderMode.quality), renderMode.interactive ? ", interactive" : "",
                     renderMode.draft ? ", draft" : "");
+    // [WP-PAR] The field the host asks for: "none" in a progressive project,
+    // "upper" / "lower" for one field of an interlaced one.  Read for the log
+    // lines below only - every field is rendered as the whole frame, as
+    // before, until a host is seen handing out a half-height field image.
+    const std::string fieldToRender = getString(inArgs, kOfxImageEffectPropFieldToRender);
+    // [WP-PAR] The geometry lines below need the output clip's RoD, which is
+    // a call into the host's image effect suite.  They are CLAIMED under the
+    // instance lock (each prints once per instance) but written after it is
+    // released: no host suite is ever called while the plug-in holds its own
+    // lock, so a host that re-enters the plug-in from inside the call (VEGAS
+    // has a deadlock history) cannot meet a lock this thread already holds.
+    bool logGeometry = false;
+    bool logField = false;
     {
         std::lock_guard<std::mutex> lock(inst->mutex);
         if (!inst->loggedTiming) {
@@ -669,6 +719,41 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
                             outputLevelsName(levels), stringText(effectPropSet, kPropVegasContext),
                             hostQualityName(renderMode.quality), renderMode.interactive ? "interactive" : "exact",
                             renderMode.draft ? "draft" : "full stitch");
+            // [WP-PAR] The geometry line goes with the first render too;
+            // written below, once the lock is released.
+            logGeometry = true;
+        }
+        if (isSingleField(fieldToRender) && !inst->loggedField) {
+            // [WP-PAR] The first single-field render: claimed here, written
+            // below with the RoD it is compared against.
+            inst->loggedField = true;
+            logField = true;
+        }
+    }
+    if (logGeometry || logField) {
+        // One host call for both lines, outside the instance lock.
+        const std::string rod = rodText(outputClip, time);
+        if (logGeometry) {
+            // [WP-PAR] The geometry the camera frame is derived from: the
+            // output image's bounds (pixels) against the output clip's RoD
+            // (canonical), the project's pixel aspect and its fielding.  A
+            // non-square or interlaced project is told apart here at once.
+            PluginLog::info("ofx source: first render of '{}': output bounds {} vs RoD {} -> camera frame {}; "
+                            "pixel aspect {}; field to render '{}', output field order {}",
+                            clip->path().filename().string(), rectText(output.bounds), rod, rectText(frame), par,
+                            fieldToRender.empty() ? std::string("absent") : fieldToRender,
+                            stringText(outputProps, kOfxImageClipPropFieldOrder));
+        }
+        if (logField) {
+            // [WP-PAR] The first single-field render (an interlaced project,
+            // e.g. a VEGAS 1080-60i template): its image bounds against the
+            // RoD say whether the host hands a full-height frame (rendered
+            // whole, as now) or a half-height field (which would squash the
+            // picture vertically).  Nothing is changed until that is seen.
+            PluginLog::info("ofx source: first field render of '{}': field '{}' at time {}, output bounds {} ({}x{}) "
+                            "vs RoD {} -> camera frame {} ({}x{}); the whole frame is rendered into the bounds",
+                            clip->path().filename().string(), fieldToRender, time, rectText(output.bounds),
+                            output.width(), output.height(), rod, rectText(frame), frameW, frameH);
         }
     }
     // `index` counts the clip's own TIMELINE (clip->fps() is its nominal
@@ -798,8 +883,8 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     // below, as does a GPU failure, logged once.
     {
         std::string gpuError;
-        if (gpu::renderSourceViewGpu(*engine, engineIndex, sphere, draft, purpose,
-                                     camera::read(params, time), camera::projectSize(effect), gpuTarget, gpuError)) {
+        if (gpu::renderSourceViewGpu(*engine, engineIndex, sphere, draft, purpose, camera::read(params, time),
+                                     camera::projectSize(effect), par, gpuTarget, gpuError)) {
             gpu::notePath(effect, gpu::Hook::SourceView, true, gpuError);
             return kOfxStatOK;
         }
@@ -829,7 +914,9 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     view.layout = reframe::PixelLayout::Bgra32f;
     view.topDown = true;
     const reframe::Settings settings = camera::read(params, time);
-    reframe::KernelSetup setup = reframe::buildParams(settings, view, frameW, frameH, camera::projectSize(effect));
+    // [WP-PAR] Framed for the project's pixel aspect (1.0: square pixels).
+    reframe::KernelSetup setup =
+        reframe::buildParams(settings, view, frameW, frameH, camera::projectSize(effect), par);
     if (!setup.valid) {
         PluginLog::oncef("ofx/source/setup", PluginLog::Level::Warn, "ofx source: no camera for a {}x{} frame ({})",
                          frameW, frameH, reframe::setupRejectName(setup.reject));

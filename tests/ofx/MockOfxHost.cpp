@@ -838,7 +838,7 @@ std::unique_ptr<Effect> PluginHarness::describeInContext(const std::string& cont
 }
 
 std::unique_ptr<Effect> PluginHarness::createInstance(const std::string& context, int projectW, int projectH,
-                                                      double fps, OfxStatus* status) {
+                                                      double fps, OfxStatus* status, double pixelAspect) {
     OfxStatus st = kOfxStatOK;
     std::unique_ptr<Effect> ctx = describeInContext(context, &st);
     auto effect = std::make_unique<Effect>();
@@ -846,10 +846,18 @@ std::unique_ptr<Effect> PluginHarness::createInstance(const std::string& context
     effect->props.setString(kOfxPropType, kOfxTypeImageEffectInstance);
     effect->props.setString(kOfxImageEffectPropContext, context);
     effect->props.setPointer(kOfxPropInstanceData, nullptr);
-    effect->props.setDoubles(kOfxImageEffectPropProjectSize, {static_cast<double>(projectW), static_cast<double>(projectH)});
-    effect->props.setDoubles(kOfxImageEffectPropProjectExtent, {static_cast<double>(projectW), static_cast<double>(projectH)});
+    // Canonical coordinates are pixels times the pixel aspect in x (the
+    // OpenFX coordinate rules): a non-square project states a canonical
+    // width wider than its pixel count.  A pixel aspect no host would report
+    // (zero, negative, not finite) is the square-pixel project instead.
+    if (!(pixelAspect > 0.0) || !std::isfinite(pixelAspect)) {
+        pixelAspect = 1.0;
+    }
+    const double canonicalW = static_cast<double>(projectW) * pixelAspect;
+    effect->props.setDoubles(kOfxImageEffectPropProjectSize, {canonicalW, static_cast<double>(projectH)});
+    effect->props.setDoubles(kOfxImageEffectPropProjectExtent, {canonicalW, static_cast<double>(projectH)});
     effect->props.setDoubles(kOfxImageEffectPropProjectOffset, {0.0, 0.0});
-    effect->props.setDouble(kOfxImageEffectPropProjectPixelAspectRatio, 1.0);
+    effect->props.setDouble(kOfxImageEffectPropProjectPixelAspectRatio, pixelAspect);
     effect->props.setDouble(kOfxImageEffectPropFrameRate, fps);
     effect->props.setDouble(kOfxImageEffectInstancePropEffectDuration, 1000.0);
     effect->props.setInt(kOfxPropIsInteractive, 1);
@@ -877,7 +885,8 @@ std::unique_ptr<Effect> PluginHarness::createInstance(const std::string& context
             clip->props.setDoubles(kOfxImageEffectPropUnmappedFrameRange, {0.0, 999.0});
         }
         clip->props.setInt(kOfxImageClipPropConnected, 1);
-        clip->rod = OfxRectD{0.0, 0.0, static_cast<double>(projectW), static_cast<double>(projectH)};
+        // The project frame in canonical coordinates (see above).
+        clip->rod = OfxRectD{0.0, 0.0, canonicalW, static_cast<double>(projectH)};
         effect->clipOrder.push_back(name);
         effect->clips[name] = std::move(clip);
     }

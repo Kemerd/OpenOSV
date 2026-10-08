@@ -64,6 +64,9 @@ add_executable(osv_ofx_tests
   test_ofx_vegas.cpp
   "${_osv_reframe_src}/ReframeCpu.cpp"
   "${_osv_reframe_src}/ReframeEasing.cpp"
+  # [WP-PAR] The direct view's camera builder, held to the sphere path's
+  # camera at every pixel aspect (test_ofx_render.cpp).
+  "${_osv_reframe_src}/DirectRender.cpp"
   # The module's host classification and CPU pixel loops, tested directly.
   "${_osv_ofx_src}/OfxHost.cpp"
   "${_osv_ofx_src}/OfxRender.cpp"

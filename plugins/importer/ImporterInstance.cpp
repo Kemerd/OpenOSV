@@ -1917,6 +1917,37 @@ void ImporterInstance::rebuildStabilization() {
     // Smooth and Smooth + horizon lock both read the smoothed orientation;
     // the smoothing is one pass over the track, done once per mode change.
     if (geom::stabilizationUsesSmoothing(m_stabParams.mode)) {
+        // [PROXY] The smoothing window is counted in this clip's own samples
+        // - one attitude sample per frame - but it stands for a span of TIME.
+        // An .LRF presented as its .OSV's proxy (VEGAS Draft / Preview
+        // playback, a Premiere proxy) runs at half the original's rate: 15 of
+        // its frames were 0.6 s where the original smooths over 0.3 s, so the
+        // preview and the render framed differently (up to 1.2 deg of heading
+        // on a day car clip, 1.9 deg at night).  The proxy therefore smooths
+        // over the same SECONDS as its original: sigma x own fps / original
+        // fps (7.5 frames at 25 fps for a 50 fps .OSV).  A clip on its own
+        // timeline - every .OSV, a lone .LRF - keeps its sigma untouched, so
+        // its render is exactly what it was.
+        if (m_proxy.active && m_proxy.rateNum > 0 && m_proxy.rateDen > 0) {
+            const double originalFps =
+                static_cast<double>(m_proxy.rateNum) / static_cast<double>(m_proxy.rateDen);
+            const double ownFps = fps();
+            const double scaled = m_stabParams.smoothSigmaFrames * ownFps / originalFps;
+            // Only a finite, positive window is taken; anything else keeps
+            // the default rather than switch the smoothing off (Smoother
+            // reads a sigma <= 0 as "no smoothing").
+            if (std::isfinite(scaled) && scaled > 0.0 && ownFps > 0.0) {
+                PluginLog::info("stabilisation: '{}': smoothing over {:.3f} of its frames ({:.3f} s at {:.3f} "
+                                "fps), the window of its original '{}' at {:.3f} fps",
+                                m_path.filename().string(), scaled, scaled / ownFps, ownFps,
+                                m_proxy.original.filename().string(), originalFps);
+                m_stabParams.smoothSigmaFrames = scaled;
+            } else {
+                PluginLog::warn("stabilisation: '{}': no usable proxy smoothing window ({} fps against {} fps); "
+                                "smoothing over {} frames",
+                                m_path.filename().string(), ownFps, originalFps, m_stabParams.smoothSigmaFrames);
+            }
+        }
         m_smoothedAttitude = geom::Smoother(m_stabParams.smoothSigmaFrames).smooth(perFrame);
     }
 }

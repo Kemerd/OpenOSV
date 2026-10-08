@@ -85,8 +85,16 @@ extern "C" {
  *       hdrToneM2, hdrToneS2, hdrToneG, hdrToneT1, hdrToneCapNits - 24
  *       bytes), so every field after the colour block moved again; no new
  *       table or entry point.  A version-5 effect meeting a version-6
- *       importer (or the reverse) refuses the engine, as above. */
-#define OSV_ENGINE_ABI_VERSION 6u
+ *       importer (or the reverse) refuses the engine, as above.
+ *    7  OsvRenderParams grew by pixelAspect (WP-PAR: 4 bytes at the end, the
+ *       displayed width of an output pixel in units of its height).
+ *       OsvEngineFrame's layout is unchanged - the field fills the padding
+ *       before `planes` - so a mixed pair could not crash, but it would pass
+ *       the version check, acquire a frame and only then fail the paramsSize
+ *       check, on every frame, and render each one a second time through
+ *       the equirect path.  A version-6 effect meeting a version-7 importer
+ *       (or the reverse) refuses the engine once, at load, as above. */
+#define OSV_ENGINE_ABI_VERSION 7u
 
 /** Module file name of the importer that exports the engine. */
 #define OSV_ENGINE_MODULE_NAME L"OpenOSVImporter.prm"

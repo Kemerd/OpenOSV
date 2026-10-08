@@ -255,8 +255,15 @@ public:
     /// A new instance for `context`: the context descriptor's clips and
     /// parameters, project properties for a `projectW` x `projectH` project
     /// at `fps`, then kOfxActionCreateInstance.
+    ///
+    /// `pixelAspect` is the project's pixel aspect ratio
+    /// (kOfxImageEffectPropProjectPixelAspectRatio).  `projectW` stays the
+    /// width in PIXELS; the project size, its extent and every clip's RoD
+    /// are canonical, i.e. projectW * pixelAspect wide, as a host with
+    /// non-square pixels states them (an HDV project: 1440 pixels, 1920
+    /// canonical).  The default 1.0 sets exactly what it always did.
     std::unique_ptr<Effect> createInstance(const std::string& context, int projectW, int projectH, double fps,
-                                           OfxStatus* status = nullptr);
+                                           OfxStatus* status = nullptr, double pixelAspect = 1.0);
     OfxStatus destroyInstance(Effect& effect);
 
     OfxStatus instanceChanged(Effect& effect, const std::string& param, const std::string& reason, double time);

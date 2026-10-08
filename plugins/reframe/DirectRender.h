@@ -207,8 +207,15 @@ struct DirectSetup {
 /// a sub-rectangle viewport, or anything buildView() refuses.  Non-finite
 /// CONTROL values are not refusals: buildView() replaces them with their
 /// documented defaults, exactly as the equirect path does.
+///
+/// [WP-PAR] `pixelAspect` is buildView()'s: the displayed width of one output
+/// pixel in units of its height.  The camera is built for it there and the
+/// block carries it (OsvRenderParams::pixelAspect), so the direct view and
+/// the equirect path frame a non-square project identically.  Premiere's
+/// sequences are square: its callers keep the default 1.0, which builds
+/// exactly the block they always got.
 [[nodiscard]] DirectSetup buildDirectParams(const Settings& settings, const StitchState& stitch, int outW, int outH,
-                                            SizePx sequenceSize) noexcept;
+                                            SizePx sequenceSize, double pixelAspect = 1.0) noexcept;
 
 /// True when `planes` (two descriptors, [0] = slave, [1] = master) are
 /// usable with `setup`: every ENABLED lens has non-null plane pointers, the

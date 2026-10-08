@@ -100,13 +100,16 @@ namespace osv::ofx::gpu {
 /// view framed out of it on the GPU, as before.
 ///
 /// `draft` and `purpose` mean what they mean for
-/// ImporterInstance::renderFrame(); `projectSize` is camera::projectSize().
+/// ImporterInstance::renderFrame(); `projectSize` is camera::projectSize()
+/// and [WP-PAR] `pixelAspect` camera::projectPixelAspect(): both cameras
+/// (the direct view's and the sphere path's) are built for it, so a
+/// non-square project is framed exactly as the CPU path frames it.
 /// The caller MUST hold clip.lock() for the whole call, exactly as for
 /// renderFrame().
 [[nodiscard]] bool renderSourceViewGpu(premiere::ImporterInstance& clip, std::uint32_t index,
                                        const premiere::OutputGeometry& sphere, bool draft,
                                        premiere::RenderPurpose purpose, const reframe::Settings& settings,
-                                       reframe::SizePx projectSize, const HostTarget& target,
+                                       reframe::SizePx projectSize, double pixelAspect, const HostTarget& target,
                                        std::string& error) noexcept;
 
 /// OpenOSV Source, 360 equirect: stitch frame `index` straight at the camera

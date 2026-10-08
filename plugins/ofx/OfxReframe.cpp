@@ -197,7 +197,8 @@ OfxStatus instanceChanged(OfxImageEffectHandle effect, OfxPropertySetHandle inAr
     }
     const std::string name = getString(inArgs, kOfxPropName);
     const OfxTime time = getDouble(inArgs, kOfxPropTime);
-    camera::instanceChanged(effectParams(effect), name.c_str(), time, camera::projectSize(effect));
+    camera::instanceChanged(effectParams(effect), name.c_str(), time, camera::projectSize(effect),
+                            camera::projectPixelAspect(effect));
     return kOfxStatOK;
 }
 
@@ -250,7 +251,10 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) noexc
     // ---- the camera ---------------------------------------------------------------
     OfxParamSetHandle params = effectParams(effect);
     const reframe::Settings settings = camera::read(params, time);
-    const double par = getDouble(effectProps(effect), kOfxImageEffectPropProjectPixelAspectRatio, 0, 1.0);
+    // [WP-PAR] The project's pixel aspect: the canonical RoD becomes pixels
+    // with it, and both cameras below are built for it, so a non-square
+    // project (HDV, DV) is framed as the host displays it, not stretched.
+    const double par = camera::projectPixelAspect(effect);
     const OfxRectI frame = cameraFrame(outputClip, time, sx, sy, par, output.bounds);
 
     // ---- [WP-V-GPU] begin - CPU images framed on our own GPU ----------------------
@@ -267,7 +271,7 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) noexc
         // size and order: the GPU reads the source as the host holds it, so
         // it needs neither the promotion nor a sampler pointer into it.
         const reframe::ViewSetup gpuView =
-            reframe::buildView(settings, frame.x2 - frame.x1, frame.y2 - frame.y1, camera::projectSize(effect));
+            reframe::buildView(settings, frame.x2 - frame.x1, frame.y2 - frame.y1, camera::projectSize(effect), par);
         if (gpuView.valid) {
             reframe::KernelSetup gpuSetup;
             gpuSetup.params = gpuView.params;
@@ -319,7 +323,7 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) noexc
 
     // ---- the sampler's setup --------------------------------------------------------
     reframe::KernelSetup setup = reframe::buildParams(settings, samplerSource, frame.x2 - frame.x1,
-                                                      frame.y2 - frame.y1, camera::projectSize(effect));
+                                                      frame.y2 - frame.y1, camera::projectSize(effect), par);
     if (!setup.valid) {
         PluginLog::oncef("ofx/reframe/setup", PluginLog::Level::Warn,
                          "ofx reframe: no camera for a {}x{} frame from a {}x{} source ({})", frame.x2 - frame.x1,

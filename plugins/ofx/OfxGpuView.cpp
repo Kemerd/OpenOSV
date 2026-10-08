@@ -322,7 +322,8 @@ bool ownGpuWanted(std::string* why) noexcept {
 
 bool renderSourceViewGpu(ImporterInstance& clip, std::uint32_t index, const premiere::OutputGeometry& sphere,
                          bool draft, premiere::RenderPurpose purpose, const reframe::Settings& settings,
-                         reframe::SizePx projectSize, const HostTarget& target, std::string& error) noexcept {
+                         reframe::SizePx projectSize, double pixelAspect, const HostTarget& target,
+                         std::string& error) noexcept {
     error.clear();
     try {
         // ---- does this path take the frame at all? ------------------------------
@@ -340,7 +341,8 @@ bool renderSourceViewGpu(ImporterInstance& clip, std::uint32_t index, const prem
             error = "the camera frame is empty";
             return false;
         }
-        const reframe::ViewSetup view = reframe::buildView(settings, frameW, frameH, projectSize);
+        // [WP-PAR] For the project's pixel aspect, as the CPU path builds it.
+        const reframe::ViewSetup view = reframe::buildView(settings, frameW, frameH, projectSize, pixelAspect);
         if (!view.valid) {
             error = std::string("no camera for a ") + std::to_string(frameW) + "x" + std::to_string(frameH) +
                     " frame (" + reframe::setupRejectName(view.reject) + ")";
@@ -377,8 +379,9 @@ bool renderSourceViewGpu(ImporterInstance& clip, std::uint32_t index, const prem
                 static const float kRendererBuildsSeamLow = 0.0f;
                 stitch.seamLow = stitchJob.params.seamSmoothEnabled ? &kRendererBuildsSeamLow : nullptr;
 
+                // [WP-PAR] The same camera as the sphere path's `view` above.
                 const reframe::DirectSetup setup =
-                    reframe::buildDirectParams(settings, stitch, frameW, frameH, projectSize);
+                    reframe::buildDirectParams(settings, stitch, frameW, frameH, projectSize, pixelAspect);
                 if (!setup.valid) {
                     refused = true;
                     refusal = reframe::directRejectName(setup.reject);

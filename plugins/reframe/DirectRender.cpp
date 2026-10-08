@@ -192,7 +192,7 @@ const char* directRejectName(DirectReject reason) noexcept {
 //  The builder
 // ---------------------------------------------------------------------------
 DirectSetup buildDirectParams(const Settings& settings, const StitchState& stitch, int outW, int outH,
-                              SizePx sequenceSize) noexcept {
+                              SizePx sequenceSize, double pixelAspect) noexcept {
     const OsvRenderParams& eq = stitch.equirect;
 
     // ---- the stitch block must be what the equirect path samples ---------
@@ -314,8 +314,8 @@ DirectSetup buildDirectParams(const Settings& settings, const StitchState& stitc
     // ---- the camera --------------------------------------------------------
     // Built by the equirect path's own function.  Non-finite controls are
     // replaced by their defaults inside it, exactly as the equirect path
-    // would do for the same frame.
-    const ViewSetup view = buildView(settings, outW, outH, sequenceSize);
+    // would do for the same frame - and so is an unusable pixel aspect.
+    const ViewSetup view = buildView(settings, outW, outH, sequenceSize, pixelAspect);
     if (!view.valid) {
         return refuse(DirectReject::View, view.reject);
     }
@@ -353,6 +353,9 @@ DirectSetup buildDirectParams(const Settings& settings, const StitchState& stitc
     p.tanHalfH = v.tanHalfH;
     p.tanHalfV = v.tanHalfV;
     p.eyeOffset = v.eyeOffset;
+    // [WP-PAR] The camera above is in display units; the ray of each pixel
+    // needs the display width of a pixel to match it (1 = square).
+    p.pixelAspect = v.pixelAspect;
 
     // body <- view = (body <- world: the importer's stabilisation)
     //              * (world <- view: the effect's camera and source rotation).
@@ -380,9 +383,12 @@ DirectSetup buildDirectParams(const Settings& settings, const StitchState& stitc
     const float eyeOffsetMax = (p.projection == OSV_PROJ_DJI_SPHERE)
                                    ? static_cast<float>(OSV_REFRAME_CORRECTION_VALID_MAX)
                                    : 1.0f;
+    // [WP-PAR] buildView() hands a sanitised pixel aspect; it is checked
+    // again on the composed block all the same.
     const bool cameraFinite = std::isfinite(p.focalPx) && p.focalPx > 0.0f && std::isfinite(p.tanHalfH) &&
                               std::isfinite(p.tanHalfV) && std::isfinite(p.eyeOffset) && p.eyeOffset >= 0.0f &&
-                              p.eyeOffset <= eyeOffsetMax;
+                              p.eyeOffset <= eyeOffsetMax && p.pixelAspect >= OSV_PIXEL_ASPECT_MIN &&
+                              p.pixelAspect <= OSV_PIXEL_ASPECT_MAX;
     if (!cameraFinite || !isRotation(p.Rout)) {
         return refuse(DirectReject::Composed);
     }
