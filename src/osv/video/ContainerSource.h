@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace osv::video::detail {
@@ -76,6 +77,19 @@ public:
     /// The sync table's own answer: the nearest LISTED sync sample at or
     /// before `index` (0 without an stss).  What libavformat's index holds.
     [[nodiscard]] std::uint32_t listedSync(std::uint32_t index) const noexcept;
+
+    /// @brief Whether sample `index`'s first picture can start a decode.
+    ///
+    /// Read from the sample's own NAL headers, exactly as previousSync()
+    /// judges a listed sync sample: true for an IRAP picture (HEVC) or an IDR
+    /// / intra slice (AVC), false for a picture that predicts from earlier
+    /// ones.  The decoder uses it to tell a run of pictures whose reference
+    /// the file lost (they all predict, and the decoder resumes at a random
+    /// access picture) from any other skip.
+    /// @param index  Sample index.
+    /// @return The verdict, or std::nullopt when the headers say nothing
+    ///         (unknown codec, damaged sample, index out of range).
+    [[nodiscard]] std::optional<bool> startsDecode(std::uint32_t index) const noexcept;
 
     /// Bytes and timing of sample `index`.  Errors: InvalidArgument (out of
     /// range), Truncated (sample lies outside the file).

@@ -286,6 +286,13 @@ public:
     /// a cache hit.  A foreground request preempts the decode-ahead worker
     /// within one frame pair.
     ///
+    /// A frame one lens cannot decode because its picture predicts from one
+    /// the file does not contain (UndecodableRun) is served as the last frame
+    /// before that run, both lenses (heldFrameFor): the lease's frameIndex()
+    /// names the frame served.  The first request inside the run finds it,
+    /// later ones go straight to the held frame, decode-ahead skips the run,
+    /// and each run is logged once.
+    ///
     /// Errors: InvalidArgument (index out of range), Decoder (libavcodec
     /// failure), Timing (the stream's own timing: a picture that is not the
     /// sample asked for, or the two lenses disagree on the presentation
@@ -371,6 +378,13 @@ public:
 
 private:
     GpuClipDecoder();
+
+    /// @brief acquire() of exactly `frameIndex`, with no undecodable-run
+    ///        handling around it.
+    /// @param frameIndex  The frame to pin (decoded when not cached).
+    /// @param requested   The frame the host asked for (it differs while a
+    ///                    held frame is served), for the sequential detection.
+    [[nodiscard]] Result<GpuFrameLease> acquireExact(std::uint32_t frameIndex, std::uint32_t requested);
 
     struct Impl;
     std::unique_ptr<Impl> m_impl;

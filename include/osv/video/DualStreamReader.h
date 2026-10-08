@@ -224,6 +224,16 @@ public:
     /// when the reader opened: every HARDWARE picture is also decoded in
     /// software (ShadowDecodeVerifier) and, when the two differ, the software
     /// picture is the one returned and the mismatch is logged and dumped.
+    ///
+    /// A frame one lens cannot decode because its picture predicts from one
+    /// the file does not contain (UndecodableRun - a recording that dropped
+    /// frames can lose one lens's key picture) is not an error: the pair of
+    /// the last frame before that run is returned in its place, both lenses
+    /// at one instant (heldFrameFor), and the pair's `index` and the lens
+    /// frames' `frameIndex` name the frame actually shown.  The first request
+    /// inside a run finds it (one decode up to the run), every later one is
+    /// served from the reader's cached held pair without decoding, and the
+    /// reader logs each run once.
     Result<FramePair> read(std::uint32_t index);
 
     /// The shadow verifier's counters (pictures checked, mismatches); both 0

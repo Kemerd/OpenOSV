@@ -352,6 +352,18 @@ struct HevcStreamDecoder::Impl {
     std::uint32_t flaggedSoftwareWarnings = 0;
     static constexpr std::uint32_t kFlaggedSoftwareWarnings = 3;
 
+    // ---- runs no decoder can produce (UndecodableRun) -----------------------
+    /// The undecodable runs this decoder has met, in the order found.  They
+    /// are a property of the file, so they are never forgotten.  Guarded by
+    /// runsMutex because undecodableRun() may be asked from another thread
+    /// while this decoder decodes (GpuClipDecoder's decode-ahead predicate
+    /// does); a leaf lock - nothing else is ever taken while it is held.
+    std::vector<UndecodableRun> runs;
+    mutable std::mutex runsMutex;
+    /// The sample the feed was put on by the last seek (its decode start),
+    /// so a skip right after a seek still has a known first sample.
+    std::uint32_t decodeStartSample = 0;
+
     // ---- lifetime -----------------------------------------------------------
     ~Impl() { close(); }
 
@@ -817,6 +829,7 @@ struct HevcStreamDecoder::Impl {
         gopDamagedAt = -1;  // a decode from a sync sample inherits nothing
         if (samplesMode) {
             sampleCursor = container ? container->previousSync(index) : 0;
+            decodeStartSample = sampleCursor;  // where the first picture after the seek comes from
             return okStatus();
         }
         if (!fmt) {
@@ -828,11 +841,13 @@ struct HevcStreamDecoder::Impl {
         // instead, so the decode passes a random access point before the
         // target; whatever precedes it is discarded like any catch-up frame.
         std::uint32_t seekIndex = index;
+        decodeStartSample = 0;
         if (container) {
             const std::uint32_t start = container->previousSync(index);
             if (start != container->listedSync(index)) {
                 seekIndex = start;
             }
+            decodeStartSample = start;  // the random access point the decode passes first
         }
         const int ret = av_seek_frame(fmt.get(), streamIndex, ptsForSeek(seekIndex), AVSEEK_FLAG_BACKWARD);
         if (ret < 0) {
@@ -1060,6 +1075,14 @@ struct HevcStreamDecoder::Impl {
             return Error{ErrorCode::InvalidArgument, "frame " + std::to_string(index) + " out of range (" +
                                                          std::to_string(frameCount) + " frames)"};
         }
+        // ---- a frame inside a run this decoder already met ----------------------
+        // Decoding toward it again would only replay the same refusal - a GOP
+        // of work per request, which is what made every request inside such a
+        // run cost ~170 ms in the host before failing anyway - so it fails at
+        // once, and the decoder's position is left exactly where it is.
+        if (const std::optional<UndecodableRun> known = knownRun(index)) {
+            return Error{ErrorCode::Timing, runMessage(index, *known)};
+        }
         if (!canDecodeForwardTo(index)) {
             const Status seeked = seekTo(index);
             if (!seeked.ok()) {
@@ -1083,6 +1106,9 @@ struct HevcStreamDecoder::Impl {
             ff::FramePtr frame = std::move(got).value();
             const std::int64_t pts = framePts(*frame);
             const std::int64_t fi = indexFromPts(pts);
+            // The picture before this one (or -1 right after a seek): a skip
+            // from it to `fi` is what an undecodable run looks like.
+            const std::int64_t previousOutput = lastDecodedIndex;
             lastDecodedIndex = fi;
             // Damage is tracked over EVERY picture, catch-up ones included:
             // the picture asked for may be clean by its own flags and still
@@ -1092,10 +1118,21 @@ struct HevcStreamDecoder::Impl {
                 continue;  // still catching up from the sync sample
             }
             if (fi > static_cast<std::int64_t>(index)) {
-                // The stream skipped the wanted frame: a property of the file
-                // (its timing), not of this decoder - Timing, so no caller
-                // drops a working hardware decoder over it.
+                // The stream skipped the wanted frame: a property of the file,
+                // not of this decoder - Timing, so no caller drops a working
+                // hardware decoder over it.
                 invalidatePosition();
+                // ---- pictures whose reference the file lost ---------------------------
+                // When the decoder went from a picture straight to the next
+                // random access picture, everything in between predicts from
+                // a picture the file does not contain: libavcodec refuses each
+                // of them on every path, software included.  The run is kept,
+                // so the next request inside it fails at once.
+                const bool resumedAtKey = (frame->flags & AV_FRAME_FLAG_KEY) != 0;
+                if (const std::optional<UndecodableRun> run = classifySkip(previousOutput, index, fi, resumedAtKey)) {
+                    noteRun(*run);
+                    return Error{ErrorCode::Timing, runMessage(index, *run)};
+                }
                 return Error{ErrorCode::Timing, "presentation time mismatch: wanted frame " + std::to_string(index) +
                                                      " but decoder produced frame " + std::to_string(fi) + " (pts " +
                                                      std::to_string(pts) + ")"};
@@ -1235,6 +1272,95 @@ struct HevcStreamDecoder::Impl {
     void invalidatePosition() noexcept {
         positionValid = false;
         lastDecodedIndex = -1;
+    }
+
+    // -------------------------------------------------------------------------
+    //  Undecodable runs (UndecodableRun)
+    // -------------------------------------------------------------------------
+
+    /// @brief The known run containing `index`, if any (thread-safe).
+    /// @param index  A frame (sample) index.
+    /// @return The run, or std::nullopt.
+    [[nodiscard]] std::optional<UndecodableRun> knownRun(std::uint32_t index) const {
+        std::lock_guard<std::mutex> lock(runsMutex);
+        for (const UndecodableRun& run : runs) {
+            if (run.contains(index)) {
+                return run;
+            }
+        }
+        return std::nullopt;
+    }
+
+    /// @brief Whether a decode that went from `previousOutput` straight to
+    ///        `fi` crossed an undecodable run, and which one.
+    ///
+    /// Only a skip that every decoder reproduces counts, so a run is never
+    /// declared on a guess:
+    ///   * frame indices are exact sample indices (the sample table indexes
+    ///     the track - tableTiming());
+    ///   * the decoder resumed at a key picture, and the container agrees that
+    ///     the picture at `fi` starts a decode - libavcodec drops pictures
+    ///     with a missing reference until exactly such a picture;
+    ///   * the first picture skipped is NOT one that starts a decode - it
+    ///     predicts from an earlier picture, which the file does not hold.
+    ///
+    /// @param previousOutput  The picture before `fi` in this decode (-1 right after a seek).
+    /// @param index           The frame asked for (inside the skip).
+    /// @param fi              The picture the decoder produced instead.
+    /// @param resumedAtKey    AV_FRAME_FLAG_KEY of that picture.
+    /// @return The run [first skipped, fi), or std::nullopt for any other skip.
+    [[nodiscard]] std::optional<UndecodableRun> classifySkip(std::int64_t previousOutput, std::uint32_t index,
+                                                             std::int64_t fi, bool resumedAtKey) const noexcept {
+        if (!tableTiming() || !resumedAtKey || fi <= 0 || fi >= static_cast<std::int64_t>(frameCount)) {
+            return std::nullopt;
+        }
+        // The first sample the decoder did not produce: right after the last
+        // picture it did, or the decode start when the skip came first.
+        const std::int64_t first =
+            previousOutput >= 0 ? previousOutput + 1 : static_cast<std::int64_t>(decodeStartSample);
+        if (first < 0 || first > static_cast<std::int64_t>(index) || first >= fi) {
+            return std::nullopt;
+        }
+        // The pictures themselves must say "predicts" at the start of the run
+        // and "random access" where decoding resumed.
+        const std::optional<bool> firstStarts = container->startsDecode(static_cast<std::uint32_t>(first));
+        const std::optional<bool> resumeStarts = container->startsDecode(static_cast<std::uint32_t>(fi));
+        if (!firstStarts.has_value() || *firstStarts || !resumeStarts.value_or(false)) {
+            return std::nullopt;
+        }
+        return UndecodableRun{static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(fi)};
+    }
+
+    /// @brief Remember a run (once) and say so in the log (once per run).
+    /// @param run  The run classifySkip() found.
+    void noteRun(const UndecodableRun& run) noexcept {
+        try {
+            {
+                std::lock_guard<std::mutex> lock(runsMutex);
+                for (const UndecodableRun& known : runs) {
+                    if (known.first == run.first && known.end == run.end) {
+                        return;  // met again by a request that started before it
+                    }
+                }
+                runs.push_back(run);
+            }
+            log::warn("video: '{}' track {}: samples {}-{} cannot be decoded - they predict from a picture the file "
+                      "does not contain (a recording that dropped frames can lose one lens's key picture); no "
+                      "decoder can produce them, decoding resumes at sample {}",
+                      clipForLog(), trackId, run.first, run.end - 1u, run.end);
+        } catch (...) {
+            // Out of memory while remembering it: the next request inside
+            // the run simply finds it again.
+        }
+    }
+
+    /// The Timing error text for a request inside `run`.
+    [[nodiscard]] std::string runMessage(std::uint32_t index, const UndecodableRun& run) const {
+        return "frame " + std::to_string(index) + " of track " + std::to_string(trackId) +
+               " cannot be decoded: samples " + std::to_string(run.first) + "-" + std::to_string(run.end - 1u) +
+               " predict from a picture the file does not contain, so no decoder can produce them (the next "
+               "decodable picture is sample " +
+               std::to_string(run.end) + ")";
     }
 
     // -------------------------------------------------------------------------
@@ -1759,6 +1885,18 @@ std::optional<DeviceFrameRef> HevcStreamDecoder::lastDeviceFrame() const {
 
 std::optional<DecodedFrameInfo> HevcStreamDecoder::lastFrameInfo() const noexcept {
     return m_impl ? m_impl->lastInfo : std::nullopt;
+}
+
+std::optional<UndecodableRun> HevcStreamDecoder::undecodableRun(std::uint32_t index) const noexcept {
+    if (!m_impl) {
+        return std::nullopt;
+    }
+    try {
+        return m_impl->knownRun(index);
+    } catch (...) {
+        // std::mutex::lock only throws on a broken mutex: nothing is known.
+        return std::nullopt;
+    }
 }
 
 // -----------------------------------------------------------------------------

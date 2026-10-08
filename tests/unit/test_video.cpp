@@ -22,6 +22,7 @@
 #include "osv/render/SeamAnalysis.h"
 #include "osv/video/Decoder.h"
 #include "osv/video/DualStreamReader.h"
+#include "osv/video/GpuClipDecoder.h"
 #include "osv/video/HwAccel.h"
 #include "osv/video/ImuCsv.h"
 #include "osv/video/PlanarFrame.h"
@@ -32,6 +33,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +50,10 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#if defined(OSV_VIDEO_HAVE_CUDA)
+#include <cuda.h>  // the GPU decoder test downloads its cached frames
+#endif
 
 using namespace osv;
 using namespace osv::video;
@@ -2323,5 +2329,389 @@ TEST_CASE("osvtool extract --hevc / --audio / --imu / --frame run end to end", "
     const std::string missing = "\"\"" + tool.string() + "\" extract \"" +
                                 (osvtest::tempDir() / "missing.OSV").string() + "\" --audio \"" + aac.string() + "\"\"";
     REQUIRE(std::system(missing.c_str()) == 2);
+}
+#endif
+
+// =============================================================================
+//  A lens that lost its key picture (UndecodableRun)
+// =============================================================================
+// tests/fixtures/fx_lost_idr_hevc.mp4 rebuilds, in 42 KB, what a night drive
+// recorded: two 160 x 160 10-bit HEVC tracks of 36 frames at 25 fps
+// (testsrc2), IDR pictures at 0/12/24 on track 1 and 0/12/13/24 on track 2,
+// and packet 12 dropped from both, the way the camera dropped two frames
+// and lost lens 0's IDR with them.  Track 1's samples 12-22 then predict
+// from a picture that is not in the file - FFmpeg's software HEVC decoder,
+// D3D11VA and NVDEC all refuse them - while track 2 restarts at its own IDR
+// (sample 12).  Both tracks keep the gap in their timestamps (sample 11 lasts
+// two periods).  Made with libx265 (keyint=100:bframes=0:open-gop=0,
+// -forced-idr 1, -force_key_frames at the frames above, qp 38) and
+//   ffmpeg -i a.mp4 -i b.mp4 -map 0:v -map 1:v -c copy
+//          -bsf:v "noise=drop=eq(n\,12)" -video_track_timescale 25000
+//          -use_editlist 0 fx_lost_idr_hevc.mp4
+namespace {
+
+/// The lost-key-picture fixture.
+std::filesystem::path lostIdrFixture() { return osvtest::fixtureDir() / "fx_lost_idr_hevc.mp4"; }
+
+/// The fixture's layout: track 1 is lens 0 (the one that lost its IDR).
+meta::FormatInfo lostIdrFormat() {
+    meta::FormatInfo f;
+    f.streamW = 160;
+    f.streamH = 160;
+    f.fps = 25.0;
+    f.bitDepth = 10;
+    f.dualFisheye = true;
+    f.videoTrackIds = {1u, 2u};
+    f.sideBySideProxy = false;
+    return f;
+}
+
+/// Samples per track, the run of track 1, and the frame shown for it.
+constexpr std::uint32_t kLostIdrFrames = 35;
+constexpr std::uint32_t kLostIdrRunFirst = 12;
+constexpr std::uint32_t kLostIdrRunEnd = 23;
+constexpr std::uint32_t kLostIdrHeld = 11;
+
+/// A software pair reader of the fixture (two frame threads, sample feed).
+Result<DualStreamReader> openLostIdrReader() {
+    DecoderOptions o;
+    o.hw = HwAccel::None;
+    o.threads = 2;
+    o.useContainerSamples = true;
+    return DualStreamReader::open(lostIdrFixture(), lostIdrFormat(), o);
+}
+
+/// Fingerprints of both lenses of a pair (worker-thread safe: no Catch2).
+std::array<std::uint64_t, 2> pairFingerprints(const FramePair& pair) {
+    return {frameFingerprint(pair.lens[0]), frameFingerprint(pair.lens[1])};
+}
+
+}  // namespace
+
+TEST_CASE("a track that lost its key picture: the run is found once, named, refused at once, and decoding recovers",
+          "[video][lostref]") {
+    REQUIRE(std::filesystem::exists(lostIdrFixture()));
+    for (const bool containerSamples : {true, false}) {
+        INFO("container samples " << containerSamples);
+        CapturedLog captured(log::Level::Warn);
+        DecoderOptions o;
+        o.hw = HwAccel::None;
+        o.threads = 2;
+        o.useContainerSamples = containerSamples;
+        auto opened = HevcStreamDecoder::open(lostIdrFixture(), 1, o);
+        INFO((opened.ok() ? std::string("ok") : opened.error().toString()));
+        REQUIRE(opened.ok());
+        HevcStreamDecoder& dec = opened.value();
+        REQUIRE(dec.frameCount() == kLostIdrFrames);
+
+        // ---- the last picture before the run decodes as recorded -------------------
+        auto before = dec.decodeFrame(kLostIdrHeld);
+        REQUIRE(before.ok());
+        CHECK(before.value().frameIndex == kLostIdrHeld);
+        CHECK_FALSE(dec.undecodableRun(15).has_value());  // nothing met yet
+
+        // ---- the first request inside the run finds it -------------------------------
+        auto first = dec.decodeFrame(kLostIdrRunFirst);
+        REQUIRE_FALSE(first.ok());
+        INFO(first.error().toString());
+        CHECK(first.error().code == ErrorCode::Timing);
+        CHECK(first.error().message.find("samples 12-22 predict from a picture the file does not contain") !=
+              std::string::npos);
+        const std::optional<UndecodableRun> run = dec.undecodableRun(15);
+        REQUIRE(run.has_value());
+        CHECK(run->first == kLostIdrRunFirst);
+        CHECK(run->end == kLostIdrRunEnd);
+        CHECK_FALSE(dec.undecodableRun(kLostIdrHeld).has_value());
+        CHECK_FALSE(dec.undecodableRun(kLostIdrRunEnd).has_value());
+        CHECK(captured.count("samples 12-22 cannot be decoded") == 1u);
+
+        // ---- every later request inside it fails at once: no decode, no FFmpeg line ----
+        const std::size_t ffmpegLines = captured.count("ffmpeg:");
+        const std::optional<DecodedFrameInfo> lastBefore = dec.lastFrameInfo();
+        for (const std::uint32_t k : {18u, 22u, 12u, 15u}) {
+            auto refused = dec.decodeFrame(k);
+            REQUIRE_FALSE(refused.ok());
+            CHECK(refused.error().code == ErrorCode::Timing);
+            CHECK(refused.error().message.find("frame " + std::to_string(k) + " of track 1 cannot be decoded") !=
+                  std::string::npos);
+        }
+        CHECK(captured.count("ffmpeg:") == ffmpegLines);
+        REQUIRE(dec.lastFrameInfo().has_value());
+        REQUIRE(lastBefore.has_value());
+        CHECK(dec.lastFrameInfo()->index == lastBefore->index);
+        CHECK(captured.count("samples 12-22 cannot be decoded") == 1u);  // logged once
+
+        // ---- after the run: the random access picture and the rest decode ------------
+        auto resumed = dec.decodeFrame(kLostIdrRunEnd);
+        INFO((resumed.ok() ? std::string("ok") : resumed.error().toString()));
+        REQUIRE(resumed.ok());
+        CHECK(resumed.value().frameIndex == kLostIdrRunEnd);
+        REQUIRE(dec.lastFrameInfo().has_value());
+        CHECK(dec.lastFrameInfo()->keyFrame);
+        auto later = dec.decodeFrame(30);
+        REQUIRE(later.ok());
+        CHECK(later.value().frameIndex == 30u);
+        // ---- and before it, after the refusals: the decoder was never stuck ---------
+        auto again = dec.decodeFrame(5);
+        REQUIRE(again.ok());
+        CHECK(again.value().frameIndex == 5u);
+    }
+
+    // ---- the other lens kept its own key picture: everything decodes ---------------
+    DecoderOptions o;
+    o.hw = HwAccel::None;
+    o.threads = 2;
+    o.useContainerSamples = true;
+    auto lens1 = HevcStreamDecoder::open(lostIdrFixture(), 2, o);
+    REQUIRE(lens1.ok());
+    for (std::uint32_t k = 0; k < kLostIdrFrames; ++k) {
+        auto f = lens1.value().decodeFrame(k);
+        INFO("track 2 frame " << k << ": " << (f.ok() ? std::string("ok") : f.error().toString()));
+        REQUIRE(f.ok());
+        CHECK(f.value().frameIndex == k);
+    }
+    CHECK_FALSE(lens1.value().undecodableRun(15).has_value());
+}
+
+TEST_CASE("the frame shown for an undecodable run is the one before it, or after it at the start", "[video][lostref]") {
+    // heldFrameFor: the frame before the run, or the run's end when it starts
+    // at frame 0, or nothing when neither exists.
+    CHECK(heldFrameFor(UndecodableRun{12, 23}, 35).value() == 11u);
+    CHECK(heldFrameFor(UndecodableRun{0, 5}, 35).value() == 5u);
+    CHECK_FALSE(heldFrameFor(UndecodableRun{0, 35}, 35).has_value());
+    CHECK(UndecodableRun{12, 23}.contains(12));
+    CHECK(UndecodableRun{12, 23}.contains(22));
+    CHECK_FALSE(UndecodableRun{12, 23}.contains(23));
+    CHECK_FALSE(UndecodableRun{12, 23}.contains(11));
+}
+
+TEST_CASE("a pair reader shows the frame before an undecodable run, bit-exact in any request order",
+          "[video][lostref]") {
+    REQUIRE(std::filesystem::exists(lostIdrFixture()));
+    CapturedLog captured(log::Level::Warn);
+
+    // ---- the reference: every frame once, in order ---------------------------------
+    auto refOpened = openLostIdrReader();
+    INFO((refOpened.ok() ? std::string("ok") : refOpened.error().toString()));
+    REQUIRE(refOpened.ok());
+    DualStreamReader& ref = refOpened.value();
+    REQUIRE(ref.frameCount() == kLostIdrFrames);
+    std::vector<std::array<std::uint64_t, 2>> expected(kLostIdrFrames);
+    for (std::uint32_t k = 0; k < kLostIdrFrames; ++k) {
+        auto pair = ref.read(k);
+        INFO("frame " << k << ": " << (pair.ok() ? std::string("ok") : pair.error().toString()));
+        REQUIRE(pair.ok());
+        const bool inRun = k >= kLostIdrRunFirst && k < kLostIdrRunEnd;
+        const std::uint32_t shown = inRun ? kLostIdrHeld : k;
+        // The pair says which frame it shows, both lenses at one instant.
+        CHECK(pair.value().index == shown);
+        CHECK(pair.value().lens[0].frameIndex == shown);
+        CHECK(pair.value().lens[1].frameIndex == shown);
+        CHECK(pair.value().lens[0].ptsUs == pair.value().lens[1].ptsUs);
+        expected[k] = pairFingerprints(pair.value());
+    }
+    // Every frame of the run shows exactly frame 11's pictures.
+    for (std::uint32_t k = kLostIdrRunFirst; k < kLostIdrRunEnd; ++k) {
+        CHECK(expected[k] == expected[kLostIdrHeld]);
+    }
+    CHECK(expected[kLostIdrRunEnd] != expected[kLostIdrHeld]);
+    CHECK(captured.count("frames 12-22 cannot be decoded on one lens") == 1u);
+
+    // ---- the replay: a host-like order, the reader taken in turns by threads -------
+    // Scrubbing backwards into the run (the night session's 12555 .. 12550
+    // walk), jumps across it, landings inside it from both sides, and a
+    // re-read of the held frame itself.
+    const std::vector<std::uint32_t> order = {30, 16, 15, 14, 13, 12, 11, 22, 23, 24, 2, 20, 21, 9, 10, 17,
+                                              34, 12, 11, 25, 18, 0, 19, 23};
+    auto replayOpened = openLostIdrReader();
+    REQUIRE(replayOpened.ok());
+    DualStreamReader& replay = replayOpened.value();
+    std::vector<Result<FramePair>> results(order.size(), Error{ErrorCode::Internal, "not run"});
+    std::mutex instanceMutex;
+    std::mutex turnMutex;
+    std::condition_variable turn;
+    std::size_t next = 0;
+    std::vector<std::thread> threads;
+    constexpr std::size_t kThreads = 3;
+    for (std::size_t w = 0; w < kThreads; ++w) {
+        threads.emplace_back([&, w]() noexcept {
+            for (std::size_t i = w; i < order.size(); i += kThreads) {
+                {
+                    std::unique_lock<std::mutex> lock(turnMutex);
+                    turn.wait(lock, [&] { return next == i; });
+                }
+                {
+                    std::lock_guard<std::mutex> lock(instanceMutex);
+                    results[i] = replay.read(order[i]);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(turnMutex);
+                    next = i + 1;
+                }
+                turn.notify_all();
+            }
+        });
+    }
+    for (std::thread& t : threads) {
+        t.join();
+    }
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        const std::uint32_t k = order[i];
+        INFO("request " << i << " frame " << k << ": "
+                        << (results[i].ok() ? std::string("ok") : results[i].error().toString()));
+        REQUIRE(results[i].ok());
+        CHECK(pairFingerprints(results[i].value()) == expected[k]);
+    }
+    // Two readers, each told the run once.
+    CHECK(captured.count("frames 12-22 cannot be decoded on one lens") == 2u);
+}
+
+#if defined(OSV_TOOL_PATH)
+TEST_CASE("osvtool decode-replay replays a logged request order and holds the frames of an undecodable run",
+          "[video][lostref][cli]") {
+    REQUIRE(std::filesystem::exists(lostIdrFixture()));
+    const std::filesystem::path tool(OSV_TOOL_PATH);
+    std::error_code ec;
+    if (!std::filesystem::exists(tool, ec)) {
+        SKIP("osvtool not built at " << tool.string());
+    }
+    // ---- a session log in the plug-in's own format ---------------------------------
+    // Two delivered frames, one request inside the run that failed (the
+    // night session's three lines), and decode lines of another clip that
+    // must be ignored.
+    const std::filesystem::path trace = osvtest::tempDir() / "lostref_trace.log";
+    {
+        std::ofstream out(trace, std::ios::binary | std::ios::trunc);
+        out << "2026-10-08 00:21:24.819 [DEBUG] [pid 7 tid 11] deliver: clip 'fx_lost_idr_hevc.mp4' frame 10 (source "
+               "10) 1920x960 32f crc 0/0 (gpu path, nothing to compare), draft, 0.6 ms\n"
+            << "2026-10-08 00:21:24.973 [WARN ] [pid 7 tid 12] video: GPU frame path failed on frame 15 of "
+               "'fx_lost_idr_hevc.mp4' (lens 0 frame 12: presentation time mismatch); the stream's timing is at "
+               "fault, not the GPU path\n"
+            << "2026-10-08 00:21:26.020 [WARN ] [pid 7 tid 12] video: frame 15 of 'fx_lost_idr_hevc.mp4' cannot be "
+               "decoded (lens 0: presentation time mismatch); the stream's timing is at fault, so d3d11va decoding "
+               "stays on\n"
+            << "2026-10-08 00:21:26.020 [ERROR] [pid 7 tid 12] imGetSourceVideo: frame 15 failed: lens 0: "
+               "presentation time mismatch\n"
+            << "2026-10-08 00:21:26.100 [DEBUG] [pid 7 tid 13] decode: track 1 frame 3 crc 0123456789abcdef hw "
+               "d3d11va key 0 'another_clip.OSV'\n"
+            << "2026-10-08 00:21:27.666 [DEBUG] [pid 7 tid 11] deliver: clip 'fx_lost_idr_hevc.mp4' frame 24 (source "
+               "24) 1920x960 32f crc 0/0 (gpu path, nothing to compare), draft, 0.6 ms\n";
+    }
+    const std::filesystem::path report = osvtest::tempDir() / "lostref_replay.txt";
+    const std::filesystem::path csv = osvtest::tempDir() / "lostref_replay.csv";
+    const std::string cmd = "\"\"" + tool.string() + "\" -q decode-replay \"" + lostIdrFixture().string() +
+                            "\" --trace \"" + trace.string() + "\" --tracks 1,2 --threads 2 --csv \"" + csv.string() +
+                            "\" > \"" + report.string() + "\" 2>&1\"";
+    const int code = std::system(cmd.c_str());
+    std::ifstream in(report);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    INFO(text);
+    CHECK(code == 0);
+    // Three requests of the clip (the other clip's decode line is ignored),
+    // all bit-exact with the sequential software reference; the request the
+    // session saw fail is now served the held frame.
+    CHECK(text.find("3 request entries of pid 7") != std::string::npos);
+    CHECK(text.find("3 ok, 0 failed (1 served a held frame)") != std::string::npos);
+    CHECK(text.find("3 identical") != std::string::npos);
+    CHECK(text.find("logged outcomes: 1 of 3 differ") != std::string::npos);
+    std::ifstream rows(csv);
+    std::string header;
+    REQUIRE(std::getline(rows, header));
+    CHECK(header.rfind("entry,trace,line,pid,tid,track,frame,logged", 0) == 0);
+    // Usage errors exit 1: no trace, a bad level.
+    CHECK(std::system(("\"\"" + tool.string() + "\" decode-replay \"" + lostIdrFixture().string() + "\"\"").c_str()) ==
+          1);
+    CHECK(std::system(("\"\"" + tool.string() + "\" -q decode-replay \"" + lostIdrFixture().string() + "\" --trace \"" +
+                       trace.string() + "\" --tracks 1,2 --level frames > nul 2>&1\"")
+                          .c_str()) == 1);
+}
+#endif
+
+#if defined(OSV_VIDEO_HAVE_CUDA)
+TEST_CASE("GpuClipDecoder serves the frame before an undecodable run and decode-ahead skips the run",
+          "[video][gpu][cuda][hwaccel][lostref]") {
+    REQUIRE(std::filesystem::exists(lostIdrFixture()));
+    std::string reason;
+    if (!GpuClipDecoder::available(&reason)) {
+        SKIP("CUDA unavailable: " << reason);
+    }
+    auto opened = GpuClipDecoder::open(lostIdrFixture(), lostIdrFormat());
+    if (!opened.ok() && opened.error().code == ErrorCode::Unsupported) {
+        SKIP("NVDEC unavailable: " << opened.error().message);
+    }
+    INFO((opened.ok() ? std::string("ok") : opened.error().toString()));
+    REQUIRE(opened.ok());
+    GpuClipDecoder& dec = *opened.value();
+
+    // ---- the software reference of the held frame and of the frame after the run ----
+    auto refOpened = openLostIdrReader();
+    REQUIRE(refOpened.ok());
+    auto heldRef = refOpened.value().read(kLostIdrHeld);
+    auto endRef = refOpened.value().read(kLostIdrRunEnd);
+    REQUIRE(heldRef.ok());
+    REQUIRE(endRef.ok());
+
+    // Download one lens of a lease and fingerprint it (P010 on the device).
+    const auto leaseFingerprint = [&](const GpuFrameLease& lease, std::size_t l) -> std::uint64_t {
+        const DeviceFrameRef& d = lease.pair().device[l];
+        REQUIRE(d.valid());
+        const std::size_t stride = d.pitchBytes / 2u;
+        const std::uint32_t chromaH = (d.height + 1u) / 2u;
+        std::vector<std::uint16_t> host(stride * (static_cast<std::size_t>(d.height) + chromaH), 0);
+        REQUIRE(cuCtxPushCurrent(static_cast<CUcontext>(dec.cuContext())) == CUDA_SUCCESS);
+        CUDA_MEMCPY2D copy{};
+        copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        copy.srcDevice = static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(d.yDevice));
+        copy.srcPitch = d.pitchBytes;
+        copy.dstMemoryType = CU_MEMORYTYPE_HOST;
+        copy.dstHost = host.data();
+        copy.dstPitch = d.pitchBytes;
+        copy.WidthInBytes = static_cast<std::size_t>(d.width) * 2u;
+        copy.Height = d.height;
+        const CUresult a = cuMemcpy2D(&copy);
+        copy.srcDevice = static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(d.uvDevice));
+        copy.dstHost = host.data() + stride * d.height;
+        copy.WidthInBytes = static_cast<std::size_t>((d.width + 1u) / 2u) * 4u;
+        copy.Height = chromaH;
+        const CUresult b = cuMemcpy2D(&copy);
+        CUcontext popped = nullptr;
+        cuCtxPopCurrent(&popped);
+        REQUIRE(a == CUDA_SUCCESS);
+        REQUIRE(b == CUDA_SUCCESS);
+        PlanarFrame16 v;
+        v.width = d.width;
+        v.height = d.height;
+        v.chromaW = (d.width + 1u) / 2u;
+        v.chromaH = chromaH;
+        v.plane = {host.data(), host.data() + stride * d.height, host.data() + stride * d.height + 1};
+        v.strideElems = {stride, stride, stride};
+        v.bitDepth = 10;
+        v.bitShift = 6;
+        v.chromaInterleaved = true;
+        return frameFingerprint(v);
+    };
+
+    // ---- the first request inside the run is served the held frame -----------------
+    {
+        auto lease = dec.acquire(15);
+        INFO((lease.ok() ? std::string("ok") : lease.error().toString()));
+        REQUIRE(lease.ok());
+        CHECK(lease.value().frameIndex() == kLostIdrHeld);
+        CHECK(leaseFingerprint(lease.value(), 0) == frameFingerprint(heldRef.value().lens[0]));
+        CHECK(leaseFingerprint(lease.value(), 1) == frameFingerprint(heldRef.value().lens[1]));
+    }
+    // ---- later requests inside it go straight to the cached held frame -------------
+    for (const std::uint32_t k : {16u, 17u, 12u, 22u}) {
+        auto lease = dec.acquire(k);
+        REQUIRE(lease.ok());
+        CHECK(lease.value().frameIndex() == kLostIdrHeld);
+        CHECK(lease.value().source() == LeaseSource::CacheHit);
+    }
+    // ---- after the run, bit-exact again ---------------------------------------------
+    auto after = dec.acquire(kLostIdrRunEnd);
+    REQUIRE(after.ok());
+    CHECK(after.value().frameIndex() == kLostIdrRunEnd);
+    CHECK(leaseFingerprint(after.value(), 0) == frameFingerprint(endRef.value().lens[0]));
+    CHECK(leaseFingerprint(after.value(), 1) == frameFingerprint(endRef.value().lens[1]));
 }
 #endif

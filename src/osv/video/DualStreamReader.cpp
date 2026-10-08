@@ -401,6 +401,13 @@ struct DualStreamReader::Impl {
     std::uint32_t lensHeight = 0;
     double fps = 0.0;
     std::int64_t ptsToleranceUs = 1;  ///< One time-base tick expressed in microseconds (rounded up).
+    // ---- frames inside an undecodable run (UndecodableRun) ---------------------
+    /// The pair shown for every request inside a run one lens cannot decode,
+    /// kept so those requests cost nothing after the first (host pictures
+    /// only; a pair on the device would pin a decoder surface).  Dropped as
+    /// soon as a request lands outside every run.
+    std::optional<FramePair> heldPair;
+    std::vector<UndecodableRun> announcedRuns;  ///< Runs already logged by this reader (once each).
 
     /// Make a PlanarFrame16 that views the left or right half of `whole`
     /// while sharing its backing memory.
@@ -501,6 +508,187 @@ struct DualStreamReader::Impl {
         } catch (...) {
             // A diagnostic never costs the frame: the primary picture stands.
         }
+    }
+
+    /// @brief The frame shown instead of `index` when a lens cannot decode it.
+    ///
+    /// Asks each lens decoder for an undecodable run it has met around
+    /// `index` (HevcStreamDecoder::undecodableRun) and holds the last frame
+    /// before the earliest such run (heldFrameFor).  The held frame is
+    /// resolved again in case another run covers it, a bounded number of
+    /// times, so the answer is never itself a frame no lens can decode.
+    /// @param index  The frame asked for.
+    /// @param run    Receives the run that decided it (when there is one).
+    /// @return The frame to read instead, or std::nullopt when both lenses
+    ///         can decode `index` as far as they know.
+    [[nodiscard]] std::optional<std::uint32_t> holdFor(std::uint32_t index, UndecodableRun& run) const noexcept {
+        std::uint32_t target = index;
+        bool held = false;
+        // Two lenses, each with runs that could in theory chain: four rounds
+        // cover every arrangement the decoders can report.
+        for (int round = 0; round < 4; ++round) {
+            std::optional<std::uint32_t> next;
+            const int lenses = sideBySide ? 1 : 2;
+            for (int lens = 0; lens < lenses; ++lens) {
+                const std::optional<UndecodableRun> r = decoders[lens].undecodableRun(target);
+                if (!r) {
+                    continue;
+                }
+                const std::optional<std::uint32_t> h = heldFrameFor(*r, frameCount);
+                if (!h) {
+                    return std::nullopt;  // no neighbour exists: the request fails as it is
+                }
+                if (!next || *h < *next) {
+                    next = *h;
+                    run = *r;
+                }
+            }
+            if (!next) {
+                break;  // `target` decodes on both lenses
+            }
+            target = *next;
+            held = true;
+        }
+        if (!held) {
+            return std::nullopt;
+        }
+        return target;
+    }
+
+    /// @brief Say once per run that its frames are shown as `heldIndex`.
+    void announce(const UndecodableRun& run, std::uint32_t heldIndex) noexcept {
+        try {
+            for (const UndecodableRun& known : announcedRuns) {
+                if (known.first == run.first && known.end == run.end) {
+                    return;
+                }
+            }
+            announcedRuns.push_back(run);
+            log::warn("video: '{}': frames {}-{} cannot be decoded on one lens (they predict from a picture the file "
+                      "does not contain); frame {} of both lenses is shown in their place",
+                      log::safe(pathText(path.filename())), run.first, run.end - 1u, heldIndex);
+        } catch (...) {
+            // A log line is never worth a frame.
+        }
+    }
+
+    /// @brief Decode the pair of `index` from the lens decoders.
+    ///
+    /// The proxy decodes once and is split; the native lenses decode on two
+    /// threads and must agree on the presentation time.  This is the whole
+    /// read() without the undecodable-run handling around it.
+    /// @param index  Frame to decode (in range; the caller checked).
+    /// @return The pair, or the first lens error.
+    Result<FramePair> decodePair(std::uint32_t index) {
+        FramePair pair;
+        pair.index = index;
+
+        if (sideBySide) {
+            // ---- decode once, split ----------------------------------------------
+            LensResult whole = decodeLens(0, index);
+            if (!whole.frame.ok()) {
+                return Error(whole.frame.error());
+            }
+            // ---- the shadow check (OPENOSV_VERIFY_HW_DECODE=1 only) ---------------
+            if (verifyHw) {
+                verifyAgainstSoftware(index, whole);
+            }
+            const PlanarFrame16& frame = whole.frame.value();
+            if (frame.width != lensWidth * 2) {
+                return Error{ErrorCode::Decoder, "side-by-side frame width changed mid-stream"};
+            }
+            pair.lens[0] = halfView(frame, 0);
+            pair.lens[1] = halfView(frame, 1);
+            pair.ptsUs = frame.ptsUs;
+            // Device halves: same pitch, luma pointer shifted by half a row of
+            // samples (2 bytes each for P010, 1 byte for NV12).
+            if (whole.device && whole.device->valid()) {
+                const std::size_t bytesPerSample =
+                    (whole.device->bitShift == 6 || whole.device->bitDepth > 8) ? 2u : 1u;
+                const std::size_t byteOffset = static_cast<std::size_t>(lensWidth) * bytesPerSample;
+                for (int lens = 0; lens < 2; ++lens) {
+                    DeviceFrameRef ref = *whole.device;
+                    ref.width = lensWidth;
+                    if (lens == 1) {
+                        ref.yDevice = static_cast<std::uint8_t*>(ref.yDevice) + byteOffset;
+                        ref.uvDevice = static_cast<std::uint8_t*>(ref.uvDevice) + byteOffset;
+                    }
+                    pair.device[static_cast<std::size_t>(lens)] = ref;
+                }
+            }
+            return pair;
+        }
+
+        // ---- two decoders, two threads ----------------------------------------------
+        // Lens 0 runs on a helper thread while lens 1 decodes on this one; the
+        // helper's result is captured by value and any exception (there should
+        // be none, decoders never throw) is converted into an error.
+        LensResult slave;
+        std::string threadFailure;
+        std::thread worker([this, &slave, &threadFailure, index]() noexcept {
+            try {
+                slave = decodeLens(0, index);
+            } catch (const std::exception& e) {
+                threadFailure = e.what();
+            } catch (...) {
+                threadFailure = "unknown exception";
+            }
+        });
+        LensResult master = decodeLens(1, index);
+        worker.join();
+
+        if (!threadFailure.empty()) {
+            return Error{ErrorCode::Internal, "lens 0 decoder thread failed: " + threadFailure};
+        }
+        if (!slave.frame.ok()) {
+            return Error{slave.frame.error().code, "lens 0: " + slave.frame.error().message};
+        }
+        if (!master.frame.ok()) {
+            return Error{master.frame.error().code, "lens 1: " + master.frame.error().message};
+        }
+        const PlanarFrame16& s = slave.frame.value();
+        const PlanarFrame16& m = master.frame.value();
+        // Both tracks are written by the same encoder clock; anything beyond a
+        // single tick means the tracks are not the pair we think they are.  The
+        // tracks' own timing says so, whichever decoder read them: Timing.
+        const std::int64_t delta = s.ptsUs > m.ptsUs ? s.ptsUs - m.ptsUs : m.ptsUs - s.ptsUs;
+        if (delta > ptsToleranceUs) {
+            return Error{ErrorCode::Timing, "lens presentation times differ at frame " + std::to_string(index) + ": " +
+                                                std::to_string(s.ptsUs) + " us vs " + std::to_string(m.ptsUs) + " us"};
+        }
+        pair.lens[0] = s;
+        pair.lens[1] = m;
+        pair.ptsUs = s.ptsUs;
+        if (slave.device) {
+            pair.device[0] = *slave.device;
+        }
+        if (master.device) {
+            pair.device[1] = *master.device;
+        }
+        return pair;
+    }
+
+    /// @brief The pair shown for `index`, which lies inside an undecodable run.
+    ///
+    /// The held frame's pair (both lenses at one instant), from the cache when
+    /// it holds that frame, else decoded once and cached.  The pair carries
+    /// its own index, so a caller can see the frame was held.
+    /// @param heldIndex  holdFor()'s answer.
+    /// @param run        The run that decided it (for the one log line).
+    Result<FramePair> heldRead(std::uint32_t heldIndex, const UndecodableRun& run) {
+        announce(run, heldIndex);
+        if (heldPair && heldPair->index == heldIndex) {
+            return *heldPair;
+        }
+        OSV_TRY_ASSIGN(FramePair pair, decodePair(heldIndex));
+        // Host pictures only: a device pair would keep a decoder surface out
+        // of its pool for as long as the run is being looked at.
+        if (!pair.onDevice()) {
+            heldPair = pair;
+        } else {
+            heldPair.reset();
+        }
+        return pair;
     }
 };
 
@@ -660,89 +848,33 @@ Result<FramePair> DualStreamReader::read(std::uint32_t index) {
         return Error{ErrorCode::InvalidArgument, "frame " + std::to_string(index) + " out of range (" +
                                                      std::to_string(impl.frameCount) + " frames)"};
     }
-    FramePair pair;
-    pair.index = index;
 
-    if (impl.sideBySide) {
-        // ---- decode once, split ----------------------------------------------
-        Impl::LensResult whole = impl.decodeLens(0, index);
-        if (!whole.frame.ok()) {
-            return Error(whole.frame.error());
-        }
-        // ---- the shadow check (OPENOSV_VERIFY_HW_DECODE=1 only) ---------------
-        if (impl.verifyHw) {
-            impl.verifyAgainstSoftware(index, whole);
-        }
-        const PlanarFrame16& frame = whole.frame.value();
-        if (frame.width != impl.lensWidth * 2) {
-            return Error{ErrorCode::Decoder, "side-by-side frame width changed mid-stream"};
-        }
-        pair.lens[0] = Impl::halfView(frame, 0);
-        pair.lens[1] = Impl::halfView(frame, 1);
-        pair.ptsUs = frame.ptsUs;
-        // Device halves: same pitch, luma pointer shifted by half a row of
-        // samples (2 bytes each for P010, 1 byte for NV12).
-        if (whole.device && whole.device->valid()) {
-            const std::size_t bytesPerSample = (whole.device->bitShift == 6 || whole.device->bitDepth > 8) ? 2u : 1u;
-            const std::size_t byteOffset = static_cast<std::size_t>(impl.lensWidth) * bytesPerSample;
-            for (int lens = 0; lens < 2; ++lens) {
-                DeviceFrameRef ref = *whole.device;
-                ref.width = impl.lensWidth;
-                if (lens == 1) {
-                    ref.yDevice = static_cast<std::uint8_t*>(ref.yDevice) + byteOffset;
-                    ref.uvDevice = static_cast<std::uint8_t*>(ref.uvDevice) + byteOffset;
-                }
-                pair.device[static_cast<std::size_t>(lens)] = ref;
-            }
-        }
+    // ---- a frame inside a run a lens already met ------------------------------
+    // Shown as the frame before the run, on both lenses, without decoding
+    // anything after the first request (heldRead caches the held pair).
+    UndecodableRun run;
+    if (const std::optional<std::uint32_t> held = impl.holdFor(index, run)) {
+        return impl.heldRead(*held, run);
+    }
+    // The held frame itself (a host stepping back out of the run asks for
+    // it next): the cached pair IS that frame, decoded once already.
+    if (impl.heldPair && impl.heldPair->index == index) {
+        return *impl.heldPair;
+    }
+    // Outside every run: the held pair is no longer wanted.
+    impl.heldPair.reset();
+
+    // ---- the pair itself ---------------------------------------------------------
+    Result<FramePair> pair = impl.decodePair(index);
+    if (pair.ok()) {
         return pair;
     }
-
-    // ---- two decoders, two threads ----------------------------------------------
-    // Lens 0 runs on a helper thread while lens 1 decodes on this one; the
-    // helper's result is captured by value and any exception (there should
-    // be none, decoders never throw) is converted into an error.
-    Impl::LensResult slave;
-    std::string threadFailure;
-    std::thread worker([&impl, &slave, &threadFailure, index]() noexcept {
-        try {
-            slave = impl.decodeLens(0, index);
-        } catch (const std::exception& e) {
-            threadFailure = e.what();
-        } catch (...) {
-            threadFailure = "unknown exception";
-        }
-    });
-    Impl::LensResult master = impl.decodeLens(1, index);
-    worker.join();
-
-    if (!threadFailure.empty()) {
-        return Error{ErrorCode::Internal, "lens 0 decoder thread failed: " + threadFailure};
-    }
-    if (!slave.frame.ok()) {
-        return Error{slave.frame.error().code, "lens 0: " + slave.frame.error().message};
-    }
-    if (!master.frame.ok()) {
-        return Error{master.frame.error().code, "lens 1: " + master.frame.error().message};
-    }
-    const PlanarFrame16& s = slave.frame.value();
-    const PlanarFrame16& m = master.frame.value();
-    // Both tracks are written by the same encoder clock; anything beyond a
-    // single tick means the tracks are not the pair we think they are.  The
-    // tracks' own timing says so, whichever decoder read them: Timing.
-    const std::int64_t delta = s.ptsUs > m.ptsUs ? s.ptsUs - m.ptsUs : m.ptsUs - s.ptsUs;
-    if (delta > impl.ptsToleranceUs) {
-        return Error{ErrorCode::Timing, "lens presentation times differ at frame " + std::to_string(index) + ": " +
-                                            std::to_string(s.ptsUs) + " us vs " + std::to_string(m.ptsUs) + " us"};
-    }
-    pair.lens[0] = s;
-    pair.lens[1] = m;
-    pair.ptsUs = s.ptsUs;
-    if (slave.device) {
-        pair.device[0] = *slave.device;
-    }
-    if (master.device) {
-        pair.device[1] = *master.device;
+    // ---- a run met by THIS request ------------------------------------------------
+    // The lens decoder that crossed it remembered it while failing, so the
+    // same question now has an answer: the request is served the held frame
+    // instead of failing.  Any other failure is returned as it is.
+    if (const std::optional<std::uint32_t> held = impl.holdFor(index, run)) {
+        return impl.heldRead(*held, run);
     }
     return pair;
 }

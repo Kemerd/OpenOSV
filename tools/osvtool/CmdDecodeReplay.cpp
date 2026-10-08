@@ -467,6 +467,11 @@ std::string describeDecoder(const osv::video::HevcStreamDecoder* d, std::uint32_
                ", corrupt " + std::to_string(info->corrupt ? 1 : 0) + ", error flags " +
                std::to_string(info->decodeErrorFlags) + ")";
     }
+    // A run the decoder found it cannot produce (pictures whose reference
+    // the file lost) explains a failure, or a held frame, on its own.
+    if (const auto run = d->undecodableRun(request)) {
+        out += ", undecodable run " + std::to_string(run->first) + "-" + std::to_string(run->end - 1u);
+    }
     return out;
 }
 
