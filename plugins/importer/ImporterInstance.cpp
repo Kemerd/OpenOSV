@@ -1393,6 +1393,26 @@ namespace {
     return ext;
 }
 
+/// @brief The frame whose moment a lens pair's pictures show.
+///
+/// The pair readers serve a frame inside a run one lens cannot decode as the
+/// frame before the run (video::heldFrameFor): its pictures - and so the
+/// camera attitude that levels them - are that frame's, not the one asked
+/// for, and stabilising the held pictures with each requested frame's
+/// attitude would turn a still picture.  Such a pair says so: its index and
+/// both lens frames name the frame shown.  Every other pair carries the
+/// requested index and is left as it is.
+/// @param requested  The source frame the render was asked for.
+/// @param pair       The pair the reader returned for it.
+/// @return The frame to take per-frame metadata (the attitude) from.
+[[nodiscard]] std::uint32_t shownFrameOf(std::uint32_t requested, const video::FramePair& pair) noexcept {
+    if (pair.index != requested && pair.lens[0].frameIndex == pair.index &&
+        pair.lens[1].frameIndex == pair.index) {
+        return pair.index;
+    }
+    return requested;
+}
+
 /// `folder / (stem + ext)` for each of the two spellings of `exts`, the
 /// first that is an existing regular file; empty when neither is.
 [[nodiscard]] std::filesystem::path existingSibling(const std::filesystem::path& folder, const std::wstring& stem,
@@ -3886,7 +3906,8 @@ Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_
     // [WP-TEMPORAL] a bucket's anchor is decoded by this same decoder
     const ScopedPointer<video::GpuClipDecoder> analysisDecoder(m_analysisGpuDecoder, decoder->second.get());
     const AnalysisOutcome analyses = applyAnalyses(index, lease.pair(), /*draft=*/false, purpose, *pool, builder);
-    builder.stabilization(stabilizationFor(index));
+    // Levelled at the moment the pictures show (a held frame's own).
+    builder.stabilization(stabilizationFor(shownFrameOf(index, lease.pair())));
 
     // The equirect's SIZE is irrelevant to the direct renderer (it replaces
     // every view field); the mode and the stabilised Rout are what it takes.
@@ -4099,7 +4120,9 @@ Result<render::RenderJob> ImporterInstance::buildEquirectJob(std::uint32_t index
     // one set of caches (see applyAnalyses).
     outcome = applyAnalyses(index, pair, draft, purpose, pool, builder);
 
-    builder.stabilization(stabilizationFor(index));
+    // Levelled at the moment the pictures show: a frame served as the one
+    // before an undecodable run takes that frame's attitude (shownFrameOf).
+    builder.stabilization(stabilizationFor(shownFrameOf(index, pair)));
 
     // ---- a view, when one was asked for (osvtool's reframe) ---------------
     // Straight from the fisheyes, with everything above - analyses,

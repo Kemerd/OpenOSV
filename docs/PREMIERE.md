@@ -2622,7 +2622,9 @@ GOP twice (~170 ms each), with `presentation time mismatch: wanted frame N but
 decoder produced frame M` and "the stream's timing is at fault". Since then
 the decoder recognises the run the first time it crosses it, and every
 request inside it shows the last frame before the run - both lenses, one
-instant, so the stitch stays consistent - without decoding anything:
+instant, so the stitch stays consistent, levelled with that frame's own
+camera attitude so the held picture stays still - without decoding
+anything:
 
 * `video: '<clip>' track T: samples A-B cannot be decoded - they predict from
   a picture the file does not contain ...; decoding resumes at sample C` -
