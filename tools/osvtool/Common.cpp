@@ -33,6 +33,10 @@ void registerAllCommands(CLI::App& app, CommandContext& ctx) {
 #if defined(OSV_HAVE_VIDEO)
     registerExtractCommand(app, ctx);
 #endif
+#if defined(OSV_HAVE_VIDEO) && defined(OSV_HAVE_META)
+    // Replays a plug-in log's frame requests through the decoder.
+    registerDecodeReplayCommand(app, ctx);
+#endif
 #if defined(OSV_HAVE_IO)
     registerRenderCommand(app, ctx);
 #endif

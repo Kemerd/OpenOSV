@@ -44,5 +44,8 @@ void registerLutCommand(CLI::App& app, CommandContext& ctx);
 void registerSeamCommand(CLI::App& app, CommandContext& ctx);
 void registerSelfcheckCommand(CLI::App& app, CommandContext& ctx);
 void registerSphericalCommand(CLI::App& app, CommandContext& ctx);
+/// `osvtool decode-replay` (CmdDecodeReplay.cpp): a plug-in log's frame requests
+/// replayed through the decoder against a sequential software decode.
+void registerDecodeReplayCommand(CLI::App& app, CommandContext& ctx);
 
 }  // namespace osvtool
