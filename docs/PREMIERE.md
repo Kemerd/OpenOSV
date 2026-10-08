@@ -2415,3 +2415,84 @@ complete and the band was added later.
 `osvtool render ... --alpha` writes the same coverage alpha into `.exr`,
 `.tif` and `.png` stills as a fourth channel (off by default; videos carry no
 alpha), so a transparent band can be seen outside Premiere too.
+
+### Part of a proxy (.LRF) frame shows the wrong picture
+
+Blocks of an earlier or unrelated picture in part of the frame - usually the
+lower part - are a different fault from a black band: the pixels are real
+picture content, just not this frame's. Four places can produce them: the
+hardware decode (D3D11VA), the stitch, the copy into Premiere's frame buffer,
+or Premiere's own caches and effects. One session with the switches below
+tells them apart.
+
+**The switches.** Environment variables, read when Premiere starts (set them
+in a Command Prompt and start Premiere from it; a running Premiere does not
+see a change):
+
+| Variable | Effect | Cost |
+| --- | --- | --- |
+| `OSV_PLUGIN_LOG_LEVEL=debug` | Debug log, including the per-frame lines below | ~1 ms per proxy frame |
+| `OPENOSV_VERIFY_HW_DECODE=1` | Every hardware-decoded proxy picture is decoded again in software and compared; a mismatch is logged, the software picture is delivered instead, and both luma planes are written to `%LOCALAPPDATA%\OpenOSV\decode-mismatch\` (16-bit PGM, the first mismatch of each GOP, 16 pairs at most) | doubles the proxy decode (~3 ms a frame) |
+| `OPENOSV_IMPORTER_LRF_SOFTWARE=1` | The proxy decodes in software only (never D3D11VA) | ~1.3-3.5 ms a frame; a landing at the end of a GOP ~25-70 ms |
+| `OPENOSV_VERIFY_DELIVERY=1` | The `deliver:` line for every frame even below Debug | a few ms a frame |
+
+None of them touches the native .OSV streams' decoding.
+
+**What the log says** (`%LOCALAPPDATA%\OpenOSV\OpenOSVImporter.log`). The
+library's own messages and FFmpeg's now land in the plug-in log at its level
+(FFmpeg's only from WARNING up, each repeated message once per clip):
+
+* `video: opened track 1 of 'CAM_..._D.LRF': 2048x1024 ..., hw d3d11va` and
+  `video: track 1 open took ...` - each decoder that opens (Debug).
+* `ffmpeg: [h264 'CAM_..._D.LRF'] ...` - FFmpeg's own warnings and errors,
+  naming the codec and the clip they are about.
+* `decode: track 1 frame N crc C hw H key K 'clip'` - one line per decoded
+  picture (Debug): a fingerprint of every 4th row, the same for a hardware and
+  a software decode of the same picture. With the verifier on, each frame gets
+  two lines, the hardware one and the software one. `(decode_error_flags ...)`
+  or `(predicted from frame M, which was damaged)` mark a damaged picture.
+* `video: decode check: 'clip' frame N (sync S + k) differs from software:
+  ..., first bad row R, ...; decoded on d3d11va, ..., surface X; ...` - a
+  WARNING from the verifier. It names the frame, its distance from the GOP's
+  sync sample, the first bad row, and whether the software decode was clean
+  ("the hardware decode is at fault") or saw damage in the recording itself.
+* `deliver: clip 'clip' frame N WxH 32f crc T/B (matches the rendered frame)`
+  - one line per delivered frame (Debug): the CRCs of the top and bottom half
+  of the frame buffer handed to Premiere and, on the importer's host path,
+  whether it equals the rendered frame converted again. A WARNING
+  `deliver: ... the host buffer does not hold the frame that was rendered`
+  means the copy into Premiere's buffer, or the buffer, is at fault.
+* `frame N (bucket B, anchor A) of 'clip': parallax refused after ... (...,
+  consistent 18.2% (needs 25%)); ...` - the per-bucket analysis lines now name
+  the clip and, on a refusal, how much of the flow was consistent.
+
+**The five-minute check.** On the clip that shows the problem, over about two
+seconds around the damaged frame:
+
+1. Close Premiere. In a Command Prompt:
+   `set OSV_PLUGIN_LOG_LEVEL=debug` and `set OPENOSV_VERIFY_HW_DECODE=1`, then
+   start Premiere from that prompt and open the project.
+2. Scrub that stretch in the Program Monitor at 1/4, then at Full. Note the
+   first and last damaged frame each time.
+3. The same in the Source Monitor (no sequence effect applies there).
+4. Source Settings: Render Device = CPU, and scrub again.
+5. Close Premiere, start it again with `set OPENOSV_IMPORTER_LRF_SOFTWARE=1`
+   added, and repeat step 2.
+6. Send the log (and anything in `decode-mismatch\`).
+
+**Reading it.**
+
+* Damage gone with the verifier on, with `decode check` warnings saying the
+  software decode is clean: the hardware decode is at fault. Software becomes
+  the proxy's default decoder (at ~1.3-3.5 ms a frame).
+* A `deliver:` WARNING: the frame was decoded and stitched correctly and broke
+  on the way into Premiere's buffer. The copy is where to look next.
+* Every `decode check` and `deliver:` line clean while the damage persists, in
+  the Program Monitor only: Premiere's frame cache or an effect. The Source
+  Monitor and the Render Device step say which.
+
+The `decode:` fingerprints can also be compared with an offline software
+decode of the same frames:
+`OSV_SEEK_LRF=<clip> OSV_CRC_FRAMES=<first>-<last> osv_tests "[.lrfcrc]"`
+prints the same lines. A frame whose fingerprint differs was decoded
+differently in the session.

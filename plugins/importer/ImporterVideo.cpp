@@ -15,20 +15,26 @@
 #include "ImporterInstance.h"
 
 #include "FrameRowCheck.h"
+#include "HostContext.h"
 #include "PixelCopy.h"
 #include "PluginLog.h"
 
 #include "PrSDKImmersiveVideoTypes.h"
 
+#include "osv/core/Crc64.h"
 #include "osv/meta/Types.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -588,6 +594,199 @@ void checkDeliveredRows(ImporterInstance& instance, const pixelcopy::HostFrame& 
                          formatName(choice.format), scan.width, scan.height, clipNameForLog(instance),
                          frame.rowBytes, scan.badRows, scan.height, scan.worstRow, scan.worstRowOpaque,
                          scan.columns);
+    } catch (...) {
+        // A diagnostic is never worth a frame.
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  imGetSourceVideo diagnostics: the delivered frame's fingerprint
+// ---------------------------------------------------------------------------
+//
+// The row check above finds rows that came out transparent or black.  It
+// cannot see WRONG content - a block of a stale or torn picture - and it runs
+// on the first few frames of each size only, so the one frame a user saw
+// damaged was usually never checked.  The fingerprint runs on every frame
+// (at Debug, or with OPENOSV_VERIFY_DELIVERY=1) and answers two questions:
+//
+//   * which pixels went out: a CRC of the top and of the bottom half of the
+//     host buffer, next to the decoder's per-picture 'decode:' line, so a
+//     session log can be lined up with an offline render frame by frame;
+//   * did they arrive as rendered: on the host path the rendered float frame
+//     is converted AGAIN, row by row, with the very kernels rgbaToHost used
+//     (pixelcopy::rgbaRowsToHost), and its CRCs must equal the buffer's.  A
+//     difference means the copy into the host's buffer, or the buffer, is at
+//     fault - not the decoder, not the stitch.
+
+/// True when OPENOSV_VERIFY_DELIVERY is an explicit yes ("1", "true", "yes",
+/// "on", any case; anything else is no), read like the importer's other
+/// switches (importerGpuDecodeDisabledByEnvironment).
+[[nodiscard]] bool deliveryCheckRequested() noexcept {
+#if defined(_WIN32)
+    // getenv_s: the importer shares the host's C runtime environment (/MD).
+    char value[8] = {};
+    std::size_t length = 0;
+    if (getenv_s(&length, value, sizeof(value), "OPENOSV_VERIFY_DELIVERY") != 0 || length == 0) {
+        return false;
+    }
+#else
+    const char* env = std::getenv("OPENOSV_VERIFY_DELIVERY");
+    if (env == nullptr || env[0] == '\0') {
+        return false;
+    }
+    char value[8] = {};
+    std::strncpy(value, env, sizeof(value) - 1);
+#endif
+    const char c = value[0];
+    const char d = value[1];
+    return c == '1' || c == 't' || c == 'T' || c == 'y' || c == 'Y' ||
+           ((c == 'o' || c == 'O') && (d == 'n' || d == 'N'));
+}
+
+/// The two halves' fingerprints of one frame.
+struct HalfCrcs {
+    std::uint64_t top = 0;     ///< Picture rows [0, H/2).
+    std::uint64_t bottom = 0;  ///< Picture rows [H/2, H).
+};
+
+/// @brief Fold per-row CRCs (picture order, top first) into the two halves.
+///
+/// Each half is the CRC-64 of its rows' CRC-64s, in picture order: equal
+/// rows give equal halves however the row CRCs were computed (in parallel,
+/// in any order), and one wrong row changes its half.
+[[nodiscard]] HalfCrcs foldHalves(const std::vector<std::uint64_t>& rows) noexcept {
+    HalfCrcs out;
+    const std::size_t half = rows.size() / 2u;
+    out.top = osv::crc64(rows.data(), half * sizeof(std::uint64_t));
+    out.bottom = osv::crc64(rows.data() + half, (rows.size() - half) * sizeof(std::uint64_t));
+    return out;
+}
+
+/// @brief Fingerprint the frame just delivered and, on the host path, prove
+/// it holds the frame that was rendered.  See the block comment above.
+///
+/// Runs under the instance lock, after the render and BEFORE the frame goes
+/// into the host's cache, like checkDeliveredRows.  Rows are hashed in
+/// parallel on the renderers' pool (the whole frame, not a sample: a torn
+/// copy can be a handful of rows anywhere).  Read-only on the buffer; never
+/// throws, never fails the frame.
+///
+/// @param instance    The clip (lock held by the caller).
+/// @param frame       The host buffer just written (bottom-left, `layout`).
+/// @param layout      Its pixel layout.
+/// @param frameIndex  The frame delivered.
+/// @param geometry    The size it was rendered at.
+/// @param draft       Whether the request was a draft (for the line).
+void fingerprintDelivery(ImporterInstance& instance, const pixelcopy::HostFrame& frame,
+                         pixelcopy::HostPixelFormat layout, std::uint32_t frameIndex, const OutputGeometry& geometry,
+                         bool draft) noexcept {
+    try {
+        // ---- is it wanted? ----------------------------------------------------------
+        const bool requested = deliveryCheckRequested();
+        if (!requested && !PluginLog::enabled(PluginLog::Level::Debug)) {
+            return;
+        }
+        const std::size_t bpp = pixelcopy::bytesPerPixel(layout);
+        if (bpp == 0 || !frame.valid(bpp)) {
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::uint32_t width = frame.width;
+        const std::uint32_t height = frame.height;
+        const std::size_t rowBytes = static_cast<std::size_t>(width) * bpp;
+
+        // ---- the rendered frame, when this one took the host path -------------------
+        const render::ImageRGBAf* image = instance.lastHostFrameLocked(frameIndex, geometry);
+        if (image != nullptr && (image->w != width || image->h != height)) {
+            image = nullptr;  // not the frame in this buffer: compare nothing
+        }
+
+        // ---- per-row CRCs, in parallel ------------------------------------------------
+        std::vector<std::uint64_t> delivered(height, 0u);
+        std::vector<std::uint64_t> rendered(image != nullptr ? height : 0u, 0u);
+        std::atomic<bool> failed{false};
+        const auto body = [&](std::size_t r) {
+            try {
+                const auto y = static_cast<std::uint32_t>(r);
+                // The buffer's row holding picture row y (bottom-left origin;
+                // the pitch may be negative).
+                const char* hostRow = frame.base + static_cast<std::ptrdiff_t>(height - 1u - y) *
+                                                       static_cast<std::ptrdiff_t>(frame.rowBytes);
+                delivered[y] = osv::crc64(hostRow, rowBytes);
+                if (image == nullptr) {
+                    return;
+                }
+                // The same row converted again, into this thread's scratch row:
+                // rgbaRowsToHost with a one-row frame writes exactly the bytes
+                // rgbaToHost wrote for that row (same kernels, no pool).
+                thread_local std::vector<char> scratch;
+                if (scratch.size() < rowBytes) {
+                    scratch.resize(rowBytes);
+                }
+                pixelcopy::RgbaRows src;
+                src.base = image->row(y);
+                src.pitchBytes = static_cast<std::size_t>(width) * pixelcopy::kBytesPerPixel32f;
+                src.width = width;
+                src.rows = 1;
+                pixelcopy::HostFrame one;
+                one.base = scratch.data();
+                one.rowBytes = static_cast<std::int32_t>(rowBytes);
+                one.width = width;
+                one.height = 1;
+                if (!pixelcopy::rgbaRowsToHost(src, 0, one, layout, nullptr).ok()) {
+                    failed.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                rendered[y] = osv::crc64(scratch.data(), rowBytes);
+            } catch (...) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+        };
+        std::shared_ptr<ThreadPool> pool;
+        if (HostContext::exists()) {
+            pool = HostContext::instance().threadPoolShared();
+        }
+        if (pool) {
+            if (!pool->parallelRows(height, 16, body).ok()) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+        } else {
+            for (std::uint32_t y = 0; y < height; ++y) {
+                body(y);
+            }
+        }
+        if (failed.load()) {
+            PluginLog::debug("deliver: clip '{}' frame {}: fingerprint failed", clipNameForLog(instance), frameIndex);
+            return;
+        }
+
+        // ---- the line, and the verdict --------------------------------------------------
+        const HalfCrcs out = foldHalves(delivered);
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const PluginLog::Level level = requested ? PluginLog::Level::Info : PluginLog::Level::Debug;
+        if (image == nullptr) {
+            PluginLog::logf(level, "deliver: clip '{}' frame {} {}x{} {} crc {:016x}/{:016x} (gpu path, nothing "
+                                   "to compare), {}{:.1f} ms",
+                            clipNameForLog(instance), frameIndex, width, height,
+                            pixelcopy::hostPixelFormatName(layout), out.top, out.bottom, draft ? "draft, " : "", ms);
+            return;
+        }
+        const HalfCrcs expected = foldHalves(rendered);
+        const bool same = expected.top == out.top && expected.bottom == out.bottom;
+        PluginLog::logf(level, "deliver: clip '{}' frame {} {}x{} {} crc {:016x}/{:016x} ({} the rendered frame), "
+                               "{}{:.1f} ms",
+                        clipNameForLog(instance), frameIndex, width, height, pixelcopy::hostPixelFormatName(layout),
+                        out.top, out.bottom, same ? "matches" : "DIFFERS FROM", draft ? "draft, " : "", ms);
+        if (!same) {
+            PluginLog::warn("deliver: clip '{}' frame {} {}x{} {}: the host buffer does not hold the frame that was "
+                            "rendered (top {:016x} vs {:016x}{}, bottom {:016x} vs {:016x}{}); the copy into the host's "
+                            "buffer, or the buffer itself, is at fault",
+                            clipNameForLog(instance), frameIndex, width, height,
+                            pixelcopy::hostPixelFormatName(layout), out.top, expected.top,
+                            out.top == expected.top ? "" : " DIFFERS", out.bottom, expected.bottom,
+                            out.bottom == expected.bottom ? "" : " DIFFERS");
+        }
     } catch (...) {
         // A diagnostic is never worth a frame.
     }
@@ -1228,6 +1427,11 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
     // the size the host asked for.  Read-only, under the lock, before the
     // frame is cached.
     checkDeliveredRows(*instance, dst, layout, choice, frameIndex, draft);
+    // ---- the delivered frame's fingerprint (Debug / OPENOSV_VERIFY_DELIVERY) --
+    // Every frame, unlike the row check: the CRCs of what went out and, on
+    // the host path, proof that it is the frame that was rendered.  Also
+    // under the lock and before the cache, so it describes the cached frame.
+    fingerprintDelivery(*instance, dst, layout, frameIndex, geometry, draft);
 
     // ---- cache + hand over -------------------------------------------------
     // [WP-STEADY] Only a frame with its final pixels is cached.  An

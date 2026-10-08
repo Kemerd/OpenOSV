@@ -510,6 +510,28 @@ public:
     /// keep showing it after the real analysis landed.
     [[nodiscard]] bool lastRenderExact() const noexcept { return m_lastRenderExact; }
 
+    /// @brief The float frame the most recent renderFrameToHost() converted
+    /// into the host's buffer, for the importer's delivery check.
+    ///
+    /// Non-null only when that render took the HOST path (the GPU path
+    /// streams its bands straight into the buffer, with no float frame on
+    /// the host) and the frame cache still holds exactly frame `index` at
+    /// `geometry` - which it does for the whole of the lock() hold the render
+    /// ran under, since nothing else writes the cache without the lock.
+    /// Read-only; never renders.  The caller MUST hold lock().
+    ///
+    /// @param index     The frame just delivered.
+    /// @param geometry  The size it was delivered at.
+    /// @return The frame, or nullptr.
+    [[nodiscard]] const render::ImageRGBAf* lastHostFrameLocked(std::uint32_t index,
+                                                                const OutputGeometry& geometry) const noexcept {
+        if (lastFramePath() != FramePath::Host || m_lastFrame.frameIndex != index ||
+            !(m_lastFrame.geometry == geometry) || !m_lastFrame.image.valid()) {
+            return nullptr;
+        }
+        return &m_lastFrame.image;
+    }
+
     // ---- [WP-V-GPU] the stitched frame, left on the GPU for a caller -------
     //
     // An OpenFX host that hands only CPU images (VEGAS Pro) would otherwise

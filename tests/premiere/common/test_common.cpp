@@ -25,6 +25,7 @@
 #include "PrefsBlob.h"
 #include "TestLogIsolation.h"
 
+#include "osv/core/Log.h"
 #include "osv/core/ThreadPool.h"
 #include "osv/render/ImageRGBAf.h"
 
@@ -1040,6 +1041,92 @@ TEST_CASE("PluginLog writes, filters by level and rotates", "[common][log]") {
     // Logging after shutdown() must not crash (it only reaches the debugger).
     PluginLog::error("after shutdown");
     REQUIRE(PluginLog::filePath().empty());
+    std::filesystem::remove(std::filesystem::path(path), ec);
+    std::filesystem::remove(std::filesystem::path(path + L".1"), ec);
+}
+
+TEST_CASE("PluginLog::init routes the library's log into the plug-in log, at its level", "[common][log]") {
+    // Inside a host there is no stderr anybody reads, so before this every
+    // library message - FFmpeg's included - was lost in Premiere.
+    const std::wstring name = L"osv_libsink_" + std::to_wstring(GetCurrentProcessId());
+    const auto readFile = [](const std::wstring& logPath) {
+        const HANDLE handle = CreateFileW(logPath.c_str(), GENERIC_READ,
+                                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            return std::string();
+        }
+        LARGE_INTEGER size{};
+        std::string text;
+        if (GetFileSizeEx(handle, &size) && size.QuadPart > 0) {
+            text.resize(static_cast<std::size_t>(size.QuadPart));
+            DWORD read = 0;
+            ReadFile(handle, text.data(), static_cast<DWORD>(text.size()), &read, nullptr);
+            text.resize(read);
+        }
+        CloseHandle(handle);
+        return text;
+    };
+    const auto countOf = [](const std::string& text, const std::string& needle) {
+        std::size_t n = 0;
+        for (std::size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) {
+            ++n;
+        }
+        return n;
+    };
+
+    // ---- a clean file for this test ---------------------------------------------------
+    REQUIRE(PluginLog::init(name));
+    const std::wstring path = PluginLog::filePath();
+    REQUIRE_FALSE(path.empty());
+    PluginLog::shutdown();
+    std::error_code ec;
+    std::filesystem::remove(std::filesystem::path(path), ec);
+    REQUIRE(PluginLog::init(name));
+
+    // ---- the library's lines land in the file, at PluginLog's level -----------------
+    PluginLog::setLevel(PluginLog::Level::Info);
+    CHECK(osv::log::level() == osv::log::Level::Info);
+    CHECK_FALSE(osv::log::enabled(osv::log::Level::Debug));
+    osv::log::info("library-marker {}", 7);
+    osv::log::debug("library-debug-marker");
+    std::string text = readFile(path);
+    CHECK(countOf(text, "library-marker 7") == 1u);
+    CHECK(countOf(text, "library-debug-marker") == 0u);
+    // setLevel carries the level over: Debug lets the library's Debug through.
+    PluginLog::setLevel(PluginLog::Level::Debug);
+    CHECK(osv::log::enabled(osv::log::Level::Debug));
+    osv::log::debug("library-debug-marker");
+    text = readFile(path);
+    CHECK(countOf(text, "library-debug-marker") == 1u);
+    CHECK(countOf(text, "[DEBUG]") >= 1u);
+
+    // ---- FFmpeg: each warning / error shape once per clip; no informational lines -----
+    const std::string clipA = "[h264 'libsink_a_" + std::to_string(GetCurrentProcessId()) + ".LRF'] ";
+    const std::string clipB = "[h264 'libsink_b_" + std::to_string(GetCurrentProcessId()) + ".LRF'] ";
+    osv::log::message(osv::log::Level::Error, "ffmpeg: " + clipA + "error while decoding MB 12 34, bytestream 5");
+    osv::log::message(osv::log::Level::Error, "ffmpeg: " + clipA + "error while decoding MB 13 34, bytestream 19");
+    osv::log::message(osv::log::Level::Error, "ffmpeg: " + clipB + "error while decoding MB 12 34, bytestream 5");
+    osv::log::message(osv::log::Level::Warn, "ffmpeg: " + clipA + "error while decoding MB 1 2, bytestream 3");
+    osv::log::message(osv::log::Level::Debug, "ffmpeg: " + clipA + "informational chatter");
+    text = readFile(path);
+    // Clip A's error once (the second differs only in its numbers), clip B's
+    // once (another clip), and the warning of the same shape once (another
+    // level): three lines.  The informational one never reaches the file.
+    CHECK(countOf(text, "error while decoding MB") == 3u);
+    CHECK(countOf(text, "ffmpeg: " + clipA + "error while decoding MB 12 34") == 1u);
+    CHECK(countOf(text, "ffmpeg: " + clipA + "error while decoding MB 13 34") == 0u);
+    CHECK(countOf(text, "ffmpeg: " + clipB) == 1u);
+    CHECK(countOf(text, "informational chatter") == 0u);
+
+    // ---- off: nothing from the library either ------------------------------------------
+    PluginLog::setLevel(PluginLog::Level::Off);
+    CHECK_FALSE(osv::log::enabled(osv::log::Level::Error));
+    osv::log::error("library-after-off");
+    CHECK(countOf(readFile(path), "library-after-off") == 0u);
+
+    PluginLog::setLevel(PluginLog::Level::Error);
+    PluginLog::shutdown();
     std::filesystem::remove(std::filesystem::path(path), ec);
     std::filesystem::remove(std::filesystem::path(path + L".1"), ec);
 }

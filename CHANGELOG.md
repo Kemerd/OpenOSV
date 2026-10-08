@@ -6,6 +6,30 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## 0.5.1 (unreleased)
+
+### Added
+
+* The plug-in logs now carry the library's own messages and FFmpeg's, at the
+  log's level. Before, inside Premiere, they went nowhere. FFmpeg lines name
+  the codec and the clip they are about, and arrive from WARNING up, each
+  repeated message once per clip.
+* Diagnostics for a proxy frame with the wrong picture in part of it
+  (docs/PREMIERE.md, Troubleshooting). At Debug, every decoded picture and
+  every delivered frame gets a fingerprint line. `OPENOSV_VERIFY_HW_DECODE=1`
+  checks every hardware-decoded proxy picture against a software decode and
+  delivers the software one on a mismatch. `OPENOSV_IMPORTER_LRF_SOFTWARE=1`
+  decodes the proxy in software only. `OPENOSV_VERIFY_DELIVERY=1` checks that
+  the frame handed to Premiere is the frame that was rendered.
+* The per-bucket parallax lines in the log name the clip, and a refusal says
+  how much of the flow was consistent.
+
+### Fixed
+
+* A hardware-decoded picture that FFmpeg flags as damaged, or that is
+  predicted from one, is decoded again in software instead of being
+  delivered.
+
 ## [0.5.0] - 2026-10-07
 
 8K and night footage, fixed at the cause. Built on a user's car-mounted 8K

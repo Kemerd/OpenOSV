@@ -27,6 +27,7 @@
 #include "ContainerSource.h"
 #include "FfmpegCommon.h"
 #include "HwDeviceCache.h"
+#include "osv/core/Crc64.h"
 #include "osv/core/Log.h"
 #include "osv/core/MappedFile.h"
 
@@ -69,10 +70,75 @@ namespace {
 // =============================================================================
 namespace {
 
+/// "OSVTAG01": marks an AVCodecContext::opaque that points at a CodecLogTag.
+/// The trailing digits are the layout version; a change to CodecLogTag must
+/// change them, so a module of another build never misreads one.
+constexpr std::uint64_t kCodecLogTagMagic = 0x4F53565441473031ull;
+
+/// @brief What every one of our AVCodecContexts carries in `opaque`.
+///
+/// av_log_set_callback() is PROCESS-wide: the importer (.prm) and the effect
+/// (.aex) each link this file and share one avutil DLL, so whichever module
+/// installed its callback last receives the FFmpeg messages of BOTH modules'
+/// decoders, and of the frame-thread copies FFmpeg makes of each context
+/// (those copy `opaque` too).  A line is only useful if it says which clip it
+/// is about, so the context names its clip in a plain, standard-layout record
+/// any module's callback can read without knowing Impl's layout: the magic
+/// first, then the owning decoder (for get_format), then the clip's file name.
+struct CodecLogTag {
+    std::uint64_t magic = 0;  ///< kCodecLogTagMagic once filled in.
+    void* owner = nullptr;    ///< The HevcStreamDecoder::Impl the context belongs to.
+    char clip[96] = {};       ///< The clip's file name, 7-bit safe, NUL-terminated (truncated if longer).
+};
+
+/// @brief "[h264 'CAM_..._D.LRF'] " - who an FFmpeg message is about.
+///
+/// The AVClass item name (the codec for a codec context, the demuxer for a
+/// format context) and, for our own codec contexts, the clip.  Every AVClass
+/// pointer is the first member of the struct FFmpeg logs with, so `avcl` can
+/// be read that far for any message.  Never throws: a tag that cannot be
+/// built is left out, the message itself still goes through.
+///
+/// @param avcl  The context FFmpeg passed to its log callback (may be null).
+/// @return The tag with a trailing space, or an empty string.
+std::string ffmpegLogTag(void* avcl) noexcept {
+    try {
+        if (avcl == nullptr) {
+            return {};
+        }
+        const AVClass* cls = *static_cast<const AVClass* const*>(avcl);
+        if (cls == nullptr) {
+            return {};
+        }
+        // ---- the item: "h264", "hevc", "mov,mp4,m4a,3gp,3g2,mj2", ... ----------
+        const char* item = cls->item_name ? cls->item_name(avcl) : cls->class_name;
+        std::string out = "[";
+        out += log::safe(item ? item : "?");
+        // ---- the clip, for a codec context that carries our tag --------------------
+        if (cls == avcodec_get_class()) {
+            const auto* ctx = static_cast<const AVCodecContext*>(avcl);
+            const auto* tag = static_cast<const CodecLogTag*>(ctx->opaque);
+            if (tag != nullptr && tag->magic == kCodecLogTagMagic && tag->clip[0] != '\0') {
+                // Bounded read: the array is NUL-terminated by construction,
+                // but a foreign record must not make this run past it.
+                const std::size_t n = ::strnlen(tag->clip, sizeof(tag->clip));
+                out += " '";
+                out.append(tag->clip, n);
+                out += "'";
+            }
+        }
+        out += "] ";
+        return out;
+    } catch (...) {
+        return {};
+    }
+}
+
 /// Forward libav* log lines into osv::log so host applications see them in
 /// their own sink.  Messages are truncated to a sane length and scrubbed to
-/// 7-bit ASCII.
-void ffmpegLogCallback(void* /*avcl*/, int level, const char* fmt, va_list args) {
+/// 7-bit ASCII, and tagged with the codec and clip they are about
+/// (ffmpegLogTag) because the callback serves every decoder in the process.
+void ffmpegLogCallback(void* avcl, int level, const char* fmt, va_list args) {
     if (!fmt) {
         return;
     }
@@ -109,7 +175,7 @@ void ffmpegLogCallback(void* /*avcl*/, int level, const char* fmt, va_list args)
     if (text.empty()) {
         return;
     }
-    log::message(target, "ffmpeg: " + log::safe(text));
+    log::message(target, "ffmpeg: " + ffmpegLogTag(avcl) + log::safe(text));
 }
 
 /// Install the callback exactly once per process.
@@ -252,6 +318,21 @@ struct HevcStreamDecoder::Impl {
 
     // ---- diagnostics --------------------------------------------------------
     DecoderOpenTimings timings;           ///< Filled phase by phase while open() runs.
+    /// What codecCtx->opaque points at: the clip name for FFmpeg's log lines
+    /// and the way back to this Impl for get_format (see CodecLogTag).  A
+    /// member of the heap-allocated Impl, so its address is stable for the
+    /// codec context's whole life, moves of the decoder included.
+    CodecLogTag logTag;
+    std::optional<DecodedFrameInfo> lastInfo;  ///< lastFrameInfo(): the last picture returned or refused.
+    /// The first picture since the last key frame that libavcodec flagged as
+    /// damaged, catch-up pictures included (DecodedFrameInfo::gopDamagedAt);
+    /// -1 when none.  Reset by every key frame and every seek.
+    std::int64_t gopDamagedAt = -1;
+    /// Damaged SOFTWARE pictures warned about so far; after
+    /// kFlaggedSoftwareWarnings the rest are logged at Debug, so one broken
+    /// recording cannot flood a log with a line per frame.
+    std::uint32_t flaggedSoftwareWarnings = 0;
+    static constexpr std::uint32_t kFlaggedSoftwareWarnings = 3;
 
     // ---- lifetime -----------------------------------------------------------
     ~Impl() { close(); }
@@ -274,7 +355,15 @@ struct HevcStreamDecoder::Impl {
             avio = nullptr;
         }
         container.reset();
+        // The codec context (and every frame-thread copy of it) is gone, so
+        // nothing reads the tag any more; clearing the magic makes a stale
+        // pointer to it fail the check instead of naming a closed clip.
+        logTag.magic = 0;
+        logTag.owner = nullptr;
     }
+
+    /// The clip's file name as it appears in this decoder's log lines.
+    [[nodiscard]] const char* clipForLog() const noexcept { return logTag.clip[0] != '\0' ? logTag.clip : "?"; }
 
     // -------------------------------------------------------------------------
     //  AVIO callbacks over the mapping
@@ -324,7 +413,9 @@ struct HevcStreamDecoder::Impl {
     //  get_format: pick the hardware surface format when one was set up
     // -------------------------------------------------------------------------
     static AVPixelFormat getFormat(AVCodecContext* ctx, const AVPixelFormat* formats) noexcept {
-        Impl* self = ctx ? static_cast<Impl*>(ctx->opaque) : nullptr;
+        // opaque is the CodecLogTag (see openCodec); its owner is this Impl.
+        const auto* tag = ctx ? static_cast<const CodecLogTag*>(ctx->opaque) : nullptr;
+        Impl* self = (tag != nullptr && tag->magic == kCodecLogTagMagic) ? static_cast<Impl*>(tag->owner) : nullptr;
         if (!formats) {
             return AV_PIX_FMT_NONE;
         }
@@ -705,6 +796,7 @@ struct HevcStreamDecoder::Impl {
         avcodec_flush_buffers(codecCtx.get());
         eofSent = false;
         lastDecodedIndex = -1;
+        gopDamagedAt = -1;  // a decode from a sync sample inherits nothing
         if (samplesMode) {
             sampleCursor = container ? container->previousSync(index) : 0;
             return okStatus();
@@ -974,6 +1066,10 @@ struct HevcStreamDecoder::Impl {
             const std::int64_t pts = framePts(*frame);
             const std::int64_t fi = indexFromPts(pts);
             lastDecodedIndex = fi;
+            // Damage is tracked over EVERY picture, catch-up ones included:
+            // the picture asked for may be clean by its own flags and still
+            // predicted from a damaged one earlier in the GOP.
+            noteGopDamage(*frame, fi);
             if (fi < static_cast<std::int64_t>(index)) {
                 continue;  // still catching up from the sync sample
             }
@@ -986,6 +1082,37 @@ struct HevcStreamDecoder::Impl {
                                                      " but decoder produced frame " + std::to_string(fi) + " (pts " +
                                                      std::to_string(pts) + ")"};
             }
+            // ---- what libavcodec said about this picture ---------------------------
+            // Read BEFORE wrapFrame, which hands the AVFrame on (and replaces
+            // a hardware surface with its host copy, losing the surface).
+            const DecodedFrameInfo info = describeFrame(*frame, index);
+            lastInfo = info;
+            const bool flagged = info.corrupt || info.decodeErrorFlags != 0;
+            if ((flagged || info.gopDamagedAt >= 0) && info.hw != HwAccel::None) {
+                // A hardware picture libavcodec itself flagged as damaged -
+                // or one predicted from such a picture earlier in its GOP -
+                // is refused: a Decoder error is what the importer's
+                // readPair() answers with a software decode of the same
+                // frame, and a damaged picture must never be the one
+                // delivered.  The position is forgotten so the next request
+                // starts afresh from its sync sample instead of predicting
+                // from it.
+                invalidatePosition();
+                const std::string which = flagged ? std::string()
+                                                  : " (predicted from frame " + std::to_string(info.gopDamagedAt) +
+                                                        ", which was)";
+                return Error{ErrorCode::Decoder, "the " + std::string(hwAccelName(info.hw)) +
+                                                     " decoder flagged frame " + std::to_string(index) + " of '" +
+                                                     clipForLog() + "' as damaged" + which + " (" + flagsText(info) +
+                                                     ")"};
+            }
+            if (flagged) {
+                // Software has no better decoder to fall back to: the picture
+                // (with libavcodec's concealment) is still the best there is,
+                // so it is served, and the log says it is damaged.
+                noteFlaggedSoftwarePicture(info);
+            }
+
             auto wrapped = wrapFrame(std::move(frame), pts, index);
             if (!wrapped.ok()) {
                 invalidatePosition();
@@ -994,7 +1121,92 @@ struct HevcStreamDecoder::Impl {
             lastPts = pts;
             nextIndex = index + 1;
             positionValid = true;
+
+            // ---- the fingerprint line (Debug) --------------------------------------
+            // One line per picture handed out, so a host session's log can be
+            // diffed frame by frame with an offline software decode
+            // (frameFingerprint brings both layouts to one).  A picture left
+            // on the device (CUDA keepOnDevice) cannot be read from here.
+            if (log::enabled(log::Level::Debug)) {
+                const PlanarFrame16& out = wrapped.value();
+                const std::string crc = lastDevice.has_value() ? std::string("device")
+                                                               : std::format("{:016x}", frameFingerprint(out));
+                // Its own damage flags, or the damaged picture it inherits from.
+                std::string damage;
+                if (flagged) {
+                    damage = " (" + flagsText(info) + ")";
+                } else if (info.gopDamagedAt >= 0) {
+                    damage = std::format(" (predicted from frame {}, which was damaged)", info.gopDamagedAt);
+                }
+                log::debug("decode: track {} frame {} crc {} hw {} key {}{} '{}'", trackId, index, crc,
+                           hwAccelName(info.hw), info.keyFrame ? 1 : 0, damage, clipForLog());
+            }
             return std::move(wrapped).value();
+        }
+    }
+
+    /// @brief Read libavcodec's own verdict on a decoded picture.
+    /// @param f      The picture, straight from avcodec_receive_frame.
+    /// @param index  The frame index it was decoded for.
+    /// @return The flags, the key-frame bit, the path and (D3D11VA) surface.
+    [[nodiscard]] DecodedFrameInfo describeFrame(const AVFrame& f, std::uint32_t index) const noexcept {
+        DecodedFrameInfo info;
+        info.index = index;
+        // A software picture after a get_format fallback reports None, even
+        // though the decoder opened on hardware: the surface format decides.
+        const auto format = static_cast<AVPixelFormat>(f.format);
+        info.hw = isHwFormat(format) ? activeHw : HwAccel::None;
+        info.keyFrame = (f.flags & AV_FRAME_FLAG_KEY) != 0;
+        info.corrupt = (f.flags & AV_FRAME_FLAG_CORRUPT) != 0;
+        info.decodeErrorFlags = f.decode_error_flags;
+        // D3D11VA frames: data[0] is the texture array, data[1] the slice.
+        if (format == AV_PIX_FMT_D3D11) {
+            info.surface = static_cast<std::int64_t>(reinterpret_cast<std::intptr_t>(f.data[1]));
+        }
+        info.gopDamagedAt = gopDamagedAt;  // noteGopDamage() already saw this picture
+        return info;
+    }
+
+    /// @brief Keep gopDamagedAt up to date with one received picture.
+    ///
+    /// A key frame starts a clean slate (nothing before it is referenced);
+    /// the first flagged picture after it is remembered until the next one.
+    /// @param f   The picture, straight from avcodec_receive_frame.
+    /// @param fi  Its frame index.
+    void noteGopDamage(const AVFrame& f, std::int64_t fi) noexcept {
+        if ((f.flags & AV_FRAME_FLAG_KEY) != 0) {
+            gopDamagedAt = -1;
+        }
+        const bool flagged = (f.flags & AV_FRAME_FLAG_CORRUPT) != 0 || f.decode_error_flags != 0;
+        if (flagged && gopDamagedAt < 0) {
+            gopDamagedAt = fi;
+        }
+    }
+
+    /// "decode_error_flags 0x4, corrupt no" - the two damage signals of a picture.
+    [[nodiscard]] static std::string flagsText(const DecodedFrameInfo& info) {
+        return std::format("decode_error_flags 0x{:x}, corrupt {}", static_cast<unsigned>(info.decodeErrorFlags),
+                           info.corrupt ? "yes" : "no");
+    }
+
+    /// Warn about a damaged software picture (the first few per decoder; the
+    /// rest at Debug, see kFlaggedSoftwareWarnings).
+    void noteFlaggedSoftwarePicture(const DecodedFrameInfo& info) noexcept {
+        try {
+            if (flaggedSoftwareWarnings < kFlaggedSoftwareWarnings) {
+                ++flaggedSoftwareWarnings;
+                log::warn("video: frame {} of track {} of '{}' decoded with damage ({}); serving libavcodec's "
+                          "concealed picture{}",
+                          info.index, trackId, clipForLog(), flagsText(info),
+                          flaggedSoftwareWarnings == kFlaggedSoftwareWarnings
+                              ? " (further damaged frames of this track are logged at debug level)"
+                              : "");
+            } else {
+                log::debug("video: frame {} of track {} of '{}' decoded with damage ({})", info.index, trackId,
+                           clipForLog(), flagsText(info));
+            }
+        } catch (...) {
+            // A log line is never worth a frame.
         }
     }
 
@@ -1010,6 +1222,27 @@ struct HevcStreamDecoder::Impl {
     // -------------------------------------------------------------------------
     //  Open helpers
     // -------------------------------------------------------------------------
+
+    /// @brief Fill the CodecLogTag the codec context's `opaque` will point at.
+    ///
+    /// The clip's file name, scrubbed to 7-bit ASCII (log::safe) and cut to
+    /// the tag's fixed size so any module can read it without an allocation.
+    void fillLogTag() noexcept {
+        logTag = CodecLogTag{};
+        logTag.owner = this;
+        try {
+            const std::string name = log::safe(path.filename().string());
+            const std::size_t n = std::min(name.size(), sizeof(logTag.clip) - 1);
+            std::memcpy(logTag.clip, name.data(), n);
+            logTag.clip[n] = '\0';
+        } catch (...) {
+            // A name that cannot be built (allocation failure) leaves the
+            // tag nameless; the lines then carry the codec only.
+            logTag.clip[0] = '\0';
+        }
+        // The magic last: a reader that sees it sees a complete record.
+        logTag.magic = kCodecLogTagMagic;
+    }
 
     /// Create the codec context for `codecId` with `extradata` (may be
     /// empty) and the requested threading / hardware configuration.
@@ -1047,7 +1280,11 @@ struct HevcStreamDecoder::Impl {
         codecCtx->thread_count = std::max(0, threads);
         codecCtx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
         codecCtx->pkt_timebase = AVRational{timeBase.num, timeBase.den};
-        codecCtx->opaque = this;
+        // opaque names the clip for FFmpeg's log lines (any module's
+        // callback reads it, see CodecLogTag) and leads get_format back to
+        // this Impl.  Filled in BEFORE avcodec_open2, which may already log.
+        fillLogTag();
+        codecCtx->opaque = &logTag;
         codecCtx->get_format = &Impl::getFormat;
 
         // Hardware: honour the request, or walk the Auto preference list.
@@ -1500,6 +1737,61 @@ std::optional<std::int64_t> HevcStreamDecoder::lastPts() const noexcept {
 
 std::optional<DeviceFrameRef> HevcStreamDecoder::lastDeviceFrame() const {
     return m_impl ? m_impl->lastDevice : std::nullopt;
+}
+
+std::optional<DecodedFrameInfo> HevcStreamDecoder::lastFrameInfo() const noexcept {
+    return m_impl ? m_impl->lastInfo : std::nullopt;
+}
+
+// -----------------------------------------------------------------------------
+//  Content fingerprint (declared in Decoder.h)
+// -----------------------------------------------------------------------------
+std::uint64_t frameFingerprint(const PlanarFrame16& frame) noexcept {
+    // Every 4th row: a quarter of the bytes, and still every 16-row block.
+    constexpr std::uint32_t kRowStep = 4;
+    if (!frame.valid() || frame.bitShift > 15) {
+        return 0;
+    }
+    try {
+        // One row of normalised samples at a time: the same values whatever
+        // the layout (planar / interleaved chroma, 10-bit low / P010 high).
+        // A row whose samples are already contiguous and unshifted is hashed
+        // in place - the same bytes, without the copy, which is about half
+        // the cost on a software or widened 8-bit picture.
+        std::vector<std::uint16_t> row(std::max(frame.width, frame.chromaW));
+        std::uint64_t crc = 0;
+        const auto hashRow = [&](const std::uint16_t* src, std::uint32_t count, std::size_t step) {
+            const std::size_t bytes = static_cast<std::size_t>(count) * sizeof(std::uint16_t);
+            if (step == 1u && frame.bitShift == 0u) {
+                crc = crc64(src, bytes, crc);
+                return;
+            }
+            for (std::uint32_t x = 0; x < count; ++x) {
+                row[x] = static_cast<std::uint16_t>(src[static_cast<std::size_t>(x) * step] >> frame.bitShift);
+            }
+            crc = crc64(row.data(), bytes, crc);
+        };
+
+        // ---- luma ---------------------------------------------------------------
+        for (std::uint32_t y = 0; y < frame.height; y += kRowStep) {
+            hashRow(frame.plane[0] + static_cast<std::size_t>(y) * frame.strideElems[0], frame.width, 1u);
+        }
+
+        // ---- Cb, then Cr ---------------------------------------------------------
+        // Interleaved chroma (NV12 / P010) steps two samples per column; the
+        // Cr pointer of such a frame already starts one sample in.
+        const std::size_t step = frame.chromaInterleaved ? 2u : 1u;
+        for (std::size_t c = 1; c <= 2; ++c) {
+            for (std::uint32_t y = 0; y < frame.chromaH; y += kRowStep) {
+                hashRow(frame.plane[c] + static_cast<std::size_t>(y) * frame.strideElems[c], frame.chromaW, step);
+            }
+        }
+        return crc;
+    } catch (...) {
+        // Only the row buffer can fail (allocation); a fingerprint is never
+        // worth an exception into a decode.
+        return 0;
+    }
 }
 
 std::optional<std::uint32_t> HevcStreamDecoder::previousSyncIndex(std::uint32_t index) const noexcept {
