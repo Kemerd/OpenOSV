@@ -48,6 +48,7 @@
 #include "osv/io/FfmpegPipe.h"
 #include "osv/io/ImageWriter.h"
 #include "osv/io/SphericalMetadata.h"
+#include "osv/render/FlowBackend.h"
 #include "osv/render/LensShading.h"
 #include "osv/render/ParallaxWarp.h"
 #include "osv/render/PhotoSeam.h"
@@ -727,6 +728,30 @@ private:
     std::mutex m_errorMutex;
 };
 
+/// One log line, before the first frame, naming the flow solver this render
+/// will run and whether it is the one the plug-ins ship.
+///
+/// WHY: osvtool's default (`auto`) prefers the neural solver whenever this
+/// build carries it and its model is installed, while the Premiere, Resolve
+/// and VEGAS plug-ins carry only the classical solver (CPU or its CUDA
+/// twin).  A render meant to show what a plug-in draws therefore has to pass
+/// `--flow-backend classical`, and this line is how a log proves that it did.
+/// `token` is the `--flow-backend` word as given (already validated by the
+/// caller; anything else is reported as the automatic choice).
+void logFlowBackendChoice(std::string_view token) {
+    if (token == "classical") {
+        log::info("flow backend: classical (the solver the Premiere, Resolve and VEGAS plug-ins run)");
+    } else if (token == "neural") {
+        log::info("flow backend: neural (NOT what the plug-ins run; pass --flow-backend classical to match them)");
+    } else if (render::haveNeuralFlowBackend()) {
+        log::info("flow backend: auto (the neural solver when its model is installed, else classical; the "
+                  "plug-ins run classical, pass --flow-backend classical to match them)");
+    } else {
+        log::info("flow backend: auto (this build has no neural solver, so the classical one runs: the "
+                  "plug-ins' solver)");
+    }
+}
+
 /// Scene Light for the classic pipeline: `auto` decides it exactly as the
 /// plug-ins do - the clip's metered light, and for a dark clip the levelled
 /// zenith cap on the lens rotation fit's three sample frames - with the
@@ -913,6 +938,11 @@ int runRender(const RenderOptions& o) {
     } else {
         std::fprintf(stderr, "error: unknown --flow-backend '%s'\n", log::safe(o.flowBackend).c_str());
         return kExitUsage;
+    }
+    // Only a parallax render runs a flow solver, so only then is the choice
+    // worth a line; a plain stitch would mislead with it.
+    if (o.parallax) {
+        logFlowBackendChoice(o.flowBackend);
     }
 
     // ---- main loop ------------------------------------------------------------------------
@@ -1486,6 +1516,13 @@ int enginePrefs(const RenderOptions& o, const CLI::App& sub, premiere::PrefsBlob
             return usage("unknown --flow-backend '" + o.flowBackend + "' (" + tokenList(kCliFlow) + ")");
         }
         out.flowBackend = static_cast<std::uint8_t>(index);
+    }
+    // The engine's own log says which solver each bucket used; this line says
+    // up front what was asked for, so a render log proves it matched (or did
+    // not match) the plug-ins' classical solver.  Off when the parallax warp
+    // is off: no flow runs then.
+    if (out.parallax != static_cast<std::uint8_t>(pr::PrefsParallax::Off)) {
+        logFlowBackendChoice(given("--flow-backend") ? std::string_view(o.flowBackend) : std::string_view("auto"));
     }
     if (given("--photo")) {
         const int index = tokenIndex(kCliPhoto, o.photo);
