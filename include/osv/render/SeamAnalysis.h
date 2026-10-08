@@ -103,7 +103,11 @@ Result<double> overlapNcc(const geom::LensRig& rig, const video::FramePair& fram
 // kSeamDistinctGapRows rows away from the peak (the peak-ratio confidence of
 // Hu & Mordohai, TPAMI 2012) and "coverage" the co-visible fraction of the
 // unshifted window.  A smooth sky ramp correlates at almost any shift, so it
-// scores a high NCC but no texture and no distinct peak: w = 0.
+// scores a high NCC but no texture and no distinct peak: w = 0.  A peak with
+// no scored shift on one side of it (at the search limit, or next to a shift
+// the co-visibility rule below refused) is not bracketed - the correlation
+// may still rise beyond it, the classic false match of a monotone score - so
+// it is recorded but earns no weight either.
 //
 // Co-visibility is part of the measurement.  A column whose UNSHIFTED window
 // holds fewer than unmeasuredFraction co-visible pixels is UNMEASURED and
@@ -179,12 +183,20 @@ struct SeamSearchParams {
     /// a measured one is not pinned but left free (weight 0, the plain prior
     /// weight), so the smoother carries a near object's measured value a
     /// short way into the arc and bends to 0 there - instead of bending the
-    /// measured side down to a pin at the arc's edge.  32 band columns of
-    /// 2048.  Measured on the car clip's LRF 5872-5920 (band NCC after the
-    /// table, mean): pinning at the edge 0.9880, 16 columns 0.9910, 32
-    /// columns 0.9919 (the old table: 0.9898); the hood beside the arc
-    /// dropped from 0.969 to 0.934 with the pin at the edge.
-    double unmeasuredInheritDeg = 5.625;
+    /// measured side down to a pin at the arc's edge.
+    ///
+    /// 48 band columns of 2048: the ~32 columns the smoother itself carries
+    /// a value at the default priorWeight (below), plus a 16-column fade -
+    /// so the pin sits past the carry instead of inside it.  Measured on the
+    /// car clip's LRF 5872-5920, priorWeight 1e-3, band NCC after the table
+    /// (+/-4 deg, mean): with the pin at the arc's edge 0.9880 and the hood
+    /// beside the arc down from 0.969 to 0.934, 16 columns 0.9910, 32
+    /// columns 0.9919.  At priorWeight 2e-2 (osvtool seam nccAfterSearch,
+    /// mean; 0.5.0: 0.9899): 32 columns 0.9919, 48 columns 0.9922.  On LRF
+    /// 622 the 48-column margin keeps 0.16-0.23 deg more of the hood's
+    /// measured +2.45 deg at columns 1688-1694, and the arc past it is still
+    /// exactly 0.
+    double unmeasuredInheritDeg = 8.4375;
 
     // ---- the robust smoother ---------------------------------------------------
     /// Second-difference penalty at 2048 columns (scaled by (columns/2048)^4,
@@ -194,7 +206,35 @@ struct SeamSearchParams {
     double smoothLambda1 = 2.0;
     /// Pull of a measured column towards the prior: a featureless stretch of
     /// the seam settles on the prior instead of drifting.
-    double priorWeight = 1e-3;
+    ///
+    /// It is the EVIDENCE FLOOR: a column must be about this confident (2 %)
+    /// before its measurement moves the table more than the prior holds it.
+    /// It also sets how far the smoother carries a value into featureless
+    /// neighbours: (smoothLambda2 / priorWeight)^(1/4) = 32 columns (5.6 deg)
+    /// at 2048 columns, the same reach as the arc's inheritance margin.
+    ///
+    /// 1e-3 let the far tails of the four confidence ramps steer the table -
+    /// barely textured sky, the 8K clip's 14-column overlap slivers inside
+    /// the mount arc (confidence <= 0.015), the sample's thin stick-arc
+    /// overlap - and carried a value 67 columns.  Measured, plug-in engine,
+    /// classical flow, 1e-3 -> 2e-2:
+    ///   * 8K day OSV 11772-11795, a lamp pole 7 deg beside the seam (whose
+    ///     sky columns inherited a confident -0.97 deg from an overpass):
+    ///     |bend| mean 0.20 -> 0.09 deg, max 0.42 -> 0.22 (no table: 0.10 /
+    ///     0.22); RMS 0.20 -> 0.19 px (no table 0.18);
+    ///   * maintainer sample, overlap NCC after the table, frames 0/32/64
+    ///     (0.5.0: 0.8970 / 0.8991 / 0.9058): 0.8997 / 0.9006 / 0.9024 ->
+    ///     0.9012 / 0.9020 / 0.9040;
+    ///   * proxy 5872-5920: overlap NCC after the table (nccAfterSearch,
+    ///     mean; 0.5.0: 0.9899) 0.9926 -> 0.9921 with the 48-column margin
+    ///     below, applied-table change at bucket starts p99 0.025 -> 0.026
+    ///     deg/frame.
+    /// The pole's bend is NOT monotonic in this weight (sweep, |bend| mean /
+    /// max: 1e-4 0.11 / 0.34, 1e-3 0.20 / 0.42, 5e-3 0.21 / 0.39, 1e-2 0.13 /
+    /// 0.32, 2e-2 0.09 / 0.22, 3e-2 0.20 / 0.38, 1e-1 0.79 / 1.03): it depends
+    /// on where the carried value's fade lands along a thin object in the
+    /// kernel's 6-12 deg taper, which no 1-D table can avoid everywhere.
+    double priorWeight = 2e-2;
     /// Pull of an UNMEASURED column (beyond unmeasuredInheritDeg) towards 0.
     /// +infinity (the default) pins it there exactly; a finite weight is a
     /// soft pull, which lets the inherited value leak on into the arc, so it

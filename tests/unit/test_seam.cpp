@@ -362,8 +362,12 @@ TEST_CASE("the seam table never shifts a column the two lenses do not both see",
 
     // The arc's columns past the inheritance margin: the first 4 columns
     // of each end still see the overlap through their 9-column window, the
-    // next 32 (unmeasuredInheritDeg at 2048 columns) may inherit.
-    const auto beyondMargin = [](std::uint32_t c) { return c >= 1764 + 4 + 32 || c <= 270 - 4 - 32; };
+    // next unmeasuredInheritDeg (48 columns at 2048) may inherit.
+    const auto margin = static_cast<std::uint32_t>(
+        std::lround(render::SeamSearchParams{}.unmeasuredInheritDeg * static_cast<double>(kBandW) / 360.0));
+    REQUIRE(margin > 0);
+    REQUIRE(margin < 200);
+    const auto beyondMargin = [margin](std::uint32_t c) { return c >= 1764 + 4 + margin || c + 4 + margin <= 270; };
 
     SECTION("pinned (the default): exactly 0 deep in the arc, the hood still fully corrected") {
         const render::SeamProfile p = estimate(b);
@@ -388,7 +392,7 @@ TEST_CASE("the seam table never shifts a column the two lenses do not both see",
         CHECK(p.shiftDeg[1740] == Catch::Approx(2.8).margin(0.15));
         CHECK(p.confidence[1650] >= 0.9f);
         // ... and it fades monotonically through the margin.
-        for (std::uint32_t c = 1765; c < 1800; ++c) {
+        for (std::uint32_t c = 1765; c < 1768 + margin; ++c) {
             CHECK(p.shiftDeg[c] <= p.shiftDeg[c - 1] + 1e-4f);
         }
         // Far from both, the table is the measured 0.
@@ -419,7 +423,10 @@ TEST_CASE("the seam table never shifts a column the two lenses do not both see",
             }
         }
         INFO("largest |shift| past the margin with a soft pull " << leak << " deg");
-        CHECK(leak > 0.2f);
+        // The pinned default is exactly 0 there; a soft pull is not (0.20 deg
+        // with the 48-column margin, 0.37 with the first cut: 32 columns,
+        // prior weight 1e-3).
+        CHECK(leak > 0.1f);
         CHECK(p.shiftDeg[1650] == Catch::Approx(2.8).margin(0.1));
     }
 
@@ -485,6 +492,47 @@ TEST_CASE("featureless sky with random correlation peaks leaves the seam table f
     // The textured columns are trusted.
     CHECK(p.confidence[300] >= 0.9f);
     CHECK(p.confidence[1600] >= 0.9f);
+}
+
+TEST_CASE("a correlation still rising at the search limit earns no weight", "[render][seam][seamtable]") {
+    // Columns 900-1099 hold one broad brightness wave along the meridian
+    // (period 100 rows, 0.1 code values: textured enough to pass the texture
+    // ramp) that lens 1 sees 30 rows lower - beyond the +/-24-row search.
+    // The correlation then climbs all the way to the last shift scored and
+    // peaks there at a high NCC: an unbracketed peak, which says only "more
+    // than 24 rows", never how much.  It must not steer the table.
+    const Scene scene(53);
+    render::LensBands b = sceneBands(scene, std::vector<double>(kBandW, 0.0));
+    constexpr double kOmega = 6.283185307179586 / 100.0;
+    constexpr double kBeyondRows = 30.0;
+    for (std::uint32_t c = 900; c < 1100; ++c) {
+        for (std::uint32_t r = 0; r < kBandH; ++r) {
+            const std::size_t i = static_cast<std::size_t>(r) * kBandW + c;
+            b.luma[0][i] = static_cast<float>(0.45 + 0.1 * std::sin(kOmega * r));
+            b.luma[1][i] = static_cast<float>(0.45 + 0.1 * std::sin(kOmega * (r - kBeyondRows)));
+        }
+    }
+    const render::SeamProfile p = estimate(b);
+    const render::SeamSearchParams sp;
+    const float limitDeg = static_cast<float>(sp.maxShiftPx * kDegPerRow);
+    for (std::uint32_t c = 910; c < 1090; ++c) {
+        INFO("column " << c << ": NCC " << p.ncc[c] << ", measured " << p.measuredDeg[c] << " deg (limit " << limitDeg
+                       << "), confidence " << p.confidence[c] << ", table " << p.shiftDeg[c]);
+        // The scene reproduces the trap: a good match, right at the limit.
+        REQUIRE(std::isfinite(p.measuredDeg[c]));
+        CHECK(p.measuredDeg[c] == Catch::Approx(limitDeg).margin(1e-4));
+        CHECK(p.ncc[c] >= 0.8f);
+        // ... and none of it is trusted: the table never follows the
+        // 4.2 deg reading.  What it does show here (~0.1-0.25 deg) is the
+        // block edges' own measurement, where a 9-column window straddles
+        // the wave and the textured scene, carried a few dozen columns in
+        // by the smoother.
+        CHECK(p.confidence[c] == 0.0f);
+        CHECK(std::fabs(p.shiftDeg[c]) < 0.5f);
+    }
+    // The textured columns either side are trusted.
+    CHECK(p.confidence[700] >= 0.9f);
+    CHECK(p.confidence[1300] >= 0.9f);
 }
 
 TEST_CASE("a match resting on a thin overlap is measured unshifted but earns little weight",
@@ -648,6 +696,9 @@ TEST_CASE("the seam-table estimator is defensive and deterministic", "[render][s
         CHECK(refused(sp));
         sp = {};
         sp.windowHalfCols = 1100;  // wider than the ring
+        CHECK(refused(sp));
+        sp = {};
+        sp.windowHalfCols = std::numeric_limits<int>::max();  // 2 * w + 1 would overflow an int
         CHECK(refused(sp));
     }
 }

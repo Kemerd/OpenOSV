@@ -160,14 +160,22 @@ constexpr double kUnscored = -2.0;
 /// Largest search range the per-column score buffer holds (rows, +/-).
 constexpr int kMaxSearchRows = 64;
 
+/// Largest matching-window half width accepted (columns).  A window of
+/// 2 * 4096 + 1 columns is already half the ring of the widest band
+/// renderLensBands produces (16384 columns), so nothing useful is refused;
+/// bounding it here keeps 2 * windowHalfCols + 1 far from int overflow for
+/// any value a caller passes (INT_MAX would wrap, undefined behaviour).
+constexpr int kMaxWindowHalfCols = 4096;
+
 /// Half width (rows) of the 1-row-sigma Gaussian the texture measure blurs
 /// with before differencing: 4 sigma, where the tail is below 3.4e-4.
 constexpr int kTextureBlurRadius = 4;
 
 /// Columns of the ring copied onto each end of the open system the smoother
 /// solves.  The smoother's influence decays over (lambda2 / weight)^(1/4)
-/// columns - ~12 where columns are confident, ~67 where only the 1e-3 prior
-/// holds them - so 512 makes the cut ends invisible in the kept centre.
+/// columns - ~12 where columns are confident, ~32 where only the default
+/// 2e-2 prior holds them (~67 at 1e-3) - so 512 makes the cut ends invisible
+/// in the kept centre.
 constexpr int kSmootherWrapPad = 512;
 
 /// Smoothstep from 0 at `lo` to 1 at `hi`, clamped outside.  A non-finite
@@ -190,6 +198,10 @@ constexpr int kSmootherWrapPad = 512;
 [[nodiscard]] Status validateSearchParams(const SeamSearchParams& p) {
     if (p.maxShiftPx <= 0 || p.windowHalfCols < 0) {
         return Error{ErrorCode::InvalidArgument, "searchSeam: bad parameters"};
+    }
+    // Checked before anything computes 2 * windowHalfCols + 1.
+    if (p.windowHalfCols > kMaxWindowHalfCols) {
+        return Error{ErrorCode::InvalidArgument, "searchSeam: windowHalfCols is wider than any band"};
     }
     if (!std::isfinite(p.minNcc)) {
         return Error{ErrorCode::InvalidArgument, "searchSeam: minNcc is not finite"};
@@ -654,10 +666,18 @@ Result<SeamProfile> searchSeamFromBands(const LensBands& b, const SeamSearchPara
             }
             profile.ncc[c] = static_cast<float>(best);
 
+            // Is the peak BRACKETED - a scored shift on both sides of it?  At
+            // the search limit, or beside a shift the co-visibility rule
+            // refused, the correlation may still be rising past the end of
+            // what was scored (a monotone score: the classic false match), so
+            // such a peak is recorded but earns no confidence below.
+            const bool bracketed = bestS > -Sc && bestS < Sc && scores[bestS - 1 + Sc] > kUnscored &&
+                                   scores[bestS + 1 + Sc] > kUnscored;
+
             // Parabolic sub-pixel refinement around the peak - only between
             // two scored neighbours, never against an unscored -2.
             double refined = bestS;
-            if (bestS > -Sc && bestS < Sc && scores[bestS - 1 + Sc] > kUnscored && scores[bestS + 1 + Sc] > kUnscored) {
+            if (bracketed) {
                 const double y0 = scores[bestS - 1 + Sc], y1 = scores[bestS + Sc], y2 = scores[bestS + 1 + Sc];
                 const double denom = y0 - 2.0 * y1 + y2;
                 if (std::fabs(denom) > 1e-9) {
@@ -676,6 +696,11 @@ Result<SeamProfile> searchSeamFromBands(const LensBands& b, const SeamSearchPara
                 continue;
             }
             accepted[c] = 1;
+            // An unbracketed peak: measured (statistics, diagnostics), but
+            // with weight 0 the smoother never follows it.
+            if (!bracketed) {
+                continue;
+            }
             // The second peak: the best scored shift clearly away from this one.
             // None at all means the peak could not be told apart from
             // anything (too few shifts scored): no distinctness.
