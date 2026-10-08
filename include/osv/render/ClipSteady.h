@@ -221,8 +221,10 @@ struct LensRotationMeasurement {
 
 /// The per-cell, per-component median of `grids` (null entries are skipped).
 /// Every grid must share one layout.  The diagnostics describe the median
-/// (disparities over the whole grid) and the summed cost of the samples.
-/// InvalidArgument for no grid or mismatched layouts.
+/// (disparities over the whole grid) and the summed cost and pixel counts of
+/// the samples; the strength is the median of the samples' strengths (a
+/// non-finite one counts as 0).  InvalidArgument for no grid or mismatched
+/// layouts.
 [[nodiscard]] Result<ParallaxWarpGrid> clipParallaxGrid(const std::vector<const ParallaxWarpGrid*>& grids);
 
 /// The per-column median of 1-D seam tables (null entries skipped; equal
@@ -372,9 +374,15 @@ struct ClipSteady {
     /// One line per planned sample that could not be decoded (what replaced
     /// it, or that it was skipped); empty when every one decoded.
     std::vector<std::string> sampleNotes;
-    std::shared_ptr<const ParallaxWarpGrid> grid;        ///< Clip grid; null when not measured or refused.
+    /// Clip grid; null when not measured or refused.  Its strength (the
+    /// median of the accepted samples' structured-gate strengths,
+    /// ParallaxWarpGrid::strength) below 1 means the clip seam table fills
+    /// the rest (render::seamTableUnderGrid), as the importer renders it.
+    std::shared_ptr<const ParallaxWarpGrid> grid;
     std::uint32_t acceptedGrids = 0;                     ///< Samples whose own grid was accepted.
-    std::shared_ptr<const std::vector<float>> seamTable; ///< Clip seam table; null when none was needed or found.
+    /// Clip seam table: the median of the tables of the samples without a
+    /// grid or with a partly trusted one; null when none was needed or found.
+    std::shared_ptr<const std::vector<float>> seamTable;
     std::shared_ptr<const BlendSeam> seam;               ///< Clip carved seam; null when seamOn is off or it failed.
     SteadyDecision decision;                             ///< The Auto rule's verdict.
     double decodeMs = 0.0;                               ///< Time in the frame source.

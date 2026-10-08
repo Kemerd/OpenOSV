@@ -411,6 +411,10 @@ int runSeam(const SeamOptions& o) {
             if (c.grid) {
                 sj["meanDisparityDeg"] = c.grid->meanAbsCorrectionDeg;
                 sj["maxDisparityDeg"] = c.grid->maxAbsCorrectionDeg;
+                // The median of the accepted samples' structured-gate
+                // strengths; below 1 the clip seam table fills the rest.
+                sj["gridStrength"] = c.grid->strength;
+                sj["structuredFraction"] = c.grid->structuredFraction();
             }
             sj["seamTable"] = c.seamTable != nullptr;
             sj["seam"] = c.seam != nullptr;
@@ -564,7 +568,17 @@ int runSeam(const SeamOptions& o) {
         render::ParallaxWarpParams pw = o.parallaxTuning;
         pw.backend = backend;  // parsed (and validated) above
         const auto t0 = std::chrono::steady_clock::now();
-        auto grid = render::buildParallaxWarp(P.rig, pair.value(), P.blendParams, pw, seamIn, *P.pool);
+        // buildParallaxWarp's two halves, so the gate's counts (filled with
+        // the cells) are there to report when the gate refuses the grid.
+        render::ParallaxCellStats cells;
+        auto grid = [&]() -> Result<render::ParallaxWarpGrid> {
+            const auto tBand = std::chrono::steady_clock::now();
+            OSV_TRY_ASSIGN(render::LensBands bands, render::measureParallaxBands(P.rig, pair.value(), P.blendParams,
+                                                                                pw, seamIn, *P.pool));
+            const double bandMs =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tBand).count();
+            return render::parallaxFromBands(bands, pw, P.pool.get(), bandMs, &cells);
+        }();
         const double buildMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         nlohmann::json pj;
         pj["buildMs"] = buildMs;
@@ -573,6 +587,52 @@ int runSeam(const SeamOptions& o) {
         // exactly the case worth looking at.
         if (out.contains("dump")) {
             pj["dump"] = out["dump"];
+        }
+        // ---- the structured gate's numbers, accepted or refused ----------------
+        // Both shares (all co-visible pixels - the retired gate's number - and
+        // the structured ones the gate judges), the structured pixel count and
+        // the strength: 0 on a refusal, so a JSON consumer never has to parse
+        // the error text.  Absent only when the flow never ran (no cells).
+        const auto putGate = [&](std::uint64_t covisible, std::uint64_t consistent, std::uint64_t structured,
+                                 std::uint64_t consistentStructured, double strength) {
+            const double all = covisible ? static_cast<double>(consistent) / static_cast<double>(covisible) : 0.0;
+            pj["consistentFraction"] = all;
+            pj["structuredFraction"] =
+                structured ? static_cast<double>(consistentStructured) / static_cast<double>(structured) : 0.0;
+            pj["structuredPixels"] = structured;
+            pj["covisiblePixels"] = covisible;
+            pj["strength"] = strength;
+            // Whether the all-pixel rule this gate replaced would have kept it.
+            pj["allPixelGate"] = all >= pw.minConsistentFraction;
+        };
+        if (grid.ok()) {
+            const render::ParallaxWarpGrid& g = grid.value();
+            putGate(g.totalPixels, g.consistentPixels, g.structuredPixels, g.consistentStructuredPixels, g.strength);
+        } else if (cells.valid()) {
+            putGate(cells.covisiblePixels, cells.consistentPixels, cells.structuredPixels,
+                    cells.consistentStructuredPixels, 0.0);
+        }
+        // Region score: the same column window uncorrected and with the seam
+        // table (when searched) whatever the gate decided - a refused bucket
+        // renders exactly that table - and with the parallax grid on top when
+        // there is one (below).
+        int rc0 = 0, rc1 = 0;
+        const bool regionAsked = !o.region.empty() && std::sscanf(o.region.c_str(), "%d-%d", &rc0, &rc1) == 2 &&
+                                 rc0 >= 0 && rc1 >= 0 && rc0 < static_cast<int>(band.equirectW) &&
+                                 rc1 < static_cast<int>(band.equirectW);
+        nlohmann::json rj;
+        const auto score = [&](const char* name, const std::vector<float>* seamT, const render::WarpGridView* w) {
+            auto bands = render::renderLensBands(P.rig, pair.value(), P.blendParams, band, false, seamT, *P.pool, w);
+            if (bands.ok()) {
+                const RegionScore s = scoreRegion(bands.value(), rc0, rc1);
+                rj[name] = {{"ncc", s.ncc}, {"meanAbsDiff", s.meanAbsDiff}, {"samples", s.samples}};
+            }
+        };
+        if (regionAsked) {
+            score("none", nullptr, nullptr);
+            if (seamIn) {
+                score("seam", seamIn, nullptr);
+            }
         }
         if (grid.ok()) {
             const render::ParallaxWarpGrid& g = grid.value();
@@ -589,7 +649,6 @@ int runSeam(const SeamOptions& o) {
             pj["backend"] = render::flowBackendName(g.usedBackend);
             pj["gridW"] = g.w;
             pj["gridH"] = g.h;
-            pj["consistentFraction"] = g.consistentFraction();
             pj["meanDisparityDeg"] = g.meanAbsCorrectionDeg;
             pj["maxDisparityDeg"] = g.maxAbsCorrectionDeg;
             pj["bandMs"] = g.bandMs;
@@ -650,30 +709,15 @@ int runSeam(const SeamOptions& o) {
                 }
                 pj["regions"] = rs;
             }
-            // Region score: the same column window uncorrected, with the seam
-            // table (when searched), and with the parallax grid on top.
-            int rc0 = 0, rc1 = 0;
-            if (!o.region.empty() && std::sscanf(o.region.c_str(), "%d-%d", &rc0, &rc1) == 2 && rc0 >= 0 &&
-                rc1 >= 0 && rc0 < static_cast<int>(band.equirectW) && rc1 < static_cast<int>(band.equirectW)) {
-                nlohmann::json rj;
-                const auto score = [&](const char* name, const std::vector<float>* seamT,
-                                       const render::WarpGridView* w) {
-                    auto bands = render::renderLensBands(P.rig, pair.value(), P.blendParams, band, false, seamT,
-                                                         *P.pool, w);
-                    if (bands.ok()) {
-                        const RegionScore s = scoreRegion(bands.value(), rc0, rc1);
-                        rj[name] = {{"ncc", s.ncc}, {"meanAbsDiff", s.meanAbsDiff}, {"samples", s.samples}};
-                    }
-                };
-                score("none", nullptr, nullptr);
-                if (seamIn) {
-                    score("seam", seamIn, nullptr);
-                }
+            // The region with the parallax grid on top of the table.
+            if (regionAsked) {
                 score("parallax", seamIn, &view);
-                pj["region"] = rj;
             }
         } else {
             pj["error"] = grid.error().message;
+        }
+        if (regionAsked) {
+            pj["region"] = rj;
         }
         out["parallax"] = pj;
     }
@@ -726,12 +770,15 @@ int runSeam(const SeamOptions& o) {
                 std::printf("  parallax: unavailable (%s), %.0f ms\n", pj["error"].get<std::string>().c_str(),
                             pj["buildMs"].get<double>());
             } else {
-                std::printf("  parallax (%s, grid %ux%u): consistent %.1f%%, disparity mean %.3f / max %.3f deg, "
-                            "%.0f ms, NCC after %.4f\n",
+                std::printf("  parallax (%s, grid %ux%u): consistent %.1f%%, structured %.1f%% of %llu px, strength "
+                            "%.2f, disparity mean %.3f / max %.3f deg, %.0f ms, NCC after %.4f\n",
                             pj["backend"].get<std::string>().c_str(), pj["gridW"].get<unsigned>(),
                             pj["gridH"].get<unsigned>(), 100.0 * pj["consistentFraction"].get<double>(),
-                            pj["meanDisparityDeg"].get<double>(), pj["maxDisparityDeg"].get<double>(),
-                            pj["buildMs"].get<double>(), pj.value("nccAfter", -1.0));
+                            100.0 * pj["structuredFraction"].get<double>(),
+                            static_cast<unsigned long long>(pj["structuredPixels"].get<std::uint64_t>()),
+                            pj["strength"].get<double>(), pj["meanDisparityDeg"].get<double>(),
+                            pj["maxDisparityDeg"].get<double>(), pj["buildMs"].get<double>(),
+                            pj.value("nccAfter", -1.0));
             }
         }
     }

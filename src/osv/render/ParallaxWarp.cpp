@@ -13,10 +13,14 @@
 //      along-meridian one (anisotropic regularization);
 //   4. the field is decayed to exactly zero at the grid's latitude edges, so
 //      the correction cannot tear where the overlap ends;
-//   5. last, every region must PROVE it helps: the finished field is applied
-//      only in proportion to how much it reduces the lens-to-lens residual
-//      (the benefit gate), because a self-consistent flow is not necessarily
-//      a true one.
+//   5. every region must PROVE it helps: the finished field is applied only
+//      in proportion to how much it reduces the lens-to-lens residual (the
+//      benefit gate), because a self-consistent flow is not necessarily a
+//      true one;
+//   6. last, the measurement as a whole must be trustworthy where it COULD
+//      be: the share of the structured pixels whose flow passed the
+//      forward-backward check decides refusal and, softly, the strength the
+//      whole grid applies at (the structured gate, parallaxFromBands).
 
 #include "osv/render/ParallaxWarp.h"
 
@@ -27,7 +31,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <format>
 #include <functional>
+#include <limits>
 
 namespace osv::render {
 
@@ -231,7 +237,57 @@ struct CellTask {
     if (!(p.minResidual >= 0.0) || !std::isfinite(p.minResidual)) {
         return failStatus(ErrorCode::InvalidArgument, "buildParallaxWarp: minResidual must be >= 0");
     }
+    // The structured gate: a finite, non-negative gradient bar, and two
+    // shares inside [0, 1] that rise (equal shares are a plain step).
+    if (!(p.minStructureGradient >= 0.0) || !std::isfinite(p.minStructureGradient)) {
+        return failStatus(ErrorCode::InvalidArgument, "buildParallaxWarp: minStructureGradient must be >= 0");
+    }
+    if (!(p.minStructuredConsistent >= 0.0) || p.minStructuredConsistent > 1.0 ||
+        !(p.fullStructuredConsistent >= p.minStructuredConsistent) || p.fullStructuredConsistent > 1.0) {
+        return failStatus(ErrorCode::InvalidArgument,
+                          "buildParallaxWarp: the structured gate needs 0 <= minStructuredConsistent <= "
+                          "fullStructuredConsistent <= 1");
+    }
     return okStatus();
+}
+
+/// Squared central-difference luma gradient of one lens at band pixel
+/// (r, c), on the 0..1 code scale (ParallaxWarpParams::minStructureGradient
+/// documents the rule).
+///
+/// Half the difference of the two neighbours along the band (longitude,
+/// wrapping: the band is a ring) and across it (latitude).  A neighbour this
+/// lens does not cover (alpha <= 0.5), a non-finite one, or one beyond the
+/// band's top or bottom row is replaced by the centre pixel - a one-sided
+/// half difference, the same as edge padding - so the black beyond a rim or
+/// an occlusion polygon never reads as structure.  NaN for a non-finite
+/// centre, which then fails every comparison: no structure.
+///
+/// @pre r < h, c < w, both planes w * h (gridFromFlow checks the sizes).
+[[nodiscard]] double lumaGradientSq(const std::vector<float>& luma, const std::vector<float>& alpha, std::uint32_t w,
+                                    std::uint32_t h, std::uint32_t r, std::uint32_t c) noexcept {
+    const std::size_t i = static_cast<std::size_t>(r) * w + c;
+    const double centre = static_cast<double>(luma[i]);
+    if (!std::isfinite(centre)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    // A neighbour's value, or the centre where the neighbour cannot speak.
+    const auto at = [&](std::size_t j) noexcept {
+        const double v = static_cast<double>(luma[j]);
+        return (alpha[j] > 0.5f && std::isfinite(v)) ? v : centre;
+    };
+    const std::size_t rowBase = static_cast<std::size_t>(r) * w;
+    // Longitude wraps round the ring.
+    const std::uint32_t cl = c == 0 ? w - 1u : c - 1u;
+    const std::uint32_t cr = c + 1u == w ? 0u : c + 1u;
+    const double left = at(rowBase + cl);
+    const double right = at(rowBase + cr);
+    // Latitude ends: the missing row is the centre.
+    const double up = r > 0 ? at(rowBase - w + c) : centre;
+    const double down = r + 1u < h ? at(rowBase + w + c) : centre;
+    const double gx = 0.5 * (right - left);
+    const double gy = 0.5 * (down - up);
+    return gx * gx + gy * gy;
 }
 
 /// Bilinear sample of a band plane at continuous PIXEL-CENTRE coordinates
@@ -419,18 +475,38 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
         cellColOf[c] = ((gc % static_cast<int>(gridW)) + static_cast<int>(gridW)) % static_cast<int>(gridW);
     }
 
+    // ---- structure, for the structured gate (parallaxFromBands) -------------
+    // A co-visible pixel is STRUCTURED when both lenses show a luma gradient
+    // of at least minStructureGradient there (lumaGradientSq): the flow can
+    // lock onto it, so its forward-backward verdict says something about the
+    // measurement.  Compared squared, so no square root per pixel.  Bands
+    // without luma planes of the band's size (a caller that only exercises
+    // the conversion) have no measurable structure: none is counted, and
+    // the gate then refuses such a measurement rather than guess.
+    const bool lumaUsable = bands.luma[0].size() == bandPixels && bands.luma[1].size() == bandPixels;
+    const double structureSq = params.minStructureGradient * params.minStructureGradient;
+    const auto structuredAt = [&](std::uint32_t r, std::uint32_t c) noexcept {
+        return lumaUsable &&
+               lumaGradientSq(bands.luma[0], bands.alpha[0], bands.w, bands.h, r, c) >= structureSq &&
+               lumaGradientSq(bands.luma[1], bands.alpha[1], bands.w, bands.h, r, c) >= structureSq;
+    };
+
     // Tasks of cells (see CellTask): each owns its cells outright and walks
     // their pixels in the sequential row-major order, so every cell's sums
-    // are bit-identical to the single-threaded loop's.  The two counters are
+    // are bit-identical to the single-threaded loop's.  The four counters are
     // integers, summed per task and then added, which no order changes.
     const std::uint32_t blocks = cellBlocks(pool);
     const std::size_t taskCount = static_cast<std::size_t>(gridRows) * blocks;
     std::vector<std::uint64_t> covisibleOf(taskCount, 0u);
     std::vector<std::uint64_t> consistentOf(taskCount, 0u);
+    std::vector<std::uint64_t> structuredOf(taskCount, 0u);
+    std::vector<std::uint64_t> consistentStructuredOf(taskCount, 0u);
     const auto accumulateTask = [&](std::size_t index) {
         const CellTask task = cellTask(index, blocks, gridW);
         std::uint64_t covisible = 0;
         std::uint64_t consistent = 0;
+        std::uint64_t structuredCount = 0;
+        std::uint64_t consistentStructured = 0;
         for (std::uint32_t r = 0; r < bands.h; ++r) {
             if (static_cast<std::size_t>(cellRowOf[r]) != task.cellRow) {
                 continue;
@@ -445,6 +521,10 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
                     continue;
                 }
                 ++covisible;
+                // Counted before the consistency test: the gate's
+                // denominator is every structured co-visible pixel.
+                const bool structured = structuredAt(r, c);
+                structuredCount += structured ? 1u : 0u;
                 if (flow.ok[i] == 0u) {
                     continue;
                 }
@@ -456,6 +536,7 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
                     continue;
                 }
                 ++consistent;
+                consistentStructured += structured ? 1u : 0u;
                 const std::size_t gi = rowBase + static_cast<std::size_t>(cellColOf[c]);
                 // Pixels -> the MASTER lens's half displacement in radians.
                 //
@@ -469,10 +550,13 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
         }
         covisibleOf[index] = covisible;
         consistentOf[index] = consistent;
+        structuredOf[index] = structuredCount;
+        consistentStructuredOf[index] = consistentStructured;
     };
     if (!forTasks(pool, taskCount, accumulateTask)) {
         // A parallel run that failed part-way leaves partial sums: start
-        // again from zero on this thread, which gives the same result.
+        // again from zero on this thread, which gives the same result.  (The
+        // per-task counters are overwritten, not added to: no reset needed.)
         std::fill(accLon.begin(), accLon.end(), 0.0);
         std::fill(accLat.begin(), accLat.end(), 0.0);
         std::fill(accN.begin(), accN.end(), 0.0);
@@ -480,12 +564,18 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
     }
     std::uint64_t consistent = 0;
     std::uint64_t covisible = 0;
+    std::uint64_t structured = 0;
+    std::uint64_t consistentStructured = 0;
     for (std::size_t t = 0; t < taskCount; ++t) {
         covisible += covisibleOf[t];
         consistent += consistentOf[t];
+        structured += structuredOf[t];
+        consistentStructured += consistentStructuredOf[t];
     }
     grid.consistentPixels = consistent;
     grid.totalPixels = covisible;
+    grid.structuredPixels = structured;
+    grid.consistentStructuredPixels = consistentStructured;
 
     // ---- per-cell averages, optional cross-meridian scale, safety clamp ---
     // Along the meridian (dLat) is the epipolar direction of a back-to-back
@@ -514,6 +604,13 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
         cellStats->rows = gridRows;
         cellStats->latTopRad = latTop;
         cellStats->latStepRad = latPerGridRow;
+        // The gate's band-wide counts ride along, so a refused measurement
+        // can still say how close it came (parallaxFromBands refuses AFTER
+        // this function returns, and then hands back no grid).
+        cellStats->covisiblePixels = covisible;
+        cellStats->consistentPixels = consistent;
+        cellStats->structuredPixels = structured;
+        cellStats->consistentStructuredPixels = consistentStructured;
         cellStats->halfFlow.assign(cells * 2u, 0.0f);
         cellStats->pixels.assign(cells, 0u);
         cellStats->gate.assign(cells, params.requiredImprovement > 0.0 ? 0.0f : 1.0f);
@@ -962,14 +1059,78 @@ Result<ParallaxWarpGrid> parallaxFromBands(const LensBands& bands, const Paralla
     grid.flowMs = flowMs;
     grid.gridMs = msSince(tGrid);
 
-    // Refuse to act on a measurement that mostly failed its own consistency
-    // check.  On featureless content - open sky, water - the solver has
-    // nothing to lock onto and most of the field is repaired guesses;
-    // applying that is worse than applying nothing.
-    if (grid.consistentFraction() < params.minConsistentFraction) {
-        return Error{ErrorCode::Unsupported, "parallax flow too inconsistent to use"};
+    // ---- the structured gate ---------------------------------------------------
+    // Judge the measurement where it COULD be right.  On a flat pixel - sky,
+    // water, white paint - the solver has nothing to lock onto and solves
+    // noise, so the forward-backward check fails there whatever the solver
+    // (9-15 % consistent on the car-mounted day clip, against 49-80 % on
+    // textured pixels).  The 0.5.0 rule took the consistent share of ALL
+    // co-visible pixels and so mostly measured how much of the band was
+    // sky: it sat at 0.19-0.35 on that clip and flipped between grid and
+    // table from one bucket to the next.  The share of the STRUCTURED
+    // pixels separates a real measurement from a meaningless one instead
+    // (0.71-0.82 on the same buckets, 0.10-0.28 on unrelated lens pairs).
+    const double structuredShare = grid.structuredFraction();
+    if (grid.structuredPixels < params.minStructuredPixels ||
+        !(structuredShare >= params.minStructuredConsistent)) {
+        // Both shares in the message: a caller that only sees the Error (a
+        // log line, a list of refusals) still knows how close it came.
+        return Error{ErrorCode::Unsupported,
+                     std::format("parallax flow too inconsistent to use: structured {:.1f}% of {} px (needs {:.0f}% of "
+                                 "at least {}), all co-visible {:.1f}%",
+                                 100.0 * structuredShare, grid.structuredPixels,
+                                 100.0 * params.minStructuredConsistent, params.minStructuredPixels,
+                                 100.0 * grid.consistentFraction())};
+    }
+
+    // Between the gate's two shares the grid applies at strength s - the
+    // whole field, uniformly - and the caller fills the rest with the seam
+    // table (seamTableUnderGrid), so the correction glides as the share
+    // drifts across the gate instead of flipping.  At full strength nothing
+    // is touched: the grid is bit for bit what gridFromFlow built.
+    const double s = parallaxGateStrength(structuredShare, params);
+    grid.strength = s;
+    if (s < 1.0) {
+        for (float& v : grid.uv) {
+            v = static_cast<float>(static_cast<double>(v) * s);
+        }
+        // The diagnostics describe what is applied (FULL disparity).
+        grid.meanAbsCorrectionDeg *= s;
+        grid.maxAbsCorrectionDeg *= s;
     }
     return grid;
+}
+
+double parallaxGateStrength(double structuredFraction, const ParallaxWarpParams& params) noexcept {
+    const double lo = params.minStructuredConsistent;
+    const double hi = params.fullStructuredConsistent;
+    // No trust in a share or a gate that is not a number, or a gate whose
+    // full-strength share sits below its refusal share.
+    if (!std::isfinite(structuredFraction) || !std::isfinite(lo) || !std::isfinite(hi) || hi < lo) {
+        return 0.0;
+    }
+    // Equal shares: a plain step at that share.
+    if (!(hi > lo)) {
+        return structuredFraction >= hi ? 1.0 : 0.0;
+    }
+    return smoothstep01((structuredFraction - lo) / (hi - lo));
+}
+
+void seamTableUnderGrid(const std::vector<float>& table, double gridStrength, std::vector<float>& out) {
+    out.clear();
+    // A non-finite strength is no trust in the grid: the whole table.
+    const double s = std::isfinite(gridStrength) ? std::clamp(gridStrength, 0.0, 1.0) : 0.0;
+    const double share = 1.0 - s;
+    if (table.empty() || !(share > 0.0)) {
+        return;  // nothing to fill: no table, or a grid trusted in full
+    }
+    out.resize(table.size());
+    for (std::size_t i = 0; i < table.size(); ++i) {
+        const double v = static_cast<double>(table[i]);
+        // share == 1 multiplies exactly, so a refused grid's table is the
+        // table bit for bit (non-finite columns aside, which shift nothing).
+        out[i] = std::isfinite(v) ? static_cast<float>(v * share) : 0.0f;
+    }
 }
 
 Result<ParallaxWarpGrid> blendParallaxGrids(const ParallaxWarpGrid& from, const ParallaxWarpGrid& to, double t) {

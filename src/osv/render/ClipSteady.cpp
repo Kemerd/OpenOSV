@@ -389,7 +389,10 @@ Result<LensRotationMeasurement> measureLensRotation(const geom::LensRig& rig, co
         const double bandMs = msSince(tBand);
         ParallaxCellStats cells;
         auto grid = parallaxFromBands(bands, parallax, &pool, bandMs, &cells);
-        (void)grid;  // only the raw cells matter here; a refused grid still filled them
+        // Only the raw cells matter here: they are the measurement before the
+        // structured gate, so neither its refusal nor its strength changes
+        // the fit (a refused grid still filled them).
+        (void)grid;
         if (!cells.valid()) {
             m.refusals.push_back(std::format("frame {}: no flow ({})", frame,
                                              grid.ok() ? std::string("no cells") : grid.error().message));
@@ -466,21 +469,32 @@ Result<ParallaxWarpGrid> clipParallaxGrid(const std::vector<const ParallaxWarpGr
     }
 
     // ---- diagnostics: the median's disparities, the samples' summed cost ---------
-    std::vector<double> measured, gated;
+    std::vector<double> measured, gated, strengths;
     out.consistentPixels = 0;
     out.totalPixels = 0;
+    out.structuredPixels = 0;
+    out.consistentStructuredPixels = 0;
     out.bandMs = out.flowMs = out.gridMs = 0.0;
     for (const ParallaxWarpGrid* g : in) {
         out.consistentPixels += g->consistentPixels;
         out.totalPixels += g->totalPixels;
+        out.structuredPixels += g->structuredPixels;
+        out.consistentStructuredPixels += g->consistentStructuredPixels;
         out.bandMs += g->bandMs;
         out.flowMs += g->flowMs;
         out.gridMs += g->gridMs;
         measured.push_back(static_cast<double>(g->measuredCells));
         gated.push_back(static_cast<double>(g->gatedCells));
+        // A non-finite strength counts as no trust (0), as the gate defines it.
+        strengths.push_back(std::isfinite(g->strength) ? std::clamp(g->strength, 0.0, 1.0) : 0.0);
     }
     out.measuredCells = static_cast<std::uint32_t>(std::lround(medianOf(measured)));
     out.gatedCells = static_cast<std::uint32_t>(std::lround(medianOf(gated)));
+    // Each sample's grid already carries its own structured-gate strength, so
+    // the per-cell median is a median of scaled corrections; its strength is
+    // the median of the samples' - all 1 gives exactly 1, and the clip seam
+    // table fills the rest under a partly trusted clip grid (measureClipSteady).
+    out.strength = medianOf(strengths);
     double sumAbs = 0.0;
     double maxAbs = 0.0;
     const std::size_t cells = static_cast<std::size_t>(out.w) * out.h;
@@ -786,6 +800,9 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
         OSV_TRY_ASSIGN(s.bands, measureParallaxBands(rig, pair, blend, params.parallax, nullptr, pool));
         const double bandMs = msSince(tBand);
         if (params.parallaxOn) {
+            // The importer's rule for one measurement, through the same call:
+            // refused by the structured gate, or accepted and already scaled
+            // by its strength (ParallaxWarpGrid::strength).
             auto grid = parallaxFromBands(s.bands, params.parallax, &pool, bandMs);
             if (grid.ok()) {
                 s.grid = std::make_shared<const ParallaxWarpGrid>(std::move(grid).value());
@@ -794,9 +811,10 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
                 onSampleGrid(frame, s.grid);
             }
         }
-        if (params.seamOn && !s.grid) {
+        if (params.seamOn && (!s.grid || s.grid->strength < 1.0)) {
             // The seam table is the correction of a sample without a grid,
-            // exactly as the importer falls back to it.
+            // and the remaining share under a partly trusted one - exactly
+            // as the importer builds a bucket's correction.
             auto profile = searchSeam(rig, pair, blend, params.seamSearch, pool);
             if (profile.ok() && !profile.value().shiftDeg.empty()) {
                 s.table = std::make_shared<const std::vector<float>>(std::move(profile).value().shiftDeg);
@@ -864,11 +882,20 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
     }
 
     // ---- the correction the clip renders with -------------------------------------------
-    // The importer's rule: the grid when there is one, else the table.
+    // The importer's rule: the grid when there is one, else the table - and
+    // under a partly trusted grid (strength < 1) the table's remaining share
+    // as well (seamTableUnderGrid), as the importer applies the clip grid.
     const WarpGridView clipView = viewOf(out.grid.get());
     SeamCorrection clipCorrection;
+    std::vector<float> clipTableShare;
     if (clipView.valid()) {
         clipCorrection.warp = &clipView;
+        if (out.seamTable && out.grid->strength < 1.0) {
+            seamTableUnderGrid(*out.seamTable, out.grid->strength, clipTableShare);
+            if (!clipTableShare.empty()) {
+                clipCorrection.seamShiftDeg = &clipTableShare;
+            }
+        }
     } else if (out.seamTable) {
         clipCorrection.seamShiftDeg = out.seamTable.get();
     }
@@ -876,6 +903,10 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
     // ---- the Auto verdict -----------------------------------------------------------------
     {
         std::vector<WarpGridView> ownViews(samples.size());
+        // Each sample's own correction exactly as a bucket measured on it
+        // renders in the importer: its grid, its table where it has none, and
+        // the table's remaining share under a partly trusted grid.
+        std::vector<std::vector<float>> ownTableShares(samples.size());
         std::vector<SteadySample> judged;
         judged.reserve(samples.size());
         for (std::size_t i = 0; i < samples.size(); ++i) {
@@ -885,6 +916,12 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
             ownViews[i] = viewOf(samples[i].grid.get());
             if (ownViews[i].valid()) {
                 ss.own.warp = &ownViews[i];
+                if (samples[i].table && samples[i].grid->strength < 1.0) {
+                    seamTableUnderGrid(*samples[i].table, samples[i].grid->strength, ownTableShares[i]);
+                    if (!ownTableShares[i].empty()) {
+                        ss.own.seamShiftDeg = &ownTableShares[i];
+                    }
+                }
             } else if (samples[i].table) {
                 ss.own.seamShiftDeg = samples[i].table.get();
             }

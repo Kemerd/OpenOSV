@@ -863,8 +863,11 @@ private:
         /// than the anchor): an Interactive frame that renders it is not final.
         bool standIn = false;
         std::shared_ptr<const render::ParallaxWarpGrid> grid;  ///< Accepted grid; null when refused / off.
-        /// The bucket's seam table where it has no grid (empty: none).  A copy
-        /// (~8 KB), so a cache trim can never pull it from under the render.
+        /// The bucket's seam table where it has no grid, and the share a
+        /// partly trusted grid leaves (render::seamTableUnderGrid, 1 - its
+        /// strength) under one; empty under a fully trusted grid or when
+        /// there is none.  A copy (~8 KB), so a cache trim can never pull it
+        /// from under the render.
         std::vector<float> table;
         /// Per-column confidence of `table` (SeamProfile::confidence, same
         /// length; empty with the table).  The glide steps a column to the
