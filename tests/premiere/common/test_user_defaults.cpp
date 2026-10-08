@@ -728,10 +728,12 @@ TEST_CASE("the HDR peak is saved as its nits and only the four choices read back
     CHECK(parsed.value().prefs.hdrPeakChoice() == PrefsHdrPeak::Nits600);
 }
 
-TEST_CASE("Hide Mount is saved as on / off and only those two words read back", "[userdefaults][hidemount]") {
-    // Both choices round-trip under the words the file documents; the
-    // built-in default (On, the occlusion mask) is spelled out too.
-    const char* const kWords[] = {"on", "off"};
+TEST_CASE("Hide Mount is saved as on / off / auto and only those three words read back",
+          "[userdefaults][hidemount]") {
+    // Every choice round-trips under the words the file documents; the
+    // built-in default (On, the occlusion mask) is spelled out too.  Auto was
+    // appended third, so "auto" is a word now, no longer a typo.
+    const char* const kWords[] = {"on", "off", "auto"};
     static_assert(std::size(kWords) == static_cast<std::size_t>(PrefsHideMount::Count));
     for (int i = 0; i < static_cast<int>(PrefsHideMount::Count); ++i) {
         PrefsBlob p = PrefsBlob::defaults();
@@ -753,7 +755,7 @@ TEST_CASE("Hide Mount is saved as on / off and only those two words read back", 
     // Anything else - a boolean, a number, an unknown word - is refused (and
     // noted), and new clips keep the mask: a hand-edited typo never shows the
     // mount on every new clip.
-    for (const char* bad : {"false", "0", "1", "\"auto\"", "\"\"", "\"of\"", "null"}) {
+    for (const char* bad : {"false", "0", "1", "\"automatic\"", "\"\"", "\"of\"", "null"}) {
         const std::string doc = std::string(R"({"format": "openosv-source-settings-defaults", "version": 1, )") +
                                 R"("settings": {"hideMount": )" + bad + "}}";
         const auto parsed = userDefaultsFromJson(doc);

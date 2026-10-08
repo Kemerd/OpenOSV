@@ -14,9 +14,14 @@
 //
 //   1. the lens rotation (Lens Alignment Auto): 3 frames at 10 / 50 / 90 % of
 //      the clip, through the calibration rig;
-//   2. the clip correction (Parallax Grid Steady / Auto): 9 frames spread over
-//      the clip, through the rig with the rotation folded in - the steady
-//      grid, seam table and carved seam, and the Auto verdict.
+//   2. the mount mask (Hide Mount Auto, osv/render/MountMask.h): the clip
+//      correction's 9 frames, both lenses without the mask, through the
+//      calibration rig - which stretches of the occlusion polygons hide the
+//      mount and which only hide scene both lenses see;
+//   3. the clip correction (Parallax Grid Steady / Auto): 9 frames spread over
+//      the clip, through the rig with the rotation folded in and the mount
+//      mask applied - the steady grid, seam table and carved seam, and the
+//      Auto verdict.
 //
 // A sample frame the decoder refuses is replaced by its neighbouring sync
 // frame (render::clipSampleAlternates) or skipped, and logged; only fewer
@@ -33,7 +38,7 @@
 //
 // CACHES
 // ------
-// Both results depend only on the clip file and on settings, never on which
+// Every result depends only on the clip file and on settings, never on which
 // frames Premiere asked for, so they are cached process-wide and every
 // instance of a clip - the Source monitor's, the new one Premiere opens on
 // each Source Settings change, the engine's for the direct path - gets them
@@ -43,9 +48,14 @@
 //     calibration rig, in memory and on disk (lens-alignment.tsv next to the
 //     plug-in log, like the lens-protector guard's cache): a project reopened
 //     next week does not measure again;
+//   * the mount mask, keyed by file identity, the calibration rig (its
+//     occlusion polygons included) and the mask's parameters, in memory and
+//     on disk (hide-mount.tsv, next to lens-alignment.tsv): the effect's
+//     direct path opens a second engine for the same clip, and it must
+//     stitch with the same polygons, not measure its own;
 //   * the clip correction, keyed by file identity, the rig (with the
-//     rotation) and every setting it depends on, in memory (a few hundred
-//     KB each, the last 16 kept).
+//     rotation and the mount mask) and every setting it depends on, in
+//     memory (a few hundred KB each, the last 16 kept).
 //
 // Two instances asking for the same result at once measure it once: the
 // second waits for the first (and measures itself if the first is
@@ -67,6 +77,7 @@
 #include "osv/meta/FormatInfo.h"
 #include "osv/render/ClipSteady.h"
 #include "osv/render/LensAlign.h"
+#include "osv/render/MountMask.h"
 
 #include <atomic>
 #include <chrono>
@@ -103,6 +114,19 @@ struct LensAlignVerdict {
 /// Name of the on-disk rotation cache (inside the plug-in log directory).
 inline constexpr const wchar_t* kLensAlignCacheFile = L"lens-alignment.tsv";
 
+/// Name of the on-disk Hide Mount Auto cache, next to the rotation cache.
+inline constexpr const wchar_t* kMountMaskCacheFile = L"hide-mount.tsv";
+
+/// A remembered Hide Mount Auto verdict for `path` measured through
+/// `baseRig` (the calibration rig with its full occlusion polygons) and
+/// `blend` (the analysis blend) with `params`: memory, then the disk cache
+/// (loaded on first use); nullptr when none is known yet.  Cheap after the
+/// first call; never throws, never measures.
+[[nodiscard]] std::shared_ptr<const render::MountMask> cachedMountMask(const std::filesystem::path& path,
+                                                                       const geom::LensRig& baseRig,
+                                                                       const geom::BlendParams& blend,
+                                                                       const render::MountMaskParams& params) noexcept;
+
 /// Everything one clip's per-clip analyses depend on.
 struct SteadyRequest {
     std::filesystem::path path;               ///< The clip file.
@@ -116,6 +140,10 @@ struct SteadyRequest {
     bool containerSamples = false;
     bool wantRotation = false;                ///< Lens Alignment Auto: fit (or look up) the rotation.
     bool wantClip = false;                    ///< Parallax Grid Steady / Auto: the clip correction.
+    /// Hide Mount Auto: measure (or look up) the mount mask; the clip
+    /// correction is then measured through the polygons it leaves.
+    bool wantMount = false;
+    render::MountMaskParams mount;            ///< The mount mask's parameters (the shipped rule by default).
     /// The clip correction's parameters.  `parallax.requiredImprovement` is
     /// the gate for the calibration rig: the stage replaces it with
     /// render::kAlignedRequiredImprovement when a rotation is folded in, as
@@ -147,6 +175,9 @@ public:
         bool active = false;           ///< A request is in force.
         bool rotationSettled = false;  ///< The rotation question is answered (wantRotation only).
         std::optional<LensAlignVerdict> rotation;  ///< The answer; empty when the measurement failed.
+        bool mountSettled = false;     ///< The mount mask question is answered (wantMount only).
+        /// The answer; null when the measurement failed (the full polygons stay).
+        std::shared_ptr<const render::MountMask> mount;
         bool clipSettled = false;      ///< The clip correction is answered (wantClip only).
         std::shared_ptr<const render::ClipSteady> clip;  ///< The answer; null when the measurement failed.
         /// Sample grids measured so far (frame, grid; null = refused), for
@@ -159,9 +190,9 @@ public:
     /// The serial of the published state (Snapshot::serial), lock-free.
     [[nodiscard]] std::uint64_t serial() const noexcept { return m_serial.load(std::memory_order_acquire); }
 
-    /// Block until the current request's rotation - and, with `clip`, its clip
-    /// correction - is settled, a measurement failed, or `timeout` passed.
-    /// True when settled.  Safe with the instance lock held.
+    /// Block until the current request's rotation and mount mask - and, with
+    /// `clip`, its clip correction - are settled, a measurement failed, or
+    /// `timeout` passed.  True when settled.  Safe with the instance lock held.
     bool waitSettled(bool clip, std::chrono::milliseconds timeout);
 
     /// Forget the current request (the instance's settings changed); the

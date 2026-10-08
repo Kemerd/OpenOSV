@@ -55,6 +55,12 @@ struct PipelineOptions {
     double lensFovDeg = 195.18;
     double featherDeg = 4.0;
     bool occlusionMask = true;
+    /// Source Settings "Hide Mount": "" (not given: --occlusion decides) | on
+    /// | off | auto.  Auto measures the mount mask on the clip's nine sample
+    /// frames (render/MountMask.h) and rebuilds the rig's occlusion polygons
+    /// from it, as the plug-ins do, so `seam` and `render --engine classic`
+    /// see the importer's mask.
+    std::string hideMount;
     bool blend = true;
 
     // Stabilisation

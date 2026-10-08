@@ -892,6 +892,57 @@ TEST_CASE("osvtool render --occlusion / --no-occlusion is Hide Mount On / Off on
     CHECK(changed > 1000u);
 }
 
+// osvtool render --hide-mount names Source Settings "Hide Mount" itself, Auto
+// included.  On the 6K sample Auto's verdict keeps the whole polygon (none of
+// its 44 arc windows agree at 0.8 over the nine sample frames), so the frame
+// must be the default's bit for bit - the promise Auto makes wherever it
+// keeps everything - and the engine must say what it measured.  An unknown
+// value is a usage error.  CPU renderer, classical flow, a small size.
+TEST_CASE("osvtool render --hide-mount auto keeps the 6K sample's polygons and its frame, bit for bit",
+          "[cli][engine][hidemount][sample]") {
+    OSV_REQUIRE_SAMPLE();
+    if (std::string(kToolPath).empty() || !std::filesystem::exists(kToolPath)) {
+        SKIP("osvtool not built");
+    }
+    const std::string clip = quoted(osvtest::sampleOsv());
+    const std::string common =
+        " --frame 0 --mode equirect --size 512x256 --device cpu --flow-backend classical --no-flare --out ";
+    const auto renderTo = [&](const std::string& extra, const char* name, RunResult& run) {
+        const auto path = osvtest::tempDir() / name;
+        std::error_code ec;
+        std::filesystem::remove(path, ec);  // never compare against a stale still
+        run = runTool("render " + clip + extra + common + quoted(path));
+        INFO(run.output);
+        REQUIRE(run.exitCode == 0);
+        auto image = osv::io::readImage(path);
+        REQUIRE(image.ok());
+        REQUIRE(image.value().data.size() == std::size_t{4} * 512u * 256u);
+        return std::move(image).value();
+    };
+
+    RunResult plainRun;
+    const auto plain = renderTo("", "cli_hidemount_auto_default.tif", plainRun);
+    RunResult autoRun;
+    const auto automatic = renderTo(" --hide-mount auto", "cli_hidemount_auto.tif", autoRun);
+    INFO(autoRun.output);
+    // The engine measured the clip and kept the calibration's polygons ...
+    CHECK(autoRun.output.find("hide mount:") != std::string::npos);
+    CHECK(autoRun.output.find("Auto - released 0 of") != std::string::npos);
+    CHECK(autoRun.output.find("Auto keeps the calibration's polygons") != std::string::npos);
+    // ... so the frame is the default's, bit for bit.
+    CHECK(automatic.data == plain.data);
+
+    // --hide-mount off is --no-occlusion; an unknown value never renders.
+    RunResult offRun;
+    const auto off = renderTo(" --hide-mount off", "cli_hidemount_auto_off.tif", offRun);
+    CHECK(offRun.output.find("Off - the calibration's occlusion polygons are not applied") != std::string::npos);
+    CHECK_FALSE(off.data == plain.data);
+    const auto refusedPath = osvtest::tempDir() / "cli_hidemount_refused.tif";
+    const RunResult bogus = runTool("render " + clip + " --hide-mount sometimes" + common + quoted(refusedPath));
+    CHECK(bogus.exitCode != 0);
+    CHECK(bogus.output.find("--hide-mount") != std::string::npos);
+}
+
 // osvtool render --alpha: the coverage alpha a host composites with, written
 // into the stills as a 4th channel - and only when asked, so every render
 // without the flag stays byte-for-byte what it was.  Without it, a band of

@@ -452,7 +452,7 @@
 #define OSV_SS_LENS_FOCAL_DEFAULT 1
 #define OSV_SS_LENS_FOCAL_HINT "Auto picks the focal each recording mode measures best. Camera trusts the recorded focal; Calibration uses each lens's own. Change it only if the seam doubles straight lines."
 
-/* "Hide Mount" - PrefsHideMount: On, Off (enum order, On first).
+/* "Hide Mount" - PrefsHideMount: On, Off, Auto (enum order, On first).
  *
  * Whether the stitch applies the occlusion polygons the camera's calibration
  * records around its own body and mount.  "On" cuts the mount out, as every
@@ -460,19 +460,24 @@
  * drops the polygons: on a car, helmet or suction mount they can leave a
  * long stretch of the seam with no overlap at all, where near objects (a
  * roof line) step at a forced cut; Off gives the seam its overlap back there,
- * and the mount itself can show.  The list is append-only: a project stores
- * the popup value.  Default 1 = On, which is also an older project's zero
- * byte. */
-#define OSV_SS_HIDE_MOUNT_ITEMS "On|Off (full lens overlap)"
-#define OSV_SS_HIDE_MOUNT_COUNT 2
+ * and the mount itself can show.  "Auto (measured per clip)", appended third,
+ * keeps the polygons only where the two lenses disagree on the clip's sample
+ * frames and releases them where both see the same scene
+ * (osv/render/MountMask.h).  The list is append-only: a project stores the
+ * popup value.  Default 1 = On, which is also an older project's zero byte. */
+#define OSV_SS_HIDE_MOUNT_ITEMS "On|Off (full lens overlap)|Auto (measured per clip)"
+#define OSV_SS_HIDE_MOUNT_COUNT 3
 #define OSV_SS_HIDE_MOUNT_DEFAULT 1
 /* The hint the hosts that show tooltips put on the control (the importer's
  * dialog, the OpenFX parameter).  It promises only what Off was measured to
  * do: near edges step LESS where the mask left no overlap (a car roof line on
  * the proxy: 0.97 -> 0.63 deg upper, 2.65 -> 2.30 deg lower), not that the
  * step goes away - near-field disparity along the seam remains - and the
- * mount CAN show, depending on where the seam runs. */
-#define OSV_SS_HIDE_MOUNT_HINT "On cuts the camera's mount out of the stitch. Off gives the seam the full lens overlap back where the mask left none, so near edges on a car, helmet or suction mount step less there; the mount can show."
+ * mount CAN show, depending on where the seam runs.  Auto's sentence says
+ * what it does, not what it achieves: on the measured car clip it gives the
+ * overlap back over the hood and keeps the mask at the roof crossing, whose
+ * near and far content no single shift matches. */
+#define OSV_SS_HIDE_MOUNT_HINT "On cuts the camera's mount out of the stitch. Off gives the seam the full lens overlap back where the mask left none, so near edges on a car, helmet or suction mount step less there; the mount can show. Auto measures the clip once and gives the overlap back only where both lenses see the same scene."
 
 /* ==========================================================================
  *  Checkbox and slider ranges / defaults

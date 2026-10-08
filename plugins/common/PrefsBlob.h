@@ -352,9 +352,19 @@ enum class PrefsLensFocal : std::uint8_t {
 /// table, no carved seam - so near objects crossing it (a roof line) step at
 /// a forced cut.  Off gives the stitch the full lens overlap back there; the
 /// price is that the mount itself can show.
+///
+/// Auto (appended third, value 2) decides per stretch of the seam, once per
+/// clip on its sample frames (osv/render/MountMask.h): where both lenses see
+/// the same scene the polygons are released, around the real mount they are
+/// kept.  It is not the default: on the 6K sample the .OSV keeps its whole
+/// polygons (bit for bit), but its .LRF proxy releases 49 of 688 arc columns
+/// and clamps most of the rest (its 24 px occlusion feather spans ~5 deg), so
+/// a default Auto would change that clip's proxy render - and the release
+/// rule is that every existing project renders bit for bit as before.
 enum class PrefsHideMount : std::uint8_t {
-    On = 0,   ///< The calibration's occlusion polygons cut the mount out (the default).
-    Off = 1,  ///< No occlusion mask: the full lens overlap, the mount visible.
+    On = 0,    ///< The calibration's occlusion polygons cut the mount out (the default).
+    Off = 1,   ///< No occlusion mask: the full lens overlap, the mount visible.
+    Auto = 2,  ///< The polygons kept only where they hide the mount, measured per clip.
     Count
 };
 
@@ -1193,6 +1203,9 @@ static_assert(offsetof(PrefsBlob, lensFocal) == 57, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, hideMount) == 58, "PrefsBlob layout drifted");
 static_assert(offsetof(PrefsBlob, reserved) == 59, "PrefsBlob layout drifted");
 static_assert(static_cast<int>(PrefsHideMount::On) == 0, "zero must stay Hide Mount On (the mask always applied)");
+// The UI lists are append-only: Auto is the THIRD item, after Off, forever.
+static_assert(static_cast<int>(PrefsHideMount::Off) == 1 && static_cast<int>(PrefsHideMount::Auto) == 2,
+              "Hide Mount values are persisted and append-only");
 static_assert(static_cast<int>(PrefsSceneLight::Auto) == 0, "zero must stay Scene Light Auto");
 static_assert(static_cast<int>(PrefsLensFocal::Auto) == 0, "zero must stay the default focal rule");
 static_assert(static_cast<int>(PrefsHdrPeak::Nits1000) == 0, "zero must stay the no-roll-off default");

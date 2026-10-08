@@ -277,8 +277,10 @@ namespace OpenOSV.Vegas.Core
         public static readonly ChoiceList SceneLight = new ChoiceList("Auto|Day|Night", 0);
         /// <summary>Lens Focal; default Auto.</summary>
         public static readonly ChoiceList LensFocal = new ChoiceList("Auto|Camera (recorded focal)|Calibration (each lens)", 0);
-        /// <summary>Hide Mount; default On (the calibration's occlusion mask, as every older project).</summary>
-        public static readonly ChoiceList HideMount = new ChoiceList("On|Off (full lens overlap)", 0);
+        /// <summary>Hide Mount; default On (the calibration's occlusion mask, as every older project).
+        /// Auto (the mount mask measured per clip) is appended third.</summary>
+        public static readonly ChoiceList HideMount =
+            new ChoiceList("On|Off (full lens overlap)|Auto (measured per clip)", 0);
         public static readonly ChoiceList DlogmCurve = new ChoiceList("DJI Refit|Pocket 3|Osmo 360|Avata 360", 2);
         /// <summary>Render Device, as the Windows build lists it.</summary>
         public static readonly ChoiceList RenderDevice = new ChoiceList("Auto|CPU|CUDA|OpenCL", 0);

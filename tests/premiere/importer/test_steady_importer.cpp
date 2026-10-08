@@ -475,3 +475,92 @@ TEST_CASE("the lens rotation cached by a Hide Mount Off clip is the one an On cl
 
     harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
 }
+
+// ---- Hide Mount Auto: the per-clip mount mask ----------------------------------
+
+TEST_CASE("Hide Mount Auto keeps the 6K sample's polygons: its frame is On's, bit for bit",
+          "[importer][hidemount][sample]") {
+    REQUIRE_SAMPLE_CLIP();
+    // On the 6K sample none of the polygon arc's windows agrees at 0.8 over
+    // the nine sample frames (the stick and its mount are in them), so Auto
+    // keeps the calibration's polygons and must render exactly what On does,
+    // photometric field and lens shading included.
+    ScopedEnv noSharing("OPENOSV_STEADY_NO_SHARED_CACHE", "1");
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+    const PrefsBlob on = hideMountPrefs(PrefsHideMount::On, true);
+    const PrefsBlob automatic = hideMountPrefs(PrefsHideMount::Auto, true);
+
+    const auto renderOnce = [&](const PrefsBlob& prefs, csSDK_int32 id) {
+        auto clip = harness.openClip(sampleClipPath(), id);
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+        harness.host().clearCache();
+        return render(harness, clip, ppix, requestFor(20, imRenderIntent_Export), prefs);
+    };
+    const Pixels masked = renderOnce(on, 3401);
+    const Pixels measured = renderOnce(automatic, 3402);
+    INFO(differing(masked, measured) << " pixels differ between On and Auto");
+    CHECK(measured == masked);
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}
+
+TEST_CASE("Hide Mount Auto: a second instance of the clip stitches with the verdict the first measured",
+          "[importer][hidemount][sample]") {
+    // The effect's direct path opens a second engine for the clip it shows;
+    // it must stitch with the same polygons as the importer's own instance,
+    // not with a verdict of its own.  On the sample's LRF proxy Auto releases
+    // part of the arc, so the frames say whether the polygons were rebuilt.
+    const std::filesystem::path proxy = sampleProxyPath();
+    std::error_code ec;
+    if (proxy.empty() || !std::filesystem::exists(proxy, ec)) {
+        SKIP("the .LRF proxy is not present at " << proxy.string());
+    }
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+    const void* suite = nullptr;
+    REQUIRE(harness.host().basicSuite()->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion, &suite) == kSPNoError);
+    const auto* ppix = static_cast<const PrSDKPPixSuite*>(suite);
+    const PrefsBlob on = hideMountPrefs(PrefsHideMount::On, false);
+    const PrefsBlob automatic = hideMountPrefs(PrefsHideMount::Auto, false);
+
+    const auto renderOnce = [&](const PrefsBlob& prefs, csSDK_int32 id) {
+        auto clip = harness.openClip(proxy, id);
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info, &prefs) == imNoErr);
+        harness.host().clearCache();
+        // The proxy advertises its own size (2000 x 1000 beside the 6K
+        // original): ask for exactly that, as Premiere does.
+        REQUIRE(info.vidInfo.imageWidth > 0);
+        REQUIRE(info.vidInfo.imageHeight > 0);
+        ImporterHarness::SourceVideoRequest request = requestFor(20, imRenderIntent_Export);
+        request.width = info.vidInfo.imageWidth;
+        request.height = info.vidInfo.imageHeight;
+        return render(harness, clip, ppix, request, prefs);
+    };
+    // A: an instance that shares nothing measures its own verdict.
+    Pixels own;
+    {
+        ScopedEnv noSharing("OPENOSV_STEADY_NO_SHARED_CACHE", "1");
+        own = renderOnce(automatic, 3411);
+    }
+    // The verdict changes the stitch (the test is not vacuous) ...
+    const Pixels masked = renderOnce(on, 3412);
+    CHECK(differing(own, masked) > 1000u);
+    // ... B measures with the shared caches on and leaves the verdict there;
+    // C, a second instance of the same clip, is served it.  Both render the
+    // frame A measured for itself: one verdict per clip, whoever asks.
+    const Pixels first = renderOnce(automatic, 3413);
+    const Pixels second = renderOnce(automatic, 3414);
+    INFO(differing(own, first) << " / " << differing(first, second) << " pixels differ");
+    CHECK(first == own);
+    CHECK(second == first);
+
+    harness.host().basicSuite()->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+}

@@ -735,7 +735,9 @@ constexpr int kIdcStaticHideMount = 1192;
 /// order (On first, the default), so the combo index is the stored value.
 void addHideMountRow(HWND dialog, const DialogControls& c) noexcept {
     const int row = growDialogForRows(dialog, 1);
-    static const wchar_t* const kModes[] = {L"On (default)", L"Off (full lens overlap; the mount can show)"};
+    // Append-only, in enum order: Auto is the third item.
+    static const wchar_t* const kModes[] = {L"On (default)", L"Off (full lens overlap; the mount can show)",
+                                            L"Auto (measured per clip)"};
     static_assert(std::size(kModes) == static_cast<std::size_t>(PrefsHideMount::Count),
                   "the Hide Mount combo does not list every PrefsHideMount value");
     addDialogChild(dialog, L"STATIC", L"Hide mount:", SS_LEFT, kIdcStaticHideMount, 7, row + 3, 70, 8);
@@ -749,7 +751,8 @@ void addHideMountRow(HWND dialog, const DialogControls& c) noexcept {
     addRowTooltip(dialog, kIdcHideMount, kIdcStaticHideMount,
                   L"On cuts the camera's mount out of the stitch. Off gives the seam the full lens overlap back where "
                   L"the mask left none, so near edges on a car, helmet or suction mount step less there; the mount "
-                  L"can show.");
+                  L"can show. Auto measures the clip once and gives the overlap back only where both lenses see the "
+                  L"same scene.");
 }
 
 /// Read the Hide Mount row back; a missing row keeps what the dialog opened

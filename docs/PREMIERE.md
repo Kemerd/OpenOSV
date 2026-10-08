@@ -617,7 +617,7 @@ meaning; forcing the bare-lens set is new and therefore last.
 | 23 | 41 | Lens Alignment | popup | Auto (fit per clip) \| Off (calibration only) | Auto | `lensAlign` |
 | 24 | 52 | Scene Light | popup | Auto \| Day \| Night | Auto | `sceneLight` |
 | 25 | 53 | Lens Focal | popup | Auto \| Camera (recorded focal) \| Calibration (each lens) | Auto | `lensFocal` |
-| 26 | 54 | Hide Mount | popup | On \| Off (full lens overlap) | On | `hideMount` |
+| 26 | 54 | Hide Mount | popup | On \| Off (full lens overlap) \| Auto (measured per clip) | On | `hideMount` |
 | 27 | 8 | (closes Stitching) | GROUP_END | | | |
 | 28 | 9 | Advanced | topic (GROUP_START, starts collapsed) | | | |
 | 29 | 10 | D-Log M Curve | popup | DJI Refit \| Pocket 3 \| Osmo 360 | Osmo 360 | `dlogmFit` |
@@ -642,6 +642,9 @@ See "User defaults for new clips" below.
 **Hide Mount (id 54).** Car, helmet or suction mount and a step at the seam: set Hide Mount to Off.
 Off drops the calibration's occlusion polygons, so the mount can show; On is the default and what every
 older project reads (`PrefsBlob` offset 58), and `osvtool render --no-occlusion` renders Off.
+Auto (byte 2) measures the clip once on its nine steady sample frames and keeps the polygons only where
+the lenses disagree (`osv/render/MountMask.h`); the verdict is cached in `hide-mount.tsv` beside
+`lens-alignment.tsv`, so the effect's direct view stitches with the same polygons. `osvtool --hide-mount auto`.
 
 An effect saved before ids 15-19 (or 34-35, or 40-41) existed has no stored
 value for them, so it picks up the control defaults above (DJI look, ghost

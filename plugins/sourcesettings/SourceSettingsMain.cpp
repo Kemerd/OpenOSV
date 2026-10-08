@@ -812,7 +812,8 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     // renders with) or the seam keeps the full lens overlap (Off: on a car,
     // helmet or suction mount the near edges step less where the mask used
     // to force a cut, though along-seam disparity remains; the mount can
-    // show).
+    // show), or - Auto, the third item - the mask stays only where the
+    // lenses disagree on the clip's sample frames.
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUPX("Hide Mount", OSV_SS_HIDE_MOUNT_COUNT, OSV_SS_HIDE_MOUNT_DEFAULT, OSV_SS_HIDE_MOUNT_ITEMS,
                   kStaticFlags, OSV_SS_ID_HIDE_MOUNT);

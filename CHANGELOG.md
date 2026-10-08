@@ -122,6 +122,23 @@ classical flow and the seam-shift table, not osvtool's neural default.
   line where it crosses the seam steps less (0.97° to 0.63° on the proxy);
   near parts of the car that cross the seam still step. osvtool `render
   --no-occlusion` now renders Off on the plug-in engine too.
+* **Hide Mount: Auto**, the third choice (On stays the default). Auto looks
+  at the clip once, on the nine frames the steady seam uses, and keeps the
+  occlusion polygons only where the two lenses disagree. Where both see the
+  same scene the overlap comes back, as with Off; around the mount the mask
+  stays. Where neither lens was fully trusted on the seam, the lens that
+  does not see the mount now covers it, so the picture's coverage no longer
+  dips there. On a car drive's proxy Auto releases 21° of the polygons'
+  120° arc (hood and roof side), the seam ring's stretch with no lens
+  overlap shrinks from 98° to none, the lowest alpha rises from 0.71 to
+  1.00, and the lower roof edge at the seam steps 0.19° instead of 2.72°.
+  On the 8K original Auto releases 18°; its polygons never covered the seam
+  plane, and that roof edge still steps about 3°: near-field disparity along
+  the seam, which no mask removes. The 6K sample keeps its polygons and its
+  frames, bit for bit; its proxy does not, which is why Auto is not the
+  default. Measuring costs 0.35-0.6 s once per clip, off the render thread,
+  and the verdict is cached next to `lens-alignment.tsv`, so the effect's
+  direct view uses the same polygons. osvtool: `--hide-mount on|off|auto`.
 * The plug-in logs now carry the library's own messages and FFmpeg's, at the
   log's level. Before, inside Premiere, they went nowhere. FFmpeg lines name
   the codec and the clip they are about, and arrive from WARNING up, each

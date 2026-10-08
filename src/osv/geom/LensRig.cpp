@@ -6,10 +6,12 @@
 #include "osv/geom/LensRig.h"
 
 #include "osv/core/Log.h"
+#include "osv/geom/Blend.h"
 
 #include <algorithm>
 #include <cmath>
 #include <format>
+#include <limits>
 
 namespace osv::geom {
 
@@ -364,6 +366,346 @@ bool LensRig::projectBody(int i, const Vec3d& dBody, Vec2d& px, double& theta) c
     // Rotate into the lens frame and hand over to the intrinsic model.
     const Vec3d dLens = bodyToLens[static_cast<std::size_t>(i)] * dBody;
     return lens[static_cast<std::size_t>(i)].project(dLens, px, theta);
+}
+
+// =============================================================================
+//  Hide Mount Auto: clipping an occlusion polygon to azimuth stretches
+// =============================================================================
+namespace {
+
+/// Largest polar-angle stretch (radians) a polygon may cover and still be
+/// rebuilt as one inner and one outer run.  The calibration's mount arcs
+/// cover about 120 deg; anything near a full turn would wrap onto itself.
+constexpr double kMaxPolygonSpanRad = 300.0 * (kPi / 180.0);
+/// Largest gap (radians) between two inner-run vertices of a released
+/// stretch: the chord between them dips to cos(7.5 deg) = 0.991 of their
+/// radius, which the released radius allows for.
+constexpr double kReleaseStepRad = 15.0 * (kPi / 180.0);
+/// Largest gap (radians) between two inner-run vertices of a clamped
+/// stretch: the chord dips to cos(5 deg) = 0.996 of the vertex radius, and
+/// the vertices sit that much further out so the chord still honours the
+/// clamp.
+constexpr double kClampStepRad = 10.0 * (kPi / 180.0);
+/// Largest gap (radians) between two outer-run vertices.
+constexpr double kOuterStepRad = 30.0 * (kPi / 180.0);
+/// Angles closer than this (radians) are one breakpoint.
+constexpr double kAngleEpsilon = 1e-9;
+
+/// `a` wrapped into [-pi, pi].
+[[nodiscard]] double wrapPi(double a) noexcept { return std::remainder(a, kTwoPi); }
+
+/// `a` wrapped into [0, 2 pi).
+[[nodiscard]] double wrapTwoPi(double a) noexcept {
+    double r = std::fmod(a, kTwoPi);
+    if (r < 0.0) {
+        r += kTwoPi;
+    }
+    return r >= kTwoPi ? 0.0 : r;
+}
+
+/// 2-D cross product (z of the 3-D one).
+[[nodiscard]] double cross2(const Vec2d& a, const Vec2d& b) noexcept { return a.x * b.y - a.y * b.x; }
+
+/// A point at polar angle `angle` and `radius` about `centre`.
+[[nodiscard]] Vec2d polarPoint(const Vec2d& centre, double angle, double radius) noexcept {
+    return Vec2d{centre.x + radius * std::cos(angle), centre.y + radius * std::sin(angle)};
+}
+
+}  // namespace
+
+std::optional<std::pair<double, double>> occlusionRayRadii(const std::vector<Vec2d>& polygon, const Vec2d& centre,
+                                                           double angleRad) noexcept {
+    // ---- defensive input checks ------------------------------------------------------
+    if (polygon.size() < 3 || !std::isfinite(centre.x) || !std::isfinite(centre.y) || !std::isfinite(angleRad)) {
+        return std::nullopt;
+    }
+    const Vec2d dir{std::cos(angleRad), std::sin(angleRad)};
+    double nearest = std::numeric_limits<double>::infinity();
+    double farthest = -std::numeric_limits<double>::infinity();
+    // ---- every edge the ray crosses ---------------------------------------------------
+    // centre + t * dir = p + s * (q - p), t > 0 and s in [0, 1].  An edge
+    // parallel to the ray is skipped: its end points are crossings of the
+    // neighbouring edges, which is all the radii need.
+    for (std::size_t i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++) {
+        const Vec2d& p = polygon[j];
+        const Vec2d& q = polygon[i];
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(q.x) || !std::isfinite(q.y)) {
+            return std::nullopt;  // a broken vertex: no radius is trustworthy
+        }
+        const Vec2d e = q - p;
+        const double denom = cross2(dir, e);
+        const double scale = std::max(1.0, std::abs(e.x) + std::abs(e.y));
+        if (std::abs(denom) <= 1e-12 * scale) {
+            continue;
+        }
+        const Vec2d w = p - centre;
+        const double t = cross2(w, e) / denom;
+        const double s = cross2(w, dir) / denom;
+        if (!(t > 0.0) || s < -1e-12 || s > 1.0 + 1e-12) {
+            continue;
+        }
+        nearest = std::min(nearest, t);
+        farthest = std::max(farthest, t);
+    }
+    if (!std::isfinite(nearest) || !std::isfinite(farthest)) {
+        return std::nullopt;  // the ray misses the polygon
+    }
+    return std::make_pair(nearest, farthest);
+}
+
+Result<std::vector<Vec2d>> clipOcclusionPolygon(const std::vector<Vec2d>& polygon, const Vec2d& centre,
+                                                const std::vector<OcclusionSpan>& spans,
+                                                const OcclusionClipParams& params) {
+    // ---- defensive input checks ----------------------------------------------------------
+    if (polygon.size() < 3) {
+        return Error{ErrorCode::InvalidArgument, "clipOcclusionPolygon: fewer than three vertices"};
+    }
+    if (!std::isfinite(centre.x) || !std::isfinite(centre.y)) {
+        return Error{ErrorCode::InvalidArgument, "clipOcclusionPolygon: the lens centre is not finite"};
+    }
+    if (!std::isfinite(params.usableRadiusPx) || params.usableRadiusPx <= 0.0 ||
+        !std::isfinite(params.clampRadiusPx) || params.clampRadiusPx < 0.0 || params.maxVertices < 3) {
+        return Error{ErrorCode::InvalidArgument, "clipOcclusionPolygon: bad radii or vertex budget"};
+    }
+    for (const Vec2d& v : polygon) {
+        if (!std::isfinite(v.x) || !std::isfinite(v.y)) {
+            return Error{ErrorCode::InvalidArgument, "clipOcclusionPolygon: a vertex is not finite"};
+        }
+    }
+    bool anyChange = false;
+    for (const OcclusionSpan& s : spans) {
+        if (!std::isfinite(s.fromRad) || !std::isfinite(s.toRad) || static_cast<int>(s.state) > 2) {
+            return Error{ErrorCode::InvalidArgument, "clipOcclusionPolygon: a span is not finite"};
+        }
+        anyChange = anyChange || s.state != OcclusionSpanState::Keep;
+    }
+    // Nothing but Keep: the calibration's polygon, whatever its shape.
+    if (!anyChange) {
+        return polygon;
+    }
+    // A polygon around the lens centre has no inner and outer run to rebuild.
+    if (pointInPolygon(polygon, centre)) {
+        return Error{ErrorCode::Unsupported, "clipOcclusionPolygon: the polygon surrounds the lens centre"};
+    }
+
+    // ---- the polygon's own polar-angle frame ---------------------------------------------
+    // Angles are measured from the polygon's mean direction, so the stretch
+    // it covers is one interval [lo, hi] even when it straddles the image's
+    // +-180 deg line.
+    double sx = 0.0;
+    double sy = 0.0;
+    std::vector<double> delta(polygon.size());
+    std::vector<double> radius(polygon.size());
+    for (std::size_t k = 0; k < polygon.size(); ++k) {
+        const Vec2d d = polygon[k] - centre;
+        radius[k] = d.norm();
+        if (!(radius[k] > 0.0)) {
+            return Error{ErrorCode::Unsupported, "clipOcclusionPolygon: a vertex sits on the lens centre"};
+        }
+        sx += d.x / radius[k];
+        sy += d.y / radius[k];
+    }
+    if (std::hypot(sx, sy) < 1e-9) {
+        return Error{ErrorCode::Unsupported, "clipOcclusionPolygon: the polygon has no mean direction"};
+    }
+    const double mean = std::atan2(sy, sx);
+    double lo = std::numeric_limits<double>::infinity();
+    double hi = -std::numeric_limits<double>::infinity();
+    for (std::size_t k = 0; k < polygon.size(); ++k) {
+        const Vec2d d = polygon[k] - centre;
+        delta[k] = wrapPi(std::atan2(d.y, d.x) - mean);
+        lo = std::min(lo, delta[k]);
+        hi = std::max(hi, delta[k]);
+    }
+    if (!(hi - lo > kAngleEpsilon) || hi - lo > kMaxPolygonSpanRad) {
+        return Error{ErrorCode::Unsupported, "clipOcclusionPolygon: the polygon's polar-angle stretch is empty or "
+                                             "too wide to rebuild"};
+    }
+
+    // ---- the state at a polar angle (in the polygon's frame) ----------------------------
+    // Later spans win over earlier ones; an angle no span covers is Keep.
+    const auto stateAt = [&](double d) {
+        OcclusionSpanState state = OcclusionSpanState::Keep;
+        for (const OcclusionSpan& s : spans) {
+            const double length = wrapTwoPi(s.toRad - s.fromRad);
+            const double start = s.fromRad - mean;
+            if (wrapTwoPi(d - start) <= length) {
+                state = s.state;
+            }
+        }
+        return state;
+    };
+
+    // ---- breakpoints: the polygon's ends and every span end inside them ------------------
+    std::vector<double> cuts{lo, hi};
+    for (const OcclusionSpan& s : spans) {
+        for (const double a : {s.fromRad, s.toRad}) {
+            const double d = wrapPi(a - mean);
+            if (d > lo + kAngleEpsilon && d < hi - kAngleEpsilon) {
+                cuts.push_back(d);
+            }
+        }
+    }
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end(), [](double a, double b) { return b - a <= kAngleEpsilon; }),
+               cuts.end());
+
+    // ---- the polygon's inner radius at a polar angle --------------------------------------
+    // At the two ends the ray runs along the closing edge, so the end
+    // vertices themselves give it: the nearest vertex at that angle.
+    const auto innerAt = [&](double d) -> double {
+        if (d <= lo + kAngleEpsilon || d >= hi - kAngleEpsilon) {
+            const double end = d <= lo + kAngleEpsilon ? lo : hi;
+            double best = std::numeric_limits<double>::infinity();
+            for (std::size_t k = 0; k < polygon.size(); ++k) {
+                if (std::abs(delta[k] - end) <= 1e-7) {
+                    best = std::min(best, radius[k]);
+                }
+            }
+            return best;
+        }
+        const auto radii = occlusionRayRadii(polygon, centre, d + mean);
+        return radii ? radii->first : std::numeric_limits<double>::quiet_NaN();
+    };
+
+    // ---- intervals between breakpoints, with their states --------------------------------
+    struct Interval {
+        double from;
+        double to;
+        OcclusionSpanState state;
+    };
+    std::vector<Interval> intervals;
+    for (std::size_t j = 0; j + 1 < cuts.size(); ++j) {
+        const OcclusionSpanState s = stateAt(0.5 * (cuts[j] + cuts[j + 1]));
+        if (!intervals.empty() && intervals.back().state == s) {
+            intervals.back().to = cuts[j + 1];  // same treatment: one interval
+        } else {
+            intervals.push_back(Interval{cuts[j], cuts[j + 1], s});
+        }
+    }
+
+    // ---- the polar angles a stretch needs vertices at -------------------------------------
+    // Its two ends, every original vertex strictly inside it (so a kept
+    // stretch follows the calibration's own edges), and enough extra angles
+    // that no gap exceeds `maxStep`.
+    const auto anglesIn = [&](const Interval& iv, double maxStep) {
+        std::vector<double> a{iv.from};
+        for (std::size_t k = 0; k < polygon.size(); ++k) {
+            if (delta[k] > iv.from + kAngleEpsilon && delta[k] < iv.to - kAngleEpsilon) {
+                a.push_back(delta[k]);
+            }
+        }
+        a.push_back(iv.to);
+        std::sort(a.begin(), a.end());
+        a.erase(std::unique(a.begin(), a.end(), [](double x, double y) { return y - x <= kAngleEpsilon; }), a.end());
+        std::vector<double> out;
+        for (std::size_t j = 0; j < a.size(); ++j) {
+            out.push_back(a[j]);
+            if (j + 1 < a.size() && maxStep > 0.0) {
+                const double gap = a[j + 1] - a[j];
+                const int extra = static_cast<int>(std::ceil(gap / maxStep)) - 1;
+                for (int e = 1; e <= extra; ++e) {
+                    out.push_back(a[j] + gap * static_cast<double>(e) / static_cast<double>(extra + 1));
+                }
+            }
+        }
+        return out;
+    };
+
+    // ---- nothing to change: the calibration's polygon, bit for bit -------------------------
+    // A Clamp stretch whose polygon already starts at or beyond the clamp
+    // radius changes nothing either.  Checked at every vertex and every
+    // quarter degree between them: a straight edge comes closest to the
+    // centre at a vertex or at the foot of the perpendicular, and a quarter
+    // degree finds that foot to well under a pixel on any stream size.
+    bool changes = false;
+    for (Interval& iv : intervals) {
+        if (iv.state == OcclusionSpanState::Release) {
+            changes = true;
+        } else if (iv.state == OcclusionSpanState::Clamp) {
+            bool binds = false;
+            for (const double d : anglesIn(iv, deg2rad(0.25))) {
+                const double r = innerAt(d);
+                if (!std::isfinite(r) || r < params.clampRadiusPx) {
+                    binds = true;
+                    break;
+                }
+            }
+            if (binds) {
+                changes = true;
+            } else {
+                iv.state = OcclusionSpanState::Keep;
+            }
+        }
+    }
+    if (!changes) {
+        return polygon;
+    }
+
+    // ---- radii of the rebuilt polygon -------------------------------------------------------
+    // Released stretches start beyond the usable circle with room for the
+    // chord between vertices; clamped ones at the clamp radius plus the same
+    // allowance; the outer run beyond every inner vertex, chords included.
+    const double releaseRadius = params.usableRadiusPx * 1.01 / std::cos(0.5 * kReleaseStepRad);
+    const double clampRadius = params.clampRadiusPx / std::cos(0.5 * kClampStepRad);
+
+    // ---- the inner run, forward in polar angle --------------------------------------------
+    std::vector<Vec2d> inner;
+    double innerMax = 0.0;
+    const auto pushInner = [&](double d, double r) -> Status {
+        if (!std::isfinite(r) || !(r > 0.0)) {
+            return Error{ErrorCode::Unsupported, "clipOcclusionPolygon: the polygon's inner edge cannot be traced"};
+        }
+        const Vec2d v = polarPoint(centre, d + mean, r);
+        if (!inner.empty() && std::abs(inner.back().x - v.x) < 1e-9 && std::abs(inner.back().y - v.y) < 1e-9) {
+            return okStatus();  // a zero-length edge adds nothing
+        }
+        inner.push_back(v);
+        innerMax = std::max(innerMax, r);
+        return okStatus();
+    };
+    for (const Interval& iv : intervals) {
+        switch (iv.state) {
+        case OcclusionSpanState::Keep:
+            for (const double d : anglesIn(iv, 0.0)) {
+                OSV_TRY(pushInner(d, innerAt(d)));
+            }
+            break;
+        case OcclusionSpanState::Release:
+            for (const double d : anglesIn(iv, kReleaseStepRad)) {
+                OSV_TRY(pushInner(d, releaseRadius));
+            }
+            break;
+        case OcclusionSpanState::Clamp:
+            for (const double d : anglesIn(iv, kClampStepRad)) {
+                OSV_TRY(pushInner(d, std::max(innerAt(d), clampRadius)));
+            }
+            break;
+        }
+    }
+
+    // ---- the outer run, back in polar angle --------------------------------------------------
+    // Beyond every inner vertex and every chord between outer vertices.
+    const double outerRadius = std::max(innerMax, releaseRadius) * 1.05 / std::cos(0.5 * kOuterStepRad);
+    const int outerSteps = std::max(1, static_cast<int>(std::ceil((hi - lo) / kOuterStepRad)));
+    std::vector<Vec2d> out = std::move(inner);
+    for (int s = outerSteps; s >= 0; --s) {
+        const double d = lo + (hi - lo) * static_cast<double>(s) / static_cast<double>(outerSteps);
+        out.push_back(polarPoint(centre, d + mean, outerRadius));
+    }
+
+    // ---- the kernels' vertex budget -----------------------------------------------------------
+    if (out.size() > params.maxVertices) {
+        return Error{ErrorCode::Unsupported,
+                     std::format("clipOcclusionPolygon: the rebuilt polygon needs {} vertices (budget {})", out.size(),
+                                 params.maxVertices)};
+    }
+    for (const Vec2d& v : out) {
+        if (!std::isfinite(v.x) || !std::isfinite(v.y)) {
+            return Error{ErrorCode::Internal, "clipOcclusionPolygon: a rebuilt vertex is not finite"};
+        }
+    }
+    return out;
 }
 
 }  // namespace osv::geom

@@ -24,6 +24,8 @@
 #include "osv/geom/StreamScaling.h"
 #include "osv/geom/VirtualCamera.h"
 #include "osv/meta/Types.h"
+#include "osv/render/MountMask.h"   // Hide Mount Auto: the verdict applied to a rig
+#include "osv/render/osv_kernel.h"  // OSV_MAX_OCCLUSION_POINTS, the kernels' vertex budget
 
 #include <algorithm>
 #include <array>
@@ -1274,4 +1276,268 @@ TEST_CASE("Blend weight: occlusion polygon geometry and feather", "[geom][blend]
     REQUIRE(lensWeightRef(rig, kSlaveLens, 0.0, apex + inward * 1.0, params) == 1.0);
     // The master has no polygon in this fixture: nothing is masked.
     REQUIRE(lensWeightRef(rig, kMasterLens, 0.0, Vec2d{1500.0, 2900.0}, params) == 1.0);
+}
+
+// =============================================================================
+//  Hide Mount Auto: rebuilding an occlusion polygon per azimuth stretch
+// =============================================================================
+namespace {
+
+/// True when no two non-adjacent edges of `poly` cross (a simple polygon).
+bool isSimplePolygon(const std::vector<Vec2d>& poly) {
+    const auto orient = [](const Vec2d& p, const Vec2d& q, const Vec2d& r) {
+        const double v = (q.y - p.y) * (r.x - q.x) - (q.x - p.x) * (r.y - q.y);
+        return v > 1e-9 ? 1 : (v < -1e-9 ? 2 : 0);
+    };
+    const auto cross = [&](const Vec2d& a, const Vec2d& b, const Vec2d& c, const Vec2d& d) {
+        return orient(a, b, c) != orient(a, b, d) && orient(c, d, a) != orient(c, d, b);
+    };
+    const std::size_t n = poly.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = i + 1; j < n; ++j) {
+            if (j == i + 1 || (i == 0 && j == n - 1)) {
+                continue;  // adjacent edges share a vertex
+            }
+            if (cross(poly[i], poly[(i + 1) % n], poly[j], poly[(j + 1) % n])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Exactly the same vertices (no tolerance: "unchanged" means bit for bit).
+bool sameVertices(const std::vector<Vec2d>& a, const std::vector<Vec2d>& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].x != b[i].x || a[i].y != b[i].y) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A point at polar angle `deg` (fisheye image convention) and `radius` px.
+Vec2d atPolar(const Vec2d& centre, double deg, double radius) {
+    return Vec2d{centre.x + radius * std::cos(deg2rad(deg)), centre.y + radius * std::sin(deg2rad(deg))};
+}
+
+}  // namespace
+
+TEST_CASE("Hide Mount Auto: the ray radii of the calibration's occlusion sliver", "[geom][rig][hidemount]") {
+    const LensRig rig = sampleRig();
+    const KannalaBrandt5& slave = rig.lens[kSlaveLens];
+    const std::vector<Vec2d>& poly = rig.occlusionPolyStream[kSlaveLens];
+    const Vec2d centre{slave.cx, slave.cy};
+    // Straight down (polar angle 90 deg, image y grows downwards) the ray
+    // meets the arc's apex first and the rim last.
+    const auto down = occlusionRayRadii(poly, centre, deg2rad(90.0));
+    REQUIRE(down.has_value());
+    CHECK(down->first > 0.5 * slave.rMaxPx);
+    CHECK(down->first < down->second);
+    CHECK(down->second >= slave.rMaxPx * 0.999);
+    // Straight up and to the right the sliver is nowhere: no crossing.
+    CHECK_FALSE(occlusionRayRadii(poly, centre, deg2rad(-90.0)).has_value());
+    CHECK_FALSE(occlusionRayRadii(poly, centre, 0.0).has_value());
+    // Garbage in, nothing out.
+    CHECK_FALSE(occlusionRayRadii(poly, Vec2d{std::nan(""), 0.0}, 0.0).has_value());
+    CHECK_FALSE(occlusionRayRadii(std::vector<Vec2d>(2), centre, 0.0).has_value());
+}
+
+TEST_CASE("Hide Mount Auto: a polygon with nothing released is the calibration's, bit for bit",
+          "[geom][rig][hidemount]") {
+    const LensRig rig = sampleRig();
+    const KannalaBrandt5& slave = rig.lens[kSlaveLens];
+    const std::vector<Vec2d>& poly = rig.occlusionPolyStream[kSlaveLens];
+    const Vec2d centre{slave.cx, slave.cy};
+    OcclusionClipParams params;
+    params.usableRadiusPx = slave.rMaxPx + 24.0;
+    params.clampRadiusPx = 10.0;  // far inside where the polygon starts
+    // No span at all, an all-Keep span, and a Clamp the polygon already honours.
+    for (const std::vector<OcclusionSpan>& spans :
+         {std::vector<OcclusionSpan>{},
+          std::vector<OcclusionSpan>{{deg2rad(0.0), deg2rad(359.0), OcclusionSpanState::Keep}},
+          std::vector<OcclusionSpan>{{deg2rad(20.0), deg2rad(160.0), OcclusionSpanState::Clamp}}}) {
+        auto out = clipOcclusionPolygon(poly, centre, spans, params);
+        REQUIRE(out.ok());
+        CHECK(sameVertices(out.value(), poly));
+    }
+}
+
+TEST_CASE("Hide Mount Auto: a released stretch gives the lens back and keeps the rest", "[geom][rig][hidemount]") {
+    const LensRig rig = sampleRig();
+    const KannalaBrandt5& slave = rig.lens[kSlaveLens];
+    const std::vector<Vec2d>& poly = rig.occlusionPolyStream[kSlaveLens];
+    const Vec2d centre{slave.cx, slave.cy};
+    const double feather = 24.0;
+    OcclusionClipParams params;
+    params.usableRadiusPx = slave.rMaxPx + feather;
+    params.maxVertices = 32;
+    // Release the middle of the arc (polar angle 80..100 deg).
+    const std::vector<OcclusionSpan> spans{{deg2rad(80.0), deg2rad(100.0), OcclusionSpanState::Release}};
+    auto out = clipOcclusionPolygon(poly, centre, spans, params);
+    REQUIRE(out.ok());
+    const std::vector<Vec2d>& clipped = out.value();
+    REQUIRE(clipped.size() >= 3);
+    CHECK(clipped.size() <= params.maxVertices);
+    CHECK(isSimplePolygon(clipped));
+
+    // Inside the released stretch: every pixel the lens can weigh is outside
+    // the polygon and beyond its feather (the kernel's factor is 1).
+    for (const double deg : {82.0, 90.0, 98.0}) {
+        const auto r = occlusionRayRadii(poly, centre, deg2rad(deg));
+        REQUIRE(r.has_value());
+        // (The calibration's own rim is a chord every ~10 deg, up to ~6 px
+        // inside rMax between its vertices, so the last probe stays 10 px in.)
+        for (const double radius : {r->first + 2.0, 0.5 * (r->first + slave.rMaxPx), slave.rMaxPx - 10.0}) {
+            const Vec2d p = atPolar(centre, deg, radius);
+            INFO("angle " << deg << " radius " << radius);
+            CHECK(pointInPolygon(poly, p));  // the calibration hid it
+            CHECK_FALSE(pointInPolygon(clipped, p));
+            CHECK(signedDistanceToPolygon(clipped, p) >= feather);
+        }
+    }
+    // Outside it: the calibration's mask, edge for edge.
+    for (const double deg : {45.0, 60.0, 120.0, 135.0}) {
+        const auto r = occlusionRayRadii(poly, centre, deg2rad(deg));
+        const auto c = occlusionRayRadii(clipped, centre, deg2rad(deg));
+        REQUIRE(r.has_value());
+        REQUIRE(c.has_value());
+        INFO("angle " << deg);
+        CHECK_THAT(c->first, Catch::Matchers::WithinAbs(r->first, 1e-6));
+        const Vec2d hidden = atPolar(centre, deg, r->first + 3.0);
+        CHECK(pointInPolygon(clipped, hidden));
+        const Vec2d seen = atPolar(centre, deg, r->first - 3.0);
+        CHECK_FALSE(pointInPolygon(clipped, seen));
+    }
+}
+
+TEST_CASE("Hide Mount Auto: a clamped stretch starts no closer than the clamp radius", "[geom][rig][hidemount]") {
+    const LensRig rig = sampleRig();
+    const KannalaBrandt5& slave = rig.lens[kSlaveLens];
+    const std::vector<Vec2d>& poly = rig.occlusionPolyStream[kSlaveLens];
+    const Vec2d centre{slave.cx, slave.cy};
+    const auto apex = occlusionRayRadii(poly, centre, deg2rad(90.0));
+    REQUIRE(apex.has_value());
+    OcclusionClipParams params;
+    params.usableRadiusPx = slave.rMaxPx + 24.0;
+    params.clampRadiusPx = apex->first + 30.0;  // binds across the middle of the arc
+    const std::vector<OcclusionSpan> spans{{deg2rad(60.0), deg2rad(120.0), OcclusionSpanState::Clamp}};
+    auto out = clipOcclusionPolygon(poly, centre, spans, params);
+    REQUIRE(out.ok());
+    const std::vector<Vec2d>& clamped = out.value();
+    CHECK(isSimplePolygon(clamped));
+    for (double deg = 62.0; deg <= 118.0; deg += 4.0) {
+        const auto c = occlusionRayRadii(clamped, centre, deg2rad(deg));
+        REQUIRE(c.has_value());
+        INFO("angle " << deg);
+        CHECK(c->first >= params.clampRadiusPx - 1e-6);
+        // Beyond the clamp the mask still holds.
+        CHECK(pointInPolygon(clamped, atPolar(centre, deg, params.clampRadiusPx + 6.0)));
+    }
+}
+
+TEST_CASE("Hide Mount Auto: a polygon the kernels cannot hold is refused, garbage is rejected",
+          "[geom][rig][hidemount]") {
+    const LensRig rig = sampleRig();
+    const KannalaBrandt5& slave = rig.lens[kSlaveLens];
+    const std::vector<Vec2d>& poly = rig.occlusionPolyStream[kSlaveLens];
+    const Vec2d centre{slave.cx, slave.cy};
+    OcclusionClipParams params;
+    params.usableRadiusPx = slave.rMaxPx + 24.0;
+    params.maxVertices = 32;
+    // Twelve released slivers of 4 deg, 10 deg apart: far over the budget.
+    std::vector<OcclusionSpan> many;
+    for (int k = 0; k < 12; ++k) {
+        const double a = 32.0 + 10.0 * k;
+        many.push_back({deg2rad(a), deg2rad(a + 4.0), OcclusionSpanState::Release});
+    }
+    auto refused = clipOcclusionPolygon(poly, centre, many, params);
+    REQUIRE_FALSE(refused.ok());
+    CHECK(refused.error().code == ErrorCode::Unsupported);
+    // Malformed input.
+    const std::vector<OcclusionSpan> one{{deg2rad(80.0), deg2rad(100.0), OcclusionSpanState::Release}};
+    CHECK(clipOcclusionPolygon(std::vector<Vec2d>(2), centre, one, params).error().code ==
+          ErrorCode::InvalidArgument);
+    CHECK(clipOcclusionPolygon(poly, Vec2d{std::nan(""), 0.0}, one, params).error().code ==
+          ErrorCode::InvalidArgument);
+    OcclusionClipParams noRadius = params;
+    noRadius.usableRadiusPx = 0.0;
+    CHECK(clipOcclusionPolygon(poly, centre, one, noRadius).error().code == ErrorCode::InvalidArgument);
+    const std::vector<OcclusionSpan> nanSpan{{std::nan(""), 1.0, OcclusionSpanState::Release}};
+    CHECK(clipOcclusionPolygon(poly, centre, nanSpan, params).error().code == ErrorCode::InvalidArgument);
+    // A polygon around the lens centre has no inner and outer run.
+    const std::vector<Vec2d> around{{centre.x - 10, centre.y - 10}, {centre.x + 10, centre.y - 10},
+                                    {centre.x + 10, centre.y + 10}, {centre.x - 10, centre.y + 10}};
+    CHECK(clipOcclusionPolygon(around, centre, one, params).error().code == ErrorCode::Unsupported);
+}
+
+TEST_CASE("Hide Mount Auto: a verdict that keeps everything leaves the 6K rig's polygons untouched",
+          "[geom][rig][hidemount]") {
+    // Both lenses with the transcribed arc, on the verified 6K geometry: the
+    // polygons start beyond the seam plane plus the occlusion feather, so a
+    // kept verdict needs no clamp and must change nothing - the promise that
+    // makes Auto byte-identical wherever it keeps the whole polygon.
+    meta::CalibrationSet set = sampleCalibration();
+    set.master = makeRecord(1043.0103f, 1042.9268f, 1908.8036f, 1918.7257f,
+                            {0.0613421f, -0.00480161f, 0.00444291f, -0.00452633f, 0.00066212f}, 0.7036960f,
+                            0.7103991f, -0.0046943f, -0.0110939f, true);
+    auto built = LensRig::build(set, sampleScaling(), FocalSource::DigitalFocalLength, kDigitalFocal,
+                                ExtrinsicConvention{});
+    REQUIRE(built.ok());
+    const LensRig rig = built.value();
+    REQUIRE(rig.occlusionPolyStream[kSlaveLens].size() >= 3);
+    REQUIRE(rig.occlusionPolyStream[kMasterLens].size() >= 3);
+
+    const render::MountMaskParams mp;
+    auto arc = render::mountArcColumns(rig, mp.equirectW);
+    REQUIRE(arc.ok());
+    REQUIRE(arc.value().arcColumns > 0u);
+
+    BlendParams blend;
+    render::MountMask kept;
+    kept.columns = mp.equirectW;
+    kept.state.assign(mp.equirectW, render::kMountKeepClean0);
+    LensRig same = rig;
+    auto applied = render::applyMountMask(same, kept, blend, mp);
+    REQUIRE(applied.ok());
+    CHECK_FALSE(applied.value().changed[0]);
+    CHECK_FALSE(applied.value().changed[1]);
+    CHECK(sameVertices(same.occlusionPolyStream[kSlaveLens], rig.occlusionPolyStream[kSlaveLens]));
+    CHECK(sameVertices(same.occlusionPolyStream[kMasterLens], rig.occlusionPolyStream[kMasterLens]));
+
+    // Release the arc's first contiguous 64 columns: the slave's polygon is
+    // rebuilt, still simple, inside the kernels' budget, and no longer
+    // reaches the seam plane there.
+    render::MountMask released = kept;
+    std::uint32_t first = 0;
+    while (first < mp.equirectW && !arc.value().inArc[first]) {
+        ++first;
+    }
+    std::uint32_t done = 0;
+    for (std::uint32_t c = first; c < mp.equirectW && done < 64u && arc.value().inArc[c]; ++c, ++done) {
+        released.state[c] = render::kMountRelease;
+    }
+    REQUIRE(done > 16u);
+    LensRig changed = rig;
+    auto applied2 = render::applyMountMask(changed, released, blend, mp);
+    REQUIRE(applied2.ok());
+    CHECK((applied2.value().changed[0] || applied2.value().changed[1]));
+    CHECK(applied2.value().releasedColumns == done);
+    for (int i = 0; i < kLensCount; ++i) {
+        const auto& p = changed.occlusionPolyStream[static_cast<std::size_t>(i)];
+        CHECK(p.size() <= static_cast<std::size_t>(OSV_MAX_OCCLUSION_POINTS));
+        CHECK(isSimplePolygon(p));
+    }
+    // Garbage verdicts are refused and leave the rig alone.
+    render::MountMask bad = kept;
+    bad.state[0] = 7;
+    LensRig untouched = rig;
+    CHECK_FALSE(render::applyMountMask(untouched, bad, blend, mp).ok());
+    CHECK(sameVertices(untouched.occlusionPolyStream[kSlaveLens], rig.occlusionPolyStream[kSlaveLens]));
+    render::MountMask shortMask = kept;
+    shortMask.state.resize(10);
+    CHECK_FALSE(render::applyMountMask(untouched, shortMask, blend, mp).ok());
 }

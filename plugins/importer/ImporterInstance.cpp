@@ -975,6 +975,39 @@ Status ImporterInstance::rebuildRig() {
     const PrefsHideMount hideMount = m_prefs.hideMountChoice();
     blend.useOcclusionMask = hideMount != PrefsHideMount::Off;
 
+    // ---- Hide Mount Auto: the per-clip mount mask --------------------------------------
+    //
+    // Auto keeps the mask ON and rebuilds the polygons themselves: released
+    // where both lenses see the same scene, kept around the mount
+    // (render/MountMask.h).  As with the rotation, only a remembered verdict
+    // is used here (memory, then hide-mount.tsv - microseconds); an unknown
+    // clip stitches with the full polygons until the steady stage has
+    // measured it on its sample frames (prepareSteadyLocked).  The verdict
+    // is defined against the CALIBRATION rig's polygons (baseRig), which the
+    // rotation does not move - they live in fisheye pixels.
+    MountState mountState = MountState::Off;
+    std::shared_ptr<const render::MountMask> mountMask;
+    std::string mountNote;
+    if (hideMount == PrefsHideMount::Auto) {
+        mountMask = cachedMountMask(m_path, baseRig, blend, render::MountMaskParams{});
+        if (!mountMask) {
+            mountState = MountState::Pending;
+            mountNote = "hide mount: Auto - to be measured on the clip's sample frames";
+        } else {
+            mountState = MountState::Settled;
+            auto applied = render::applyMountMask(builtRig, *mountMask, blend, render::MountMaskParams{});
+            if (applied.ok()) {
+                mountNote = "hide mount: Auto - " + render::describeMountMask(*mountMask) + " (cached)";
+            } else {
+                // The calibration's polygons are still a correct (if
+                // overlap-starved) stitch: keep them and say why.
+                mountNote = "hide mount: Auto - keeping the full mask; the cached verdict could not be applied (" +
+                            applied.error().message + ")";
+                mountMask.reset();
+            }
+        }
+    }
+
     // ---- commit ----------------------------------------------------------------
     m_calibration = calibration;
     m_baseRig = std::move(baseRig);  // [WP-STEADY]
@@ -984,17 +1017,23 @@ Status ImporterInstance::rebuildRig() {
     m_rigLensAlign = alignChoice;    // [WP-STEADY]
     m_rigLensFocal = focalChoice;    // Lens Focal
     m_rigHideMount = hideMount;      // Hide Mount
+    m_mountState = mountState;       // Hide Mount Auto
+    m_mountMask = std::move(mountMask);
 
     // The notes feed the Properties panel.  A rebuild REPLACES the previous
     // calibration / scaling / rig notes instead of piling another copy on
     // top of them each time the user flips the setting.
     std::erase_if(m_notes, [](const std::string& n) {
         return n.starts_with("calibration: ") || n.starts_with("scaling: ") || n.starts_with("rig: ") ||
-               n.starts_with("lens alignment: ");  // [WP-STEADY]
+               n.starts_with("lens alignment: ") ||  // [WP-STEADY]
+               n.starts_with("hide mount: ");        // Hide Mount Auto
     });
     m_notes.push_back("calibration: " + reason);
     if (!alignNote.empty()) {
         m_notes.push_back(alignNote);  // [WP-STEADY]
+    }
+    if (!mountNote.empty()) {
+        m_notes.push_back(mountNote);  // Hide Mount Auto
     }
     if (!protectorNote.empty()) {
         m_notes.push_back("calibration: " + protectorNote);
@@ -1049,6 +1088,10 @@ Status ImporterInstance::rebuildRig() {
         PluginLog::info("hide mount: '{}': Off - the calibration's occlusion polygons are not applied; the seam "
                         "uses the full lens overlap and the mount can show",
                         m_path.filename().string());
+    } else if (!mountNote.empty()) {
+        // Auto: the verdict in force (cached), or that it is still to come
+        // (the measurement logs its own line when it lands).
+        PluginLog::info("{} ('{}')", mountNote, m_path.filename().string());
     }
 
     // The CHOICE, not the calibration byte: Auto and a forced Native share
@@ -2581,6 +2624,8 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     frameExact = applyPhotoSeam(builder) && frameExact;  // [WP-PHOTO] rim + gain field (after the global gain)
     frameExact = applyLensShading(builder) && frameExact;  // [WP-VIGNETTE] the lens shading correction
     frameExact = frameExact && m_sceneFrameExact;  // Scene Light: a provisional day profile is not final
+    // Hide Mount Auto: the full mask stands in until the verdict lands.
+    frameExact = frameExact && m_mountState != MountState::Pending;
     return AnalysisOutcome{parallaxApplied, frameExact};
 }
 
@@ -2604,6 +2649,20 @@ namespace {
     key.push_back(static_cast<double>(rig.streamW));
     key.push_back(static_cast<double>(rig.streamH));
     return key;
+}
+
+/// Append both lenses' occlusion polygons to a measurement's cache key.
+/// Hide Mount Auto rebuilds the polygons without touching anything else of
+/// the rig, so a field measured through the old ones must not be reused.
+/// For a clip whose polygons never change this only adds constant entries.
+void appendOcclusionKey(std::vector<double>& key, const geom::LensRig& rig) {
+    for (std::size_t i = 0; i < 2; ++i) {
+        key.push_back(static_cast<double>(rig.occlusionPolyStream[i].size()));
+        for (const Vec2d& v : rig.occlusionPolyStream[i]) {
+            key.push_back(v.x);
+            key.push_back(v.y);
+        }
+    }
 }
 
 }  // namespace
@@ -2646,6 +2705,7 @@ render::PhotoRimPenaltyScope ImporterInstance::preparePhotoSeam(std::uint32_t in
         // occlusion mask, which Source Settings can switch without touching
         // the rig - fields measured through the other mask are stale.
         key.push_back(m_blend.useOcclusionMask ? 1.0 : 0.0);
+        appendOcclusionKey(key, m_rig);  // Hide Mount Auto rebuilds the polygons themselves
         // Scene Light: each cell is clamped when it is MEASURED, so fields
         // stored under the other profile's clamp are stale too.
         key.push_back(params.maxAbsLog2Gain);
@@ -3009,6 +3069,7 @@ void ImporterInstance::prepareLensShading(std::uint32_t index, const video::Fram
         // Hide Mount: the models are measured through the analysis blend's
         // occlusion mask too, which can change while the rig does not.
         rigKey.push_back(m_blend.useOcclusionMask ? 1.0 : 0.0);
+        appendOcclusionKey(rigKey, m_rig);  // Hide Mount Auto rebuilds the polygons themselves
         if (rigKey != m_shadingRigKey) {
             m_shading.clear();
             m_shadingStandIns.clear();  // [WP-TEMPORAL] measured with the old rig too
@@ -3392,7 +3453,75 @@ SteadyRequest ImporterInstance::steadyRequestLocked(bool wantRotation, bool want
     // [WP-VIGNETTE] that rim on shading-corrected lenses, like the per-bucket field.
     r.clip.shading = shadingParamsLocked();
     r.clip.shadingOn = r.clip.shading.mode == render::LensShadingMode::Auto;
+    // Hide Mount Auto: the mount mask, measured (or looked up) by the stage;
+    // the clip correction above is then measured through its polygons.
+    r.wantMount = m_prefs.hideMountChoice() == PrefsHideMount::Auto;
+    r.mount = render::MountMaskParams{};
     return r;
+}
+
+bool ImporterInstance::applyMountMaskLocked(geom::LensRig& rig) const {
+    if (!m_mountMask) {
+        return true;  // the calibration's polygons: nothing to fold in
+    }
+    geom::LensRig candidate = rig;
+    auto applied = render::applyMountMask(candidate, *m_mountMask, m_blend, render::MountMaskParams{});
+    if (!applied.ok()) {
+        PluginLog::warn("hide mount: '{}': the verdict could not be applied ({}); keeping the full mask",
+                        m_path.filename().string(), applied.error().message);
+        return false;
+    }
+    rig = std::move(candidate);
+    return true;
+}
+
+void ImporterInstance::settleMountLocked(const std::shared_ptr<const render::MountMask>& mount,
+                                         const std::string& failure) {
+    const std::string name = m_path.filename().string();
+    m_mountState = MountState::Settled;
+    std::string note;
+    if (mount) {
+        // m_rig carries the calibration's polygons here (no verdict was
+        // folded in while it was pending), with or without the rotation.
+        geom::LensRig rig = m_rig;
+        auto applied = render::applyMountMask(rig, *mount, m_blend, render::MountMaskParams{});
+        if (applied.ok()) {
+            m_mountMask = mount;
+            note = "hide mount: Auto - " + render::describeMountMask(*mount);
+            const render::MountMaskApplied& a = applied.value();
+            if (a.changed[0] || a.changed[1]) {
+                m_rig = std::move(rig);
+                // Everything measured so far was measured through the full
+                // polygons: the rendered frame, the per-bucket grids, tables,
+                // seams and gains (the photometric fields and lens shading
+                // models go by themselves, keyed by the polygons).
+                m_lastFrame = RenderedFrame{};
+                m_seamTables.clear();
+                m_gains.clear();
+                resetParallaxLocked();
+                PluginLog::info("hide mount: '{}': folded into the rig from now on (lens 0 {}, lens 1 {}; {} "
+                                "released, {} / {} clamped columns{})",
+                                name, a.changed[0] ? "rebuilt" : "unchanged", a.changed[1] ? "rebuilt" : "unchanged",
+                                a.releasedColumns, a.clampedColumns[0], a.clampedColumns[1],
+                                a.mergedStretches > 0
+                                    ? std::format(", {} stretch(es) kept to fit the polygon budget", a.mergedStretches)
+                                    : std::string());
+            } else {
+                PluginLog::info("hide mount: '{}': Auto keeps the calibration's polygons", name);
+            }
+        } else {
+            note = "hide mount: Auto - keeping the full mask; the verdict could not be applied (" +
+                   applied.error().message + ")";
+            PluginLog::warn("{} ('{}')", note, name);
+        }
+    } else {
+        // The stage abstained (too few frames, a failure): the full mask.
+        const std::string why = failure.empty() ? std::string("not measured") : failure;
+        note = "hide mount: Auto - keeping the full mask (" + why + ")";
+    }
+    // The Properties panel's note describes the polygons actually in force.
+    std::erase_if(m_notes, [](const std::string& n) { return n.starts_with("hide mount: "); });
+    m_notes.push_back(note);
 }
 
 void ImporterInstance::settleLensAlignLocked(const std::optional<LensAlignVerdict>& rotation,
@@ -3403,6 +3532,9 @@ void ImporterInstance::settleLensAlignLocked(const std::optional<LensAlignVerdic
         geom::LensRig rig = m_baseRig;
         const Status folded = render::applyLensRotation(rig, rotation->wRad);
         if (folded.ok()) {
+            // Hide Mount Auto: m_baseRig carries the calibration's polygons,
+            // so a verdict already in force is folded in again.
+            (void)applyMountMaskLocked(rig);
             m_rig = std::move(rig);
             m_lensAlignState = LensAlignState::Applied;
             note = "lens alignment: " + rotation->summary;
@@ -3437,7 +3569,8 @@ void ImporterInstance::prepareSteadyLocked(RenderPurpose purpose, bool draft) {
     const bool alignAuto = m_prefs.lensAlignChoice() == PrefsLensAlign::Auto;
     const bool corrections = m_prefs.parallaxEnabled() || m_prefs.seamSearch != 0;
     const bool wantClip = m_prefs.parallaxGridChoice() != PrefsParallaxGrid::FollowsScene && corrections;
-    if (!alignAuto && !wantClip) {
+    const bool mountAuto = m_prefs.hideMountChoice() == PrefsHideMount::Auto;  // Hide Mount Auto
+    if (!alignAuto && !wantClip && !mountAuto) {
         return;  // the per-bucket schedule and the calibration, exactly as before
     }
 
@@ -3468,6 +3601,11 @@ void ImporterInstance::prepareSteadyLocked(RenderPurpose purpose, bool draft) {
     // up on it) BEFORE anything below reads m_rig.
     if (m_lensAlignState == LensAlignState::Pending && snap.active && snap.rotationSettled) {
         settleLensAlignLocked(snap.rotation, snap.failure);
+    }
+    // Hide Mount Auto: a mount mask that has just been answered rebuilds the
+    // polygons, likewise before anything below reads m_rig.
+    if (m_mountState == MountState::Pending && snap.active && snap.mountSettled) {
+        settleMountLocked(snap.mount, snap.failure);
     }
     m_steadyFrame = std::move(snap);
 }
