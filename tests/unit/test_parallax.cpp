@@ -1617,6 +1617,97 @@ TEST_CASE("blendSeamTables glides where two tables agree and steps where the sce
     }
 }
 
+TEST_CASE("blendSeamTables steps only where both tables' measurements are confident",
+          "[parallax][schedule][temporal]") {
+    using render::blendSeamTables;
+    const double noise = render::kSeamTableGlideNoiseDeg;
+    const double step = render::kSeamTableStepDeg;
+    REQUIRE(render::kSeamTableStepConfLo < render::kSeamTableStepConfHi);
+    REQUIRE(render::kSeamTableStepConfLo > 0.0);
+    REQUIRE(render::kSeamTableStepConfHi <= 1.0);
+    // Every column changes by 3 deg - far past the step band - so without the
+    // gate every one would step at the anchor.
+    const std::vector<float> from(5, 0.0f);
+    const std::vector<float> to(5, 3.0f);
+    const double t = 0.25;
+    std::vector<float> out;
+
+    SECTION("confident on both sides: exactly the ungated rule") {
+        const std::vector<float> sure(5, 1.0f);
+        std::vector<float> legacy;
+        blendSeamTables(&from, &to, t, legacy);
+        blendSeamTables(&from, &to, t, out, noise, step, &sure, &sure);
+        REQUIRE(out == legacy);
+        CHECK(out[0] == 3.0f);
+    }
+    SECTION("either side unsure: a plain glide by t") {
+        const std::vector<float> sure(5, 1.0f);
+        const std::vector<float> unsure(5, 0.1f);
+        blendSeamTables(&from, &to, t, out, noise, step, &unsure, &sure);
+        CHECK(out[0] == Catch::Approx(3.0 * t).margin(1e-6));
+        blendSeamTables(&from, &to, t, out, noise, step, &sure, &unsure);
+        CHECK(out[0] == Catch::Approx(3.0 * t).margin(1e-6));
+    }
+    SECTION("the step grows smoothly and monotonically with the smaller confidence") {
+        const std::vector<float> sure(5, 1.0f);
+        const std::vector<float> ramp{0.2f, 0.35f, 0.45f, 0.55f, 0.7f};
+        blendSeamTables(&from, &to, t, out, noise, step, &ramp, &sure);
+        REQUIRE(out.size() == 5u);
+        CHECK(out[0] == Catch::Approx(3.0 * t).margin(1e-6));  // below the gate
+        CHECK(out[4] == 3.0f);                                  // above it
+        for (std::size_t i = 1; i < out.size(); ++i) {
+            CHECK(out[i] >= out[i - 1]);
+        }
+        CHECK(out[2] > 3.0f * static_cast<float>(t));
+        CHECK(out[2] < 3.0f);
+    }
+    SECTION("no confidence, or one of the wrong length, is the ungated rule") {
+        std::vector<float> legacy;
+        blendSeamTables(&from, &to, t, legacy);
+        const std::vector<float> shortConf(3, 0.0f);
+        blendSeamTables(&from, &to, t, out, noise, step, &shortConf, nullptr);
+        CHECK(out == legacy);
+        const std::vector<float> empty;
+        blendSeamTables(&from, &to, t, out, noise, step, &empty, &empty);
+        CHECK(out == legacy);
+    }
+    SECTION("a missing table side leaves the gate to the other side's confidence") {
+        // Fading in from a bucket whose grid was accepted (no table): an
+        // unsure new table glides in, a sure one steps in.
+        const std::vector<float> ignored(5, 0.0f);  // belongs to no table: never read
+        const std::vector<float> unsure(5, 0.1f);
+        const std::vector<float> sure(5, 1.0f);
+        blendSeamTables(nullptr, &to, t, out, noise, step, &ignored, &unsure);
+        CHECK(out[0] == Catch::Approx(3.0 * t).margin(1e-6));
+        blendSeamTables(nullptr, &to, t, out, noise, step, &ignored, &sure);
+        CHECK(out[0] == 3.0f);
+    }
+    SECTION("non-finite confidences glide, out-of-range ones are clamped") {
+        const std::vector<float> sure(5, 1.0f);
+        const std::vector<float> odd{std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
+                                     -2.0f, 7.0f, 0.0f};
+        blendSeamTables(&from, &to, t, out, noise, step, &odd, &sure);
+        CHECK(out[0] == Catch::Approx(3.0 * t).margin(1e-6));  // NaN: unsure
+        CHECK(out[1] == Catch::Approx(3.0 * t).margin(1e-6));  // inf: not a confidence, unsure
+        CHECK(out[2] == Catch::Approx(3.0 * t).margin(1e-6));  // clamped to 0
+        CHECK(out[3] == 3.0f);                                  // clamped to 1
+        for (const float v : out) {
+            CHECK(std::isfinite(v));
+        }
+    }
+    SECTION("small changes glide whatever the confidence") {
+        const std::vector<float> near(5, 0.2f);  // within the noise band
+        const std::vector<float> sure(5, 1.0f);
+        blendSeamTables(&from, &near, t, out, noise, step, &sure, &sure);
+        CHECK(out[0] == Catch::Approx(0.2 * t).margin(1e-6));
+    }
+    SECTION("the agreement test switched off is a plain glide, gate or not") {
+        const std::vector<float> sure(5, 1.0f);
+        blendSeamTables(&from, &to, t, out, 1.0, 0.5, &sure, &sure);  // inverted band
+        CHECK(out[0] == Catch::Approx(3.0 * t).margin(1e-6));
+    }
+}
+
 TEST_CASE("a refused bucket is glided through, and only a large table change steps at the anchor",
           "[parallax][schedule][temporal]") {
     // What applyAnalyses applies to frame f of bucket b, glided from b - 1:

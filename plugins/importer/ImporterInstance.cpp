@@ -2033,7 +2033,7 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
     if (out.grid == nullptr && wantSeam) {
         // The anchored table first: cached, or measured now (Exact) or from a
         // free anchor (Interactive).
-        std::map<std::uint32_t, std::vector<float>>* lane = &m_seamTables;
+        std::map<std::uint32_t, SeamTableEntry>* lane = &m_seamTables;
         auto cached = m_seamTables.find(bucket);
         const video::FramePair* source = nullptr;
         if (cached == m_seamTables.end()) {
@@ -2051,7 +2051,13 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
             render::SeamSearchParams sp;
             auto profile = render::searchSeam(m_rig, *source, m_blend, sp, pool);
             if (profile.ok()) {
-                cached = lane->emplace(bucket, std::move(profile).value().shiftDeg).first;
+                // The table and the confidence of each of its columns: the
+                // glide to the next bucket steps only where both are sure.
+                render::SeamProfile& p = profile.value();
+                SeamTableEntry entry;
+                entry.shiftDeg = std::move(p.shiftDeg);
+                entry.confidence = std::move(p.confidence);
+                cached = lane->emplace(bucket, std::move(entry)).first;
                 trimAnalysisCache(*lane, lane == &m_seamTables ? kMaxAnalysisCache : kMaxStandInCache, bucket);
             } else {
                 // Searched and failed: the bucket renders without a table.
@@ -2063,7 +2069,12 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
             return out;  // the table is not known yet: neither is the correction
         }
         if (cached != lane->end()) {
-            out.table = cached->second;
+            out.table = cached->second.shiftDeg;
+            // Only a confidence that matches the table column for column is
+            // carried; otherwise the glide treats the table as ungated.
+            if (cached->second.confidence.size() == cached->second.shiftDeg.size()) {
+                out.tableConfidence = cached->second.confidence;
+            }
         }
         out.standIn = out.standIn || lane == &m_standInTables;
     }
@@ -2253,13 +2264,22 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
             const std::vector<float>* tFrom =
                 (from != nullptr && from->grid == nullptr && !from->table.empty()) ? &from->table : nullptr;
             const std::vector<float>* tTo = (to->grid == nullptr && !to->table.empty()) ? &to->table : nullptr;
+            // Each table's per-column confidence gates the step: a large
+            // change steps at the anchor only where both measurements are
+            // sure of it (a near object arrived); matching noise on
+            // featureless columns glides instead of jumping every 8 frames.
+            const std::vector<float>* cFrom =
+                (tFrom != nullptr && !from->tableConfidence.empty()) ? &from->tableConfidence : nullptr;
+            const std::vector<float>* cTo = (tTo != nullptr && !to->tableConfidence.empty()) ? &to->tableConfidence
+                                                                                             : nullptr;
             if (wantSeam && (tFrom != nullptr || tTo != nullptr)) {
                 if (from == nullptr) {
                     if (tTo != nullptr) {
                         builder.seam(*tTo);  // no glide: the table exactly
                     }
                 } else {
-                    render::blendSeamTables(tFrom, tTo, w, m_seamTableFrame);
+                    render::blendSeamTables(tFrom, tTo, w, m_seamTableFrame, render::kSeamTableGlideNoiseDeg,
+                                            render::kSeamTableStepDeg, cFrom, cTo);
                     if (!m_seamTableFrame.empty()) {
                         builder.seam(m_seamTableFrame);
                     }
