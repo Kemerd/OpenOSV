@@ -180,6 +180,15 @@ void presetToCustom(OfxParamSetHandle set, OfxTime t) noexcept {
 /// A named Output Resolution is a square-pixel size already, and an unknown
 /// project keeps framingAspect()'s 16:9 fallback; both are left as they are,
 /// and square pixels skip the multiply altogether.
+///
+/// The pixel aspect is honoured over exactly the range the camera is built
+/// for: buildView() renders a ratio outside [OSV_PIXEL_ASPECT_MIN,
+/// OSV_PIXEL_ASPECT_MAX] (or a non-finite one) as square pixels, so such a
+/// ratio is square here too - otherwise an absurd host value would turn the
+/// Zoom read-out and the presets into numbers for a shape the render never
+/// shows.  projectPixelAspect() itself stays the host's raw ratio: it also
+/// converts canonical coordinates to pixels (projectSize(), the camera
+/// frame), and that conversion must follow whatever the host reports.
 [[nodiscard]] double aspectFor(OfxParamSetHandle set, OfxTime t, SizePx project, double pixelAspect) noexcept {
     const Resolution resolution =
         sanitiseResolution(intAt(set, kOutputResolution, t, OSV_REFRAME_RESOLUTION_DEFAULT - 1) + 1);
@@ -187,7 +196,11 @@ void presetToCustom(OfxParamSetHandle set, OfxTime t) noexcept {
     // resolveOutputSize() answers a fixed table entry without any size given,
     // and only a fixed entry: that is what tells a named size from Match.
     const bool named = resolveOutputSize(resolution, SizePx{}, SizePx{}).valid();
-    if (pixelAspect != 1.0 && std::isfinite(pixelAspect) && pixelAspect > 0.0 && !named && project.valid()) {
+    // The same predicate (and the same float-to-double bounds) as the camera
+    // builder's sanitiser in ReframeCpu.cpp, so the two always agree.
+    const bool usable = std::isfinite(pixelAspect) && pixelAspect >= static_cast<double>(OSV_PIXEL_ASPECT_MIN) &&
+                        pixelAspect <= static_cast<double>(OSV_PIXEL_ASPECT_MAX);
+    if (usable && pixelAspect != 1.0 && !named && project.valid()) {
         return aspect * pixelAspect;
     }
     return aspect;

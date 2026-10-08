@@ -687,6 +687,14 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     // lines below only - every field is rendered as the whole frame, as
     // before, until a host is seen handing out a half-height field image.
     const std::string fieldToRender = getString(inArgs, kOfxImageEffectPropFieldToRender);
+    // [WP-PAR] The geometry lines below need the output clip's RoD, which is
+    // a call into the host's image effect suite.  They are CLAIMED under the
+    // instance lock (each prints once per instance) but written after it is
+    // released: no host suite is ever called while the plug-in holds its own
+    // lock, so a host that re-enters the plug-in from inside the call (VEGAS
+    // has a deadlock history) cannot meet a lock this thread already holds.
+    bool logGeometry = false;
+    bool logField = false;
     {
         std::lock_guard<std::mutex> lock(inst->mutex);
         if (!inst->loggedTiming) {
@@ -711,28 +719,41 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
                             outputLevelsName(levels), stringText(effectPropSet, kPropVegasContext),
                             hostQualityName(renderMode.quality), renderMode.interactive ? "interactive" : "exact",
                             renderMode.draft ? "draft" : "full stitch");
+            // [WP-PAR] The geometry line goes with the first render too;
+            // written below, once the lock is released.
+            logGeometry = true;
+        }
+        if (isSingleField(fieldToRender) && !inst->loggedField) {
+            // [WP-PAR] The first single-field render: claimed here, written
+            // below with the RoD it is compared against.
+            inst->loggedField = true;
+            logField = true;
+        }
+    }
+    if (logGeometry || logField) {
+        // One host call for both lines, outside the instance lock.
+        const std::string rod = rodText(outputClip, time);
+        if (logGeometry) {
             // [WP-PAR] The geometry the camera frame is derived from: the
             // output image's bounds (pixels) against the output clip's RoD
             // (canonical), the project's pixel aspect and its fielding.  A
             // non-square or interlaced project is told apart here at once.
             PluginLog::info("ofx source: first render of '{}': output bounds {} vs RoD {} -> camera frame {}; "
                             "pixel aspect {}; field to render '{}', output field order {}",
-                            clip->path().filename().string(), rectText(output.bounds), rodText(outputClip, time),
-                            rectText(frame), par, fieldToRender.empty() ? std::string("absent") : fieldToRender,
+                            clip->path().filename().string(), rectText(output.bounds), rod, rectText(frame), par,
+                            fieldToRender.empty() ? std::string("absent") : fieldToRender,
                             stringText(outputProps, kOfxImageClipPropFieldOrder));
         }
-        if (isSingleField(fieldToRender) && !inst->loggedField) {
+        if (logField) {
             // [WP-PAR] The first single-field render (an interlaced project,
             // e.g. a VEGAS 1080-60i template): its image bounds against the
             // RoD say whether the host hands a full-height frame (rendered
             // whole, as now) or a half-height field (which would squash the
             // picture vertically).  Nothing is changed until that is seen.
-            inst->loggedField = true;
             PluginLog::info("ofx source: first field render of '{}': field '{}' at time {}, output bounds {} ({}x{}) "
                             "vs RoD {} -> camera frame {} ({}x{}); the whole frame is rendered into the bounds",
                             clip->path().filename().string(), fieldToRender, time, rectText(output.bounds),
-                            output.width(), output.height(), rodText(outputClip, time), rectText(frame), frameW,
-                            frameH);
+                            output.width(), output.height(), rod, rectText(frame), frameW, frameH);
         }
     }
     // `index` counts the clip's own TIMELINE (clip->fps() is its nominal

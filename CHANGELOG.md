@@ -16,7 +16,7 @@ All notable changes to OpenOSV are documented here. The format follows
   the camera took every pixel as square. It is now built for the picture the
   host displays, in OpenOSV Source and OpenOSV 360 Reframe, on the CPU and
   on the GPU. The Zoom read-out and the presets use the displayed shape too.
-  Square-pixel projects render exactly as before.
+  Square-pixel projects render exactly as before. Engine ABI 7.
 * **The playback proxy smooths over the same time as the clip.** With Smooth
   or Smooth + Horizon Lock, the `.LRF` proxy (VEGAS Draft and Preview
   playback, an `.LRF` beside its `.OSV` in Premiere) smoothed over twice the

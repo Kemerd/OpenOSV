@@ -1213,6 +1213,26 @@ TEST_CASE("VEGAS: the Zoom read-out and the presets use the shape a non-square p
         100.0, rf::DjiLens{OSV_REFRAME_DJI_FOV_DEFAULT, OSV_REFRAME_CORRECTION_DEFAULT}, 1440.0 / 1080.0);
     CHECK_FALSE(same(hdv.param(cam::kDjiFov).d, pixelShape.fovDeg));
 
+    // ---- a ratio the camera does not honour is square here too --------------------
+    // buildView() renders a pixel aspect outside [OSV_PIXEL_ASPECT_MIN,
+    // OSV_PIXEL_ASPECT_MAX] as square pixels, so the Zoom read-out must be the
+    // square project's - not numbers for a 20:1 shape the render never shows.
+    REQUIRE(20.0 > static_cast<double>(OSV_PIXEL_ASPECT_MAX));
+    ParFilter absurd(kDisplayW, 20.0);
+    absurd.param(cam::kZoom).d = 100.0;
+    REQUIRE(edit(absurd, cam::kZoom) == kOfxStatOK);
+    INFO("pixel aspect 20: DJI FOV " << absurd.param(cam::kDjiFov).d << ", correction "
+                                     << absurd.param(cam::kCorrection).d);
+    CHECK(same(absurd.param(cam::kDjiFov).d, square.param(cam::kDjiFov).d));
+    CHECK(same(absurd.param(cam::kCorrection).d, square.param(cam::kCorrection).d));
+    CHECK(same(absurd.param(cam::kZoom).d, square.param(cam::kZoom).d));
+    // And not what the unhonoured 20:1 widening would have given (the check
+    // tells the two apart).
+    const rf::DjiLens wideShape =
+        rf::djiZoomTo(100.0, rf::DjiLens{OSV_REFRAME_DJI_FOV_DEFAULT, OSV_REFRAME_CORRECTION_DEFAULT},
+                      20.0 * static_cast<double>(kDisplayW) / static_cast<double>(kDisplayH));
+    CHECK_FALSE(same(absurd.param(cam::kDjiFov).d, wideShape.fovDeg));
+
     // ---- a preset writes the same DJI look --------------------------------------
     ParFilter squarePreset(kDisplayW, 1.0);
     ParFilter hdvPreset(1440, 4.0 / 3.0);
@@ -1269,6 +1289,51 @@ TEST_CASE("VEGAS: square pixels build exactly the camera they always did", "[ofx
 // and at Preview quality with Playback Proxy on (the .LRF proxy, which
 // smooths over the .OSV's seconds).  NVDEC / GPU: not part of the CPU-only
 // runs.
+//
+// "Native" is a different size for each engine, and the reference sphere
+// must be rendered at exactly the size the view frames:
+//
+//   * Good stitches the .OSV: the 6K sample's native sphere is 6000 x 3000
+//     (as in test_ofx_source.cpp's view-vs-sphere case).
+//   * Preview with Playback Proxy plays the .LRF proxy, whose native sphere
+//     is its ORIGINAL's divided by the whole number that brings it nearest
+//     the proxy's own 2048 x 1024 detail (ImporterInstance::
+//     geometryForLocked, the [PROXY] divisor rule): 6000 x 3000 / 3 =
+//     2000 x 1000, the size the importer advertises for this proxy
+//     (test_lrf_coverage.cpp).  The generator's Equirect output stitches at
+//     the frame's size, so the proxy half compares against the proxy's own
+//     2000 x 1000 native sphere - a 6000 x 3000 reference would be a
+//     different stitch of the same moment and could never match.
+
+namespace {
+
+/// One quality the parity case runs at, and the native sphere the
+/// generator's reframed view frames at that quality.
+struct NativeSphereCase {
+    const char* quality;  ///< VEGAS's OfxImageEffectPropRenderQuality value.
+    bool fromProxy;       ///< True when the frame is served by the .LRF proxy.
+    int width;            ///< Native sphere width, pixels.
+    int height;           ///< Native sphere height, pixels.
+};
+
+/// The camera's .LRF beside `clip` (either spelling), or empty when there is
+/// none - the proxy half of the parity case then has nothing to play.
+std::filesystem::path proxyBeside(const std::string& clip) {
+    if (clip.empty()) {
+        return {};
+    }
+    std::filesystem::path lrf = clip;
+    std::error_code ec;
+    for (const char* extension : {".LRF", ".lrf"}) {
+        lrf.replace_extension(extension);
+        if (std::filesystem::is_regular_file(lrf, ec)) {
+            return lrf;
+        }
+    }
+    return {};
+}
+
+}  // namespace
 
 TEST_CASE("VEGAS: Smooth + Horizon Lock frames the view out of the engine's own stabilised sphere",
           "[ofx][.vegas][sample]") {
@@ -1280,11 +1345,28 @@ TEST_CASE("VEGAS: Smooth + Horizon Lock frames the view out of the engine's own 
     }
     // The 0-based popup index of "Smooth + Horizon Lock" (OSV_SS_STAB_ITEMS).
     constexpr int kSmoothHorizonLock = 4;
-    const char* const qualities[] = {ofx::kVegasQualityGood, ofx::kVegasQualityPreview};
-    for (const char* quality : qualities) {
-        INFO("quality " << quality);
+    // Good: the .OSV at its own native size.  Preview: the .LRF proxy at its
+    // original's native size divided per the [PROXY] rule (see above).
+    const NativeSphereCase cases[] = {
+        {ofx::kVegasQualityGood, false, 6000, 3000},
+        {ofx::kVegasQualityPreview, true, 2000, 1000},
+    };
+    // Without the camera's .LRF beside the sample, Preview would stitch the
+    // .OSV and the proxy half would test nothing it claims to: it is left
+    // out (and said so), the .OSV half still runs.
+    const bool haveProxy = !proxyBeside(clip).empty();
+    if (!haveProxy) {
+        WARN("no .LRF beside the sample clip: the proxy half of the parity case is not run");
+    }
+    for (const NativeSphereCase& c : cases) {
+        if (c.fromProxy && !haveProxy) {
+            continue;
+        }
+        INFO("quality " << c.quality << ", native sphere " << c.width << "x" << c.height
+                        << (c.fromProxy ? " (the .LRF proxy)" : " (the .OSV)"));
+        const char* const quality = c.quality;
         // ---- the engine's native sphere, stabilised -------------------------------
-        VegasSourceRig sphere({ofx::HostDepth::Float, ofx::HostOrder::Rgba}, 29.97, 6000, 3000);
+        VegasSourceRig sphere({ofx::HostDepth::Float, ofx::HostOrder::Rgba}, 29.97, c.width, c.height);
         sphere.param(src::kFile).s = clip;
         sphere.param(src::kOutput).i = src::kOutputEquirect;
         sphere.param(sp::kStabilization).i = kSmoothHorizonLock;
