@@ -479,6 +479,11 @@ template in the `.rc`, owner = host main window). Cancel returns `imCancel`.
 The dialog's "Save as De&fault" button stores what it shows as the user
 defaults without closing it. The blob is part of every PPix cache key so
 changed settings never hit stale frames. `imGetInstancePrefs` mirrors it.
+For a clip whose settings live in the Source Settings effect neither has
+allocated a block in any Premiere session logged since 0.2.2; for those clips
+`imGetInfo8` hands Premiere the 128-byte block itself
+(see "Importer side" under "Source Settings effect design"), and a block
+shorter than 128 bytes is read only as far as it goes and upgraded.
 
 ### Concurrency
 
@@ -544,7 +549,13 @@ absent, so that fact cannot be forgotten.
 ### Identity
 
 * Display name "OpenOSV Source Settings", category "OpenOSV", match name
-  `OpenOSV.SourceSettings` (never changes), version 1.0.0.
+  `OpenOSV.SourceSettings` (never changes), version 1.1.0. The version moves
+  whenever the parameter list changes (1.0.0 up to 0.5.0's 36 parameters;
+  1.1.0 from 0.5.2 for Hide Mount, which 0.5.1 added without moving it). A
+  project stores each parameter by its permanent id and Premiere matches the
+  ids to the current list, so an older instance keeps every value and a new
+  control starts at its default: a 0.5.0 project reopened under 0.5.1 kept all
+  36 values and gained Hide Mount = On.
 * `out_flags = PF_OutFlag_SEND_UPDATE_PARAMS_UI` (`0x04000000`) only.
   `out_flags2 = PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG | PF_OutFlag2_SUPPORTS_THREADED_RENDERING`
   (`0x08000008`). `SourceSettingsParams.h` carries both as decimal literals so
@@ -1084,8 +1095,10 @@ ends up showing "2560 x 1280" while decoding at 6000 x 3000.
 * **`PF_Cmd_TRANSLATE_PARAMS_TO_PREFS`** is the only route by which anything
   set in the panel reaches the decoder. It reads the nine controls, builds a
   sanitised `PrefsBlob` and `memcpy`s exactly `sizeof(PrefsBlob)` bytes into
-  `extra->prefsPC`. Three refusals, each a real failure mode: a null `extra`
-  or `prefsPC` leaves the importer on its existing prefs (writing through the
+  `extra->prefsPC` - the clip's settings block, which the importer hands
+  Premiere in `imGetInfo8` (see "Importer side"). Three refusals, each a real
+  failure mode: a null `extra` or `prefsPC` (a clip with no settings block
+  yet) leaves the importer on its existing prefs (writing through the
   null would take the host down); a `prefs_sizeLu` **smaller** than the blob
   is refused outright and logged, because writing 128 bytes into a smaller
   buffer is a heap overflow in the *host's* allocator; a **larger** buffer is
@@ -1099,13 +1112,46 @@ ends up showing "2560 x 1280" while decoding at 6000 x 3000.
 
 * `imInit`: `hasSourceSettingsEffect = kPrTrue`. Without this flag Premiere
   ignores `sourceSettingsMatchName` entirely, so the two must be set together.
-  `hasSetup` stays `kPrTrue` as well - the modal dialog is deliberately kept
-  working, because right-click > Source Settings is muscle memory for a lot of
-  users and is the only route left on a machine where the `.aex` failed to
-  install. Both paths write the same `PrefsBlob`.
+  `hasSetup` stays `kPrTrue` as well - the modal dialog is the only route left
+  on a machine where the `.aex` failed to install. Both paths write the same
+  `PrefsBlob`. Where the effect is attached, a clip's settings are edited in
+  it: select the clip, **Effect Controls**, the clip's **Source** tab,
+  **OpenOSV Source Settings**. Premiere's own `Source Settings...` item in the
+  Project panel is not where they live for such a clip: in every Premiere
+  session logged since 0.2.2 (the first build whose effect Premiere matched by
+  its host name) no dialog was accepted, and no project stored settings for
+  an OpenOSV clip.
 * `imGetInfo8` fills `sourceSettingsMatchName` from
   `kSourceSettingsHostMatchNameW`: the host's `AE.`-prefixed name (see
   "Identity" above for the duplicate effects the bare name caused).
+* `imGetInfo8` also owns **the clip's settings block** (`imFileInfoRec8::prefs`,
+  `syncClipPrefsBlock` in `SourceSettingsDialog.cpp`). Premiere keeps one
+  opaque block per clip, stores it in the project and hands it to the effect's
+  `PF_Cmd_TRANSLATE_PARAMS_TO_PREFS`; but it allocates that block itself only
+  in the dialog route (after the `imGetPrefs8` size handshake), which it never
+  takes for a clip with a Source Settings effect. So:
+  * **no block**: the clip keeps the settings it was seeded with (the user
+    defaults), and the importer hands Premiere a new 128-byte block holding
+    exactly those (`piSuites->memFuncs->newPtrClear`; Premiere owns and frees
+    it). Without it the effect's controls had nowhere to go - 0.5.0 and 0.5.1
+    logged "TRANSLATE_PARAMS_TO_PREFS with no prefs buffer" in every Premiere
+    session, imGetInfo8 was told "the host gave it no settings" even for a
+    clip reopened from a saved project, and no project file held settings for
+    an OpenOSV clip. Not for an `.LRF` beside its `.OSV`, whose settings follow
+    the original's live instance ([PROXY]); a stored block would freeze them;
+  * **a full block** is the clip's settings and is applied, as always;
+  * **a shorter block** (its real size from `memFuncs->getPtrSize`) is read
+    only as far as it goes - never past its end - and, when it is ours,
+    `PrefsBlob::fromStoredBytes` reads its missing tail as zero (each later
+    field's old behaviour: Hide Mount On), grows it in place to the full blob
+    with `setPtrSize` and stores the upgraded settings in it. A shorter block
+    that is not ours is left exactly as it is.
+  After installing a build that changes this, launch Premiere once with
+  **Shift** held so it rescans the plug-ins and reads the effect's new version.
+* `imGetPrefs8` / `imGetInstancePrefs` log every call at debug level (the
+  size handshake, the dialog opening) and a cancelled dialog at info level, so
+  a session log answers whether the host ever asked; before 0.5.2 only an
+  accepted dialog left a line.
 * `imPerformSourceSettingsCommand` (selector 66, `param1` an
   `imFileAccessRec8*`, `param2` an `imSourceSettingsCommandRec*`) is in
   `SourceSettingsDialog.cpp` beside the other prefs selectors. With a live

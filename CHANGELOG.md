@@ -6,6 +6,32 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+* **Every clip now has a Source Settings block for the panel to write into.**
+  Premiere keeps one settings block per clip and hands it to the OpenOSV
+  Source Settings effect (Effect Controls, the clip's Source tab) to store
+  the panel's controls in, but for a clip with such an effect it does not
+  create the block itself: the importer has to, and it never did. In the
+  0.5.0 and 0.5.1 Premiere sessions the effect got no block at all, the
+  importer was told "the host gave it no settings" even for a clip reopened
+  from a saved project, and no project file held settings for an OpenOSV
+  clip. The importer now hands Premiere a 128-byte block (0 bytes before)
+  holding the settings the clip is decoded with, so a new clip renders
+  exactly as before and the panel's controls have somewhere to go and to be
+  saved. An .LRF beside its .OSV still follows the original's settings.
+  Launch Premiere once with Shift held after installing.
+* **Older projects keep every Source Setting.** The Source Settings effect's
+  version is now 1.1.0 (0.5.1 added Hide Mount and kept 1.0.0); a project
+  saved with 0.5.0's 36 controls restores every value by its id and gets Hide
+  Mount On. A stored settings block shorter than today's is read only as far
+  as it goes - before, the importer read 128 bytes from it whatever its size -
+  and is upgraded in place, the fields it lacks reading as they always did.
+* **Source Settings questions are answerable from the log.** The importer now
+  logs the host's settings-size request and a cancelled Source Settings
+  dialog; before, only an accepted dialog left a line, so "did Premiere ever
+  ask?" had no answer.
+
 ## [0.5.1] - 2026-10-07
 
 Premiere on a car mount, fixed at the cause. Built on the same two 8K car
