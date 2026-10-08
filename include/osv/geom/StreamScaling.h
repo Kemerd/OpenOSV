@@ -59,7 +59,7 @@ struct StreamScaling {
     ///     stream, as an LRF repeats its parent's value)
     ///                               -> the scale that wider parent gets from these
     ///                                  rules x streamW / parentW, never above
-    ///                                  streamW / 3000; unverified.
+    ///                                  streamW / min(3000, sensorW); unverified.
     ///   * otherwise                 -> digitalFocalLength / calFxMean, unverified.
     /// Human readable explanations are appended to `notes` when non-null,
     /// plus a log-only line when a full-size stream's digitalFocalLength is

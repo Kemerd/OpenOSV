@@ -69,7 +69,7 @@ class Scoring:
 
     def __init__(self, frame):
         prefix = os.path.join(FLOWBANDS, f"f{frame}_b10")
-        l0, l1, a0, a1, info = load_dump(prefix, "none", os.path.join(FLOWBANDS, f"dump_f{frame}_b10.json"))
+        l0, l1, a0, a1, info = load_dump(prefix, "raw", os.path.join(FLOWBANDS, f"dump_f{frame}_b10.json"))
         self.l0, self.l1, self.a0, self.a1 = l0, l1, a0, a1
         self.w, self.h = l0.shape[1], l0.shape[0]
         self.row_offset = int(info["rowOffset"])

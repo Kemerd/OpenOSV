@@ -6,7 +6,9 @@ Data sources (all rendered by the release build, nothing synthetic):
     lens's production blend weight; f<F>_lens0.f32 / f<F>_lens1.f32 /
     f<F>_blend.f32 + meta.json + theta.f32.
   * osvtool seam --dump-bands: per-lens code-space luma + coverage of the
-    parallax analysis band (the input production DIS sees) - <prefix>_none_luma0.f32 ...
+    parallax analysis band (the input production DIS sees) - <prefix>_raw_luma0.f32 ...
+    (the uncorrected pair; 0.5.0 and earlier labelled it _none_; _table_ is the
+    seam-table-corrected pair and _parallax_ the grid-corrected one).
 
 Polar-axis layout: the lens axes are the poles, the seam is the equator.
 +latitude is towards lens 1 (the master) on the sample clip.
@@ -76,7 +78,7 @@ class ProbeBands:
 #  osvtool seam --dump-bands output
 # --------------------------------------------------------------------------
 def load_dump(prefix, tag, dump_json):
-    """(luma0, luma1, alpha0, alpha1, info) for tag none / parallax."""
+    """(luma0, luma1, alpha0, alpha1, info) for tag raw / table / parallax."""
     with open(dump_json, "r", encoding="utf-8-sig") as f:
         info = json.load(f)["parallax"]["dump"]
     w, h = int(info["w"]), int(info["h"])

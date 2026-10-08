@@ -39,11 +39,15 @@ struct FfmpegPipeOptions {
     /// the sound at 0:00, so the caller sets this to the moment of the first
     /// rendered frame on the clip's timeline (first frame x rate denominator
     /// / rate numerator).  It becomes an input-side `-ss` on the audio input
-    /// only, written with microsecond precision.  With `-c:a copy` ffmpeg
-    /// starts the copy at the audio packet at or before that moment (an AAC
-    /// packet is 1024 samples, 21.3 ms at 48 kHz) and times it relative to
-    /// the moment itself, so the .mp4's edit list trims the lead-in and the
-    /// sound lines up to the sample.  0 - the default - adds no `-ss`
+    /// only, written with microsecond precision.  With `-c:a copy` ffmpeg's
+    /// input seek lands on the clip's VIDEO keyframe at or before that
+    /// moment (the default stream of the seek) and keeps every audio packet
+    /// from there on, timed relative to the moment itself, so the lead-in
+    /// carries negative timestamps: up to one keyframe interval (0.8 s on a
+    /// 25 fps Osmo 360 clip), not just one AAC packet.  The .mp4's edit list
+    /// trims that lead-in, so the sound lines up to the sample wherever edit
+    /// lists are honoured; a player that ignores them starts the sound up to
+    /// one keyframe interval early.  0 - the default - adds no `-ss`
     /// at all, so a render from the clip's start keeps the exact command
     /// line it always had.  NaN, infinite or negative values are treated as
     /// 0 (FfmpegPipeWriter::open logs a warning).  Ignored without

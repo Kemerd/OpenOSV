@@ -358,7 +358,7 @@ std::vector<Quatd> carTurn(double mountTiltDeg, double turnDeg, int frames) {
 
 /// Probe samples for a truth sequence: the attitude stored through `conv`,
 /// the accelerometer reading the body's gravity reaction (1 g up, plus
-/// `extraG` of the given body-frame acceleration and Gaussian noise).
+/// Gaussian noise of `noiseG`).
 std::vector<ProbeSample> probeSamples(const std::vector<Quatd>& truth, const AttitudeConvention& conv, double noiseG,
                                       std::uint64_t seed) {
     std::mt19937_64 rng(seed);

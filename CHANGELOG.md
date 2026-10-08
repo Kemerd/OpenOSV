@@ -6,7 +6,9 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
-## 0.5.1 (unreleased)
+Premiere on a car mount, fixed at the cause. Built on the same two 8K car
+drives as 0.5.0, this time against what Premiere Pro actually renders: the
+classical flow and the seam-shift table, not osvtool's neural default.
 
 ### Fixed
 
@@ -31,16 +33,13 @@ All notable changes to OpenOSV are documented here. The format follows
   chance shifts gone, the lower roof edge where the car roof crosses the
   mount-side seam steps by 2.6° (it was 1.5°, offset by accident); the upper
   edge improves from 0.86° to 0.26°. That crossing has no lens overlap at
-  all, so no seam table can fix it.
+  all, so no seam table can fix it; Hide Mount (below) gives the overlap
+  back.
 * **A table change steps at a bucket edge only when both measurements are
   sure of it.** A near object arriving still switches at once; matching noise
   glides. The applied table's per-frame change at bucket starts drops from
   3.4° (p99) on 16 % of the columns to 0.04° on none, and the overlap match
   after the table rises from 0.990 to 0.992 (NCC, proxy 5872-5920).
-* osvtool `seam --search --json` reports each column's confidence and raw
-  measurement and the unmeasured and confident column counts. `--dump-bands`
-  writes the uncorrected bands as `_raw_` and the table-corrected ones as
-  `_table_`; it used to label the corrected pair `_none_`.
 * **Horizon Lock is level on mounted clips, in every host.** 0.5.0 still
   left the two 8K car drives leaning: lamp posts 28° off on the sunset
   drive and 7-11° at night, the sunset sun at +36° when it sat 7° above the
@@ -56,9 +55,6 @@ All notable changes to OpenOSV are documented here. The format follows
 * The accelerometer no longer steers the levelling; it is a canary. The
   log names the angle between its gravity and the attitude's up (under 1°
   on the car drives) and warns above 15°.
-* osvtool `--attitude-convention` takes a `-rig` suffix: `auto` is
-  `xyzw-w2b-z-rig`, and `xyzw-b2w-ny` still gives the old reading, for
-  comparisons.
 * **The parallax correction now aligns a car body a metre from the lenses.**
   The classical flow solver (the one Premiere, VEGAS and Resolve run, on the
   CPU and on CUDA) could not reach the 14 px (2.4°) offset a roof rail shows
@@ -70,8 +66,62 @@ All notable changes to OpenOSV are documented here. The format follows
   clip's seam band and the 6K sample hold or improve (sample OSV frame 60:
   0.917 to 0.920). The flow solve costs about 10 ms more per bucket on four
   CPU threads (~35 to ~44 ms).
+* A hardware-decoded picture that FFmpeg flags as damaged, or that is
+  predicted from one, is decoded again in software instead of being
+  delivered. As with any other hardware decode failure, on the importer's
+  host path the clip then stays on software decoding until its importer
+  instance closes: about 1 s per random-access landing on an 8K .OSV, a few
+  ms a frame on a proxy. On the GPU frame path the frame takes the host path,
+  and three such frames in a row move the clip to it. A software decode of a
+  damaged recording sees the same damage, so this only helps when the
+  hardware decoder is at fault.
+* **VEGAS and Resolve: non-square projects are no longer stretched.** In an
+  HDV 1440 x 1080 project (pixel aspect 4:3), a DV project or an anamorphic
+  one, the reframed view came out stretched sideways by the pixel aspect:
+  the camera took every pixel as square. It is now built for the picture the
+  host displays, in OpenOSV Source and OpenOSV 360 Reframe, on the CPU and
+  on the GPU. The Zoom read-out and the presets use the displayed shape too.
+  Square-pixel projects render exactly as before. Engine ABI 7.
+* **The playback proxy smooths over the same time as the clip.** With Smooth
+  or Smooth + Horizon Lock, the `.LRF` proxy (VEGAS Draft and Preview
+  playback, an `.LRF` beside its `.OSV` in Premiere) smoothed over twice the
+  time the `.OSV` did, so the preview's framing drifted up to 1.2° (day
+  drive) and 1.9° (night drive) from the final render. It now smooths over
+  the same seconds: at most 0.11° apart. The `.OSV` render is unchanged.
+* **A clip without a recorded focal length still opens.** A recording mode
+  no rule knows (4K, or anything new) needed the camera's
+  `digital_focal_length` to work out its scale, and without it the clip
+  refused to open. It now opens on the 3776 px crop every other rule assumes
+  when the file says nothing, and the log says the scale is unverified.
+* **A proxy never gets its parent's focal length.** An `.LRF` repeats the
+  focal length of the full-size clip it was recorded beside. On a sensor
+  other than the Osmo 360's 3840 px one, OpenOSV read that number as the
+  proxy's own and built a lens about 3.7x too long. A proxy now takes its
+  parent's scale, shrunk to its own width, capped so it can never claim to
+  show less than 3000 sensor pixels. Every measured mode keeps its scale:
+  8K 1.0, 8K LRF 0.2666667, 6K 0.794492, 6K LRF 0.2711864; renders of the
+  8K and 6K test clips are byte-identical.
+* **A ranged osvtool render plays its own sound.** `osvtool render --range
+  A-B` (or `--frame`) into an `.mp4` copied the source audio from 0:00, so
+  frames 3000-3020 of a 25 fps clip played the first 0.84 s of sound
+  instead of the sound at 2:00. The audio copy now starts at the first
+  rendered frame's moment, from the clip's exact frame rate (frame x
+  denominator / numerator). Measured on a 25 fps clip, frames 3000 and 3001
+  start their sound at 120.000 s and 120.040 s of the source to the sample.
+  A render from frame 0, and `--all`, run exactly the ffmpeg command they
+  always did.
+
 ### Added
 
+* **Hide Mount** (Source Settings, and the OpenOSV Source generator in
+  Resolve and VEGAS: On, Off). Off stops the calibration's occlusion polygons
+  from cutting the seam, so the two lenses keep their full overlap where the
+  mask used to leave none. Car, helmet or suction mount and a step at the
+  seam: set it to Off. The mount itself can show. On is the default and what
+  every existing project keeps, bit for bit. On a car-roof clip the roof
+  line where it crosses the seam steps less (0.97° to 0.63° on the proxy);
+  near parts of the car that cross the seam still step. osvtool `render
+  --no-occlusion` now renders Off on the plug-in engine too.
 * The plug-in logs now carry the library's own messages and FFmpeg's, at the
   log's level. Before, inside Premiere, they went nowhere. FFmpeg lines name
   the codec and the clip they are about, and arrive from WARNING up, each
@@ -88,77 +138,23 @@ All notable changes to OpenOSV are documented here. The format follows
   dropped frames.
 * The per-bucket parallax lines in the log name the clip, and a refusal says
   how much of the flow was consistent.
-
-### Fixed
-
-* A hardware-decoded picture that FFmpeg flags as damaged, or that is
-  predicted from one, is decoded again in software instead of being
-  delivered. As with any other hardware decode failure, on the importer's
-  host path the clip then stays on software decoding until its importer
-  instance closes: about 1 s per random-access landing on an 8K .OSV, a few
-  ms a frame on a proxy. On the GPU frame path the frame takes the host path,
-  and three such frames in a row move the clip to it. A software decode of a
-  damaged recording sees the same damage, so this only helps when the
-  hardware decoder is at fault.
-### Added
-
-* **Hide Mount** (Source Settings, and the OpenOSV Source generator in
-  Resolve and VEGAS: On, Off). Off stops the calibration's occlusion polygons
-  from cutting the seam, so the two lenses keep their full overlap where the
-  mask used to leave none. Car, helmet or suction mount and a step at the
-  seam: set it to Off. The mount itself can show. On is the default and what
-  every existing project keeps, bit for bit. On a car-roof clip the roof
-  line where it crosses the seam steps less (0.97° to 0.63° on the proxy);
-  near parts of the car that cross the seam still step. osvtool `render
-  --no-occlusion` now renders Off on the plug-in engine too.
-* **VEGAS and Resolve: non-square projects are no longer stretched.** In an
-  HDV 1440 x 1080 project (pixel aspect 4:3), a DV project or an anamorphic
-  one, the reframed view came out stretched sideways by the pixel aspect:
-  the camera took every pixel as square. It is now built for the picture the
-  host displays, in OpenOSV Source and OpenOSV 360 Reframe, on the CPU and
-  on the GPU. The Zoom read-out and the presets use the displayed shape too.
-  Square-pixel projects render exactly as before. Engine ABI 7.
-* **The playback proxy smooths over the same time as the clip.** With Smooth
-  or Smooth + Horizon Lock, the `.LRF` proxy (VEGAS Draft and Preview
-  playback, an `.LRF` beside its `.OSV` in Premiere) smoothed over twice the
-  time the `.OSV` did, so the preview's framing drifted up to 1.2° (day
-  drive) and 1.9° (night drive) from the final render. It now smooths over
-  the same seconds: at most 0.11° apart. The `.OSV` render is unchanged.
-
-### Added
-
 * The OpenFX generator's log records each instance's output bounds against
   its region of definition, the project's pixel aspect and field order, and
   the first single-field render of an interlaced project.
-* **A clip without a recorded focal length still opens.** A recording mode
-  no rule knows (4K, or anything new) needed the camera's
-  `digital_focal_length` to work out its scale, and without it the clip
-  refused to open. It now opens on the 3776 px crop every other rule assumes
-  when the file says nothing, and the log says the scale is unverified.
-* **A proxy never gets its parent's focal length.** An `.LRF` repeats the
-  focal length of the full-size clip it was recorded beside. On a sensor
-  other than the Osmo 360's 3840 px one, OpenOSV read that number as the
-  proxy's own and built a lens about 3.7x too long. A proxy now takes its
-  parent's scale, shrunk to its own width, capped so it can never claim to
-  show less than 3000 sensor pixels. Every measured mode keeps its scale:
-  8K 1.0, 8K LRF 0.2666667, 6K 0.794492, 6K LRF 0.2711864; renders of the
-  8K and 6K test clips are byte-identical.
 * The log notes a `digital_focal_length` more than 0.2 % off the Osmo 360
   convention (0.2764537 x the clip's lens width). Log only: a camera or
   firmware that writes something else shows up before its seam does.
+* osvtool `seam --search --json` reports each column's confidence and raw
+  measurement and the unmeasured and confident column counts. `--dump-bands`
+  writes the uncorrected bands as `_raw_` and the table-corrected ones as
+  `_table_`; it used to label the corrected pair `_none_`.
 * osvtool `seam`: the alternatives table is built from the lens image, as
   the main rig is. On an `.LRF` every alternative used to read -2; the
   "no crop" row is now the lens width over the sensor width (0.78125 on 6K,
   as before).
-* **A ranged osvtool render plays its own sound.** `osvtool render --range
-  A-B` (or `--frame`) into an `.mp4` copied the source audio from 0:00, so
-  frames 3000-3020 of a 25 fps clip played the first 0.84 s of sound
-  instead of the sound at 2:00. The audio copy now starts at the first
-  rendered frame's moment, from the clip's exact frame rate (frame x
-  denominator / numerator). Measured on a 25 fps clip, frames 3000 and 3001
-  start their sound at 120.000 s and 120.040 s of the source to the sample.
-  A render from frame 0, and `--all`, run exactly the ffmpeg command they
-  always did.
+* osvtool `--attitude-convention` takes a `-rig` suffix: `auto` is
+  `xyzw-w2b-z-rig`, and `xyzw-b2w-ny` still gives the old reading, for
+  comparisons.
 
 ## [0.5.0] - 2026-10-07
 

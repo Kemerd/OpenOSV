@@ -89,6 +89,15 @@ a publication, that is recorded in `docs/LEGAL.md`, not here.
     anisotropic disparity search ranges (`ParallaxWarp.h`), and the
     observation that changing ghosting is worse than constant ghosting
     (`NEURAL_STITCHING.md` section 5).
+  - Implemented: the classical flow solver's restricted 1-D search along
+    the seam direction before each patch refines, the way Jump's stereo
+    stitcher searches along the epipolar line (`include/osv/render/DisFlow.h`).
+- David G. Lowe. **Distinctive Image Features from Scale-Invariant
+  Keypoints.** *International Journal of Computer Vision* 60(2), 2004.
+  <https://doi.org/10.1023/B:VISI.0000029664.99615.94>
+  - Implemented: the ratio test. The classical flow solver's 1-D search
+    adopts an offset only when its residual beats the runner-up by the
+    ratio (`include/osv/render/DisFlow.h`).
 
 ## 2. Photometric alignment and filtering
 

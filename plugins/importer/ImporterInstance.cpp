@@ -1879,8 +1879,10 @@ void ImporterInstance::rebuildStabilization() {
     }
 
     // Convention detection is the rule Pipeline.cpp uses for
-    // `--attitude-convention auto`: the verified reading, with the world-up
-    // axis measured from the accelerometer's world-frame gravity reaction.
+    // `--attitude-convention auto`: the verified reading of the stored
+    // attitude, levelled on that attitude alone.  The accelerometer is only
+    // a canary now: its gravity reaction is compared with the reading's up
+    // and the angle lands in the reason string that is logged below.
     geom::AttitudeTrack::Options attOpt;
     const geom::AutoConvention detected = geom::ConventionProbe::autoDetect(m_track);
     detected.applyTo(attOpt);
@@ -2883,8 +2885,8 @@ std::optional<SceneLightRequest> ImporterInstance::sceneRequestLocked() {
         const geom::AttitudeTrack* attitude = m_attitude ? &*m_attitude : nullptr;
         if (!attitude) {
             if (!m_sceneAttitude) {
-                // The same reading the stabilisation would use (measured
-                // gravity), built once for a clip rendered with it off.
+                // The same reading the stabilisation would use (the stored
+                // attitude), built once for a clip rendered with it off.
                 geom::AttitudeTrack::Options options;
                 geom::ConventionProbe::autoDetect(m_track).applyTo(options);
                 auto built = geom::AttitudeTrack::build(m_track, options);
