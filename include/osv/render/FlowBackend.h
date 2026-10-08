@@ -55,9 +55,11 @@ namespace osv::render {
 /// The numeric values are persisted in the plug-in's preferences blob, so
 /// they are permanent: insert new members before Count and never renumber.
 enum class FlowBackendKind : int {
-    /// Pick the best that is actually available, preferring Neural.  This is
-    /// the default because it does the right thing on both a machine with
-    /// the model installed and one without.
+    /// Pick the best that is actually available, in this order: Neural
+    /// (when a model can run), then ClassicalCuda (once a host has installed
+    /// the CUDA analyses - the Premiere importer does), then Classical on
+    /// the CPU.  This is the default because it does the right thing on both
+    /// a machine with the model installed and one without.
     Auto = 0,
     /// Dense Inverse Search on the CPU.  Always available.
     Classical = 1,
@@ -68,9 +70,12 @@ enum class FlowBackendKind : int {
     /// CudaAnalysis.h).  It lives in the CUDA library, which this one cannot
     /// link, so it is available only once that library has installed its
     /// factory (installCudaAnalyses()); until then it reports itself
-    /// unavailable and computeFlow() falls back to Classical.  Never chosen
-    /// by Auto: a caller asks for it explicitly, so no existing selection
-    /// changes behind anyone's back.
+    /// unavailable and computeFlow() falls back to Classical.  Auto chooses
+    /// it whenever it is installed and no neural model can run - so it is
+    /// what the Premiere importer measures with ("parallax classical-cuda"
+    /// in its log).  It gives the CPU solver's field bit for bit
+    /// (tests/unit/test_disflow_cuda.cpp), so that choice changes timing and
+    /// never the picture; an explicit Classical stays on the CPU.
     ClassicalCuda = 3,
     Count
 };

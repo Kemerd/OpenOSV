@@ -36,6 +36,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include "RailScene.h"
 #include "TestSample.h"
 
 #include "osv/core/ThreadPool.h"
@@ -363,6 +364,82 @@ TEST_CASE("CUDA DIS matches the CPU solver on synthetic pairs", "[render][flow][
         REQUIRE(cpu.ok());
         REQUIRE(gpu.ok());
         checkFlowParity(compareFlows(cpu.value(), gpu.value()));
+    }
+}
+
+TEST_CASE("CUDA DIS matches the CPU solver bit for bit with the near-field additions",
+          "[render][flow][cuda]") {
+    // Tikhonov, the 1-D epipolar search (bracket, ratio and margin) and
+    // revert-on-runaway are ported statement for statement; the importer's
+    // promise that an export does not depend on which backend measured a
+    // bucket needs the fields EQUAL, so every section asserts bit identity,
+    // not only the design document's parity bar.
+    OSV_REQUIRE_CUDA_ANALYSES();
+    const std::uint32_t w = 2048;
+    const std::uint32_t h = 68;
+    const testrail::RailScene scene = testrail::makeRailScene(w);
+    // The car-roof band of test_disflow.cpp: 14 px along the band rows, one
+    // code of noise - every patch on the rails runs the search and adopts.
+    const GrayImage railA = testrail::renderRailScene(scene, w, h, 0.0, 1.0, 11u);
+    const GrayImage railB = testrail::renderRailScene(scene, w, h, 14.0, 1.0, 29u);
+
+    const auto expectIdentical = [](const GrayImage& a, const GrayImage& b, const DisFlowParams& p) {
+        const auto cpu = render::disFlowBidirectional(a, b, p, nullptr);
+        const auto gpu = render::cudaDisFlowBidirectional(a, b, p);
+        REQUIRE(cpu.ok());
+        REQUIRE(gpu.ok());
+        const FlowParity parity = compareFlows(cpu.value(), gpu.value());
+        checkFlowParity(parity);
+        CHECK(parity.identical);
+    };
+
+    SECTION("the near-field band with the default parameters (lane-group solve)") {
+        expectIdentical(railA, railB, DisFlowParams{});
+    }
+
+    SECTION("the general one-thread solve, searching every level") {
+        DisFlowParams p;
+        p.patchSize = 6;
+        p.patchStridePx = 3;
+        p.epipolarSearchMinLevel = 0;
+        expectIdentical(railA, railB, p);
+    }
+
+    SECTION("a cap below the disparity: candidates and starts past it") {
+        DisFlowParams p;
+        p.maxDisplacementPx = 6.0;
+        expectIdentical(railA, railB, p);
+    }
+
+    SECTION("every descent forced past the cap: revert on, then off") {
+        const GrayImage a = textured(128, 96);
+        const GrayImage b = shifted(a, 0.0, -5.3);
+        DisFlowParams p;
+        p.stepScale = 1000.0;
+        p.epipolarSearchMinLevel = 0;
+        expectIdentical(a, b, p);
+        p.revertOnRunaway = false;
+        expectIdentical(a, b, p);
+    }
+
+    SECTION("a one-pixel search, where only the seed is ever bracketed") {
+        DisFlowParams p;
+        p.epipolarSearchPx = 2.0;
+        expectIdentical(railA, railB, p);
+    }
+
+    SECTION("a periodic railing, where the ratio test decides") {
+        const testrail::RailScene railing = testrail::makeRailingScene(10.0);
+        const GrayImage a = testrail::renderRailScene(railing, w, h, 0.0, 1.0, 11u);
+        const GrayImage b = testrail::renderRailScene(railing, w, h, 0.0, 1.0, 29u);
+        expectIdentical(a, b, DisFlowParams{});
+    }
+
+    SECTION("every addition off: the 0.5.0 solver") {
+        GrayImage a;
+        GrayImage b;
+        bandPair(a, b);
+        expectIdentical(a, b, testrail::legacyDisParams());
     }
 }
 

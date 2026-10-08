@@ -59,6 +59,17 @@ All notable changes to OpenOSV are documented here. The format follows
 * osvtool `--attitude-convention` takes a `-rig` suffix: `auto` is
   `xyzw-w2b-z-rig`, and `xyzw-b2w-ny` still gives the old reading, for
   comparisons.
+* **The parallax correction now aligns a car body a metre from the lenses.**
+  The classical flow solver (the one Premiere, VEGAS and Resolve run, on the
+  CPU and on CUDA) could not reach the 14 px (2.4°) offset a roof rail shows
+  along the seam, so an accepted correction left the rails doubled. It now
+  searches along the seam direction before it refines, and only moves where
+  the match is unambiguous. Measured on the car-mounted day clip with the
+  correction applied, the car body goes from 0.84-0.87 to 0.93-0.97 overlap
+  NCC and the whole seam band from 0.967-0.987 to 0.987-0.994; the night
+  clip's seam band and the 6K sample hold or improve (sample OSV frame 60:
+  0.917 to 0.920). The flow solve costs about 10 ms more per bucket on four
+  CPU threads (~35 to ~44 ms).
 
 ## [0.5.0] - 2026-10-07
 

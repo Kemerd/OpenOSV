@@ -12,20 +12,33 @@
 
 #include "osv/render/DisFlow.h"
 
+#include "RailScene.h"
+
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <numeric>
 #include <vector>
 
+using osv::testrail::legacyDisParams;
+using osv::testrail::makeRailingScene;
+using osv::testrail::makeRailScene;
+using osv::testrail::RailScene;
+using osv::testrail::RailStats;
+using osv::testrail::railStats;
+using osv::testrail::renderRailScene;
 using osv::render::BidirFlow;
 using osv::render::DisFlowParams;
+using osv::render::disEpipolarRadius;
 using osv::render::disFlow;
 using osv::render::disFlowBidirectional;
 using osv::render::FlowField;
 using osv::render::GrayImage;
+using osv::render::kMaxEpipolarRadius;
 using osv::render::repairFlow;
 using osv::render::smoothFlow;
 
@@ -408,5 +421,278 @@ TEST_CASE("the pooled solve is bit-identical to the sequential one", "[render][f
         CHECK(p.backward.v == s.backward.v);
         CHECK(p.ok == s.ok);
         CHECK(p.consistent == s.consistent);
+    }
+}
+
+// ===========================================================================
+//  The near-field additions: Tikhonov, the 1-D epipolar search, revert
+// ===========================================================================
+
+TEST_CASE("disEpipolarRadius covers the finest-level range at every searching level", "[render][flow]") {
+    DisFlowParams p;  // 24 px, from level 1
+    // Level 0 is below epipolarSearchMinLevel; coarser levels search the
+    // same 24 finest-level pixels in their own units, rounded up.
+    CHECK(disEpipolarRadius(p, 0) == 0);
+    CHECK(disEpipolarRadius(p, 1) == 12);
+    CHECK(disEpipolarRadius(p, 2) == 6);
+    CHECK(disEpipolarRadius(p, 3) == 3);
+    CHECK(disEpipolarRadius(p, 4) == 2);  // 1.5 rounds up
+    CHECK(disEpipolarRadius(p, 7) == 1);  // 0.1875 rounds up: never a zero-width search
+    CHECK(disEpipolarRadius(p, 8) == 0);  // past the deepest pyramid level
+    CHECK(disEpipolarRadius(p, -1) == 0);
+
+    SECTION("searching from the finest level") {
+        p.epipolarSearchMinLevel = 0;
+        CHECK(disEpipolarRadius(p, 0) == 24);
+    }
+    SECTION("a range that is not a whole number of coarse pixels") {
+        p.epipolarSearchPx = 25.0;
+        CHECK(disEpipolarRadius(p, 1) == 13);
+    }
+    SECTION("disabled or nonsense ranges search nothing") {
+        for (const double px : {0.0, -4.0, std::nan(""), HUGE_VAL}) {
+            INFO("epipolarSearchPx " << px);
+            p.epipolarSearchPx = px;
+            CHECK(disEpipolarRadius(p, 1) == 0);
+            CHECK(disEpipolarRadius(p, 2) == 0);
+        }
+    }
+    SECTION("an absurd range is clamped, not looped over") {
+        p.epipolarSearchPx = 1.0e9;
+        CHECK(disEpipolarRadius(p, 1) == kMaxEpipolarRadius);
+    }
+}
+
+TEST_CASE("the epipolar search measures a 14 px near-field shift along the band rows", "[render][flow]") {
+    // A car roof a metre from the lenses: rails and rivets offset 14 band px
+    // along the meridian, sensor noise of one 8-bit code - the case the
+    // 0.5.0 solver could not reach from zero on a three-level pyramid.  The
+    // true flow from a to b is (0, -14) on every row both bands share.
+    const std::uint32_t w = 2048;
+    const std::uint32_t h = 68;
+    const RailScene scene = makeRailScene(w);
+    const GrayImage a = renderRailScene(scene, w, h, 0.0, 1.0, 11u);
+    const GrayImage b = renderRailScene(scene, w, h, 14.0, 1.0, 29u);
+    // Rows 24..57 of a: their content is inside b (rows 10..43), away from
+    // the band edges and from the rows the patch grid does not cover.
+    const int x0 = 32;
+    const int x1 = static_cast<int>(w) - 32;
+    const int y0 = 24;
+    const int y1 = 58;
+
+    const auto now = disFlowBidirectional(a, b, DisFlowParams{}, nullptr);
+    REQUIRE(now.ok());
+    const RailStats s = railStats(scene, now.value(), x0, x1, y0, y1);
+    REQUIRE(s.pixels > 10000);
+    INFO("defaults: on the rails u " << s.meanU << " v " << s.meanV << ", consistent " << 100.0 * s.consistent
+                                     << " % of " << s.pixels << " px");
+    CHECK_THAT(s.meanV, Catch::Matchers::WithinAbs(-14.0, 0.5));
+    CHECK_THAT(s.meanU, Catch::Matchers::WithinAbs(0.0, 0.5));
+    CHECK(s.consistent >= 0.80);
+
+    SECTION("the 0.5.0 solver does not reach it, which is what the search is for") {
+        const auto old = disFlowBidirectional(a, b, legacyDisParams(), nullptr);
+        REQUIRE(old.ok());
+        const RailStats o = railStats(scene, old.value(), x0, x1, y0, y1);
+        INFO("legacy: on the rails v " << o.meanV << ", consistent " << 100.0 * o.consistent << " %");
+        CHECK(std::fabs(o.meanV + 14.0) > 5.0);
+    }
+
+    SECTION("the pooled solve is bit-identical with the search active") {
+        osv::ThreadPool pool(5);
+        const auto pooled = disFlowBidirectional(a, b, DisFlowParams{}, &pool);
+        REQUIRE(pooled.ok());
+        CHECK(pooled.value().forward.u == now.value().forward.u);
+        CHECK(pooled.value().forward.v == now.value().forward.v);
+        CHECK(pooled.value().backward.u == now.value().backward.u);
+        CHECK(pooled.value().backward.v == now.value().backward.v);
+        CHECK(pooled.value().ok == now.value().ok);
+    }
+}
+
+TEST_CASE("the epipolar search moves the near field and leaves the far field alone", "[render][flow]") {
+    // The car body on the left half (14 px), distant scenery on the right
+    // (no disparity): each half must come out as itself, so the search acts
+    // per patch and not as one global shift.
+    const std::uint32_t w = 2048;
+    const std::uint32_t h = 68;
+    const RailScene scene = makeRailScene(w);
+    const GrayImage a = renderRailScene(scene, w, h, 0.0, 1.0, 11u);
+    const GrayImage b = renderRailScene(scene, w, h, 14.0, 1.0, 29u, 1024u, 0.0);
+    const auto f = disFlowBidirectional(a, b, DisFlowParams{}, nullptr);
+    REQUIRE(f.ok());
+    // 64 px clear of the boundary either side, where the halves blend.
+    const RailStats nearHalf = railStats(scene, f.value(), 32, 960, 24, 58);
+    const RailStats farHalf = railStats(scene, f.value(), 1088, static_cast<int>(w) - 32, 24, 58);
+    INFO("near half v " << nearHalf.meanV << " (" << 100.0 * nearHalf.consistent << " % consistent), far half v "
+                        << farHalf.meanV << " (" << 100.0 * farHalf.consistent << " %)");
+    CHECK_THAT(nearHalf.meanV, Catch::Matchers::WithinAbs(-14.0, 0.5));
+    CHECK_THAT(farHalf.meanV, Catch::Matchers::WithinAbs(0.0, 0.5));
+    CHECK(nearHalf.consistent >= 0.80);
+    CHECK(farHalf.consistent >= 0.80);
+}
+
+TEST_CASE("the epipolar search does not jump a railing's period", "[render][flow]") {
+    // Identical bars every 10 px and nothing else, with no disparity: every
+    // offset that is a multiple of the period matches as well as the truth
+    // up to noise.  The ratio test and the bracket must keep (almost) every
+    // patch at its seed; a patch that does jump must at least fail the
+    // forward-backward check, so it never reaches a warp.  Measured: 0.2 %
+    // of the interior keeps a consistent jumped vector with the ratio test,
+    // 2.8 % without it (and 0 % with the 0.5.0 solver, which cannot jump).
+    const std::uint32_t w = 2048;
+    const std::uint32_t h = 68;
+    const RailScene railing = makeRailingScene(10.0);
+    const GrayImage a = renderRailScene(railing, w, h, 0.0, 1.0, 11u);
+    const GrayImage b = renderRailScene(railing, w, h, 0.0, 1.0, 29u);
+
+    const auto countJumps = [&](const DisFlowParams& p, std::uint64_t& jumped, std::uint64_t& jumpedOk,
+                                std::uint64_t& pixels) {
+        const auto f = disFlowBidirectional(a, b, p, nullptr);
+        REQUIRE(f.ok());
+        jumped = 0;
+        jumpedOk = 0;
+        pixels = 0;
+        for (int y = 24; y < 58; ++y) {
+            for (int x = 32; x < static_cast<int>(w) - 32; ++x) {
+                const std::size_t idx = static_cast<std::size_t>(y) * w + static_cast<std::size_t>(x);
+                const bool jump = std::fabs(f.value().forward.v[idx]) > 2.0f;
+                jumped += jump ? 1u : 0u;
+                jumpedOk += (jump && f.value().ok[idx] != 0) ? 1u : 0u;
+                ++pixels;
+            }
+        }
+    };
+
+    std::uint64_t jumped = 0;
+    std::uint64_t jumpedOk = 0;
+    std::uint64_t pixels = 0;
+    countJumps(DisFlowParams{}, jumped, jumpedOk, pixels);
+    REQUIRE(pixels > 0);
+    const double okFraction = static_cast<double>(jumpedOk) / static_cast<double>(pixels);
+    INFO("defaults: " << jumped << " of " << pixels << " interior px a period off, " << jumpedOk
+                      << " of them consistent (" << 100.0 * okFraction << " %)");
+    CHECK(okFraction < 0.005);
+
+    SECTION("Lowe's ratio is what keeps them out") {
+        DisFlowParams noRatio;
+        noRatio.epipolarRatio = 1.0;
+        std::uint64_t jumpedNoRatio = 0;
+        std::uint64_t jumpedOkNoRatio = 0;
+        std::uint64_t pixelsNoRatio = 0;
+        countJumps(noRatio, jumpedNoRatio, jumpedOkNoRatio, pixelsNoRatio);
+        INFO("without the ratio test: " << jumpedNoRatio << " px a period off, " << jumpedOkNoRatio
+                                        << " consistent; with it " << jumpedOk);
+        CHECK(jumpedOkNoRatio > 4u * jumpedOk);
+    }
+}
+
+TEST_CASE("a one-pixel search can only keep the seed: the winner must be bracketed", "[render][flow]") {
+    // With a radius of 1 the only candidate with a scored neighbour on both
+    // sides is the seed itself, so the search must never move a patch - the
+    // field must equal the field without any search, bit for bit.  A minimum
+    // at the end of the scanned range is a curve still falling where the scan
+    // stopped (on the night clip, a diamond-plate panel pulled patches to the
+    // end of the range a whole pattern period off), and is never adopted.
+    const std::uint32_t w = 2048;
+    const std::uint32_t h = 68;
+    const RailScene scene = makeRailScene(w);
+    const GrayImage a = renderRailScene(scene, w, h, 0.0, 1.0, 11u);
+    const GrayImage b = renderRailScene(scene, w, h, 14.0, 1.0, 29u);
+    DisFlowParams oneStep;
+    oneStep.epipolarSearchPx = 2.0;  // radius 1 on levels 1 and 2
+    REQUIRE(disEpipolarRadius(oneStep, 1) == 1);
+    REQUIRE(disEpipolarRadius(oneStep, 2) == 1);
+    DisFlowParams none = oneStep;
+    none.epipolarSearchPx = 0.0;
+    const auto searched = disFlowBidirectional(a, b, oneStep, nullptr);
+    const auto plain = disFlowBidirectional(a, b, none, nullptr);
+    REQUIRE(searched.ok());
+    REQUIRE(plain.ok());
+    CHECK(searched.value().forward.u == plain.value().forward.u);
+    CHECK(searched.value().forward.v == plain.value().forward.v);
+    CHECK(searched.value().backward.v == plain.value().backward.v);
+    CHECK(searched.value().ok == plain.value().ok);
+}
+
+TEST_CASE("revertOnRunaway keeps the position the descent started from", "[render][flow]") {
+    // A step scaled a thousandfold throws every patch past the displacement
+    // cap on its first iteration.  Searching every level, each patch starts
+    // its descent from the 1-D search's whole-pixel pick, so with revert the
+    // field is those picks (the true -5.3 px, to within the half pixel a
+    // whole-pixel search can miss it by); without, every patch is disowned
+    // and the field is zero.
+    const GrayImage a = textured(128, 96);
+    const GrayImage b = shifted(a, 0.0, -5.3);
+    DisFlowParams p;
+    p.stepScale = 1000.0;
+    p.epipolarSearchMinLevel = 0;
+
+    SECTION("with revert: the start is kept") {
+        const auto f = disFlow(a, b, p, nullptr);
+        REQUIRE(f.ok());
+        double mu = 0.0;
+        double mv = 0.0;
+        meanInterior(f.value(), 16, mu, mv);
+        INFO("recovered (" << mu << ", " << mv << ") against (0, -5.3)");
+        CHECK_THAT(mu, Catch::Matchers::WithinAbs(0.0, 0.1));
+        CHECK_THAT(mv, Catch::Matchers::WithinAbs(-5.3, 0.5));
+    }
+
+    SECTION("without revert: every patch is disowned") {
+        p.revertOnRunaway = false;
+        const auto f = disFlow(a, b, p, nullptr);
+        REQUIRE(f.ok());
+        for (std::size_t i = 0; i < f.value().u.size(); ++i) {
+            REQUIRE(f.value().u[i] == 0.0f);
+            REQUIRE(f.value().v[i] == 0.0f);
+        }
+    }
+}
+
+TEST_CASE("no reported vector exceeds the displacement cap, revert or not", "[render][flow]") {
+    // The truth (14 px) lies beyond a 6 px cap: the search must not adopt a
+    // candidate past it, and revert must not keep a start past it, so no
+    // patch - hence no densified, smoothed pixel - reports more than 6.
+    const std::uint32_t w = 2048;
+    const std::uint32_t h = 68;
+    const RailScene scene = makeRailScene(w);
+    const GrayImage a = renderRailScene(scene, w, h, 0.0, 1.0, 11u);
+    const GrayImage b = renderRailScene(scene, w, h, 14.0, 1.0, 29u);
+    for (const bool revert : {true, false}) {
+        DisFlowParams p;
+        p.maxDisplacementPx = 6.0;
+        p.revertOnRunaway = revert;
+        const auto f = disFlowBidirectional(a, b, p, nullptr);
+        REQUIRE(f.ok());
+        float largest = 0.0f;
+        for (const FlowField* field : {&f.value().forward, &f.value().backward}) {
+            for (std::size_t i = 0; i < field->u.size(); ++i) {
+                largest = std::max(largest, std::max(std::fabs(field->u[i]), std::fabs(field->v[i])));
+            }
+        }
+        INFO("revert " << revert << ": largest |component| " << largest);
+        CHECK(largest <= 6.0f);
+    }
+}
+
+TEST_CASE("the near-field additions are off when their parameters say so", "[render][flow]") {
+    // tensorTikhonov 0, epipolarSearchPx 0 and revertOnRunaway false are the
+    // 0.5.0 solver.  A negative or NaN Tikhonov term means the same as 0 (an
+    // indefinite tensor is never inverted), so those must give the 0.5.0
+    // field exactly too.
+    const GrayImage a = textured(1500, 120);
+    const GrayImage b = shifted(a, 1.7, -0.6);
+    const auto legacy = disFlowBidirectional(a, b, legacyDisParams(), nullptr);
+    REQUIRE(legacy.ok());
+    for (const double tik : {-0.5, std::nan("")}) {
+        INFO("tensorTikhonov " << tik);
+        DisFlowParams p = legacyDisParams();
+        p.tensorTikhonov = tik;
+        const auto f = disFlowBidirectional(a, b, p, nullptr);
+        REQUIRE(f.ok());
+        CHECK(f.value().forward.u == legacy.value().forward.u);
+        CHECK(f.value().forward.v == legacy.value().forward.v);
+        CHECK(f.value().ok == legacy.value().ok);
     }
 }

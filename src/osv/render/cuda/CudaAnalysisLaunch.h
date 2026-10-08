@@ -68,6 +68,11 @@ inline constexpr int kDisMaxBlurRadius = 64;
 /// pyramid construction, (u, v) x two directions during flow smoothing.
 inline constexpr int kDisMaxBatch = 4;
 
+/// Largest 1-D epipolar search radius a solve launch accepts: DisFlow.h's
+/// kMaxEpipolarRadius, restated here because the kernels see no host
+/// headers (CudaDisFlow.cpp static_asserts that the two agree).
+inline constexpr int kDisMaxEpipolarRadius = 64;
+
 /// A normalised 1-D Gaussian, built on the HOST with exactly the arithmetic
 /// DisFlow.cpp uses (double exp, float taps, float multiply by a float
 /// reciprocal of the double sum) so both backends blur with identical taps.
@@ -107,6 +112,15 @@ struct DisPatch {
     float iHxy;
     float iHyy;
     int usable;     ///< 0 when the tensor was singular or the solve failed.
+    int epipolar;   ///< 1 when the raw tensor trace admits the 1-D epipolar search.
+};
+
+/// The constants of the structure-tensor stage, pre-converted on the host
+/// exactly as DisFlow.cpp precomputeTensors converts them.
+struct DisTensorConsts {
+    double minTensorDet = 0.001;      ///< params.minTensorDet: the raw-determinant floor.
+    double tikhonov = 0.1;            ///< params.tensorTikhonov, or 0 when not positive and finite.
+    double epipolarMinTrace = 64.0;   ///< params.epipolarMinTracePerPx * double(ps) * ps.
 };
 
 /// Patches of both directions: p[0] from image A's tensors, p[1] from B's.
@@ -131,6 +145,13 @@ struct DisSolveConsts {
     double minStepPx = 0.01;
     double maxDisplacementPx = 24.0;
     double maxPatchSsd = 1.0e7;
+    /// Whole pixels the 1-D epipolar search covers either side of the seed
+    /// at the level being solved (disEpipolarRadius(params, level), so it is
+    /// set per launch); 0 = no search at this level.
+    int epipolarRadius = 0;
+    double epipolarRatio = 0.85;        ///< params.epipolarRatio, Lowe's ratio.
+    double epipolarMarginCodes = 0.05;  ///< params.epipolarMarginCodes.
+    int revertOnRunaway = 1;            ///< params.revertOnRunaway ? 1 : 0.
 };
 
 /// dst = src * scale (or a plain copy when applyScale is 0) for both images,
@@ -156,13 +177,15 @@ cudaError_t disLaunchDecimate(const DisPlaneBatch& batch, int srcW, int srcH, in
 cudaError_t disLaunchGradients(DisPair img, DisPairW gx, DisPairW gy, int w, int h, cudaStream_t stream);
 
 /// Lay out both patch grids and precompute every inverse structure tensor
-/// (double accumulation, raw-determinant test against minTensorDet).
-cudaError_t disLaunchTensors(DisPair gx, DisPair gy, int w, int h, DisGrid grid, double minTensorDet,
+/// (double accumulation, Tikhonov term, raw-determinant test against
+/// consts.minTensorDet) and every patch's epipolar-search flag.
+cudaError_t disLaunchTensors(DisPair gx, DisPair gy, int w, int h, DisGrid grid, const DisTensorConsts& consts,
                              DisPatchPair patches, cudaStream_t stream);
 
 /// Seed every patch of both directions from the coarser level's field
-/// (when `seeded`, coarse planes coarseW x coarseH) and run the damped
-/// inverse search.  Direction d solves from[d] -> to[d] with gx[d] / gy[d].
+/// (when `seeded`, coarse planes coarseW x coarseH), run the 1-D epipolar
+/// search when consts.epipolarRadius > 0, then the damped inverse search.
+/// Direction d solves from[d] -> to[d] with gx[d] / gy[d].
 /// `multiprocessors` (the device's SM count) sizes the lane groups of the
 /// solve to the level's patch count; it changes speed, never results.
 cudaError_t disLaunchSolve(DisPair from, DisPair to, DisPair gx, DisPair gy, int w, int h, DisGrid grid,
