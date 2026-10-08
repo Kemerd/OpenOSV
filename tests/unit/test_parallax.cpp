@@ -1516,9 +1516,12 @@ TEST_CASE("the per-column guard changes nothing where the grid measured the colu
         unchanged(guardTestGrid(W, H, std::vector<float>(W, 0.25f)), table, std::vector<float>(N, 1.0f));
     }
     SECTION("an untrusted grid over a table that is not sure (below kGridGuardConfidenceLo)") {
-        // 0.29: the float nearest 0.3 sits a hair above the double 0.3, where
-        // the ramp already starts.
-        unchanged(guardTestGrid(W, H, std::vector<float>(W, 1.0f)), table, std::vector<float>(N, 0.29f));
+        // 0.45: the night drive's half-sure columns (0.43-0.52), whose table
+        // was wrong there; 0.59: a hair under the floor (the float nearest
+        // 0.6 sits above the double 0.6, where the ramp already starts).
+        for (const float halfSure : {0.45f, 0.59f}) {
+            unchanged(guardTestGrid(W, H, std::vector<float>(W, 1.0f)), table, std::vector<float>(N, halfSure));
+        }
     }
     SECTION("a partly trusted grid: the table's 1 - strength share, as before") {
         unchanged(guardTestGrid(W, H, std::vector<float>(W, 0.0f), 0.4), table, std::vector<float>(N, 1.0f));
@@ -1533,6 +1536,65 @@ TEST_CASE("the per-column guard changes nothing where the grid measured the colu
             grid.uv[k] = static_cast<float>(-deg2rad(1.5 + 0.2) / 2.0);  // 0.2 deg apart: agreement
         }
         unchanged(grid, flat, std::vector<float>(N, 1.0f));
+    }
+}
+
+TEST_CASE("a hand-over starts only where the table is sure and reaches at most three grid columns past it",
+          "[render][parallax][guard]") {
+    // Every grid column untrusted and missing the table's +2 deg (the grid
+    // corrects nothing along the meridian): only the table's confidence
+    // decides.  Grid columns 12..15 are the run the table measured; table
+    // column i averages into grid column round((i + 0.5) / 8), so that run is
+    // table columns 8 x 12 - 4 .. 8 x 15 + 3.
+    constexpr std::uint32_t W = 32, H = 12;
+    constexpr std::size_t N = 256;
+    constexpr std::uint32_t runFirst = 12, runLast = 15;
+    const std::vector<float> table(N, 2.0f);
+    const auto runOf = [&](float inside) {
+        std::vector<float> conf(N, 0.0f);  // outside the run: unmeasured
+        for (std::size_t i = 8u * runFirst - 4u; i <= 8u * runLast + 3u; ++i) {
+            conf[i] = inside;
+        }
+        return conf;
+    };
+    render::ParallaxWarpGrid grid = guardTestGrid(W, H, std::vector<float>(W, 1.0f));
+    for (std::size_t k = 1; k < grid.uv.size(); k += 2) {
+        grid.uv[k] = 0.0f;
+    }
+
+    SECTION("a sure run: handed over, its smoothed edge at most three columns out, the grid exact beyond") {
+        auto guarded = render::guardGridWithTable(grid, table, runOf(1.0f));
+        REQUIRE(guarded.ok());
+        const render::GuardedCorrection& out = guarded.value();
+        REQUIRE(out.changed);
+        REQUIRE(out.guard.size() == W);
+        REQUIRE(out.grid.valid());
+        for (std::uint32_t gc = runFirst; gc <= runLast; ++gc) {
+            CHECK(out.guard[gc] > 0.5f);
+        }
+        // The smoothing (sigma one grid column, radius three) reaches the
+        // three columns either side of the run and not one further.
+        CHECK(out.guard[runFirst - 1] > 0.0f);
+        CHECK(out.guard[runLast + 1] > 0.0f);
+        for (std::uint32_t gc = 0; gc < W; ++gc) {
+            if (gc + 3u >= runFirst && gc <= runLast + 3u) {
+                continue;
+            }
+            INFO("grid column " << gc);
+            CHECK(out.guard[gc] == 0.0f);
+            for (std::uint32_t y = 0; y < H; ++y) {
+                CHECK(cell(out.grid, gc, y, 0) == cell(grid, gc, y, 0));
+                CHECK(cell(out.grid, gc, y, 1) == cell(grid, gc, y, 1));
+            }
+        }
+    }
+    SECTION("a half-sure run (the night drive's 0.43-0.52) hands nothing over and spills nothing") {
+        auto guarded = render::guardGridWithTable(grid, table, runOf(0.5f));
+        REQUIRE(guarded.ok());
+        CHECK_FALSE(guarded.value().changed);
+        CHECK(guarded.value().guard.empty());
+        CHECK(guarded.value().guardedColumns == 0u);
+        CHECK(guarded.value().table.empty());  // full strength: no table at all, as before the guard
     }
 }
 

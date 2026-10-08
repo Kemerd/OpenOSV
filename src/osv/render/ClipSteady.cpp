@@ -946,6 +946,17 @@ Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::Blend
                 }
             }
         }
+        // The guard could not run (no sample table carried its confidence,
+        // or the medians failed) under a partly trusted clip grid: the rule
+        // before the guard, the fallback table's 1 - strength share, so the
+        // clip grid never renders with less than its table share.
+        if (!out.gridTable && out.seamTable && out.grid->strength < 1.0) {
+            std::vector<float> share;
+            seamTableUnderGrid(*out.seamTable, out.grid->strength, share);
+            if (!share.empty()) {
+                out.gridTable = std::make_shared<const std::vector<float>>(std::move(share));
+            }
+        }
     }
 
     // ---- the correction the clip renders with -------------------------------------------

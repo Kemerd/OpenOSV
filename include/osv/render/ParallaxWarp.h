@@ -544,15 +544,32 @@ void seamTableUnderGrid(const std::vector<float>& table, double gridStrength, st
 //       kGridGuardAgreeDeg .. kGridGuardDisagreeDeg - the table found a
 //       disparity the grid missed.
 //  g = sstep(u) * sstep(c) * sstep(d), smoothed along the ring like the
-//  benefit gate's weights, then
+//  benefit gate's weights (sigma kGridGuardSmoothCols, three grid columns of
+//  reach), then
 //      grid         column x (1 - g)
 //      table share  T x (1 - s (1 - g))
-//  so the grid and the table still add up to ONE correction everywhere: a
-//  column where any of the three says no keeps the grid exactly as before
-//  (g = 0, the table's 1 - s share of seamTableUnderGrid), a column all three
-//  hand over takes the table in full.  The per-cell rule (a cell the grid
-//  could not measure goes to a table that is sure of it) becomes a
-//  per-column one because the table is one number per column.
+//  so the grid and the table still add up to ONE correction everywhere.  A
+//  hand-over starts only in a column all three hand over - and so only where
+//  the table is at least kGridGuardConfidenceLo sure; a column all three
+//  hand over takes the table in full; the smoothing carries a run's
+//  hand-over at most three grid columns past its edge; every column farther
+//  than that from any column all three hand over keeps the grid exactly as
+//  before (g = 0, the table's 1 - s share of seamTableUnderGrid).  The
+//  per-cell rule (a cell the grid could not measure goes to a table that is
+//  sure of it) becomes a per-column one because the table is one number per
+//  column.
+//
+//  The smoothing's reach past a run is kept on purpose: at the car body's
+//  edge the column's own table measurement is unsure (texture, coverage),
+//  but the table's robust smoother continues the sure run's value there, and
+//  that value is the right one where the grid's is not (day proxy frame
+//  3423, grid column 193: table confidence 0.16, table +1.96 deg, the grid
+//  +0.95).  Capping the smoothed weight at each column's own product (all
+//  three factors, u x c, or c alone; measured with the confidence ramp's top
+//  at 0.8) cost the day proxy's car window median 0.9669 -> 0.9654-0.9657
+//  and its whole band 0.9929 -> 0.9917-0.9918 (frame 3423 0.9669 ->
+//  0.9576-0.9581, 6008 0.9507 -> 0.9380-0.9384), and bought nothing at night
+//  once the confidence floor is 0.6.
 //
 //  G is -2 dLat in degrees, averaged over the rows where the kernel applies
 //  the table in full (osvSeamShiftTaper): the grid stores the master lens's
@@ -576,7 +593,16 @@ void seamTableUnderGrid(const std::vector<float>& table, double gridStrength, st
 //    * the grid kept whole and the table adding g (s T - G): a column of a
 //      car mount is part car body (under-corrected) and part background
 //      (near zero), and a column-wide offset mis-corrected both (car window
-//      median 0.93, below the grid alone).
+//      median 0.93, below the grid alone);
+//    * the confidence ramp of the table glide's step rule (0.3 .. 0.6): on
+//      the night drive the table is half sure (0.43-0.52) of car-window
+//      columns it measures wrong, the guard handed them - and, smoothed,
+//      their neighbours of confidence 0 - to it, and the car window lost
+//      0.050 against the grid alone (frame 2000: 0.7675 -> 0.7171; whole
+//      band 0.9830 -> 0.9828).  From 0.6 no night car-window column starts
+//      a hand-over and the night renders the grid alone there (0.7675 and
+//      0.9467 at frames 2000 and 3500), while the day keeps its gain (car
+//      window median 0.9668 -> 0.9670, whole band 0.9929 both).
 //
 //  Composing the two everywhere (the grid measured on bands the table has
 //  already corrected) was measured as the alternative and NOT adopted: it
@@ -585,14 +611,21 @@ void seamTableUnderGrid(const std::vector<float>& table, double gridStrength, st
 //  table's smoothed shift stays where the grid does better.
 // ===========================================================================
 
-/// Table confidence (SeamProfile::confidence) at or below which the guard
-/// never hands a column to the table: the confidence below which a table
-/// change never steps either (kSeamTableStepConfLo, below).
-inline constexpr double kGridGuardConfidenceLo = 0.3;
+/// Table confidence (SeamProfile::confidence) at or below which a hand-over
+/// never starts in a column: the confidence from which a change of the table
+/// fully steps at a bucket's anchor (kSeamTableStepConfHi, below) - a table
+/// column less sure than that is not sure enough to replace the grid.  The
+/// night drive's half-sure car-window columns (0.43-0.52), whose table is
+/// wrong there (car window 0.62 against the grid's 0.77), sit below it.
+inline constexpr double kGridGuardConfidenceLo = 0.6;
 /// Table confidence from which an untrusted grid column can go to the table
-/// in full: a measurement this sure steps at a bucket's anchor
-/// (kSeamTableStepConfHi, below), and is sure enough to replace the grid.
-inline constexpr double kGridGuardConfidenceHi = 0.6;
+/// in full: the ramp is as wide as the table glide's step ramp
+/// (kSeamTableStepConfLo .. kSeamTableStepConfHi), so a confidence that
+/// wobbles from bucket to bucket moves the hand-over no faster than it moves
+/// the step.  The car body the table aligns on the day drive is 0.93-1.00
+/// sure.  A top of 0.8 or 0.7 measured within 0.0005 or 0.0017 of this one
+/// on every frame (the 8K original's car window at frame 12014 the most).
+inline constexpr double kGridGuardConfidenceHi = 0.9;
 /// Untrusted share (ParallaxWarpGrid::untrustedShare) up to which a grid
 /// column stays the grid's: a quarter of its cells unmeasured or gated is the
 /// sky above or the road below a feature the flow did measure.

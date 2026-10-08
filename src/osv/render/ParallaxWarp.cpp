@@ -1156,11 +1156,20 @@ void seamTableUnderGrid(const std::vector<float>& table, double gridStrength, st
     }
 }
 
-// The guard's confidence ramp is the table glide's step ramp (see the header):
-// one notion of "a table column this sure is a real measurement".
-static_assert(kGridGuardConfidenceLo == kSeamTableStepConfLo && kGridGuardConfidenceHi == kSeamTableStepConfHi,
-              "the per-column guard and the table glide must agree on what a confident table column is");
-static_assert(kGridGuardConfidenceHi > kGridGuardConfidenceLo, "the guard's confidence ramp must rise");
+// The guard's confidence ramp starts where the table glide's step ramp ends
+// (see the header): a table column hands nothing over below the confidence
+// from which a change of it fully steps at a bucket's anchor - one notion of
+// "a table column this sure is a real measurement".  It rises over the same
+// width as the step ramp (to within rounding: the constants are decimals).
+static_assert(kGridGuardConfidenceLo == kSeamTableStepConfHi,
+              "the per-column guard must start where the table glide counts a column as fully confident");
+static_assert(kGridGuardConfidenceHi > kGridGuardConfidenceLo && kGridGuardConfidenceHi <= 1.0,
+              "the guard's confidence ramp must rise inside [0, 1]");
+static_assert([] {
+    const double guardWidth = kGridGuardConfidenceHi - kGridGuardConfidenceLo;
+    const double stepWidth = kSeamTableStepConfHi - kSeamTableStepConfLo;
+    return guardWidth - stepWidth < 1e-9 && stepWidth - guardWidth < 1e-9;
+}(), "the guard's confidence ramp must be as wide as the table glide's step ramp");
 static_assert(kGridGuardUntrustedHi > kGridGuardUntrustedLo && kGridGuardUntrustedLo >= 0.0 &&
                   kGridGuardUntrustedHi <= 1.0,
               "the guard's untrusted-share ramp must rise inside [0, 1]");
@@ -1259,6 +1268,11 @@ Result<GuardedCorrection> guardGridWithTable(const ParallaxWarpGrid& grid, const
     // so its distance from the table's T is |G + (1 - s) T - T| = |G - s T|.
     // Interleaved as blurComponent expects (component 0, one row), so the
     // smoothing wraps at +/-180 deg exactly as the kernel's grid fetch does.
+    // A hand-over can only START in a column whose table is at least
+    // kGridGuardConfidenceLo sure; the smoothing then carries it up to three
+    // grid columns (3 x kGridGuardSmoothCols, blurComponent's radius) past the
+    // edge of such a run, where the table's own smoother continues the sure
+    // run's value (see the header for why that reach is kept).
     std::vector<float> weight(static_cast<std::size_t>(W) * 2u, 0.0f);
     bool any = false;
     for (std::uint32_t gc = 0; gc < W; ++gc) {

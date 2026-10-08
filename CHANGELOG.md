@@ -89,12 +89,18 @@ classical flow and the seam-shift table, not osvtool's neural default.
   table is sure of its match and found an offset the correction missed. The
   hood goes to 0.94-0.98 (median of 15 moments 0.967, from 0.951) and the
   whole seam band to 0.988-0.996 (median 0.993, from 0.989); the 8K
-  original gains on its car body too, the night drive holds, and the 6K
-  sample renders byte for byte as before (no stretch qualifies there). Where
-  a moment hands a stretch between the correction and the table, the table
-  now glides with the correction instead of stepping at the moment's first
-  frame: on the car body the change at bucket starts stays within 1.11x the
-  change inside buckets (1.05x before, 1.11x with no correction at all).
+  original gains on its car body too. A stretch goes to the table only
+  where it is at least 60 % sure of its match: on the night drive it is at
+  most half sure of the hood and wrong there (0.62 and 0.81 against the
+  correction's 0.77 and 0.95), so the hood keeps the correction's
+  alignment, and the whole band its 0.983-0.991. The 6K sample renders
+  byte for byte as before (no stretch qualifies there). Where a moment
+  hands a stretch between the correction and the table, the table now
+  glides with the correction instead of stepping at the moment's first
+  frame, and under a partly trusted correction the table's share steps
+  only as far as it carries the column: on the car body the change at
+  bucket starts stays within 1.11x the change inside buckets (1.05x
+  before, 1.11x with no correction at all).
 * A hardware-decoded picture that FFmpeg flags as damaged, or that is
   predicted from one, is decoded again in software instead of being
   delivered. As with any other hardware decode failure, on the importer's

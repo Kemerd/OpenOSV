@@ -391,9 +391,11 @@ struct ClipSteady {
     std::shared_ptr<const ParallaxWarpGrid> grid;
     /// The seam table share that renders WITH the clip grid: 1 - its
     /// strength everywhere plus the columns the guard handed over (the
-    /// GuardedCorrection's table).  Null or empty when nothing of the table
-    /// applies under the grid (a fully trusted grid that guarded no column,
-    /// no table, or no grid).
+    /// GuardedCorrection's table).  When the guard cannot run under a partly
+    /// trusted grid (no sample table carried its confidence), the fallback
+    /// `seamTable`'s 1 - strength share instead, the rule before the guard.
+    /// Null or empty when nothing of the table applies under the grid (a
+    /// fully trusted grid that guarded no column, no table, or no grid).
     std::shared_ptr<const std::vector<float>> gridTable;
     std::uint32_t guardedColumns = 0;                    ///< Clip grid columns handed to the table (diagnostics).
     std::uint32_t acceptedGrids = 0;                     ///< Samples whose own grid was accepted.

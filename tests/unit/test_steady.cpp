@@ -548,20 +548,17 @@ TEST_CASE("with the seam on, the clip grid renders after the per-column guard an
     REQUIRE(c.grid->valid());
     // The clip grid carries the median untrusted share the guard read.
     REQUIRE(c.grid->untrustedShare.size() == c.grid->w);
-    CHECK(c.guardedColumns <= c.grid->w);
-    if (c.acceptedGrids == c.frames.size() && c.grid->strength >= 1.0) {
-        // Every sample accepted at full strength: no refused sample, so no
-        // fallback table - as before - and nothing of a table under the grid
-        // unless the guard handed it columns.
-        CHECK(c.seamTable == nullptr);
-        if (c.guardedColumns == 0u) {
-            CHECK((c.gridTable == nullptr || c.gridTable->empty()));
-        }
-    }
-    // Whatever the guard decided, its share has the table's width.
-    if (c.gridTable) {
-        CHECK(c.gridTable->size() == static_cast<std::size_t>(params.seamSearch.band.equirectW));
-    }
+    // The scene this test is built on: every sample accepted at full
+    // strength, and nothing for the guard to hand over.  Required, so a
+    // change to the synthetic setup fails here instead of leaving the checks
+    // below with nothing to check.
+    REQUIRE(c.acceptedGrids == c.frames.size());
+    REQUIRE(c.grid->strength >= 1.0);
+    REQUIRE(c.guardedColumns == 0u);
+    // No refused sample, so no fallback table - as before - and nothing of a
+    // table under the grid, since the guard handed it no column.
+    CHECK(c.seamTable == nullptr);
+    CHECK((c.gridTable == nullptr || c.gridTable->empty()));
 }
 
 TEST_CASE("the clip correction's medians are medians, and a median seam is a valid seam", "[steady][clip]") {
