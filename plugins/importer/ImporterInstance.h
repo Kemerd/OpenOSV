@@ -520,7 +520,11 @@ public:
     /// ran under, since nothing else writes the cache without the lock.
     /// Read-only; never renders.  The caller MUST hold lock().
     ///
-    /// @param index     The frame just delivered.
+    /// @param index     The clip's own (source) frame the render was asked
+    ///                  for - the index passed to renderFrameToHost(), i.e.
+    ///                  sourceFrameFor() of the host's frame, NOT the host's
+    ///                  timeline index (the two differ for an .LRF presented
+    ///                  as its .OSV's proxy and for a clip that dropped frames).
     /// @param geometry  The size it was delivered at.
     /// @return The frame, or nullptr.
     [[nodiscard]] const render::ImageRGBAf* lastHostFrameLocked(std::uint32_t index,

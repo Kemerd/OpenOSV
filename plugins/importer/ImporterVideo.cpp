@@ -671,15 +671,23 @@ struct HalfCrcs {
 /// copy can be a handful of rows anywhere).  Read-only on the buffer; never
 /// throws, never fails the frame.
 ///
-/// @param instance    The clip (lock held by the caller).
-/// @param frame       The host buffer just written (bottom-left, `layout`).
-/// @param layout      Its pixel layout.
-/// @param frameIndex  The frame delivered.
-/// @param geometry    The size it was rendered at.
-/// @param draft       Whether the request was a draft (for the line).
+/// Two frame numbers go into the line because they differ whenever the clip
+/// is not on its own timeline (an .LRF presented as its .OSV's proxy, a clip
+/// that dropped frames): `frameIndex` is the host's, the one Premiere asked
+/// for; `sourceIndex` is the clip's own sample that was decoded and rendered
+/// for it - the number the decoder's 'decode:' lines carry, and the one the
+/// instance's rendered frame is held under.
+///
+/// @param instance     The clip (lock held by the caller).
+/// @param frame        The host buffer just written (bottom-left, `layout`).
+/// @param layout       Its pixel layout.
+/// @param frameIndex   The host's (timeline) frame delivered.
+/// @param sourceIndex  The clip's own frame rendered for it (sourceFrameFor).
+/// @param geometry     The size it was rendered at.
+/// @param draft        Whether the request was a draft (for the line).
 void fingerprintDelivery(ImporterInstance& instance, const pixelcopy::HostFrame& frame,
-                         pixelcopy::HostPixelFormat layout, std::uint32_t frameIndex, const OutputGeometry& geometry,
-                         bool draft) noexcept {
+                         pixelcopy::HostPixelFormat layout, std::uint32_t frameIndex, std::uint32_t sourceIndex,
+                         const OutputGeometry& geometry, bool draft) noexcept {
     try {
         // ---- is it wanted? ----------------------------------------------------------
         const bool requested = deliveryCheckRequested();
@@ -696,7 +704,9 @@ void fingerprintDelivery(ImporterInstance& instance, const pixelcopy::HostFrame&
         const std::size_t rowBytes = static_cast<std::size_t>(width) * bpp;
 
         // ---- the rendered frame, when this one took the host path -------------------
-        const render::ImageRGBAf* image = instance.lastHostFrameLocked(frameIndex, geometry);
+        // Held under the SOURCE index renderFrame() was called with, never
+        // the host's timeline index (they differ for a proxy or a VFR clip).
+        const render::ImageRGBAf* image = instance.lastHostFrameLocked(sourceIndex, geometry);
         if (image != nullptr && (image->w != width || image->h != height)) {
             image = nullptr;  // not the frame in this buffer: compare nothing
         }
@@ -756,7 +766,8 @@ void fingerprintDelivery(ImporterInstance& instance, const pixelcopy::HostFrame&
             }
         }
         if (failed.load()) {
-            PluginLog::debug("deliver: clip '{}' frame {}: fingerprint failed", clipNameForLog(instance), frameIndex);
+            PluginLog::debug("deliver: clip '{}' frame {} (source {}): fingerprint failed", clipNameForLog(instance),
+                             frameIndex, sourceIndex);
             return;
         }
 
@@ -766,23 +777,32 @@ void fingerprintDelivery(ImporterInstance& instance, const pixelcopy::HostFrame&
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         const PluginLog::Level level = requested ? PluginLog::Level::Info : PluginLog::Level::Debug;
         if (image == nullptr) {
-            PluginLog::logf(level, "deliver: clip '{}' frame {} {}x{} {} crc {:016x}/{:016x} (gpu path, nothing "
-                                   "to compare), {}{:.1f} ms",
-                            clipNameForLog(instance), frameIndex, width, height,
-                            pixelcopy::hostPixelFormatName(layout), out.top, out.bottom, draft ? "draft, " : "", ms);
+            // Nothing to compare against.  Only the GPU path has a reason:
+            // it streams its bands straight into the buffer and never holds
+            // a float frame on the host.  On the host path this means the
+            // instance no longer holds the frame it rendered for this
+            // request - the line must say so rather than claim the GPU path.
+            const bool gpuPath = instance.lastFramePath() == ImporterInstance::FramePath::Gpu;
+            PluginLog::logf(level, "deliver: clip '{}' frame {} (source {}) {}x{} {} crc {:016x}/{:016x} ({}), "
+                                   "{}{:.1f} ms",
+                            clipNameForLog(instance), frameIndex, sourceIndex, width, height,
+                            pixelcopy::hostPixelFormatName(layout), out.top, out.bottom,
+                            gpuPath ? "gpu path, nothing to compare" : "no rendered frame held to compare",
+                            draft ? "draft, " : "", ms);
             return;
         }
         const HalfCrcs expected = foldHalves(rendered);
         const bool same = expected.top == out.top && expected.bottom == out.bottom;
-        PluginLog::logf(level, "deliver: clip '{}' frame {} {}x{} {} crc {:016x}/{:016x} ({} the rendered frame), "
-                               "{}{:.1f} ms",
-                        clipNameForLog(instance), frameIndex, width, height, pixelcopy::hostPixelFormatName(layout),
-                        out.top, out.bottom, same ? "matches" : "DIFFERS FROM", draft ? "draft, " : "", ms);
+        PluginLog::logf(level, "deliver: clip '{}' frame {} (source {}) {}x{} {} crc {:016x}/{:016x} ({} the "
+                               "rendered frame), {}{:.1f} ms",
+                        clipNameForLog(instance), frameIndex, sourceIndex, width, height,
+                        pixelcopy::hostPixelFormatName(layout), out.top, out.bottom,
+                        same ? "matches" : "DIFFERS FROM", draft ? "draft, " : "", ms);
         if (!same) {
-            PluginLog::warn("deliver: clip '{}' frame {} {}x{} {}: the host buffer does not hold the frame that was "
-                            "rendered (top {:016x} vs {:016x}{}, bottom {:016x} vs {:016x}{}); the copy into the host's "
-                            "buffer, or the buffer itself, is at fault",
-                            clipNameForLog(instance), frameIndex, width, height,
+            PluginLog::warn("deliver: clip '{}' frame {} (source {}) {}x{} {}: the host buffer does not hold the "
+                            "frame that was rendered (top {:016x} vs {:016x}{}, bottom {:016x} vs {:016x}{}); the copy "
+                            "into the host's buffer, or the buffer itself, is at fault",
+                            clipNameForLog(instance), frameIndex, sourceIndex, width, height,
                             pixelcopy::hostPixelFormatName(layout), out.top, expected.top,
                             out.top == expected.top ? "" : " DIFFERS", out.bottom, expected.bottom,
                             out.bottom == expected.bottom ? "" : " DIFFERS");
@@ -1408,9 +1428,15 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
     // (PixelCopy's host functions).  The thread pool the conversion runs on
     // is leased inside, from the process-wide context, so imShutdown on
     // another thread cannot join it under a copy in progress.
+    //
+    // `frameIndex` is the HOST's (timeline) frame; the frame decoded and
+    // rendered is the clip's own sample for it.  The two differ for an .LRF
+    // presented as its .OSV's proxy (another rate, another start) and for a
+    // clip that dropped frames.  Worked out once, here, so the render and
+    // the delivery fingerprint below name the same frame.
+    const std::uint32_t sourceIndex = instance->sourceFrameFor(frameIndex);
     const Status rendered =
-        instance->renderFrameToHost(instance->sourceFrameFor(frameIndex), geometry, draft, renderPurposeFor(*rec), dst,
-                                    layout, outputTransfer);
+        instance->renderFrameToHost(sourceIndex, geometry, draft, renderPurposeFor(*rec), dst, layout, outputTransfer);
     if (!rendered.ok()) {
         g.suites.ppix->Dispose(frame);
         PluginLog::error("imGetSourceVideo: frame {} failed: {}", frameIndex, rendered.error().message);
@@ -1431,7 +1457,9 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
     // Every frame, unlike the row check: the CRCs of what went out and, on
     // the host path, proof that it is the frame that was rendered.  Also
     // under the lock and before the cache, so it describes the cached frame.
-    fingerprintDelivery(*instance, dst, layout, frameIndex, geometry, draft);
+    // The rendered frame is looked up by the SOURCE index it was rendered
+    // under; the line carries both numbers.
+    fingerprintDelivery(*instance, dst, layout, frameIndex, sourceIndex, geometry, draft);
 
     // ---- cache + hand over -------------------------------------------------
     // [WP-STEADY] Only a frame with its final pixels is cached.  An
