@@ -2492,7 +2492,7 @@ library's own messages and FFmpeg's now land in the plug-in log at its level
   that was rendered` means the copy into Premiere's buffer, or the buffer, is
   at fault.
 * `frame N (bucket B, anchor A) of 'clip': parallax refused after ... (...:
-  structured 18.2% of 4235 px (needs 25% of at least 1500), all co-visible
+  structured 18.2% of 4235 px (needs 30% of at least 1500), all co-visible
   9.6%); ...` - the per-bucket analysis lines now name the clip and say how
   much of the flow was consistent: over the pixels with structure in both
   lenses (the share the gate judges) and over all co-visible pixels. An
@@ -2534,3 +2534,79 @@ decode of the same frames:
 `OSV_SEEK_LRF=<clip> OSV_CRC_FRAMES=<first>-<last> osv_tests "[.lrfcrc]"`
 prints the same lines. A frame whose fingerprint differs was decoded
 differently in the session.
+
+### A car, helmet or suction mount: the seam steps, wobbles or pops
+
+A mounted camera puts part of the vehicle a metre from the lenses, right
+across the seam, and holds it there for the whole clip. That is the hardest
+case the stitch has: the two lenses see the near part from different places
+(parallax of a degree or more along the seam), the calibration's occlusion
+polygons leave an arc of the seam ring with no overlap at all, and the sky
+over the rest of the ring has nothing to match. 0.5.1 was built on two such
+clips; this is what to set, what the log says, and what to send if it still
+looks wrong.
+
+**Settings, in the order they matter** (Source Settings, Stitching group):
+
+1. **Hide Mount.** On (the default) keeps the calibration's mask, so where the
+   roof or hood crosses the mount-side seam there is no overlap and a near
+   edge can step by a few degrees. **Off** gives the overlap back everywhere
+   and the mount itself can show; **Auto** measures the clip once and gives
+   the overlap back only where both lenses agree, keeping the mount hidden.
+   Try Off first: if the mount stays out of frame (or gets cropped by the
+   reframe), it is the best stitch; otherwise Auto.
+2. **Stabilisation.** Smooth + Horizon Lock levels on the camera's stored
+   attitude; 0.5.1 corrected its reading (older versions leaned by tens of
+   degrees on a moving mount). Off is the reference: if the seam is still
+   wrong with stabilisation off, it is a stitch matter, not a levelling one.
+3. **Seam Search** (on by default) measures a per-column seam shift; since
+   0.5.1 only columns both lenses can see move it, with a confidence per
+   column, so a blank sky can no longer bend a lamp pole beside the seam.
+   Switch it off only to see what the calibration alone gives.
+4. **Parallax Grid.** Auto decides per clip whether one steady correction
+   serves the whole clip or each moment is measured on its own. On a rigid
+   mount the near part never moves, so Steady (per clip) is worth a try when
+   the seam still breathes; Follows scene (per moment) when something passes
+   close by.
+5. **Parallax Blend** and **Seam Blend** widen the crossfade; a wider blend
+   hides a small residual step as a soft double edge instead of a cut.
+
+**What the log says** (`%LOCALAPPDATA%\OpenOSV\OpenOSVImporter.log`;
+`OSV_PLUGIN_LOG_LEVEL=debug` set before Premiere starts adds the per-bucket
+lines):
+
+* `attitude: level on the attitude's own up (Z); accelerometer canary:
+  gravity N deg from the reading's up ...` - the levelling. A `WARNING
+  accelerometer canary` above 15 deg means this camera stores its attitude
+  differently from the two it was measured on: send the clip.
+* `lens alignment: 'clip': ... measured in N ms` - the per-clip lens rotation
+  fit, cached in `lens-alignment.tsv`.
+* `hide mount: 'clip': Auto - released N of M arc columns ... measured in
+  N ms` - the Auto verdict, cached in `hide-mount.tsv` beside it. At Debug a
+  line per 16-column window gives its agreement and which lens was kept.
+* `steady: 'clip': clip correction ready N ms after the first request (...;
+  9 sample frames ..., K grids accepted; ...): grid yes|no, seam table
+  yes|no, seam yes|no; Auto: ...` - the per-clip correction and the Auto
+  verdict (`follows scene` means each moment is measured on its own).
+* `frame N (bucket B, anchor A) of 'clip': parallax accepted ... structured
+  x% ... strength s` or `parallax refused ...` - each moment's 2-D
+  correction. A refusal is normal on sky and fog: the seam table carries
+  those moments. Many accepted lines at a strength below 1.00 mean the share
+  hovers at the gate and the table fills the rest.
+
+**What to send** when the seam is still wrong: the clip's name and recording
+mode (4K / 6K / 8K), the frame number or timecode of the moment, the Source
+Settings in use, the logs in `%LOCALAPPDATA%\OpenOSV\` (all `OpenOSV*.log`),
+a screenshot of the moment and, if you have it, DJI Studio's export of the
+same moment at the same view. A ten-second cut of the original `.OSV` and its
+`.LRF` around that moment lets the stitch be reproduced exactly.
+
+Known limits on a mount in 0.5.1: a near part that crosses the seam inside
+the mask's arc still steps with Hide Mount On (about 2.7 deg for the lower
+roof edge on the measured car's proxy, 0.8 deg for the upper); Off brings
+them to about 2.3 and 0.6 deg, and Auto keeps the mask there unless the
+clip shows which lens does not see the mount. What remains is the near
+part's own disparity along the seam and about half a degree across it,
+which the seam correction (columns moved along the seam only) cannot
+remove. A passing walker very close to the camera can double for a few
+frames after a refused moment.
