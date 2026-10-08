@@ -9,7 +9,8 @@
 //
 // Verified on the 6K clip: the 3000 px stream is the central 3776 px of the
 // 3840 px calibration frame scaled by 0.794492 (== 3000 / 3776).  Other modes
-// are derived from digital_focal_length and flagged as unverified.
+// are derived from digital_focal_length and flagged as unverified; without
+// it they fall back to the 3776 px crop prior instead of failing.
 #pragma once
 
 #include "osv/core/Math.h"
@@ -45,16 +46,26 @@ struct StreamScaling {
     /// Identity mapping for a stream that has the sensor's size.
     [[nodiscard]] static StreamScaling identity(int width, int height) noexcept;
 
-    /// Derive the mapping for a stream of streamW x streamH from a sensor of
-    /// sensorW x sensorH.  Rules, in order:
+    /// Derive the mapping for a stream of streamW x streamH (ONE lens image:
+    /// pass FormatInfo::lensW()/lensH(), never the LRF's whole track) from a
+    /// sensor of sensorW x sensorH.  Rules, in order:
     ///   * overrideScale set         -> used verbatim (flagged verified=false).
     ///   * same size                 -> 1.0.
     ///   * 3000 from 3840            -> kVerifiedCropScale6K (verified on the sample clip).
-    ///   * 1024 from 3840 (LRF half) -> 1024 / 3776, unverified.
+    ///   * 1024 from 3840 (LRF half) -> 1024 / 3840 when digitalFocalLength / calFxMean
+    ///                                  names an 8K-mode clip, else 1024 / 3776; unverified.
+    ///   * no usable focal lengths   -> the prior, streamW / 3776; unverified.
+    ///   * a proxy (digitalFocalLength names a lens >= 1.4x wider than this
+    ///     stream, as an LRF repeats its parent's value)
+    ///                               -> the scale that wider parent gets from these
+    ///                                  rules x streamW / parentW, never above
+    ///                                  streamW / 3000; unverified.
     ///   * otherwise                 -> digitalFocalLength / calFxMean, unverified.
-    /// Human readable explanations are appended to `notes` when non-null.
-    /// Fails on non-positive sizes, a non-positive override, or when the
-    /// fallback rule has no usable focal lengths.
+    /// Human readable explanations are appended to `notes` when non-null,
+    /// plus a log-only line when a full-size stream's digitalFocalLength is
+    /// more than 0.2 % off the Osmo 360 convention (0.2764537 x its width).
+    /// Fails only on non-positive sizes or a non-finite / non-positive
+    /// override: a clip without usable focal lengths opens on the prior.
     [[nodiscard]] static Result<StreamScaling> derive(int streamW, int streamH, int sensorW, int sensorH,
                                                       double digitalFocalLength, double calFxMean,
                                                       std::optional<double> overrideScale = std::nullopt,

@@ -130,6 +130,26 @@ All notable changes to OpenOSV are documented here. The format follows
 * The OpenFX generator's log records each instance's output bounds against
   its region of definition, the project's pixel aspect and field order, and
   the first single-field render of an interlaced project.
+* **A clip without a recorded focal length still opens.** A recording mode
+  no rule knows (4K, or anything new) needed the camera's
+  `digital_focal_length` to work out its scale, and without it the clip
+  refused to open. It now opens on the 3776 px crop every other rule assumes
+  when the file says nothing, and the log says the scale is unverified.
+* **A proxy never gets its parent's focal length.** An `.LRF` repeats the
+  focal length of the full-size clip it was recorded beside. On a sensor
+  other than the Osmo 360's 3840 px one, OpenOSV read that number as the
+  proxy's own and built a lens about 3.7x too long. A proxy now takes its
+  parent's scale, shrunk to its own width, capped so it can never claim to
+  show less than 3000 sensor pixels. Every measured mode keeps its scale:
+  8K 1.0, 8K LRF 0.2666667, 6K 0.794492, 6K LRF 0.2711864; renders of the
+  8K and 6K test clips are byte-identical.
+* The log notes a `digital_focal_length` more than 0.2 % off the Osmo 360
+  convention (0.2764537 x the clip's lens width). Log only: a camera or
+  firmware that writes something else shows up before its seam does.
+* osvtool `seam`: the alternatives table is built from the lens image, as
+  the main rig is. On an `.LRF` every alternative used to read -2; the
+  "no crop" row is now the lens width over the sensor width (0.78125 on 6K,
+  as before).
 
 ## [0.5.0] - 2026-10-07
 

@@ -32,6 +32,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace osv;
@@ -407,8 +408,14 @@ TEST_CASE("StreamScaling other rules and error handling", "[geom][scaling]") {
     REQUIRE(fourK.value().dstCx == 960.0);
     REQUIRE(fourK.value().srcCx == 1920.0);
 
-    // Fallback without focal lengths is an error, not a guess.
-    REQUIRE_FALSE(StreamScaling::derive(1920, 1920, 3840, 3840, 0.0, 0.0).ok());
+    // Fallback without focal lengths: the 3776 px crop prior, flagged
+    // unverified.  (This used to be an error, and a clip missing its
+    // digital_focal_length did not open at all; the next test case covers
+    // the prior in full.)
+    auto noFocal = StreamScaling::derive(1920, 1920, 3840, 3840, 0.0, 0.0);
+    REQUIRE(noFocal.ok());
+    REQUIRE_THAT(noFocal.value().scale, Catch::Matchers::WithinAbs(1920.0 / 3776.0, 1e-12));
+    REQUIRE_FALSE(noFocal.value().verified);
     // Override wins and is flagged.
     auto forced = StreamScaling::derive(3000, 3000, 3840, 3840, kDigitalFocal, 1043.445, 0.8);
     REQUIRE(forced.ok());
@@ -428,6 +435,192 @@ TEST_CASE("StreamScaling other rules and error handling", "[geom][scaling]") {
     zero.scale = 0.0;
     const Vec2d inv = zero.applyInverse(Vec2d{10.0, 10.0});
     REQUIRE(inv.x == zero.srcCx);
+}
+
+namespace {
+
+/// digital_focal_length as the Osmo 360 writes it: 0.2764537 x the full-size
+/// clip's lens width.  The two values below are the float32 numbers of the
+/// 6K and 8K clips (829.3612 = x3000, 1061.5823 = x3840).
+constexpr double kDfl6K = 829.3612060546875;
+constexpr double kDfl8K = 1061.582275390625;
+/// The same convention for a 1920 px (4K) lens.
+constexpr double kDfl4K = kDfl6K / 3000.0 * 1920.0;
+
+/// True when any note contains `needle`.
+bool anyNoteHas(const std::vector<std::string>& notes, const char* needle) {
+    for (const std::string& n : notes) {
+        if (n.find(needle) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST_CASE("StreamScaling: a clip without usable focal lengths opens on the 3776 px prior", "[geom][scaling]") {
+    // The 4K case (1920 px per lens): no rule keys on its size, so it used to
+    // need digital_focal_length / fx and failed without it.
+    std::vector<std::string> notes;
+    auto s = StreamScaling::derive(1920, 1920, 3840, 3840, 0.0, 0.0, std::nullopt, &notes);
+    REQUIRE(s.ok());
+    REQUIRE_THAT(s.value().scale, Catch::Matchers::WithinAbs(1920.0 / 3776.0, 1e-12));
+    REQUIRE_FALSE(s.value().verified);
+    // Centred as every other rule: sensor centre -> stream centre.
+    REQUIRE(s.value().dstCx == 960.0);
+    REQUIRE(s.value().srcCx == 1920.0);
+    // One note, saying it is the unverified prior and why.
+    REQUIRE(notes.size() == 1);
+    REQUIRE(notes[0].find("prior") != std::string::npos);
+    REQUIRE(notes[0].find("unverified") != std::string::npos);
+
+    // Either focal alone is not enough, and garbage never reaches the scale.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    const std::pair<double, double> unusable[] = {
+        {0.0, 1043.445}, {kDfl4K, 0.0}, {nan, 1043.445}, {kDfl4K, nan}, {inf, 1043.445},
+        {kDfl4K, inf},   {-5.0, 1043.445}, {kDfl4K, -1.0},
+    };
+    for (const auto& [dfl, fx] : unusable) {
+        INFO("dfl " << dfl << " fx " << fx);
+        auto prior = StreamScaling::derive(1920, 1920, 3840, 3840, dfl, fx);
+        REQUIRE(prior.ok());
+        REQUIRE_THAT(prior.value().scale, Catch::Matchers::WithinAbs(1920.0 / 3776.0, 1e-12));
+        REQUIRE_FALSE(prior.value().verified);
+    }
+
+    // On a sensor narrower than the 3776 px crop, the prior is the whole
+    // sensor instead: never a crop wider than the sensor it is cut from.
+    auto narrow = StreamScaling::derive(1000, 1000, 2000, 2000, 0.0, 0.0);
+    REQUIRE(narrow.ok());
+    REQUIRE_THAT(narrow.value().scale, Catch::Matchers::WithinAbs(0.5, 1e-12));
+
+    // Sizes are still validated first: no prior rescues a zero stream.
+    REQUIRE_FALSE(StreamScaling::derive(0, 1920, 3840, 3840, 0.0, 0.0).ok());
+    REQUIRE_FALSE(StreamScaling::derive(1920, 1920, 0, 3840, 0.0, 0.0).ok());
+}
+
+TEST_CASE("StreamScaling: a proxy never takes its parent's focal", "[geom][scaling]") {
+    // An LRF half from a sensor that is not 3840 px wide misses Rule 3 (keyed
+    // on the Osmo 360's sensor).  It used to fall to digital_focal_length /
+    // fx - the PARENT's scale, ~1.02 for an 8K parent - and so built a lens
+    // ~3.7x too long on a 1024 px image.
+    const double fxs[] = {1033.4852, 1040.6721, 1043.445, 1047.9333, 1087.0};
+    const double dfls[] = {kDfl8K, kDfl6K, kDfl4K, 0.0, std::numeric_limits<double>::quiet_NaN(), 1.0e9, -5.0,
+                           kDfl6K / 3000.0 * 4000.0};
+    for (const double fx : fxs) {
+        for (const double dfl : dfls) {
+            INFO("fx " << fx << " dfl " << dfl);
+            auto s = StreamScaling::derive(1024, 1024, 4000, 4000, dfl, fx);
+            REQUIRE(s.ok());
+            REQUIRE(std::isfinite(s.value().scale));
+            REQUIRE(s.value().scale > 0.0);
+            REQUIRE(s.value().scale <= 0.3);
+            REQUIRE_FALSE(s.value().verified);
+            REQUIRE(s.value().dstCx == 512.0);
+            REQUIRE(s.value().srcCx == 2000.0);
+        }
+    }
+
+    // The exact value: the proxy takes the scale its 3840 px parent gets
+    // (digital_focal_length / fx on this sensor), shrunk by 1024 / 3840.
+    std::vector<std::string> notes;
+    auto lrf8k = StreamScaling::derive(1024, 1024, 4000, 4000, kDfl8K, 1040.6721, std::nullopt, &notes);
+    REQUIRE(lrf8k.ok());
+    REQUIRE_THAT(lrf8k.value().scale, Catch::Matchers::WithinAbs(kDfl8K / 1040.6721 * 1024.0 / 3840.0, 1e-12));
+    REQUIRE(notes.size() == 1);
+    REQUIRE(notes[0].find("proxy") != std::string::npos);
+    REQUIRE(notes[0].find("3840x3840") != std::string::npos);
+    // A parent that is the whole sensor maps the proxy as the whole sensor.
+    auto fullSensor = StreamScaling::derive(1024, 1024, 4000, 4000, kDfl6K / 3000.0 * 4000.0, 1087.0);
+    REQUIRE(fullSensor.ok());
+    REQUIRE_THAT(fullSensor.value().scale, Catch::Matchers::WithinAbs(1024.0 / 4000.0, 1e-12));
+
+    // A garbage calibration focal cannot push a proxy past 1024 / 3000.
+    std::vector<std::string> cappedNotes;
+    auto capped = StreamScaling::derive(1024, 1024, 4000, 4000, kDfl8K, 100.0, std::nullopt, &cappedNotes);
+    REQUIRE(capped.ok());
+    REQUIRE_THAT(capped.value().scale, Catch::Matchers::WithinAbs(1024.0 / 3000.0, 1e-12));
+    REQUIRE(anyNoteHas(cappedNotes, "capped"));
+
+    // On the Osmo 360's own sensor a proxy of another size inherits the
+    // verified rules of its parent: the 8K frame at 1:1, the 6K crop.
+    auto half8k = StreamScaling::derive(960, 960, 3840, 3840, kDfl8K, 1040.6721);
+    REQUIRE(half8k.ok());
+    REQUIRE_THAT(half8k.value().scale, Catch::Matchers::WithinAbs(960.0 / 3840.0, 1e-12));
+    auto half6k = StreamScaling::derive(960, 960, 3840, 3840, kDfl6K, 1043.445);
+    REQUIRE(half6k.ok());
+    REQUIRE_THAT(half6k.value().scale,
+                 Catch::Matchers::WithinAbs(StreamScaling::kVerifiedCropScale6K * 960.0 / 3000.0, 1e-12));
+    REQUIRE_FALSE(half6k.value().verified);
+}
+
+TEST_CASE("StreamScaling: the measured modes keep their scales", "[geom][scaling]") {
+    // 8K OSV / 8K LRF (the reporter's camera) and 6K OSV / 6K LRF (the
+    // sample): the four scales every render of those clips is built on.
+    // Each digital_focal_length follows the convention, so no rule adds a
+    // second note.
+    constexpr double kFx8K = 0.5 * (1033.4852 + 1047.9333);
+    constexpr double kFx6K = 1043.445;
+    struct Mode {
+        const char* name;
+        int lensW;
+        double dfl;
+        double fx;
+        double scale;
+    };
+    const Mode modes[] = {
+        {"8K OSV", 3840, kDfl8K, kFx8K, 1.0},
+        {"8K LRF", 1024, kDfl8K, kFx8K, 1024.0 / 3840.0},
+        {"6K OSV", 3000, kDfl6K, kFx6K, StreamScaling::kVerifiedCropScale6K},
+        {"6K LRF", 1024, kDfl6K, kFx6K, 1024.0 / 3776.0},
+    };
+    for (const Mode& m : modes) {
+        INFO(m.name);
+        std::vector<std::string> notes;
+        auto s = StreamScaling::derive(m.lensW, m.lensW, 3840, 3840, m.dfl, m.fx, std::nullopt, &notes);
+        REQUIRE(s.ok());
+        REQUIRE(s.value().scale == m.scale);
+        REQUIRE(notes.size() == 1);
+        REQUIRE_FALSE(anyNoteHas(notes, "convention"));
+    }
+    // The brief's rounded figures, for the record.
+    REQUIRE_THAT(1024.0 / 3840.0, Catch::Matchers::WithinAbs(0.2666667, 1e-7));
+    REQUIRE_THAT(1024.0 / 3776.0, Catch::Matchers::WithinAbs(0.2711864, 1e-7));
+
+    // 4K keeps Rule 4 exactly (digital_focal_length / fx), unchanged.
+    auto fourK = StreamScaling::derive(1920, 1920, 3840, 3840, kDfl4K, kFx6K);
+    REQUIRE(fourK.ok());
+    REQUIRE(fourK.value().scale == kDfl4K / kFx6K);
+}
+
+TEST_CASE("StreamScaling: a digital_focal_length off the Osmo 360 convention is logged, never used differently",
+          "[geom][scaling]") {
+    // 520 px on a 1920 px stream is 2 % off 0.2764537 x 1920 = 530.79.  The
+    // scale is still the ratio (Rule 4 unchanged); one extra note says so.
+    std::vector<std::string> notes;
+    auto s = StreamScaling::derive(1920, 1920, 3840, 3840, 520.0, 1040.0, std::nullopt, &notes);
+    REQUIRE(s.ok());
+    REQUIRE_THAT(s.value().scale, Catch::Matchers::WithinAbs(0.5, 1e-12));
+    REQUIRE(notes.size() == 2);
+    REQUIRE(notes[1].find("does not follow the Osmo 360 convention") != std::string::npos);
+
+    // The same check on the full-frame and 6K rules: logged, scale untouched.
+    std::vector<std::string> notes8k;
+    auto full = StreamScaling::derive(3840, 3840, 3840, 3840, kDfl8K * 1.01, 1040.0, std::nullopt, &notes8k);
+    REQUIRE(full.ok());
+    REQUIRE(full.value().scale == 1.0);
+    REQUIRE(anyNoteHas(notes8k, "does not follow"));
+    std::vector<std::string> notes6k;
+    auto sixK = StreamScaling::derive(3000, 3000, 3840, 3840, kDfl6K * 0.99, 1043.445, std::nullopt, &notes6k);
+    REQUIRE(sixK.ok());
+    REQUIRE(sixK.value().scale == StreamScaling::kVerifiedCropScale6K);
+    REQUIRE(anyNoteHas(notes6k, "does not follow"));
+    // Within 0.2 % stays quiet.
+    std::vector<std::string> quiet;
+    REQUIRE(StreamScaling::derive(3840, 3840, 3840, 3840, kDfl8K * 1.0015, 1040.0, std::nullopt, &quiet).ok());
+    REQUIRE_FALSE(anyNoteHas(quiet, "does not follow"));
 }
 
 // -----------------------------------------------------------------------------

@@ -269,10 +269,24 @@ RegionScore scoreRegion(const render::LensBands& b, int c0, int c1) {
 }
 
 /// Rebuild the rig with a different scale / extrinsic sense for comparison.
+///
+/// The rig describes ONE lens image, so it is derived from lensW()/lensH(),
+/// exactly as Pipeline.cpp builds the main rig.  The track size is wrong for
+/// an LRF: its single 2048 x 1024 side-by-side track matches no rule, fell
+/// through to digital_focal_length / fx (the 6K or 8K parent's scale on a
+/// 1024 px half), and built a rig 2048 px wide that the 1024 px halves the
+/// reader delivers never matched - every alternative scored -2.
+///
+/// @param P              The opened pipeline (format, calibration, main rig).
+/// @param scaleOverride  Sensor -> lens-image scale to force, or nullopt for
+///                       the clip's own rule.
+/// @param sense          Extrinsic rotation sense to build with.
+/// @param order          Quaternion component order to build with.
+/// @return The rebuilt rig, or the error StreamScaling / LensRig reported.
 Result<geom::LensRig> variantRig(const Pipeline& P, std::optional<double> scaleOverride, geom::RotationSense sense,
                                  geom::QuatOrder order) {
     OSV_TRY_ASSIGN(geom::StreamScaling scaling,
-                   geom::StreamScaling::derive(static_cast<int>(P.format.streamW), static_cast<int>(P.format.streamH),
+                   geom::StreamScaling::derive(static_cast<int>(P.format.lensW()), static_cast<int>(P.format.lensH()),
                                                static_cast<int>(P.format.sensorW), static_cast<int>(P.format.sensorH),
                                                P.format.digitalFocalLength,
                                                0.5 * (P.calibration.slave.fx + P.calibration.master.fx), scaleOverride));
@@ -444,8 +458,19 @@ int runSeam(const SeamOptions& o) {
         geom::RotationSense sense;
         geom::QuatOrder order;
     };
+    // "No crop": the lens image shows the whole sensor width.  Relative to
+    // the lens image, like variantRig itself: 3000 / 3840 = 0.78125 on the
+    // 6K clip (the value this row always had), 1024 / 3840 on an LRF half,
+    // 1.0 on an 8K stream.  A fixed 0.78125 on a 1024 px half put the whole
+    // overlap off the image.  A clip without a sensor size gets 0, which
+    // StreamScaling refuses, so its row reads -2 instead of a made-up scale.
+    const double noCropScale = P.format.sensorW > 0 ? static_cast<double>(P.format.lensW()) /
+                                                          static_cast<double>(P.format.sensorW)
+                                                    : 0.0;
+    char noCropName[64] = {};
+    std::snprintf(noCropName, sizeof(noCropName), "scale %.5f (no crop)", noCropScale);
     const Variant variants[] = {
-        {"scale 0.78125 (no crop)", 3000.0 / 3840.0, geom::RotationSense::BodyToLens, geom::QuatOrder::WXYZ},
+        {noCropName, noCropScale, geom::RotationSense::BodyToLens, geom::QuatOrder::WXYZ},
         {"extrinsic lens2body", std::nullopt, geom::RotationSense::LensToBody, geom::QuatOrder::WXYZ},
         {"extrinsic xyzw", std::nullopt, geom::RotationSense::BodyToLens, geom::QuatOrder::XYZW},
     };
