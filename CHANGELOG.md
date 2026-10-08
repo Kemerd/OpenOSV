@@ -15,11 +15,14 @@ All notable changes to OpenOSV are documented here. The format follows
   CPU and on CUDA) could not reach the 14 px (2.4°) offset a roof rail shows
   along the seam, so an accepted correction left the rails doubled. It now
   searches along the seam direction before it refines, and only moves where
-  the match is unambiguous. Measured on the car-mounted day clip, the car body
-  goes from 0.84-0.87 to 0.93-0.97 overlap NCC and the whole seam band from
-  0.967-0.987 to 0.987-0.994; the night clip's seam band and the 6K sample
-  hold or improve (sample OSV frame 60: 0.917 to 0.920). The flow solve is also faster: ~45 ms
-  per bucket on four CPU threads, down from ~70.
+  the match is unambiguous. Measured on the car-mounted day clip with the
+  correction applied, the car body goes from 0.84-0.87 to 0.93-0.97 overlap
+  NCC and the whole seam band from 0.967-0.987 to 0.987-0.994; the night
+  clip's seam band and the 6K sample hold or improve (sample OSV frame 60:
+  0.917 to 0.920). The flow solve costs about 10 ms more per bucket on four
+  CPU threads (~35 to ~44 ms).
+
+## [0.5.0] - 2026-10-07
 
 8K and night footage, fixed at the cause. Built on a user's car-mounted 8K
 clips, a sunset drive and a night drive, which DJI Studio stitched cleanly

@@ -280,7 +280,7 @@ __global__ void disGradientKernel(DisPair img, DisPairW gx, DisPairW gy, int w, 
 /// accumulated in double, row by row, exactly as the CPU does it; the
 /// epipolar-search flag is taken from its raw trace, the Tikhonov term is
 /// added the same way, and the singularity test is the same RAW determinant
-/// against DJI's floor.
+/// against the same floor (DisFlowParams::minTensorDet).
 __global__ void disTensorKernel(DisPair gx, DisPair gy, int w, int h, DisGrid grid, DisTensorConsts c,
                                 DisPatchPair patches) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -337,7 +337,7 @@ __global__ void disTensorKernel(DisPair gx, DisPair gy, int w, int h, DisGrid gr
         hxx += eps;
         hyy += eps;
     }
-    // DJI's raw-determinant invertibility test (see DisFlowParams), on the
+    // The raw-determinant invertibility test (see DisFlowParams), on the
     // tensor actually inverted.
     const double det = hxx * hyy - hxy * hxy;
     if (det > c.minTensorDet) {

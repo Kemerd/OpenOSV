@@ -73,7 +73,15 @@
 //      repeated bars from luring a patch one period off.  The bracket was
 //      added after measuring the night car-mounted clip: a diamond-plate
 //      body panel there drew patches to the END of the range, a whole
-//      pattern period off, and passed the ratio test doing it.  The
+//      pattern period off, and passed the ratio test doing it.
+//
+//      The search keeps the seed's u, so on a slanted edge it can trade a
+//      cross-meridian error du for a v error of (hxy / hyy) * du - the
+//      aperture problem.  Skipping the search where |hxy| > 2 * hyy was
+//      measured and NOT adopted: it repairs one night-clip pole (a 64-column
+//      window back from 0.14 to 0.34 NCC) but costs the day clip's car body
+//      0.02 (frame 0: 0.963 to 0.942), because there the epipolar prior
+//      u = seed is right and the slanted body edges need the search.  The
 //      restricted search follows Jump's stereo stitcher (Anderson et al.,
 //      "Jump: Virtual Reality Video", SIGGRAPH Asia 2016); the ratio test
 //      is Lowe's ("Distinctive Image Features from Scale-Invariant
@@ -229,9 +237,10 @@ struct DisFlowParams {
     double consistencyTolPx = 1.5;
 
     // ---- Near-field additions (see "WHERE THIS DEPARTS FROM THE PAPER") ----
-    // None of these is a DJI constant.  Each was chosen on the car-mounted
-    // day and night clips and the 6K sample, measured as the overlap NCC the
-    // kernel renders with the resulting grid; 0 / false turns each one off.
+    // None of these comes from the reference stitcher.  Each was chosen on
+    // the car-mounted day and night clips and the 6K sample, measured as the
+    // overlap NCC the kernel renders with the resulting grid; 0 / false turns
+    // each one off.
 
     /// Tikhonov term added to both diagonal entries of every patch's
     /// structure tensor before it is inverted, as a fraction of the tensor's

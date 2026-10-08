@@ -118,7 +118,7 @@ struct DisPatch {
 /// The constants of the structure-tensor stage, pre-converted on the host
 /// exactly as DisFlow.cpp precomputeTensors converts them.
 struct DisTensorConsts {
-    double minTensorDet = 0.001;      ///< params.minTensorDet: DJI's raw-determinant floor.
+    double minTensorDet = 0.001;      ///< params.minTensorDet: the raw-determinant floor.
     double tikhonov = 0.1;            ///< params.tensorTikhonov, or 0 when not positive and finite.
     double epipolarMinTrace = 64.0;   ///< params.epipolarMinTracePerPx * double(ps) * ps.
 };
