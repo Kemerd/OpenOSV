@@ -2585,14 +2585,20 @@ lines):
   N ms` - the Auto verdict, cached in `hide-mount.tsv` beside it. At Debug a
   line per 16-column window gives its agreement and which lens was kept.
 * `steady: 'clip': clip correction ready N ms after the first request (...;
-  9 sample frames ..., K grids accepted; ...): grid yes|no, seam table
-  yes|no, seam yes|no; Auto: ...` - the per-clip correction and the Auto
-  verdict (`follows scene` means each moment is measured on its own).
+  9 sample frames ..., K grids accepted; ...): grid yes (N of 256 columns
+  to the seam table)|no, seam table yes|no, seam yes|no; Auto: ...` - the
+  per-clip correction and the Auto verdict (`follows scene` means each
+  moment is measured on its own). The column count is how much of the
+  grid the seam table took over where the flow could not measure the seam
+  and the table was sure of it: a car hood typically hands over 10-20
+  columns, the 6K sample none.
 * `frame N (bucket B, anchor A) of 'clip': parallax accepted ... structured
   x% ... strength s` or `parallax refused ...` - each moment's 2-D
   correction. A refusal is normal on sky and fog: the seam table carries
   those moments. Many accepted lines at a strength below 1.00 mean the share
-  hovers at the gate and the table fills the rest.
+  hovers at the gate and the table fills the rest. The Debug line `the seam
+  table under the parallax grid takes N of 256 grid columns` that follows an
+  accepted moment is the same hand-over, per moment.
 
 **What to send** when the seam is still wrong: the clip's name and recording
 mode (4K / 6K / 8K), the frame number or timecode of the moment, the Source

@@ -6,6 +6,8 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-07
+
 Premiere on a car mount, fixed at the cause. Built on the same two 8K car
 drives as 0.5.0, this time against what Premiere Pro actually renders: the
 classical flow and the seam-shift table, not osvtool's neural default.
