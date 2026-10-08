@@ -417,6 +417,10 @@ int runSeam(const SeamOptions& o) {
                 sj["structuredFraction"] = c.grid->structuredFraction();
             }
             sj["seamTable"] = c.seamTable != nullptr;
+            // The table share under the clip grid and the columns the
+            // per-column guard handed to it (render::guardGridWithTable).
+            sj["gridTable"] = c.gridTable != nullptr && !c.gridTable->empty();
+            sj["guardedColumns"] = c.guardedColumns;
             sj["seam"] = c.seam != nullptr;
             sj["decision"] = {{"steady", c.decision.steady},
                               {"textured", c.decision.textured},
@@ -492,8 +496,10 @@ int runSeam(const SeamOptions& o) {
     }
     out["alternatives"] = alt;
 
-    // The seam table, kept for the band dump and the parallax measurement.
+    // The seam table, kept for the band dump and the parallax measurement,
+    // with its per-column confidence for the per-column guard.
     std::vector<float> seamHold;
+    std::vector<float> seamConfHold;
     if (o.search) {
         render::SeamSearchParams sp;
         auto profile = render::searchSeam(P.rig, pair.value(), P.blendParams, sp, *P.pool);
@@ -519,6 +525,7 @@ int runSeam(const SeamOptions& o) {
                 out["nccAfterSearch"] = after.value();
             }
             seamHold = p.shiftDeg;
+            seamConfHold = p.confidence;
         } else {
             out["searchError"] = profile.error().message;  // no "search" block: nothing was measured
         }
@@ -675,6 +682,16 @@ int runSeam(const SeamOptions& o) {
                 if (held.ok()) {
                     pj["nccAfterSteady"] = held.value();
                 }
+                // The clip correction exactly as the importer renders it: the
+                // clip grid (after the per-column guard) and the clip table
+                // share under it (ClipSteady::gridTable), not this frame's table.
+                const std::vector<float>* clipShare =
+                    (steady->gridTable && !steady->gridTable->empty()) ? steady->gridTable.get() : nullptr;
+                auto asRendered =
+                    render::overlapNcc(P.rig, pair.value(), P.blendParams, band, *P.pool, clipShare, &steadyView);
+                if (asRendered.ok()) {
+                    pj["nccAfterClip"] = asRendered.value();
+                }
             }
             // [WP-STEADY] --regions: every named window uncorrected, with this
             // frame's grid and (with --steady) with the clip grid, each
@@ -718,6 +735,76 @@ int runSeam(const SeamOptions& o) {
         }
         if (regionAsked) {
             pj["region"] = rj;
+        }
+
+        // ---- the importer's policy: the grid on RAW bands, guarded by the table -------
+        // With --search the grid above is measured on table-corrected bands
+        // (the two composed), which is NOT what the plug-ins render: they
+        // measure the grid on the uncorrected bands, let it replace the table,
+        // and hand back to the table only the columns the grid could not
+        // measure, where the table is sure and found a disparity the grid
+        // missed (render::guardGridWithTable).  So the shipped picture is
+        // measured here as well, through the same calls, and scored on the
+        // same band and window as the rest.
+        if (seamIn != nullptr) {
+            nlohmann::json gj;
+            auto raw = [&]() -> Result<render::ParallaxWarpGrid> {
+                OSV_TRY_ASSIGN(render::LensBands bands, render::measureParallaxBands(P.rig, pair.value(),
+                                                                                    P.blendParams, pw, nullptr,
+                                                                                    *P.pool));
+                return render::parallaxFromBands(bands, pw, P.pool.get());
+            }();
+            if (raw.ok()) {
+                const render::ParallaxWarpGrid& rg = raw.value();
+                auto guarded = render::guardGridWithTable(rg, seamHold, seamConfHold);
+                if (guarded.ok()) {
+                    const render::GuardedCorrection& gc = guarded.value();
+                    // The guarded grid when the guard took columns, else the
+                    // measured one, exactly as the importer renders.
+                    const render::ParallaxWarpGrid& shown = gc.changed ? gc.grid : rg;
+                    render::WarpGridView gv;
+                    gv.uv = shown.uv.data();
+                    gv.w = shown.w;
+                    gv.h = shown.h;
+                    gv.latMinRad = shown.latMinRad;
+                    gv.latMaxRad = shown.latMaxRad;
+                    // An empty share renders no table at all, as the importer does.
+                    const std::vector<float>* share = gc.table.empty() ? nullptr : &gc.table;
+                    gj["strength"] = rg.strength;
+                    gj["guardedColumns"] = gc.guardedColumns;
+                    gj["meanGuard"] = gc.meanGuard;
+                    gj["changed"] = gc.changed;
+                    // Per grid column: what the guard weighed, what it decided
+                    // and the grid's own along-meridian correction (as a table
+                    // value, degrees).
+                    gj["untrustedShare"] = rg.untrustedShare;
+                    gj["guard"] = gc.guard;
+                    gj["gridAlongDeg"] = gc.gridAlongDeg;
+                    auto after = render::overlapNcc(P.rig, pair.value(), P.blendParams, band, *P.pool, share, &gv);
+                    if (after.ok()) {
+                        gj["nccAfter"] = after.value();
+                    }
+                    if (regionAsked) {
+                        auto bands =
+                            render::renderLensBands(P.rig, pair.value(), P.blendParams, band, false, share, *P.pool,
+                                                    &gv);
+                        if (bands.ok()) {
+                            const RegionScore s = scoreRegion(bands.value(), rc0, rc1);
+                            gj["region"] = {{"ncc", s.ncc}, {"meanAbsDiff", s.meanAbsDiff}, {"samples", s.samples}};
+                        }
+                    }
+                } else {
+                    gj["error"] = guarded.error().message;
+                }
+            } else {
+                // Refused on the raw bands: the importer renders the table alone.
+                gj["refused"] = raw.error().message;
+                gj["nccAfter"] = out.value("nccAfterSearch", -1.0);
+                if (regionAsked && rj.contains("seam")) {
+                    gj["region"] = rj["seam"];
+                }
+            }
+            pj["guarded"] = gj;
         }
         out["parallax"] = pj;
     }

@@ -862,11 +862,16 @@ private:
         /// Part of it comes from the stand-in lane (measured on a frame other
         /// than the anchor): an Interactive frame that renders it is not final.
         bool standIn = false;
-        std::shared_ptr<const render::ParallaxWarpGrid> grid;  ///< Accepted grid; null when refused / off.
-        /// The bucket's seam table where it has no grid, and the share a
-        /// partly trusted grid leaves (render::seamTableUnderGrid, 1 - its
-        /// strength) under one; empty under a fully trusted grid or when
-        /// there is none.  A copy (~8 KB), so a cache trim can never pull it
+        /// Accepted grid; null when refused / off.  With Seam Search on it is
+        /// the grid after the per-column guard (render::guardGridWithTable):
+        /// the columns it could not measure, where the bucket's table is sure
+        /// and found a disparity the grid missed, are given up to the table.
+        std::shared_ptr<const render::ParallaxWarpGrid> grid;
+        /// The bucket's seam table where it has no grid; under an accepted
+        /// grid the share that renders with it (render::guardGridWithTable:
+        /// 1 - its strength, plus the columns the guard handed over) - empty
+        /// under a fully trusted grid that guarded no column, or when there
+        /// is no table.  A copy (~8 KB), so a cache trim can never pull it
         /// from under the render.
         std::vector<float> table;
         /// Per-column confidence of `table` (SeamProfile::confidence, same
@@ -896,9 +901,14 @@ private:
 
     /// Measure (as `how` allows) and return bucket `bucket`'s correction for
     /// frame `index`'s render: the grid on the anchor, and the seam table
-    /// where the grid is refused or off.  With Now and an anchor that cannot
-    /// be decoded, the bucket of the frame itself (`bucket` holding `index`)
-    /// is measured on `pair` instead, so it never loses its correction.
+    /// where the grid is refused or off - and, under an accepted grid, the
+    /// table measured too, so the per-column guard can hand it the columns
+    /// the grid could not measure.  A fully trusted grid
+    /// whose table is not known yet (an Interactive glide partner) is
+    /// returned alone and marked a stand-in, so the frame is not final.
+    /// With Now and an anchor that cannot be decoded, the bucket of the
+    /// frame itself (`bucket` holding `index`) is measured on `pair`
+    /// instead, so it never loses its correction.
     /// Caller holds m_mutex.
     [[nodiscard]] BucketCorrection bucketCorrectionLocked(std::uint32_t bucket, std::uint32_t index,
                                                           const video::FramePair& pair, bool wantParallax,

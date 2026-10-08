@@ -32,6 +32,12 @@
 //     otherwise applied at a strength that scales it uniformly - with the
 //     seam table's share under a partly trusted grid, and a fully trusted
 //     grid left exactly as it was.
+//
+//   * THE PER-COLUMN GUARD.  Where the grid could not measure a column (its
+//     cells unmeasured or gated), the seam table is sure of it and found a
+//     disparity the grid misses, the table takes the column over; the grid's
+//     along-meridian correction is compared in the table's own units and
+//     sign, checked through the real rig; nothing changes anywhere else.
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -1302,6 +1308,466 @@ TEST_CASE("a clip grid carries the median of its samples' strengths and their su
         auto m = render::clipParallaxGrid({&a, &b, &c});
         REQUIRE(m.ok());
         CHECK(m.value().strength == 0.5);
+    }
+}
+
+// ===========================================================================
+//  The per-column guard: the seam table where the grid measured nothing
+// ===========================================================================
+
+namespace {
+
+/// A hand-built accepted grid of `w` columns and `h` rows, every cell
+/// (dLon, dLat) = (0.01, 0.02) rad, with the given untrusted share per column
+/// and strength - the shape gridFromFlow and parallaxFromBands hand out.
+render::ParallaxWarpGrid guardTestGrid(std::uint32_t w, std::uint32_t h, std::vector<float> untrusted,
+                                       double strength = 1.0) {
+    render::ParallaxWarpGrid g;
+    g.w = w;
+    g.h = h;
+    g.latMinRad = 0.15f;
+    g.latMaxRad = -0.15f;
+    g.uv.resize(static_cast<std::size_t>(w) * h * 2u);
+    for (std::size_t k = 0; k < g.uv.size(); k += 2) {
+        g.uv[k] = 0.01f;
+        g.uv[k + 1] = 0.02f;
+    }
+    g.untrustedShare = std::move(untrusted);
+    g.strength = strength;
+    return g;
+}
+
+/// The guard weight at table column `i` of an `n`-column table, interpolated
+/// between grid columns exactly as the kernel's bilinear grid fetch does.
+double guardAtTableColumn(const std::vector<float>& guard, std::size_t i, std::size_t n) {
+    const std::size_t w = guard.size();
+    const double fx = (static_cast<double>(i) + 0.5) * static_cast<double>(w) / static_cast<double>(n);
+    const double fl = std::floor(fx);
+    const std::size_t c0 = static_cast<std::size_t>(fl) % w;
+    const std::size_t c1 = (c0 + 1) % w;
+    return guard[c0] + (guard[c1] - guard[c0]) * (fx - fl);
+}
+
+}  // namespace
+
+TEST_CASE("gridFromFlow records each column's untrusted share: no consistent flow, or gated off",
+          "[render][parallax][guard]") {
+    constexpr std::uint32_t W = 512, H = 40, mapH = 256;
+    const auto a = [](std::uint32_t x, std::uint32_t y) { return bandTexture(x, y, W); };
+    render::ParallaxWarpParams p;
+    p.gridW = 64;  // 8 band columns per grid column
+    p.gridRows = 8;
+    p.decayRows = 4;
+
+    SECTION("unmeasured: the columns whose flow failed the check are untrusted, the rest are not") {
+        render::BidirFlow flow = uniformFlow(W, H, 0.0f, 0.0f);
+        // Band columns 0..127 fail the forward-backward check: grid columns
+        // 0..16 (by the rounding gridFromFlow accumulates with) get nothing.
+        for (std::uint32_t y = 0; y < H; ++y) {
+            for (std::uint32_t x = 0; x < 128; ++x) {
+                flow.ok[static_cast<std::size_t>(y) * W + x] = 0u;
+            }
+        }
+        p.requiredImprovement = 0.0;  // no gate: only the unmeasured cells count
+        auto grid = render::gridFromFlow(makeBands(W, H, mapH, a, a), flow, p);
+        REQUIRE(grid.ok());
+        const render::ParallaxWarpGrid& g = grid.value();
+        REQUIRE(g.untrustedShare.size() == g.w);
+        for (std::uint32_t gc = 2; gc <= 14; ++gc) {
+            CHECK(g.untrustedShare[gc] == 1.0f);
+        }
+        for (std::uint32_t gc = 20; gc < 60; ++gc) {
+            CHECK(g.untrustedShare[gc] == 0.0f);
+        }
+    }
+    SECTION("gated: content the flow does not explain leaves most columns untrusted, content it does none") {
+        constexpr float fu = 2.0f, fv = -3.0f;
+        const auto bTrue = [](std::uint32_t x, std::uint32_t y) {
+            return bandTexture(static_cast<double>(x) - fu, static_cast<double>(y) - fv, W);
+        };
+        // The benefit gate test's unrelated master (hashed noise).
+        const auto bOther = [](std::uint32_t x, std::uint32_t y) {
+            std::uint32_t hsh = x * 73856093u ^ y * 19349663u ^ 0x9E3779B9u;
+            hsh ^= hsh >> 13;
+            hsh *= 0x5bd1e995u;
+            hsh ^= hsh >> 15;
+            return 0.2 + 0.6 * static_cast<double>(hsh & 0xFFFFu) / 65535.0;
+        };
+        const render::BidirFlow flow = uniformFlow(W, H, fu, fv);
+        p.requiredImprovement = 0.2;
+        auto kept = render::gridFromFlow(makeBands(W, H, mapH, a, bTrue), flow, p);
+        REQUIRE(kept.ok());
+        REQUIRE(kept.value().untrustedShare.size() == kept.value().w);
+        for (const float u : kept.value().untrustedShare) {
+            CHECK(u == 0.0f);
+        }
+        auto gated = render::gridFromFlow(makeBands(W, H, mapH, a, bOther), flow, p);
+        REQUIRE(gated.ok());
+        double sum = 0.0;
+        for (const float u : gated.value().untrustedShare) {
+            CHECK(u >= 0.0f);
+            CHECK(u <= 1.0f);
+            sum += u;
+        }
+        // Every untrusted cell is a gated one here (all were measured).
+        const double mean = sum / static_cast<double>(gated.value().w);
+        CHECK(mean == Catch::Approx(static_cast<double>(gated.value().gatedCells) /
+                                    static_cast<double>(gated.value().w * p.gridRows)));
+        CHECK(mean > 0.5);
+    }
+}
+
+TEST_CASE("the per-column guard hands a column the grid could not measure to a sure table that disagrees",
+          "[render][parallax][guard]") {
+    constexpr std::uint32_t W = 32, H = 12;
+    constexpr std::size_t N = 256;  // 8 table columns per grid column
+    // Grid columns 10..17 are untrusted; the table is sure of every column
+    // and measured +2 deg, which the grid (no along-meridian correction at
+    // all, dLat = 0) does not apply.
+    std::vector<float> untrusted(W, 0.0f);
+    for (std::uint32_t gc = 10; gc <= 17; ++gc) {
+        untrusted[gc] = 1.0f;
+    }
+    const std::vector<float> table(N, 2.0f);
+    const std::vector<float> sure(N, 1.0f);
+
+    for (const double s : {1.0, 0.5}) {
+        DYNAMIC_SECTION("strength " << s) {
+            render::ParallaxWarpGrid grid = guardTestGrid(W, H, untrusted, s);
+            for (std::size_t k = 1; k < grid.uv.size(); k += 2) {
+                grid.uv[k] = 0.0f;  // dLat: the grid corrects nothing along the meridian
+            }
+            auto guarded = render::guardGridWithTable(grid, table, sure);
+            REQUIRE(guarded.ok());
+            const render::GuardedCorrection& out = guarded.value();
+            REQUIRE(out.changed);
+            REQUIRE(out.guard.size() == W);
+            REQUIRE(out.gridAlongDeg.size() == W);
+            REQUIRE(out.table.size() == N);
+            REQUIRE(out.grid.valid());
+            CHECK(out.gridAlongDeg[13] == 0.0f);
+            // In the middle of the untrusted run the table takes the column
+            // over; far from it the grid keeps it.
+            CHECK(out.guard[13] > 0.99f);
+            CHECK(out.guard[14] > 0.99f);
+            CHECK(out.guard[2] == 0.0f);
+            CHECK(out.guard[25] == 0.0f);
+            CHECK(out.guardedColumns >= 6u);
+            CHECK(out.guardedColumns <= 10u);
+            CHECK(out.meanGuard > 0.0);
+            // The grid: every row of a column keeps exactly 1 - g of its
+            // correction; an untouched column is the input bit for bit.
+            for (std::uint32_t y = 0; y < H; ++y) {
+                for (std::uint32_t gc = 0; gc < W; ++gc) {
+                    const float keep = 1.0f - out.guard[gc];
+                    CHECK(cell(out.grid, gc, y, 0) == 0.01f * keep);
+                    CHECK(cell(out.grid, gc, y, 1) == 0.0f);
+                }
+                CHECK(cell(out.grid, 2, y, 0) == cell(grid, 2, y, 0));
+            }
+            // The table: 1 - s (1 - g) of it at every column, with g read
+            // between the grid columns as the kernel reads the grid - so the
+            // two still add up to one correction everywhere.
+            // tableFraction says how much of each column is the table's -
+            // what the glide between buckets weighs the table's confidence by.
+            REQUIRE(out.tableFraction.size() == N);
+            for (std::size_t i = 0; i < N; ++i) {
+                const double g = guardAtTableColumn(out.guard, i, N);
+                CHECK(out.table[i] == Catch::Approx(2.0 * (1.0 - s * (1.0 - g))).margin(1e-6));
+                CHECK(out.tableFraction[i] == Catch::Approx(1.0 - s * (1.0 - g)).margin(1e-6));
+            }
+            // At full strength the grid's own columns carry no table at all.
+            if (s == 1.0) {
+                CHECK(out.table[2 * 8 + 4] == 0.0f);
+            }
+        }
+    }
+}
+
+TEST_CASE("the per-column guard changes nothing where the grid measured the column, the table is unsure or the "
+          "two agree",
+          "[render][parallax][guard]") {
+    constexpr std::uint32_t W = 32, H = 12;
+    constexpr std::size_t N = 256;
+    std::vector<float> table(N);
+    for (std::size_t i = 0; i < N; ++i) {
+        table[i] = 0.01f * static_cast<float>(i) - 1.0f;  // -1 .. +1.55 deg
+    }
+    const auto unchanged = [&](const render::ParallaxWarpGrid& grid, const std::vector<float>& tab,
+                               const std::vector<float>& conf) {
+        auto guarded = render::guardGridWithTable(grid, tab, conf);
+        REQUIRE(guarded.ok());
+        const render::GuardedCorrection& out = guarded.value();
+        CHECK_FALSE(out.changed);
+        CHECK(out.guardedColumns == 0u);
+        CHECK(out.guard.empty());
+        CHECK(out.grid.uv.empty());  // the input grid renders as it is
+        // The table's share exactly as before the guard (seamTableUnderGrid),
+        // carried at 1 - strength in every column.
+        std::vector<float> before;
+        render::seamTableUnderGrid(tab, grid.strength, before);
+        CHECK(out.table == before);
+        CHECK(out.tableFraction == std::vector<float>(before.size(), static_cast<float>(1.0 - grid.strength)));
+    };
+    SECTION("a grid that measured every column: the grid alone, no table") {
+        unchanged(guardTestGrid(W, H, std::vector<float>(W, 0.0f)), table, std::vector<float>(N, 1.0f));
+    }
+    SECTION("a quarter of each column untrusted is still the grid's") {
+        unchanged(guardTestGrid(W, H, std::vector<float>(W, 0.25f)), table, std::vector<float>(N, 1.0f));
+    }
+    SECTION("an untrusted grid over a table that is not sure (below kGridGuardConfidenceLo)") {
+        // 0.45: the night drive's half-sure columns (0.43-0.52), whose table
+        // was wrong there; 0.59: a hair under the floor (the float nearest
+        // 0.6 sits above the double 0.6, where the ramp already starts).
+        for (const float halfSure : {0.45f, 0.59f}) {
+            unchanged(guardTestGrid(W, H, std::vector<float>(W, 1.0f)), table, std::vector<float>(N, halfSure));
+        }
+    }
+    SECTION("a partly trusted grid: the table's 1 - strength share, as before") {
+        unchanged(guardTestGrid(W, H, std::vector<float>(W, 0.0f), 0.4), table, std::vector<float>(N, 1.0f));
+    }
+    SECTION("an untrusted grid that applies what the sure table measured (within kGridGuardAgreeDeg)") {
+        // dLat = -T / 2: the grid's along-meridian correction IS the
+        // table's, so there is nothing for the table to take over - the 6K
+        // sample's already aligned ground, half of it gated.
+        render::ParallaxWarpGrid grid = guardTestGrid(W, H, std::vector<float>(W, 1.0f));
+        const std::vector<float> flat(N, 1.5f);
+        for (std::size_t k = 1; k < grid.uv.size(); k += 2) {
+            grid.uv[k] = static_cast<float>(-deg2rad(1.5 + 0.2) / 2.0);  // 0.2 deg apart: agreement
+        }
+        unchanged(grid, flat, std::vector<float>(N, 1.0f));
+    }
+}
+
+TEST_CASE("a hand-over starts only where the table is sure and reaches at most three grid columns past it",
+          "[render][parallax][guard]") {
+    // Every grid column untrusted and missing the table's +2 deg (the grid
+    // corrects nothing along the meridian): only the table's confidence
+    // decides.  Grid columns 12..15 are the run the table measured; table
+    // column i averages into grid column round((i + 0.5) / 8), so that run is
+    // table columns 8 x 12 - 4 .. 8 x 15 + 3.
+    constexpr std::uint32_t W = 32, H = 12;
+    constexpr std::size_t N = 256;
+    constexpr std::uint32_t runFirst = 12, runLast = 15;
+    const std::vector<float> table(N, 2.0f);
+    const auto runOf = [&](float inside) {
+        std::vector<float> conf(N, 0.0f);  // outside the run: unmeasured
+        for (std::size_t i = 8u * runFirst - 4u; i <= 8u * runLast + 3u; ++i) {
+            conf[i] = inside;
+        }
+        return conf;
+    };
+    render::ParallaxWarpGrid grid = guardTestGrid(W, H, std::vector<float>(W, 1.0f));
+    for (std::size_t k = 1; k < grid.uv.size(); k += 2) {
+        grid.uv[k] = 0.0f;
+    }
+
+    SECTION("a sure run: handed over, its smoothed edge at most three columns out, the grid exact beyond") {
+        auto guarded = render::guardGridWithTable(grid, table, runOf(1.0f));
+        REQUIRE(guarded.ok());
+        const render::GuardedCorrection& out = guarded.value();
+        REQUIRE(out.changed);
+        REQUIRE(out.guard.size() == W);
+        REQUIRE(out.grid.valid());
+        for (std::uint32_t gc = runFirst; gc <= runLast; ++gc) {
+            CHECK(out.guard[gc] > 0.5f);
+        }
+        // The smoothing (sigma one grid column, radius three) reaches the
+        // three columns either side of the run and not one further.
+        CHECK(out.guard[runFirst - 1] > 0.0f);
+        CHECK(out.guard[runLast + 1] > 0.0f);
+        for (std::uint32_t gc = 0; gc < W; ++gc) {
+            if (gc + 3u >= runFirst && gc <= runLast + 3u) {
+                continue;
+            }
+            INFO("grid column " << gc);
+            CHECK(out.guard[gc] == 0.0f);
+            for (std::uint32_t y = 0; y < H; ++y) {
+                CHECK(cell(out.grid, gc, y, 0) == cell(grid, gc, y, 0));
+                CHECK(cell(out.grid, gc, y, 1) == cell(grid, gc, y, 1));
+            }
+        }
+    }
+    SECTION("a half-sure run (the night drive's 0.43-0.52) hands nothing over and spills nothing") {
+        auto guarded = render::guardGridWithTable(grid, table, runOf(0.5f));
+        REQUIRE(guarded.ok());
+        CHECK_FALSE(guarded.value().changed);
+        CHECK(guarded.value().guard.empty());
+        CHECK(guarded.value().guardedColumns == 0u);
+        CHECK(guarded.value().table.empty());  // full strength: no table at all, as before the guard
+    }
+}
+
+TEST_CASE("the per-column guard falls back to the rule before it without what it needs",
+          "[render][parallax][guard]") {
+    constexpr std::uint32_t W = 32, H = 12;
+    constexpr std::size_t N = 256;
+    const std::vector<float> table(N, 1.5f);
+    const std::vector<float> sure(N, 1.0f);
+    const std::vector<float> allUntrusted(W, 1.0f);
+    // A grid with no along-meridian correction, which every column of the
+    // table above disagrees with by 1.5 deg.
+    const auto flatGrid = [&](std::vector<float> shares, double strength) {
+        render::ParallaxWarpGrid g = guardTestGrid(W, H, std::move(shares), strength);
+        for (std::size_t k = 1; k < g.uv.size(); k += 2) {
+            g.uv[k] = 0.0f;
+        }
+        return g;
+    };
+
+    SECTION("no table, a confidence of another length, or a grid without untrusted shares") {
+        const render::ParallaxWarpGrid grid = flatGrid(allUntrusted, 0.25);
+        auto noTable = render::guardGridWithTable(grid, {}, {});
+        REQUIRE(noTable.ok());
+        CHECK_FALSE(noTable.value().changed);
+        CHECK(noTable.value().table.empty());
+        auto shortConf = render::guardGridWithTable(grid, table, std::vector<float>(N - 1, 1.0f));
+        REQUIRE(shortConf.ok());
+        CHECK_FALSE(shortConf.value().changed);
+        REQUIRE(shortConf.value().table.size() == N);
+        CHECK(shortConf.value().table[7] == Catch::Approx(1.5 * 0.75));  // seamTableUnderGrid's share
+        const render::ParallaxWarpGrid handBuilt = flatGrid({}, 1.0);
+        auto noShares = render::guardGridWithTable(handBuilt, table, sure);
+        REQUIRE(noShares.ok());
+        CHECK_FALSE(noShares.value().changed);
+        CHECK(noShares.value().table.empty());
+    }
+    SECTION("garbage entries count as nothing, and the output is always finite") {
+        std::vector<float> shares(allUntrusted);
+        shares[3] = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> conf(sure);
+        conf[100] = std::numeric_limits<float>::infinity();
+        std::vector<float> t(table);
+        t[50] = std::numeric_limits<float>::quiet_NaN();
+        render::ParallaxWarpGrid grid = flatGrid(shares, 1.0);
+        grid.uv[3] = std::numeric_limits<float>::quiet_NaN();  // a dLat cell of column 1
+        auto guarded = render::guardGridWithTable(grid, t, conf);
+        REQUIRE(guarded.ok());
+        const render::GuardedCorrection& out = guarded.value();
+        REQUIRE(out.changed);
+        REQUIRE(out.table.size() == N);
+        for (std::size_t i = 0; i < N; ++i) {
+            CHECK(std::isfinite(out.table[i]));
+        }
+        CHECK(out.table[50] == 0.0f);  // a non-finite shift shifts nothing
+        for (const float v : out.grid.uv) {
+            CHECK(std::isfinite(v));
+        }
+        for (const float a : out.gridAlongDeg) {
+            CHECK(std::isfinite(a));
+        }
+        for (const float g : out.guard) {
+            CHECK(g >= 0.0f);
+            CHECK(g <= 1.0f);
+        }
+    }
+    SECTION("a strength that is not a number trusts the table: its whole share, as before the guard") {
+        // No trust in the grid: as parallaxFromBands hands it out at
+        // strength 0, it corrects nothing - nor is there anything to guard.
+        render::ParallaxWarpGrid grid = flatGrid(allUntrusted, std::numeric_limits<double>::quiet_NaN());
+        std::fill(grid.uv.begin(), grid.uv.end(), 0.0f);
+        auto guarded = render::guardGridWithTable(grid, table, sure);
+        REQUIRE(guarded.ok());
+        CHECK_FALSE(guarded.value().changed);
+        REQUIRE(guarded.value().table.size() == N);
+        CHECK(guarded.value().table[10] == 1.5f);
+    }
+    SECTION("a malformed grid is refused") {
+        render::ParallaxWarpGrid bad = flatGrid(allUntrusted, 1.0);
+        bad.uv.pop_back();
+        auto r = render::guardGridWithTable(bad, table, sure);
+        REQUIRE_FALSE(r.ok());
+        CHECK(r.error().code == ErrorCode::InvalidArgument);
+    }
+}
+
+TEST_CASE("the guard reads the grid's along-meridian correction in the seam table's units and sign",
+          "[render][parallax][guard]") {
+    // A pure along-meridian disparity through the real rig geometry: the
+    // grid and the seam table measure the same thing, and the guard's G
+    // (-2 dLat as a table value) must come out as the table's number - with
+    // a flipped sign every column would look like a disagreement of twice
+    // the disparity and be handed to the table.
+    const SceneFixture& f = scene();
+    REQUIRE(f.ok);
+    ThreadPool pool;
+    geom::BlendParams blend;
+    const video::FramePair pair = makeScenePair(f.rig, 0.0, deg2rad(kParallaxLatDeg));
+    REQUIRE(pair.valid());
+
+    auto grid = render::buildParallaxWarp(f.rig, pair, blend, syntheticParams(), nullptr, pool);
+    REQUIRE(grid.ok());
+    render::SeamSearchParams sp;
+    sp.band = syntheticBand(4.0);
+    auto profile = render::searchSeam(f.rig, pair, blend, sp, pool);
+    REQUIRE(profile.ok());
+    const render::SeamProfile& p = profile.value();
+    REQUIRE(p.shiftDeg.size() == p.confidence.size());
+
+    // Every column untrusted and the table sure of all of them: G for every
+    // column, and a hand-over only where the two disagree.
+    render::ParallaxWarpGrid all = grid.value();
+    all.untrustedShare.assign(all.w, 1.0f);
+    const std::vector<float> sure(p.shiftDeg.size(), 1.0f);
+    auto guarded = render::guardGridWithTable(all, p.shiftDeg, sure);
+    REQUIRE(guarded.ok());
+    const render::GuardedCorrection& out = guarded.value();
+    REQUIRE(out.gridAlongDeg.size() == all.w);
+
+    // Medians over the columns the table measured with confidence.
+    std::vector<double> tableDeg, gridDeg;
+    const std::size_t n = p.shiftDeg.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        if (p.confidence[i] >= 0.5f) {
+            tableDeg.push_back(p.shiftDeg[i]);
+            const std::size_t gc = static_cast<std::size_t>(std::llround((i + 0.5) * all.w / n)) % all.w;
+            gridDeg.push_back(out.gridAlongDeg[gc]);
+        }
+    }
+    REQUIRE(tableDeg.size() > n / 10);
+    const double t = median(tableDeg);
+    const double g = median(gridDeg);
+    INFO("table " << t << " deg, the grid's along-meridian correction " << g << " deg (disparity "
+                  << kParallaxLatDeg << " deg), guarded columns " << out.guardedColumns);
+    CHECK(std::fabs(t) > 0.5 * kParallaxLatDeg);
+    CHECK(std::signbit(t) == std::signbit(g));
+    CHECK(std::fabs(t - g) < 0.3 * kParallaxLatDeg);
+    // The two agree, so the guard leaves most of the ring to the grid.
+    CHECK(out.guardedColumns < all.w / 4);
+
+    // And rendered: whatever the guard decided, the grid with its table
+    // share aligns the lenses as well as the table alone does.
+    const render::BandParams scored = syntheticBand(4.0);
+    const render::WarpGridView view = viewOf(out.changed ? out.grid : all);
+    const std::vector<float>* share = out.table.empty() ? nullptr : &out.table;
+    auto none = render::overlapNcc(f.rig, pair, blend, scored, pool);
+    auto tableOnly = render::overlapNcc(f.rig, pair, blend, scored, pool, &p.shiftDeg);
+    auto both = render::overlapNcc(f.rig, pair, blend, scored, pool, share, &view);
+    REQUIRE(none.ok());
+    REQUIRE(tableOnly.ok());
+    REQUIRE(both.ok());
+    INFO("overlap NCC none " << none.value() << ", table " << tableOnly.value() << ", guarded " << both.value());
+    CHECK(tableOnly.value() > none.value() + 0.1);
+    CHECK(both.value() > none.value() + 0.1);
+    CHECK(both.value() > tableOnly.value() - 0.03);
+}
+
+TEST_CASE("a clip grid's untrusted share is the per-column median of its samples'",
+          "[render][parallax][guard][steady]") {
+    render::ParallaxWarpGrid a = guardTestGrid(8, 4, {0.0f, 1.0f, 0.5f, 0.0f, 1.0f, 0.2f, 0.0f, 0.9f});
+    render::ParallaxWarpGrid b = guardTestGrid(8, 4, {1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.4f, 0.0f, 0.1f});
+    render::ParallaxWarpGrid c = guardTestGrid(8, 4, {0.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.3f, 1.0f, 0.5f});
+    SECTION("every sample carries one: the median per column") {
+        auto m = render::clipParallaxGrid({&a, &b, &c});
+        REQUIRE(m.ok());
+        const std::vector<float> expect{0.0f, 1.0f, 0.5f, 0.0f, 1.0f, 0.3f, 0.0f, 0.5f};
+        CHECK(m.value().untrustedShare == expect);
+    }
+    SECTION("a sample without one: none, so the guard leaves the clip grid alone") {
+        b.untrustedShare.clear();
+        auto m = render::clipParallaxGrid({&a, &b, &c});
+        REQUIRE(m.ok());
+        CHECK(m.value().untrustedShare.empty());
     }
 }
 

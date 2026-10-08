@@ -802,9 +802,15 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
     // boundary guarantee above survives the gate.
     std::uint32_t measuredCells = 0;
     std::uint32_t gatedCells = 0;
+    // Per grid column, the measured-row cells the measurement leaves
+    // untrusted (ParallaxWarpGrid::untrustedShare): unmeasured ones counted
+    // here, gated ones added by the benefit gate below.
+    std::vector<std::uint32_t> untrustedRows(gridW, 0u);
     for (std::size_t gi = 0; gi < cells; ++gi) {
         if (accN[gi] > 0.0) {
             ++measuredCells;
+        } else {
+            ++untrustedRows[gi % gridW];  // no consistent flow: the fill invented this cell
         }
     }
     if (params.requiredImprovement > 0.0) {
@@ -939,6 +945,7 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
             weight[gi] = static_cast<float>(w);
             if (accN[gi] > 0.0 && w <= 0.0) {
                 ++gatedCells;
+                ++untrustedRows[gi % gridW];  // measured, but warping by it did not help
             }
         }
         // The gate's per-cell verdict, before the smoothing below spreads it:
@@ -966,6 +973,15 @@ Result<ParallaxWarpGrid> gridFromFlow(const LensBands& bands, const BidirFlow& f
     }
     grid.measuredCells = measuredCells;
     grid.gatedCells = gatedCells;
+
+    // ---- the untrusted share per column, for the per-column guard -------------
+    // Counted over the measured rows only: the decay rings are copies of the
+    // edge rows and say nothing of their own.  gridRows >= 4 (checkParams).
+    grid.untrustedShare.assign(gridW, 0.0f);
+    for (std::uint32_t gc = 0; gc < gridW; ++gc) {
+        grid.untrustedShare[gc] =
+            static_cast<float>(static_cast<double>(untrustedRows[gc]) / static_cast<double>(gridRows));
+    }
 
     // ---- diagnostics -------------------------------------------------------
     double sumAbs = 0.0;
@@ -1138,6 +1154,204 @@ void seamTableUnderGrid(const std::vector<float>& table, double gridStrength, st
         // table bit for bit (non-finite columns aside, which shift nothing).
         out[i] = std::isfinite(v) ? static_cast<float>(v * share) : 0.0f;
     }
+}
+
+// The guard's confidence ramp starts where the table glide's step ramp ends
+// (see the header): a table column hands nothing over below the confidence
+// from which a change of it fully steps at a bucket's anchor - one notion of
+// "a table column this sure is a real measurement".  It rises over the same
+// width as the step ramp (to within rounding: the constants are decimals).
+static_assert(kGridGuardConfidenceLo == kSeamTableStepConfHi,
+              "the per-column guard must start where the table glide counts a column as fully confident");
+static_assert(kGridGuardConfidenceHi > kGridGuardConfidenceLo && kGridGuardConfidenceHi <= 1.0,
+              "the guard's confidence ramp must rise inside [0, 1]");
+static_assert([] {
+    const double guardWidth = kGridGuardConfidenceHi - kGridGuardConfidenceLo;
+    const double stepWidth = kSeamTableStepConfHi - kSeamTableStepConfLo;
+    return guardWidth - stepWidth < 1e-9 && stepWidth - guardWidth < 1e-9;
+}(), "the guard's confidence ramp must be as wide as the table glide's step ramp");
+static_assert(kGridGuardUntrustedHi > kGridGuardUntrustedLo && kGridGuardUntrustedLo >= 0.0 &&
+                  kGridGuardUntrustedHi <= 1.0,
+              "the guard's untrusted-share ramp must rise inside [0, 1]");
+// A disagreement counts from the table's own bucket-to-bucket noise on: the
+// glide's noise floor (kSeamTableGlideNoiseDeg) is the same measurement noise.
+static_assert(kGridGuardDisagreeDeg == kSeamTableGlideNoiseDeg && kGridGuardAgreeDeg >= 0.0 &&
+                  kGridGuardAgreeDeg < kGridGuardDisagreeDeg,
+              "the guard's disagreement ramp must rise to the table's noise floor");
+
+Result<GuardedCorrection> guardGridWithTable(const ParallaxWarpGrid& grid, const std::vector<float>& table,
+                                             const std::vector<float>& confidence) {
+    if (!grid.valid()) {
+        return Error{ErrorCode::InvalidArgument, "guardGridWithTable: the grid is empty or malformed"};
+    }
+    GuardedCorrection out;
+    // The grid's own strength: the table already fills 1 - s of every column
+    // under a partly trusted grid (seamTableUnderGrid), with or without the guard.
+    const double s = std::isfinite(grid.strength) ? std::clamp(grid.strength, 0.0, 1.0) : 0.0;
+    const std::uint32_t W = grid.w;
+    const std::size_t n = table.size();
+
+    // ---- without what the guard needs: the rule before it ------------------------
+    // No table, a confidence that is not the table's column for column, or a
+    // grid that carries no untrusted shares (built by hand, not measured).
+    if (n == 0 || confidence.size() != n || grid.untrustedShare.size() != W) {
+        seamTableUnderGrid(table, s, out.table);
+        // The table's share is 1 - s in every column (none when it is empty).
+        out.tableFraction.assign(out.table.size(), static_cast<float>(1.0 - s));
+        return out;
+    }
+
+    // ---- the table's confidence and value per grid column ----------------------------
+    // Table column i sits at longitude fraction (i + 0.5) / n; the grid cell
+    // nearest it is the one gridFromFlow accumulated that longitude into
+    // (cellColOf: the rounded position), so each grid column averages exactly
+    // the table columns its cells were measured over when the two share a
+    // band width.  A value that is not a number counts as 0 (no confidence,
+    // no shift).
+    std::vector<double> confSum(W, 0.0);
+    std::vector<double> shiftSum(W, 0.0);
+    std::vector<double> count(W, 0.0);
+    const double gridPerTable = static_cast<double>(W) / static_cast<double>(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const long long nearest = std::llround((static_cast<double>(i) + 0.5) * gridPerTable);
+        const auto gc = static_cast<std::size_t>(((nearest % static_cast<long long>(W)) + W) % W);
+        const double c = static_cast<double>(confidence[i]);
+        const double v = static_cast<double>(table[i]);
+        confSum[gc] += std::isfinite(c) ? std::clamp(c, 0.0, 1.0) : 0.0;
+        shiftSum[gc] += std::isfinite(v) ? v : 0.0;
+        count[gc] += 1.0;
+    }
+
+    // ---- the grid's own along-meridian correction per column, as a table value ------
+    // G = -2 dLat in degrees: the grid stores the master lens's displacement
+    // (HALF the disparity), the master's axis is body +Y - the +90 deg pole of
+    // the polar-axis band - and a positive table value moves each lens AWAY
+    // from its own axis, i.e. the master toward lower latitude.  Averaged over
+    // the rows where the kernel applies the table in full (|latitude| up to
+    // OSV_SEAM_SHIFT_FULL_DEG, osvSeamShiftTaper), since that is where the two
+    // corrections stand for the same thing; every row when none lies there.
+    const double fullRad = static_cast<double>(OSV_SEAM_SHIFT_FULL_DEG) * osv::kPi / 180.0;
+    const double latMin = static_cast<double>(grid.latMinRad);
+    const double latSpan = static_cast<double>(grid.latMaxRad) - latMin;
+    std::vector<std::uint32_t> rows;
+    rows.reserve(grid.h);
+    for (std::uint32_t gy = 0; gy < grid.h; ++gy) {
+        // Rows run linearly from latMinRad (row 0) to latMaxRad (row h - 1),
+        // as osvWarpSample reads them.
+        const double lat =
+            grid.h > 1 ? latMin + latSpan * static_cast<double>(gy) / static_cast<double>(grid.h - 1u) : latMin;
+        if (std::isfinite(lat) && std::fabs(lat) <= fullRad) {
+            rows.push_back(gy);
+        }
+    }
+    if (rows.empty()) {
+        for (std::uint32_t gy = 0; gy < grid.h; ++gy) {
+            rows.push_back(gy);
+        }
+    }
+    out.gridAlongDeg.assign(W, 0.0f);
+    for (std::uint32_t gc = 0; gc < W; ++gc) {
+        double sumLat = 0.0;
+        for (const std::uint32_t gy : rows) {
+            const double v = static_cast<double>(grid.uv[(static_cast<std::size_t>(gy) * W + gc) * 2u + 1u]);
+            sumLat += std::isfinite(v) ? v : 0.0;  // a cell that is not a number corrects nothing
+        }
+        const double meanLat = sumLat / static_cast<double>(rows.size());
+        out.gridAlongDeg[gc] = static_cast<float>(-2.0 * meanLat * 180.0 / osv::kPi);
+    }
+
+    // ---- the guard weight per grid column, smoothed round the ring ------------------
+    // g = (the grid did not measure the column) x (the table did) x (the table
+    // found a disparity the correction on screen misses), each a smoothstep
+    // so the hand-over has no threshold step of its own.  The correction on
+    // screen along the meridian is the grid's G plus the table's 1 - s share,
+    // so its distance from the table's T is |G + (1 - s) T - T| = |G - s T|.
+    // Interleaved as blurComponent expects (component 0, one row), so the
+    // smoothing wraps at +/-180 deg exactly as the kernel's grid fetch does.
+    // A hand-over can only START in a column whose table is at least
+    // kGridGuardConfidenceLo sure; the smoothing then carries it up to three
+    // grid columns (3 x kGridGuardSmoothCols, blurComponent's radius) past the
+    // edge of such a run, where the table's own smoother continues the sure
+    // run's value (see the header for why that reach is kept).
+    std::vector<float> weight(static_cast<std::size_t>(W) * 2u, 0.0f);
+    bool any = false;
+    for (std::uint32_t gc = 0; gc < W; ++gc) {
+        const double share = static_cast<double>(grid.untrustedShare[gc]);
+        const double u = std::isfinite(share) ? std::clamp(share, 0.0, 1.0) : 0.0;
+        const double untrusted =
+            smoothstep01((u - kGridGuardUntrustedLo) / (kGridGuardUntrustedHi - kGridGuardUntrustedLo));
+        const double conf = count[gc] > 0.0 ? confSum[gc] / count[gc] : 0.0;
+        const double sure =
+            smoothstep01((conf - kGridGuardConfidenceLo) / (kGridGuardConfidenceHi - kGridGuardConfidenceLo));
+        const double tableDeg = count[gc] > 0.0 ? shiftSum[gc] / count[gc] : 0.0;
+        const double miss = std::fabs(static_cast<double>(out.gridAlongDeg[gc]) - s * tableDeg);
+        const double disagree =
+            std::isfinite(miss)
+                ? smoothstep01((miss - kGridGuardAgreeDeg) / (kGridGuardDisagreeDeg - kGridGuardAgreeDeg))
+                : 0.0;
+        const double g = untrusted * sure * disagree;
+        weight[static_cast<std::size_t>(gc) * 2u] = static_cast<float>(g);
+        any = any || g > 0.0;
+    }
+    if (!any) {
+        // Nothing guarded: the grid as it is and the table's 1 - s share,
+        // the rule before the guard.
+        seamTableUnderGrid(table, s, out.table);
+        out.tableFraction.assign(out.table.size(), static_cast<float>(1.0 - s));
+        return out;
+    }
+    blurComponent(weight, W, 1u, 0, kGridGuardSmoothCols, nullptr);
+    out.guard.assign(W, 0.0f);
+    double sumGuard = 0.0;
+    for (std::uint32_t gc = 0; gc < W; ++gc) {
+        const float g = weight[static_cast<std::size_t>(gc) * 2u];
+        out.guard[gc] = std::isfinite(g) ? std::clamp(g, 0.0f, 1.0f) : 0.0f;
+        sumGuard += static_cast<double>(out.guard[gc]);
+        if (static_cast<double>(out.guard[gc]) >= kGridGuardCountedWeight) {
+            ++out.guardedColumns;
+        }
+    }
+    out.meanGuard = sumGuard / static_cast<double>(W);
+    out.changed = true;
+
+    // ---- the grid: every row of a column keeps 1 - g of its correction -----------------
+    // The decay rings included, so the column's fall-off to zero keeps its
+    // shape.  A cell that is not a number comes out as no correction.
+    out.grid = grid;
+    for (std::uint32_t gy = 0; gy < out.grid.h; ++gy) {
+        float* row = out.grid.uv.data() + static_cast<std::size_t>(gy) * W * 2u;
+        for (std::uint32_t gc = 0; gc < W; ++gc) {
+            const float keep = 1.0f - out.guard[gc];
+            for (std::uint32_t comp = 0; comp < 2u; ++comp) {
+                float& v = row[gc * 2u + comp];
+                v = std::isfinite(v) ? v * keep : 0.0f;
+            }
+        }
+    }
+
+    // ---- the table: its 1 - s share plus s of every column handed over ---------------
+    // g at the table column's longitude is interpolated linearly between the
+    // two grid columns around it - the kernel's own bilinear grid fetch
+    // (osvWarpSample) - so wherever the grid gives up a share, the table takes
+    // exactly that share over.
+    out.table.resize(n);
+    out.tableFraction.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const double fx = (static_cast<double>(i) + 0.5) * gridPerTable;
+        const double fl = std::floor(fx);
+        const double t = fx - fl;
+        const long long x0 = static_cast<long long>(fl);
+        const auto c0 = static_cast<std::size_t>(((x0 % static_cast<long long>(W)) + W) % W);
+        const auto c1 = static_cast<std::size_t>((c0 + 1u) % W);
+        const double g0 = static_cast<double>(out.guard[c0]);
+        const double g = std::clamp(g0 + (static_cast<double>(out.guard[c1]) - g0) * t, 0.0, 1.0);
+        const double fraction = 1.0 - s * (1.0 - g);
+        out.tableFraction[i] = static_cast<float>(fraction);
+        const double v = static_cast<double>(table[i]);
+        // No measurement here (not a number): no shift.
+        out.table[i] = std::isfinite(v) ? static_cast<float>(v * fraction) : 0.0f;
+    }
+    return out;
 }
 
 Result<ParallaxWarpGrid> blendParallaxGrids(const ParallaxWarpGrid& from, const ParallaxWarpGrid& to, double t) {

@@ -327,6 +327,18 @@ struct ParallaxWarpGrid {
     /// (render::clipParallaxGrid) holds the median of its samples'.
     double strength = 1.0;
 
+    /// Per grid column (`w` entries, each in [0, 1]): the share of the
+    /// column's MEASURED rows (gridRows, not the decay rings) whose cell the
+    /// measurement leaves untrusted - no consistent flow landed in it (the
+    /// fill copied a neighbour's value there), or the benefit gate switched it
+    /// fully off.  Filled by gridFromFlow(); a clip grid holds the per-column
+    /// median of its samples'.  The per-column guard (guardGridWithTable)
+    /// hands such columns to the seam table where the table is sure of them
+    /// and found a disparity the grid missed.
+    /// Empty for a grid nothing measured (one built by hand): the guard then
+    /// has nothing to go on and leaves the grid alone.
+    std::vector<float> untrustedShare;
+
     // ---- diagnostics -------------------------------------------------------
     FlowBackendKind usedBackend = FlowBackendKind::Classical;
     std::uint64_t consistentPixels = 0;  ///< Co-visible pixels whose flow passed the check.
@@ -424,9 +436,11 @@ struct ParallaxCellStats {
 /// it makes the flow measure only what the seam table did NOT correct, so
 /// the two compose instead of double-counting the same disparity.  Note that
 /// on the sample clip composing measured WORSE than the grid alone (whole-
-/// band overlap NCC 0.902-0.909 against 0.916-0.921), so the importer and
-/// `osvtool render` pass nullptr and use the grid INSTEAD of the table,
-/// keeping the table only as the fallback when a grid is refused.
+/// band overlap NCC, robust table and fixed solver, LRF 30 / OSV 60: 0.9782 /
+/// 0.9128 against 0.9793 / 0.9197), so the importer and `osvtool render` pass
+/// nullptr and use the grid INSTEAD of the table, keeping the table as the
+/// fallback when a grid is refused and for the columns the per-column guard
+/// hands it (guardGridWithTable).
 ///
 /// Returns Unsupported when the flow was measured but the structured gate
 /// refused it (too few structured pixels, or too small a consistent share of
@@ -500,6 +514,194 @@ struct ParallaxCellStats {
 /// correction).  Non-finite entries become 0.  An empty table gives an empty
 /// `out`.
 void seamTableUnderGrid(const std::vector<float>& table, double gridStrength, std::vector<float>& out);
+
+// ===========================================================================
+//  The per-column guard: the seam table where the grid measured nothing
+//
+//  An accepted grid REPLACES the seam table (see buildParallaxWarp for the
+//  measurement that keeps it that way).  The two measure differently: the
+//  table searches each column along the meridian over +/- 24 band rows, the
+//  flow follows a pyramid that does not reach a large near-field offset
+//  everywhere.  On a car mount the car body crosses the seam ~2.5 deg out of
+//  place; half or more of its grid cells come out unmeasured (no consistent
+//  flow: the fill copies a neighbour's value in) or gated (the benefit gate
+//  saw the flow make things no better), the rest under-correct, and the
+//  rails stay doubled - while the table measured exactly those columns with
+//  confidence.  Measured on the day proxy at frame 3423 (car body, band
+//  columns 1548-1659): table +2.15..+2.73 deg, the grid's along-meridian
+//  correction +0.96..+2.07 deg; overlap NCC table 0.93-0.98, grid 0.26-0.92.
+//
+//  Per grid column the guard weighs three things, each a smoothstep so the
+//  hand-over has no threshold step of its own:
+//    u  the column's untrusted share (ParallaxWarpGrid::untrustedShare):
+//       kGridGuardUntrustedLo .. kGridGuardUntrustedHi - the grid did not
+//       measure the column;
+//    c  the table's confidence there (SeamProfile::confidence):
+//       kGridGuardConfidenceLo .. kGridGuardConfidenceHi - the table did;
+//    d  how far the correction the column renders along the meridian is
+//       from the table's: |G - s T| (G the grid's own along-meridian
+//       correction as a table value, s its strength, T the table):
+//       kGridGuardAgreeDeg .. kGridGuardDisagreeDeg - the table found a
+//       disparity the grid missed.
+//  g = sstep(u) * sstep(c) * sstep(d), smoothed along the ring like the
+//  benefit gate's weights (sigma kGridGuardSmoothCols, three grid columns of
+//  reach), then
+//      grid         column x (1 - g)
+//      table share  T x (1 - s (1 - g))
+//  so the grid and the table still add up to ONE correction everywhere.  A
+//  hand-over starts only in a column all three hand over - and so only where
+//  the table is at least kGridGuardConfidenceLo sure; a column all three
+//  hand over takes the table in full; the smoothing carries a run's
+//  hand-over at most three grid columns past its edge; every column farther
+//  than that from any column all three hand over keeps the grid exactly as
+//  before (g = 0, the table's 1 - s share of seamTableUnderGrid).  The
+//  per-cell rule (a cell the grid could not measure goes to a table that is
+//  sure of it) becomes a per-column one because the table is one number per
+//  column.
+//
+//  The smoothing's reach past a run is kept on purpose: at the car body's
+//  edge the column's own table measurement is unsure (texture, coverage),
+//  but the table's robust smoother continues the sure run's value there, and
+//  that value is the right one where the grid's is not (day proxy frame
+//  3423, grid column 193: table confidence 0.16, table +1.96 deg, the grid
+//  +0.95).  Capping the smoothed weight at each column's own product (all
+//  three factors, u x c, or c alone; measured with the confidence ramp's top
+//  at 0.8) cost the day proxy's car window median 0.9669 -> 0.9654-0.9657
+//  and its whole band 0.9929 -> 0.9917-0.9918 (frame 3423 0.9669 ->
+//  0.9576-0.9581, 6008 0.9507 -> 0.9380-0.9384), and bought nothing at night
+//  once the confidence floor is 0.6.
+//
+//  G is -2 dLat in degrees, averaged over the rows where the kernel applies
+//  the table in full (osvSeamShiftTaper): the grid stores the master lens's
+//  displacement (HALF the disparity), the master's axis is body +Y - the +90
+//  deg pole of the polar-axis band - and a positive table value moves each
+//  lens AWAY from its own axis.
+//
+//  Measured and rejected on the way (osvtool seam, classical flow,
+//  kernel-rendered overlap NCC):
+//    * g = u * c (no smoothstep on u, no d): the car body went only half to
+//      the table (about half of its cells pass the benefit gate, which
+//      compares a correction against NONE, not against the table) and the
+//      proxy's car window median stayed at the grid's 0.951;
+//    * without d: with the maintainer's 6K sample's lens rotation folded (the
+//      plug-ins' default) the aligned ground is half gated - nothing left to
+//      fix - and the table took 64-83 grid columns over at a shift of ~0.01
+//      deg, dropping the grid's small 2-D gains (OSV 60 0.9138 -> 0.9131,
+//      the clip correction -0.0009 on every sample frame); there the table
+//      and the grid agree to 0.05 deg, on the car body they differ by
+//      0.5-1.3 deg;
+//    * the grid kept whole and the table adding g (s T - G): a column of a
+//      car mount is part car body (under-corrected) and part background
+//      (near zero), and a column-wide offset mis-corrected both (car window
+//      median 0.93, below the grid alone);
+//    * the confidence ramp of the table glide's step rule (0.3 .. 0.6): on
+//      the night drive the table is half sure (0.43-0.52) of car-window
+//      columns it measures wrong, the guard handed them - and, smoothed,
+//      their neighbours of confidence 0 - to it, and the car window lost
+//      0.050 against the grid alone (frame 2000: 0.7675 -> 0.7171; whole
+//      band 0.9830 -> 0.9828).  From 0.6 no night car-window column starts
+//      a hand-over and the night renders the grid alone there (0.7675 and
+//      0.9467 at frames 2000 and 3500), while the day keeps its gain (car
+//      window median 0.9668 -> 0.9670, whole band 0.9929 both).
+//
+//  Composing the two everywhere (the grid measured on bands the table has
+//  already corrected) was measured as the alternative and NOT adopted: it
+//  wins on the car body, but costs the 6K sample's OSV 0.007 of whole-band
+//  overlap NCC (frame 60: 0.9128 against the grid alone's 0.9197) - the
+//  table's smoothed shift stays where the grid does better.
+// ===========================================================================
+
+/// Table confidence (SeamProfile::confidence) at or below which a hand-over
+/// never starts in a column: the confidence from which a change of the table
+/// fully steps at a bucket's anchor (kSeamTableStepConfHi, below) - a table
+/// column less sure than that is not sure enough to replace the grid.  The
+/// night drive's half-sure car-window columns (0.43-0.52), whose table is
+/// wrong there (car window 0.62 against the grid's 0.77), sit below it.
+inline constexpr double kGridGuardConfidenceLo = 0.6;
+/// Table confidence from which an untrusted grid column can go to the table
+/// in full: the ramp is as wide as the table glide's step ramp
+/// (kSeamTableStepConfLo .. kSeamTableStepConfHi), so a confidence that
+/// wobbles from bucket to bucket moves the hand-over no faster than it moves
+/// the step.  The car body the table aligns on the day drive is 0.93-1.00
+/// sure.  A top of 0.8 or 0.7 measured within 0.0005 or 0.0017 of this one
+/// on every frame (the 8K original's car window at frame 12014 the most).
+inline constexpr double kGridGuardConfidenceHi = 0.9;
+/// Untrusted share (ParallaxWarpGrid::untrustedShare) up to which a grid
+/// column stays the grid's: a quarter of its cells unmeasured or gated is the
+/// sky above or the road below a feature the flow did measure.
+inline constexpr double kGridGuardUntrustedLo = 0.25;
+/// Untrusted share from which a grid column can go to a confident table in
+/// full: half or more of its cells unmeasured or gated means the grid did
+/// not measure that column.  Measured on the day proxy at frame 3423: the
+/// car-body columns the table aligns (NCC 0.93-0.98) and the grid does not
+/// (0.26-0.92) are 47-81 % untrusted; the columns beside them where the grid
+/// does better (0.88-0.97 against 0.80-0.92) are 25-31 %.
+inline constexpr double kGridGuardUntrustedHi = 0.5;
+/// Disagreement (degrees, |G - s T|) up to which the grid and the table say
+/// the same thing along the meridian and the grid keeps the column: half the
+/// table's own bucket-to-bucket noise (kGridGuardDisagreeDeg), 1.4 rows of a
+/// 2048-column band.
+inline constexpr double kGridGuardAgreeDeg = 0.25;
+/// Disagreement (degrees) from which the table has found a disparity the
+/// grid missed: the top of the table's bucket-to-bucket measurement noise
+/// (kSeamTableGlideNoiseDeg, below - 2.8 px of a 2048 px equirect).  The
+/// car body at frame 3423 disagrees by 0.5-1.3 deg, the 6K sample's aligned
+/// ground by at most 0.05.
+inline constexpr double kGridGuardDisagreeDeg = 0.5;
+/// Smoothing of the per-column guard weight along the ring, in grid columns
+/// (the benefit gate's own weight smoothing), so the hand-over between grid
+/// and table has no step from one grid column to the next.
+inline constexpr double kGridGuardSmoothCols = 1.0;
+/// A grid column counts as guarded in the diagnostics from this weight on.
+inline constexpr double kGridGuardCountedWeight = 0.5;
+
+/// A grid and the seam table share that renders with it, after the guard.
+struct GuardedCorrection {
+    /// The grid with each column scaled by 1 - g - filled only when
+    /// `changed`; otherwise empty, and the input grid renders as it is.
+    ParallaxWarpGrid grid;
+    /// The table share at every table column, T x (1 - s (1 - g)) - empty
+    /// when nothing of the table applies (a fully trusted grid and no guarded
+    /// column), exactly as seamTableUnderGrid leaves it.
+    std::vector<float> table;
+    /// The fraction of the table that renders at every table column,
+    /// 1 - s (1 - g) in [0, 1]: how much of that column's correction along
+    /// the meridian is the table's (the rest is the grid's).  Same length as
+    /// `table`, empty with it.  A glide between two buckets weighs the
+    /// table's confidence by it (render::blendSeamTables): where the grid
+    /// carries a column, a change of the table there is not the table's to
+    /// step.
+    std::vector<float> tableFraction;
+    /// The guard weight g per grid column, in [0, 1]; empty when no column
+    /// was guarded (`changed` false).
+    std::vector<float> guard;
+    /// The grid's own along-meridian correction per grid column, as a table
+    /// value in degrees (G above); filled whenever the guard could weigh the
+    /// columns (a table, its confidence and the grid's untrusted shares).
+    std::vector<float> gridAlongDeg;
+    /// Grid columns guarded by at least kGridGuardCountedWeight.
+    std::uint32_t guardedColumns = 0;
+    /// Mean guard weight over the ring (0 when unchanged).
+    double meanGuard = 0.0;
+    /// True when at least one column was guarded at all: `grid` is then the
+    /// one to render and the share differs from seamTableUnderGrid's.
+    bool changed = false;
+};
+
+/// Apply the per-column guard (see above) to an accepted `grid` with the
+/// seam `table` measured on the same frame and its per-column `confidence`:
+/// the grid and the table share that render together.
+///
+/// Without what the guard needs - an empty table, a confidence that does not
+/// match the table column for column, or a grid without its untrusted shares
+/// - it falls back to the rule before it: the grid as it is and
+/// seamTableUnderGrid's share of the table (if any).  A non-finite share,
+/// confidence, grid cell or table entry counts as 0 (no hand-over, no
+/// shift); the strength is clamped to [0, 1] and a non-finite one counts as
+/// 0.  InvalidArgument for a malformed grid.
+[[nodiscard]] Result<GuardedCorrection> guardGridWithTable(const ParallaxWarpGrid& grid,
+                                                          const std::vector<float>& table,
+                                                          const std::vector<float>& confidence);
 
 // ===========================================================================
 //  Temporal schedule: measure once per bucket of frames, glide between them

@@ -2222,20 +2222,25 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
         return out;  // not measured yet: unknown
     }
 
-    // ---- the seam table where there is no grid, or only a partly trusted one ----------
+    // ---- the seam table: the fallback, the share, and the guard's columns -----------
     // The refused bucket's fallback, the whole correction with parallax off,
-    // and the remaining share under a grid the structured gate accepted at a
-    // strength below 1 (render::seamTableUnderGrid) - so as a bucket's
-    // structured share drifts down toward the gate, the table fades in
-    // instead of switching on at the refusal.  A fully trusted grid needs no
-    // table, exactly as before.
-    const bool partialGrid = out.grid != nullptr && out.grid->strength < 1.0;
-    if ((out.grid == nullptr || partialGrid) && wantSeam) {
+    // the remaining share under a grid the structured gate accepted at a
+    // strength below 1 - so as a bucket's structured share drifts down toward
+    // the gate, the table fades in instead of switching on at the refusal -
+    // and, under every accepted grid, the columns the grid could not measure
+    // where the table is sure and found a disparity the grid missed
+    // (render::guardGridWithTable, the per-column guard): on a car mount the
+    // car body crossing the seam is exactly such a stretch, aligned by the
+    // table and left doubled by the grid.  So with Seam Search on, the table
+    // is measured for every bucket.
+    const bool gridApplies = out.grid != nullptr && out.grid->valid();
+    if (wantSeam) {
         // The anchored table first: cached, or measured now (Exact) or from a
         // free anchor (Interactive).
         std::map<std::uint32_t, SeamTableEntry>* lane = &m_seamTables;
         auto cached = m_seamTables.find(bucket);
         const video::FramePair* source = nullptr;
+        bool searchedNow = false;  // the table was measured by this call (logged once per bucket below)
         if (cached == m_seamTables.end()) {
             const bool measure = now || how == AnchorMeasure::IfFree;
             source = measure ? measuredOn(now) : nullptr;
@@ -2259,6 +2264,7 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
                 entry.confidence = std::move(p.confidence);
                 cached = lane->emplace(bucket, std::move(entry)).first;
                 trimAnalysisCache(*lane, lane == &m_seamTables ? kMaxAnalysisCache : kMaxStandInCache, bucket);
+                searchedNow = true;
             } else {
                 // Searched and failed: the bucket renders without a table.
                 PluginLog::debug("frame {} (bucket {}): seam search failed ({}); rendering without a seam table",
@@ -2266,21 +2272,76 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
             }
         }
         if (cached == lane->end() && source == nullptr) {
-            return out;  // the table is not known yet: neither is the correction
+            if (!gridApplies || out.grid->strength < 1.0) {
+                // The table is not known yet: neither is the correction - a
+                // refused bucket's, or the share a partly trusted grid leaves.
+                return out;
+            }
+            // A fully trusted grid whose table is not known yet (an
+            // Interactive glide partner whose table nobody measured): the
+            // grid alone, the rule before the guard - and not final, since an
+            // Exact request measures the table and may hand it columns.
+            out.standIn = out.standIn || readStandIns;
         }
         if (cached != lane->end()) {
-            if (partialGrid) {
-                // Only the share the grid leaves (1 - strength).  The cache
-                // keeps the measured table; the share is this bucket's.
-                render::seamTableUnderGrid(cached->second.shiftDeg, out.grid->strength, out.table);
+            // The share of each table column that renders: 1 where the table
+            // is the whole correction, less where a grid carries the rest.
+            std::vector<float> fraction;
+            if (gridApplies) {
+                // The grid and the table's share under it after the
+                // per-column guard: 1 - strength of the table everywhere
+                // (seamTableUnderGrid, the rule for a partly trusted grid),
+                // and the columns the grid could not measure, where the table
+                // is sure and found a disparity the grid missed, handed to the
+                // table.  The cache keeps the measured grid and table; this
+                // pair is this bucket's render.  Unguarded, the grid is shared
+                // as it is.
+                auto guarded =
+                    render::guardGridWithTable(*out.grid, cached->second.shiftDeg, cached->second.confidence);
+                if (guarded.ok()) {
+                    render::GuardedCorrection& g = guarded.value();
+                    if (searchedNow) {
+                        // Once per bucket: when its table is measured.
+                        PluginLog::debug("frame {} (bucket {}) of '{}': the seam table under the parallax grid "
+                                         "takes {} of {} grid columns (mean weight {:.2f}), strength {:.2f}",
+                                         index, bucket, clipLogName(m_path), g.guardedColumns, out.grid->w,
+                                         g.meanGuard, out.grid->strength);
+                    }
+                    if (g.changed) {
+                        out.grid = std::make_shared<const render::ParallaxWarpGrid>(std::move(g.grid));
+                    }
+                    out.table = std::move(g.table);
+                    fraction = std::move(g.tableFraction);
+                } else {
+                    // Defensive (a malformed grid never gets here): the rule
+                    // before the guard, the table's 1 - strength share.
+                    PluginLog::debug("frame {} (bucket {}): per-column guard refused ({}); the grid alone",
+                                     index, bucket, guarded.error().message);
+                    render::seamTableUnderGrid(cached->second.shiftDeg, out.grid->strength, out.table);
+                    // seamTableUnderGrid's own reading of the strength.
+                    const double s =
+                        std::isfinite(out.grid->strength) ? std::clamp(out.grid->strength, 0.0, 1.0) : 0.0;
+                    fraction.assign(out.table.size(), static_cast<float>(1.0 - s));
+                }
             } else {
                 out.table = cached->second.shiftDeg;  // the whole table, untouched
             }
             // Only a confidence that matches the table column for column is
-            // carried; otherwise the glide treats the table as ungated.  (The
-            // confidence is the measurement's, whatever share of it applies.)
+            // carried; otherwise the glide treats the table as ungated.  It is
+            // the measurement's confidence times the share of the column the
+            // table carries: where a grid carries a column, a change of the
+            // table there is the grid handing over, not a near object
+            // arriving, and must glide with the grid instead of stepping at
+            // the anchor (render::blendSeamTables).  A bucket without a grid
+            // carries its whole table: the confidence as measured.
             if (!out.table.empty() && cached->second.confidence.size() == cached->second.shiftDeg.size()) {
                 out.tableConfidence = cached->second.confidence;
+                if (fraction.size() == out.tableConfidence.size()) {
+                    for (std::size_t i = 0; i < fraction.size(); ++i) {
+                        const float f = std::isfinite(fraction[i]) ? std::clamp(fraction[i], 0.0f, 1.0f) : 0.0f;
+                        out.tableConfidence[i] *= f;
+                    }
+                }
             }
         }
         out.standIn = out.standIn || lane == &m_standInTables;
@@ -2306,17 +2367,28 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
     // When it yields a grid, the grid REPLACES the 1-D seam table instead of
     // composing with it.  The grid already contains the along-meridian
     // correction the table makes - spatially resolved rather than one number
-    // per column - plus the cross-meridian one the table cannot express, and
-    // composing the two measured WORSE than the grid alone.  On the sample
-    // clip, whole-band overlap NCC on frames 0 / 32 / 64:
-    //     seam table alone   0.897 / 0.902 / 0.900
-    //     grid alone         0.916 / 0.918 / 0.921
-    //     table + grid       0.906 / 0.902 / 0.909
+    // per column - plus the cross-meridian one the table cannot express.
+    // Composing the two (the grid measured on bands the table has corrected)
+    // was measured again with the robust table and the fixed solver, whole-
+    // band overlap NCC, classical flow:
+    //                          sample LRF 30   sample OSV 60   day proxy (median of 15)
+    //     seam table alone     0.9766          0.9021          0.9913
+    //     grid alone           0.9793          0.9197          0.9893
+    //     table + grid         0.9782          0.9128          0.9959
+    // It wins on the car-mounted clip but costs the 6K sample's OSV 0.007
     // (after the table the residual is smaller, so the benefit gate keeps
-    // fewer cells, and the table's heavily smoothed per-column shift stays
-    // where the grid would have done better).  Replacing it also saves the
-    // table's cost.  When the grid is refused - featureless content with too
-    // little consistent flow - the seam table below is the fallback, so
+    // fewer cells, and the table's smoothed per-column shift stays where the
+    // grid would have done better), so the grid still replaces the table -
+    // except per column: render::guardGridWithTable hands the table the
+    // columns the grid could not measure (mostly unmeasured or gated cells)
+    // where the table is sure of them and found a disparity the grid missed.
+    // That is the car body crossing the seam, which the classical flow does
+    // not follow and the table aligns: proxy car window (band columns
+    // 1540-1830) median 0.951 grid alone, 0.967 table alone, 0.967 guarded;
+    // whole band 0.9893 / 0.9913 / 0.9929; the sample's frames and its clip
+    // correction hand over no column and render as before.  When the grid is
+    // refused - featureless content with too little consistent flow - the
+    // seam table below is the fallback, so
     // turning parallax on never leaves a frame with LESS correction.  Between
     // the two the structured gate accepts a grid at a strength s below 1
     // (ParallaxWarpParams::minStructuredConsistent): the grid then carries s
@@ -2359,16 +2431,15 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
             builder.warp(g.uv, g.w, g.h, g.latMinRad, g.latMaxRad);
             parallaxApplied = true;
             appliedGrid = clipSteady->grid;  // [WP-SEAMTOOLS]
-            // A clip grid the structured gate trusted only partly (strength
-            // below 1): the clip seam table fills the rest, as the clip
-            // correction was judged and carved (render::measureClipSteady).
-            // A fully trusted one - every clip before the soft gate - needs
-            // nothing more.
-            if (wantSeam && g.strength < 1.0 && clipSteady->seamTable && !clipSteady->seamTable->empty()) {
-                render::seamTableUnderGrid(*clipSteady->seamTable, g.strength, m_seamTableFrame);
-                if (!m_seamTableFrame.empty()) {
-                    builder.seam(m_seamTableFrame);
-                }
+            // The clip seam table's share under the clip grid: what a partly
+            // trusted grid leaves (1 - strength), plus the columns the
+            // per-column guard handed to the table (the clip grid has given
+            // them up) - exactly the correction the clip was judged and
+            // carved with (render::measureClipSteady, ClipSteady::gridTable).
+            // Empty for a fully trusted grid that guarded no column, which
+            // then needs nothing more.
+            if (wantSeam && clipSteady->gridTable && !clipSteady->gridTable->empty()) {
+                builder.seam(*clipSteady->gridTable);
             }
         }
     } else if (steadyUse == SteadyUse::StandIn) {
@@ -2483,21 +2554,42 @@ ImporterInstance::AnalysisOutcome ImporterInstance::applyAnalyses(std::uint32_t 
             // went between the anchors) the column steps to the newer side at
             // the anchor instead of keeping the stale table on screen for most
             // of the bucket (render::blendSeamTables).  A side's table is its
-            // whole table where it has no grid and the share its grid leaves
-            // (1 - strength) where the structured gate trusted the grid only
-            // partly (bucketCorrectionLocked), so each side's grid and table
-            // add up to one correction and the grid/table crossfade follows
-            // the strength continuously; a fully trusted grid has none.
+            // whole table where it has no grid and, under a grid, the share
+            // that renders with it: 1 - strength where the structured gate
+            // trusted it only partly, plus the columns the per-column guard
+            // handed to the table (bucketCorrectionLocked) - so each side's
+            // grid and table add up to one correction and the grid/table
+            // crossfade follows both continuously; a fully trusted grid that
+            // guarded no column has none.
             const std::vector<float>* tFrom = (from != nullptr && !from->table.empty()) ? &from->table : nullptr;
             const std::vector<float>* tTo = !to->table.empty() ? &to->table : nullptr;
             // Each table's per-column confidence gates the step: a large
             // change steps at the anchor only where both measurements are
             // sure of it (a near object arrived); matching noise on
             // featureless columns glides instead of jumping every 8 frames.
+            // (Under a grid the confidence already counts only the share of
+            // each column the table carries - bucketCorrectionLocked.)
             const std::vector<float>* cFrom =
                 (tFrom != nullptr && !from->tableConfidence.empty()) ? &from->tableConfidence : nullptr;
             const std::vector<float>* cTo = (tTo != nullptr && !to->tableConfidence.empty()) ? &to->tableConfidence
                                                                                              : nullptr;
+            // A side whose fully trusted grid carries every column has no
+            // table at all.  To the glide a missing table is a confident "no
+            // shift", so the other side's table would step in (or out) at the
+            // anchor while the grid glides - an over- or under-correction for
+            // the whole bucket, the pop at a bucket start.  That side's grid
+            // is its correction: it stands for a zero table of zero
+            // confidence, so the table glides as the grid does.
+            std::vector<float> gridSideZeros;
+            if (from != nullptr && from->grid && tFrom == nullptr && tTo != nullptr) {
+                gridSideZeros.assign(tTo->size(), 0.0f);
+                tFrom = &gridSideZeros;
+                cFrom = &gridSideZeros;
+            } else if (from != nullptr && to->grid && tTo == nullptr && tFrom != nullptr) {
+                gridSideZeros.assign(tFrom->size(), 0.0f);
+                tTo = &gridSideZeros;
+                cTo = &gridSideZeros;
+            }
             if (wantSeam && (tFrom != nullptr || tTo != nullptr)) {
                 if (from == nullptr) {
                     if (tTo != nullptr) {
