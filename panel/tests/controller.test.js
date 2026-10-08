@@ -290,6 +290,43 @@ test('a sequence switch racing an automatic pass is not reported as an error', a
     assert.equal(t.last().status.tone, 'error', 'a real failure is still reported');
 });
 
+test('a sequence switch racing the proxy step of an automatic pass stays quiet, and the clip is asked again', async () => {
+    const t = setup({ configure: (s) => { s.items.s1 = [osv('a')]; } });
+    // The proxy step: refuses once as a sequence switch, then attaches.
+    const calls = [];
+    let refuse = true;
+    t.adapter.attachProxies = async (seq, items) => {
+        calls.push(items.map((i) => i.projectItemId));
+        if (refuse) {
+            refuse = false;
+            throw new Error('the active sequence changed. Try again');
+        }
+        return { attached: items.length, already: 0, missing: 0, failed: 0, unsupported: 0, ambiguous: 0, errors: [] };
+    };
+    t.ctl.start();
+    await t.step(0);
+    t.s.items.s1.push(osv('new', 0, 500));
+    t.s.onEvent('track');
+    await t.step(1000);
+    assert.deepEqual(calls, [['pi-new']], 'the dropped clip was offered its proxy');
+    assert.equal(t.last().status.tone, 'ok', 'the switch is not an error');
+    assert.equal(t.last().status.text, 'Applied to 1 clip.', 'the effect summary alone is reported');
+    // The same master clip dropped again is asked again (its first attempt
+    // never ran), unlike one whose proxy step did run.
+    t.s.items.s1.push(osv('again', 1, 0, 'pi-new'), osv('other', 1, 500));
+    t.s.onEvent('track');
+    await t.step(1000);
+    assert.deepEqual(calls[1].slice().sort(), ['pi-new', 'pi-other'], 'the refused clip is asked again beside the new one');
+    assert.match(t.last().status.text, /Attached the \.LRF proxy to 2 clips\./);
+    // A real failure in the proxy step is still reported.
+    t.adapter.attachProxies = async () => { throw new Error('Premiere\'s script engine refused the call'); };
+    t.s.items.s1.push(osv('third', 1, 500));
+    t.s.onEvent('track');
+    await t.step(1000);
+    assert.equal(t.last().status.tone, 'error');
+    assert.match(t.last().status.text, /Couldn't attach the \.LRF proxy: Premiere's script engine refused the call/);
+});
+
 test('a missing effect is reported at start', async () => {
     const t = setup({ configure: (s) => { s.effectAvailable = false; } });
     t.ctl.start();

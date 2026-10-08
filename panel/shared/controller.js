@@ -394,6 +394,14 @@
                 .then(function (r) {
                     return core.summarizeProxies(r, 'auto');
                 }, function (err) {
+                    // The user switched sequence while this pass was looking:
+                    // the same harmless case the apply step keeps quiet above.
+                    // The switch itself triggers the next pass, which attaches
+                    // the proxies for whatever that sequence holds.
+                    if (/active sequence changed/i.test(messageOf(err))) {
+                        fresh.forEach(function (it) { proxyItems.delete(String(it.projectItemId)); });
+                        return null;
+                    }
                     return { tone: 'error', quiet: false,
                              text: 'Couldn\'t attach the .LRF proxy: ' + core.shortError(messageOf(err)) + '.' };
                 });

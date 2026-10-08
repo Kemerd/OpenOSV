@@ -701,10 +701,20 @@ struct GpuClipDecoder::Impl {
     ///     previous GOP.  When the two agree (every constant-rate file, every
     ///     GOP before a gap) both ends are the same sample.
     ///
+    ///   * Never continue from inside a run a lens cannot decode.  After a
+    ///     held frame is served the engine can sit exactly at the run's first
+    ///     sample (the held frame is the one before it); continuing from there
+    ///     would ask that lens to decode a picture it has already refused,
+    ///     fail the whole request, and send the importer to its host-path
+    ///     retry.  Restarting at the later lens start reaches the first frame
+    ///     after the run instead, which is the only target such a request can
+    ///     carry (requests inside the run are answered by holdFor before any
+    ///     decode is planned).
+    ///
     /// Engine owner only (or under the store mutex while the engine is idle).
     [[nodiscard]] std::uint32_t planStart(std::uint32_t target) const noexcept {
         const LensStarts starts = startsFor(target);
-        if (engineValid && engineNext <= target && starts.earliest <= engineNext) {
+        if (engineValid && engineNext <= target && starts.earliest <= engineNext && !inKnownRun(engineNext)) {
             return engineNext;
         }
         return starts.latest;
