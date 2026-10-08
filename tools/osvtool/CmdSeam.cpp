@@ -49,8 +49,9 @@ struct SeamOptions {
     /// the near object crossing the seam is the number that actually says
     /// whether the correction helps where it matters.
     std::string region;
-    /// Optional path prefix: write the per-lens bands (uncorrected and
-    /// corrected) as raw float32 planes for offline inspection.
+    /// Optional path prefix: write the per-lens bands as raw float32 planes
+    /// for offline inspection - "raw" (uncorrected), "table" (with the
+    /// --search table) and "parallax" (with the --parallax grid).
     std::string dumpBands;
     /// [WP-PHOTO] Measure the photometric seam field and score the sky seam
     /// (NEURAL_STITCHING.md table 1.4) for off / inset / rim / full, over the
@@ -462,18 +463,69 @@ int runSeam(const SeamOptions& o) {
     }
     out["alternatives"] = alt;
 
+    // The seam table, kept for the band dump and the parallax measurement.
+    std::vector<float> seamHold;
     if (o.search) {
         render::SeamSearchParams sp;
         auto profile = render::searchSeam(P.rig, pair.value(), P.blendParams, sp, *P.pool);
         if (profile.ok()) {
-            out["search"] = {{"meanNcc", profile.value().meanNcc},
-                             {"acceptedColumns", profile.value().acceptedColumns},
-                             {"columns", profile.value().columns},
-                             {"shiftDeg", profile.value().shiftDeg}};
-            auto after = render::overlapNcc(P.rig, pair.value(), P.blendParams, band, *P.pool, &profile.value().shiftDeg);
+            const render::SeamProfile& p = profile.value();
+            // The raw measurement is NaN where no shift could be scored:
+            // null in the JSON, which has no NaN.
+            nlohmann::json measured = nlohmann::json::array();
+            for (const float v : p.measuredDeg) {
+                measured.push_back(std::isfinite(v) ? nlohmann::json(v) : nlohmann::json());
+            }
+            out["search"] = {{"meanNcc", p.meanNcc},
+                             {"acceptedColumns", p.acceptedColumns},
+                             {"columns", p.columns},
+                             {"unmeasuredColumns", p.unmeasuredColumns},
+                             {"confidentColumns", p.confidentColumns},
+                             {"meanConfidence", p.meanConfidence},
+                             {"shiftDeg", p.shiftDeg},
+                             {"confidence", p.confidence},
+                             {"measuredDeg", measured}};
+            auto after = render::overlapNcc(P.rig, pair.value(), P.blendParams, band, *P.pool, &p.shiftDeg);
             if (after.ok()) {
                 out["nccAfterSearch"] = after.value();
             }
+            seamHold = p.shiftDeg;
+        } else {
+            out["searchError"] = profile.error().message;  // no "search" block: nothing was measured
+        }
+    }
+    const std::vector<float>* seamIn = seamHold.empty() ? nullptr : &seamHold;
+
+    // ---- --dump-bands: the per-lens bands as raw float32 planes ------------------
+    // "raw" is the uncorrected pair, "table" the same band with the seam
+    // table applied (when --search ran), "parallax" (below) with the grid on
+    // top of the table, as the composed corrections render.  Written on the
+    // ANALYSIS band (--parallax-band-deg), so a dump can be widened to show
+    // content beyond the scored band.
+    const auto writeBands = [&](const char* tag, const std::vector<float>* seamT, const render::WarpGridView* w) {
+        auto bands = render::renderLensBands(P.rig, pair.value(), P.blendParams, o.parallaxTuning.band, false, seamT,
+                                             *P.pool, w);
+        if (!bands.ok()) {
+            out["dumpError"] = bands.error().message;
+            return;
+        }
+        const render::LensBands& b = bands.value();
+        bool written = true;
+        for (int lens = 0; lens < 2; ++lens) {
+            const std::string stem = o.dumpBands + "_" + tag + "_";
+            const std::string suffix = std::to_string(lens) + ".f32";
+            written = writeRawPlane(stem + "luma" + suffix, b.luma[lens]) && written;
+            written = writeRawPlane(stem + "alpha" + suffix, b.alpha[lens]) && written;
+        }
+        if (!written) {
+            out["dumpError"] = std::string("could not write the ") + tag + " planes";
+        }
+        out["dump"] = {{"w", b.w}, {"h", b.h}, {"rowOffset", b.rowOffset}};
+    };
+    if (!o.dumpBands.empty()) {
+        writeBands("raw", nullptr, nullptr);
+        if (seamIn != nullptr) {
+            writeBands("table", seamIn, nullptr);
         }
     }
 
@@ -486,38 +538,16 @@ int runSeam(const SeamOptions& o) {
     if (o.parallax) {
         render::ParallaxWarpParams pw = o.parallaxTuning;
         pw.backend = backend;  // parsed (and validated) above
-        std::vector<float> seamHold;
-        const std::vector<float>* seamIn = nullptr;
-        if (o.search && out.contains("search")) {
-            seamHold = out["search"]["shiftDeg"].get<std::vector<float>>();
-            if (!seamHold.empty()) {
-                seamIn = &seamHold;
-            }
-        }
         const auto t0 = std::chrono::steady_clock::now();
         auto grid = render::buildParallaxWarp(P.rig, pair.value(), P.blendParams, pw, seamIn, *P.pool);
         const double buildMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         nlohmann::json pj;
         pj["buildMs"] = buildMs;
-        // Raw band dump: lens luma and coverage, without and with the warp.
-        // The uncorrected pair is written even when the grid was refused, since
-        // a refused grid is exactly the case worth looking at.
-        const auto dump = [&](const char* tag, const render::WarpGridView* w) {
-            // The ANALYSIS band (pw.band), so --parallax-band-deg can widen
-            // the dump to show content beyond the scored band.
-            auto bands = render::renderLensBands(P.rig, pair.value(), P.blendParams, pw.band, false, seamIn, *P.pool, w);
-            if (!bands.ok()) {
-                return;
-            }
-            const render::LensBands& b = bands.value();
-            for (int lens = 0; lens < 2; ++lens) {
-                writeRawPlane(o.dumpBands + "_" + tag + "_luma" + std::to_string(lens) + ".f32", b.luma[lens]);
-                writeRawPlane(o.dumpBands + "_" + tag + "_alpha" + std::to_string(lens) + ".f32", b.alpha[lens]);
-            }
-            pj["dump"] = {{"w", b.w}, {"h", b.h}, {"rowOffset", b.rowOffset}};
-        };
-        if (!o.dumpBands.empty()) {
-            dump("none", nullptr);
+        // The uncorrected pair ("raw", and "table" with --search) was dumped
+        // above, whether or not the grid is refused - a refused grid is
+        // exactly the case worth looking at.
+        if (out.contains("dump")) {
+            pj["dump"] = out["dump"];
         }
         if (grid.ok()) {
             const render::ParallaxWarpGrid& g = grid.value();
@@ -528,7 +558,7 @@ int runSeam(const SeamOptions& o) {
             view.latMinRad = g.latMinRad;
             view.latMaxRad = g.latMaxRad;
             if (!o.dumpBands.empty()) {
-                dump("parallax", &view);
+                writeBands("parallax", seamIn, &view);
                 writeRawPlane(o.dumpBands + "_grid.f32", g.uv);
             }
             pj["backend"] = render::flowBackendName(g.usedBackend);
@@ -635,9 +665,12 @@ int runSeam(const SeamOptions& o) {
             std::printf("  %-28s NCC %.4f\n", a["variant"].get<std::string>().c_str(), a["ncc"].get<double>());
         }
         if (out.contains("search")) {
-            std::printf("  seam search: meanNcc %.4f, accepted %u/%u columns, NCC after %.4f\n",
+            std::printf("  seam search: meanNcc %.4f, accepted %u/%u columns (%u confident, %u unmeasured, mean "
+                        "confidence %.3f), NCC after %.4f\n",
                         out["search"]["meanNcc"].get<double>(), out["search"]["acceptedColumns"].get<unsigned>(),
-                        out["search"]["columns"].get<unsigned>(), out.value("nccAfterSearch", -1.0));
+                        out["search"]["columns"].get<unsigned>(), out["search"]["confidentColumns"].get<unsigned>(),
+                        out["search"]["unmeasuredColumns"].get<unsigned>(),
+                        out["search"]["meanConfidence"].get<double>(), out.value("nccAfterSearch", -1.0));
         }
         if (out.contains("photo")) {
             const nlohmann::json& ph = out["photo"];
@@ -692,7 +725,9 @@ void registerSeamCommand(CLI::App& app, CommandContext& ctx) {
     sub->add_flag("--parallax", opt->parallax, "Also measure the 2-D optical-flow parallax correction");
     sub->add_option("--flow-backend", opt->flowBackend, "auto|classical|neural")->default_str("auto");
     sub->add_option("--region", opt->region, "Also score band columns c0-c1 (of 2048, wraps) with --parallax");
-    sub->add_option("--dump-bands", opt->dumpBands, "Write raw float32 lens bands to this path prefix (diagnostic)");
+    sub->add_option("--dump-bands", opt->dumpBands,
+                    "Write raw float32 lens bands to this path prefix: _raw_ (uncorrected), _table_ (with the "
+                    "--search table), _parallax_ (with the --parallax grid) (diagnostic)");
     // [WP-STEADY]
     sub->add_flag("--lens-align", opt->lensAlign,
                   "Fit the clip's lens rotation on its fixed rotation frames and fold it into the rig first");

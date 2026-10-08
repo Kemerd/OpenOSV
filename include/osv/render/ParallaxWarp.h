@@ -470,24 +470,40 @@ inline constexpr std::uint32_t kParallaxBucketFrames = 8;
 // So per column the glide weight t rises to 1 between kSeamTableGlideNoiseDeg
 // (below it the change is noise: a pure glide) and kSeamTableStepDeg (above
 // it the column steps to the new table at the anchor, as before the glide):
-//     t' = t + (1 - t) * smoothstep(noise, step, |to - from|)
-// A table changes smoothly along longitude (SeamSearchParams::smoothSigmaCols),
-// so t' does too, and the stepped and glided columns meet without a seam of
-// their own.  0.5 deg (2.8 px of a 2048 px equirect) is the top of the aerial
-// sample's bucket-to-bucket noise, so its tables glide as before; 1.5 deg
-// (8.5 px) of stale shift is what doubled the pole.  Measured with the step
-// metric (mean frame-to-frame change at bucket edges over the other frames,
-// seam band) with parallax off, plain glide -> this rule -> stepping:
+//     t' = t + (1 - t) * smoothstep(noise, step, |to - from|) * g
+// A table changes smoothly along longitude (the robust smoother in
+// searchSeam, SeamAnalysis.h), so t' does too, and the stepped and glided
+// columns meet without a seam of their own.  0.5 deg (2.8 px of a 2048 px
+// equirect) is the top of the aerial sample's bucket-to-bucket noise, so its
+// tables glide as before; 1.5 deg (8.5 px) of stale shift is what doubled
+// the pole.  Measured with the step metric (mean frame-to-frame change at
+// bucket edges over the other frames, seam band) with parallax off, plain
+// glide -> this rule -> stepping:
 //     day clip 3000-3095     1.25 -> 1.77 -> 2.70
 //     night clip 1200-1295   0.88 (the pole doubled) -> 1.03 -> 1.12
 // and the pole and a lamp arm are single again from the anchor on.  A
 // narrower band (0.25 / 0.75 deg) stepped more of the day clip (2.11) for no
 // visible gain on the night one.
+//
+// g is the CONFIDENCE gate: smoothstep(kSeamTableStepConfLo,
+// kSeamTableStepConfHi, min(confidence of the two columns)), with each
+// table's per-column confidence from SeamProfile::confidence.  A large
+// change between two confident measurements is a real one (the pole above)
+// and still steps; a large change where either measurement is unsure is
+// matching noise and glides.  Measured on the car-mounted day clip (LRF
+// 5872-5920) before the gate: 16 % of the columns jumped at every bucket
+// start (p99 3.4 deg in one frame, 0 % between bucket starts), and 99.9 % of
+// the columns that stepped had a confidence below 0.1 in one of the two
+// anchors.
 
 /// Below this per-column change (degrees) two buckets' tables glide fully.
 inline constexpr double kSeamTableGlideNoiseDeg = 0.5;
 /// Above this per-column change (degrees) the column steps to the new table.
 inline constexpr double kSeamTableStepDeg = 1.5;
+/// Below this confidence (the smaller of the two columns') a change never steps.
+inline constexpr double kSeamTableStepConfLo = 0.3;
+/// From this confidence on a large change steps fully.
+inline constexpr double kSeamTableStepConfHi = 0.6;
 
 /// Glide two seam tables for one frame into `out` (its capacity is reused).
 ///
@@ -501,8 +517,18 @@ inline constexpr double kSeamTableStepDeg = 1.5;
 /// `out` is left empty when neither side has a table.  `noiseDeg` >=
 /// `stepDeg` (or a non-finite threshold) disables the agreement test: a plain
 /// linear glide.
+///
+/// `fromConf` / `toConf` (optional) are the two tables' per-column
+/// confidences (SeamProfile::confidence) and gate the step: a column steps
+/// only as far as smoothstep(kSeamTableStepConfLo, kSeamTableStepConfHi,
+/// min(fromConf, toConf)) allows.  A side without a confidence vector (null,
+/// empty, or not the table's length) counts as fully confident - the
+/// behaviour before the gate - so a missing TABLE side, which is the exact
+/// "no shift", leaves the gate to the other side's confidence.  A non-finite
+/// confidence counts as 0 (glide), entries are clamped to [0, 1].
 void blendSeamTables(const std::vector<float>* from, const std::vector<float>* to, double t, std::vector<float>& out,
-                     double noiseDeg = kSeamTableGlideNoiseDeg, double stepDeg = kSeamTableStepDeg);
+                     double noiseDeg = kSeamTableGlideNoiseDeg, double stepDeg = kSeamTableStepDeg,
+                     const std::vector<float>* fromConf = nullptr, const std::vector<float>* toConf = nullptr);
 
 /// Convert a band flow field into the angular grid, without rendering.
 ///

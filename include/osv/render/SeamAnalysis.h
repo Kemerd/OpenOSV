@@ -26,6 +26,7 @@
 #include "osv/video/PlanarFrame.h"
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace osv::render {
@@ -82,26 +83,207 @@ Result<double> overlapNcc(const geom::LensRig& rig, const video::FramePair& fram
                           const BandParams& band, ThreadPool& pool, const std::vector<float>* seamTable = nullptr,
                           const WarpGridView* warp = nullptr);
 
+// ===========================================================================
+//  The seam-shift table: a per-column search, then a robust smoother
+// ===========================================================================
+//
+// searchSeam scans, for every band column, a +/- maxShiftPx row shift of
+// lens 1 against lens 0 and keeps the best normalised cross-correlation.
+// That raw measurement is only trustworthy where the column has something to
+// lock onto, so each column also gets a CONFIDENCE in [0, 1]:
+//
+//     w = sstep(confNccLo, confNccHi, best NCC)                 the match itself
+//       * sstep(confTextureLo, confTextureHi, texture)          something to match
+//       * sstep(confDistinctLo, confDistinctHi, best - second)  one clear peak
+//       * sstep(confCoverageLo, confCoverageHi, coverage)       enough of a window
+//
+// with sstep the smoothstep, "texture" the mean |d luma / d row| over the
+// matching window (after a 1-row Gaussian, the smaller of the two lenses,
+// covered pixels only), "second" the best score more than
+// kSeamDistinctGapRows rows away from the peak (the peak-ratio confidence of
+// Hu & Mordohai, TPAMI 2012) and "coverage" the co-visible fraction of the
+// unshifted window.  A smooth sky ramp correlates at almost any shift, so it
+// scores a high NCC but no texture and no distinct peak: w = 0.  A peak with
+// no scored shift on one side of it (at the search limit, or next to a shift
+// the co-visibility rule below refused) is not bracketed - the correlation
+// may still rise beyond it, the classic false match of a monotone score - so
+// it is recorded but earns no weight either.
+//
+// Co-visibility is part of the measurement.  A column whose UNSHIFTED window
+// holds fewer than unmeasuredFraction co-visible pixels is UNMEASURED and
+// not scored at all: on a car-mounted clip the calibration's occlusion
+// polygons leave a ~98 deg arc of the seam ring with no overlap, where the
+// only shifts that correlate pair different content across the polygon gap.
+// In a measured column a shift is scored only when it keeps at least
+// minCovalidFraction of the column's unshifted co-visible pixels, and a
+// column that rests on a thin overlap (the maintainer's sample has 14-19
+// co-visible rows of 68 along its selfie-stick arc) earns little weight.
+//
+// The table is then the solution of a confidence-weighted, robust Whittaker
+// smoother on the closed ring (Eilers, Anal. Chem. 2003; Huber IRLS):
+//
+//     (W + l2 D2'D2 + l1 D1'D1 + M) T = W m + M p
+//
+// with m the measured (parabolic-refined) shift, W = diag(w), D1 / D2 the
+// first and second differences along longitude, M = diag(priorWeight) and
+// p the prior (0, or an optional caller table).  Unmeasured columns more
+// than unmeasuredInheritDeg from a measured one are pinned to 0 exactly (see
+// unmeasuredPriorWeight), so nothing is ever interpolated across the arc;
+// the few inside that margin inherit a measured neighbour's value and fade
+// to the pin.  The kernel applies the table out to 12 deg from the seam, so
+// any noise along the seam bends a line that runs parallel to it; the
+// smoother is what keeps such lines straight.
+
+/// The second correlation peak counts only this many rows or more away from
+/// the best one (|s - s*| > 3): closer shifts are the same peak's shoulder.
+inline constexpr int kSeamDistinctGapRows = 3;
+
 struct SeamSearchParams {
     BandParams band;
     int maxShiftPx = 24;          ///< Search range in band rows (+/-).
     int windowHalfCols = 4;       ///< Half width of the matching window (columns).
-    double smoothSigmaCols = 8.0; ///< Gaussian smoothing of the profile along longitude.
-    double minNcc = 0.5;          ///< Columns below this correlation inherit their neighbours.
+    /// Columns whose best correlation stays below this are not counted as
+    /// accepted (SeamProfile::acceptedColumns / meanNcc) and carry no weight.
+    double minNcc = 0.5;
+
+    // ---- per-column confidence (smoothstep ramps, see above) -------------------
+    // Measured on a car-mounted day clip (LRF 5872-5920): only 21.7 % of the
+    // columns the old NCC >= 0.5 test accepted have w > 0.5, and 43 % of all
+    // columns were accepted with w < 0.1 - featureless sky with random peaks.
+    double confNccLo = 0.60;        ///< Best NCC giving w = 0.
+    double confNccHi = 0.85;        ///< Best NCC giving full weight.
+    double confTextureLo = 0.8e-3;  ///< Mean |d luma / d row| (D-Log M codes per row) giving w = 0.
+    double confTextureHi = 2.5e-3;  ///< ... giving full weight.
+    double confDistinctLo = 0.03;   ///< Best minus second peak giving w = 0.
+    double confDistinctHi = 0.10;   ///< ... giving full weight.
+    /// Co-visible fraction of the unshifted window ((2 windowHalfCols + 1) x
+    /// matched rows) giving w = 0, and full weight.  A match on a quarter of
+    /// its window rests on a quarter of the evidence, and its candidate
+    /// shifts are cut short on one side.  Measured on the maintainer's
+    /// sample (overlap NCC after the table, frame 0): without this ramp a
+    /// handful of such columns along the selfie-stick arc set the table to
+    /// -3 deg over 300 columns and the NCC fell from 0.897 to 0.842.
+    double confCoverageLo = 0.25;
+    double confCoverageHi = 0.50;
+
+    // ---- co-visibility -----------------------------------------------------------
+    /// In a measured column, a shift is scored only when its window keeps at
+    /// least this fraction of the co-visible pixels the column has unshifted.
+    /// Relative to the column's own support rather than the full window: a
+    /// thin-overlap column would otherwise lose the unshifted match itself
+    /// and keep only shifts that slide one lens's covered rows over the
+    /// other's - a one-sided candidate set, measured at -2.8 deg or below on
+    /// every such column of the sample.
+    double minCovalidFraction = 0.5;
+    /// A column whose unshifted window has fewer co-visible pixels than this
+    /// fraction of it is unmeasured: not scored, weight 0, and 0 in the table
+    /// (beyond unmeasuredInheritDeg).
+    double unmeasuredFraction = 0.25;
+    /// Bounded inheritance: an unmeasured column within this many degrees of
+    /// a measured one is not pinned but left free (weight 0, the plain prior
+    /// weight), so the smoother carries a near object's measured value a
+    /// short way into the arc and bends to 0 there - instead of bending the
+    /// measured side down to a pin at the arc's edge.
+    ///
+    /// 48 band columns of 2048: the ~32 columns the smoother itself carries
+    /// a value at the default priorWeight (below), plus a 16-column fade -
+    /// so the pin sits past the carry instead of inside it.  Measured on the
+    /// car clip's LRF 5872-5920, priorWeight 1e-3, band NCC after the table
+    /// (+/-4 deg, mean): with the pin at the arc's edge 0.9880 and the hood
+    /// beside the arc down from 0.969 to 0.934, 16 columns 0.9910, 32
+    /// columns 0.9919.  At priorWeight 2e-2 (osvtool seam nccAfterSearch,
+    /// mean; 0.5.0: 0.9899): 32 columns 0.9919, 48 columns 0.9922.  On LRF
+    /// 622 the 48-column margin keeps 0.16-0.23 deg more of the hood's
+    /// measured +2.45 deg at columns 1688-1694, and the arc past it is still
+    /// exactly 0.
+    double unmeasuredInheritDeg = 8.4375;
+
+    // ---- the robust smoother ---------------------------------------------------
+    /// Second-difference penalty at 2048 columns (scaled by (columns/2048)^4,
+    /// so the smoothness in degrees does not depend on the band width).
+    double smoothLambda2 = 2e4;
+    /// First-difference penalty at 2048 columns (scaled by (columns/2048)^2).
+    double smoothLambda1 = 2.0;
+    /// Pull of a measured column towards the prior: a featureless stretch of
+    /// the seam settles on the prior instead of drifting.
+    ///
+    /// It is the EVIDENCE FLOOR: a column must be about this confident (2 %)
+    /// before its measurement moves the table more than the prior holds it.
+    /// It also sets how far the smoother carries a value into featureless
+    /// neighbours: (smoothLambda2 / priorWeight)^(1/4) = 32 columns (5.6 deg)
+    /// at 2048 columns, the same reach as the arc's inheritance margin.
+    ///
+    /// 1e-3 let the far tails of the four confidence ramps steer the table -
+    /// barely textured sky, the 8K clip's 14-column overlap slivers inside
+    /// the mount arc (confidence <= 0.015), the sample's thin stick-arc
+    /// overlap - and carried a value 67 columns.  Measured, plug-in engine,
+    /// classical flow, 1e-3 -> 2e-2:
+    ///   * 8K day OSV 11772-11795, a lamp pole 7 deg beside the seam (whose
+    ///     sky columns inherited a confident -0.97 deg from an overpass):
+    ///     |bend| mean 0.20 -> 0.09 deg, max 0.42 -> 0.22 (no table: 0.10 /
+    ///     0.22); RMS 0.20 -> 0.19 px (no table 0.18);
+    ///   * maintainer sample, overlap NCC after the table, frames 0/32/64
+    ///     (0.5.0: 0.8970 / 0.8991 / 0.9058): 0.8997 / 0.9006 / 0.9024 ->
+    ///     0.9012 / 0.9020 / 0.9040;
+    ///   * proxy 5872-5920: overlap NCC after the table (nccAfterSearch,
+    ///     mean; 0.5.0: 0.9899) 0.9926 -> 0.9921 with the 48-column margin
+    ///     below, applied-table change at bucket starts p99 0.025 -> 0.026
+    ///     deg/frame.
+    /// The pole's bend is NOT monotonic in this weight (sweep, |bend| mean /
+    /// max: 1e-4 0.11 / 0.34, 1e-3 0.20 / 0.42, 5e-3 0.21 / 0.39, 1e-2 0.13 /
+    /// 0.32, 2e-2 0.09 / 0.22, 3e-2 0.20 / 0.38, 1e-1 0.79 / 1.03): it depends
+    /// on where the carried value's fade lands along a thin object in the
+    /// kernel's 6-12 deg taper, which no 1-D table can avoid everywhere.
+    double priorWeight = 2e-2;
+    /// Pull of an UNMEASURED column (beyond unmeasuredInheritDeg) towards 0.
+    /// +infinity (the default) pins it there exactly; a finite weight is a
+    /// soft pull, which lets the inherited value leak on into the arc, so it
+    /// exists for comparison only (test_seam.cpp measures the leak).
+    double unmeasuredPriorWeight = std::numeric_limits<double>::infinity();
+    double huberDeg = 0.3;    ///< Huber threshold of the IRLS reweighting (degrees).
+    int irlsIterations = 3;   ///< Solves (the first unweighted by Huber, then reweighted).
 };
 
 struct SeamProfile {
     std::uint32_t columns = 0;
-    std::vector<float> shiftDeg;  ///< Disparity per column in degrees (kernel seam table).
-    std::vector<float> ncc;       ///< Best correlation per column (before smoothing).
-    double meanNcc = 0.0;         ///< Mean of the accepted columns.
-    std::uint32_t acceptedColumns = 0;
+    std::vector<float> shiftDeg;    ///< Disparity per column in degrees (kernel seam table).
+    std::vector<float> ncc;         ///< Best correlation per column (0 where no shift could be scored).
+    /// Per-column confidence of the measurement, 0..1 (0: unmeasured, or
+    /// nothing to trust).  Carried with the table so a glide between two
+    /// buckets can tell a real change from noise (render::blendSeamTables).
+    std::vector<float> confidence;
+    /// The raw per-column measurement (parabolic-refined, degrees) the
+    /// smoother was fed; NaN where no shift could be scored.  Diagnostics.
+    std::vector<float> measuredDeg;
+    double meanNcc = 0.0;               ///< Mean best NCC of the accepted columns.
+    std::uint32_t acceptedColumns = 0;  ///< Measured columns with best NCC >= minNcc.
+    /// Columns without co-visible pixels (0 in the table beyond the
+    /// unmeasuredInheritDeg margin).
+    std::uint32_t unmeasuredColumns = 0;
+    std::uint32_t confidentColumns = 0;   ///< Columns with confidence >= 0.5.
+    double meanConfidence = 0.0;          ///< Mean confidence over all columns.
 };
 
 /// Per-column disparity search.  Positive values mean the same feature sits
 /// farther from both lens axes than the calibration predicts (near object).
+///
+/// `seamPrior` (optional) is the table a featureless measured column settles
+/// on instead of 0 - e.g. a clip-steady table.  It must have one entry per
+/// band column; a non-finite entry means "no prior here" (0).  Unmeasured
+/// columns ignore it (their prior is always 0).  A prior of the wrong size is
+/// ignored with a warning.
 Result<SeamProfile> searchSeam(const geom::LensRig& rig, const video::FramePair& frames,
-                               const geom::BlendParams& blend, const SeamSearchParams& params, ThreadPool& pool);
+                               const geom::BlendParams& blend, const SeamSearchParams& params, ThreadPool& pool,
+                               const std::vector<float>* seamPrior = nullptr);
+
+/// The search and the smoother on bands already rendered (searchSeam renders
+/// them first).  `bands` must hold the search band: maxShiftPx rows of
+/// padding above and below the matched rows.  Split out so the estimator can
+/// be tested on synthetic bands with no clip, decoder or renderer involved.
+/// `pool` (optional) splits the per-column search; the result is identical
+/// with or without it.
+Result<SeamProfile> searchSeamFromBands(const LensBands& bands, const SeamSearchParams& params,
+                                        ThreadPool* pool = nullptr, const std::vector<float>* seamPrior = nullptr);
 
 struct GainEstimate {
     Vec3d gain[2] = {Vec3d{1, 1, 1}, Vec3d{1, 1, 1}};  ///< Per-lens linear gains (slave, master).

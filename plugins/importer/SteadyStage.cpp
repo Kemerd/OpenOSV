@@ -185,8 +185,15 @@ void hashClipParams(Hasher& h, const render::ClipSteadyParams& p) noexcept {
     h.f64(p.seamSearch.band.bandHalfDeg);
     h.u64(static_cast<std::uint64_t>(p.seamSearch.maxShiftPx));
     h.u64(static_cast<std::uint64_t>(p.seamSearch.windowHalfCols));
-    h.f64(p.seamSearch.smoothSigmaCols);
-    h.f64(p.seamSearch.minNcc);
+    // The seam table's confidence and robust-smoother parameters (SeamAnalysis.h).
+    const render::SeamSearchParams& ss = p.seamSearch;
+    for (const double v : {ss.minNcc, ss.confNccLo, ss.confNccHi, ss.confTextureLo, ss.confTextureHi,
+                           ss.confDistinctLo, ss.confDistinctHi, ss.confCoverageLo, ss.confCoverageHi,
+                           ss.minCovalidFraction, ss.unmeasuredFraction, ss.unmeasuredInheritDeg, ss.smoothLambda2,
+                           ss.smoothLambda1, ss.priorWeight, ss.unmeasuredPriorWeight, ss.huberDeg}) {
+        h.f64(v);
+    }
+    h.u64(static_cast<std::uint64_t>(ss.irlsIterations));
     h.u64(p.carve.columns);
     for (const double v : {p.carve.narrowHalfWidthDeg, p.carve.wideHalfWidthDeg, p.carve.costWindowDeg,
                            p.carve.agreeResidual, p.carve.disagreeResidual, p.carve.edgeRampDeg}) {

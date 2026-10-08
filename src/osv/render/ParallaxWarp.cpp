@@ -1005,7 +1005,8 @@ ParallaxWarpGrid zeroParallaxGridLike(const ParallaxWarpGrid& like) {
 }
 
 void blendSeamTables(const std::vector<float>* from, const std::vector<float>* to, double t, std::vector<float>& out,
-                     double noiseDeg, double stepDeg) {
+                     double noiseDeg, double stepDeg, const std::vector<float>* fromConf,
+                     const std::vector<float>* toConf) {
     out.clear();
     // ---- inputs: the weight, which sides exist, the agreement band -----------
     t = std::isfinite(t) ? std::clamp(t, 0.0, 1.0) : 1.0;
@@ -1024,6 +1025,15 @@ void blendSeamTables(const std::vector<float>* from, const std::vector<float>* t
 
     // ---- per column ------------------------------------------------------------
     const std::size_t n = hasTo ? to->size() : from->size();
+    // A side's confidence is used only for a table that is used, and only
+    // when it has one entry per column; otherwise that side is "sure" and
+    // the gate is left to the other one (1 on both: the ungated rule).
+    const bool gateFrom = hasFrom && fromConf != nullptr && fromConf->size() == n;
+    const bool gateTo = hasTo && toConf != nullptr && toConf->size() == n;
+    const auto confAt = [](const std::vector<float>& conf, std::size_t i) {
+        const double c = static_cast<double>(conf[i]);
+        return std::isfinite(c) ? std::clamp(c, 0.0, 1.0) : 0.0;  // NaN: unsure, glide
+    };
     out.resize(n);
     for (std::size_t i = 0; i < n; ++i) {
         // Each side's shift at this column; a missing or non-finite side
@@ -1033,11 +1043,18 @@ void blendSeamTables(const std::vector<float>* from, const std::vector<float>* t
         a = std::isfinite(a) ? a : 0.0;
         b = std::isfinite(b) ? b : 0.0;
         // Where the two disagree by more than measurement noise the scene at
-        // the seam has changed: the newer table takes over (smoothstep).
+        // the seam has changed: the newer table takes over (smoothstep) -
+        // as far as both measurements are confident.  A large change that
+        // either side is unsure of is matching noise, and glides.
         double k = t;
         if (agreementTest) {
-            const double x = std::clamp((std::abs(b - a) - noiseDeg) / (stepDeg - noiseDeg), 0.0, 1.0);
-            k = t + (1.0 - t) * (x * x * (3.0 - 2.0 * x));
+            double x = std::clamp((std::abs(b - a) - noiseDeg) / (stepDeg - noiseDeg), 0.0, 1.0);
+            x = x * x * (3.0 - 2.0 * x);
+            if (gateFrom || gateTo) {
+                const double c = std::min(gateFrom ? confAt(*fromConf, i) : 1.0, gateTo ? confAt(*toConf, i) : 1.0);
+                x *= smoothstep01((c - kSeamTableStepConfLo) / (kSeamTableStepConfHi - kSeamTableStepConfLo));
+            }
+            k = t + (1.0 - t) * x;
         }
         const double v = a + (b - a) * k;
         out[i] = std::isfinite(v) ? static_cast<float>(v) : 0.0f;

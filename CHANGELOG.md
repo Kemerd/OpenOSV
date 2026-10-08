@@ -6,6 +6,42 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## 0.5.1 (unreleased)
+
+### Fixed
+
+* **Light poles beside the seam are straight again, and the seam no longer
+  jumps every eight frames.** Where the parallax warp is refused, which in
+  Premiere is most of a car-mounted clip, the seam-shift table is the whole
+  correction. It took a shift from every column that matched at all, so
+  featureless sky gave random shifts of up to ±4°, and they bent anything
+  running along the seam. Each column's match now carries a confidence (the
+  match, the texture under it, one clear, bracketed peak, and how much of the
+  window both lenses see), and the table is a robust, confidence-weighted
+  smooth of the measurements that only a column at least 2 % confident can
+  move. On the 8K day clip a lamp pole next to the seam goes from 2.85 px
+  RMS wobble (bends up to 15.5°) to 0.19 px and bends of at most 0.22°, the
+  same as with no table at all; on its proxy from 3.32 px to 1.01 px.
+* **The seam table no longer shifts what neither lens can match.** On a car
+  mount the occlusion polygons leave about 98° of the seam ring with no lens
+  overlap. The search used to accept chance matches there and spread them
+  across the whole arc, moving the car body near the cut by up to 1°. Those
+  columns now stay exactly where the calibration puts them, and a near object
+  measured beside the arc fades out over its first 8.4°. Known: with those
+  chance shifts gone, the lower roof edge where the car roof crosses the
+  mount-side seam steps by 2.6° (it was 1.5°, offset by accident); the upper
+  edge improves from 0.86° to 0.26°. That crossing has no lens overlap at
+  all, so no seam table can fix it.
+* **A table change steps at a bucket edge only when both measurements are
+  sure of it.** A near object arriving still switches at once; matching noise
+  glides. The applied table's per-frame change at bucket starts drops from
+  3.4° (p99) on 16 % of the columns to 0.04° on none, and the overlap match
+  after the table rises from 0.990 to 0.992 (NCC, proxy 5872-5920).
+* osvtool `seam --search --json` reports each column's confidence and raw
+  measurement and the unmeasured and confident column counts. `--dump-bands`
+  writes the uncorrected bands as `_raw_` and the table-corrected ones as
+  `_table_`; it used to label the corrected pair `_none_`.
+
 ## [0.5.0] - 2026-10-07
 
 8K and night footage, fixed at the cause. Built on a user's car-mounted 8K

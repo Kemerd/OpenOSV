@@ -840,6 +840,18 @@ private:
         /// The bucket's seam table where it has no grid (empty: none).  A copy
         /// (~8 KB), so a cache trim can never pull it from under the render.
         std::vector<float> table;
+        /// Per-column confidence of `table` (SeamProfile::confidence, same
+        /// length; empty with the table).  The glide steps a column to the
+        /// newer table only where both buckets' measurements are confident
+        /// (render::blendSeamTables).
+        std::vector<float> tableConfidence;
+    };
+
+    /// One bucket's cached seam table and the per-column confidence of the
+    /// measurement it came from (render::SeamProfile).
+    struct SeamTableEntry {
+        std::vector<float> shiftDeg;    ///< The table (degrees per band column).
+        std::vector<float> confidence;  ///< 0..1 per column, same length.
     };
 
     /// How far a per-bucket lookup may go to fill a missing measurement.
@@ -889,8 +901,8 @@ private:
     std::map<std::uint32_t, std::shared_ptr<const render::ParallaxWarpGrid>> m_standInGrids;
     /// Seams carved on a frame, or through a stand-in correction.  m_mutex.
     std::map<std::uint32_t, std::shared_ptr<const render::BlendSeam>> m_standInSeams;
-    /// Seam tables searched on a frame.  m_mutex.
-    std::map<std::uint32_t, std::vector<float>> m_standInTables;
+    /// Seam tables (with their confidence) searched on a frame.  m_mutex.
+    std::map<std::uint32_t, SeamTableEntry> m_standInTables;
     /// Exposure gains measured on a frame (Interactive, or a draft).  m_mutex.
     std::map<std::uint32_t, std::array<Vec3d, 2>> m_standInGains;
     static constexpr std::size_t kMaxStandInCache = 16;
@@ -1023,8 +1035,9 @@ private:
     /// so one measurement per kParallaxBucketFrames frames loses nothing and
     /// removes ~7/8 of the cost.  Bounded: entries beyond kMaxAnalysisCache
     /// are dropped (never the one being inserted) so a long timeline cannot
-    /// grow the instance without limit.
-    std::map<std::uint32_t, std::vector<float>> m_seamTables;
+    /// grow the instance without limit.  Each entry carries the per-column
+    /// confidence of its measurement for the glide (render::blendSeamTables).
+    std::map<std::uint32_t, SeamTableEntry> m_seamTables;
     /// Per-lens linear gains per bucket (gainMatch).  Exposure drifts even
     /// more slowly than the seam, so the same bucketing applies.
     std::map<std::uint32_t, std::array<Vec3d, 2>> m_gains;
