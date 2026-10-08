@@ -147,6 +147,33 @@ in the middle of an automatic pass, the panel says nothing: the switch starts
 the next pass itself. A clip that failed in an automatic pass isn't retried in
 a loop. The buttons retry.
 
+**The camera's .LRF as proxy.** The same pass attaches the `.LRF` beside each
+newly dropped `.OSV` as its master clip's proxy, once per master clip per
+project; **Attach .LRF proxies** does it for every OSV clip of the active
+sequence. `OsvCore.lrfCandidatesFor()` ranks where the `.LRF` can be (the same
+name, then the name without a `-<digits>` copy suffix: `CAM_..._D-001.OSV`
+beside `CAM_..._D.LRF`), which is the importer's own rule
+(`ImporterInstance::proxyFileFor`). An `.LRF` reached only through the copy
+suffix is taken when that `.OSV` is the one renamed copy in its folder
+(`OsvCore.countCopies`, the importer's `proxyOriginalFor` rule); two copies
+are ambiguous, the importer would leave the `.LRF` on its own timeline, and
+the panel attaches nothing. A master clip that has a proxy keeps it
+(`hasProxy()`); a new one is attached as the proxy and checked with
+`hasProxy()` again:
+
+* **UXP**: `ClipProjectItem.attachProxy(mediaPath, false, false)` (since 25.6,
+  `Promise<boolean>`, not undoable). Whether the `.LRF` exists, and the
+  folder's names for the one-copy rule, come from UXP's `fs` module (`lstat`,
+  `readdir`), which needs `localFileSystem: "fullAccess"` in the manifest;
+  without an answer the status line says so and nothing is attached.
+* **CEP**: `ProjectItem.attachProxy(mediaPath, 0)` (`0` = as the proxy;
+  "returns 0 if successful"), the file checked with ExtendScript's
+  `File(path).exists` and the folder listed with `Folder.getFiles()`.
+
+Quiet on a drop unless something was attached or failed; the button reports
+attached / had one / no `.LRF` beside it. See `docs/PREMIERE.md`, "The
+camera's .LRF as Premiere's proxy", for why Premiere takes it.
+
 ### The lens and drag sensitivity
 
 **DJI** is the effect's own default, so choosing it writes nothing.
@@ -541,6 +568,11 @@ Each of these is documented but hasn't been observed in Premiere yet:
     call but draws nothing, the tiles still carry their names.
 11. **CEP undo.** Measured against the Scripting Guide, not a live History
     panel: each `setValue` / `setValueAtKey` is expected to be its own step.
+12. **attachProxy.** Both routes follow Adobe's reference (UXP
+    `ClipProjectItem.attachProxy`, ExtendScript `ProjectItem.attachProxy`)
+    and are tested against mocks of it; the first live attach confirms the
+    return values. On UXP, Premiere may ask the user to allow the panel's
+    file access on install.
 
 ## Sources
 
@@ -553,7 +585,8 @@ Each of these is documented but hasn't been observed in Premiere yet:
   * [EventManager](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/eventmanager/)
   * [Constants](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/constants/) (`VideoTrackEvent`, `SequenceEvent`, `ProjectEvent`, `TrackItemType`)
   * [VideoTrack](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/videotrack/)
-  * [ClipProjectItem](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/clipprojectitem/) (`getComponentChain(mediaType)`: the master clip's effects)
+  * [ClipProjectItem](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/clipprojectitem/) (`getComponentChain(mediaType)`: the master clip's effects; `hasProxy`, `canProxy`, `attachProxy(mediaPath, isHiRes, inMakeAlternateLinkInTeamProjects)` -> `Promise<boolean>`, "Not undoable", since 25.6)
+  * ExtendScript [ProjectItem](https://ppro-scripting.docsforadobe.dev/item/projectitem/) (`attachProxy(mediaPath, isHiRes)`: "Returns 0 if successful", isHiRes 0 = proxy; `hasProxy()`, `canProxy()`)
   * [Sequence](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/sequence/) (`getPlayerPosition`, `getFrameSize`)
   * [Keyframe](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/keyframe/) (`position`) and [TickTime](https://developer.adobe.com/premiere-pro/uxp/ppro-reference/classes/ticktime/) (`createWithTicks`)
   * `Project.executeTransaction`: "Execute undoable transaction by passing compound action"

@@ -369,6 +369,28 @@ std::uint32_t ContainerSource::previousSync(std::uint32_t index) const noexcept 
     return listed;
 }
 
+std::optional<bool> ContainerSource::startsDecode(std::uint32_t index) const noexcept {
+    if (!m_impl || !m_impl->track || index >= m_impl->sampleCount) {
+        return std::nullopt;
+    }
+    try {
+        // The same header walk previousSync() trusts for a listed sync sample.
+        auto view = sample(index);
+        if (!view.ok()) {
+            return std::nullopt;
+        }
+        switch (decodeStartOf(view.value().bytes, nalLengthSize(), m_impl->codec)) {
+        case DecodeStart::Yes: return true;
+        case DecodeStart::No: return false;
+        case DecodeStart::Unknown: return std::nullopt;
+        }
+    } catch (...) {
+        // An allocation failure while building the message of a failed
+        // sample(): nothing is known.
+    }
+    return std::nullopt;
+}
+
 Result<SampleView> ContainerSource::sample(std::uint32_t index) const {
     if (!m_impl || !m_impl->track) {
         return Error{ErrorCode::InvalidArgument, "container source not open"};

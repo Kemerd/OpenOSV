@@ -129,6 +129,7 @@ function stubController(state) {
         setDragSensitivity(v) { calls.push(['setDragSensitivity', v]); },
         applySelected() { calls.push(['applySelected']); },
         applyAll() { calls.push(['applyAll']); },
+        attachProxies() { calls.push(['attachProxies']); },
         // [WP-EASING]
         setHintOpen(v) { calls.push(['setHintOpen', v]); },
         setEasing(v) { calls.push(['setEasing', v]); },
@@ -171,11 +172,11 @@ test('mount replaces the placeholder with the panel and renders the first state'
     assert.equal(shell.find('osv-status-text').textContent, 'Watching the timeline.');
     assert.equal(shell.find('osv-pill-text').textContent, 'Watching');
     const buttons = shell.findAll('osv-button');
-    // The auto-apply buttons come first; [WP-EASING] then the Manual Framing
+    // The auto-apply buttons and the .LRF proxy button come first; [WP-EASING] then the Manual Framing
     // presets and zoom stepper, the Keyframe Animation pair and the
     // Stabilisation apply.
     assert.deepEqual(buttons.map((b) => b.textContent), [
-        'Apply to selected clips', 'Apply to all OSV clips in this sequence',
+        'Apply to selected clips', 'Apply to all OSV clips in this sequence', 'Attach .LRF proxies',
         'Crystal Ball', 'Asteroid', 'Wide', 'Ultra Wide', 'Dewarp', '−', '+',
         'Apply to selected clips', 'Apply to all OSV clips in this sequence',
         'Apply to selected clips'
@@ -265,6 +266,27 @@ test('the buttons call the controller, and are inert while busy', () => {
     t.view.render(baseState({ host: 'error' }));
     all.fire('click');
     assert.equal(t.ctl.calls.length, 2, 'no host, no action');
+});
+
+test('the .LRF proxy button calls the controller and shows its own progress', () => {
+    const t = mount();
+    const buttons = t.shell.findAll('osv-button');
+    const proxies = buttons[2];
+    assert.equal(proxies.textContent, 'Attach .LRF proxies');
+    proxies.fire('click');
+    assert.deepEqual(t.ctl.calls, [['attachProxies']]);
+    // Its own run shows on it, and only on it.
+    t.view.render(baseState({ busy: true, busyAction: 'proxies', busyLabel: 'Attaching proxies...' }));
+    assert.equal(proxies.textContent, 'Attaching proxies...');
+    assert.equal(buttons[0].textContent, 'Apply to selected clips');
+    proxies.fire('click');
+    assert.equal(t.ctl.calls.length, 1, 'inert while busy');
+    // Another card's run leaves its label alone.
+    t.view.render(baseState({ busy: true, busyAction: 'apply', busyLabel: 'Applying to sequence...' }));
+    assert.equal(proxies.textContent, 'Attach .LRF proxies');
+    t.view.render(baseState({ host: 'error' }));
+    proxies.fire('click');
+    assert.equal(t.ctl.calls.length, 1, 'no host, no action');
 });
 
 test('the status line shows tone, text and a time stamp, and rises in', () => {
@@ -393,8 +415,8 @@ test('without SVG the tiles and the chevron fall back to text glyphs', () => {
 test('the Keyframe Animation buttons, the busy label on its own card, and the undo note on CEP', () => {
     const t = mount();
     const buttons = t.shell.findAll('osv-button');
-    const easeSel = buttons[9];
-    const easeAll = buttons[10];
+    const easeSel = buttons[10];
+    const easeAll = buttons[11];
     easeSel.fire('click');
     easeAll.fire('click');
     assert.deepEqual(t.ctl.calls, [['applyEasingSelected'], ['applyEasingAll']]);
@@ -420,10 +442,10 @@ test('Manual Framing: read-outs of the selected clip, preset chips and the zoom 
     assert.deepEqual(values, ['60.0°', '0.60', '12.3°', '-3.0°', '0.0°']);
     assert.equal(t.shell.findAll('osv-readout-label')[1].textContent, 'Correction');
     const buttons = t.shell.findAll('osv-button');
-    buttons[2].fire('click');                      // Crystal Ball
-    buttons[6].fire('keydown', { key: 'Enter' });  // Dewarp
-    buttons[7].fire('click');                      // zoom in (narrower)
-    buttons[8].fire('click');                      // zoom out (wider)
+    buttons[3].fire('click');                      // Crystal Ball
+    buttons[7].fire('keydown', { key: 'Enter' });  // Dewarp
+    buttons[8].fire('click');                      // zoom in (narrower)
+    buttons[9].fire('click');                      // zoom out (wider)
     assert.deepEqual(t.ctl.calls, [['framingPreset', 'crystal-ball'], ['framingPreset', 'dewarping'], ['zoomStep', -1],
                                    ['zoomStep', 1]]);
     // A new Zoom glides to its number on a spring.
@@ -444,8 +466,8 @@ test('Manual Framing with nothing to frame: the reason, dashes, and inert button
     assert.equal(t.shell.find('osv-zoom-value').textContent, '—');
     assert.ok(t.shell.findAll('osv-readout-value').every((v) => v.textContent === '—'));
     const buttons = t.shell.findAll('osv-button');
-    buttons[2].fire('click');
-    buttons[7].fire('click');
+    buttons[3].fire('click');
+    buttons[8].fire('click');
     assert.deepEqual(t.ctl.calls, []);
 });
 
@@ -491,7 +513,7 @@ test('Stabilisation: DJI Studio\'s two switches, both on, the entry they spell, 
         assert.ok(caption.textContent.indexOf(' ' + name + ' on ') !== -1, name);
     }
     // Apply.
-    const apply = t.shell.findAll('osv-button')[11];
+    const apply = t.shell.findAll('osv-button')[12];
     apply.fire('click');
     assert.deepEqual(t.ctl.calls[2], ['applyStabilization']);
     // A route that cannot reach Source Settings says so, and Apply is inert.

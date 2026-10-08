@@ -569,6 +569,10 @@ struct GpuClipDecoder::Impl {
     std::array<std::uint32_t, 2> openTracks{};   ///< Lens tracks (videoTrackIds).
     std::wstring openIdentity;                   ///< detail::fileIdentity at open (empty = unknown).
 
+    // ---- frames inside an undecodable run (UndecodableRun) ---------------------
+    std::mutex announceMutex;                    ///< Guards announcedRuns (acquire() runs on any thread).
+    std::vector<UndecodableRun> announcedRuns;   ///< Runs already logged by this decoder (once each).
+
     ~Impl() { shutdown(); }
 
     // -------------------------------------------------------------------------
@@ -1141,17 +1145,90 @@ struct GpuClipDecoder::Impl {
         store->cv.notify_all();
     }
 
-    /// First frame of the window that is not cached, or -1.
+    /// First frame of the window that is not cached, or -1.  Frames inside a
+    /// run a lens cannot decode are skipped: decoding toward them would only
+    /// fail again (a GOP of work each time), and requests for them are served
+    /// the held frame anyway (holdFor).
     [[nodiscard]] std::int64_t firstMissingAheadLocked() const noexcept {
         if (!aheadActive) {
             return -1;
         }
         for (std::uint32_t i = aheadBase + 1; i <= aheadEnd && i < frameCount; ++i) {
-            if (store->frameToSlot[i] < 0) {
+            if (store->frameToSlot[i] < 0 && !inKnownRun(i)) {
                 return i;
             }
         }
         return -1;
+    }
+
+    // -------------------------------------------------------------------------
+    //  Frames inside an undecodable run
+    // -------------------------------------------------------------------------
+
+    /// True when a lens decoder has met an undecodable run containing `index`
+    /// (HevcStreamDecoder::undecodableRun is thread-safe and takes only its
+    /// own leaf lock, so this may run under the store mutex).
+    [[nodiscard]] bool inKnownRun(std::uint32_t index) const noexcept {
+        return lens[0].undecodableRun(index).has_value() || lens[1].undecodableRun(index).has_value();
+    }
+
+    /// @brief The frame shown instead of `index` when a lens cannot decode it.
+    ///
+    /// The DualStreamReader rule (heldFrameFor): the last frame before the
+    /// earliest run around `index`, on both lenses, resolved again in case
+    /// another run covers it.
+    /// @param index  The frame asked for.
+    /// @param run    Receives the run that decided it.
+    /// @return The frame to serve instead, or std::nullopt.
+    [[nodiscard]] std::optional<std::uint32_t> holdFor(std::uint32_t index, UndecodableRun& run) const noexcept {
+        std::uint32_t target = index;
+        bool held = false;
+        for (int round = 0; round < 4; ++round) {
+            std::optional<std::uint32_t> next;
+            for (std::size_t l = 0; l < lens.size(); ++l) {
+                const std::optional<UndecodableRun> r = lens[l].undecodableRun(target);
+                if (!r) {
+                    continue;
+                }
+                const std::optional<std::uint32_t> h = heldFrameFor(*r, frameCount);
+                if (!h) {
+                    return std::nullopt;
+                }
+                if (!next || *h < *next) {
+                    next = *h;
+                    run = *r;
+                }
+            }
+            if (!next) {
+                break;
+            }
+            target = *next;
+            held = true;
+        }
+        if (!held) {
+            return std::nullopt;
+        }
+        return target;
+    }
+
+    /// Say once per run that its frames are served as `heldIndex`.
+    void announce(const UndecodableRun& run, std::uint32_t heldIndex) noexcept {
+        try {
+            {
+                std::lock_guard<std::mutex> lock(announceMutex);
+                for (const UndecodableRun& known : announcedRuns) {
+                    if (known.first == run.first && known.end == run.end) {
+                        return;
+                    }
+                }
+                announcedRuns.push_back(run);
+            }
+            log::warn("video/gpu: '{}': frames {}-{} cannot be decoded on one lens (they predict from a picture the "
+                      "file does not contain); frame {} of both lenses is served in their place",
+                      log::safe(openPath.filename().string()), run.first, run.end - 1u, heldIndex);
+        } catch (...) {
+            // A log line is never worth a frame.
+        }
     }
 
     /// The worker's wake-up predicate.
@@ -1636,8 +1713,47 @@ Result<GpuFrameLease> GpuClipDecoder::acquire(std::uint32_t frameIndex) {
             return Error{ErrorCode::InvalidArgument, "decoder not open"};
         }
         Impl& impl = *m_impl;
-        detail::GpuFrameStore& s = *impl.store;
         if (frameIndex >= impl.frameCount) {
+            return Error{ErrorCode::InvalidArgument, "frame " + std::to_string(frameIndex) + " out of range (" +
+                                                         std::to_string(impl.frameCount) + " frames)"};
+        }
+        // ---- a frame inside a run a lens already met ------------------------------
+        // Served as the frame before the run (both lenses, one instant): no
+        // decode, usually a cache hit.  The access is noted as the frame the
+        // host asked for, so playing through the run still reads as playing.
+        UndecodableRun run;
+        if (const std::optional<std::uint32_t> held = impl.holdFor(frameIndex, run)) {
+            impl.announce(run, *held);
+            return acquireExact(*held, frameIndex);
+        }
+        Result<GpuFrameLease> lease = acquireExact(frameIndex, frameIndex);
+        if (lease.ok()) {
+            return lease;
+        }
+        // ---- a run met by THIS request -----------------------------------------------
+        // The lens decoder that crossed it remembered it while failing; the
+        // request is served the held frame instead of failing (every frame on
+        // the way to the run was cached, so this is normally a cache hit).
+        if (const std::optional<std::uint32_t> held = impl.holdFor(frameIndex, run)) {
+            impl.announce(run, *held);
+            return acquireExact(*held, frameIndex);
+        }
+        return lease;
+    } catch (const std::exception& e) {
+        return Error{ErrorCode::Internal, std::string("GpuClipDecoder::acquire: ") + e.what()};
+    } catch (...) {
+        return Error{ErrorCode::Internal, "GpuClipDecoder::acquire: unknown failure"};
+    }
+}
+
+Result<GpuFrameLease> GpuClipDecoder::acquireExact(std::uint32_t frameIndex, std::uint32_t requested) {
+    try {
+        if (!m_impl || !m_impl->store) {
+            return Error{ErrorCode::InvalidArgument, "decoder not open"};
+        }
+        Impl& impl = *m_impl;
+        detail::GpuFrameStore& s = *impl.store;
+        if (frameIndex >= impl.frameCount || requested >= impl.frameCount) {
             return Error{ErrorCode::InvalidArgument, "frame " + std::to_string(frameIndex) + " out of range (" +
                                                          std::to_string(impl.frameCount) + " frames)"};
         }
@@ -1650,7 +1766,8 @@ Result<GpuFrameLease> GpuClipDecoder::acquire(std::uint32_t frameIndex) {
         if (impl.stopping) {
             return Error{ErrorCode::Internal, "decoder is shutting down"};
         }
-        impl.noteAccessLocked(frameIndex);
+        // Sequential detection follows what the host ASKED for.
+        impl.noteAccessLocked(requested);
         bool waited = false;
         for (;;) {
             // ---- cached: pin and go ------------------------------------------
@@ -1703,9 +1820,9 @@ Result<GpuFrameLease> GpuClipDecoder::acquire(std::uint32_t frameIndex) {
         guard.release();
         return impl.makeLease(std::move(pin), frameIndex, LeaseSource::Decoded);
     } catch (const std::exception& e) {
-        return Error{ErrorCode::Internal, std::string("GpuClipDecoder::acquire: ") + e.what()};
+        return Error{ErrorCode::Internal, std::string("GpuClipDecoder::acquireExact: ") + e.what()};
     } catch (...) {
-        return Error{ErrorCode::Internal, "GpuClipDecoder::acquire: unknown failure"};
+        return Error{ErrorCode::Internal, "GpuClipDecoder::acquireExact: unknown failure"};
     }
 }
 

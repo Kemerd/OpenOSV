@@ -109,6 +109,49 @@ struct DecodedFrameInfo {
     std::int64_t gopDamagedAt = -1;
 };
 
+/// @brief A run of samples of one track that no decoder can produce.
+///
+/// A camera that drops frames while recording can drop one lens's IDR
+/// picture with them.  Every picture of that lens up to its next random
+/// access point still predicts from the lost one, so a decoder - FFmpeg's
+/// software HEVC decoder, D3D11VA and NVDEC alike - refuses each of them and
+/// produces nothing until that next random access point.  Measured on a night
+/// recording: lens 0 lost its IDR in a two-frame gap at sample 12550, and its
+/// samples 12550-12598 decode on no path; the other lens kept its own IDR.
+///
+/// HevcStreamDecoder finds a run the first time a decode crosses it (see
+/// undecodableRun()); the pair readers then show the last frame before it in
+/// its place (heldFrameFor()).
+struct UndecodableRun {
+    std::uint32_t first = 0;  ///< First sample of the run.
+    std::uint32_t end = 0;    ///< One past its last sample: the random access picture decoding resumes at.
+
+    /// True when `index` lies inside the run.
+    [[nodiscard]] bool contains(std::uint32_t index) const noexcept { return index >= first && index < end; }
+};
+
+/// @brief The frame a pair reader shows for a request inside `run`.
+///
+/// The last frame before the run - the moment the lens lost its picture -
+/// for BOTH lenses, so the two halves of the stitch stay one instant and the
+/// seam analyses never compare pictures taken at different times.  A run
+/// that starts at frame 0 has nothing before it and is shown as the frame it
+/// ends at instead.
+///
+/// @param run         The undecodable run the request fell into.
+/// @param frameCount  Frames in the clip (the held frame must exist).
+/// @return The frame to show, or std::nullopt when neither neighbour exists.
+[[nodiscard]] inline std::optional<std::uint32_t> heldFrameFor(const UndecodableRun& run,
+                                                               std::uint32_t frameCount) noexcept {
+    if (run.first > 0 && run.first - 1u < frameCount) {
+        return run.first - 1u;
+    }
+    if (run.end < frameCount) {
+        return run.end;
+    }
+    return std::nullopt;
+}
+
 /// @brief Content fingerprint of a decoded picture, for per-frame log lines.
 ///
 /// CRC-64/XZ (osv/core/Crc64.h) over every 4th row of luma, then every 4th
@@ -202,7 +245,24 @@ public:
     /// property of the file that every decoder reproduces, never a reason to
     /// leave hardware decoding).  A flagged SOFTWARE picture is still
     /// returned, with a warning: there is no better decoder to ask.
+    ///
+    /// A frame inside an undecodable run (UndecodableRun: its picture
+    /// predicts from one the file does not contain) is a Timing error too,
+    /// naming the run.  The first request that crosses the run finds it and
+    /// logs it once; every later request inside it fails at once, without
+    /// decoding anything and without moving the decoder.
     Result<PlanarFrame16> decodeFrame(std::uint32_t index);
+
+    /// @brief The undecodable run this decoder has met that contains `index`.
+    ///
+    /// Runs are found by decoding (a decode that crosses one sees the decoder
+    /// skip from the last picture before it straight to the random access
+    /// picture after it) and are a property of the file, so they are kept for
+    /// the decoder's life.  Thread-safe: may be called while another thread
+    /// decodes with this decoder.
+    /// @param index  A frame (sample) index.
+    /// @return The run, or std::nullopt when none known contains `index`.
+    [[nodiscard]] std::optional<UndecodableRun> undecodableRun(std::uint32_t index) const noexcept;
 
     /// What libavcodec reported about the last picture decodeFrame() / next()
     /// returned or refused; std::nullopt before the first one.

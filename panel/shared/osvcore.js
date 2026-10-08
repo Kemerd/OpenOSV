@@ -319,6 +319,160 @@
     }
 
     /* ======================================================================
+     *  The camera's .LRF beside an .OSV (Premiere's proxy of it)
+     * ====================================================================== */
+
+    /**
+     * Where the camera's .LRF of an .OSV can be, best first.
+     *
+     * The camera writes CAM_..._D.LRF beside CAM_..._D.OSV.  A download or a
+     * copy into the same folder can rename the .OSV alone, adding a
+     * "-<digits>" suffix (seen on a user's pairs: CAM_..._D-001.OSV beside
+     * CAM_..._D.LRF), so for such a name the stem without the suffix is
+     * tried after the stem itself.  Both spellings of the extension are
+     * listed, for a case-sensitive volume.  This is the importer's own rule
+     * (ImporterInstance::proxyFileFor); the importer presents the .LRF on the
+     * .OSV's timeline exactly when it finds the pair the same way.
+     *
+     * @param {*} path  the .OSV's media path; anything else gives [].
+     * @returns {string[]} candidate .LRF paths in the same folder.
+     */
+    function lrfCandidatesFor(path) {
+        if (!isOsvMediaPath(path)) {
+            return [];
+        }
+        var p = path.replace(/\u0000+$/, '').trim();
+        var cut = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+        var folder = p.substring(0, cut + 1);
+        var name = p.substring(cut + 1);
+        var dot = name.lastIndexOf('.');
+        // Only an .OSV has a proxy (an .LRF IS one).
+        if (name.substring(dot + 1).toLowerCase() !== 'osv') {
+            return [];
+        }
+        var stem = name.substring(0, dot);
+        var stems = [stem];
+        // "-" plus one to four digits, with something before it.
+        var copy = /^(.+)-[0-9]{1,4}$/.exec(stem);
+        if (copy) {
+            stems.push(copy[1]);
+        }
+        var out = [];
+        for (var i = 0; i < stems.length; i += 1) {
+            out.push(folder + stems[i] + '.LRF');
+            out.push(folder + stems[i] + '.lrf');
+        }
+        return out;
+    }
+
+    /** How many lrfCandidatesFor() entries come from the .OSV's own name. */
+    var LRF_EXACT_CANDIDATES = 2;
+
+    /**
+     * The copy-suffix reading of an .OSV path: {folder, base} when its stem
+     * ends in "-" plus one to four digits after something (CAM_..._D-001),
+     * else null.  `folder` keeps its trailing separator.
+     *
+     * @param {*} path  the .OSV's media path.
+     * @returns {{folder: string, base: string}|null}
+     */
+    function copySuffixOf(path) {
+        if (!isOsvMediaPath(path)) {
+            return null;
+        }
+        var p = path.replace(/\u0000+$/, '').trim();
+        var cut = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+        var name = p.substring(cut + 1);
+        var dot = name.lastIndexOf('.');
+        if (name.substring(dot + 1).toLowerCase() !== 'osv') {
+            return null;
+        }
+        var copy = /^(.+)-[0-9]{1,4}$/.exec(name.substring(0, dot));
+        return copy ? { folder: p.substring(0, cut + 1), base: copy[1] } : null;
+    }
+
+    /**
+     * How many of `names` (file names in one folder) are an .OSV named
+     * `base` plus a copy suffix - the importer's test for an unambiguous
+     * pair (ImporterInstance::proxyOriginalFor): exactly one, or the .LRF
+     * stays on its own timeline and must not become a proxy.  The stem is
+     * compared exactly, the extension in any case.
+     *
+     * @param {*} names  file names (anything else counts nothing).
+     * @param {string} base  the stem without the suffix.
+     * @returns {number}
+     */
+    function countCopies(names, base) {
+        if (!Array.isArray(names) || !isNonEmptyString(base)) {
+            return 0;
+        }
+        var n = 0;
+        for (var i = 0; i < names.length; i += 1) {
+            var m = typeof names[i] === 'string' ? /^(.+)-[0-9]{1,4}\.osv$/i.exec(names[i]) : null;
+            if (m && m[1] === base) {
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    /**
+     * The status line for an "attach the .LRF proxies" pass.
+     *
+     * @param {object} r  { attached, already, missing, failed, unsupported,
+     *                      ambiguous, noFileAccess, errors[] } from an adapter.
+     * @param {string} context  'auto' (a drop: quiet unless something was
+     *                          attached or failed) or 'all' (the button).
+     * @returns {{tone: string, text: string, quiet: boolean}}
+     */
+    function summarizeProxies(r, context) {
+        var res = (r !== null && typeof r === 'object') ? r : {};
+        var attached = Math.max(0, Number(res.attached) || 0);
+        var already = Math.max(0, Number(res.already) || 0);
+        var missing = Math.max(0, Number(res.missing) || 0);
+        var failed = Math.max(0, Number(res.failed) || 0);
+        var unsupported = Math.max(0, Number(res.unsupported) || 0);
+        var ambiguous = Math.max(0, Number(res.ambiguous) || 0);
+        var errors = Array.isArray(res.errors) ? res.errors : [];
+        var auto = context === 'auto';
+        if (failed > 0) {
+            var detail = errors.length > 0 ? ': ' + shortError(String(errors[0])) : '';
+            return { tone: 'error', quiet: false,
+                     text: 'Couldn\'t attach the .LRF proxy to ' + plural(failed, 'clip', 'clips') + detail + '.' };
+        }
+        if (ambiguous > 0) {
+            return { tone: 'warn', quiet: false,
+                     text: 'Several copies of ' + plural(ambiguous, 'recording', 'recordings') +
+                           ' share one .LRF, so no proxy went on. Keep one copy per folder.' };
+        }
+        if (res.noFileAccess === true && attached === 0) {
+            return { tone: 'warn', quiet: auto,
+                     text: 'This panel can\'t look for .LRF files. Use Proxy > Attach Proxies.' };
+        }
+        if (attached > 0) {
+            var tail = already > 0 ? ' ' + plural(already, 'clip', 'clips') + ' had one.' : '';
+            return { tone: 'ok', quiet: false,
+                     text: 'Attached the .LRF proxy to ' + plural(attached, 'clip', 'clips') + '.' + tail };
+        }
+        if (auto) {
+            return { tone: 'info', quiet: true, text: '' };
+        }
+        if (unsupported > 0 && already === 0 && missing === 0) {
+            return { tone: 'warn', quiet: false, text: 'This Premiere can\'t attach proxies from a panel.' };
+        }
+        if (already > 0 && missing === 0) {
+            return { tone: 'info', quiet: false,
+                     text: already === 1 ? 'The OSV clip already has its proxy.'
+                         : 'All ' + already + ' OSV clips already have their proxies.' };
+        }
+        if (missing > 0) {
+            return { tone: 'info', quiet: false,
+                     text: 'No .LRF beside ' + plural(missing, 'OSV clip', 'OSV clips') + '.' };
+        }
+        return { tone: 'info', quiet: false, text: 'No OSV clips in this sequence.' };
+    }
+
+    /* ======================================================================
      *  "Already has the effect"
      * ====================================================================== */
 
@@ -1636,6 +1790,11 @@
         DRAG: DRAG,
         LENS: LENS,
         isOsvMediaPath: isOsvMediaPath,
+        lrfCandidatesFor: lrfCandidatesFor,
+        LRF_EXACT_CANDIDATES: LRF_EXACT_CANDIDATES,
+        copySuffixOf: copySuffixOf,
+        countCopies: countCopies,
+        summarizeProxies: summarizeProxies,
         normaliseMatchName: normaliseMatchName,
         isReframeMatchName: isReframeMatchName,
         countReframeEffects: countReframeEffects,

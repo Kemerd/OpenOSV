@@ -285,7 +285,10 @@ Source Settings.
    sequences.
 4. **Drop your `.OSV`** on the timeline. **Open 360 Reframe goes on by
    itself.** For clips that were already there, press **Apply to all OSV clips
-   in this sequence**.
+   in this sequence**. The camera's `.LRF` beside it is attached as its proxy
+   on the same drop (**Attach .LRF proxies** does it for clips already
+   there): switch **Toggle Proxies** on in the Program Monitor to edit on the
+   light file. Export always uses the `.OSV`.
 5. **Select the clip**, then click **Open 360 Reframe** in Effect Controls.
    The Program Monitor overlay only appears while the effect is selected.
 6. **Drag the picture** to aim the camera (see [Controls](#controls)).

@@ -77,7 +77,7 @@
         title: 'OpenOSV',
         subtitle: 'Open 360 Reframe on every OSV drop.',
         autoLabel: 'Auto-apply to OSV clips',
-        autoCaption: 'Drop an .OSV or .LRF on the timeline. The reframe goes on by itself.',
+        autoCaption: 'Drop an .OSV or .LRF on the timeline. The reframe goes on by itself, and an .OSV gets its .LRF as proxy.',
         section: 'New effects start with',
         lensLabel: 'Lens',
         dragLabel: 'Drag sensitivity',
@@ -85,6 +85,8 @@
         dragCaptionOn: 'How fast a Program Monitor drag turns the view.',
         applySelected: 'Apply to selected clips',
         applyAll: 'Apply to all OSV clips in this sequence',
+        // The camera's .LRF as each .OSV's proxy (Toggle Proxies plays it).
+        attachProxies: 'Attach .LRF proxies',
         pillOn: 'Watching',
         pillOff: 'Off',
         // [WP-EASING] The Program Monitor controls card: one line per
@@ -950,6 +952,11 @@
                                   function () { controller.applyAll(); });
         actions.appendChild(applySelected.node);
         actions.appendChild(applyAll.node);
+        // The camera's .LRF beside each .OSV becomes its proxy (auto-apply does
+        // this for every drop; the button catches the clips already there).
+        var attachProxies = makeButton('btnProxies', 'osv-button-secondary', COPY.attachProxies,
+                                       function () { controller.attachProxies(); });
+        actions.appendChild(attachProxies.node);
         shell.appendChild(actions);
 
         // ---- [WP-EASING] Manual Framing --------------------------------------
@@ -1200,6 +1207,8 @@
                 ? busyText : COPY.applySelected);
             applyAll.setLabel(running === 'apply' && busyText.indexOf('sequence') !== -1
                 ? busyText : COPY.applyAll);
+            attachProxies.setEnabled(usable);
+            attachProxies.setLabel(running === 'proxies' && busyText.length > 0 ? busyText : COPY.attachProxies);
 
             // [WP-EASING] The Program Monitor controls card.
             if (first || rendered.settings.hintOpen !== s.hintOpen) {

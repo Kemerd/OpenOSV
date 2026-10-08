@@ -53,6 +53,7 @@
 #include <cwctype>
 #include <exception>
 #include <format>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -1307,25 +1308,113 @@ double ImporterInstance::fps() const noexcept {
 //  [PROXY] An .LRF presented as the proxy of its .OSV
 // ---------------------------------------------------------------------------
 
+namespace {
+
+/// @brief A file stem without a "-<digits>" copy suffix, or empty.
+///
+/// "CAM_20260122163617_0007_D-001" -> "CAM_20260122163617_0007_D".  The
+/// camera names an .OSV and its .LRF alike, but a download, a cloud copy or
+/// a second copy into the same folder adds such a suffix to the .OSV only
+/// (seen on a user's pair: CAM_..._D-001.OSV beside CAM_..._D.LRF).  One to
+/// four digits after the last '-', and something before it; anything else
+/// has no suffix.
+/// @param stem  The file name without its extension.
+/// @return The stem without the suffix, or empty when it carries none.
+[[nodiscard]] std::wstring stemWithoutCopySuffix(const std::wstring& stem) {
+    const std::size_t dash = stem.rfind(L'-');
+    if (dash == std::wstring::npos || dash == 0) {
+        return {};
+    }
+    const std::size_t digits = stem.size() - dash - 1u;
+    if (digits < 1u || digits > 4u) {
+        return {};
+    }
+    for (std::size_t i = dash + 1u; i < stem.size(); ++i) {
+        if (stem[i] < L'0' || stem[i] > L'9') {
+            return {};
+        }
+    }
+    return stem.substr(0, dash);
+}
+
+/// Lower-case extension of `path` including the dot (L"" when none).
+[[nodiscard]] std::wstring lowerExtension(const std::filesystem::path& path) {
+    std::wstring ext = path.extension().wstring();
+    for (wchar_t& c : ext) {
+        c = static_cast<wchar_t>(std::towlower(c));
+    }
+    return ext;
+}
+
+/// @brief The frame whose moment a lens pair's pictures show.
+///
+/// The pair readers serve a frame inside a run one lens cannot decode as the
+/// frame before the run (video::heldFrameFor): its pictures - and so the
+/// camera attitude that levels them - are that frame's, not the one asked
+/// for, and stabilising the held pictures with each requested frame's
+/// attitude would turn a still picture.  Such a pair says so: its index and
+/// both lens frames name the frame shown.  Every other pair carries the
+/// requested index and is left as it is.
+/// @param requested  The source frame the render was asked for.
+/// @param pair       The pair the reader returned for it.
+/// @return The frame to take per-frame metadata (the attitude) from.
+[[nodiscard]] std::uint32_t shownFrameOf(std::uint32_t requested, const video::FramePair& pair) noexcept {
+    if (pair.index != requested && pair.lens[0].frameIndex == pair.index &&
+        pair.lens[1].frameIndex == pair.index) {
+        return pair.index;
+    }
+    return requested;
+}
+
+/// `folder / (stem + ext)` for each of the two spellings of `exts`, the
+/// first that is an existing regular file; empty when neither is.
+[[nodiscard]] std::filesystem::path existingSibling(const std::filesystem::path& folder, const std::wstring& stem,
+                                                    std::initializer_list<const wchar_t*> exts) {
+    for (const wchar_t* ext : exts) {
+        const std::filesystem::path candidate = folder / (stem + ext);
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(candidate, ec) && !ec) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
+}  // namespace
+
 std::filesystem::path ImporterInstance::proxyOriginalFor(const std::filesystem::path& path) {
     try {
         // Only an .LRF has an original; the extension in any case.
-        std::wstring ext = path.extension().wstring();
-        for (wchar_t& c : ext) {
-            c = static_cast<wchar_t>(std::towlower(c));
-        }
-        if (ext != L".lrf") {
+        if (lowerExtension(path) != L".lrf") {
             return {};
         }
         // The camera names the pair alike: CAM_..._D.LRF beside CAM_..._D.OSV.
         // Both spellings are tried, for a case-sensitive volume.
-        for (const wchar_t* candidateExt : {L".OSV", L".osv"}) {
-            std::filesystem::path candidate = path;
-            candidate.replace_extension(candidateExt);
-            std::error_code ec;
-            if (std::filesystem::is_regular_file(candidate, ec) && !ec) {
-                return candidate;
+        const std::filesystem::path folder = path.parent_path();
+        const std::wstring stem = path.stem().wstring();
+        if (std::filesystem::path same = existingSibling(folder, stem, {L".OSV", L".osv"}); !same.empty()) {
+            return same;
+        }
+        // ---- an .OSV whose name gained a copy suffix (CAM_..._D-001.OSV) -------
+        // Only when there is exactly one: two copies of a recording, or two
+        // chapters, beside one .LRF are not this importer's to choose between.
+        std::filesystem::path found;
+        std::size_t matches = 0;
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(folder, ec), end; !ec && it != end; it.increment(ec)) {
+            const std::filesystem::path& candidate = it->path();
+            if (lowerExtension(candidate) != L".osv") {
+                continue;
             }
+            const std::wstring base = stemWithoutCopySuffix(candidate.stem().wstring());
+            std::error_code fileEc;
+            if (base == stem && std::filesystem::is_regular_file(candidate, fileEc) && !fileEc) {
+                found = candidate;
+                ++matches;
+            }
+        }
+        if (matches == 1u) {
+            return found;
         }
     } catch (...) {
         // A path the filesystem library cannot handle has no original.
@@ -1336,22 +1425,19 @@ std::filesystem::path ImporterInstance::proxyOriginalFor(const std::filesystem::
 std::filesystem::path ImporterInstance::proxyFileFor(const std::filesystem::path& path) {
     try {
         // Only an .OSV has a proxy; the extension in any case.
-        std::wstring ext = path.extension().wstring();
-        for (wchar_t& c : ext) {
-            c = static_cast<wchar_t>(std::towlower(c));
-        }
-        if (ext != L".osv") {
+        if (lowerExtension(path) != L".osv") {
             return {};
         }
         // proxyOriginalFor()'s rule the other way round: the camera names the
         // pair alike, and both spellings are tried for a case-sensitive volume.
-        for (const wchar_t* candidateExt : {L".LRF", L".lrf"}) {
-            std::filesystem::path candidate = path;
-            candidate.replace_extension(candidateExt);
-            std::error_code ec;
-            if (std::filesystem::is_regular_file(candidate, ec) && !ec) {
-                return candidate;
-            }
+        const std::filesystem::path folder = path.parent_path();
+        const std::wstring stem = path.stem().wstring();
+        if (std::filesystem::path same = existingSibling(folder, stem, {L".LRF", L".lrf"}); !same.empty()) {
+            return same;
+        }
+        // An .OSV renamed with a copy suffix keeps the camera's .LRF name.
+        if (const std::wstring base = stemWithoutCopySuffix(stem); !base.empty()) {
+            return existingSibling(folder, base, {L".LRF", L".lrf"});
         }
     } catch (...) {
         // A path the filesystem library cannot handle has no proxy.
@@ -4129,7 +4215,8 @@ Result<ImporterInstance::DirectFrame> ImporterInstance::directFrame(std::uint32_
     // [WP-TEMPORAL] a bucket's anchor is decoded by this same decoder
     const ScopedPointer<video::GpuClipDecoder> analysisDecoder(m_analysisGpuDecoder, decoder->second.get());
     const AnalysisOutcome analyses = applyAnalyses(index, lease.pair(), /*draft=*/false, purpose, *pool, builder);
-    builder.stabilization(stabilizationFor(index));
+    // Levelled at the moment the pictures show (a held frame's own).
+    builder.stabilization(stabilizationFor(shownFrameOf(index, lease.pair())));
 
     // The equirect's SIZE is irrelevant to the direct renderer (it replaces
     // every view field); the mode and the stabilised Rout are what it takes.
@@ -4351,7 +4438,9 @@ Result<render::RenderJob> ImporterInstance::buildEquirectJob(std::uint32_t index
     // one set of caches (see applyAnalyses).
     outcome = applyAnalyses(index, pair, draft, purpose, pool, builder);
 
-    builder.stabilization(stabilizationFor(index));
+    // Levelled at the moment the pictures show: a frame served as the one
+    // before an undecodable run takes that frame's attitude (shownFrameOf).
+    builder.stabilization(stabilizationFor(shownFrameOf(index, pair)));
 
     // ---- a view, when one was asked for (osvtool's reframe) ---------------
     // Straight from the fisheyes, with everything above - analyses,

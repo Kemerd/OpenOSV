@@ -825,3 +825,73 @@ TEST_CASE("the delivery fingerprint compares every host-path frame of a proxy .L
     // to miss (it looked the rendered frame up by the host's number).
     CHECK(sawRemapped);
 }
+
+// -----------------------------------------------------------------------------
+//  The camera's .LRF beside an .OSV renamed with a copy suffix
+// -----------------------------------------------------------------------------
+// A user's pairs arrive as CAM_..._D-001.OSV beside CAM_..._D.LRF: the .OSV
+// went through a download or a copy that added "-001", the .LRF kept the
+// camera's name.  Premiere's Attach Proxies only plays such a pair right when
+// the .LRF presents itself on the .OSV's timeline, which needs the importer
+// to find the pair.  One renamed .OSV is the pair; two are ambiguous and the
+// .LRF keeps its own timeline.  Only imGetInfo8 is asked: nothing renders.
+TEST_CASE("an .LRF finds an .OSV renamed with a copy suffix, and only when the choice is unique",
+          "[importer][lrf][proxy][sample]") {
+    const std::filesystem::path proxy = sampleProxyPath();
+    const std::filesystem::path clipPath = sampleClipPath();
+    std::error_code ec;
+    if (proxy.empty() || !std::filesystem::exists(proxy, ec) || clipPath.empty() ||
+        !std::filesystem::exists(clipPath, ec)) {
+        SKIP("the sample .OSV / .LRF pair is not present");
+    }
+    // ---- a folder laid out the way the user's was --------------------------------
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() /
+                                      ("openosv-lrf-copy-suffix-" + std::to_string(::GetCurrentProcessId()));
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    REQUIRE_FALSE(ec);
+    const std::filesystem::path lrf = dir / "CAM_20260101000000_0001_D.LRF";
+    const std::filesystem::path osv1 = dir / "CAM_20260101000000_0001_D-001.OSV";
+    std::filesystem::copy_file(proxy, lrf, std::filesystem::copy_options::overwrite_existing, ec);
+    REQUIRE_FALSE(ec);
+    std::filesystem::copy_file(clipPath, osv1, std::filesystem::copy_options::overwrite_existing, ec);
+    REQUIRE_FALSE(ec);
+
+    {
+        // ---- one renamed .OSV: the .LRF is its proxy -------------------------------
+        ImporterHarness harness;
+        REQUIRE(harness.loaded());
+        auto clip = harness.openClip(lrf);
+        INFO("open result " << clip.openResult());
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info) == imNoErr);
+        // The original's rate and length (the sample: 65 frames at 60000 / 1001).
+        CHECK(info.vidScale == 60000);
+        CHECK(info.vidSampleSize == 1001);
+        CHECK(info.vidDurationInFrames == 65);
+        CHECK(info.vidInfo.imageWidth == 2000);
+        CHECK(info.vidInfo.imageHeight == 1000);
+    }
+
+    // ---- a second renamed copy: ambiguous, so the .LRF is on its own -----------------
+    const std::filesystem::path osv2 = dir / "CAM_20260101000000_0001_D-002.OSV";
+    std::filesystem::copy_file(clipPath, osv2, std::filesystem::copy_options::overwrite_existing, ec);
+    REQUIRE_FALSE(ec);
+    {
+        ImporterHarness harness;
+        REQUIRE(harness.loaded());
+        auto clip = harness.openClip(lrf);
+        REQUIRE(clip.open());
+        imFileInfoRec8 info{};
+        REQUIRE(harness.getInfo8(clip, info) == imNoErr);
+        // As recorded: 124 frames at 30000 / 1001, 2048 x 1024.
+        CHECK(info.vidScale == 30000);
+        CHECK(info.vidSampleSize == 1001);
+        CHECK(info.vidDurationInFrames == 124);
+        CHECK(info.vidInfo.imageWidth == 2048);
+        CHECK(info.vidInfo.imageHeight == 1024);
+    }
+    // The clips are closed with their harnesses, so the folder can go.
+    std::filesystem::remove_all(dir, ec);
+}

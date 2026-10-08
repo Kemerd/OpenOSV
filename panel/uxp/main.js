@@ -31,6 +31,81 @@
 
     var ppro = tryRequire('premierepro');
     var uxp = tryRequire('uxp');
+    // UXP's file system module (manifest: localFileSystem "fullAccess"), for
+    // one question only: is the camera's .LRF beside an .OSV.
+    var fs = tryRequire('fs');
+
+    /** True when an error says the file is not there (rather than "cannot look"). */
+    function isNotFound(err) {
+        var text = String((err && (err.code || err.message)) || err || '');
+        return /ENOENT|not\s*found|no such|does not exist|cannot find/i.test(text);
+    }
+
+    /**
+     * Whether `path` names an existing file: Promise<true | false | null>,
+     * null when the file system cannot be asked (no fs module, no
+     * permission).  A native path is tried first, then its file: URL form,
+     * which every UXP fs accepts.
+     */
+    function fileExists(path) {
+        if (!fs || typeof fs.lstat !== 'function' || typeof path !== 'string' || path.length === 0) {
+            return Promise.resolve(null);
+        }
+        var forms = [path, 'file:' + path.replace(/\\/g, '/')];
+        // What the forms said: something there (a file, or a folder of that
+        // name, which is not the .LRF), or "not there".
+        var verdict = null;
+        var chain = Promise.resolve();
+        forms.forEach(function (form) {
+            chain = chain.then(function () {
+                if (verdict === true || verdict === false) {
+                    return undefined;
+                }
+                return new Promise(function (resolve) { resolve(fs.lstat(form)); }).then(function (stats) {
+                    verdict = !(stats && typeof stats.isFile === 'function' && stats.isFile() === false);
+                }, function (err) {
+                    if (isNotFound(err)) {
+                        verdict = 'missing';
+                    }
+                });
+            });
+        });
+        return chain.then(function () {
+            if (verdict === true || verdict === false) {
+                return verdict;
+            }
+            return verdict === 'missing' ? false : null;
+        });
+    }
+
+    /**
+     * The file names in `folder`: Promise<string[] | null>, null when the
+     * folder cannot be read.  Native path first, then its file: URL form.
+     */
+    function listFolder(folder) {
+        if (!fs || typeof fs.readdir !== 'function' || typeof folder !== 'string' || folder.length === 0) {
+            return Promise.resolve(null);
+        }
+        var plain = folder.replace(/[\\\/]+$/, '');
+        var forms = [plain, 'file:' + plain.replace(/\\/g, '/')];
+        var names = null;
+        var chain = Promise.resolve();
+        forms.forEach(function (form) {
+            chain = chain.then(function () {
+                if (names !== null) {
+                    return undefined;
+                }
+                return new Promise(function (resolve) { resolve(fs.readdir(form)); }).then(function (list) {
+                    if (Array.isArray(list)) {
+                        names = list.map(function (n) { return String(n); });
+                    }
+                }, function () {
+                    // The next form, or "cannot tell".
+                });
+            });
+        });
+        return chain.then(function () { return names; });
+    }
 
     /**
      * Close to Premiere's panel grey per theme, for hosts older than 26.5,
@@ -93,7 +168,7 @@
             if (!ppro) {
                 throw new Error('this Premiere has no UXP API (Premiere Pro 25.6 or later is needed)');
             }
-            return g.OsvUxpAdapter.createUxpAdapter(ppro, g.OsvCore, { log: log });
+            return g.OsvUxpAdapter.createUxpAdapter(ppro, g.OsvCore, { log: log, fileExists: fileExists, listFolder: listFolder });
         },
         theme: theme,
         log: log
