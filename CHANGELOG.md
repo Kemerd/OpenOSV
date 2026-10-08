@@ -6,6 +6,41 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+* **A clip that dropped frames no longer fails a whole second of frames.**
+  When the camera drops frames it can drop one lens's key picture with them,
+  and every picture of that lens up to the next key picture predicts from the
+  lost one: no decoder can produce them (on a night drive, lens 0's frames
+  12550-12598). Premiere got an error for each of those frames, after the
+  importer had decoded the whole GOP twice for nothing (about 170 ms a
+  request), and the log blamed "the stream's timing". The decoder now
+  recognises such a run the first time it crosses it and names it in the log;
+  those frames show the last frame before the run, on both lenses, at no
+  decode cost (0.001 ms a request instead of 160-180 ms). Every other frame
+  is unchanged, bit for bit.
+* **An `.LRF` finds its `.OSV` when the `.OSV` was renamed by a copy.** A
+  download or a second copy can add `-001` to the `.OSV`
+  (`CAM_..._D-001.OSV` beside `CAM_..._D.LRF`); the `.LRF` then played on its
+  own 25 fps timeline instead of the `.OSV`'s, which breaks it as a proxy.
+  One such `.OSV` beside the `.LRF` is now its pair; two are left alone as
+  ambiguous.
+
+### Added
+
+* **The camera's `.LRF` becomes the `.OSV`'s proxy.** With Auto-apply on, the
+  OpenOSV panel attaches the `.LRF` beside each dropped `.OSV` as its proxy
+  (once per master clip, never over a proxy that is already there), and
+  **Attach .LRF proxies** does it for the clips already in a sequence. Toggle
+  Proxies in the Program Monitor then edits on the light file; export still
+  uses the `.OSV`. The UXP panel now asks for file access to find the `.LRF`.
+* `osvtool decode-replay <clip> --trace <plug-in log>`: replays the frames a
+  Premiere session asked for, in its order and from its threads, through the
+  importer's reader (software or D3D11VA) and compares every picture with a
+  sequential software decode. On the session that showed a smeared `.LRF`
+  frame, all 84 logged decodes and 69 requests replay bit for bit: the
+  decoder handed out the right pictures there.
+
 ## [0.5.1] - 2026-10-07
 
 Premiere on a car mount, fixed at the cause. Built on the same two 8K car

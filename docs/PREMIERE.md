@@ -2377,6 +2377,58 @@ is the one thing a human has to do.
   outstanding. Unverified and untouched by this work.
 * Windows on ARM builds are not produced (no CUDA); the CPU path would work.
 
+## The camera's .LRF as Premiere's proxy
+
+The camera records a small .LRF beside every .OSV (2048 x 1024 H.264, both
+lenses side by side, 25 fps for a 50 fps recording). Premiere's proxy
+workflow plays it in place of the 6K / 8K .OSV while **Toggle Proxies** is on
+and goes back to the .OSV for full resolution and for export.
+
+**Attaching it.**
+
+* The OpenOSV panel does it. With Auto-apply on, every .OSV dropped on a
+  timeline also gets the .LRF beside it as its proxy - once per master clip,
+  and a proxy that is already attached is left alone. **Attach .LRF proxies**
+  does the same for every OSV clip already in the active sequence; the status
+  line says how many it attached, which had one, and which have no .LRF
+  beside them.
+* By hand: Project panel, right-click the .OSV, **Proxy > Attach Proxies**,
+  pick the .LRF.
+* **Toggle Proxies** sits in the Program Monitor's button editor (the `+`);
+  drag it to the button bar.
+
+Under the hood the panel calls the documented project item API:
+`ProjectItem.attachProxy(mediaPath, 0)` on CEP (ExtendScript; `0` = as the
+proxy, it "returns 0 if successful"), and
+`ClipProjectItem.attachProxy(mediaPath, false, false)` on UXP (since 25.6,
+`Promise<boolean>`, not undoable). `hasProxy()` is checked before (an
+existing proxy is kept) and after (an answer Premiere did not act on is
+reported as a failure). The UXP panel needs file access (`localFileSystem:
+fullAccess` in its manifest) to see whether the .LRF exists; without it the
+status line says so and nothing is attached on a guess.
+
+**Why Premiere takes it.** An attached proxy must match its original's frame
+rate, duration and audio channels, and its frame size should divide the
+original's - anything else is accepted silently and plays back wrong. The
+importer presents an .LRF that has its .OSV beside it on the .OSV's timeline:
+the .OSV's frame rate and length, each frame showing the moment the .OSV
+shows (matched by the camera's clock), at 2000 x 1000 (6K) or 1920 x 960 (8K).
+It finds the pair by name, the panel by the same rule:
+
+* `CAM_..._D.LRF` beside `CAM_..._D.OSV` (the camera's own names);
+* `CAM_..._D.LRF` beside ONE `CAM_..._D-001.OSV` - a download or a copy that
+  added a `-<digits>` suffix to the .OSV only. Two such .OSVs beside one .LRF
+  are ambiguous: the importer then leaves the .LRF on its own timeline (25
+  fps, its own length), which Premiere must not be given as a proxy. The
+  panel only looks for the .LRF, not for a second copy, so keep one copy of a
+  recording per folder before attaching (the importer log says `proxy: ...
+  is presented as the proxy of ...` when the pair is found).
+
+**Source Settings.** A newly attached proxy starts from the Source Settings
+its .OSV is decoded with (Premiere does not carry them over itself). After
+that Premiere keeps the proxy's settings apart from the master clip's:
+change both, or detach and re-attach the proxy after changing the .OSV's.
+
 ## Troubleshooting
 
 ### A band of the frame is black (or transparent)
@@ -2534,6 +2586,54 @@ decode of the same frames:
 `OSV_SEEK_LRF=<clip> OSV_CRC_FRAMES=<first>-<last> osv_tests "[.lrfcrc]"`
 prints the same lines. A frame whose fingerprint differs was decoded
 differently in the session.
+
+**Replaying the session.** `osvtool decode-replay <clip> --trace
+OpenOSVImporter.log.1 --trace OpenOSVImporter.log` reads every frame
+Premiere asked for (the `deliver:` and `imGetSourceVideo: frame N failed`
+lines of that clip, from its last session), plays them through the
+importer's own reader in the same order - handed from thread to thread the
+way Premiere's render threads took turns - and compares every picture with
+a sequential software decode. `--hw d3d11va` replays on the hardware path,
+`--level decode` replays the `decode:` lines instead and also checks their
+fingerprints, `--from` / `--to` narrow it to a stretch, `--csv` writes one
+row per request. "bit-exact" means the request pattern cannot have made the
+decoder hand out a wrong picture.
+
+What it found on the 0.5.1 session that showed a smeared lower half on the
+day .LRF at 00:02:12:32 (its frame 63): all 84 logged D3D11VA fingerprints,
+frame 63 included, equal the replay and the software decode, and so do all
+69 requests on both paths. The decoder handed out the right pictures; the
+damage came later in the chain (the stitch of a correct picture, or
+Premiere), so the `deliver:` lines and the Source Monitor / Render Device
+steps above are where to look.
+
+### A stretch of frames fails, or holds still, on a clip that dropped frames
+
+A camera that drops frames while recording can drop one lens's IDR picture
+with them. Every picture of that lens up to its next random access point
+still predicts from the lost one, so no decoder can produce them - FFmpeg's
+software decoder, D3D11VA and NVDEC alike skip straight to the next random
+access point. On a night drive, lens 0 lost its IDR in a two-frame gap at
+sample 12550: its samples 12550-12598 (one second) exist in the file but
+decode on no path, while lens 1 kept its own IDR.
+
+Up to 0.5.1 every request in such a stretch failed after decoding the whole
+GOP twice (~170 ms each), with `presentation time mismatch: wanted frame N but
+decoder produced frame M` and "the stream's timing is at fault". Since then
+the decoder recognises the run the first time it crosses it, and every
+request inside it shows the last frame before the run - both lenses, one
+instant, so the stitch stays consistent - without decoding anything:
+
+* `video: '<clip>' track T: samples A-B cannot be decoded - they predict from
+  a picture the file does not contain ...; decoding resumes at sample C` -
+  once per decoder that meets it.
+* `video: '<clip>': frames A-B cannot be decoded on one lens (...); frame
+  A-1 of both lenses is shown in their place` (and `video/gpu:` for the GPU
+  frame path) - once per reader.
+
+The picture holds still for that stretch: the file holds nothing else to
+show for that lens. `osvtool decode-replay` lists such frames as "served a
+held frame".
 
 ### A car, helmet or suction mount: the seam steps, wobbles or pops
 
