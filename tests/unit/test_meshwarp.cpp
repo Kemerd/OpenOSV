@@ -516,6 +516,34 @@ TEST_CASE("mesh warp: the field alone is the solve without the previous mesh, bi
     CHECK(prior.value().report.mode == render::MeshWarpMode::PriorOnly);
     REQUIRE(prior.value().alone.has_value());
     CHECK(prior.value().alone->uv == prior.value().grid.uv);
+
+    // A previous mesh but nothing measured and no line (open sky, fog): the
+    // call is a solve (the previous mesh takes part), but the field ALONE is
+    // exactly what the call without it returns - the prior, bit for bit,
+    // never a Cholesky round trip of it that leaves rounding where the prior
+    // is 0.  Otherwise the next bucket's temporal prior would depend on
+    // whether this bucket was measured with a prior of its own (a cold
+    // landing) or without (a sequential render).
+    std::vector<float> table(512, 0.0f);
+    for (std::size_t c = 100; c < 300; ++c) {
+        table[c] = 1.25f;  // a 1.25 degree shift over part of the ring, 0 elsewhere
+    }
+    auto lift = render::liftSeamTable(table, p);
+    REQUIRE(lift.ok());
+    render::MeshWarpInputs skyOnly;
+    skyOnly.prior = &lift.value();
+    skyOnly.solveAlone = true;
+    auto skyReference = render::solveMeshWarp(skyOnly, p);
+    REQUIRE(skyReference.ok());
+    CHECK(skyReference.value().report.mode == render::MeshWarpMode::PriorOnly);
+    CHECK(skyReference.value().grid.uv == lift.value().uv);  // the lift's edge rows are already zero
+    skyOnly.previous = &previous.value().grid;
+    auto skyPulled = render::solveMeshWarp(skyOnly, p, &pool);
+    REQUIRE(skyPulled.ok());
+    CHECK(skyPulled.value().report.temporal);
+    CHECK(skyPulled.value().report.mode == render::MeshWarpMode::Solved);
+    REQUIRE(skyPulled.value().alone.has_value());
+    CHECK(skyPulled.value().alone->uv == skyReference.value().grid.uv);  // bit for bit
 }
 
 // ===========================================================================

@@ -38,6 +38,10 @@
 #include <tuple>
 #include <utility>
 
+#if defined(_M_X64) || defined(__SSE2__)
+#include <emmintrin.h>  // SSE2: the banded Cholesky's inner products (dotUnrolled)
+#endif
+
 namespace osv::render {
 
 namespace {
@@ -366,15 +370,47 @@ struct BandStencils {
 /// compiler may not reorder them); four partial sums run side by side and
 /// the factorisation's inner products - nearly all of its time - go about
 /// three times faster.  The order is fixed, so the result is deterministic.
+///
+/// On x64 the four partial sums live in two SSE2 registers, lanes (s0, s1)
+/// and (s2, s3).  A packed multiply and a packed add round each lane exactly
+/// as the scalar multiply and add do (IEEE double, no fused multiply-add:
+/// the build has no /arch beyond SSE2 and /fp:precise forbids contraction),
+/// and every lane accumulates the same products in the same order as the
+/// scalar loop below - so the result is the scalar result BIT FOR BIT, with
+/// half the instructions.  Measured on the 2048 band: the scalar loop was
+/// bound by its two loads per multiply-add (~1 per cycle), and the banded
+/// Cholesky (two factorisations per solve) took 7.3-7.7 ms of the 10.8-15.0
+/// ms mesh solve.
 [[nodiscard]] double dotUnrolled(const double* a, const double* b, std::size_t len) noexcept {
     double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
     std::size_t k = 0;
+#if defined(_M_X64) || defined(__SSE2__)
+    // ---- the packed body: lanes (s0, s1) and (s2, s3) ---------------------------
+    __m128d acc01 = _mm_setzero_pd();
+    __m128d acc23 = _mm_setzero_pd();
+    for (; k + 4u <= len; k += 4u) {
+        // Unaligned loads: a band row starts wherever the storage puts it.
+        acc01 = _mm_add_pd(acc01, _mm_mul_pd(_mm_loadu_pd(a + k), _mm_loadu_pd(b + k)));
+        acc23 = _mm_add_pd(acc23, _mm_mul_pd(_mm_loadu_pd(a + k + 2u), _mm_loadu_pd(b + k + 2u)));
+    }
+    // Back to the four scalar partial sums for the tail and the final order.
+    alignas(16) double lanes[4];
+    _mm_store_pd(lanes, acc01);
+    _mm_store_pd(lanes + 2, acc23);
+    s0 = lanes[0];
+    s1 = lanes[1];
+    s2 = lanes[2];
+    s3 = lanes[3];
+#else
+    // ---- the portable body (no SSE2): the same sums in the same order -----------
     for (; k + 4u <= len; k += 4u) {
         s0 += a[k] * b[k];
         s1 += a[k + 1u] * b[k + 1u];
         s2 += a[k + 2u] * b[k + 2u];
         s3 += a[k + 3u] * b[k + 3u];
     }
+#endif
+    // ---- the tail (fewer than four left) into the first sum, as always -----------
     for (; k < len; ++k) {
         s0 += a[k] * b[k];
     }
@@ -1336,20 +1372,29 @@ Result<MeshWarpResult> solveMeshWarp(const MeshWarpInputs& in, const MeshWarpPar
         out.maxAbsCorrectionDeg = 2.0 * rad2deg(maxAbs);
     };
 
+    // ---- the prior as a field: what "nothing to solve" returns ------------------------
+    // A copy of the prior, bit for bit (zero without one), its pinned rows
+    // zero by definition, with the measurement's diagnostics and no cell
+    // measured.  The no-previous call returns it as the field; a call WITH a
+    // previous mesh but nothing measured returns it as the field alone.
+    const auto priorOnlyGrid = [&]() {
+        ParallaxWarpGrid out = in.prior != nullptr ? *in.prior : layout;
+        for (std::uint32_t i = 0; i < g.W; ++i) {
+            for (const std::uint32_t j : {0u, g.H - 1u}) {
+                const std::size_t k = (static_cast<std::size_t>(j) * g.W + i) * 2u;
+                out.uv[k] = 0.0f;
+                out.uv[k + 1u] = 0.0f;
+            }
+        }
+        fillDiagnostics(out, {}, {});
+        return out;
+    };
+
     // ---- the nothing-to-solve case: the prior, exactly ------------------------------
     if (matches.empty() && lineTriples.empty() && in.previous == nullptr) {
         // Nothing measured, nothing to keep straight, nothing to follow: the
         // field IS the prior (a copy, bit for bit), or zero without one.
-        result.grid = in.prior != nullptr ? *in.prior : layout;
-        // Its pinned rows are zero by definition.
-        for (std::uint32_t i = 0; i < g.W; ++i) {
-            for (const std::uint32_t j : {0u, g.H - 1u}) {
-                const std::size_t k = (static_cast<std::size_t>(j) * g.W + i) * 2u;
-                result.grid.uv[k] = 0.0f;
-                result.grid.uv[k + 1u] = 0.0f;
-            }
-        }
-        fillDiagnostics(result.grid, {}, {});
+        result.grid = priorOnlyGrid();
         rep.mode = MeshWarpMode::PriorOnly;
         rep.totalMs = msSince(tStart);
         result.grid.gridMs = rep.totalMs;
@@ -1442,20 +1487,35 @@ Result<MeshWarpResult> solveMeshWarp(const MeshWarpInputs& in, const MeshWarpPar
     std::vector<double> dataSum(N, 0.0);
     std::vector<double> xFree;  // the first solve, made without the temporal term
     const bool benefitOn = pp.requiredImprovement > 0.0 && verify != nullptr && !matches.empty();
-    BandedSpd system;  // this iteration's matrix, factored in place
+    BandedSpd system;       // this iteration's matrix, factored in place
+    BandedSpd systemAlone;  // the field-alone solve's matrix (MeshWarpInputs::solveAlone)
+    // The field alone - this measurement without the temporal term - is a
+    // real solve only when a previous mesh took part AND there is something
+    // to solve: with no match and no line it is the prior, exactly as the
+    // no-previous call returns it (PriorOnly), not a Cholesky round trip of
+    // the prior that could leave rounding where the prior is zero.
+    const bool nothingButPrior = matches.empty() && lineTriples.empty();
+    const bool solveAloneHere = in.solveAlone && !xPrev.empty() && !nothingButPrior;
+    std::vector<double> xAlone;   // its solution, from the last IRLS iteration's weights
+    double aloneAssembleMs = 0.0;
+    double aloneFactorMs = 0.0;
 
     // ---- one exact solve at the current weights ---------------------------------------
-    // Assembles the system from the constant part (shape, lines), the matches
-    // at their current weights and the per-vertex anchor - plus, with
+    // Assembles `sys` from the constant part (shape, lines), the matches at
+    // their current weights and the per-vertex anchor - plus, with
     // `withTemporal`, the temporal pull toward the previous mesh - then
     // factors it and solves into `xOut` (block-major).  Without the temporal
     // term NOTHING of it is added (not even zeros), so a solve without a
     // previous mesh and the "alone" solve below assemble the same numbers in
-    // the same order.
-    const auto assembleAndSolve = [&](bool withTemporal, std::vector<double>& xOut) -> Status {
+    // the same order.  It only READS the shared state (the constant part,
+    // the matches, the weights, the prior and the previous mesh) and writes
+    // `sys`, `xOut` and the two times, so two calls with their own systems
+    // and outputs may run side by side.
+    const auto assembleAndSolve = [&](bool withTemporal, BandedSpd& sys, std::vector<double>& xOut,
+                                      double& asmMs, double& factorMs) -> Status {
         const auto tAsm = Clock::now();
         std::vector<double> b = baseB;  // interleaved
-        system.copyFrom(baseA);
+        sys.copyFrom(baseA);
         for (const Match& m : matches) {
             if (!(m.weight > 0.0)) {
                 continue;
@@ -1465,8 +1525,8 @@ Result<MeshWarpResult> solveMeshWarp(const MeshWarpInputs& in, const MeshWarpPar
                 e[k].idx = m.st.idx[k];
                 e[k].coef = m.st.w[k];
             }
-            (void)addOuterComp(system, e.data(), m.st.n, m.weight, 0);
-            (void)addOuterComp(system, e.data(), m.st.n, m.weight, 1);
+            (void)addOuterComp(sys, e.data(), m.st.n, m.weight, 0);
+            (void)addOuterComp(sys, e.data(), m.st.n, m.weight, 1);
             for (std::uint8_t k = 0; k < m.st.n; ++k) {
                 b[il(m.st.idx[k], 0)] += m.weight * m.st.w[k] * m.mLon;
                 b[il(m.st.idx[k], 1)] += m.weight * m.st.w[k] * m.mLat;
@@ -1478,9 +1538,9 @@ Result<MeshWarpResult> solveMeshWarp(const MeshWarpInputs& in, const MeshWarpPar
             for (int c = 0; c < 2; ++c) {
                 const std::size_t base = static_cast<std::size_t>(c) * N;
                 if (temporalOn) {
-                    (void)system.add(il(vi, c), il(vi, c), anchorW[v] + temporalW[v]);
+                    (void)sys.add(il(vi, c), il(vi, c), anchorW[v] + temporalW[v]);
                 } else {
-                    (void)system.add(il(vi, c), il(vi, c), anchorW[v]);
+                    (void)sys.add(il(vi, c), il(vi, c), anchorW[v]);
                 }
                 b[il(vi, c)] += anchorW[v] * x0[base + v];
                 if (temporalOn) {
@@ -1488,7 +1548,7 @@ Result<MeshWarpResult> solveMeshWarp(const MeshWarpInputs& in, const MeshWarpPar
                 }
             }
         }
-        rep.assembleMs += msSince(tAsm);
+        asmMs += msSince(tAsm);
 
         // ---- solve exactly: factor this system, two triangular sweeps ---------------------
         // About 17 million multiply-adds at the defaults (2 x 128 x 11
@@ -1496,16 +1556,16 @@ Result<MeshWarpResult> solveMeshWarp(const MeshWarpInputs& in, const MeshWarpPar
         // conjugate gradients on the previous iteration's factor, which the
         // benefit gate's reweighting left 17-44 steps from converging.
         const auto tFactor = Clock::now();
-        if (!system.factor()) {
+        if (!sys.factor()) {
             return failStatus(ErrorCode::Internal, "solveMeshWarp: the normal equations are not positive definite");
         }
-        system.solveInPlace(b.data());
+        sys.solveInPlace(b.data());
         xOut.assign(2u * N, 0.0);
         for (std::size_t v = 0; v < N; ++v) {
             xOut[v] = b[2u * v];
             xOut[N + v] = b[2u * v + 1u];
         }
-        rep.factorMs += msSince(tFactor);
+        factorMs += msSince(tFactor);
         return okStatus();
     };
 
@@ -1553,6 +1613,13 @@ Result<MeshWarpResult> solveMeshWarp(const MeshWarpInputs& in, const MeshWarpPar
             // change never looked larger than the scale and moved only a
             // quarter of the way per solve.  With a single IRLS solve there
             // is no free solve to judge by: the term applies in full.
+            //
+            // The floor holds every vertex, measured or not.  Scaling it by
+            // the vertex's data support instead (no pull of its own where
+            // nothing was measured) was measured and rejected: the night
+            // drive's car window gained 0.003 (frame 2000: 0.7172 -> 0.7204),
+            // while the bucket-to-bucket change of the plug-ins' fields rose
+            // 9-21 % (day proxy 3400 / 5992, the 6K sample, night 2000).
             temporalW[v] = 0.0;
             if (!xPrev.empty() && (it > 0 || params.irlsIterations == 1)) {
                 double robust = 1.0;
@@ -1566,11 +1633,47 @@ Result<MeshWarpResult> solveMeshWarp(const MeshWarpInputs& in, const MeshWarpPar
                     robust * (params.temporalWeight * dataDiag[v] + params.temporalFloor * g.cellArea);
             }
         }
-        // ---- assemble the system ------------------------------------------------------
-        // (assembleAndSolve, below the loop's weights: the same assembly also
-        // serves the solve WITHOUT the temporal term after the loop.)
+        // ---- assemble and solve the system -----------------------------------------------
+        // (assembleAndSolve, below the loop's weights.)  On the LAST
+        // iteration with the field alone asked for, the same weights also
+        // give the solve WITHOUT the temporal term: nothing after this point
+        // changes a weight (the benefit gate judged the first solve, the
+        // temporal weights the free one), so the two are independent and run
+        // side by side on the pool - the alone solve then costs no wall time
+        // beyond the longer of the two (MeshWarpReport::aloneMs).  Each solve
+        // is exactly the arithmetic it is on its own, so the fields do not
+        // depend on whether a pool ran them.
         rep.assembleMs += msSince(tAsm);
-        if (const Status solved = assembleAndSolve(true, x); !solved.ok()) {
+        const bool lastIteration = it + 1 >= params.irlsIterations;
+        if (lastIteration && solveAloneHere) {
+            Status solvedField = okStatus();
+            Status solvedAlone = okStatus();
+            double fieldAssembleMs = 0.0;
+            double fieldFactorMs = 0.0;
+            forTasks(pool, 2u, [&](std::size_t task) {
+                // Each task writes only its own system, solution, status and
+                // times (a rerun after a failed parallel pass redoes both).
+                if (task == 0u) {
+                    fieldAssembleMs = 0.0;
+                    fieldFactorMs = 0.0;
+                    solvedField = assembleAndSolve(true, system, x, fieldAssembleMs, fieldFactorMs);
+                } else {
+                    aloneAssembleMs = 0.0;
+                    aloneFactorMs = 0.0;
+                    solvedAlone = assembleAndSolve(false, systemAlone, xAlone, aloneAssembleMs, aloneFactorMs);
+                }
+            });
+            if (!solvedField.ok()) {
+                return solvedField.error();
+            }
+            if (!solvedAlone.ok()) {
+                return solvedAlone.error();
+            }
+            // CPU time of both, as before; the alone solve's own share apart.
+            rep.assembleMs += fieldAssembleMs + aloneAssembleMs;
+            rep.factorMs += fieldFactorMs + aloneFactorMs;
+        } else if (const Status solved = assembleAndSolve(true, system, x, rep.assembleMs, rep.factorMs);
+                   !solved.ok()) {
             return solved.error();
         }
         ++rep.irlsIterations;
@@ -1769,20 +1872,28 @@ Result<MeshWarpResult> solveMeshWarp(const MeshWarpInputs& in, const MeshWarpPar
     fillDiagnostics(result.grid, preGateWeight, cellGate);
     rep.benefitGatedCells = result.grid.gatedCells;
 
-    // ---- the field on its own: the last solve again, without the temporal term ----------
-    // The match weights (benefit gate, Cauchy), the anchor and the constant
-    // part stay exactly as the last iteration left them; only the pull toward
-    // the previous mesh is left out.  At the defaults those weights never
-    // depended on the previous mesh (the gate judged the first, temporal-free
-    // solve), so this is the solve a caller without a previous mesh gets.
+    // ---- the field on its own: the last solve without the temporal term ----------------
+    // Solved beside the last IRLS iteration (above): the match weights
+    // (benefit gate, Cauchy), the anchor and the constant part exactly as that
+    // iteration had them, only the pull toward the previous mesh left out.
+    // At the defaults those weights never depended on the previous mesh (the
+    // gate judged the first, temporal-free solve), so this is the solve a
+    // caller without a previous mesh gets.
     if (in.solveAlone) {
         if (xPrev.empty()) {
             result.alone = result.grid;  // nothing temporal took part
+        } else if (nothingButPrior) {
+            // Nothing measured and no line: what a call without the previous
+            // mesh returns - the prior, exactly (PriorOnly) - so the field a
+            // later bucket takes as its temporal prior is the same whether
+            // this bucket was solved with a prior of its own or without.
+            result.alone = priorOnlyGrid();
         } else {
-            const auto tAlone = Clock::now();
-            std::vector<double> xAlone;
-            if (const Status solved = assembleAndSolve(false, xAlone); !solved.ok()) {
-                return solved.error();
+            if (xAlone.size() != 2u * N) {
+                // Unreachable: the last iteration solved it whenever this
+                // branch is taken (solveAloneHere).  A field must never come
+                // back half made, so say so instead of guessing.
+                return Error{ErrorCode::Internal, "solveMeshWarp: the field alone was not solved"};
             }
             for (const double v : xAlone) {
                 if (!std::isfinite(v)) {
@@ -1793,7 +1904,9 @@ Result<MeshWarpResult> solveMeshWarp(const MeshWarpInputs& in, const MeshWarpPar
             ParallaxWarpGrid alone = finishGrid(xAlone);
             fillDiagnostics(alone, preGateWeight, cellGate);
             result.alone = std::move(alone);
-            rep.aloneMs = msSince(tAlone);
+            // Its own assembly and factorisation (it ran beside the field's,
+            // so this is CPU time, not added wall time).
+            rep.aloneMs = aloneAssembleMs + aloneFactorMs;
         }
     }
     rep.totalMs = msSince(tStart);

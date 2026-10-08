@@ -134,7 +134,8 @@
 // 2 (5 R - 1) + 1, R the free rows, and the line term's normal, which mixes
 // dLon and dLat at an oblique line, stays inside it.  A banded Cholesky
 // solves it exactly: about 17 million multiply-adds at the defaults (128 x
-// 11 free vertices, half width 109), ~4 ms.  (Two separate blocks with the
+// 11 free vertices, half width 109), ~3 ms with its inner products on SSE2
+// (bit for bit the scalar sums).  (Two separate blocks with the
 // oblique lines' cross part left to conjugate gradients needed 20-130
 // iterations per solve - a line is stiff along its normal and free along its
 // tangent, which no block preconditioner captures - and the separable
@@ -464,7 +465,10 @@ struct MeshWarpReport {
     double factorMs = 0.0;    ///< Banded Cholesky factorisations and solves (all IRLS iterations).
     double benefitMs = 0.0;   ///< The benefit gate's residual pass.
     /// The extra solve without the temporal term (MeshWarpInputs::solveAlone
-    /// with a previous mesh); 0 when none ran.  Included in factorMs too.
+    /// with a previous mesh): its own assembly and factorisation, CPU time;
+    /// 0 when none ran.  Included in assembleMs / factorMs too.  It runs
+    /// BESIDE the last IRLS solve on the pool (both at the same weights), so
+    /// with a pool of two or more threads it adds no wall time to totalMs.
     double aloneMs = 0.0;
     double totalMs = 0.0;     ///< The whole of solveMeshWarp.
 
@@ -490,8 +494,10 @@ struct MeshWarpResult {
     /// defaults (two IRLS solves, no Cauchy weight on the matches) it is bit
     /// for bit what solveMeshWarp returns with `previous` null: the first
     /// solve and the benefit gate never see the temporal term, and the last
-    /// solve is repeated at the same weights without it.  Empty without
-    /// solveAlone.
+    /// solve is repeated at the same weights without it (beside it, on the
+    /// pool).  With nothing measured and no line it is the prior exactly, as
+    /// that call returns it (PriorOnly), never a solve that rounds it.
+    /// Empty without solveAlone.
     std::optional<ParallaxWarpGrid> alone;
 };
 
@@ -539,8 +545,9 @@ struct MeshWarpInputs {
     /// The previous solve's mesh (the temporal prior), or null for none.
     const ParallaxWarpGrid* previous = nullptr;
     /// Also return the field solved without the temporal term
-    /// (MeshWarpResult::alone): one more factorisation (~4 ms) instead of a
-    /// second solve, for a caller that keeps both.
+    /// (MeshWarpResult::alone): one more assembly and factorisation (~3 ms
+    /// of CPU) instead of a second solve, run beside the last IRLS solve when
+    /// a pool is given - for a caller that keeps both.
     bool solveAlone = false;
     // ---- diagnostics copied onto the grid ------------------------------------
     FlowBackendKind usedBackend = FlowBackendKind::Classical;
