@@ -27,8 +27,50 @@ All notable changes to OpenOSV are documented here. The format follows
   nothing can be measured at all - the stick strip of the aerial sample, the
   thin overlap beside a car mount's blind arc at night - 0.5.1's copied
   correction still scores a little higher (sample frame 60: 0.915 against
-  0.920). Available in `osvtool seam --mesh` (with `--temporal N` for
-  consecutive buckets) for now; the plug-ins switch to it in the next step.
+  0.920). `osvtool seam --mesh` scores it (`--temporal N` for consecutive
+  buckets, `--mesh-prior` for the field exactly as the plug-ins render it).
+* `osvtool render --purpose exact|interactive|playback` renders the way
+  Premiere asks during playback; `playback` parks on the first frame, plays
+  the range twice and writes the second pass, so a byte compare with an
+  `exact` render shows whether playback and a parked frame agree.
+
+### Fixed
+
+* **The seam is one smooth field in Premiere, Resolve and VEGAS.** The
+  plug-ins now render the mesh correction above instead of the 0.5.1 mix of
+  shift table, flow grid and per-column switch, so a roof edge or a pole
+  crossing the seam no longer picks up a kink where the two used to hand
+  over. Measured on the day drive's proxy, field as the plug-ins render it:
+  the car body lines up at 0.992 instead of 0.971 (median of 18 frames),
+  detected straight edges bend 0.01-0.04 px instead of 0.06-0.26 px, and the
+  whole seam scores higher on every day frame. The seam table is still
+  measured - it is the field's starting point - but never rendered on its
+  own while Parallax Grid is on.
+* **Playback shows the frame you get when you stop.** During playback a
+  frame used to borrow corrections measured on itself, so a propeller or a
+  roof edge could look different playing than parked. Now each 8-frame
+  bucket is measured once, on its first frame, and every frame of it renders
+  the same whether playing or parked - byte for byte on the 6K sample (17 of
+  17 frames) and the day drive (32 of 32). A frame whose bucket is still
+  being measured shows the previous bucket's correction until it lands.
+* **The seam moves less from one moment to the next.** Each bucket's field
+  leans on the bucket before it, so measurement noise is held still while a
+  real change (a car passing) still comes through: the field changes 1.4-1.6
+  times less between buckets on the clips measured, and on the day drive the
+  stitch at the car body flickers less (frame-to-frame change 0.60 against
+  0.71, in thousandths of full scale).
+* Parallax Grid Steady and Auto judge the new field: the clip correction is
+  the median of nine frames' fields, then kept straight along every line the
+  nine frames show. Auto now holds the day drive steady and lets the 6K
+  aerial sample follow the scene (the other way round in 0.5.1); the
+  sample's propeller blade, which bent at the seam in 0.5.1, renders single
+  and straight.
+
+Known limits: on the night drive the car body next to the mount's blind arc
+lines up a little worse than 0.5.1 (0.717 against 0.768 at frame 2000,
+0.924 against 0.947 at frame 3500); the clip correction takes about 30 %
+longer on the CPU (5.5 s against 4.2 s on the 6K sample in `osvtool`), and
+one bucket's solve 15-19 ms on four CPU threads.
 
 ## [0.5.1] - 2026-10-07
 

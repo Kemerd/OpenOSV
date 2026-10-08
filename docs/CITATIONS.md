@@ -123,6 +123,11 @@ a publication, that is recorded in `docs/LEGAL.md`, not here.
     the previous frame's mesh, stronger where the scene is static) and its
     anchor (their E_gs: a pull toward the pre-warped mesh where no match
     guides a vertex) (`MeshWarp.h`).
+  - Adapted in the plug-ins: the previous mesh is the previous bucket's
+    solved WITHOUT its own temporal term (`MeshWarpResult::alone`) rather
+    than its final mesh, so every bucket's field depends on two anchors
+    only and a frame renders the same in playback, in an export and when
+    parked, whatever was rendered before it (`ImporterInstance.cpp`).
 - Julio Zaragoza, Tat-Jun Chin, Michael S. Brown, David Suter.
   **As-Projective-As-Possible Image Stitching with Moving DLT.** *IEEE
   CVPR*, 2013.
