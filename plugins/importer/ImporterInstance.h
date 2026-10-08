@@ -353,14 +353,19 @@ public:
     [[nodiscard]] std::uint32_t sourceFrameFor(std::uint32_t timelineIndex) const noexcept;
 
     /// The .OSV an .LRF was recorded beside: the same folder and name with
-    /// the .OSV extension, when that file exists.  Empty for anything else.
+    /// the .OSV extension, when that file exists.  Failing that, the ONE
+    /// .OSV in the folder named like the .LRF plus a "-<digits>" copy
+    /// suffix (CAM_..._D.LRF beside CAM_..._D-001.OSV: the camera's .LRF
+    /// next to an .OSV a download or a copy renamed); two such .OSVs are
+    /// ambiguous and give none.  Empty for anything else.
     [[nodiscard]] static std::filesystem::path proxyOriginalFor(const std::filesystem::path& path);
 
     /// The other direction: the .LRF the camera recorded beside an .OSV -
-    /// the same folder and name with the .LRF extension - when that file
-    /// exists.  Empty for anything else (an .LRF, a missing proxy, a path
-    /// the filesystem cannot handle).  Whether the .LRF really covers the
-    /// .OSV's moments is for the opened proxy to say (isProxy()).
+    /// the same folder and name with the .LRF extension, or, for an .OSV
+    /// whose name ends in a "-<digits>" copy suffix, the name without it -
+    /// when that file exists.  Empty for anything else (an .LRF, a missing
+    /// proxy, a path the filesystem cannot handle).  Whether the .LRF really
+    /// covers the .OSV's moments is for the opened proxy to say (isProxy()).
     [[nodiscard]] static std::filesystem::path proxyFileFor(const std::filesystem::path& path);
 
     /// Native equirect output size: 2 x decoded lens height by lens height.

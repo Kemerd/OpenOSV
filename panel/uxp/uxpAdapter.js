@@ -16,6 +16,10 @@
  *   parameters         Component.getParam(i).displayName / getStartValue() /
  *                      createKeyframe() / createSetValueAction()
  *   media path         ClipProjectItem.cast(projectItem).getMediaFilePath()
+ *   .LRF proxy         ClipProjectItem.hasProxy() / canProxy() /
+ *                      attachProxy(mediaPath, isHiRes, inMakeAlternateLinkInTeamProjects)
+ *                      (Promise<boolean>, "Not undoable", since 25.6); the
+ *                      .LRF's existence comes from UXP's fs (main.js)
  *   clips added        EventManager + Constants.VideoTrackEvent.TRACK_CHANGED
  *                      (fires when "a clip is added to the track (drag from
  *                      Project panel, paste, overwrite edit)", per Adobe's
@@ -34,6 +38,7 @@
  *   signature()              -> string that changes when clips are added
  *   scan(seq, {selectedOnly})-> {items: OSV items, otherCount}
  *   apply(seq, items, settings) -> {applied, already, failed, errors[], notes[], missingEffect}
+ *   attachProxies(seq, items)-> {attached, already, missing, failed, unsupported, noFileAccess, errors[]}
  *   checkEffect()            -> {available: true | false | null}
  *   capabilities()           -> {undoGroups, stabilization}
  *   setEasing(seq, items, {entry, popupBase})
@@ -90,7 +95,7 @@
     /**
      * @param {object} ppro     require('premierepro')
      * @param {object} core     OsvCore
-     * @param {object} [options] { log(message) }
+     * @param {object} [options] { log(message), fileExists(path) -> Promise<true | false | null> }
      */
     function createUxpAdapter(ppro, core, options) {
         if (!ppro || (typeof ppro !== 'object' && typeof ppro !== 'function')) {
@@ -101,6 +106,10 @@
         }
         var opts = options || {};
         var log = typeof opts.log === 'function' ? opts.log : function () {};
+        // Whether a file exists: path -> Promise<true | false | null> (null =
+        // cannot tell).  main.js builds it on UXP's fs module; the premierepro
+        // module has no such call, and the camera's .LRF is found by name.
+        var fileExists = typeof opts.fileExists === 'function' ? opts.fileExists : null;
 
         var onEvent = null;
         var trackListeners = [];   // {track, name, handler}
@@ -356,6 +365,107 @@
                         return info;
                     });
             });
+        }
+
+        // ---- the camera's .LRF as the proxy ------------------------------------------
+
+        /** Call `fn` and settle its value; a synchronous throw becomes a rejection. */
+        function invoke(fn) {
+            return new Promise(function (resolve) { resolve(fn()); });
+        }
+
+        /**
+         * The first of `candidates` that exists: {path, unknown}.  `path` is ''
+         * when none does; `unknown` says whether some answer was "cannot tell"
+         * (then a missing .LRF is not proven).
+         */
+        function firstExisting(candidates) {
+            var found = { path: '', unknown: false };
+            var chain = Promise.resolve();
+            candidates.forEach(function (candidate) {
+                chain = chain.then(function () {
+                    if (found.path !== '') {
+                        return undefined;
+                    }
+                    return invoke(function () { return fileExists(candidate); }).then(function (yes) {
+                        if (yes === true) {
+                            found.path = candidate;
+                        } else if (yes !== false) {
+                            found.unknown = true;
+                        }
+                    }, function () {
+                        found.unknown = true;
+                    });
+                });
+            });
+            return chain.then(function () { return found; });
+        }
+
+        /**
+         * Attach the first existing candidate as the proxy of one clip
+         * project item, unless it has a proxy already, and count the outcome.
+         * hasProxy() is read again afterwards, so an answer Premiere did not
+         * act on is never counted as attached.
+         */
+        function attachProxyTo(clip, candidates, result) {
+            return safeCall(function () { return typeof clip.hasProxy === 'function' ? clip.hasProxy() : false; },
+                            false)
+                .then(function (has) {
+                    // ---- a proxy already there is kept ------------------------------
+                    if (has === true) {
+                        result.already += 1;
+                        return undefined;
+                    }
+                    if (typeof clip.attachProxy !== 'function') {
+                        result.unsupported += 1;
+                        return undefined;
+                    }
+                    return safeCall(function () { return typeof clip.canProxy === 'function' ? clip.canProxy() : true; },
+                                    true)
+                        .then(function (can) {
+                            if (can === false) {
+                                result.unsupported += 1;
+                                return undefined;
+                            }
+                            if (!fileExists) {
+                                result.noFileAccess = true;
+                                return undefined;
+                            }
+                            // ---- the first candidate that exists -------------------
+                            return firstExisting(candidates).then(function (found) {
+                                if (found.path === '') {
+                                    if (found.unknown) {
+                                        result.noFileAccess = true;
+                                    } else {
+                                        result.missing += 1;
+                                    }
+                                    return undefined;
+                                }
+                                // ---- attach as the proxy (isHiRes false), then check -----
+                                return invoke(function () { return clip.attachProxy(found.path, false, false); })
+                                    .then(function (ok) {
+                                        if (ok !== true) {
+                                            result.failed += 1;
+                                            result.errors.push('Premiere did not take ' + found.path + ' as the proxy');
+                                            return undefined;
+                                        }
+                                        return safeCall(function () {
+                                            return typeof clip.hasProxy === 'function' ? clip.hasProxy() : true;
+                                        }, true).then(function (now) {
+                                            if (now === false) {
+                                                result.failed += 1;
+                                                result.errors.push('Premiere did not take ' + found.path + ' as the proxy');
+                                            } else {
+                                                result.attached += 1;
+                                            }
+                                        });
+                                    }, function (err) {
+                                        result.failed += 1;
+                                        result.errors.push(messageOf(err));
+                                    });
+                            });
+                        });
+                });
         }
 
         // ---- effects -------------------------------------------------------------------
@@ -1209,6 +1319,81 @@
                         });
                     })
                     .then(function () { return result; });
+            },
+
+            /**
+             * Attach the camera's .LRF as the proxy of each .OSV clip's
+             * project item (ClipProjectItem.hasProxy / canProxy /
+             * attachProxy(mediaPath, isHiRes, inMakeAlternateLinkInTeamProjects)
+             * -> Promise<boolean>, "Not undoable", since 25.6).  OsvCore ranks
+             * where the .LRF can be; the injected fileExists() says which is
+             * there.  An item with a proxy already keeps it, and each project
+             * item is handled once however many of its clips are listed.
+             * -> {attached, already, missing, failed, unsupported, noFileAccess, errors[]}
+             */
+            attachProxies: function (seq, items) {
+                var result = { attached: 0, already: 0, missing: 0, failed: 0, unsupported: 0, noFileAccess: false,
+                               errors: [] };
+                var list = [];
+                (Array.isArray(items) ? items : []).forEach(function (i) {
+                    if (!i || typeof i.key !== 'string' || i.key.length === 0) {
+                        return;
+                    }
+                    // An .LRF on the timeline is a proxy itself: nothing to attach.
+                    var candidates = core.lrfCandidatesFor(i.mediaPath);
+                    if (candidates.length > 0) {
+                        list.push({ key: i.key, candidates: candidates });
+                    }
+                });
+                if (list.length === 0) {
+                    return Promise.resolve(result);
+                }
+                if (!ppro.ClipProjectItem || typeof ppro.ClipProjectItem.cast !== 'function') {
+                    result.unsupported = list.length;
+                    return Promise.resolve(result);
+                }
+                return contextFor(seq).then(function () {
+                    var seen = new Set();
+                    var chain = Promise.resolve();
+                    list.forEach(function (entry) {
+                        chain = chain.then(function () {
+                            // The clip as the latest scan saw it (scan() fills `live`).
+                            var ti = live.get(entry.key);
+                            if (!ti) {
+                                return undefined;
+                            }
+                            return safeCall(function () { return ti.getProjectItem(); }, null).then(function (pi) {
+                                if (!pi) {
+                                    return undefined;
+                                }
+                                var id = '';
+                                try {
+                                    id = typeof pi.getId === 'function' ? String(pi.getId() || '') : '';
+                                } catch (err) {
+                                    id = '';
+                                }
+                                if (id) {
+                                    if (seen.has(id)) {
+                                        return undefined;
+                                    }
+                                    seen.add(id);
+                                }
+                                var clip = null;
+                                try {
+                                    clip = ppro.ClipProjectItem.cast(pi);
+                                } catch (err) {
+                                    clip = null;
+                                }
+                                if (!clip) {
+                                    result.unsupported += 1;
+                                    return undefined;
+                                }
+                                return attachProxyTo(clip, entry.candidates, result);
+                            });
+                        });
+                    });
+                    return chain.then(function () { return result; });
+                });
             },
 
             checkEffect: function () {

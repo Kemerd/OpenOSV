@@ -455,3 +455,52 @@ test('toExtendScriptLiteral escapes the two characters ES3 cannot hold in a stri
     assert.equal(core.toExtendScriptLiteral(cyclic), 'null');
     assert.equal(core.toExtendScriptLiteral(undefined), 'null');
 });
+
+// ---------------------------------------------------------------------------
+//  The camera's .LRF as the proxy of an .OSV
+// ---------------------------------------------------------------------------
+
+test('lrfCandidatesFor: the .LRF of the same name first, then of the name without a copy suffix', () => {
+    // The user's pair: the .OSV renamed by a copy, the .LRF as the camera wrote it.
+    assert.deepEqual(core.lrfCandidatesFor('L:\\ref\\CAM_20260122163617_0007_D-001.OSV'), [
+        'L:\\ref\\CAM_20260122163617_0007_D-001.LRF', 'L:\\ref\\CAM_20260122163617_0007_D-001.lrf',
+        'L:\\ref\\CAM_20260122163617_0007_D.LRF', 'L:\\ref\\CAM_20260122163617_0007_D.lrf'
+    ]);
+    // The camera's own layout, a Mac card, the extension in any case.
+    assert.deepEqual(core.lrfCandidatesFor('/Volumes/SD/DCIM/CAM_20260508002450_0016_D.osv'),
+                     ['/Volumes/SD/DCIM/CAM_20260508002450_0016_D.LRF', '/Volumes/SD/DCIM/CAM_20260508002450_0016_D.lrf']);
+    // A trailing NUL or whitespace from the host does not leak into the path.
+    assert.deepEqual(core.lrfCandidatesFor('C:/a/CAM.OSV\u0000'), ['C:/a/CAM.LRF', 'C:/a/CAM.lrf']);
+});
+
+test('lrfCandidatesFor: only "-" plus one to four digits after something is a copy suffix', () => {
+    assert.equal(core.lrfCandidatesFor('C:/a/trip-final.OSV').length, 2, 'a word is part of the name');
+    assert.equal(core.lrfCandidatesFor('C:/a/clip-12345.OSV').length, 2, 'five digits are part of the name');
+    assert.equal(core.lrfCandidatesFor('C:/a/-001.OSV').length, 2, 'nothing before the dash');
+    assert.deepEqual(core.lrfCandidatesFor('C:/a/CAM_D-2.OSV').slice(2), ['C:/a/CAM_D.LRF', 'C:/a/CAM_D.lrf']);
+});
+
+test('lrfCandidatesFor: an .LRF, other media and garbage have no proxy to look for', () => {
+    for (const v of ['C:/a/CAM.LRF', 'C:/a/clip.mp4', 'C:/a/trip.osv/', '', null, undefined, 42, {}, ['a.OSV']]) {
+        assert.deepEqual(core.lrfCandidatesFor(v), [], JSON.stringify(v));
+    }
+});
+
+test('summarizeProxies: attached, already, missing, failed and the quiet automatic pass', () => {
+    const attached = core.summarizeProxies({ attached: 2, already: 1 }, 'all');
+    assert.equal(attached.tone, 'ok');
+    assert.equal(attached.text, 'Attached the .LRF proxy to 2 clips. 1 clip had one.');
+    assert.equal(core.summarizeProxies({ attached: 1 }, 'auto').quiet, false, 'an attach is worth saying on a drop');
+    assert.equal(core.summarizeProxies({ already: 1 }, 'auto').quiet, true);
+    assert.equal(core.summarizeProxies({ missing: 3 }, 'auto').quiet, true, 'no .LRF beside a dropped clip is not news');
+    assert.equal(core.summarizeProxies({ already: 1 }, 'all').text, 'The OSV clip already has its proxy.');
+    assert.equal(core.summarizeProxies({ already: 4 }, 'all').text, 'All 4 OSV clips already have their proxies.');
+    assert.equal(core.summarizeProxies({ missing: 2, already: 1 }, 'all').text, 'No .LRF beside 2 OSV clips.');
+    const failed = core.summarizeProxies({ failed: 1, errors: ['Premiere did not take X as the proxy'] }, 'auto');
+    assert.equal(failed.tone, 'error');
+    assert.equal(failed.quiet, false);
+    assert.match(failed.text, /^Couldn't attach the \.LRF proxy to 1 clip: Premiere did not take X as the proxy\.$/);
+    assert.equal(core.summarizeProxies({ unsupported: 2 }, 'all').tone, 'warn');
+    assert.match(core.summarizeProxies({ noFileAccess: true }, 'all').text, /can't look for \.LRF files/);
+    assert.equal(core.summarizeProxies(null, 'all').text, 'No OSV clips in this sequence.');
+});

@@ -257,3 +257,111 @@ test('end to end: drop OSV clips on the timeline and Open 360 Reframe lands on e
     assert.equal(m.reframeCount(d2), 1, 'still exactly one');
     ctl.stop();
 });
+
+// ---------------------------------------------------------------------------
+//  The camera's .LRF as the proxy (ClipProjectItem.attachProxy, since 25.6)
+// ---------------------------------------------------------------------------
+
+/** A fileExists() over a fixed list, as main.js builds one on UXP's fs. */
+function filesThatExist(list) {
+    return async (p) => list.indexOf(p) !== -1;
+}
+
+test('attachProxies attaches the .LRF beside each .OSV once, as the proxy, and keeps one that is there', async () => {
+    const m = createMockPremiere();
+    const seq = m.addSequence('seq-1', 'Main', 2);
+    const adapter = createUxpAdapter(m.ppro, core, {
+        fileExists: filesThatExist(['C:\\DCIM\\CAM_X_D.LRF', 'C:\\DCIM\\CAM_Y.LRF'])
+    });
+    const shared = { id: 'pi-x', path: 'C:\\DCIM\\CAM_X_D-001.OSV', isSequence: false };
+    m.addClip(seq, 0, { name: 'x', start: 0, end: 1000, projectItem: shared });
+    m.addClip(seq, 1, { name: 'x again', start: 0, end: 1000, projectItem: shared });
+    const mine = { id: 'pi-y', path: 'C:\\DCIM\\CAM_Y.OSV', isSequence: false, proxyPath: 'D:\\mine.mov' };
+    m.addClip(seq, 0, { name: 'y', start: 2000, end: 3000, projectItem: mine });
+    m.addClip(seq, 0, { name: 'z', start: 4000, end: 5000,
+                        projectItem: { id: 'pi-z', path: 'C:\\DCIM\\CAM_Z.OSV', isSequence: false } });
+    adapter.init(() => {});
+    const active = await adapter.getActiveSequence();
+    const scanned = await adapter.scan(active, { selectedOnly: false });
+    const r = await adapter.attachProxies(active, scanned.items);
+    assert.deepEqual(r, { attached: 1, already: 1, missing: 1, failed: 0, unsupported: 0, noFileAccess: false,
+                          errors: [] });
+    // As the proxy (isHiRes false), not as a Team Projects alternate link, once.
+    assert.deepEqual(m.world.proxyCalls, [{ item: 'pi-x', path: 'C:\\DCIM\\CAM_X_D.LRF', isHiRes: false,
+                                            alternateLink: false }]);
+    assert.equal(shared.proxyPath, 'C:\\DCIM\\CAM_X_D.LRF');
+    assert.equal(mine.proxyPath, 'D:\\mine.mov', 'a proxy already there is kept');
+});
+
+test('attachProxies: a refusal fails, no file access or no proxy API is said, never guessed', async () => {
+    const make = (options, adapterOptions) => {
+        const m = createMockPremiere(options);
+        const seq = m.addSequence('seq-1', 'Main', 1);
+        m.addClip(seq, 0, { name: 'x', start: 0, end: 1000,
+                            projectItem: { id: 'pi-x', path: 'C:\\DCIM\\CAM_X.OSV', isSequence: false } });
+        const adapter = createUxpAdapter(m.ppro, core, adapterOptions);
+        adapter.init(() => {});
+        return { m, adapter };
+    };
+    const run = async (t) => {
+        const active = await t.adapter.getActiveSequence();
+        const scanned = await t.adapter.scan(active, { selectedOnly: false });
+        return t.adapter.attachProxies(active, scanned.items);
+    };
+    // Premiere answers false.
+    const refused = make({}, { fileExists: filesThatExist(['C:\\DCIM\\CAM_X.LRF']) });
+    refused.m.world.proxyRefuses = true;
+    const r1 = await run(refused);
+    assert.equal(r1.failed, 1);
+    assert.match(r1.errors[0], /did not take C:\\DCIM\\CAM_X\.LRF as the proxy/);
+    // No file system: nothing is attached on a guess.
+    const blind = make({}, {});
+    const r2 = await run(blind);
+    assert.equal(r2.noFileAccess, true);
+    assert.equal(r2.attached + r2.missing + r2.failed, 0);
+    assert.equal(blind.m.world.proxyCalls.length, 0);
+    // The file system cannot tell (no permission): the same, not "missing".
+    const unsure = make({}, { fileExists: async () => null });
+    const r3 = await run(unsure);
+    assert.equal(r3.noFileAccess, true);
+    assert.equal(r3.missing, 0);
+    // A host without the proxy calls.
+    const old = make({}, { fileExists: filesThatExist(['C:\\DCIM\\CAM_X.LRF']) });
+    old.m.world.noProxyApi = true;
+    const r4 = await run(old);
+    assert.equal(r4.unsupported, 1);
+});
+
+test('auto-apply attaches the .LRF of a dropped .OSV once; the button reports every clip', async () => {
+    const m = createMockPremiere();
+    const seq = m.addSequence('seq-1', 'Main', 2);
+    const adapter = createUxpAdapter(m.ppro, core, { fileExists: filesThatExist(['C:\\DCIM\\CAM_D.LRF']) });
+    const timers = fakeTimers();
+    const ctl = createController({ core, adapter, timers, storage: null });
+    const step = async (ms) => {
+        await settle(40);
+        timers.advance(ms);
+        await settle(40);
+        await ctl.idle();
+        await settle(40);
+    };
+    ctl.start();
+    await step(0);
+    // The drop.
+    m.addClip(seq, 0, { name: 'drop', start: 0, end: 1000,
+                        projectItem: { id: 'pi-d', path: 'C:\\DCIM\\CAM_D-001.OSV', isSequence: false } });
+    m.fireTrackChanged(seq, 0);
+    await step(1000);
+    assert.equal(m.reframeCount(seq.tracks[0][0]), 1, 'the effect went on');
+    assert.deepEqual(m.world.proxyCalls.map((c) => c.path), ['C:\\DCIM\\CAM_D.LRF']);
+    assert.match(ctl.getState().status.text, /Attached the \.LRF proxy to 1 clip\./);
+    // The same master clip dropped again: not asked again.
+    m.addClip(seq, 1, { name: 'again', start: 0, end: 1000, projectItem: seq.tracks[0][0].projectItem });
+    m.fireTrackChanged(seq, 1);
+    await step(1000);
+    assert.equal(m.world.proxyCalls.length, 1);
+    // The button looks at every clip: it has its proxy now.
+    await ctl.attachProxies();
+    assert.equal(ctl.getState().status.text, 'The OSV clip already has its proxy.');
+    ctl.stop();
+});

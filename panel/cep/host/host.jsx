@@ -822,6 +822,94 @@ var OpenOSVHost = (function () {
     }
 
     // ======================================================================
+    //  The camera's .LRF as the proxy of an .OSV project item
+    // ======================================================================
+
+    /** True when `path` names an existing file (ExtendScript's File object). */
+    function fileExists(path) {
+        try {
+            var f = new File(String(path));
+            return f.exists === true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /**
+     * Attach the first existing path of `candidates` as the proxy of one
+     * project item, unless it has a proxy already (the user's own, or one
+     * attached before), and count the outcome in `result`.
+     *
+     * Official DOM (ppro-scripting.docsforadobe.dev, ProjectItem):
+     * hasProxy() -> Boolean, canProxy() -> Boolean, and
+     * attachProxy(mediaPath, isHiRes) with isHiRes 0 = attach as the proxy,
+     * which "returns 0 if successful".  hasProxy() is read again afterwards,
+     * so an answer Premiere did not act on is never counted as attached.
+     */
+    function attachProxyTo(item, candidates, result) {
+        // ---- a proxy already there is kept ----------------------------------
+        var has = false;
+        try {
+            has = typeof item.hasProxy === 'function' && item.hasProxy() === true;
+        } catch (e) {
+            has = false;
+        }
+        if (has) {
+            result.already += 1;
+            return;
+        }
+        // ---- can this Premiere (and this item) take one at all ----------------
+        if (typeof item.attachProxy !== 'function') {
+            result.unsupported += 1;
+            return;
+        }
+        try {
+            if (typeof item.canProxy === 'function' && item.canProxy() === false) {
+                result.unsupported += 1;
+                return;
+            }
+        } catch (e) {
+            // An unreadable answer is not a refusal; attachProxy() will say.
+        }
+        // ---- the first candidate that exists ------------------------------------
+        var path = '';
+        for (var c = 0; c < candidates.length && path === ''; c += 1) {
+            var candidate = String(candidates[c]);
+            if (candidate.length > 0 && fileExists(candidate)) {
+                path = candidate;
+            }
+        }
+        if (path === '') {
+            result.missing += 1;
+            return;
+        }
+        // ---- attach, then believe hasProxy() -----------------------------------
+        var code = null;
+        try {
+            code = item.attachProxy(path, 0);
+        } catch (e) {
+            result.failed += 1;
+            result.errors.push(messageOf(e));
+            return;
+        }
+        var ok = code === 0 || code === true;
+        try {
+            if (typeof item.hasProxy === 'function') {
+                ok = ok && item.hasProxy() === true;
+            }
+        } catch (e) {
+            // Keep attachProxy()'s own answer.
+        }
+        if (ok) {
+            result.attached += 1;
+            result.paths.push(path);
+        } else {
+            result.failed += 1;
+            result.errors.push('Premiere did not take ' + path + ' as the proxy');
+        }
+    }
+
+    // ======================================================================
     //  Events -> the panel
     // ======================================================================
 
@@ -1342,6 +1430,63 @@ var OpenOSVHost = (function () {
                 return okJson({ available: null });
             }
             return okJson({ available: qeEffect() !== null });
+        } catch (e) {
+            return errorJson(messageOf(e));
+        }
+    };
+
+    /**
+     * Attach the camera's .LRF as the proxy of the project items behind the
+     * clips named in `request.requests` - [{key: track item nodeId,
+     * candidates: [path, ...]}], the candidates in the order the panel's
+     * OsvCore.lrfCandidatesFor() ranks them.  Each project item is handled
+     * once however many of its clips are listed, and an item with a proxy
+     * already keeps it.
+     *
+     * Returns {attached, already, missing, failed, unsupported, errors[], paths[]}.
+     */
+    api.attachProxies = function (request) {
+        try {
+            var req = request || {};
+            var seq = activeSequence();
+            if (!seq || sequenceIdOf(seq) !== String(req.sequenceId)) {
+                return errorJson('the active sequence changed. Try again');
+            }
+            var list = isArray(req.requests) ? req.requests : [];
+            var result = { attached: 0, already: 0, missing: 0, failed: 0, unsupported: 0, errors: [], paths: [] };
+            var done = {};
+            for (var i = 0; i < list.length; i += 1) {
+                var r = list[i] || {};
+                // findClip() answers {clip, trackIndex, ordinal}.
+                var found = findClip(seq, String(r.key));
+                if (!found || !found.clip) {
+                    continue;
+                }
+                var item = null;
+                try {
+                    item = found.clip.projectItem;
+                } catch (e) {
+                    item = null;
+                }
+                if (!item) {
+                    continue;
+                }
+                // One project item, one attach - its other clips share it.
+                var id = '';
+                try {
+                    id = String(item.nodeId);
+                } catch (e) {
+                    id = '';
+                }
+                if (id && done.hasOwnProperty(id)) {
+                    continue;
+                }
+                if (id) {
+                    done[id] = true;
+                }
+                attachProxyTo(item, isArray(r.candidates) ? r.candidates : [], result);
+            }
+            return okJson(result);
         } catch (e) {
             return errorJson(messageOf(e));
         }

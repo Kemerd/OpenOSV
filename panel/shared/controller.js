@@ -144,6 +144,10 @@
         var seqIndex = { projectId: null, ids: null, synced: false };
         // Sequence id -> the OSV items seen at the last pass.
         var knownItems = new Map();
+        // Project items whose .LRF proxy an automatic pass already handled
+        // (attached, had one, none beside it, or failed): a clip dropped again
+        // does not ask again.  The "Attach .LRF proxies" button always asks.
+        var proxyItems = new Set();
 
         // ---- helpers ---------------------------------------------------------
 
@@ -250,6 +254,7 @@
                 .then(function () {
                     if (projectChanged) {
                         knownItems.clear();
+                        proxyItems.clear();
                     }
                     seqIndex.projectId = seq.projectId;
                     seqIndex.synced = true;
@@ -321,9 +326,10 @@
                     }
                     return Promise.resolve(adapter.apply(seq, diff.added, state.settings)).then(function (result) {
                         var summary = core.summarize(result, 'auto');
-                        if (!summary.quiet) {
-                            setStatus(summary.tone, summary.text, true);
-                        }
+                        // The same drop also gets each new .OSV's .LRF as its proxy.
+                        return newProxies(seq, diff.added).then(function (proxies) {
+                            reportAuto([summary, proxies]);
+                        });
                     });
                 })
                 .catch(function (err) {
@@ -334,6 +340,62 @@
                         return undefined;
                     }
                     throw err;
+                });
+        }
+
+        /** Severity order of the status tones, for a line that joins two summaries. */
+        var TONE_RANK = { info: 0, ok: 1, warn: 2, error: 3 };
+
+        /**
+         * One status line for an automatic pass from its summaries (the
+         * effect's, the proxies'): the ones worth saying, joined, at the most
+         * severe of their tones.  Nothing at all when every one is quiet.
+         */
+        function reportAuto(summaries) {
+            var parts = [];
+            var tone = null;
+            summaries.forEach(function (s) {
+                if (!s || s.quiet || typeof s.text !== 'string' || s.text.length === 0) {
+                    return;
+                }
+                parts.push(s.text);
+                if (tone === null || (TONE_RANK[s.tone] || 0) > (TONE_RANK[tone] || 0)) {
+                    tone = s.tone;
+                }
+            });
+            if (parts.length > 0) {
+                setStatus(tone || 'info', parts.join(' '), true);
+            }
+        }
+
+        /**
+         * Attach the camera's .LRF as the proxy of the project items behind
+         * newly dropped clips, once per project item per project (the adapter
+         * leaves a proxy that is already there alone).  Resolves to a status
+         * summary (quiet when there was nothing to say), never rejects.
+         */
+        function newProxies(seq, items) {
+            if (typeof adapter.attachProxies !== 'function') {
+                return Promise.resolve(null);
+            }
+            var fresh = (Array.isArray(items) ? items : []).filter(function (it) {
+                var id = it ? String(it.projectItemId) : '';
+                if (id.length === 0 || proxyItems.has(id)) {
+                    return false;
+                }
+                proxyItems.add(id);
+                return true;
+            });
+            if (fresh.length === 0) {
+                return Promise.resolve(null);
+            }
+            return Promise.resolve()
+                .then(function () { return adapter.attachProxies(seq, fresh); })
+                .then(function (r) {
+                    return core.summarizeProxies(r, 'auto');
+                }, function (err) {
+                    return { tone: 'error', quiet: false,
+                             text: 'Couldn\'t attach the .LRF proxy: ' + core.shortError(messageOf(err)) + '.' };
                 });
         }
 
@@ -563,6 +625,46 @@
             });
         }
 
+        /**
+         * The "Attach .LRF proxies" button: every OSV clip of the active
+         * sequence gets its project item's .LRF as the proxy, where the item
+         * has none yet and the .LRF is beside the .OSV.
+         */
+        function attachProxiesAll() {
+            return runAction('proxies', 'Attaching proxies...', function () {
+                var seq = null;
+                return Promise.resolve(adapter.getActiveSequence())
+                    .then(function (s) {
+                        seq = (s && typeof s === 'object' && s.id) ? s : null;
+                        if (!seq) {
+                            setStatus('info', 'Open a sequence first.', true);
+                            return null;
+                        }
+                        return syncProject(seq, false).then(function () { return scan(seq, false); });
+                    })
+                    .then(function (scanned) {
+                        if (!seq || !scanned) {
+                            return undefined;
+                        }
+                        if (scanned.items.length === 0) {
+                            var none = core.summarizeProxies({}, 'all');
+                            setStatus(none.tone, none.text, true);
+                            return undefined;
+                        }
+                        return Promise.resolve(adapterCall('attachProxies')(seq, scanned.items)).then(function (r) {
+                            // Asked now: a later automatic pass need not ask again.
+                            scanned.items.forEach(function (it) {
+                                if (it && it.projectItemId !== undefined) {
+                                    proxyItems.add(String(it.projectItemId));
+                                }
+                            });
+                            var summary = core.summarizeProxies(r, 'all');
+                            setStatus(summary.tone, summary.text, true);
+                        });
+                    });
+            });
+        }
+
         /** A Manual Framing action on the selected clip, then fresh read-outs. */
         function framingAction(request, label) {
             return runAction('framing', label, function () {
@@ -767,6 +869,8 @@
 
             applySelected: function () { return manualApply(true); },
             applyAll: function () { return manualApply(false); },
+            /** Attach every OSV clip's .LRF as its proxy (the button). */
+            attachProxies: function () { return attachProxiesAll(); },
 
             // ---- [WP-EASING] --------------------------------------------------------
 

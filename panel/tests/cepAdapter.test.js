@@ -198,3 +198,26 @@ test('end to end: OSV clips dropped on the timeline get the effect once; the res
     assert.equal(w.reframeCount(a), 1);
     ctl.stop();
 });
+
+test('attachProxies: the scanned .OSV clips get the .LRF beside them, an .LRF clip asks for nothing', async () => {
+    const { w, seq, bridge, adapter } = boot();
+    const a = w.addClip(seq, 0, {
+        name: 'CAM_X_D-001.OSV', start: 0, end: 1000, path: 'C:\\DCIM\\CAM_X_D-001.OSV', projectItemId: 'pi-x'
+    });
+    w.addClip(seq, 1, { name: 'CAM_X_D.LRF', start: 0, end: 1000, path: 'C:\\DCIM\\CAM_X_D.LRF', projectItemId: 'pi-l' });
+    w.world.files.push('C:\\DCIM\\CAM_X_D.LRF');
+    adapter.init(() => {});
+    await settle();
+    const active = await adapter.getActiveSequence();
+    const scanned = await adapter.scan(active, { selectedOnly: false });
+    assert.equal(scanned.items.length, 2, 'both are OpenOSV media');
+    const r = await adapter.attachProxies(active, scanned.items);
+    assert.deepEqual(r, { attached: 1, already: 0, missing: 0, failed: 0, unsupported: 0, errors: [] });
+    assert.deepEqual(w.world.proxyCalls, [{ item: 'pi-x', path: 'C:\\DCIM\\CAM_X_D.LRF', isHiRes: 0 }]);
+    assert.equal(a.projectItem.hasProxy(), true);
+    // Nothing that can have a proxy: no host call at all.
+    const before = bridge.calls.length;
+    const none = await adapter.attachProxies(active, scanned.items.filter((i) => /\.LRF$/.test(i.mediaPath)));
+    assert.equal(none.attached, 0);
+    assert.equal(bridge.calls.length, before);
+});

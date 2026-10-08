@@ -84,7 +84,12 @@ function createMockPremiere(options) {
         playhead: 0,
         frameSize: { width: 1920, height: 1080 },
         // A ClipProjectItem without getComponentChain (an older host).
-        noMasterChains: false
+        noMasterChains: false,
+        // The .LRF proxy: every attachProxy() call, a Premiere that answers
+        // false to it, and one without the proxy calls at all.
+        proxyCalls: [],
+        proxyRefuses: false,
+        noProxyApi: false
     };
 
     // ---- value classes ------------------------------------------------------
@@ -311,6 +316,22 @@ function createMockPremiere(options) {
                     isSequence: async () => m.isSequence === true,
                     getMediaFilePath: async () => m.isSequence ? '' : m.path
                 };
+                // The proxy calls; projectItem.proxyPath is a proxy already
+                // there, projectItem.canProxy === false an item that takes none.
+                if (!world.noProxyApi) {
+                    clip.hasProxy = async () => typeof m.proxyPath === 'string' && m.proxyPath.length > 0;
+                    clip.canProxy = async () => m.canProxy !== false;
+                    clip.attachProxy = async (mediaPath, isHiRes, alternateLink) => {
+                        world.proxyCalls.push({ item: m.id, path: mediaPath, isHiRes: isHiRes, alternateLink: alternateLink });
+                        if (world.proxyRefuses) {
+                            return false;
+                        }
+                        if (isHiRes === false) {
+                            m.proxyPath = mediaPath;
+                        }
+                        return true;
+                    };
+                }
                 // [WP-EASING] The master clip's effects: its OpenOSV Source
                 // Settings, when the test gave the project item one.
                 if (!world.noMasterChains) {
