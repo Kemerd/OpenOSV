@@ -94,7 +94,8 @@ struct CodecLogTag {
 /// @brief "[h264 'CAM_..._D.LRF'] " - who an FFmpeg message is about.
 ///
 /// The AVClass item name (the codec for a codec context, the demuxer for a
-/// format context) and, for our own codec contexts, the clip.  Every AVClass
+/// format context) and the clip: from our tag for our own codec contexts,
+/// from the name it was opened with for a format context.  Every AVClass
 /// pointer is the first member of the struct FFmpeg logs with, so `avcl` can
 /// be read that far for any message.  Never throws: a tag that cannot be
 /// built is left out, the message itself still goes through.
@@ -125,6 +126,23 @@ std::string ffmpegLogTag(void* avcl) noexcept {
                 out += " '";
                 out.append(tag->clip, n);
                 out += "'";
+            }
+        } else if (cls == avformat_get_class()) {
+            // ---- the clip, for a demuxer: the name it was opened with ------------------
+            // AVFormatContext::url is what avformat_open_input() was given (a
+            // file name here, a full path for the importer's audio): its last
+            // component names the clip, so a demuxer's line - "timescale not
+            // set" - is attributable, and throttled per clip, like a codec's.
+            const auto* fmt = static_cast<const AVFormatContext*>(avcl);
+            if (fmt->url != nullptr && fmt->url[0] != '\0') {
+                const std::string_view url(fmt->url, ::strnlen(fmt->url, 4096u));
+                const std::size_t slash = url.find_last_of("/\\");
+                const std::string_view name = slash == std::string_view::npos ? url : url.substr(slash + 1u);
+                if (!name.empty()) {
+                    out += " '";
+                    out += log::safe(name.substr(0, 95u));
+                    out += "'";
+                }
             }
         }
         out += "] ";

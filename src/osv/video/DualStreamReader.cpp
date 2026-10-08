@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <exception>
@@ -51,6 +52,29 @@ namespace {
            ((c == 'o' || c == 'O') && (d == 'n' || d == 'N'));
 }
 
+/// @brief A path as UTF-8 text for a log line or an error message.
+///
+/// path::string() converts through the ANSI code page on Windows and throws
+/// on a character it cannot map - a non-ASCII user profile under
+/// %LOCALAPPDATA%, a renamed clip.  Inside the verifier that exception would
+/// be swallowed by verifyAgainstSoftware()'s catch, silently skipping the
+/// check or, after a mismatch, losing the software replacement.  The UTF-8
+/// form exists for every path; "?" only when even that cannot be built.
+[[nodiscard]] std::string pathText(const std::filesystem::path& p) noexcept {
+    try {
+        const std::u8string text = p.u8string();
+        return std::string(text.begin(), text.end());
+    } catch (...) {
+        return "?";
+    }
+}
+
+/// Mismatch dump pairs written by every verifier of this module so far.  The
+/// cap (ShadowDecodeVerifier::kMaxDumps) bounds the dump folder for the whole
+/// session: a reader that is reopened (a pool miss, a new instance of the
+/// clip) gets a new verifier, and a per-verifier count would start again.
+std::atomic<std::uint32_t> g_dumpPairsWritten{0};
+
 /// @brief Make a clip name usable in a file name: [A-Za-z0-9._-] kept, the
 /// rest replaced by '_', at most 80 characters.
 [[nodiscard]] std::string fileSafeName(std::string_view name) {
@@ -83,7 +107,7 @@ Status writeLumaPgm(const std::filesystem::path& file, const PlanarFrame16& fram
     }
     std::ofstream out(file, std::ios::binary | std::ios::trunc);
     if (!out) {
-        return failStatus(ErrorCode::Io, "cannot create " + file.string());
+        return failStatus(ErrorCode::Io, "cannot create " + pathText(file));
     }
     out << "P5\n" << frame.width << ' ' << frame.height << "\n1023\n";
     // One row of big-endian samples at a time.
@@ -98,7 +122,7 @@ Status writeLumaPgm(const std::filesystem::path& file, const PlanarFrame16& fram
         out.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
     }
     if (!out) {
-        return failStatus(ErrorCode::Io, "cannot write " + file.string());
+        return failStatus(ErrorCode::Io, "cannot write " + pathText(file));
     }
     return okStatus();
 }
@@ -192,24 +216,34 @@ struct ShadowDecodeVerifier::Impl {
     std::filesystem::path dumpDirectory;    ///< Empty = never dump.
     std::uint64_t checked = 0;              ///< Pictures compared.
     std::uint64_t mismatched = 0;           ///< Of those, how many differed.
-    std::uint32_t dumps = 0;                ///< Mismatch pairs written so far (<= kMaxDumps).
     std::optional<std::uint32_t> lastDumpedSync;  ///< The GOP (its sync sample) of the last dump.
 
     /// @brief Dump both luma planes of a mismatch, if this one should be.
     ///
     /// Only the first mismatch after each sync sample - the onset of a
     /// damaged run, which is what says where it started - and at most
-    /// kMaxDumps per verifier.  Failures are logged, never returned: a dump
-    /// is a convenience on top of the warning.
+    /// kMaxDumps pairs per process (g_dumpPairsWritten), however many readers
+    /// and verifiers the session opens.  Failures are logged, never returned:
+    /// a dump is a convenience on top of the warning.
     void maybeDump(Verdict& verdict, std::uint32_t index, const PlanarFrame16& primary, const PlanarFrame16& ref,
                    const std::optional<DecodedFrameInfo>& info, std::uint32_t sync, std::string_view clipName) {
-        if (dumpDirectory.empty() || dumps >= kMaxDumps || (lastDumpedSync && *lastDumpedSync == sync)) {
+        if (dumpDirectory.empty() || (lastDumpedSync && *lastDumpedSync == sync)) {
             return;
         }
+        // ---- reserve one of the session's pairs --------------------------------------
+        // A compare-exchange, so two verifiers on two readers can never both
+        // take the last slot.  Given back below when nothing was written.
+        std::uint32_t used = g_dumpPairsWritten.load(std::memory_order_relaxed);
+        do {
+            if (used >= kMaxDumps) {
+                return;
+            }
+        } while (!g_dumpPairsWritten.compare_exchange_weak(used, used + 1u, std::memory_order_relaxed));
         std::error_code ec;
         std::filesystem::create_directories(dumpDirectory, ec);
         if (ec) {
-            log::warn("video: decode check: cannot create {} ({})", log::safe(dumpDirectory.string()), ec.message());
+            g_dumpPairsWritten.fetch_sub(1u, std::memory_order_relaxed);
+            log::warn("video: decode check: cannot create {} ({})", log::safe(pathText(dumpDirectory)), ec.message());
             return;
         }
         // <clip>_f<index>_<path>.pgm and <clip>_f<index>_software.pgm.
@@ -220,11 +254,11 @@ struct ShadowDecodeVerifier::Impl {
         const Status wa = writeLumaPgm(a, primary);
         const Status wb = writeLumaPgm(b, ref);
         if (!wa.ok() || !wb.ok()) {
+            g_dumpPairsWritten.fetch_sub(1u, std::memory_order_relaxed);  // nothing usable written
             log::warn("video: decode check: could not dump frame {} ({})", index,
                       !wa.ok() ? wa.error().message : wb.error().message);
             return;
         }
-        ++dumps;
         lastDumpedSync = sync;
         verdict.dumpedPrimary = a;
         verdict.dumpedReference = b;
@@ -335,8 +369,8 @@ Result<ShadowDecodeVerifier::Verdict> ShadowDecodeVerifier::check(std::uint32_t 
               c.firstBadRow, c.lastBadRow, hwAccelName(info.hw), static_cast<unsigned>(info.decodeErrorFlags),
               info.corrupt ? "yes" : "no", info.keyFrame ? 1 : 0, info.surface, refVerdict,
               verdict.dumpedPrimary.empty() ? std::string()
-                                            : "; luma planes dumped to " + log::safe(verdict.dumpedPrimary.string()) +
-                                                  " and " + log::safe(verdict.dumpedReference.string()));
+                                            : "; luma planes dumped to " + log::safe(pathText(verdict.dumpedPrimary)) +
+                                                  " and " + log::safe(pathText(verdict.dumpedReference)));
     verdict.replacement = std::move(ref).value();
     return verdict;
 }
@@ -433,7 +467,7 @@ struct DualStreamReader::Impl {
             if (!info || info->hw == HwAccel::None || info->index != index) {
                 return;
             }
-            const std::string clip = log::safe(path.filename().string());
+            const std::string clip = log::safe(pathText(path.filename()));
             // ---- the reference decoder, on the first hardware picture -----------------
             if (!verifier.isOpen()) {
                 if (verifierTried) {
@@ -451,7 +485,8 @@ struct DualStreamReader::Impl {
                 verifier = std::move(opened).value();
                 log::info("video: decode check: '{}' every {} picture is compared with a software decode "
                           "(OPENOSV_VERIFY_HW_DECODE); mismatches are logged, replaced and dumped to {}",
-                          clip, hwAccelName(info->hw), dumps.empty() ? std::string("nowhere") : log::safe(dumps.string()));
+                          clip, hwAccelName(info->hw),
+                          dumps.empty() ? std::string("nowhere") : log::safe(pathText(dumps)));
             }
             // ---- compare, and deliver the software picture on a mismatch ------------
             auto verdict = verifier.check(index, whole.frame.value(), info, d.previousSyncIndex(index), clip);

@@ -99,13 +99,15 @@ struct LumaComparison {
 /// frame threads, the primary's sample feed) and decodes the same index the
 /// primary did.  On a mismatch it writes both luma planes as 16-bit PGM
 /// (maxval 1023) to the dump directory - the first mismatch after each sync
-/// sample only, and at most kMaxDumps per verifier, because a damaged GOP
-/// would otherwise write 8 MB per proxy frame.
+/// sample only, and at most kMaxDumps pairs per process (each plug-in module
+/// counts its own), however many readers and verifiers the session opens,
+/// because a damaged GOP would otherwise write 8 MB per proxy frame.
 ///
 /// Not thread-safe: the owning reader serialises calls, as it does decodes.
 class ShadowDecodeVerifier {
 public:
-    /// Mismatch dumps (pairs of PGMs) one verifier writes at most.
+    /// Mismatch dumps (pairs of PGMs) written at most per process - shared
+    /// by every verifier, so a reopened reader never starts the count again.
     static constexpr std::uint32_t kMaxDumps = 16;
 
     /// What one check() found.

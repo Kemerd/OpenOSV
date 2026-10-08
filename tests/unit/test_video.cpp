@@ -1773,6 +1773,55 @@ TEST_CASE("the shadow verifier names the first bad row, dumps the planes and han
     std::filesystem::remove_all(damaged.dir, ec);
 }
 
+TEST_CASE("the shadow verifier dumps into, and names, a folder the ANSI code page cannot spell",
+          "[video][sample][verify]") {
+    OSV_REQUIRE_SAMPLE_LRF();
+    // A user profile (the dump folder sits under %LOCALAPPDATA%) or a clip
+    // name outside the ANSI code page - Greek or CJK on a Western Windows -
+    // made path::string() throw inside the mismatch warning.  The reader's
+    // catch then lost the software replacement and delivered the hardware
+    // picture.  The folder here holds characters no single-byte code page
+    // has, so on such a system the old conversion throws.
+    const DamagedLrf damaged = makeDamagedLrf(osvtest::sampleLrf(), "lrfverify-unicode");
+    const std::filesystem::path dumps = damaged.dir / std::filesystem::path(u8"decode-mismatch-Ω日本");
+    {
+        CapturedLog captured(log::Level::Warn);
+        auto primaryOpened = openSoftware(damaged.path);
+        REQUIRE(primaryOpened.ok());
+        HevcStreamDecoder& primary = primaryOpened.value();
+        DecoderOptions primaryOptions;
+        primaryOptions.useContainerSamples = true;
+        auto verifierOpened = ShadowDecodeVerifier::open(osvtest::sampleLrf(), 1, primaryOptions, dumps);
+        REQUIRE(verifierOpened.ok());
+
+        // ---- the damaged picture: compared, replaced, dumped, named ---------------------
+        auto p = primary.decodeFrame(damaged.damaged);
+        REQUIRE(p.ok());
+        auto v = verifierOpened.value().check(damaged.damaged, p.value(), primary.lastFrameInfo(),
+                                              primary.previousSyncIndex(damaged.damaged), "verify-unicode.LRF");
+        REQUIRE(v.ok());
+        CHECK(v.value().comparison.mismatch());
+        // The software picture still comes back: nothing was lost to the path.
+        CHECK(v.value().replacement.has_value());
+        // Both planes went into the folder (the session's dump budget is
+        // far from spent by this binary's two dumping tests).
+        REQUIRE_FALSE(v.value().dumpedPrimary.empty());
+        REQUIRE_FALSE(v.value().dumpedReference.empty());
+        std::error_code exists;
+        CHECK(std::filesystem::exists(v.value().dumpedPrimary, exists));
+        CHECK(std::filesystem::exists(v.value().dumpedReference, exists));
+        CHECK(v.value().dumpedPrimary.parent_path() == dumps);
+        // The warning says where (its non-ASCII bytes made safe for a console).
+        const std::string warning = captured.first("differs from software");
+        INFO(warning);
+        CHECK(warning.find("serving the software picture") != std::string::npos);
+        CHECK(warning.find("luma planes dumped to ") != std::string::npos);
+        CHECK(warning.find("decode-mismatch-") != std::string::npos);
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(damaged.dir, ec);
+}
+
 TEST_CASE("the reader's shadow check never runs on a software picture", "[video][sample][verify]") {
     OSV_REQUIRE_SAMPLE_LRF();
     // OPENOSV_VERIFY_HW_DECODE asks for the check, but a software primary has
@@ -1807,6 +1856,42 @@ TEST_CASE("the decoder's Debug line carries the picture's fingerprint", "[video]
     CHECK(line.find("'" + osvtest::sampleLrf().filename().string() + "'") != std::string::npos);
     // The open itself is at Debug too, and now reaches a sink.
     CHECK(captured.count("video: opened track 1 of ") == 1u);
+}
+
+TEST_CASE("a demuxer's FFmpeg lines name the clip they are about", "[video][sample][log]") {
+    OSV_REQUIRE_SAMPLE_LRF();
+    // A codec context names its clip through our tag in `opaque`; a format
+    // context has no such slot, but it keeps the name it was opened with.
+    // Without the clip, demuxer warnings ("stream 0, timescale not set") could
+    // not be told apart between clips, and their once-per-clip throttle in the
+    // plug-in logs was really once per module.  The libavformat feed (no
+    // container samples) opens the mov demuxer on the clip.
+    CapturedLog captured(log::Level::Warn);
+    DecoderOptions o;
+    o.hw = HwAccel::None;
+    o.threads = 2;
+    o.useContainerSamples = false;
+    auto opened = HevcStreamDecoder::open(osvtest::sampleLrf(), 1, o);
+    REQUIRE(opened.ok());
+    auto frame = opened.value().decodeFrame(0);
+    REQUIRE(frame.ok());
+
+    // ---- every demuxer line carries the clip ------------------------------------------
+    const std::string demuxer = "ffmpeg: [mov,mp4,m4a,3gp,3g2,mj2";
+    const std::string tagged = demuxer + " '" + osvtest::sampleLrf().filename().string() + "'] ";
+    std::size_t lines = 0;
+    std::size_t named = 0;
+    for (const std::string& l : captured.lines()) {
+        if (l.rfind(demuxer, 0) == 0) {
+            ++lines;
+            named += l.rfind(tagged, 0) == 0 ? 1u : 0u;
+        }
+    }
+    INFO("first demuxer line: " << captured.first(demuxer));
+    if (lines == 0u) {
+        SKIP("the demuxer reported nothing about this clip at WARNING");
+    }
+    CHECK(named == lines);
 }
 
 TEST_CASE("a refused parallax measurement's consistent share is rebuilt exactly from its cell counts",

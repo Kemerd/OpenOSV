@@ -512,8 +512,12 @@ void ImporterInstance::parallaxWorkerLoop() noexcept {
             if (grid.ok()) {
                 result = std::make_shared<const render::ParallaxWarpGrid>(std::move(grid).value());
             } else {
-                refusal = grid.error().message + ", " +
-                          consistentShareText(cells, job.bands, job.params.minConsistentFraction);
+                refusal = grid.error().message;
+                // The consistent share walks every band pixel, and only the
+                // Debug line below prints it: below Debug it is never built.
+                if (PluginLog::enabled(PluginLog::Level::Debug)) {
+                    refusal += ", " + consistentShareText(cells, job.bands, job.params.minConsistentFraction);
+                }
             }
         } catch (const std::exception& e) {
             // Allocation failure is the realistic case.  Record it as a
@@ -2091,12 +2095,16 @@ ImporterInstance::BucketCorrection ImporterInstance::bucketCorrectionLocked(std:
                                          g.meanAbsCorrectionDeg, g.maxAbsCorrectionDeg);
                         out.grid = std::make_shared<const render::ParallaxWarpGrid>(std::move(grid).value());
                     } else {
-                        PluginLog::debug("frame {} (bucket {}, anchor {}) of '{}': parallax refused after {:.0f} ms "
-                                         "({}, {}); {}",
-                                         index, bucket, source->index, clipLogName(m_path), ms,
-                                         grid.error().message,
-                                         consistentShareText(cells, bands.value(), pw.minConsistentFraction),
-                                         wantSeam ? "using the seam table instead" : "rendering without it");
+                        // Built only at Debug: the consistent share walks every
+                        // band pixel, and the line is the only thing that uses it.
+                        if (PluginLog::enabled(PluginLog::Level::Debug)) {
+                            PluginLog::debug("frame {} (bucket {}, anchor {}) of '{}': parallax refused after {:.0f} "
+                                             "ms ({}, {}); {}",
+                                             index, bucket, source->index, clipLogName(m_path), ms,
+                                             grid.error().message,
+                                             consistentShareText(cells, bands.value(), pw.minConsistentFraction),
+                                             wantSeam ? "using the seam table instead" : "rendering without it");
+                        }
                         out.grid = nullptr;  // a stored nullptr records the refusal
                     }
                     gridKnown = true;
