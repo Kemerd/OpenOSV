@@ -27,7 +27,7 @@ if(CMAKE_HOST_APPLE)
 endif()
 
 project(openosv
-        VERSION 0.5.3
+        VERSION 0.6.0
         DESCRIPTION "Independent open-source DJI Osmo 360 .OSV parser, stitcher, reframer and HDR colour pipeline"
         HOMEPAGE_URL "https://github.com/Kemerd/OpenOSV"
         LANGUAGES C CXX)

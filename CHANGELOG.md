@@ -6,6 +6,15 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-08
+
+The stitch holds still. 0.5.x moved the seam correction to one mesh warp
+solved per clip and per eight-frame moment, and 0.5.3 stopped the mount
+shaking; on a drive, though, a moment could still pick a wrong answer on a
+repeating facade and slide the two lenses against each other. 0.6.0 keeps
+the clip's correction everywhere a moment has not earned its own, so the
+stitch only moves where the scene does.
+
 ### Fixed
 
 * **A stitch on a repeating facade no longer slides back and forth.** When
