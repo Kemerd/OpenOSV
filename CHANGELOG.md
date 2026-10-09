@@ -6,6 +6,16 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-10-08
+
+The mount holds still. On a camera bolted to a wing or a car, the engine's
+vibration reached the levelling as a sign flip every frame and the whole
+mount shook on screen; the per-clip verdict that used to freeze the seam on
+such a mount had tipped over to re-measuring it every eight frames; and
+reduced-resolution playback dropped every seam correction. 0.5.3 fixes the
+three at their causes, and the .LRF proxy stops being blown up from a
+quarter frame.
+
 ### Fixed
 
 * **A mounted camera's vibration no longer shakes the mount on screen.**
