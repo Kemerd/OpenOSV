@@ -1227,6 +1227,11 @@ private:
         /// [WP-TEMPORAL] Cut from a frame other than the bucket's anchor: the
         /// result goes to the stand-in lane (m_standInGrids), not m_meshes.
         bool standIn = false;
+        /// Auto following the scene: the clip field the moment's field must
+        /// beat, cell by cell, to be rendered (render::preferClipCorrection);
+        /// null when the moment's own field renders as solved (Follows scene
+        /// chosen, or the clip correction not measured).
+        std::shared_ptr<const render::ParallaxWarpGrid> clipField;
     };
 
     /// The render-thread half of a mesh measurement of bucket `bucket` on
@@ -1575,6 +1580,25 @@ private:
     bool m_lastRenderExact = true;
     /// An Exact wait that timed out has been logged for this clip.
     bool m_steadyWaitWarned = false;
+    /// The clip field every per-moment field is judged against
+    /// (preferredClipFieldLocked()) as of the last frame; when it changes -
+    /// the clip correction lands, or Auto's verdict flips - every bucket
+    /// measured against the old one is measured again.  Guarded by m_mutex.
+    std::shared_ptr<const render::ParallaxWarpGrid> m_preferClip;
+
+    /// Auto following the scene with a measured clip field: that field, which
+    /// a moment's own field must beat cell by cell to render
+    /// (render::preferClipCorrection, ClipSteady.h); null otherwise - Follows
+    /// scene chosen, Steady, Auto holding the clip still, the clip correction
+    /// not settled or without a field.  Reads m_steadyFrame; caller holds
+    /// m_mutex.
+    [[nodiscard]] std::shared_ptr<const render::ParallaxWarpGrid> preferredClipFieldLocked() const;
+
+    /// Keep m_preferClip equal to preferredClipFieldLocked(), resetting every
+    /// per-bucket analysis when it changes (see the definition).  Called by
+    /// prepareSteadyLocked() once the frame's snapshot is in; caller holds
+    /// m_mutex.
+    void syncPreferredClipLocked();
 
     /// Longest an Exact frame waits for the per-clip analyses before it
     /// renders with the per-moment corrections instead (and says so).

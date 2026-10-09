@@ -2753,6 +2753,14 @@ looks wrong.
    the sample clip to Follows scene; it is "agreed" now, and the log line
    says so ("0 of 66 judged sectors lose ..., 4 more lose it where both
    corrections move the picture alike").
+   When Auto does follow the scene, a moment's own field renders only where
+   it lines the lenses up measurably better than the clip's field, and only
+   where the two lenses share enough of the band to tell (not along the
+   thin strip Hide Mount leaves across a mount). The clip's field holds
+   everywhere else. A repeating facade on the seam would otherwise be lined
+   up one window-period off by one moment and at the truth by the next, and
+   the stitch slid between them every eight frames. Follows scene (per
+   moment) still renders every moment's own field everywhere.
    During playback a moment that is still being measured shows the one
    before it for a few frames; once measured, a frame looks exactly as it
    does when you stop on it.
@@ -2795,7 +2803,14 @@ lines):
   four CPU threads, the field alone included). `field alone (its temporal
   prior is not measured)` is a moment measured before the one ahead of it
   (playback that started without a parked frame): not final, measured
-  again once the moment before is known. `stand-in field` is a moment
+  again once the moment before is known. With Auto following the scene the
+  line ends `; against the clip field: own O / clip C / B blended of N
+  cells, T on a thin overlap (own share x)`: how many mesh cells render this
+  moment's own field, how many the clip's, how many a mix, and how many sit
+  on an overlap too thin to judge (those keep the clip's). The first such
+  frame logs `steady: 'clip': Auto follows the scene; each moment's field
+  now renders only where it lines the lenses up measurably better than the
+  clip field ...` (Info). `stand-in field` is a moment
   measured on the frame itself because nothing around it was measured yet:
   not final either. `mesh failed (...); the bucket renders the seam table's
   lift` falls back to the seam table's shift for that moment (`uncorrected`

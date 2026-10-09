@@ -853,6 +853,148 @@ TEST_CASE("the geometric gate tells a texture loss from a moved object, exactly"
     }
 }
 
+TEST_CASE("a moment's field renders only where it beats the clip field", "[steady][auto][prefer]") {
+    ThreadPool pool;
+    const render::MeshWarpParams mp;
+    auto zeroLayout = render::meshWarpLayout(mp);
+    REQUIRE(zeroLayout.ok());
+    const render::ParallaxWarpGrid zero = zeroLayout.value();
+    // A table of `deg` over band columns [c0, c1), 0 elsewhere, lifted into the mesh.
+    const auto liftOf = [&](double deg, std::uint32_t c0, std::uint32_t c1) {
+        std::vector<float> t(2048, 0.0f);
+        for (std::uint32_t c = c0; c < c1; ++c) {
+            t[c] = static_cast<float>(deg);
+        }
+        auto g = render::liftSeamTable(t, mp);
+        REQUIRE(g.ok());
+        return g.value();
+    };
+    // Mean |dLat| (radians) of a field's vertices over mesh columns whose
+    // centre lies in band columns [c0, c1), on the middle row.
+    const auto meanAbsDLat = [&](const render::ParallaxWarpGrid& g, std::uint32_t c0, std::uint32_t c1) {
+        double s = 0.0;
+        int k = 0;
+        const std::uint32_t mid = g.h / 2u;
+        for (std::uint32_t vx = 0; vx < g.w; ++vx) {
+            const double col = (static_cast<double>(vx) + 0.5) * 2048.0 / g.w;
+            if (col < c0 || col >= c1) {
+                continue;
+            }
+            s += std::fabs(static_cast<double>(g.uv[(static_cast<std::size_t>(mid) * g.w + vx) * 2u + 1u]));
+            ++k;
+        }
+        return k ? s / k : 0.0;
+    };
+
+    SECTION("a near object the clip field does not know: the moment's field renders there, the clip elsewhere") {
+        // 0.7 deg of parallax over columns 600-700; the clip field has none.
+        // syntheticBands' positive disparity puts lens 1's copy HIGHER in the
+        // band (lens 1 at y + d/2 of the texture), the opposite of a real near
+        // object's sign, so the table that lines it up is the negative one.
+        const render::LensBands b =
+            syntheticBands([](std::uint32_t col) { return (col >= 600u && col < 700u) ? 4.0 : 0.0; }, 11u);
+        const render::ParallaxWarpGrid own = liftOf(-0.7, 600, 700);
+        render::ClipPreferenceReport rep;
+        auto out = render::preferClipCorrection(b, own, zero, {}, &pool, &rep);
+        REQUIRE(out.ok());
+        INFO(rep.summary());
+        CHECK(rep.ownCells > 0u);
+        // Over the object the moment's field is kept whole ...
+        CHECK(meanAbsDLat(out.value(), 620, 680) == Catch::Approx(meanAbsDLat(own, 620, 680)).epsilon(0.02));
+        CHECK(meanAbsDLat(own, 620, 680) > 0.0);
+        // ... and far from it nothing moves (both fields are zero there).
+        CHECK(meanAbsDLat(out.value(), 1200, 1400) == 0.0);
+    }
+    SECTION("a moment's field one period off on a repeated structure: the clip field stays") {
+        // A pattern repeating every 8 band rows along the epipolar direction,
+        // at no parallax; the moment's field claims one whole period (1.41
+        // deg) over columns 600-700 - it lines the period up as well as zero
+        // does, so it cannot earn its way in.
+        render::LensBands b = syntheticBands([](std::uint32_t) { return 0.0; }, 13u);
+        std::mt19937 rng(17u);
+        std::normal_distribution<float> noise(0.0f, 0.004f);
+        for (std::uint32_t y = 0; y < b.h; ++y) {
+            for (std::uint32_t x = 0; x < b.w; ++x) {
+                const std::size_t i = static_cast<std::size_t>(y) * b.w + x;
+                const float stripe = 0.2f * std::sin(2.0f * static_cast<float>(kPi) * static_cast<float>(y) / 8.0f);
+                b.luma[0][i] = 0.5f + stripe + noise(rng);
+                b.luma[1][i] = 0.5f + stripe + noise(rng);
+            }
+        }
+        const double periodDeg = 8.0 * 180.0 / 1024.0;
+        const render::ParallaxWarpGrid own = liftOf(periodDeg, 600, 700);
+        render::ClipPreferenceReport rep;
+        auto out = render::preferClipCorrection(b, own, zero, {}, &pool, &rep);
+        REQUIRE(out.ok());
+        INFO(rep.summary());
+        CHECK(meanAbsDLat(own, 620, 680) > deg2rad(0.5));
+        CHECK(meanAbsDLat(out.value(), 620, 680) < 0.1 * meanAbsDLat(own, 620, 680));
+    }
+    SECTION("the same near object on a thin overlap: the clip field holds") {
+        // The first section's object, but in a mount arc: over columns
+        // 520-780 the occlusion polygons leave the lenses 15 co-visible rows
+        // of the band's 68 (lens 0 masked above, lens 1 below), as Hide Mount
+        // leaves them along a car clip's mount arc.  The residual rule alone
+        // would let the moment's field in; the coverage ramp keeps the clip.
+        render::LensBands b =
+            syntheticBands([](std::uint32_t col) { return (col >= 600u && col < 700u) ? 4.0 : 0.0; }, 11u);
+        for (std::uint32_t r = 0; r < b.h; ++r) {
+            for (std::uint32_t c = 520; c < 780; ++c) {
+                const std::size_t i = static_cast<std::size_t>(r) * b.w + c;
+                if (r < 26u) {
+                    b.alpha[0][i] = 0.0f;
+                }
+                if (r >= 41u) {
+                    b.alpha[1][i] = 0.0f;
+                }
+            }
+        }
+        const render::ParallaxWarpGrid own = liftOf(-0.7, 600, 700);
+        render::ClipPreferenceReport rep;
+        auto out = render::preferClipCorrection(b, own, zero, {}, &pool, &rep);
+        REQUIRE(out.ok());
+        INFO(rep.summary());
+        CHECK(rep.thinCells > 0u);
+        CHECK(meanAbsDLat(own, 620, 680) > 0.0);
+        CHECK(meanAbsDLat(out.value(), 620, 680) == 0.0);
+        // The ramp is a parameter: with no coverage required the residuals
+        // decide again and the moment's field is back over the object.
+        render::ClipPreferenceParams anyOverlap;
+        anyOverlap.minCoverage = 0.0;
+        anyOverlap.fullCoverage = 1e-6;
+        auto ruled = render::preferClipCorrection(b, own, zero, anyOverlap, &pool);
+        REQUIRE(ruled.ok());
+        CHECK(meanAbsDLat(ruled.value(), 620, 680) > 0.5 * meanAbsDLat(own, 620, 680));
+    }
+    SECTION("the same field from the clip and the moment: exactly that field") {
+        const render::LensBands b =
+            syntheticBands([](std::uint32_t col) { return (col >= 600u && col < 700u) ? 4.0 : 0.0; }, 19u);
+        const render::ParallaxWarpGrid both = liftOf(-0.7, 600, 700);
+        auto out = render::preferClipCorrection(b, both, both, {}, &pool);
+        REQUIRE(out.ok());
+        for (std::size_t k = 0; k < both.uv.size(); ++k) {
+            REQUIRE(out.value().uv[k] == Catch::Approx(both.uv[k]).margin(1e-9));
+        }
+    }
+    SECTION("malformed input is refused") {
+        const render::LensBands b = syntheticBands([](std::uint32_t) { return 0.0; }, 23u);
+        render::ParallaxWarpGrid other = zero;
+        other.w = zero.w / 2u;
+        other.uv.resize(static_cast<std::size_t>(other.w) * other.h * 2u);
+        CHECK_FALSE(render::preferClipCorrection(b, zero, other).ok());
+        render::ClipPreferenceParams bad;
+        bad.fullAdvantage = bad.minAdvantage;
+        CHECK_FALSE(render::preferClipCorrection(b, zero, zero, bad).ok());
+        render::ClipPreferenceParams badCoverage;
+        badCoverage.fullCoverage = 1.5;
+        CHECK_FALSE(render::preferClipCorrection(b, zero, zero, badCoverage).ok());
+        badCoverage.fullCoverage = std::nan("");
+        CHECK_FALSE(render::preferClipCorrection(b, zero, zero, badCoverage).ok());
+        render::LensBands empty;
+        CHECK_FALSE(render::preferClipCorrection(empty, zero, zero).ok());
+    }
+}
+
 TEST_CASE("correctionDisplacement reads a table and a grid the way the bands are resampled", "[steady][auto]") {
     // A band with a 1-D table of 1 degree over its first half and 0 over
     // the rest: the displacement is 1 deg of full disparity (rows, master

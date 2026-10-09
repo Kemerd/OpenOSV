@@ -6,6 +6,28 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+* **A stitch on a repeating facade no longer slides back and forth.** When
+  Parallax Grid Auto decides a clip follows the scene, every eight frames
+  rendered their own correction field. On a reported 8K drive a hotel 25 m
+  away sat on the seam, in the arc where Hide Mount leaves the two lenses a
+  strip only 15 rows of the band's 68 deep. A strip that short holds two
+  periods of the facade's columns, so the flow lined the facade up one
+  period off as happily as at the truth. Each eight frames chose a
+  different answer, and the glide between them slid one lens's half of the
+  hotel against the other's by up to 60 px, the wobble at the stitch. A
+  moment's field now renders only where it lines the lenses up measurably
+  better than the clip's own field (a near car passing the seam), and only
+  where the two lenses share enough of the band for that comparison to
+  mean anything: the seam search's own coverage rule. Everywhere else the
+  clip's field holds. On that drive the seam's frame-to-frame motion fell
+  from 1.34 to 0.22-0.50 px per frame, Steady's 0.36, and the hotel's
+  lens-to-lens offset stopped swinging between -37 and +21 px. It now holds
+  still, where the clip's correction leaves it (+16 to +25 px of the
+  uncorrected +30, a calibration error at that angle the clip's lens
+  rotation fit could not take).
+
 ## [0.5.3] - 2026-10-08
 
 The mount holds still. On a camera bolted to a wing or a car, the engine's

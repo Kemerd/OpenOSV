@@ -389,6 +389,111 @@ struct SteadyDecision {
 [[nodiscard]] std::string describeSteadyDecision(const SteadyDecision& decision);
 
 // ===========================================================================
+//  Auto, moment by moment: the clip field unless a moment's own field earns it
+// ===========================================================================
+// When Auto follows the scene, every 8-frame bucket used to render its OWN
+// mesh field.  A field measured on one frame is right wherever the flow
+// matched the right thing, and wrong wherever the texture let it match the
+// wrong thing - and the commonest wrong thing is a REPEATED structure along
+// the epipolar direction: the columns and balconies of a facade, a fence, a
+// railing.  One period off still lines the lenses up, so neither the flow's
+// own checks nor the benefit gate can tell.  Measured on a user's 8K drive
+// (CAM_..._0007, a hotel 25 m away beside the seam, true parallax under 0.1
+// degree): consecutive buckets' fields put -0.5 to -2.3 degrees of parallax
+// on the facade ("beyond infinity"), a different value every bucket, and the
+// glide between them slid lens 1's half of the hotel against lens 0's by up
+// to +-20 px in a 40 degree view - the stitch "wobble".  The clip field (the
+// median over nine frames spread through the clip) put the same columns at
+// ~0 and held still.
+//
+// So a moment's field replaces the clip field only where it EARNS it: cell by
+// cell, on the moment's own anchor bands, the lens-to-lens residual through
+// the moment's field against the residual through the clip field (pooled
+// over the 3 x 3 neighbouring cells, like the benefit gate).  Where the
+// moment's field leaves clearly less residual - a near object the clip field
+// does not know about, a car passing a metre from the seam - it renders;
+// where the clip field lines the lenses up about as well - a static scene,
+// noise, a periodic ambiguity - the clip field renders, and nothing moves.
+// It is a hysteresis toward the stable answer, in the spirit of Lowe's ratio
+// test applied to whole correction hypotheses: a change must be measurably
+// better to be believed.  The residual is in-sample for the moment's field
+// (it was fitted to these very bands), so the bar is a relative margin, not
+// zero: minAdvantage below which the clip field stays, fullAdvantage above
+// which the moment's field renders whole, a smoothstep between.
+//
+// A residual only means something on enough overlap.  The hotel of that
+// drive sits in the mount arc, where Hide Mount's occlusion polygons leave
+// the two lenses a strip of 14-16 co-visible rows of the band's 68 (about
+// 2.6 deg) along roughly 100 deg of the ring.  A strip that short along the
+// epipolar direction holds two periods of the facade, so a field one period
+// off lines it up exactly as well as the true one - and both line it up
+// better than a clip field 0.23 deg off there (the lens rotation of that clip
+// could not be fitted), so the residual alone let every moment in with its
+// own alias and the wobble stayed (1.34 -> 1.14 px/frame at the seam).  The
+// seam search refuses the same columns for the same reason (its coverage
+// ramp, SeamSearchParams::confCoverageLo/Hi: a match on a quarter of its
+// window rests on a quarter of the evidence).  Here the same ramp of the
+// co-visible fraction scales the moment's share: on a thin overlap the clip
+// field holds, on a full one the residuals decide as above.
+
+/// Tuning of preferClipCorrection().
+struct ClipPreferenceParams {
+    /// Relative residual reduction (clip - own) / clip of the moment's field
+    /// at or below which the clip field is kept whole: an in-sample fit
+    /// earns about this much on noise alone.
+    double minAdvantage = 0.10;
+    /// ... at or above which the moment's own field renders whole.
+    double fullAdvantage = 0.25;
+    /// Pooled residual through the clip field below which there is nothing
+    /// measurable to improve (open sky, flat water): the clip field stays.
+    /// The benefit gate's own floor (ParallaxWarpParams::minResidual).
+    double minResidual = 0.0015;
+    /// Cells pooled each way around a cell for its verdict (1: 3 x 3).
+    std::uint32_t poolRadiusCells = 1;
+    /// Co-visible band pixels a pooled verdict needs; fewer keeps the clip.
+    std::uint32_t minPixels = 64;
+    /// Co-visible fraction of the band's rows, averaged over the columns a
+    /// verdict pools, at or below which the clip field is kept whole whatever
+    /// the residuals say ...
+    double minCoverage = SeamSearchParams{}.confCoverageLo;
+    /// ... and at or above which the residuals alone decide (a smoothstep
+    /// between).  The seam search's own coverage ramp, so the table and the
+    /// moment's field refuse the same thin evidence.
+    double fullCoverage = SeamSearchParams{}.confCoverageHi;
+};
+
+/// What preferClipCorrection() decided, for the logs.
+struct ClipPreferenceReport {
+    std::uint32_t cells = 0;      ///< Mesh cells with a verdict (inside the bands).
+    std::uint32_t ownCells = 0;   ///< ... where the moment's own field renders whole.
+    std::uint32_t clipCells = 0;  ///< ... where the clip field is kept whole.
+    /// ... of the judged cells, those whose overlap was too thin for the
+    /// moment's field to count in full (coverage below fullCoverage).
+    std::uint32_t thinCells = 0;
+    double meanOwnWeight = 0.0;  ///< Mean share of the moment's field over the judged cells.
+    double ms = 0.0;             ///< Wall time.
+    /// "own 12 / clip 380 / 20 blended of 412 cells, 96 on a thin overlap
+    /// (own share 0.05)".
+    [[nodiscard]] std::string summary() const;
+};
+
+/// The field a follows-scene moment renders: per mesh vertex
+/// w * own + (1 - w) * clip, w from the rules above (the residuals' verdict
+/// times the coverage ramp of the raw bands' co-visible rows), measured on `bands` (the
+/// moment's anchor bands, raw, as measureParallaxBands renders them - the
+/// bands its own field was solved on).  `own` and `clip` must share one
+/// layout (both are mesh fields: render::meshWarpLayout).  Vertices beyond
+/// the bands' rows take the weight of the nearest judged row in their column
+/// (the decay rings follow the band); a column with nothing judged keeps the
+/// clip field.  The result carries `own`'s diagnostics.  InvalidArgument for
+/// mismatched layouts, malformed bands or parameters out of range.
+[[nodiscard]] Result<ParallaxWarpGrid> preferClipCorrection(const LensBands& bands, const ParallaxWarpGrid& own,
+                                                            const ParallaxWarpGrid& clip,
+                                                            const ClipPreferenceParams& params = {},
+                                                            ThreadPool* pool = nullptr,
+                                                            ClipPreferenceReport* report = nullptr);
+
+// ===========================================================================
 //  The clip correction
 // ===========================================================================
 

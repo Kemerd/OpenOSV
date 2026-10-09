@@ -861,6 +861,242 @@ std::string describeSteadyDecision(const SteadyDecision& d) {
 }
 
 // ---------------------------------------------------------------------------
+//  Auto, moment by moment (see the header)
+// ---------------------------------------------------------------------------
+std::string ClipPreferenceReport::summary() const {
+    const std::uint32_t blended = cells - std::min(cells, ownCells + clipCells);
+    return std::format("own {} / clip {} / {} blended of {} cells, {} on a thin overlap (own share {:.2f}, {:.1f} ms)",
+                       ownCells, clipCells, blended, cells, thinCells, meanOwnWeight, ms);
+}
+
+Result<ParallaxWarpGrid> preferClipCorrection(const LensBands& bands, const ParallaxWarpGrid& own,
+                                              const ParallaxWarpGrid& clip, const ClipPreferenceParams& params,
+                                              ThreadPool* pool, ClipPreferenceReport* report) {
+    const auto t0 = Clock::now();
+    // ---- the inputs ---------------------------------------------------------------
+    const auto finitePos = [](double v) { return std::isfinite(v) && v >= 0.0; };
+    if (!finitePos(params.minAdvantage) || !finitePos(params.fullAdvantage) ||
+        !(params.fullAdvantage > params.minAdvantage) || params.fullAdvantage > 1.0 || !finitePos(params.minResidual) ||
+        params.poolRadiusCells > 8 || !finitePos(params.minCoverage) || !finitePos(params.fullCoverage) ||
+        !(params.fullCoverage > params.minCoverage) || params.fullCoverage > 1.0) {
+        return Error{ErrorCode::InvalidArgument, "preferClipCorrection: parameters out of range"};
+    }
+    if (!own.valid() || !clip.valid() || own.w != clip.w || own.h != clip.h || own.latMinRad != clip.latMinRad ||
+        own.latMaxRad != clip.latMaxRad || own.uv.size() != clip.uv.size()) {
+        return Error{ErrorCode::InvalidArgument, "preferClipCorrection: the two fields do not share one layout"};
+    }
+    const std::size_t n = static_cast<std::size_t>(bands.w) * bands.h;
+    if (bands.w == 0 || bands.h == 0 || bands.mapH == 0 || bands.luma[0].size() != n || bands.luma[1].size() != n ||
+        bands.alpha[0].size() != n || bands.alpha[1].size() != n) {
+        return Error{ErrorCode::InvalidArgument, "preferClipCorrection: malformed bands"};
+    }
+    const std::uint32_t gw = own.w;
+    const std::uint32_t gh = own.h;
+    if (gh < 2) {
+        return Error{ErrorCode::InvalidArgument, "preferClipCorrection: a field needs two rows"};
+    }
+
+    // ---- the lenses through each field, as the kernel will blend them ----------------
+    const WarpGridView ownView = viewOf(&own);
+    const WarpGridView clipView = viewOf(&clip);
+    SeamCorrection ownCorr;
+    ownCorr.warp = &ownView;
+    SeamCorrection clipCorr;
+    clipCorr.warp = &clipView;
+    OSV_TRY_ASSIGN(const LensBands throughOwn, correctBandsForSeam(bands, ownCorr, pool));
+    OSV_TRY_ASSIGN(const LensBands throughClip, correctBandsForSeam(bands, clipCorr, pool));
+
+    // ---- per mesh cell: the residual through each, over the pixels both see in both ----
+    // Cell (cx, cy) spans vertex columns cx..cx+1 (longitude wraps) and rows
+    // cy..cy+1, exactly the cell osvWarpSample interpolates in.
+    const std::uint32_t cellsY = gh - 1;
+    const std::size_t cellCount = static_cast<std::size_t>(gw) * cellsY;
+    std::vector<double> eOwn(cellCount, 0.0), eClip(cellCount, 0.0), cnt(cellCount, 0.0);
+    const double radPerRow = kPi / static_cast<double>(bands.mapH);
+    const double latSpan = static_cast<double>(own.latMaxRad) - static_cast<double>(own.latMinRad);
+    if (!(std::fabs(latSpan) > 1e-9)) {
+        return Error{ErrorCode::InvalidArgument, "preferClipCorrection: a field spans no latitude"};
+    }
+    for (std::uint32_t r = 0; r < bands.h; ++r) {
+        const double lat = kHalfPi - (static_cast<double>(bands.rowOffset) + r + 0.5) * radPerRow;
+        const double fy = (lat - static_cast<double>(own.latMinRad)) / latSpan * static_cast<double>(gh - 1);
+        if (!(fy >= 0.0) || fy > static_cast<double>(gh - 1)) {
+            continue;
+        }
+        const auto cy = std::min<std::uint32_t>(static_cast<std::uint32_t>(fy), cellsY - 1u);
+        for (std::uint32_t c = 0; c < bands.w; ++c) {
+            const std::size_t i = static_cast<std::size_t>(r) * bands.w + c;
+            // Co-visible through BOTH fields, so the two residuals are taken
+            // over the same pixels.
+            if (!(throughOwn.alpha[0][i] > 0.5f) || !(throughOwn.alpha[1][i] > 0.5f) ||
+                !(throughClip.alpha[0][i] > 0.5f) || !(throughClip.alpha[1][i] > 0.5f)) {
+                continue;
+            }
+            const double ro = std::fabs(static_cast<double>(throughOwn.luma[1][i]) - throughOwn.luma[0][i]);
+            const double rc = std::fabs(static_cast<double>(throughClip.luma[1][i]) - throughClip.luma[0][i]);
+            if (!std::isfinite(ro) || !std::isfinite(rc)) {
+                continue;
+            }
+            const double fx = (static_cast<double>(c) + 0.5) / static_cast<double>(bands.w) * static_cast<double>(gw);
+            const auto cx = static_cast<std::uint32_t>(fx) % gw;
+            const std::size_t k = static_cast<std::size_t>(cy) * gw + cx;
+            eOwn[k] += ro;
+            eClip[k] += rc;
+            cnt[k] += 1.0;
+        }
+    }
+
+    // ---- per mesh column: how much of the band the two lenses share ------------------------
+    // The RAW bands' coverage (the lens geometry and the occlusion polygons,
+    // not either field): the co-visible fraction of the band's rows, summed
+    // per mesh column over the band columns that fall in it - the same
+    // column-to-cell mapping as the residuals above.
+    std::vector<double> covSum(gw, 0.0), covCnt(gw, 0.0);
+    for (std::uint32_t c = 0; c < bands.w; ++c) {
+        std::uint32_t rows = 0;
+        for (std::uint32_t r = 0; r < bands.h; ++r) {
+            const std::size_t i = static_cast<std::size_t>(r) * bands.w + c;
+            rows += (bands.alpha[0][i] > 0.5f && bands.alpha[1][i] > 0.5f) ? 1u : 0u;
+        }
+        const double fx = (static_cast<double>(c) + 0.5) / static_cast<double>(bands.w) * static_cast<double>(gw);
+        const auto cx = static_cast<std::uint32_t>(fx) % gw;
+        covSum[cx] += static_cast<double>(rows) / static_cast<double>(bands.h);
+        covCnt[cx] += 1.0;
+    }
+    // The smoothstep both ramps use.
+    const auto smoothRamp = [](double lo, double hi, double x) {
+        const double t = std::clamp((x - lo) / (hi - lo), 0.0, 1.0);
+        return t * t * (3.0 - 2.0 * t);
+    };
+
+    // ---- per cell: the pooled verdict -----------------------------------------------------
+    // w = 1: the moment's own field; 0: the clip field; -1: no verdict.
+    std::vector<double> cellW(cellCount, -1.0);
+    ClipPreferenceReport rep;
+    double sumW = 0.0;
+    const int pr = static_cast<int>(params.poolRadiusCells);
+    for (std::uint32_t cy = 0; cy < cellsY; ++cy) {
+        for (std::uint32_t cx = 0; cx < gw; ++cx) {
+            // Only cells the bands reach get a verdict of their own.
+            if (cnt[static_cast<std::size_t>(cy) * gw + cx] <= 0.0) {
+                continue;
+            }
+            double so = 0.0, sc = 0.0, sn = 0.0;
+            for (int dy = -pr; dy <= pr; ++dy) {
+                const int yy = static_cast<int>(cy) + dy;
+                if (yy < 0 || yy >= static_cast<int>(cellsY)) {
+                    continue;
+                }
+                for (int dx = -pr; dx <= pr; ++dx) {
+                    const int xx = ((static_cast<int>(cx) + dx) % static_cast<int>(gw) + static_cast<int>(gw)) %
+                                   static_cast<int>(gw);
+                    const std::size_t k = static_cast<std::size_t>(yy) * gw + static_cast<std::size_t>(xx);
+                    so += eOwn[k];
+                    sc += eClip[k];
+                    sn += cnt[k];
+                }
+            }
+            double w = 0.0;  // the clip field unless the moment earns more
+            if (sn >= static_cast<double>(params.minPixels)) {
+                const double mo = so / sn;
+                const double mc = sc / sn;
+                if (mc >= params.minResidual) {
+                    const double advantage = (mc - mo) / mc;
+                    w = smoothRamp(params.minAdvantage, params.fullAdvantage, advantage);
+                }
+            }
+            // The overlap the verdict rests on, over the same pooled columns:
+            // on a thin strip a residual cannot tell a field from its alias
+            // one period off, so the clip field holds (see the header).
+            double cs = 0.0, cn = 0.0;
+            for (int dx = -pr; dx <= pr; ++dx) {
+                const auto xx = static_cast<std::size_t>(
+                    ((static_cast<int>(cx) + dx) % static_cast<int>(gw) + static_cast<int>(gw)) % static_cast<int>(gw));
+                cs += covSum[xx];
+                cn += covCnt[xx];
+            }
+            const double coverage = cn > 0.0 ? cs / cn : 0.0;
+            const double coverageW = smoothRamp(params.minCoverage, params.fullCoverage, coverage);
+            w *= coverageW;
+            cellW[static_cast<std::size_t>(cy) * gw + cx] = w;
+            ++rep.cells;
+            rep.ownCells += w >= 0.99 ? 1u : 0u;
+            rep.clipCells += w <= 0.01 ? 1u : 0u;
+            rep.thinCells += coverageW < 0.99 ? 1u : 0u;
+            sumW += w;
+        }
+    }
+    rep.meanOwnWeight = rep.cells ? sumW / static_cast<double>(rep.cells) : 0.0;
+
+    // ---- per vertex: the mean of its judged cells; the decay rings follow the band ----
+    std::vector<double> vertW(static_cast<std::size_t>(gw) * gh, -1.0);
+    for (std::uint32_t vy = 0; vy < gh; ++vy) {
+        for (std::uint32_t vx = 0; vx < gw; ++vx) {
+            double s = 0.0;
+            int k = 0;
+            for (int dy = -1; dy <= 0; ++dy) {
+                const int cy = static_cast<int>(vy) + dy;
+                if (cy < 0 || cy >= static_cast<int>(cellsY)) {
+                    continue;
+                }
+                for (int dx = -1; dx <= 0; ++dx) {
+                    const std::uint32_t cx = (vx + gw + static_cast<std::uint32_t>(dx + 1) - 1u) % gw;
+                    const double w = cellW[static_cast<std::size_t>(cy) * gw + cx];
+                    if (w >= 0.0) {
+                        s += w;
+                        ++k;
+                    }
+                }
+            }
+            if (k > 0) {
+                vertW[static_cast<std::size_t>(vy) * gw + vx] = s / k;
+            }
+        }
+    }
+    // A vertex no judged cell touches (the decay rings beyond the bands, an
+    // arc no lens pair covers) takes the nearest judged vertex of its column -
+    // read from the JUDGED weights only, never from one filled in this pass -
+    // and the clip field (0) when its column has none.
+    const std::vector<double> judgedW = vertW;
+    for (std::uint32_t vx = 0; vx < gw; ++vx) {
+        for (std::uint32_t vy = 0; vy < gh; ++vy) {
+            const std::size_t v = static_cast<std::size_t>(vy) * gw + vx;
+            if (judgedW[v] >= 0.0) {
+                continue;
+            }
+            double found = 0.0;
+            for (std::uint32_t d = 1; d < gh; ++d) {
+                const double up = vy >= d ? judgedW[static_cast<std::size_t>(vy - d) * gw + vx] : -1.0;
+                const double dn = vy + d < gh ? judgedW[static_cast<std::size_t>(vy + d) * gw + vx] : -1.0;
+                if (up >= 0.0 || dn >= 0.0) {
+                    found = (up >= 0.0 && dn >= 0.0) ? 0.5 * (up + dn) : std::max(up, dn);
+                    break;
+                }
+            }
+            vertW[v] = found;
+        }
+    }
+
+    // ---- the field ------------------------------------------------------------------------
+    ParallaxWarpGrid out = own;  // the moment's diagnostics, its layout
+    for (std::size_t v = 0; v < static_cast<std::size_t>(gw) * gh; ++v) {
+        const double w = std::clamp(vertW[v], 0.0, 1.0);
+        for (std::size_t comp = 0; comp < 2; ++comp) {
+            const double a = static_cast<double>(own.uv[v * 2u + comp]);
+            const double b = static_cast<double>(clip.uv[v * 2u + comp]);
+            const double m = w * a + (1.0 - w) * b;
+            out.uv[v * 2u + comp] = static_cast<float>(std::isfinite(m) ? m : (std::isfinite(b) ? b : 0.0));
+        }
+    }
+    refreshCorrectionStats(out);
+    rep.ms = msSince(t0);
+    if (report != nullptr) {
+        *report = rep;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 //  The clip correction
 // ---------------------------------------------------------------------------
 Result<ClipSteady> measureClipSteady(const geom::LensRig& rig, const geom::BlendParams& blend,

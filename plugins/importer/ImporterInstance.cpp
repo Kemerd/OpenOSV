@@ -2293,6 +2293,8 @@ Result<ImporterInstance::ParallaxJob> ImporterInstance::prepareMeshJobLocked(std
     job.bandMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tBand).count();
     // ---- the temporal prior as it stands --------------------------------------------
     fillTemporalPrior(job);
+    // ---- Auto following the scene: the clip field this moment must beat --------------
+    job.clipField = preferredClipFieldLocked();
     // ---- the anchor's raw bands for the carve ----------------------------------------
     // carveSeam IS renderLensBands at this band + carveSeamFromBands, so a
     // later frame of the bucket carves the anchored seam from these.
@@ -2354,7 +2356,27 @@ ImporterInstance::MeshJobResult ImporterInstance::solveMeshJob(const ParallaxJob
         r.summary = m.report.summary() + lineNote + (flowFailure.empty() ? "" : " (flow failed: " + flowFailure + ")");
         // With solveAlone the library always fills `alone`; defensively the
         // field itself stands for it (identical whenever no prior took part).
+        // `alone` stays the moment's own measurement: it is the next bucket's
+        // temporal prior, a measurement and not a rendering decision.
         r.alone = std::make_shared<const render::ParallaxWarpGrid>(m.alone ? std::move(*m.alone) : m.grid);
+        // ---- Auto following the scene: the clip field unless this moment earns it ----
+        // Cell by cell on the anchor's own bands (ClipSteady.h): a near object
+        // the clip field misses renders from this moment's field, a facade the
+        // flow matched a period off keeps the clip field and holds still.
+        if (job.clipField && job.clipField->valid() && m.grid.valid()) {
+            render::ClipPreferenceReport pref;
+            auto preferred =
+                render::preferClipCorrection(*job.bands, m.grid, *job.clipField, render::ClipPreferenceParams{}, pool,
+                                             &pref);
+            if (preferred.ok()) {
+                m.grid = std::move(preferred).value();
+                r.summary += "; against the clip field: " + pref.summary();
+            } else {
+                // A layout mismatch (settings changed under the clip field):
+                // the moment's own field, as before the rule existed.
+                r.summary += "; clip field not applicable (" + preferred.error().message + ")";
+            }
+        }
         r.field = std::make_shared<const render::ParallaxWarpGrid>(std::move(m.grid));
     } catch (const std::exception& e) {
         // Allocation failure is the realistic case: a failed measurement,
@@ -4119,6 +4141,7 @@ void ImporterInstance::prepareSteadyLocked(RenderPurpose purpose, bool draft) {
     const bool wantClip = m_prefs.parallaxGridChoice() != PrefsParallaxGrid::FollowsScene && corrections;
     const bool mountAuto = m_prefs.hideMountChoice() == PrefsHideMount::Auto;  // Hide Mount Auto
     if (!alignAuto && !wantClip && !mountAuto) {
+        syncPreferredClipLocked();  // no clip field to defer to (drops one a prefs change left)
         return;  // the per-bucket schedule and the calibration, exactly as before
     }
 
@@ -4156,6 +4179,53 @@ void ImporterInstance::prepareSteadyLocked(RenderPurpose purpose, bool draft) {
         settleMountLocked(snap.mount, snap.mountFailure);  // its own reason, not the rotation's
     }
     m_steadyFrame = std::move(snap);
+    syncPreferredClipLocked();
+}
+
+void ImporterInstance::syncPreferredClipLocked() {
+    // The per-moment fields are measured against the clip field in force when
+    // their job was prepared (ParallaxJob::clipField).  When that field
+    // changes - the clip correction lands, Auto's verdict flips, the prefs
+    // moved on - every bucket measured against the old one is measured again,
+    // exactly as when the lens rotation is folded into the rig.  Interactive
+    // frames rendered before were non-final; an Exact frame waits for the
+    // clip correction (prepareSteadyLocked), so it never saw the old state
+    // unless that wait timed out - and the frame cache goes too, for that case.
+    std::shared_ptr<const render::ParallaxWarpGrid> now = preferredClipFieldLocked();
+    if (now == m_preferClip) {
+        return;
+    }
+    const bool hadOne = static_cast<bool>(m_preferClip);
+    m_preferClip = std::move(now);
+    m_lastFrame = RenderedFrame{};
+    resetParallaxLocked();
+    if (m_preferClip) {
+        PluginLog::info("steady: '{}': Auto follows the scene; each moment's field now renders only where it lines "
+                        "the lenses up measurably better than the clip field (a near object passing), and the clip "
+                        "field holds everything else still",
+                        m_path.filename().string());
+    } else if (hadOne) {
+        PluginLog::debug("steady: '{}': the per-moment fields no longer defer to a clip field",
+                         m_path.filename().string());
+    }
+}
+
+std::shared_ptr<const render::ParallaxWarpGrid> ImporterInstance::preferredClipFieldLocked() const {
+    // Only Auto that has measured the clip, has a field, and decided to
+    // follow the scene: Steady renders the clip field anyway, Follows scene
+    // asked for every moment's own field, and Auto holding still renders
+    // the clip field everywhere (SteadyUse::Clip).
+    if (!m_prefs.parallaxEnabled() || m_prefs.parallaxGridChoice() != PrefsParallaxGrid::Auto) {
+        return nullptr;
+    }
+    if (!m_steadyFrame.active || !m_steadyFrame.clipSettled || !m_steadyFrame.clip) {
+        return nullptr;
+    }
+    const render::ClipSteady& clip = *m_steadyFrame.clip;
+    if (clip.decision.steady || !clip.grid || !clip.grid->valid()) {
+        return nullptr;
+    }
+    return clip.grid;
 }
 
 ImporterInstance::SteadyUse ImporterInstance::steadyUseLocked(RenderPurpose purpose) const noexcept {
