@@ -689,6 +689,22 @@ the view's forward axis swings 0.87 deg in total from frame to frame over
 the clip, against 1.84 deg with Horizon Lock, which carries the body's
 heading shake.
 
+**Vibration is not shake.** Every mode reads the attitude from the clip's
+1 kHz IMU batches low-passed at 12 Hz (`kStabilisationVibrationCutoffHz`,
+`AttitudeTrack::Options::vibrationCutoffHz`), not from the one sample per
+frame. On the airborne sample the camera buzzes with the engine at 22 / 44 /
+89 / 134 Hz (0.02-0.05 deg each); one sample per frame reads the 89 Hz line
+as a 0.2 deg sign flip every frame, and counter-rotating that held the world
+still while the engine nacelle - bolted to the wing the camera is bolted to -
+shook by a pixel against it. Rotation above the cutoff is left in place,
+because everything mounted with the camera shares it and the mount is what
+the viewer wants steady; the real motion below it (a turn, a bank, hand
+shake under ~10 Hz) is removed as before. The nacelle's outline moves 0.1-0.4
+px per frame instead of about 1 px. A clip without IMU batches keeps the
+per-frame track, and the log says which it got ("1078 IMU samples at 1000
+Hz; rotation above 12 Hz ... left in place" or "one attitude sample per
+frame").
+
 #### Lens shading (ids 34-35)
 
 Each lens's own brightness structure near its rim, measured from that lens's
@@ -2729,6 +2745,14 @@ looks wrong.
    clip or each moment is measured on its own. On a rigid mount the near
    part never moves, so Steady (per clip) is worth a try when the seam still
    breathes; Follows scene (per moment) when something passes close by.
+   Auto's test is geometric as well as photometric: a sample frame's own
+   correction counts as lost only where it really moves the picture
+   differently from the clip's (half a degree of disparity or more). A
+   spinning propeller or a reflection on chrome scores a frame's own
+   correction higher without moving anything differently, and used to tip
+   the sample clip to Follows scene; it is "agreed" now, and the log line
+   says so ("0 of 66 judged sectors lose ..., 4 more lose it where both
+   corrections move the picture alike").
    During playback a moment that is still being measured shows the one
    before it for a few frames; once measured, a frame looks exactly as it
    does when you stop on it.

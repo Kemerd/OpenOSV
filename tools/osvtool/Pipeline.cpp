@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <format>
 #include <string_view>
 
 namespace osvtool {
@@ -428,17 +429,23 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
             return Error{ErrorCode::InvalidArgument,
                          "unknown --attitude-convention '" + options.attitudeConvention + "'"};
         }
+        // The mount's vibration stays out of the counter-rotation, exactly
+        // as the plug-ins' engine builds its track (Stabilization.h).
+        attOpt.vibrationCutoffHz = geom::kStabilisationVibrationCutoffHz;
         OSV_TRY_ASSIGN(geom::AttitudeTrack att, geom::AttitudeTrack::build(p->track, attOpt));
         p->attitude = std::move(att);
         if (p->attitude->sampleCount() == 0) {
             return Error{ErrorCode::Malformed, "clip has no attitude samples; cannot stabilise"};
         }
         p->referenceAttitude = p->attitude->worldFromBody(p->attitude->beginUs());
-        std::vector<Quatd> perFrame;
-        perFrame.reserve(p->attitude->samples().size());
-        for (const auto& s : p->attitude->samples()) {
-            perFrame.push_back(s.worldFromBody);
+        if (p->attitude->vibrationCutoffHz() > 0.0) {
+            p->notes.push_back(std::format("stabilisation: {} IMU samples; rotation above {:.0f} Hz (the mount's "
+                                           "vibration) is left in place",
+                                           p->attitude->sampleCount(), p->attitude->vibrationCutoffHz()));
         }
+        // One orientation per video frame for the smoothing window and the
+        // mount measurement, whatever the track's own sample density.
+        std::vector<Quatd> perFrame = p->attitude->perFrame(p->track);
         // The same mount the importer measures: identity for a lenses-level
         // camera, a quarter turn for a lens-up / lens-down one (Avata 360).
         p->stabParams.mount = geom::levellingMount(perFrame, p->attitude->worldUp());

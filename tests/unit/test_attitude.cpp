@@ -1116,6 +1116,100 @@ TEST_CASE("AttitudeTrack dense track: anchor 4 lands on the frame attitude", "[a
     REQUIRE(s.track.clip().imuSamplingRate == 1000);
 }
 
+// -----------------------------------------------------------------------------
+//  The vibration low-pass
+// -----------------------------------------------------------------------------
+TEST_CASE("AttitudeTrack::lowPass keeps a slow turn and removes an engine vibration", "[attitude]") {
+    // 1 kHz samples over 2 s: a 5 degree yaw swing at 0.5 Hz (the motion a
+    // stabiliser must follow) with a 0.05 degree buzz at 89 Hz on top (the
+    // airborne sample clip's engine line).
+    constexpr double kRate = 1000.0;
+    constexpr double kSeconds = 2.0;
+    std::vector<AttitudeTrack::Sample> noisy;
+    std::vector<Quatd> clean;
+    for (int i = 0; i <= static_cast<int>(kRate * kSeconds); ++i) {
+        const double t = static_cast<double>(i) / kRate;
+        const double slow = deg2rad(5.0) * std::sin(2.0 * kPi * 0.5 * t);
+        const double buzz = deg2rad(0.05) * std::sin(2.0 * kPi * 89.0 * t);
+        const Quatd slowQ = quatExp(Vec3d{0.0, 0.0, slow});
+        clean.push_back(slowQ);
+        noisy.push_back(AttitudeTrack::Sample{t * 1.0e6, slowQ * quatExp(Vec3d{0.0, 0.0, buzz})});
+    }
+    const std::vector<AttitudeTrack::Sample> filtered = AttitudeTrack::lowPass(noisy, 12.0);
+    REQUIRE(filtered.size() == noisy.size());
+    double worstToClean = 0.0;
+    double worstNoisy = 0.0;
+    // Away from the ends, where the window is one-sided.
+    for (std::size_t i = 100; i + 100 < filtered.size(); ++i) {
+        REQUIRE(filtered[i].tUs == noisy[i].tUs);
+        worstToClean = std::max(worstToClean, rad2deg(filtered[i].worldFromBody.angleTo(clean[i])));
+        worstNoisy = std::max(worstNoisy, rad2deg(noisy[i].worldFromBody.angleTo(clean[i])));
+    }
+    // The buzz is gone (0.05 deg -> under 0.005 deg) and the slow swing is
+    // kept to within a hundredth of a degree (-3 dB at 12 Hz leaves 0.5 Hz
+    // attenuated by less than 0.1 %).
+    REQUIRE(worstNoisy > 0.045);
+    REQUIRE(worstToClean < 0.01);
+
+    // No cutoff, or a nonsensical one: the samples come back as they are.
+    for (const double cutoff : {0.0, -3.0, std::numeric_limits<double>::quiet_NaN()}) {
+        const std::vector<AttitudeTrack::Sample> same = AttitudeTrack::lowPass(noisy, cutoff);
+        REQUIRE(same.size() == noisy.size());
+        REQUIRE(same[500].worldFromBody.angleTo(noisy[500].worldFromBody) < 1e-12);
+    }
+    REQUIRE(AttitudeTrack::lowPass({}, 12.0).empty());
+    REQUIRE(AttitudeTrack::lowPass({noisy[0]}, 12.0).size() == 1);
+}
+
+TEST_CASE("AttitudeTrack with a vibration cutoff is dense and steadies the sample's per-frame attitude",
+          "[attitude][sample]") {
+    OSV_REQUIRE_SAMPLE();
+    const std::unique_ptr<SampleMeta> sample = openSample();
+    const SampleMeta& s = *sample;
+
+    AttitudeTrack::Options sparseOpt;
+    auto sparseBuilt = AttitudeTrack::build(s.track, sparseOpt);
+    REQUIRE(sparseBuilt.ok());
+    const AttitudeTrack& sparse = sparseBuilt.value();
+    REQUIRE_FALSE(sparse.dense());
+    REQUIRE(sparse.vibrationCutoffHz() == 0.0);
+
+    AttitudeTrack::Options filteredOpt;
+    filteredOpt.vibrationCutoffHz = 12.0;
+    auto filteredBuilt = AttitudeTrack::build(s.track, filteredOpt);
+    REQUIRE(filteredBuilt.ok());
+    const AttitudeTrack& filtered = filteredBuilt.value();
+    // Dense without asking for it: the cutoff needs every batch sample.
+    REQUIRE(filtered.dense());
+    REQUIRE(filtered.vibrationCutoffHz() == 12.0);
+    REQUIRE(filtered.sampleCount() >= 65u * 16u);
+
+    // One orientation per frame from each, at the frame timestamps.
+    const std::vector<Quatd> a = sparse.perFrame(s.track);
+    const std::vector<Quatd> b = filtered.perFrame(s.track);
+    REQUIRE(a.size() == 65);
+    REQUIRE(b.size() == 65);
+    // The sparse per-frame samples carry the engine's 89 Hz line aliased to a
+    // sign flip every frame (+-0.1-0.2 deg); the filtered track does not.
+    double sparseStep = 0.0;
+    double filteredStep = 0.0;
+    double worstApart = 0.0;
+    for (std::size_t i = 1; i < a.size(); ++i) {
+        sparseStep += std::pow(rad2deg(a[i].angleTo(a[i - 1])), 2.0);
+        filteredStep += std::pow(rad2deg(b[i].angleTo(b[i - 1])), 2.0);
+        worstApart = std::max(worstApart, rad2deg(a[i].angleTo(b[i])));
+    }
+    sparseStep = std::sqrt(sparseStep / static_cast<double>(a.size() - 1));
+    filteredStep = std::sqrt(filteredStep / static_cast<double>(a.size() - 1));
+    INFO("frame-to-frame rotation rms: sparse " << sparseStep << " deg, filtered " << filteredStep << " deg; "
+         << "largest difference between the two per-frame attitudes " << worstApart << " deg");
+    REQUIRE(sparseStep > 0.08);
+    REQUIRE(filteredStep < 0.4 * sparseStep);
+    // And it is the same clip: the filtered attitude never strays from the
+    // recorded one by more than the vibration it took out.
+    REQUIRE(worstApart < 0.5);
+}
+
 TEST_CASE("AttitudeTrack clock fit: 1006 ticks per IMU sample", "[attitude][sample]") {
     OSV_REQUIRE_SAMPLE();
     const std::unique_ptr<SampleMeta> sample = openSample();

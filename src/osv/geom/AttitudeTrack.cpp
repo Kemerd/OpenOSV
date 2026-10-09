@@ -7,6 +7,7 @@
 #include "osv/geom/AttitudeTrack.h"
 
 #include "osv/core/Log.h"
+#include "osv/geom/Stabilization.h"  // quatLog / quatExp for the low-pass
 #include "osv/meta/MetadataTrack.h"
 
 #include <algorithm>
@@ -136,6 +137,74 @@ Result<AttitudeTrack> AttitudeTrack::fromSamples(std::vector<Sample> samples, co
     return track;
 }
 
+std::vector<AttitudeTrack::Sample> AttitudeTrack::lowPass(std::vector<Sample> samples, double cutoffHz) {
+    tidySamples(samples);
+    if (samples.size() < 2 || !std::isfinite(cutoffHz) || cutoffHz <= 0.0) {
+        return samples;
+    }
+    // ---- the window: sigma for -3 dB at the cutoff, +-3 sigma support ----------
+    // exp(-2 pi^2 f^2 sigma^2) = 1/sqrt(2)  =>  sigma = sqrt(ln sqrt 2) / (sqrt 2 pi f).
+    const double sigmaUs = std::sqrt(std::log(std::sqrt(2.0))) / (std::sqrt(2.0) * kPi * cutoffHz) * 1.0e6;
+    const double reachUs = 3.0 * sigmaUs;
+    if (!(sigmaUs > 0.0) || !std::isfinite(reachUs)) {
+        return samples;
+    }
+    std::vector<Sample> out;
+    out.reserve(samples.size());
+    // Two pointers keep the window [lo, hi] over the sorted times, so the
+    // whole pass is linear in the samples plus the window width.
+    std::size_t lo = 0;
+    std::size_t hi = 0;
+    for (std::size_t k = 0; k < samples.size(); ++k) {
+        const double tk = samples[k].tUs;
+        while (lo < k && samples[lo].tUs < tk - reachUs) {
+            ++lo;
+        }
+        while (hi + 1 < samples.size() && samples[hi + 1].tUs <= tk + reachUs) {
+            ++hi;
+        }
+        // ---- Gaussian log-map mean about this sample (as Smoother does) --------
+        const Quatd centre = samples[k].worldFromBody;  // unit (tidySamples)
+        const Quatd centreInv = centre.conj();
+        Vec3d sum;
+        double weightSum = 0.0;
+        for (std::size_t i = lo; i <= hi; ++i) {
+            const double d = (samples[i].tUs - tk) / sigmaUs;
+            const double wgt = std::exp(-0.5 * d * d);
+            Quatd rel = centreInv * samples[i].worldFromBody;
+            if (rel.w < 0.0) {
+                rel = Quatd{-rel.w, -rel.x, -rel.y, -rel.z};  // the short arc
+            }
+            sum += quatLog(rel) * wgt;
+            weightSum += wgt;
+        }
+        Sample s = samples[k];
+        if (weightSum > 0.0) {
+            const Quatd mean = centre * quatExp(sum / weightSum);
+            if (mean.isFinite()) {
+                s.worldFromBody = mean.normalized();
+            }
+        }
+        out.push_back(s);
+    }
+    return out;
+}
+
+std::vector<Quatd> AttitudeTrack::perFrame(const meta::MetadataTrack& track) const {
+    const std::uint32_t frameCount = track.frameCount();
+    std::vector<Quatd> out;
+    out.reserve(frameCount);
+    Quatd last = Quatd::identity();
+    for (std::uint32_t i = 0; i < frameCount; ++i) {
+        const Result<meta::FrameMeta> frame = track.frame(i);
+        if (frame.ok()) {
+            last = worldFromBody(static_cast<double>(frame.value().timestampUs));
+        }
+        out.push_back(last);  // a frame without metadata repeats the previous one
+    }
+    return out;
+}
+
 Result<AttitudeTrack> AttitudeTrack::build(const meta::MetadataTrack& track, const Options& options) {
     const std::uint32_t frameCount = track.frameCount();
     if (frameCount == 0) {
@@ -149,19 +218,28 @@ Result<AttitudeTrack> AttitudeTrack::build(const meta::MetadataTrack& track, con
         return Error{ErrorCode::InvalidArgument, "AttitudeTrack: extra offset is not finite"};
     }
 
-    // Dense placement needs the IMU rate to space the batch samples.
+    // Dense placement needs the IMU rate to space the batch samples.  An
+    // explicit `dense` without the rate is an error; a vibration cutoff
+    // without it falls back to the per-frame samples (nothing to filter).
+    const std::uint32_t rate = track.clip().imuSamplingRate;
+    const bool filter = std::isfinite(options.vibrationCutoffHz) && options.vibrationCutoffHz > 0.0;
+    if (options.dense && rate == 0) {
+        return Error{ErrorCode::NotFound, "AttitudeTrack: imu_sampling_rate missing (needed for dense mode)"};
+    }
+    if (filter && rate == 0) {
+        log::debug("AttitudeTrack: no imu_sampling_rate; the vibration cutoff of {:.1f} Hz cannot be applied to "
+                   "one attitude sample per frame",
+                   options.vibrationCutoffHz);
+    }
+    const bool dense = options.dense || (filter && rate > 0);
     double samplePeriodUs = 0.0;
-    if (options.dense) {
-        const std::uint32_t rate = track.clip().imuSamplingRate;
-        if (rate == 0) {
-            return Error{ErrorCode::NotFound, "AttitudeTrack: imu_sampling_rate missing (needed for dense mode)"};
-        }
+    if (dense) {
         samplePeriodUs = 1.0e6 / static_cast<double>(rate);
     }
 
     std::vector<Sample> samples;
     std::vector<ClockObservation> clock;
-    samples.reserve(options.dense ? frameCount * 17 : frameCount);
+    samples.reserve(dense ? frameCount * 17 : frameCount);
     clock.reserve(frameCount);
     std::size_t skipped = 0;
 
@@ -178,7 +256,7 @@ Result<AttitudeTrack> AttitudeTrack::build(const meta::MetadataTrack& track, con
         if (frame.imu.has_value() && frame.imu->current.present && !frame.imu->current.q.empty()) {
             const meta::ImuBatch& batch = frame.imu->current;
             clock.push_back(ClockObservation{frameTs, static_cast<double>(batch.ts), batch.q.size()});
-            if (options.dense) {
+            if (dense) {
                 for (std::size_t s = 0; s < batch.q.size(); ++s) {
                     if (!batch.q[s].present) {
                         continue;
@@ -189,7 +267,7 @@ Result<AttitudeTrack> AttitudeTrack::build(const meta::MetadataTrack& track, con
                 }
                 continue;
             }
-        } else if (options.dense) {
+        } else if (dense) {
             // Dense mode without a batch: fall back to the frame attitude so
             // the track has no hole.
             if (frame.camera.attitude.present) {
@@ -212,8 +290,18 @@ Result<AttitudeTrack> AttitudeTrack::build(const meta::MetadataTrack& track, con
     if (skipped > 0) {
         log::debug("AttitudeTrack: {} of {} frames had no usable attitude", skipped, frameCount);
     }
+    // ---- the vibration out of a dense track -------------------------------------
+    // Only a dense track can be filtered: at one sample per frame a
+    // vibration above half the frame rate is already folded into the
+    // samples (aliased) and no filter can separate it from a shake.
+    const bool filtered = dense && filter;
+    if (filtered) {
+        samples = lowPass(std::move(samples), options.vibrationCutoffHz);
+    }
     OSV_TRY_ASSIGN(AttitudeTrack result, fromSamples(std::move(samples), options));
     result.m_clockFit = fitClock(clock);
+    result.m_dense = dense;
+    result.m_vibrationCutoffHz = filtered ? options.vibrationCutoffHz : 0.0;
     return result;
 }
 

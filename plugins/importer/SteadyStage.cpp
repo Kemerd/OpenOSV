@@ -221,6 +221,7 @@ void hashClipParams(Hasher& h, const render::ClipSteadyParams& p) noexcept {
     // The verdict's tolerance and the sample minimum change the result too.
     h.f64(d.maxFailedFraction);
     h.f64(d.maxFailedLoss);
+    h.f64(d.minFieldDiffDeg);  // the geometric gate on a failure
     h.u64(p.minSamples);
     // [WP-M] The mesh solve (render/MeshWarp.h) that builds every sample's
     // field and the clip field: every weight and the lattice change the

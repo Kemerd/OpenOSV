@@ -8,6 +8,37 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ### Fixed
 
+* **A mounted camera's vibration no longer shakes the mount on screen.**
+  Stabilisation counter-rotates the view by the camera's measured rotation,
+  and it read that rotation from one attitude sample per frame. On the
+  airborne sample the camera buzzes with the engine at 89 Hz (0.04 deg, with
+  lines at 22, 44 and 134 Hz, measured on the 1 kHz IMU batches); sampled
+  once per frame that is a 0.2 deg sign flip every frame, and Smooth +
+  Horizon Lock counter-rotated it faithfully: the world stood still and the
+  engine nacelle, bolted to the same wing as the camera, shook by a pixel
+  against it, the wobble reported at the seam. Every stabilisation mode now
+  builds its attitude from every IMU sample and low-passes it at 12 Hz, so
+  what is faster than a visible shake (a mount's vibration, which everything
+  mounted with the camera shares) is left in place and the mount holds
+  still. The real motion below that - hand shake, a turn, a bank - is
+  removed as before. Clips without IMU batches keep the per-frame attitude.
+* **Parallax Grid Auto holds a rigid mount still again.** 0.3.0 and 0.4.2
+  judged the airborne sample "steady" (one correction and one seam for the
+  whole clip); 0.5.2 judged it "follows scene" and re-measured the nacelle
+  every eight frames, gliding between measurements and re-carving the cut,
+  which is the seam that looked unnatural. The verdict compared the
+  lens-to-lens correlation of each sample frame's own correction with the
+  clip's, and a correction fitted to a frame's flow matches scores higher on
+  that same frame wherever the flow locked on to something that is not a
+  surface - the streaks of a spinning propeller, a reflection on chrome -
+  even though it moves the picture no differently. A sector now counts as
+  lost only where the two corrections really move the picture differently
+  (half a degree of disparity or more, below any near object's parallax);
+  the propeller sectors become "agreed" and the sample is steady: 0 of 66
+  judged sectors lost, 4 agreed. A near object that moves still differs by
+  its parallax and still fails. The osvtool seam --steady report and the log
+  line show the field difference and the agreed count.
+
 * **Playback shows the seam correction the parked frame shows.** Every
   frame Premiere asks for at 1/2 or 1/4 playback resolution is a draft
   request (its playback ratio is below 1), and a draft rendered with no seam

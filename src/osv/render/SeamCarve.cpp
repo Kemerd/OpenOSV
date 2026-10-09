@@ -225,38 +225,112 @@ template <class Body> void forRange(ThreadPool* pool, std::size_t n, std::size_t
 /// correctBandsForSeam, optionally also reporting the FULL vertical
 /// disparity (band rows) the correction assumes at every band pixel - the
 /// measure of how close to the camera the content there is.
+/// The kernel's lookup of a correction at a band pixel: the HALF
+/// displacement (dx columns, dy rows) the master samples at, the slave
+/// sampling the negation.  One object serves every pixel of a band, so the
+/// band resampling (correctBandsImpl) and the geometric comparison of two
+/// corrections (correctionDisplacement) read a correction the same way.
+class CorrectionLookup {
+public:
+    /// InvalidArgument for a corrupt table; an empty correction is valid and
+    /// reads zero everywhere (active() false).
+    [[nodiscard]] static Result<CorrectionLookup> make(const LensBands& bands, const SeamCorrection& correction) {
+        CorrectionLookup l;
+        l.m_haveWarp = correction.warp && correction.warp->valid();
+        l.m_haveTable = correction.seamShiftDeg && !correction.seamShiftDeg->empty();
+        // A table of absurd length is a corrupt input, not a finer measurement.
+        if (l.m_haveTable && correction.seamShiftDeg->size() > 65536u) {
+            return Error{ErrorCode::InvalidArgument, "correctBandsForSeam: seam table is implausibly long"};
+        }
+        // The kernel's view of the grid, so osvWarpSample reads it exactly as
+        // the renderer will (the same construction as ParallaxWarp's gate).
+        std::memset(&l.m_kp, 0, sizeof(l.m_kp));
+        if (l.m_haveWarp) {
+            l.m_kp.warpEnabled = 1;
+            l.m_kp.warpW = static_cast<int>(correction.warp->w);
+            l.m_kp.warpH = static_cast<int>(correction.warp->h);
+            l.m_kp.warpLatMinRad = correction.warp->latMinRad;
+            l.m_kp.warpLatMaxRad = correction.warp->latMaxRad;
+            l.m_uv = correction.warp->uv;
+        }
+        l.m_table = l.m_haveTable ? correction.seamShiftDeg : nullptr;
+        l.m_tableN = l.m_haveTable ? static_cast<int>(correction.seamShiftDeg->size()) : 0;
+        l.m_radPerRow = osv::kPi / static_cast<double>(bands.mapH);
+        l.m_radPerCol = osv::kTwoPi / static_cast<double>(bands.w);
+        l.m_rowsPerDeg = static_cast<double>(bands.mapH) / 180.0;
+        l.m_rowOffset = bands.rowOffset;
+        l.m_w = bands.w;
+        return l;
+    }
+
+    /// Whether anything is in force at all.
+    [[nodiscard]] bool active() const noexcept { return m_haveWarp || m_haveTable; }
+    [[nodiscard]] double radPerRow() const noexcept { return m_radPerRow; }
+    [[nodiscard]] double radPerCol() const noexcept { return m_radPerCol; }
+
+    /// Latitude of band row `r`'s centre (radians), as the float the kernel
+    /// would see.
+    [[nodiscard]] float latOfRow(std::size_t r) const noexcept {
+        return static_cast<float>(osv::kHalfPi -
+                                  (static_cast<double>(m_rowOffset) + static_cast<double>(r) + 0.5) * m_radPerRow);
+    }
+
+    /// The half displacement at column `x`, latitude `lat`: `dx` columns and
+    /// `dy` rows (positive = down the band).
+    void at(std::uint32_t x, float lat, double& dx, double& dy) const noexcept {
+        dx = 0.0;
+        dy = 0.0;
+        const float lon = static_cast<float>((static_cast<double>(x) + 0.5) * m_radPerCol - osv::kPi);
+        if (m_haveTable) {
+            // osvSeamColumn's rule: the column the kernel reads for this
+            // longitude.  Each lens samples half the disparity away from its
+            // own axis - master (north pole) south, i.e. to larger rows;
+            // slave the other way.
+            double f = (static_cast<double>(lon) + osv::kPi) / osv::kTwoPi;
+            f = std::clamp(f, 0.0, 0.999999);
+            const int c = std::clamp(static_cast<int>(f * m_tableN), 0, m_tableN - 1);
+            const double delta = static_cast<double>((*m_table)[static_cast<std::size_t>(c)]);
+            if (std::isfinite(delta)) {
+                dy += 0.5 * delta * m_rowsPerDeg;
+            }
+        }
+        if (m_haveWarp) {
+            // Master moves by +(dLon, dLat), slave by the negation; a
+            // latitude step is a NEGATIVE row step.
+            const double dLon = osvWarpSample(&m_kp, m_uv, lon, lat, 0);
+            const double dLat = osvWarpSample(&m_kp, m_uv, lon, lat, 1);
+            if (std::isfinite(dLon) && std::isfinite(dLat)) {
+                dx += dLon / m_radPerCol;
+                dy += -dLat / m_radPerRow;
+            }
+        }
+    }
+
+private:
+    bool m_haveWarp = false;
+    bool m_haveTable = false;
+    OsvRenderParams m_kp{};
+    const float* m_uv = nullptr;
+    const std::vector<float>* m_table = nullptr;
+    int m_tableN = 0;
+    double m_radPerRow = 0.0;
+    double m_radPerCol = 0.0;
+    double m_rowsPerDeg = 0.0;
+    std::uint32_t m_rowOffset = 0;
+    std::uint32_t m_w = 0;
+};
+
 Result<LensBands> correctBandsImpl(const LensBands& bands, const SeamCorrection& correction, ThreadPool* pool,
                                    std::vector<float>* disparityRows) {
     OSV_TRY(checkBands(bands, "correctBandsForSeam"));
     const std::size_t n = static_cast<std::size_t>(bands.w) * bands.h;
-    const bool haveWarp = correction.warp && correction.warp->valid();
-    const bool haveTable = correction.seamShiftDeg && !correction.seamShiftDeg->empty();
     if (disparityRows) {
         disparityRows->assign(n, 0.0f);
     }
-    if (!haveWarp && !haveTable) {
+    OSV_TRY_ASSIGN(const CorrectionLookup lookup, CorrectionLookup::make(bands, correction));
+    if (!lookup.active()) {
         return bands;  // nothing to correct: the bands are what the kernel blends
     }
-    // A table of absurd length is a corrupt input, not a finer measurement.
-    if (haveTable && correction.seamShiftDeg->size() > 65536u) {
-        return Error{ErrorCode::InvalidArgument, "correctBandsForSeam: seam table is implausibly long"};
-    }
-
-    // The kernel's view of the grid, so osvWarpSample reads it exactly as
-    // the renderer will (the same construction as ParallaxWarp's gate).
-    OsvRenderParams kp;
-    std::memset(&kp, 0, sizeof(kp));
-    if (haveWarp) {
-        kp.warpEnabled = 1;
-        kp.warpW = static_cast<int>(correction.warp->w);
-        kp.warpH = static_cast<int>(correction.warp->h);
-        kp.warpLatMinRad = correction.warp->latMinRad;
-        kp.warpLatMaxRad = correction.warp->latMaxRad;
-    }
-    const double radPerRow = osv::kPi / static_cast<double>(bands.mapH);
-    const double radPerCol = osv::kTwoPi / static_cast<double>(bands.w);
-    const double rowsPerDeg = static_cast<double>(bands.mapH) / 180.0;
-    const int tableN = haveTable ? static_cast<int>(correction.seamShiftDeg->size()) : 0;
 
     LensBands out;
     out.w = bands.w;
@@ -270,36 +344,11 @@ Result<LensBands> correctBandsImpl(const LensBands& bands, const SeamCorrection&
 
     forRange(pool, bands.h, 1, [&](std::size_t r0, std::size_t r1) {
         for (std::size_t r = r0; r < r1; ++r) {
-            // Latitude of the row centre, as the float the kernel would see.
-            const float lat = static_cast<float>(
-                osv::kHalfPi - (static_cast<double>(bands.rowOffset) + static_cast<double>(r) + 0.5) * radPerRow);
+            const float lat = lookup.latOfRow(r);
             for (std::uint32_t x = 0; x < bands.w; ++x) {
-                const float lon = static_cast<float>((static_cast<double>(x) + 0.5) * radPerCol - osv::kPi);
                 double dx = 0.0;
                 double dy = 0.0;
-                if (haveTable) {
-                    // osvSeamColumn's rule: the column the kernel reads for
-                    // this longitude.  Each lens samples half the disparity
-                    // away from its own axis - master (north pole) south,
-                    // i.e. to larger rows; slave the other way.
-                    double f = (static_cast<double>(lon) + osv::kPi) / osv::kTwoPi;
-                    f = std::clamp(f, 0.0, 0.999999);
-                    const int c = std::clamp(static_cast<int>(f * tableN), 0, tableN - 1);
-                    const double delta = static_cast<double>((*correction.seamShiftDeg)[static_cast<std::size_t>(c)]);
-                    if (std::isfinite(delta)) {
-                        dy += 0.5 * delta * rowsPerDeg;
-                    }
-                }
-                if (haveWarp) {
-                    // Master moves by +(dLon, dLat), slave by the negation; a
-                    // latitude step is a NEGATIVE row step.
-                    const double dLon = osvWarpSample(&kp, correction.warp->uv, lon, lat, 0);
-                    const double dLat = osvWarpSample(&kp, correction.warp->uv, lon, lat, 1);
-                    if (std::isfinite(dLon) && std::isfinite(dLat)) {
-                        dx += dLon / radPerCol;
-                        dy += -dLat / radPerRow;
-                    }
-                }
+                lookup.at(x, lat, dx, dy);
                 const std::size_t i = r * bands.w + x;
                 const double px = static_cast<double>(x) + 0.5;
                 const double py = static_cast<double>(r) + 0.5;
@@ -519,6 +568,34 @@ Result<std::vector<int>> solveSeamDp(const std::vector<float>& cost, std::uint32
 // ===========================================================================
 Result<LensBands> correctBandsForSeam(const LensBands& bands, const SeamCorrection& correction, ThreadPool* pool) {
     return correctBandsImpl(bands, correction, pool, nullptr);
+}
+
+Result<CorrectionDisplacement> correctionDisplacement(const LensBands& bands, const SeamCorrection& correction) {
+    OSV_TRY(checkBands(bands, "correctionDisplacement"));
+    OSV_TRY_ASSIGN(const CorrectionLookup lookup, CorrectionLookup::make(bands, correction));
+    const std::size_t n = static_cast<std::size_t>(bands.w) * bands.h;
+    CorrectionDisplacement out;
+    out.w = bands.w;
+    out.h = bands.h;
+    out.dx.assign(n, 0.0f);
+    out.dy.assign(n, 0.0f);
+    if (!lookup.active()) {
+        return out;  // an empty correction moves nothing
+    }
+    for (std::size_t r = 0; r < bands.h; ++r) {
+        const float lat = lookup.latOfRow(r);
+        for (std::uint32_t x = 0; x < bands.w; ++x) {
+            double dx = 0.0;
+            double dy = 0.0;
+            lookup.at(x, lat, dx, dy);
+            // The master samples at +d and the slave at -d: the full
+            // disparity between what the two lenses show is 2 d.
+            const std::size_t i = r * bands.w + x;
+            out.dx[i] = static_cast<float>(2.0 * dx);
+            out.dy[i] = static_cast<float>(2.0 * dy);
+        }
+    }
+    return out;
 }
 
 // ===========================================================================

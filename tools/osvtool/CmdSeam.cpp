@@ -466,17 +466,20 @@ int runSeam(const SeamOptions& o) {
                               {"textured", c.decision.textured},
                               {"judged", c.decision.judged},
                               {"failed", c.decision.failed},
+                              {"agreed", c.decision.agreed},
                               {"worstKeep", c.decision.worstKeep},
                               {"worstLoss", c.decision.worstLoss},
+                              {"worstFieldDiffDeg", c.decision.worstFieldDiffDeg},
                               {"meanLoss", c.decision.meanLoss},
                               {"worstFrame", c.decision.worstFrame},
                               {"worstLonDeg", c.decision.worstLonDeg},
                               {"summary", render::describeSteadyDecision(c.decision)}};
             nlohmann::json scores = nlohmann::json::array();
             for (const render::SteadySectorScore& r : c.decision.scores) {
-                scores.push_back({r.frame, r.sector, std::isfinite(r.none) ? r.none : -2.0, r.own, r.clip});
+                scores.push_back({r.frame, r.sector, std::isfinite(r.none) ? r.none : -2.0, r.own, r.clip,
+                                  std::isfinite(r.fieldDiffDeg) ? r.fieldDiffDeg : -1.0});
             }
-            sj["decision"]["scores"] = scores;  // [frame, sector, none, own, clip]
+            sj["decision"]["scores"] = scores;  // [frame, sector, none, own, clip, fieldDiffDeg]
             steady = measured.value();
         }
         out["steady"] = sj;

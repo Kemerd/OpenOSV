@@ -106,6 +106,20 @@ public:
         /// what `auto` passes: under the default reading the world frame is
         /// level by construction (its +Z is up).
         Vec3d measuredUp{0.0, 0.0, 0.0};
+        /// Vibration cutoff for a track that feeds the stabilisation, in Hz
+        /// (0 = none).  With it, and with the per-frame IMU batches present,
+        /// the track is built from EVERY batch sample (dense, whatever
+        /// `dense` says) and low-passed in time (a Gaussian, -3 dB at this
+        /// frequency; see lowPass()), so rotation faster than a shake a
+        /// viewer could see - a mount's vibration, which everything mounted
+        /// with the camera shares - stays out of the track and out of the
+        /// counter-rotation the stabilisation applies.  One attitude sample
+        /// per frame cannot do that: a 90 Hz vibration sampled at 60 Hz
+        /// reads as a sign flip every frame, and the levelling shakes the
+        /// whole picture by it.  Without batches (or their rate) the sparse
+        /// per-frame samples are kept as they are, and vibrationCutoffHz()
+        /// reports 0.
+        double vibrationCutoffHz = 0.0;
     };
 
     /// One orientation sample.
@@ -141,6 +155,31 @@ public:
     /// Identity when the track is empty or the time is not finite.
     [[nodiscard]] Quatd worldFromBody(double tUs) const noexcept;
 
+    /// One orientation per video frame of `track`, at each frame's own
+    /// timestamp - what the per-frame smoothing (Smoother) and the mount
+    /// measurement (levellingMount) read, whether this track holds one
+    /// sample per frame or every IMU sample.  A frame without metadata
+    /// repeats the previous frame's orientation (identity for the first).
+    [[nodiscard]] std::vector<Quatd> perFrame(const meta::MetadataTrack& track) const;
+
+    /// Low-pass `samples` in time: each orientation becomes the Gaussian
+    /// log-map average of its neighbours within +-3 sigma, with sigma chosen
+    /// so the response is -3 dB at `cutoffHz` (sigma = 0.1325 / cutoffHz
+    /// seconds: exp(-2 pi^2 f^2 sigma^2) = 1 / sqrt 2).  Irregular spacing is
+    /// fine: the weights are by time, not by index.  Samples are tidied
+    /// (sorted, duplicates and non-finite entries dropped) first.  A cutoff
+    /// that is not finite or not positive returns the tidied samples as they
+    /// are.
+    [[nodiscard]] static std::vector<Sample> lowPass(std::vector<Sample> samples, double cutoffHz);
+
+    /// True when the track holds every IMU batch sample (dense placement),
+    /// false for one sample per frame.
+    [[nodiscard]] bool dense() const noexcept { return m_dense; }
+
+    /// The vibration cutoff the samples were low-passed with (Hz), 0 when
+    /// they were not (no cutoff asked for, or no IMU batches to apply it to).
+    [[nodiscard]] double vibrationCutoffHz() const noexcept { return m_vibrationCutoffHz; }
+
     /// Time of the first / last sample (0 when empty).
     [[nodiscard]] double beginUs() const noexcept;
     [[nodiscard]] double endUs() const noexcept;
@@ -173,6 +212,8 @@ private:
     std::vector<Sample> m_samples;
     ClockFit m_clockFit;
     Options m_options;
+    bool m_dense = false;               ///< Every batch sample, not one per frame.
+    double m_vibrationCutoffHz = 0.0;   ///< The low-pass applied (0 = none).
 };
 
 }  // namespace osv::geom

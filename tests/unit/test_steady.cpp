@@ -679,9 +679,14 @@ TEST_CASE("Auto holds a static near object still and follows one that moves", "[
         REQUIRE(d.ok());
         return d.value();
     };
-    // A near object 4 rows (0.7 deg) of disparity wide, over 100 columns.
+    // A near object 4 rows (0.7 deg) of disparity wide, over 100 columns -
+    // and a nearer one of 12 rows (2.1 deg, a metre away) for the moving
+    // cases, where the gate must see its parallax above the noise.
     const auto object = [](std::uint32_t col, std::uint32_t start) {
         return (col >= start && col < start + 100u) ? 4.0 : 0.0;
+    };
+    const auto nearObject = [](std::uint32_t col, std::uint32_t start) {
+        return (col >= start && col < start + 100u) ? 12.0 : 0.0;
     };
 
     SECTION("static: the same place in every sample (a wing, a helmet visor)") {
@@ -690,20 +695,212 @@ TEST_CASE("Auto holds a static near object still and follows one that moves", "[
         CHECK(d.steady);
         CHECK(d.judged > 0u);  // the object was judged, not skipped
         CHECK(d.failed == 0u);
+        // The own and clip corrections move the picture alike everywhere: a
+        // static object's field IS the median's.
+        for (const render::SteadySectorScore& r : d.scores) {
+            INFO("frame " << r.frame << " sector " << r.sector);
+            CHECK(r.fieldDiffDeg < 0.5);
+        }
     }
     SECTION("moving: somewhere else in every sample (a person walking past)") {
         const render::SteadyDecision d =
-            decide([&](std::uint32_t k, std::uint32_t col) { return object(col, 300u + 350u * k); });
+            decide([&](std::uint32_t k, std::uint32_t col) { return nearObject(col, 300u + 350u * k); });
         INFO(render::describeSteadyDecision(d));
         CHECK_FALSE(d.steady);
         CHECK(d.failed > 0u);
         CHECK(d.worstKeep < 0.4);
+        // The failures are geometric: where the object is, its own field
+        // differs from the median by its parallax.
+        CHECK(d.worstFieldDiffDeg >= 0.5);
+    }
+    SECTION("the geometric gate alone turns a moving object's failures into agreement") {
+        // With the gate set above any possible difference, the same moving
+        // object's NCC failures are all counted as agreed: the verdict then
+        // rests on the NCC alone, as it did before the gate existed.  This
+        // pins that the gate is what tells the two apart.
+        std::vector<render::LensBands> bands;
+        std::vector<std::shared_ptr<render::ParallaxWarpGrid>> grids;
+        for (std::uint32_t k = 0; k < 5; ++k) {
+            bands.push_back(
+                syntheticBands([&](std::uint32_t col) { return nearObject(col, 300u + 350u * k); }, 100u + k));
+            auto g = render::parallaxFromBands(bands.back(), pw, &pool);
+            REQUIRE(g.ok());
+            grids.push_back(std::make_shared<render::ParallaxWarpGrid>(std::move(g).value()));
+        }
+        std::vector<const render::ParallaxWarpGrid*> ptrs;
+        for (const auto& g : grids) {
+            ptrs.push_back(g.get());
+        }
+        auto clip = render::clipParallaxGrid(ptrs);
+        REQUIRE(clip.ok());
+        const render::WarpGridView clipView = viewOf(clip.value());
+        render::SeamCorrection clipCorr;
+        clipCorr.warp = &clipView;
+        std::vector<render::WarpGridView> views;
+        views.reserve(grids.size());
+        std::vector<render::SteadySample> samples;
+        for (std::uint32_t k = 0; k < 5; ++k) {
+            views.push_back(viewOf(*grids[k]));
+            render::SteadySample s;
+            s.frame = k * 8u;
+            s.bands = &bands[k];
+            s.own.warp = &views.back();
+            samples.push_back(s);
+        }
+        render::SteadyDecisionParams wide;
+        wide.minFieldDiffDeg = 10.0;  // nothing differs by that much
+        auto d = render::decideSteady(samples, clipCorr, wide, &pool);
+        REQUIRE(d.ok());
+        INFO(render::describeSteadyDecision(d.value()));
+        CHECK(d.value().failed == 0u);
+        CHECK(d.value().agreed > 0u);
+        CHECK(d.value().steady);
+        // And switched off (0), every NCC failure counts, as before.
+        wide.minFieldDiffDeg = 0.0;
+        auto off = render::decideSteady(samples, clipCorr, wide, &pool);
+        REQUIRE(off.ok());
+        CHECK(off.value().failed > 0u);
+        CHECK(off.value().agreed == 0u);
+        CHECK_FALSE(off.value().steady);
     }
     SECTION("nothing near at all") {
         const render::SteadyDecision d = decide([](std::uint32_t, std::uint32_t) { return 0.0; });
         INFO(render::describeSteadyDecision(d));
         CHECK(d.steady);
     }
+}
+
+TEST_CASE("the geometric gate tells a texture loss from a moved object, exactly", "[steady][auto]") {
+    // Hand-made 1-D tables, so the geometry is known to the digit: every
+    // sample's own table and the clip's table.  The bands are a different
+    // random texture per sample, which is what makes the NCC lose when a
+    // table shifts it against the other lens.
+    ThreadPool pool;
+    constexpr std::uint32_t kSamples = 4;
+    std::vector<render::LensBands> bands;
+    for (std::uint32_t k = 0; k < kSamples; ++k) {
+        // The object: 0.7 deg of disparity over columns 600-700 in every sample.
+        bands.push_back(syntheticBands([](std::uint32_t col) { return (col >= 600u && col < 700u) ? 4.0 : 0.0; },
+                                       300u + k));
+    }
+    const auto tableWith = [](double deg, std::uint32_t c0, std::uint32_t c1) {
+        std::vector<float> t(2048, 0.0f);
+        for (std::uint32_t c = c0; c < c1; ++c) {
+            t[c] = static_cast<float>(deg);
+        }
+        return t;
+    };
+    const std::vector<float> clipTable = tableWith(0.7, 600, 700);   // the clip's: the object's parallax
+    const std::vector<float> sameTable = tableWith(0.7, 600, 700);   // an own table that agrees with it
+    const std::vector<float> movedTable = tableWith(0.7, 1200, 1300);  // an own table that put the object elsewhere
+    render::SeamCorrection clip;
+    clip.seamShiftDeg = &clipTable;
+
+    SECTION("own tables identical to the clip's: nothing can fail") {
+        std::vector<render::SteadySample> samples;
+        for (std::uint32_t k = 0; k < kSamples; ++k) {
+            render::SteadySample s;
+            s.frame = k * 8u;
+            s.bands = &bands[k];
+            s.own.seamShiftDeg = &sameTable;
+            samples.push_back(s);
+        }
+        auto d = render::decideSteady(samples, clip, render::SteadyDecisionParams{}, &pool);
+        REQUIRE(d.ok());
+        INFO(render::describeSteadyDecision(d.value()));
+        CHECK(d.value().steady);
+        CHECK(d.value().failed == 0u);
+        for (const render::SteadySectorScore& r : d.value().scores) {
+            CHECK(r.fieldDiffDeg == Catch::Approx(0.0).margin(1e-6));
+        }
+    }
+    SECTION("an own table that moves the object: the difference is its parallax, and it fails") {
+        // One sample's own correction has the object 0.7 deg at columns
+        // 1200-1300 (where the clip table has none) and none at 600-700
+        // (where the clip has 0.7): both sectors differ by 0.7 deg.
+        std::vector<render::SteadySample> samples;
+        for (std::uint32_t k = 0; k < kSamples; ++k) {
+            render::SteadySample s;
+            s.frame = k * 8u;
+            s.bands = &bands[k];
+            s.own.seamShiftDeg = (k == 1) ? &movedTable : &sameTable;
+            samples.push_back(s);
+        }
+        auto d = render::decideSteady(samples, clip, render::SteadyDecisionParams{}, &pool);
+        REQUIRE(d.ok());
+        INFO(render::describeSteadyDecision(d.value()));
+        double largest = 0.0;
+        for (const render::SteadySectorScore& r : d.value().scores) {
+            if (r.frame == 8u) {
+                largest = std::max(largest, r.fieldDiffDeg);
+            } else {
+                CHECK(r.fieldDiffDeg == Catch::Approx(0.0).margin(1e-6));
+            }
+        }
+        // A sector wholly inside the moved object's columns differs by
+        // exactly the object's parallax; the sector grid is 64 columns wide
+        // (2048 / 32) so columns 1200-1300 cover sector 18 completely.
+        CHECK(largest == Catch::Approx(0.7).margin(0.02));
+        // With the gate at its default the moved sectors are failures (they
+        // differ by 0.7 deg); with the gate above that they are "agreed".
+        render::SteadyDecisionParams wide;
+        wide.minFieldDiffDeg = 2.0;
+        auto agreed = render::decideSteady(samples, clip, wide, &pool);
+        REQUIRE(agreed.ok());
+        CHECK(agreed.value().failed == 0u);
+        CHECK(agreed.value().agreed == d.value().failed + d.value().agreed);
+        CHECK(agreed.value().judged == d.value().judged);
+    }
+}
+
+TEST_CASE("correctionDisplacement reads a table and a grid the way the bands are resampled", "[steady][auto]") {
+    // A band with a 1-D table of 1 degree over its first half and 0 over
+    // the rest: the displacement is 1 deg of full disparity (rows, master
+    // south) there and nothing elsewhere; a grid of a constant half
+    // displacement reads as twice that in both axes.
+    const render::LensBands b = syntheticBands([](std::uint32_t) { return 0.0; }, 7u);
+    std::vector<float> table(256, 0.0f);
+    for (std::size_t c = 0; c < 128; ++c) {
+        table[c] = 1.0f;
+    }
+    render::SeamCorrection withTable;
+    withTable.seamShiftDeg = &table;
+    auto moved = render::correctionDisplacement(b, withTable);
+    REQUIRE(moved.ok());
+    const render::CorrectionDisplacement& m = moved.value();
+    REQUIRE(m.w == b.w);
+    REQUIRE(m.h == b.h);
+    const double rowsPerDeg = static_cast<double>(b.mapH) / 180.0;
+    const std::size_t mid = static_cast<std::size_t>(b.h / 2) * b.w;
+    CHECK(m.dx[mid + 100] == 0.0f);
+    CHECK(m.dy[mid + 100] == Catch::Approx(rowsPerDeg).margin(1e-3));
+    CHECK(m.dy[mid + b.w - 100] == 0.0f);
+    // An empty correction moves nothing.
+    auto none = render::correctionDisplacement(b, render::SeamCorrection{});
+    REQUIRE(none.ok());
+    CHECK(none.value().dx[mid + 100] == 0.0f);
+    CHECK(none.value().dy[mid + 100] == 0.0f);
+    // A grid: a constant half displacement of (0.1, -0.2) deg in (lon, lat)
+    // over the whole band reads as (0.2, +0.4) deg of full disparity - a
+    // latitude step south is a positive row step.
+    render::ParallaxWarpGrid g;
+    g.w = 8;
+    g.h = 4;
+    g.latMinRad = static_cast<float>(deg2rad(-12.0));
+    g.latMaxRad = static_cast<float>(deg2rad(12.0));
+    g.uv.assign(static_cast<std::size_t>(g.w) * g.h * 2u, 0.0f);
+    for (std::size_t k = 0; k < static_cast<std::size_t>(g.w) * g.h; ++k) {
+        g.uv[k * 2u] = static_cast<float>(deg2rad(0.1));
+        g.uv[k * 2u + 1u] = static_cast<float>(deg2rad(-0.2));
+    }
+    const render::WarpGridView view = viewOf(g);
+    render::SeamCorrection withGrid;
+    withGrid.warp = &view;
+    auto gridMove = render::correctionDisplacement(b, withGrid);
+    REQUIRE(gridMove.ok());
+    const double colsPerDeg = static_cast<double>(b.w) / 360.0;
+    CHECK(gridMove.value().dx[mid + 100] == Catch::Approx(0.2 * colsPerDeg).margin(1e-2));
+    CHECK(gridMove.value().dy[mid + 100] == Catch::Approx(0.4 * rowsPerDeg).margin(1e-2));
 }
 
 TEST_CASE("Auto tolerates a few small failures, never many or large ones", "[steady][auto]") {
@@ -751,6 +948,11 @@ TEST_CASE("decideSteady refuses malformed input", "[steady][auto]") {
     CHECK_FALSE(render::decideSteady({}, render::SeamCorrection{}, bad).ok());
     bad = render::SteadyDecisionParams{};
     bad.maxLoss = std::nan("");
+    CHECK_FALSE(render::decideSteady({}, render::SeamCorrection{}, bad).ok());
+    bad = render::SteadyDecisionParams{};
+    bad.minFieldDiffDeg = -1.0;
+    CHECK_FALSE(render::decideSteady({}, render::SeamCorrection{}, bad).ok());
+    bad.minFieldDiffDeg = std::nan("");
     CHECK_FALSE(render::decideSteady({}, render::SeamCorrection{}, bad).ok());
     // Nothing to judge is steady.
     auto none = render::decideSteady({}, render::SeamCorrection{}, render::SteadyDecisionParams{});

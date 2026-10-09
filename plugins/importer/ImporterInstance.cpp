@@ -411,6 +411,32 @@ void ensureGpuAnalyses() noexcept {
            ((c == 'o' || c == 'O') && (d == 'n' || d == 'N'));
 }
 
+/// The lens OPENOSV_RENDER_ONLY_LENS names (0 or 1), a diagnostic for taking
+/// a stitched frame apart into its two lenses (buildEquirectJob); -1 when
+/// the variable is unset or holds anything else, so a stray value can never
+/// blank a lens for a user.  Read the same way as importerSwitchOn().
+[[nodiscard]] int diagnosticOnlyLens() noexcept {
+#if defined(_WIN32)
+    char value[8] = {};
+    std::size_t length = 0;
+    if (getenv_s(&length, value, sizeof(value), "OPENOSV_RENDER_ONLY_LENS") != 0 || length == 0) {
+        return -1;
+    }
+#else
+    const char* env = std::getenv("OPENOSV_RENDER_ONLY_LENS");
+    if (env == nullptr || env[0] == '\0') {
+        return -1;
+    }
+    char value[8] = {};
+    std::strncpy(value, env, sizeof(value) - 1);
+#endif
+    // Exactly one character, "0" or "1": "10", "01" and the like are no lens.
+    if (value[1] != '\0') {
+        return -1;
+    }
+    return value[0] == '0' ? 0 : value[0] == '1' ? 1 : -1;
+}
+
 /// @brief The clip's file name for a log line, UTF-8; "?" when it cannot be
 /// converted.  Never throws: path::string() converts through the ANSI code
 /// page and throws on a name it cannot map, which must not happen on a
@@ -1931,6 +1957,9 @@ void ImporterInstance::rebuildStabilization() {
     geom::AttitudeTrack::Options attOpt;
     const geom::AutoConvention detected = geom::ConventionProbe::autoDetect(m_track);
     detected.applyTo(attOpt);
+    // The mount's vibration stays out of the counter-rotation: the track is
+    // built from the 1 kHz IMU batches and low-passed (see the constant).
+    attOpt.vibrationCutoffHz = geom::kStabilisationVibrationCutoffHz;
     PluginLog::info("stabilisation: '{}': attitude reading {}: {}", m_path.filename().string(),
                     geom::attitudeConventionName(detected.conv), detected.reason);
 
@@ -1944,12 +1973,20 @@ void ImporterInstance::rebuildStabilization() {
     }
     m_attitude = std::move(built).value();
     m_referenceAttitude = m_attitude->worldFromBody(m_attitude->beginUs());
-
-    std::vector<Quatd> perFrame;
-    perFrame.reserve(m_attitude->samples().size());
-    for (const auto& s : m_attitude->samples()) {
-        perFrame.push_back(s.worldFromBody);
+    if (m_attitude->vibrationCutoffHz() > 0.0) {
+        PluginLog::info("stabilisation: '{}': {} IMU samples at {} Hz; rotation above {:.0f} Hz (the mount's "
+                        "vibration) is left in place, not counter-rotated",
+                        m_path.filename().string(), m_attitude->sampleCount(), m_track.clip().imuSamplingRate,
+                        m_attitude->vibrationCutoffHz());
+    } else {
+        PluginLog::info("stabilisation: '{}': one attitude sample per frame ({} frames); no IMU batches to tell a "
+                        "vibration from a shake",
+                        m_path.filename().string(), m_attitude->sampleCount());
     }
+
+    // One orientation per video frame for the smoothing window and the
+    // mount measurement, whatever the track's own sample density.
+    std::vector<Quatd> perFrame = m_attitude->perFrame(m_track);
     // How the rig is mounted, from the whole track: identity for a camera
     // held lenses-level (every Osmo 360 clip), a quarter turn for one flown
     // lens-up / lens-down (the Avata 360), whose heading would otherwise sit
@@ -4457,6 +4494,17 @@ Result<render::RenderJob> ImporterInstance::buildEquirectJob(std::uint32_t index
     // same routine device-resident frames, so both paths use - and fill -
     // one set of caches (see applyAnalyses).
     outcome = applyAnalyses(index, pair, draft, purpose, pool, builder);
+
+    // ---- diagnostic: one lens only -------------------------------------------
+    // OPENOSV_RENDER_ONLY_LENS=0 or =1 renders that lens alone, with every
+    // analysis, warp and levelling above exactly as the stitched frame gets
+    // them, so a stitched frame can be taken apart into what each lens
+    // contributed (which lens owns a pixel, and how far the two disagree
+    // there).  Read per frame so osvtool can set it per run; anything but
+    // "0" or "1" leaves both lenses on.
+    if (const int only = diagnosticOnlyLens(); only == 0 || only == 1) {
+        builder.lensEnabled(1 - only, false);
+    }
 
     // Levelled at the moment the pictures show: a frame served as the one
     // before an undecodable run takes that frame's attitude (shownFrameOf).

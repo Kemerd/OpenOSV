@@ -161,6 +161,55 @@ struct SectorScore {
     return out;
 }
 
+/// Per-sector mean |a - b| of two corrections' displacements (full disparity,
+/// degrees) over the pixels sectorScores judges: the rows within
+/// latHalfDeg, co-visible in the UNCORRECTED bands.  NaN for a sector with
+/// no such pixel.  Both displacements must be the band's size.
+[[nodiscard]] std::vector<double> sectorFieldDifferenceDeg(const LensBands& b, const CorrectionDisplacement& a,
+                                                           const CorrectionDisplacement& c,
+                                                           const SteadyDecisionParams& p) {
+    std::vector<double> out(p.sectors, std::numeric_limits<double>::quiet_NaN());
+    const std::size_t n = static_cast<std::size_t>(b.w) * b.h;
+    if (b.w == 0 || b.h == 0 || b.mapH == 0 || a.w != b.w || a.h != b.h || c.w != b.w || c.h != b.h ||
+        a.dx.size() != n || a.dy.size() != n || c.dx.size() != n || c.dy.size() != n || b.alpha[0].size() != n ||
+        b.alpha[1].size() != n) {
+        return out;
+    }
+    std::vector<double> sum(p.sectors, 0.0);
+    std::vector<double> count(p.sectors, 0.0);
+    const double radPerRow = kPi / static_cast<double>(b.mapH);
+    const double latLimit = deg2rad(p.latHalfDeg);
+    // Band pixels are square on the polar map (w columns round 360 deg, mapH
+    // rows over 180 deg, w = 2 mapH), so one conversion serves both axes.
+    const double degPerPx = 180.0 / static_cast<double>(b.mapH);
+    for (std::uint32_t r = 0; r < b.h; ++r) {
+        const double lat = kHalfPi - (static_cast<double>(b.rowOffset) + r + 0.5) * radPerRow;
+        if (std::fabs(lat) > latLimit) {
+            continue;
+        }
+        for (std::uint32_t col = 0; col < b.w; ++col) {
+            const std::size_t i = static_cast<std::size_t>(r) * b.w + col;
+            if (!(b.alpha[0][i] > 0.5f) || !(b.alpha[1][i] > 0.5f)) {
+                continue;
+            }
+            const double ddx = static_cast<double>(a.dx[i]) - static_cast<double>(c.dx[i]);
+            const double ddy = static_cast<double>(a.dy[i]) - static_cast<double>(c.dy[i]);
+            if (!std::isfinite(ddx) || !std::isfinite(ddy)) {
+                continue;
+            }
+            const std::size_t s = std::min<std::size_t>(static_cast<std::size_t>(col) * p.sectors / b.w, p.sectors - 1u);
+            sum[s] += std::hypot(ddx, ddy) * degPerPx;
+            count[s] += 1.0;
+        }
+    }
+    for (std::uint32_t s = 0; s < p.sectors; ++s) {
+        if (count[s] > 0.0) {
+            out[s] = sum[s] / count[s];
+        }
+    }
+    return out;
+}
+
 /// Whether a correction has anything in it.
 [[nodiscard]] bool hasCorrection(const SeamCorrection& c) noexcept {
     return (c.warp != nullptr && c.warp->valid()) || (c.seamShiftDeg != nullptr && !c.seamShiftDeg->empty());
@@ -666,10 +715,14 @@ Result<SteadyDecision> decideSteady(const std::vector<SteadySample>& samples, co
     // NCC losses live in [-2, 2]; the tolerated loss is a non-negative part of that.
     const bool lossOk = std::isfinite(params.maxFailedLoss) && params.maxFailedLoss >= 0.0 &&
                         params.maxFailedLoss <= 2.0;
+    // The field difference is a few degrees at most (the mesh clamps at 3
+    // deg of half disparity); 0 switches the geometric test off.
+    const bool fieldOk = std::isfinite(params.minFieldDiffDeg) && params.minFieldDiffDeg >= 0.0 &&
+                         params.minFieldDiffDeg <= 10.0;
     if (params.sectors == 0 || params.sectors > 4096 || !(params.latHalfDeg > 0.0) ||
         !std::isfinite(params.latHalfDeg) || !finite01(params.maxLoss) || !finite01(params.minStd) ||
         !(params.minOwnNcc >= -1.0 && params.minOwnNcc <= 1.0) || !finite01(params.minGain) ||
-        !finite01(params.minKeep) || !finite01(params.maxFailedFraction) || !lossOk) {
+        !finite01(params.minKeep) || !finite01(params.maxFailedFraction) || !lossOk || !fieldOk) {
         return Error{ErrorCode::InvalidArgument, "decideSteady: parameters out of range"};
     }
     SteadyDecision d;
@@ -696,6 +749,12 @@ Result<SteadyDecision> decideSteady(const std::vector<SteadySample>& samples, co
         const std::vector<SectorScore> none = sectorScores(*s.bands, params);
         const std::vector<SectorScore> own = sectorScores(*ownBands, params);
         const std::vector<SectorScore> held = sectorScores(*clipBands, params);
+        // ---- how differently the two corrections MOVE the picture, per sector -------
+        // Read on the uncorrected bands' co-visible pixels, so an NCC loss
+        // can be told apart from a geometric one (see the header).
+        OSV_TRY_ASSIGN(const CorrectionDisplacement ownMove, correctionDisplacement(*s.bands, s.own));
+        OSV_TRY_ASSIGN(const CorrectionDisplacement clipMove, correctionDisplacement(*s.bands, clip));
+        const std::vector<double> fieldDiff = sectorFieldDifferenceDeg(*s.bands, ownMove, clipMove, params);
 
         // ---- per sector ---------------------------------------------------------------
         for (std::uint32_t k = 0; k < params.sectors; ++k) {
@@ -709,6 +768,7 @@ Result<SteadyDecision> decideSteady(const std::vector<SteadySample>& samples, co
             rec.none = none[k].ncc;
             rec.own = own[k].ncc;
             rec.clip = held[k].ncc;
+            rec.fieldDiffDeg = fieldDiff[k];
             d.scores.push_back(rec);
             ++d.textured;
             const double loss = rec.own - rec.clip;
@@ -724,8 +784,18 @@ Result<SteadyDecision> decideSteady(const std::vector<SteadySample>& samples, co
             // The share of that alignment the clip correction keeps.
             const double keep = (rec.clip - rec.none) / gain;
             if (loss > params.maxLoss && keep < params.minKeep) {
-                ++d.failed;
-                d.worstFailedLoss = std::max(d.worstFailedLoss, loss);
+                // The NCC says the clip correction lost the alignment; it is
+                // a failure only where the two corrections move the picture
+                // differently.  A difference that could not be measured
+                // (NaN: no co-visible pixel) is taken as a real one.
+                const bool fieldsAgree = params.minFieldDiffDeg > 0.0 && std::isfinite(rec.fieldDiffDeg) &&
+                                         rec.fieldDiffDeg < params.minFieldDiffDeg;
+                if (fieldsAgree) {
+                    ++d.agreed;
+                } else {
+                    ++d.failed;
+                    d.worstFailedLoss = std::max(d.worstFailedLoss, loss);
+                }
             }
             if (keep < d.worstKeep) {
                 d.worstKeep = keep;
@@ -736,6 +806,7 @@ Result<SteadyDecision> decideSteady(const std::vector<SteadySample>& samples, co
                 d.worstNoneNcc = rec.none;
                 d.worstOwnNcc = rec.own;
                 d.worstClipNcc = rec.clip;
+                d.worstFieldDiffDeg = std::isfinite(rec.fieldDiffDeg) ? rec.fieldDiffDeg : 0.0;
             }
         }
     }
@@ -777,12 +848,16 @@ std::string describeSteadyDecision(const SteadyDecision& d) {
         d.failed > 0 ? std::format(" (largest failed loss {:.3f}{})", d.worstFailedLoss,
                                    d.steady ? ", within the tolerance" : "")
                      : std::string();
-    return std::format("{}: {} of {} judged sectors lose their alignment to the clip correction{}; the worst keeps "
+    // Sectors whose NCC loss was texture, not geometry (see the header).
+    const std::string agreed =
+        d.agreed > 0 ? std::format(", {} more lose it where both corrections move the picture alike", d.agreed)
+                     : std::string();
+    return std::format("{}: {} of {} judged sectors lose their alignment to the clip correction{}{}; the worst keeps "
                        "{:.0f}% of its own gain (frame {}, lon {:+.0f} deg, NCC none {:.3f} / own {:.3f} / clip "
-                       "{:.3f}); mean loss {:+.4f} over {} textured",
-                       d.steady ? "steady" : "follows scene", d.failed, d.judged, tolerance, 100.0 * d.worstKeep,
-                       d.worstFrame, d.worstLonDeg, d.worstNoneNcc, d.worstOwnNcc, d.worstClipNcc, d.meanLoss,
-                       d.textured);
+                       "{:.3f}, fields {:.2f} deg apart); mean loss {:+.4f} over {} textured",
+                       d.steady ? "steady" : "follows scene", d.failed, d.judged, tolerance, agreed,
+                       100.0 * d.worstKeep, d.worstFrame, d.worstLonDeg, d.worstNoneNcc, d.worstOwnNcc,
+                       d.worstClipNcc, d.worstFieldDiffDeg, d.meanLoss, d.textured);
 }
 
 // ---------------------------------------------------------------------------

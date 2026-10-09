@@ -306,6 +306,23 @@ struct BlendSeam {
 [[nodiscard]] Result<LensBands> correctBandsForSeam(const LensBands& bands, const SeamCorrection& correction,
                                                     ThreadPool* pool = nullptr);
 
+/// The displacement a correction applies at every band pixel: the FULL
+/// disparity it assumes between the lenses (master's sample minus slave's),
+/// in band pixels - `dx` along the columns, `dy` down the rows (positive =
+/// the master sampled further south, as the 1-D table's sign).  Read with
+/// the lookup correctBandsForSeam samples with (the kernel's own), so two
+/// corrections can be compared geometrically - what each really MOVES at
+/// a pixel - independently of the picture under them.  Zero everywhere
+/// for an empty correction.
+struct CorrectionDisplacement {
+    std::uint32_t w = 0;    ///< Band width (columns).
+    std::uint32_t h = 0;    ///< Band height (rows).
+    std::vector<float> dx;  ///< w x h, columns of full disparity.
+    std::vector<float> dy;  ///< w x h, rows of full disparity.
+};
+[[nodiscard]] Result<CorrectionDisplacement> correctionDisplacement(const LensBands& bands,
+                                                                    const SeamCorrection& correction);
+
 /// Carve the seam from UNCORRECTED bands (as renderLensBands /
 /// measureParallaxBands produce them) seen through `correction`.
 ///

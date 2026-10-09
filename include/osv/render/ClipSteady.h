@@ -84,6 +84,18 @@
 //     correction's gain.  A near object that moved past the seam fails (the
 //     median of the other samples has no parallax where it now is: the gain
 //     kept is ~0); a static one does not (the median carries it).
+//   * ... and only where the two corrections really DIFFER: the sector's
+//     mean |own - clip| displacement (correctionDisplacement, the full
+//     disparity each would render) is at least minFieldDiffDeg.  NCC is an
+//     in-sample score: a sample's own mesh is fitted to that frame's flow
+//     matches and then scored on the same frame, so wherever the flow
+//     locked on to something that is not a surface - the streaks of a
+//     spinning propeller, a reflection sliding over a chrome nacelle - the
+//     own correction "wins" by a wide NCC margin while moving the picture
+//     by no more than the clip correction does.  Such a sector is counted
+//     as agreed, not failed: holding the clip correction there changes
+//     nothing a viewer could see.  A near object that moved fails as
+//     before - its own field differs from the median by its parallax.
 //   * Steady when at most maxFailedFraction (5 %) of the judged sectors
 //     fail and none of them loses more than maxFailedLoss (0.10 NCC).
 //
@@ -295,6 +307,17 @@ struct SteadyDecisionParams {
     /// largest loss the keep test already passes on the sample clip (0.093
     /// at frame 32, the wing root, keeping 73 % of its gain), rounded up.
     double maxFailedLoss = 0.10;
+    /// A sector can fail only where the sample's own correction and the
+    /// clip correction differ by at least this much (mean full disparity
+    /// over the sector's judged pixels, degrees; see the header).  Two
+    /// mesh fields solved on different frames of a static scene differ by
+    /// their measurement noise - about a band pixel, 0.18 deg, the scale
+    /// the mesh's temporal term names (MeshWarp.h) - and by what the flow
+    /// made of texture that is not a surface: on the sample clip the
+    /// propeller sectors reach 0.32 deg (frame 32, lon +152).  Half a
+    /// degree sits above both and below a near object's parallax (0.7 deg
+    /// at 2 m, 1.4 deg at 1 m), which is what a moving one fails by.
+    double minFieldDiffDeg = 0.5;
 };
 
 /// One sample as the Auto rule sees it: its uncorrected bands (as
@@ -314,6 +337,10 @@ struct SteadySectorScore {
     double none = 0.0;         ///< NCC with no correction at all.
     double own = 0.0;          ///< NCC through the sample's own correction.
     double clip = 0.0;         ///< NCC through the clip correction.
+    /// Mean |own - clip| displacement over the sector's judged pixels (full
+    /// disparity, degrees): how differently the two corrections MOVE the
+    /// picture there, whatever the NCC says.
+    double fieldDiffDeg = 0.0;
 };
 
 /// The Auto rule's verdict.
@@ -322,7 +349,12 @@ struct SteadyDecision {
     std::uint32_t textured = 0;     ///< (sample, sector) pairs with the texture to score at all.
     std::uint32_t judged = 0;       ///< ... of which the own correction aligned something (judged).
     std::uint32_t failed = 0;       ///< ... of which the clip correction lost it (see the header).
+    /// ... and of which the clip correction lost the NCC but moves the
+    /// picture the same way (the fields differ by less than
+    /// minFieldDiffDeg): the own score was texture, not geometry.
+    std::uint32_t agreed = 0;
     double worstFailedLoss = 0.0;   ///< The largest NCC loss of a failed pair (0 when none failed).
+    double worstFieldDiffDeg = 0.0; ///< The field difference of the worst-keep pair (below).
     double meanLoss = 0.0;          ///< Mean NCC loss (own - clip) over the textured pairs.
     /// The judged pair that kept the least of its own correction's gain
     /// (1 when nothing was judged).

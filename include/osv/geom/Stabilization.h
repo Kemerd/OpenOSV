@@ -63,6 +63,25 @@ enum class StabilizationMode {
     return mode == StabilizationMode::Smooth || mode == StabilizationMode::SmoothLevel;
 }
 
+/// The vibration cutoff every stabilisation mode builds its attitude track
+/// with (AttitudeTrack::Options::vibrationCutoffHz), in Hz.
+///
+/// Stabilisation counter-rotates the view by the camera's measured
+/// rotation.  Rotation faster than this is VIBRATION, not a shake a viewer
+/// could see: on the airborne sample clip the camera buzzes with the engine
+/// at 22 / 44 / 89 / 134 Hz, 0.02-0.05 deg each, measured on the 1 kHz IMU
+/// batches.  One attitude sample per frame reads the 89 Hz line as a
+/// +-0.2 deg sign flip every frame (it aliases to 29.5 Hz at 59.94 fps), and
+/// counter-rotating that held the world still while the engine nacelle -
+/// bolted to the wing the camera is bolted to, so it shares every bit of the
+/// vibration - shook by a pixel against it.  Everything mounted with the
+/// camera shares its vibration; what a viewer wants steady is the mount.
+/// Below this cutoff the sample clip's rotation is under 1 deg/s rms: the
+/// real motion, which is what the modes remove.  Hand shake (under ~10 Hz)
+/// and vehicle motion are well inside it; a per-frame track (no IMU
+/// batches) is left as it is.
+inline constexpr double kStabilisationVibrationCutoffHz = 12.0;
+
 /// Parameters shared by every mode.
 struct StabilizationParams {
     StabilizationMode mode = StabilizationMode::Off;
