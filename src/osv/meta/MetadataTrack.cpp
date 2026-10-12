@@ -59,6 +59,14 @@ bool MetadataTrack::hasCalibration() const noexcept {
     return false;
 }
 
+std::string MetadataTrack::origin() const {
+    // Every string is the camera's own, possibly empty on a clip that has no
+    // ClipMeta at all; the quotes keep an empty one visible as such.
+    const ClipHeader& h = clip().header;
+    return std::format("proto '{}', product '{}', firmware '{}', read in the {} numbering", h.protoFileName,
+                       h.productName, h.firmware, djmdSchemaName(m_schema));
+}
+
 bool MetadataTrack::isPrimaryCandidate(const ProductMeta& product) noexcept {
     if (!product.clip.has_value() || !product.stream.has_value()) {
         return false;

@@ -6,6 +6,31 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-12
+
+An Avata 360 clip is known by its layout, not by one spelling of its name.
+
+### Fixed
+
+* **An Avata 360 clip could open as "no lens calibration" in OpenOSV Source
+  (#7).** The decoder knew an Avata 360 clip by one exact schema name, the
+  one the three recorded clips it was written against carried. A clip that
+  names its schema any other way (another firmware, another case) was read in
+  the Osmo 360 numbering, where the Avata 360's calibration slot is
+  `fov_type`, and the clip was refused as not a dual-fisheye OSV. The name is
+  now matched by its product token whatever its case, and it is no longer the
+  last word: when the numbering a clip's name gives finds no lens calibration
+  in its `StreamMeta`, every known schema is tried and the one under which
+  the `StreamMeta` carries a calibration is used for the whole clip, its
+  `ClipMeta` (focal length, sensor size) and every frame (attitude) included.
+  `osvtool probe` notes when the layout, not the name, chose the schema. A
+  `StreamMeta` that carries the calibration is also no longer displaced by a
+  later one that does not, on a clip that describes more than one stream.
+* **The "no lens calibration" message says what the clip did carry**: the
+  schema name it wrote, its product and firmware, the numbering it was read
+  in, and that `osvtool probe --raw` prints the rest. A report of that
+  message is now diagnosable on its own.
+
 ## [0.6.0] - 2026-10-08
 
 The stitch holds still. 0.5.x moved the seam correction to one mesh warp

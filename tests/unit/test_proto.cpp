@@ -600,7 +600,9 @@ Pb makeEmptyDewarp() {
 }
 
 /// A complete synthetic sample 0: ClipMeta + StreamMeta + FrameMeta.
-Pb makeProductMeta() {
+/// `extraStream`, when given, is written as a second StreamMeta after the
+/// first (a clip that describes more than one stream).
+Pb makeProductMeta(const Pb* extraStream = nullptr) {
     const Quaternion qs{0.0026615f, 0.0019091f, -0.7056412f, 0.7085618f, true};
     const Quaternion qm{0.7036960f, 0.7103991f, -0.0046943f, -0.0110939f, true};
 
@@ -679,11 +681,31 @@ Pb makeProductMeta() {
     frame.msg(4, Pb().msg(1, Pb().vint(1, 3).str(4, "Osmo OQ001").f32(5, 59.94f)));
 
     Pb product;
-    product.msg(1, clip).msg(2, stream).msg(3, frame);
+    product.msg(1, clip).msg(2, stream);
+    if (extraStream != nullptr) {
+        product.msg(2, *extraStream);
+    }
+    product.msg(3, frame);
     return product;
 }
 
 }  // namespace
+
+TEST_CASE("A StreamMeta with calibration is not displaced by a later one without", "[meta][proto]") {
+    // A second StreamMeta (an audio stream's, say) after the video's: proto3's
+    // last-wins would hand the clip an uncalibrated StreamMeta and the whole
+    // clip would open as "no lens calibration".
+    const Pb audio = Pb().msg(1, Pb().vint(1, 1).vint(2, 1).str(3, "audio"));
+    const Result<ProductMeta> decoded = DjmdDecoder::decode(makeProductMeta(&audio).span());
+    REQUIRE(decoded.ok());
+    const ProductMeta& p = decoded.value();
+    REQUIRE(p.warnings.empty());
+    REQUIRE(p.schema == DjmdSchema::Osmo360);
+    REQUIRE(p.stream.has_value());
+    REQUIRE(p.stream->name == "video");
+    REQUIRE(p.stream->dewarp.get(PanoDewarpParams::NativeRefineSlave) != nullptr);
+    REQUIRE(p.stream->dewarp.get(PanoDewarpParams::NativeRefineMaster) != nullptr);
+}
 
 TEST_CASE("DjmdDecoder decodes a synthetic ProductMeta", "[meta][proto]") {
     const Pb sample = makeProductMeta();
@@ -1094,19 +1116,72 @@ TEST_CASE("The Avata 360 schema: calibration, focal length, colour mode and atti
         REQUIRE(p.stream->colorMode == ColorMode::HLG);
         REQUIRE(p.stream->present.test(4));
     }
-    SECTION("Any other proto keeps the Osmo 360 numbering") {
-        // Same bytes, Osmo proto name: 2 is not an Osmo field, the empty 4
-        // reads as Normal, 5 is fov_type and 6 holds no calibration.
+    SECTION("A name nobody knows is read by the layout") {
+        // The Avata layout under a name the decoder has never seen (another
+        // firmware's spelling): read as an Osmo 360 there is no calibration,
+        // because 5 is fov_type; read as an Avata 360 there is, so the whole
+        // sample is read that way: calibration, colour mode, the ClipMeta's
+        // focal length and sensor size, the frame's attitude.  One warning
+        // says so, and nothing from the Osmo reading is left behind.
+        const ProductMeta p = decodeAll(makeAvataSample("dvtm_drone.proto", &dlogm));
+        REQUIRE(p.schema == DjmdSchema::Avata360);
+        REQUIRE(p.clip->header.protoFileName == "dvtm_drone.proto");
+        REQUIRE(p.stream->dewarp.get(PanoDewarpParams::NativeRefineSlave) != nullptr);
+        REQUIRE(p.stream->dewarp.get(PanoDewarpParams::NativeRefineMaster) != nullptr);
+        REQUIRE(p.stream->colorMode == ColorMode::DLogM);
+        REQUIRE(p.stream->extriLensMode == ExtriLensMode::LensGuards);
+        REQUIRE_THAT(p.clip->digitalFocalLength, WithinRel(1061.25f, 1e-6f));
+        REQUIRE(p.clip->sensorW == 3840);
+        REQUIRE(p.clip->imuSamplingRate == 1000);
+        REQUIRE(p.frame->camera.attitude.present);
+        REQUIRE(p.frame->imu.has_value());
+        REQUIRE(p.frame->imu->current.ts == 1234);
+        REQUIRE(p.warnings.size() == 1);
+        REQUIRE(p.warnings[0].find("Osmo 360 numbering") != std::string::npos);
+        REQUIRE(p.warnings[0].find("Avata 360 numbering") != std::string::npos);
+        REQUIRE(p.warnings[0].find("dvtm_drone.proto") != std::string::npos);
+    }
+    SECTION("Even the Osmo 360's own name does not override the layout") {
+        // The same bytes under the Osmo 360's name.  Before the layout check
+        // this read as an Osmo clip with no calibration, the IMU rate as the
+        // focal length and flat_res as the sensor size.
         const ProductMeta p = decodeAll(makeAvataSample(kOsmo360ProtoFile, &dlogm));
-        REQUIRE(p.schema == DjmdSchema::Osmo360);
-        REQUIRE(p.stream->colorMode == ColorMode::Normal);
-        REQUIRE(p.stream->present.test(4));
-        REQUIRE(p.stream->dewarp.get(PanoDewarpParams::NativeRefineSlave) == nullptr);
-        // Which is exactly how an Avata clip read before the schema existed:
-        // the IMU rate as the focal length, flat_res as the sensor size.
-        REQUIRE(p.clip->digitalFocalLength == 1000.0f);
-        REQUIRE(p.clip->sensorW == 7680);
-        REQUIRE_FALSE(p.frame->camera.attitude.present);
+        REQUIRE(p.schema == DjmdSchema::Avata360);
+        REQUIRE(p.stream->dewarp.get(PanoDewarpParams::NativeRefineSlave) != nullptr);
+        REQUIRE_THAT(p.clip->digitalFocalLength, WithinRel(1061.25f, 1e-6f));
+        REQUIRE(p.clip->sensorW == 3840);
+        REQUIRE(p.frame->camera.attitude.present);
+        REQUIRE(p.warnings.size() == 1);
+    }
+    SECTION("The Osmo 360 layout under an unknown name stays an Osmo 360") {
+        // makeProductMeta names "dvtm_test.proto", which nothing recognises:
+        // the Osmo numbering finds its calibration, so no other is tried and
+        // nothing is said.
+        const Result<ProductMeta> decoded = DjmdDecoder::decode(makeProductMeta().span());
+        REQUIRE(decoded.ok());
+        REQUIRE(decoded.value().schema == DjmdSchema::Osmo360);
+        REQUIRE(decoded.value().warnings.empty());
+        REQUIRE(decoded.value().stream->dewarp.get(PanoDewarpParams::NativeRefineSlave) != nullptr);
+    }
+    SECTION("A clip with no calibration in any numbering keeps the named reading") {
+        // An Avata-named sample whose StreamMeta holds no calibration at all:
+        // the Osmo reading is tried and finds none either, so the Avata
+        // reading stands, and the warning is the one about the colour mode
+        // only, not one about a schema.
+        Pb product;
+        Pb header;
+        header.str(1, kAvata360ProtoFile).str(10, "DJI Avata360");
+        product.msg(1, Pb().msg(1, header));
+        product.msg(2, Pb().msg(1, Pb().str(3, "video")).msg(3, Pb().vint(1, 3840).vint(2, 3840)));
+        const Result<ProductMeta> decoded = DjmdDecoder::decode(product.span());
+        REQUIRE(decoded.ok());
+        REQUIRE(decoded.value().schema == DjmdSchema::Avata360);
+        REQUIRE(decoded.value().stream.has_value());
+        REQUIRE(decoded.value().stream->name == "video");
+        for (const std::string& w : decoded.value().warnings) {
+            INFO(w);
+            REQUIRE(w.find("numbering") == std::string::npos);
+        }
     }
     SECTION("Frames without a ClipMeta are read in the schema they are given") {
         // Samples 1..N carry FrameMeta alone; MetadataTrack passes sample 0's
@@ -1127,7 +1202,14 @@ TEST_CASE("The Avata 360 schema: calibration, focal length, colour mode and atti
         REQUIRE(djmdSchemaForProto(kAvata360ProtoFile) == DjmdSchema::Avata360);
         REQUIRE(djmdSchemaForProto(kOsmo360ProtoFile) == DjmdSchema::Osmo360);
         REQUIRE(djmdSchemaForProto("") == DjmdSchema::Osmo360);
-        REQUIRE(djmdSchemaForProto("dvtm_avata360.proto") == DjmdSchema::Osmo360);  // exact names only
+        // The product's token, whatever its case or what surrounds it.
+        REQUIRE(djmdSchemaForProto("dvtm_avata360.proto") == DjmdSchema::Avata360);
+        REQUIRE(djmdSchemaForProto("DVTM_Avata360_v2.proto") == DjmdSchema::Avata360);
+        REQUIRE(djmdSchemaForProto("avata360") == DjmdSchema::Avata360);
+        // Anything else is the default, the Osmo 360: the layout check takes
+        // it from there.
+        REQUIRE(djmdSchemaForProto("dvtm_oq102.proto") == DjmdSchema::Osmo360);
+        REQUIRE(djmdSchemaForProto("dvtm_avata.proto") == DjmdSchema::Osmo360);
         REQUIRE(std::string(djmdSchemaName(DjmdSchema::Avata360)) == "Avata 360");
         REQUIRE(std::string(djmdSchemaName(static_cast<DjmdSchema>(200))) == "Unknown");
     }

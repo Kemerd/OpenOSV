@@ -66,6 +66,14 @@ Osmo 360 numbering above, so the typed structs and their `present` bits mean
 the same on every camera; frames after the first carry no header and are read
 in sample 0's schema. `osvtool probe` prints the schema used.
 
+The name is matched by its product token whatever its case
+(`dvtm_avata360.proto` is an Avata 360 too), and it is not the last word: when
+the numbering it gives finds no lens calibration in a `StreamMeta`, every known
+schema is tried and the one under which the `StreamMeta` carries a calibration
+is used for the whole sample, `ClipMeta` and frames included. A camera whose
+firmware spells its schema name some other way therefore still opens, and
+`osvtool probe` notes that the layout, not the name, chose the schema.
+
 The DJI Avata 360 (`dvtm_AVATA360.proto`), where it differs:
 
 | Avata 360 | Meaning | Osmo 360 |

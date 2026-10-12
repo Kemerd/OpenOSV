@@ -74,6 +74,12 @@ public:
     /// none); every later sample is decoded with it.
     [[nodiscard]] DjmdSchema schema() const noexcept { return m_schema; }
 
+    /// One line on where the metadata came from, for an error message that
+    /// has to be diagnosable from a bug report alone: the schema name the
+    /// clip wrote, its product and firmware, and the numbering it was read
+    /// with.  Never the serial number.
+    [[nodiscard]] std::string origin() const;
+
     /// The djmd track this object was loaded from.
     [[nodiscard]] std::uint32_t trackId() const noexcept { return m_trackId; }
 

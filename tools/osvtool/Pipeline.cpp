@@ -200,8 +200,13 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     for (const std::string& n : p->format.notes) {
         p->notes.push_back("format: " + n);
     }
+    // Say what the clip did carry: the schema it named and the one it was
+    // read in, so a report of this message is diagnosable on its own.
     if (!p->track.hasCalibration()) {
-        return Error{ErrorCode::Malformed, "clip carries no lens calibration (not a dual-fisheye OSV?)"};
+        return Error{ErrorCode::Malformed,
+                     std::format("clip carries no lens calibration (not a dual-fisheye OSV?); {}. "
+                                 "`osvtool probe --raw` shows what it holds",
+                                 p->track.origin())};
     }
 
     // ---- calibration set --------------------------------------------------------

@@ -332,6 +332,28 @@ constexpr FieldMap fieldMap(const std::uint8_t (&table)[N]) noexcept {
     return FieldMap{table, N};
 }
 
+/// Every schema the decoder can read, in the order the layout check tries
+/// them when a clip's name leads nowhere.
+constexpr DjmdSchema kKnownSchemas[] = {DjmdSchema::Osmo360, DjmdSchema::Avata360};
+
+/// True when `s` holds at least one calibrated slot: the same test
+/// MetadataTrack::hasCalibration makes, so "the schema under which the clip
+/// carries a calibration" means the same thing here and there.
+bool carriesCalibration(const StreamMeta& s) noexcept {
+    for (std::uint32_t slot = 1; slot < PanoDewarpParams::SlotCount; ++slot) {
+        const DewarpParams* rec = s.dewarp.get(slot);
+        if (rec && rec->hasCore()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The optional form: an absent StreamMeta carries nothing.
+bool carriesCalibration(const std::optional<StreamMeta>& s) noexcept {
+    return s.has_value() && carriesCalibration(*s);
+}
+
 /// The tables of `schema`.
 SchemaMaps schemaMaps(DjmdSchema schema) noexcept {
     switch (schema) {
@@ -405,12 +427,16 @@ Quaternion DjmdDecoder::decodeQuaternion(ByteSpan body, std::vector<std::string>
 //  ClipMeta
 // -----------------------------------------------------------------------------
 
-Result<ClipMeta> DjmdDecoder::decodeClipMeta(ByteSpan body, std::vector<std::string>* warnings) {
+Result<ClipMeta> DjmdDecoder::decodeClipMeta(ByteSpan body, std::vector<std::string>* warnings,
+                                             std::optional<DjmdSchema> schema) {
     ClipMeta clip;
     std::size_t decoded = 0;
     // The header (field 1 on every camera) names the schema, and the schema
-    // numbers every other field of this very message: read the name first.
-    const FieldMap map = schemaMaps(djmdSchemaForProto(clipProtoFileName(body))).clipMeta;
+    // numbers every other field of this very message: read the name first,
+    // unless the caller already knows better (decode() does once the layout
+    // has contradicted the name).
+    const DjmdSchema used = schema.has_value() ? *schema : djmdSchemaForProto(clipProtoFileName(body));
+    const FieldMap map = schemaMaps(used).clipMeta;
     const bool clean = scanMessage(body, "ClipMeta", warnings, [&](const ProtoField& raw) {
         const ProtoField f = canonicalField(raw, map);
         // Every known field lives in an embedded message; anything else with
@@ -934,14 +960,14 @@ Result<ProductMeta> DjmdDecoder::decode(ByteSpan sample, DjmdSchema schemaHint) 
     }
     ProductMeta product;
     product.schema = schemaHint;
-    std::size_t decoded = 0;
 
-    // ---- pass 1: ClipMeta, which names the schema ------------------------------
-    // StreamMeta and FrameMeta are numbered by the schema, and nothing obliges
-    // the camera to write ClipMeta first, so their bodies are only collected
-    // here (in order: proto3 keeps the last good occurrence) and decoded once
-    // the header has been read.  ProductMeta's own numbering (1 clip,
-    // 2 stream, 3 frame) is the same on every camera.
+    // ---- pass 1: collect the bodies ----------------------------------------------
+    // ClipMeta, StreamMeta and FrameMeta are all numbered by the schema, and
+    // nothing obliges the camera to write ClipMeta (whose header names the
+    // schema) first, so the bodies are only collected here, in order (proto3
+    // keeps the last good occurrence), and decoded below.  ProductMeta's own
+    // numbering (1 clip, 2 stream, 3 frame) is the same on every camera.
+    std::vector<ByteSpan> clipBodies;
     std::vector<ByteSpan> streamBodies;
     std::vector<ByteSpan> frameBodies;
     const bool clean = scanMessage(sample, "ProductMeta", &product.warnings, [&](const ProtoField& f) {
@@ -949,46 +975,114 @@ Result<ProductMeta> DjmdDecoder::decode(ByteSpan sample, DjmdSchema schemaHint) 
             return;
         }
         switch (f.number) {
-        case 1: {
-            auto clip = decodeClipMeta(f.bytes, &product.warnings);
-            if (clip.ok()) {
-                product.clip = std::move(clip).value();
-                ++decoded;
-            } else {
-                addWarning(&product.warnings, clip.error().toString());
-            }
-            break;
-        }
+        case 1: clipBodies.push_back(f.bytes); break;
         case 2: streamBodies.push_back(f.bytes); break;
         case 3: frameBodies.push_back(f.bytes); break;
         default: noteUnknown("ProductMeta", f); break;
         }
     });
-    // A sample that names its camera overrides the hint: sample 0 is where
-    // the hint comes from in the first place.
-    if (product.clip && !product.clip->header.protoFileName.empty()) {
-        product.schema = djmdSchemaForProto(product.clip->header.protoFileName);
+
+    // ---- pass 2: one reading of every body in one schema -------------------------
+    // A Reading is the sample as one numbering sees it.  Its warnings stay
+    // its own, so a reading that is thrown away below leaves no complaint
+    // about the wrong numbering behind in the product.
+    struct Reading {
+        DjmdSchema schema = DjmdSchema::Osmo360;  ///< The numbering the bodies were read with.
+        std::optional<ClipMeta> clip;
+        std::optional<StreamMeta> stream;
+        std::optional<FrameMeta> frame;
+        std::vector<std::string> warnings;
+        std::size_t decoded = 0;  ///< Messages that decoded.
+    };
+    // `forced` empty: ClipMeta reads by its own header's name, and that name
+    // (or the hint, when the sample carries no name) numbers the rest.
+    // `forced` set: everything reads in that schema, name or no name.
+    const auto read = [&](std::optional<DjmdSchema> forced) {
+        Reading r;
+        for (const ByteSpan body : clipBodies) {
+            auto clip = decodeClipMeta(body, &r.warnings, forced);
+            if (clip.ok()) {
+                r.clip = std::move(clip).value();
+                ++r.decoded;
+            } else {
+                addWarning(&r.warnings, clip.error().toString());
+            }
+        }
+        // A sample that names its camera overrides the hint: sample 0 is
+        // where the hint comes from in the first place.
+        r.schema = schemaHint;
+        if (forced.has_value()) {
+            r.schema = *forced;
+        } else if (r.clip && !r.clip->header.protoFileName.empty()) {
+            r.schema = djmdSchemaForProto(r.clip->header.protoFileName);
+        }
+        for (const ByteSpan body : streamBodies) {
+            auto stream = decodeStreamMeta(body, &r.warnings, r.schema);
+            if (!stream.ok()) {
+                addWarning(&r.warnings, stream.error().toString());
+                continue;
+            }
+            ++r.decoded;
+            // Among several StreamMeta bodies (a clip that describes more
+            // than one stream) one that carries the lens calibration is never
+            // displaced by a later one that does not; otherwise the last good
+            // one wins, proto3 style.
+            if (carriesCalibration(r.stream) && !carriesCalibration(stream.value())) {
+                continue;
+            }
+            r.stream = std::move(stream).value();
+        }
+        for (const ByteSpan body : frameBodies) {
+            auto frame = decodeFrameMeta(body, &r.warnings, r.schema);
+            if (frame.ok()) {
+                r.frame = std::move(frame).value();
+                ++r.decoded;
+            } else {
+                addWarning(&r.warnings, frame.error().toString());
+            }
+        }
+        return r;
+    };
+    Reading chosen = read(std::nullopt);
+
+    // ---- the layout check: a schema the name did not give away -------------------
+    // The name is one firmware's spelling.  A StreamMeta that carries no
+    // calibration in the numbering the name gave is read in every other
+    // known numbering, and the first under which it does carry one is the
+    // clip's real schema: a lens calibration (four positive intrinsics and a
+    // frame size, in 24 slots of 35 typed fields) does not come out of the
+    // wrong numbering by accident.  The whole sample is then re-read in that
+    // schema, ClipMeta and FrameMeta included, and the product says so.  A
+    // clip that carries no calibration in any numbering keeps the named
+    // reading, whose warnings describe what was found.
+    if (!streamBodies.empty() && !carriesCalibration(chosen.stream)) {
+        const std::string protoName = chosen.clip ? chosen.clip->header.protoFileName : std::string();
+        for (const DjmdSchema candidate : kKnownSchemas) {
+            if (candidate == chosen.schema) {
+                continue;
+            }
+            Reading trial = read(candidate);
+            if (!carriesCalibration(trial.stream)) {
+                continue;
+            }
+            addWarning(&trial.warnings,
+                       std::format("djmd: StreamMeta carries no lens calibration read in the {} numbering "
+                                   "(proto '{}'); it does in the {} numbering, so the clip is read as one",
+                                   djmdSchemaName(chosen.schema), protoName, djmdSchemaName(candidate)));
+            chosen = std::move(trial);
+            break;
+        }
     }
 
-    // ---- pass 2: StreamMeta and FrameMeta in the sample's schema ---------------
-    for (const ByteSpan body : streamBodies) {
-        auto stream = decodeStreamMeta(body, &product.warnings, product.schema);
-        if (stream.ok()) {
-            product.stream = std::move(stream).value();
-            ++decoded;
-        } else {
-            addWarning(&product.warnings, stream.error().toString());
-        }
+    // ---- the product is the chosen reading ---------------------------------------
+    product.schema = chosen.schema;
+    product.clip = std::move(chosen.clip);
+    product.stream = std::move(chosen.stream);
+    product.frame = std::move(chosen.frame);
+    for (std::string& w : chosen.warnings) {
+        product.warnings.push_back(std::move(w));
     }
-    for (const ByteSpan body : frameBodies) {
-        auto frame = decodeFrameMeta(body, &product.warnings, product.schema);
-        if (frame.ok()) {
-            product.frame = std::move(frame).value();
-            ++decoded;
-        } else {
-            addWarning(&product.warnings, frame.error().toString());
-        }
-    }
+    const std::size_t decoded = chosen.decoded;
     if (decoded == 0) {
         // Nothing usable: report the scan failure if there was one, otherwise
         // the sample simply held no known message.

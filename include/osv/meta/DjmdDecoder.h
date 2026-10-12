@@ -15,6 +15,7 @@
 #include "osv/core/Result.h"
 #include "osv/meta/Types.h"
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -30,14 +31,23 @@ public:
     /// alone) is read with `schemaHint`, which MetadataTrack takes from
     /// sample 0.  ProductMeta::schema records the one used.
     ///
+    /// The name is not the last word.  When the numbering it gives finds no
+    /// lens calibration in a sample that carries a StreamMeta, every known
+    /// schema is tried and the one under which the StreamMeta carries a
+    /// calibration is used for the whole sample, ClipMeta included, with a
+    /// warning that says so.  A camera whose firmware spells its schema name
+    /// some other way therefore still opens.
+    ///
     /// Returns InvalidArgument for an empty span and Malformed when the
     /// top-level scan produced nothing usable.
     [[nodiscard]] static Result<ProductMeta> decode(ByteSpan sample, DjmdSchema schemaHint = DjmdSchema::Osmo360);
 
     /// Decode a ClipMeta message body (field 1 payload of ProductMeta).  The
-    /// body's own header names the schema its other fields are read with.
-    /// `warnings` (optional) receives non-fatal problems.
-    [[nodiscard]] static Result<ClipMeta> decodeClipMeta(ByteSpan body, std::vector<std::string>* warnings = nullptr);
+    /// body's own header names the schema its other fields are read with,
+    /// unless `schema` forces one (decode() does, once the layout has shown
+    /// the name wrong).  `warnings` (optional) receives non-fatal problems.
+    [[nodiscard]] static Result<ClipMeta> decodeClipMeta(ByteSpan body, std::vector<std::string>* warnings = nullptr,
+                                                         std::optional<DjmdSchema> schema = std::nullopt);
 
     /// Decode a StreamMeta message body (field 2 payload), including all 24
     /// PanoDewarpParams slots, numbered as `schema` numbers it.

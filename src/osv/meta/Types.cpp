@@ -15,10 +15,47 @@ namespace osv::meta {
 //  Schemas
 // -----------------------------------------------------------------------------
 
+namespace {
+
+/// True when `text` holds `token` somewhere, compared ASCII case-folded.
+/// `token` must be lower case.  No allocation: the names are short and this
+/// runs once per clip.
+bool containsFolded(std::string_view text, std::string_view token) noexcept {
+    if (token.empty() || text.size() < token.size()) {
+        return false;
+    }
+    for (std::size_t start = 0; start + token.size() <= text.size(); ++start) {
+        std::size_t i = 0;
+        for (; i < token.size(); ++i) {
+            const unsigned char c = static_cast<unsigned char>(text[start + i]);
+            const unsigned char folded = static_cast<unsigned char>((c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c);
+            if (folded != static_cast<unsigned char>(token[i])) {
+                break;
+            }
+        }
+        if (i == token.size()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
 DjmdSchema djmdSchemaForProto(std::string_view protoFileName) noexcept {
-    // Exact match only: the name is what the camera writes into every clip,
-    // and a near miss is far more likely a new product than a typo.
+    // The exact names first: they are what every clip seen so far writes.
     if (protoFileName == kAvata360ProtoFile) {
+        return DjmdSchema::Avata360;
+    }
+    if (protoFileName == kOsmo360ProtoFile) {
+        return DjmdSchema::Osmo360;
+    }
+    // Then the product's token, whatever its case and whatever surrounds it
+    // ("dvtm_avata360.proto", "DVTM_Avata360_v2.proto"): a firmware that
+    // spells the name differently still numbers its fields the same way.
+    // The name is only the first word on the schema anyway - when it leads
+    // nowhere, DjmdDecoder reads the clip by its layout.
+    if (containsFolded(protoFileName, "avata360")) {
         return DjmdSchema::Avata360;
     }
     return DjmdSchema::Osmo360;
