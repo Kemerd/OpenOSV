@@ -626,12 +626,12 @@ Status ImporterInstance::parseOnce() {
     // importer can claim, so the dispatcher must hand it back with imBadFile.
     // The message has to carry enough for a bug report to be diagnosable
     // without the clip: which schema the clip named and which it was read
-    // in, and how to get the rest (`osvtool probe --raw` prints every field
-    // the clip holds, numbered as the camera wrote it).
+    // in, and how to get the rest (`osvtool probe --report` prints every
+    // field the clip holds, numbered as the camera wrote it, and more).
     if (!m_track.hasCalibration()) {
         return Error{ErrorCode::Malformed,
                      std::format("clip carries no lens calibration (not a dual-fisheye OSV); {}. "
-                                 "`osvtool probe --raw` on the clip shows what it holds",
+                                 "`osvtool probe --report` on the clip shows what it holds",
                                  m_track.origin())};
     }
 

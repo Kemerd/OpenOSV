@@ -52,6 +52,9 @@
 #include "osv/container/OsvFile.h"
 #include "osv/core/ByteReader.h"
 #include "osv/core/Log.h"
+#include "osv/geom/AttitudeTrack.h"
+#include "osv/geom/ConventionProbe.h"
+#include "osv/geom/Stabilization.h"
 #include "osv/meta/CalibrationSelector.h"
 #include "osv/meta/DjmdDecoder.h"
 #include "osv/meta/FormatDetector.h"
@@ -304,6 +307,182 @@ void addStableKeys(json& doc, const osv::MovieInfo& movie, const osv::meta::Form
     doc["isLrf"] = (format && format->sideBySideProxy) || ext == ".lrf";
 }
 
+/// One line on what a populated lens record holds and what, if anything,
+/// keeps it from being a calibration: which of fx / fy / cx / cy are missing
+/// or not positive, whether the frame size is there, where the extrinsic
+/// came from (written, the 4-float copy, built from the Euler angles) or
+/// that there is none, and the Euler angles themselves.  "partial" on its
+/// own told nobody what to look at.
+std::string describeRecord(const osv::meta::DewarpParams& d) {
+    std::string out;
+    // ---- intrinsics --------------------------------------------------------------
+    std::string missing;
+    const struct { const char* name; float v; } core[] = {{"fx", d.fx}, {"fy", d.fy}, {"cx", d.cx}, {"cy", d.cy}};
+    for (const auto& c : core) {
+        if (!std::isfinite(c.v) || c.v <= 0.0f) {
+            missing += missing.empty() ? "" : "/";
+            missing += c.name;
+        }
+    }
+    if (missing.empty()) {
+        char buf[96] = {};
+        std::snprintf(buf, sizeof(buf), "f=(%.3f, %.3f) c=(%.3f, %.3f)", static_cast<double>(d.fx),
+                      static_cast<double>(d.fy), static_cast<double>(d.cx), static_cast<double>(d.cy));
+        out += buf;
+    } else {
+        out += "NO INTRINSICS (" + missing + " missing or zero)";
+    }
+    // ---- frame size --------------------------------------------------------------
+    if (d.width != 0 && d.height != 0) {
+        out += " " + std::to_string(d.width) + "x" + std::to_string(d.height);
+    } else {
+        out += " NO SIZE (width/height 0)";
+    }
+    // ---- the extrinsic and where it came from --------------------------------------
+    bool copyUsable = d.q.size() == 4;
+    if (copyUsable) {
+        float norm2 = 0.0f;
+        for (const float v : d.q) {
+            copyUsable = copyUsable && std::isfinite(v);
+            norm2 += v * v;
+        }
+        copyUsable = copyUsable && norm2 >= 1e-6f;
+    }
+    if (d.camExtriQ.present) {
+        char buf[128] = {};
+        std::snprintf(buf, sizeof(buf), " q=(%.5f, %.5f, %.5f, %.5f) %s", static_cast<double>(d.camExtriQ.w),
+                      static_cast<double>(d.camExtriQ.x), static_cast<double>(d.camExtriQ.y),
+                      static_cast<double>(d.camExtriQ.z),
+                      d.camExtriQFromEuler ? "BUILT FROM EULER (no cam_extri_q written)" : "written (cam_extri_q)");
+        out += buf;
+    } else if (copyUsable) {
+        char buf[96] = {};
+        std::snprintf(buf, sizeof(buf), " q=(%.5f, %.5f, %.5f, %.5f) from the 4-float copy (field 21)",
+                      static_cast<double>(d.q[0]), static_cast<double>(d.q[1]), static_cast<double>(d.q[2]),
+                      static_cast<double>(d.q[3]));
+        out += buf;
+    } else {
+        out += " NO EXTRINSIC (no cam_extri_q, field 21 ";
+        out += d.q.empty() ? "absent" : (d.q.size() == 4 ? "all zero" : std::to_string(d.q.size()) + " floats");
+        out += ")";
+    }
+    if (d.present.test(12) || d.present.test(13) || d.present.test(14)) {
+        char buf[96] = {};
+        std::snprintf(buf, sizeof(buf), " euler y/p/r=(%.3f, %.3f, %.3f)", static_cast<double>(d.yaw),
+                      static_cast<double>(d.pitch), static_cast<double>(d.roll));
+        out += buf;
+    } else {
+        out += " no euler";
+    }
+    // ---- the fields the camera wrote, by number ---------------------------------------
+    std::string fields;
+    for (std::size_t i = 1; i < d.present.size(); ++i) {
+        if (d.present.test(i)) {
+            fields += fields.empty() ? "" : ",";
+            fields += std::to_string(i);
+        }
+    }
+    out += " fields[" + fields + "]";
+    out += d.hasCore() ? " -> usable" : " -> NOT USABLE";
+    return out;
+}
+
+/// The attitude the clip carries and what OpenOSV does with it: which
+/// sources every frame has (per-frame camera_attitude / camera_acc, the IMU
+/// batch), the first frame's values from each, the reading `auto` would
+/// build the track with and whether that reading has been verified on this
+/// product, and the frame the view is placed in meanwhile.  The next report
+/// of a wrong horizon starts from these lines.
+void describeAttitude(const osv::meta::MetadataTrack& track, json& doc) {
+    using namespace osv;
+    using namespace osv::meta;
+    using namespace osv::geom;
+    const std::uint32_t frameCount = track.frameCount();
+    std::uint32_t withAttitude = 0;
+    std::uint32_t withAcc = 0;
+    std::uint32_t withBatch = 0;
+    std::uint64_t batchSamples = 0;
+    std::uint32_t decoded = 0;
+    std::optional<FrameMeta> first;
+    for (std::uint32_t i = 0; i < frameCount; ++i) {
+        const Result<FrameMeta> f = track.frame(i);
+        if (!f.ok()) {
+            continue;
+        }
+        ++decoded;
+        const FrameMeta& m = f.value();
+        withAttitude += m.camera.attitude.present ? 1 : 0;
+        withAcc += m.camera.accPresent ? 1 : 0;
+        if (m.imu.has_value() && m.imu->current.present && !m.imu->current.q.empty()) {
+            ++withBatch;
+            batchSamples += m.imu->current.q.size();
+        }
+        if (!first) {
+            first = m;
+        }
+    }
+    json a;
+    a["framesDecoded"] = decoded;
+    a["framesWithCameraAttitude"] = withAttitude;
+    a["framesWithCameraAcc"] = withAcc;
+    a["framesWithImuBatch"] = withBatch;
+    a["imuBatchSamples"] = batchSamples;
+    a["imuSamplingRate"] = track.clip().imuSamplingRate;
+    std::printf("attitude: %u frames decoded: camera_attitude on %u, camera_acc on %u, IMU batch on %u (%llu samples, "
+                "%u Hz)\n",
+                decoded, withAttitude, withAcc, withBatch, static_cast<unsigned long long>(batchSamples),
+                track.clip().imuSamplingRate);
+    if (first) {
+        const CameraFrame& c = first->camera;
+        if (c.attitude.present) {
+            std::printf("  frame 0 camera_attitude (w,x,y,z) = (%.6f, %.6f, %.6f, %.6f)\n", static_cast<double>(c.attitude.w),
+                        static_cast<double>(c.attitude.x), static_cast<double>(c.attitude.y),
+                        static_cast<double>(c.attitude.z));
+        }
+        if (c.accPresent) {
+            std::printf("  frame 0 camera_acc = (%.4f, %.4f, %.4f)\n", static_cast<double>(c.acc.x),
+                        static_cast<double>(c.acc.y), static_cast<double>(c.acc.z));
+        }
+        if (first->imu.has_value() && first->imu->current.present && !first->imu->current.q.empty()) {
+            const ImuBatch& b = first->imu->current;
+            const Quaternion& q0 = b.q.front();
+            const Quaternion& qn = b.q.back();
+            std::printf("  frame 0 IMU batch: ts %u, vsync %u, %u samples, first (w,x,y,z) = (%.6f, %.6f, %.6f, %.6f), "
+                        "last = (%.6f, %.6f, %.6f, %.6f)\n",
+                        b.ts, b.vsync, static_cast<unsigned>(b.q.size()), static_cast<double>(q0.w),
+                        static_cast<double>(q0.x), static_cast<double>(q0.y), static_cast<double>(q0.z),
+                        static_cast<double>(qn.w), static_cast<double>(qn.x), static_cast<double>(qn.y),
+                        static_cast<double>(qn.z));
+        }
+    }
+    // ---- the reading and what is done with it -----------------------------------------
+    const AutoConvention detected = ConventionProbe::autoDetect(track);
+    const bool verified = attitudeReadingVerified(track.schema());
+    const Mat3d mount = productMount(track.schema());
+    a["autoReading"] = attitudeConventionName(detected.conv);
+    a["autoReason"] = safe(detected.reason);
+    a["readingVerified"] = verified;
+    a["productMount"] = json::array({mount.m[0], mount.m[1], mount.m[2], mount.m[3], mount.m[4], mount.m[5],
+                                     mount.m[6], mount.m[7], mount.m[8]});
+    std::printf("  auto reading: %s; %s\n", attitudeConventionName(detected.conv).c_str(), safe(detected.reason).c_str());
+    const Vec3d right = mount.col(0);
+    const Vec3d forward = mount.col(1);
+    const Vec3d up = mount.col(2);
+    std::printf("  product frame (body axes right, forward, up): (%+.0f,%+.0f,%+.0f) (%+.0f,%+.0f,%+.0f) "
+                "(%+.0f,%+.0f,%+.0f)%s\n",
+                right.x, right.y, right.z, forward.x, forward.y, forward.z, up.x, up.y, up.z,
+                mount.distance(Mat3d::identity()) == 0.0 ? " = the body itself" : "");
+    if (verified) {
+        std::printf("  the %s reading is verified on footage: the plug-ins stabilise and level with it\n",
+                    djmdSchemaName(track.schema()));
+    } else {
+        std::printf("  the %s reading is NOT verified on footage: the plug-ins leave stabilisation off and place the "
+                    "view in the product frame; `osvtool render --attitude-convention <reading>` tries one\n",
+                    djmdSchemaName(track.schema()));
+    }
+    doc["attitude"] = a;
+}
+
 /// Print one schema-less tree node and its children, one line each, as
 /// `field: value` under two spaces of indent per level.  A fixed32 shows
 /// both readings (float and unsigned), a varint its unsigned value and, when
@@ -390,6 +569,7 @@ struct ProbeOptions {
     std::string coversDir;      ///< --covers: directory for the JPEG cover images.
     bool raw = false;           ///< --raw: include schema-less protobuf trees.
     bool imu = false;           ///< --imu: include the full IMU quaternion lists.
+    bool report = false;        ///< --report: everything, plus the JSON beside the clip.
 };
 
 /// Parse the --frames selector into a sorted list of indices bounded by
@@ -643,7 +823,24 @@ void describeCalibrationSets(const osv::meta::StreamMeta& s, json& calibration) 
 }
 
 /// Run the command; returns one of the kExit* codes.
-int runProbe(const ProbeOptions& opt) {
+int runProbe(ProbeOptions opt) {
+    // --report is the one-flag form for a bug report: the tree, every IMU
+    // sample of the selected frames, and the JSON document written beside
+    // the clip (or into the working directory when that fails) so it can be
+    // attached as a file.  An explicit --json still wins.
+    if (opt.report) {
+        opt.raw = true;
+        opt.imu = true;
+        if (opt.jsonPath.empty()) {
+            const std::filesystem::path clip(opt.inputPath);
+            std::filesystem::path beside = clip;
+            beside += ".probe.json";
+            std::error_code ec;
+            const bool writable = !clip.has_parent_path() ||
+                                  (std::filesystem::is_directory(clip.parent_path(), ec) && !ec);
+            opt.jsonPath = (writable ? beside : std::filesystem::path(clip.filename()) += ".probe.json").string();
+        }
+    }
     using namespace osv;
     using namespace osv::meta;
 
@@ -847,6 +1044,12 @@ int runProbe(const ProbeOptions& opt) {
                 }
             }
             std::printf("  calibration slots: %s\n", slots.empty() ? "(none)" : slots.c_str());
+            // What each populated record holds, so "partial" names the field.
+            for (std::uint32_t slot = 1; slot < PanoDewarpParams::SlotCount; ++slot) {
+                if (const DewarpParams* rec = s.dewarp.get(slot)) {
+                    std::printf("    %2u %-24s %s\n", slot, PanoDewarpParams::fieldName(slot), describeRecord(*rec).c_str());
+                }
+            }
 
             std::vector<std::string> calWarnings;
             Result<CalibrationSet> selected = CalibrationSelector::select(s, {}, &calWarnings);
@@ -894,6 +1097,8 @@ int runProbe(const ProbeOptions& opt) {
                                     {"fromFallback", order.value().fromFallback},
                                     {"source", safe(order.value().source)}};
         }
+        // The attitude: sources, first values, the reading and its standing.
+        describeAttitude(*meta, doc);
     }
 
     // ---- frames --------------------------------------------------------------------------
@@ -1026,6 +1231,11 @@ int runProbe(const ProbeOptions& opt) {
         }
         std::printf("wrote %s\n", safe(opt.jsonPath).c_str());
     }
+    if (opt.report) {
+        std::printf("report: paste everything above and attach %s; the plug-in log is in %%LOCALAPPDATA%%\\OpenOSV\\ "
+                    "(Premiere, Resolve and VEGAS each write their own)\n",
+                    safe(opt.jsonPath).c_str());
+    }
     return kExitOk;
 }
 
@@ -1043,6 +1253,9 @@ void registerProbeCommand(CLI::App& app, CommandContext& ctx) {
                   "Print the schema-less protobuf tree of sample 0 (every field as the camera wrote it) and "
                   "include the selected samples' trees in --json");
     sub->add_flag("--imu", opt->imu, "Include every IMU quaternion of the selected frames");
+    sub->add_flag("--report", opt->report,
+                  "Everything a bug report needs: --raw, --imu and the JSON written beside the clip "
+                  "(<clip>.probe.json); paste the console output and attach the file");
     // The callback runs during parse; the exit code lands in the context.
     sub->callback([opt, &ctx]() { ctx.exitCode = runProbe(*opt); });
 }

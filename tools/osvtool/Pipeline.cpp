@@ -205,7 +205,7 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     if (!p->track.hasCalibration()) {
         return Error{ErrorCode::Malformed,
                      std::format("clip carries no lens calibration (not a dual-fisheye OSV?); {}. "
-                                 "`osvtool probe --raw` shows what it holds",
+                                 "`osvtool probe --report` shows what it holds",
                                  p->track.origin())};
     }
 

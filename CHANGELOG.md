@@ -35,9 +35,17 @@ The Avata 360's lens calibration is read as the aircraft writes it.
   `osvtool --attitude-convention <reading>` still builds the track for anyone
   with footage to verify one. The lens-down levelling frame
   (`levellingMount`) faces the nose too, where it faced the tail.
-* **`osvtool probe --raw` prints the tree.** It printed only a node count and
-  put the tree in `--json`; the message that points people at it promised
-  more. Every field of sample 0 now prints as the camera wrote it.
+* **`osvtool probe` reports enough for the next round.** `--raw` printed only
+  a node count and put the tree in `--json`; every field of sample 0 now
+  prints as the camera wrote it. Each populated calibration record gets a
+  line saying what it holds and what keeps it from being usable (which
+  intrinsics are missing, no size, no extrinsic, or one built from the Euler
+  angles), where "partial" named nothing. A new `attitude` section counts the
+  sources every frame carries (per-frame attitude, acceleration, the IMU
+  batch), prints the first frame's values, the reading `auto` would use and
+  whether it is verified on the product, and the frame the view is placed
+  in. `--report` turns all of it on and writes the JSON beside the clip. The
+  "no lens calibration" message now points at `--report`.
 
 ## [0.6.1] - 2026-10-12
 
