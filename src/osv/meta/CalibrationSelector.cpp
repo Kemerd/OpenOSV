@@ -157,6 +157,17 @@ std::optional<CalibrationSet> nativePair(const StreamMeta& stream, bool preferRe
                                    P::fieldName(secondS), P::fieldName(secondM)));
         return pair;
     }
+    // The Avata 360 writes its lens records in native_refine_far (3/4) and
+    // leaves native_refine (1/2) with a few fields and no intrinsics, while
+    // native (11/12) is a placeholder.  DJI's own tools fall back per lens
+    // through native_refine_far (FORMAT.md), so it is the last native resort
+    // here too; the Osmo 360 never reaches it (its 3/4 are placeholders).
+    if (auto pair = CalibrationSelector::pairFromSlots(stream, P::NativeRefineFarSlave, P::NativeRefineFarMaster)) {
+        note(warnings, std::format("native pairs {}/{} and {}/{} unusable; using {}/{}", P::fieldName(firstS),
+                                   P::fieldName(firstM), P::fieldName(secondS), P::fieldName(secondM),
+                                   pair->sourceSlave, pair->sourceMaster));
+        return pair;
+    }
     return std::nullopt;
 }
 
@@ -453,6 +464,9 @@ CalibrationInventory CalibrationSelector::inventory(const StreamMeta& stream) {
         inv.nativeReference = CalibrationSetId::NativeRefine;
     } else if (inv.usable(CalibrationSetId::Native)) {
         inv.nativeReference = CalibrationSetId::Native;
+    } else if (inv.usable(CalibrationSetId::NativeRefineFar)) {
+        // The Avata 360's only native set (what select() stitches with).
+        inv.nativeReference = CalibrationSetId::NativeRefineFar;
     }
     if (!inv.nativeReference) {
         return inv;  // Nothing to compare against.

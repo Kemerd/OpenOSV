@@ -12,7 +12,8 @@
 // The renderer computes  d_body = C * R_cam * d_pixel  where R_cam is
 // VirtualCamera::rotation() and C is the matrix returned by
 // stabilizationBodyFromWorld().  Per mode:
-//   Off         : C = I (the view is glued to the body).
+//   Off         : C = the product's mount (productMount(); I on the Osmo
+//                 360): the view is glued to the body, in its levelling frame.
 //   Full        : the view is glued to the reference body pose:
 //                 C = R_wb^T * R_ref  (R_wb = worldFromBody now, R_ref = worldFromBody at the reference).
 //   HorizonLock : the view keeps the body's yaw about world-up but pitch and
@@ -31,6 +32,7 @@
 #pragma once
 
 #include "osv/core/Math.h"
+#include "osv/meta/Types.h"
 
 #include <cstddef>
 #include <optional>
@@ -108,11 +110,36 @@ struct StabilizationParams {
 ///
 /// Returns the identity when the mean |cos| between the body's +Y and up is
 /// at most cos(45 deg) over the samples (and for no usable sample at all).
-/// Otherwise it returns the quarter turn about the body's +X that makes the
-/// body's horizontal +/-Z axis the levelling frame's forward and whichever of
-/// +/-Y points up on average its up; as a matrix, its columns are those body
+/// Otherwise it returns the frame whose forward is the body's -Z and whose
+/// up is whichever of +/-Y points up on average: with +Y up the quarter turn
+/// about +X (right +X, forward -Z, up +Y); with +Y down - the Avata 360,
+/// whose master lens looks at the ground - that frame turned half a turn
+/// about the vertical (right -X, forward -Z, up -Y), so the view faces the
+/// aircraft's nose, which is its -Z (measured against DJI Studio's default
+/// view on a recorded clip).  As a matrix, the columns are those body
 /// directions (right, forward, up).  It is a proper rotation either way.
 [[nodiscard]] Mat3d levellingMount(const std::vector<Quatd>& worldFromBody, const Vec3d& worldUp) noexcept;
+
+/// The levelling frame a product is known to be held or flown in before any
+/// attitude is read: what levellingMount() measures on its clips, as a
+/// matrix of the same shape (columns right, forward, up in the body).  The
+/// identity for the Osmo 360, held with its lenses level.  For the Avata
+/// 360, flown with the master lens (+Y) down and the nose at -Z, the
+/// (-X, -Z, -Y) frame, so that even with no attitude the view faces forward
+/// with the sky up instead of into the ground through the master lens.  It
+/// is StabilizationParams::mount until a track replaces it, and the
+/// correction stabilisation Off applies.
+[[nodiscard]] Mat3d productMount(meta::DjmdSchema schema) noexcept;
+
+/// True when the default AttitudeConvention has been verified against
+/// recorded footage of this product, so a track built from its stored
+/// attitude levels the world.  The Osmo 360's reading is.  The Avata 360's
+/// is not: on the one clip measured against DJI Studio's output the default
+/// reading put up 141 deg from the true up and no component order or sign
+/// came within 36 deg, so a levelled view of it would be upside down and
+/// tilted.  Callers leave stabilisation off, with the product mount, for a
+/// product whose reading is unverified.
+[[nodiscard]] bool attitudeReadingVerified(meta::DjmdSchema schema) noexcept;
 
 /// Quaternion logarithm: rotation vector (axis * angle) of a unit quaternion.
 [[nodiscard]] Vec3d quatLog(const Quatd& q) noexcept;

@@ -6,6 +6,39 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-10-13
+
+The Avata 360's lens calibration is read as the aircraft writes it.
+
+### Fixed
+
+* **An Avata 360 clip was refused as "no lens calibration" in OpenOSV Source
+  (#7), with the schema read correctly.** 0.6.1's fix was aimed at the schema
+  name; the reporter's probe showed the name was right and the records were
+  not: the Avata 360 writes each lens's extrinsic as Euler angles only (no
+  `cam_extri_q`, four zeros in its copy), so every record failed the
+  calibration test, and it keeps its lens records in `native_refine_far`
+  (3/4) with nothing usable in `native_refine` (1/2). The decoder now builds
+  the quaternion from the angles by the relation the Osmo 360's own records
+  follow (verified on every populated slot of the sample clip to better than
+  0.03 degrees; a written quaternion is never replaced), and the native
+  choice falls back through `native_refine_far`, DJI's own order. The clip
+  opens and stitches; `osvtool probe` says where the extrinsics came from and
+  compares the other sets against the set in use.
+* **An Avata 360 clip no longer opens looking at the ground, or levelled
+  upside down.** Its master lens looks down and its nose is the body's -Z
+  (measured against DJI Studio's view of a recorded clip), so the view is
+  placed in that frame before any attitude is read: forward, sky up. Its
+  stored attitude has no verified reading yet (the default one puts up 141
+  degrees from the true up on the clip measured), so stabilisation is left off
+  on it with a log line, instead of levelling by a reading that is wrong.
+  `osvtool --attitude-convention <reading>` still builds the track for anyone
+  with footage to verify one. The lens-down levelling frame
+  (`levellingMount`) faces the nose too, where it faced the tail.
+* **`osvtool probe --raw` prints the tree.** It printed only a node count and
+  put the tree in `--json`; the message that points people at it promised
+  more. Every field of sample 0 now prints as the camera wrote it.
+
 ## [0.6.1] - 2026-10-12
 
 An Avata 360 clip is known by its layout, not by one spelling of its name.

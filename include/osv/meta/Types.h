@@ -132,6 +132,10 @@ struct DewarpParams {
     Quaternion camImuExtriQ;            ///< 26 camera->IMU quaternion (absent on Osmo 360)
     std::vector<float> tangentCoeff;    ///< 27 tangential coefficients (duplicate of p)
     Quaternion camExtriQ;               ///< 28 body->lens quaternion (w,x,y,z)
+    /// True when field 28 was not in the record and camExtriQ was built from
+    /// the Euler fields 12 / 13 / 14 (DjmdDecoder::decodeDewarp).  The Avata
+    /// 360 writes its lens extrinsic only that way.
+    bool camExtriQFromEuler = false;
     bool camImuCaliEnable = false;      ///< 29
     bool tempCompenEnable = false;      ///< 30
     float tempCompenK = 0.0f;           ///< 31

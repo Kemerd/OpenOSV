@@ -1949,10 +1949,28 @@ void ImporterInstance::rebuildStabilization() {
     m_stabBuilt = true;
     m_stabParams = geom::StabilizationParams{};
     m_stabParams.mode = toStabMode(m_prefs.stab());
+    // The product's own levelling frame until an attitude track measures
+    // one: the identity on the Osmo 360; on the Avata 360, whose master lens
+    // looks at the ground, the nose-forward sky-up frame.  It is the whole
+    // correction while stabilisation is off (stabilizationFor).
+    m_stabParams.mount = geom::productMount(m_track.schema());
     m_attitude.reset();
     m_smoothedAttitude.clear();
 
     if (m_stabParams.mode == geom::StabilizationMode::Off) {
+        return;
+    }
+    // A product whose stored attitude has no verified reading is not
+    // levelled by it: on the Avata 360 the default reading puts up 141 deg
+    // from the true up (measured against DJI Studio's output), and a view
+    // levelled by that is upside down.  The product mount keeps the view
+    // facing forward and the sky up instead.
+    if (!geom::attitudeReadingVerified(m_track.schema())) {
+        PluginLog::oncef("stab-unverified-attitude", PluginLog::Level::Warn,
+                         "stabilisation: '{}': the {} attitude reading is unverified on footage; stabilisation "
+                         "disabled, the view faces the product's forward with the sky up",
+                         m_path.filename().string(), meta::djmdSchemaName(m_track.schema()));
+        m_stabParams.mode = geom::StabilizationMode::Off;
         return;
     }
 
@@ -2044,8 +2062,10 @@ void ImporterInstance::rebuildStabilization() {
 }
 
 Mat3d ImporterInstance::stabilizationFor(std::uint32_t frameIndex) const {
+    // No attitude correction: the view is glued to the body in its product
+    // mount (the identity on the Osmo 360, so nothing changes there).
     if (!m_attitude || m_stabParams.mode == geom::StabilizationMode::Off) {
-        return Mat3d::identity();
+        return m_stabParams.mount;
     }
     // Prefer the metadata track's own timestamp for the frame; fall back to
     // nominal spacing from the start of the attitude track.
@@ -3418,6 +3438,10 @@ std::optional<SceneLightRequest> ImporterInstance::sceneRequestLocked() {
         // ---- gravity-up per frame: the stabilisation's attitude, or one of our own --------
         const geom::AttitudeTrack* attitude = m_attitude ? &*m_attitude : nullptr;
         if (!attitude) {
+            // An unverified reading levels nothing, the sky included.
+            if (!geom::attitudeReadingVerified(m_track.schema())) {
+                return std::nullopt;
+            }
             if (!m_sceneAttitude) {
                 // The same reading the stabilisation would use (the stored
                 // attitude), built once for a clip rendered with it off.

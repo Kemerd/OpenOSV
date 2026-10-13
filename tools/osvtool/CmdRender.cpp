@@ -779,7 +779,8 @@ void logFlowBackendChoice(std::string_view token) {
     // ---- gravity-up: the stabilisation's attitude, else one of our own ----------
     std::optional<geom::AttitudeTrack> own;
     const geom::AttitudeTrack* attitude = P.attitude ? &*P.attitude : nullptr;
-    if (!attitude) {
+    // An unverified reading levels nothing, the sky included.
+    if (!attitude && geom::attitudeReadingVerified(P.track.schema())) {
         geom::AttitudeTrack::Options options;
         geom::ConventionProbe::autoDetect(P.track).applyTo(options);
         auto built = geom::AttitudeTrack::build(P.track, options);

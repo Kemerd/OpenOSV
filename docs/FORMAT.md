@@ -91,10 +91,41 @@ The DJI Avata 360 (`dvtm_AVATA360.proto`), where it differs:
 | FrameMetaOfCamera.22 / .23 | `camera_attitude` / `camera_acc` | .9 / .10 |
 | FrameMetaOfIMU.4 | a single fused attitude batch, used when field 2 has none | - |
 
+What its recorded clips hold (firmware 01.00.02 to 01.00.06, library
+02.01.20), where the Osmo 360's differ:
+
+* **The lens extrinsic is written as Euler angles only.** Every `DewarpParams`
+  record has `yaw` / `pitch` / `roll` (12 / 13 / 14), no `cam_extri_q` (28)
+  and four zeros in `q` (21). The Osmo 360 writes all three, and on its records
+  `qY(yaw) * qZ(roll) * qX(pitch)` (degrees) reproduces `cam_extri_q` in every
+  populated slot of the sample clip to better than 0.03 degrees, so the decoder
+  builds the quaternion by that relation when a record has the angles and no
+  usable quaternion (`DewarpParams::camExtriQFromEuler`; `osvtool probe` says
+  so once per stream). A quaternion the camera wrote is never replaced.
+* **The lens records sit in `native_refine_far` (3/4).** `native_refine` (1/2)
+  carries a temperature and the angles but no intrinsics, and `native`
+  (11/12) is a placeholder, so the native choice falls back through 3/4 (DJI's
+  own order) and `osvtool probe` compares the other sets against it.
+* **No `digital_focal_length`** (`ClipMeta.6` is absent): the stream and the
+  calibration are both 3840 px, so the scale is read from the calibration.
+* **No per-frame `camera_attitude` / `camera_acc`** (`FrameMetaOfCamera` holds
+  fields 1-19): the fused IMU batch (`FrameMetaOfIMU`, 4 kHz, about 67 samples
+  per frame) is the only attitude.
+
 The Avata 360 flies its 360 camera with one lens up and one down, so its lens
 axis (the body's +Y) is vertical: Horizon Leveling measures that from the
 attitude track and levels about the body's horizontal axis instead
-(`levellingMount`, `include/osv/geom/Stabilization.h`).
+(`levellingMount`, `include/osv/geom/Stabilization.h`). Its master lens (+Y)
+looks at the ground and the aircraft's nose is the body's -Z (both measured
+against DJI Studio's default view of a recorded clip), so before any attitude
+is read the view is placed in that frame (`productMount`: right -X, forward
+-Z, up -Y) and faces forward with the sky up. Its stored attitude has no
+verified reading yet: on the one clip measured, the default reading put up
+141 degrees from the true up and no component order or sign came within 36
+degrees, so the plug-ins and `osvtool`'s `auto` leave stabilisation off on it
+(`attitudeReadingVerified`) rather than level the world upside down.
+`osvtool --attitude-convention <reading>` still builds the track, which is how
+a reading gets verified.
 
 ### Calibration sets and lens accessories
 

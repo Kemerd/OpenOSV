@@ -587,6 +587,30 @@ Pb makeDewarp(float fx, float fy, float cx, float cy, bool widthAsFloat, const Q
     return d;
 }
 
+/// A lens record the way the Avata 360 writes one: intrinsics, size and the
+/// extrinsic as the Euler angles (12 / 13 / 14) alone - no cam_extri_q (28),
+/// four zeros in q (21).
+Pb makeEulerDewarp(float fx, float cx, float cy, float k1, float yaw, float pitch, float roll) {
+    Pb d;
+    d.f32(1, fx).f32(2, fx).f32(3, cx).f32(4, cy);
+    d.f32(5, k1).f32(6, -0.0128859f).f32(7, 0.0103815f).f32(8, -0.00677581f);
+    d.f32(10, 3840.0f).f32(11, 3840.0f);
+    d.f32(12, yaw).f32(13, pitch).f32(14, roll);
+    d.packedFloats(21, {0.0f, 0.0f, 0.0f, 0.0f});
+    d.f32(24, 8.0f).f32(25, 32.5f);
+    return d;
+}
+
+/// What the Avata 360 leaves in native_refine (1/2): a temperature and the
+/// angles, no intrinsics.
+Pb makeSparseDewarp(float yaw, float pitch, float roll) {
+    Pb d;
+    d.f32(12, yaw).f32(13, pitch).f32(14, roll);
+    d.packedFloats(21, {0.0f, 0.0f, 0.0f, 0.0f});
+    d.f32(25, 32.5f);
+    return d;
+}
+
 /// An all-zero 159-byte style empty slot (zeros in the repeated fields only).
 Pb makeEmptyDewarp() {
     Pb d;
@@ -917,6 +941,95 @@ TEST_CASE("DjmdDecoder rejects empty and useless samples", "[meta][proto]") {
     REQUIRE_FALSE(ok.value().frame->camera.attitude.present);
 }
 
+TEST_CASE("A lens extrinsic written only as Euler angles becomes the quaternion the camera left out",
+          "[meta][proto]") {
+    // The Osmo 360 sample clip's far_09 records: their yaw / pitch / roll
+    // and the cam_extri_q the camera wrote beside them.  Read back without
+    // field 28 and with q zeroed, the way the Avata 360 writes a record, the
+    // relation qY(yaw) * qZ(roll) * qX(pitch) must give the same quaternion.
+    SECTION("The Osmo 360's own relation, slave and master") {
+        std::vector<std::string> warnings;
+        const Result<DewarpParams> slave = DjmdDecoder::decodeDewarp(
+            makeEulerDewarp(1041.7777f, 1906.92f, 1911.23f, 0.0674f, -179.63262939453125f, 90.24027252197266f,
+                            0.06085320562124252f)
+                .span(),
+            &warnings);
+        REQUIRE(slave.ok());
+        REQUIRE(warnings.empty());
+        const DewarpParams& s = slave.value();
+        REQUIRE(s.camExtriQ.present);
+        REQUIRE(s.camExtriQFromEuler);
+        REQUIRE(s.hasCore());
+        REQUIRE_FALSE(s.present.test(28));
+        REQUIRE_THAT(s.camExtriQ.w, Catch::Matchers::WithinAbs(0.0026384538f, 5e-5f));
+        REQUIRE_THAT(s.camExtriQ.x, Catch::Matchers::WithinAbs(0.0018969558f, 5e-5f));
+        REQUIRE_THAT(s.camExtriQ.y, Catch::Matchers::WithinAbs(-0.7056176662f, 5e-5f));
+        REQUIRE_THAT(s.camExtriQ.z, Catch::Matchers::WithinAbs(0.7085853219f, 5e-5f));
+
+        const Result<DewarpParams> master = DjmdDecoder::decodeDewarp(
+            makeEulerDewarp(1040.965f, 1926.75f, 1923.78f, 0.0910f, 0.5247750282f, 90.54442596f, -1.27772522f).span(),
+            &warnings);
+        REQUIRE(master.ok());
+        const DewarpParams& m = master.value();
+        REQUIRE(m.camExtriQFromEuler);
+        REQUIRE(m.hasCore());
+        REQUIRE_THAT(m.camExtriQ.w, Catch::Matchers::WithinAbs(0.7037245035f, 5e-5f));
+        REQUIRE_THAT(m.camExtriQ.x, Catch::Matchers::WithinAbs(0.7103707194f, 5e-5f));
+        REQUIRE_THAT(m.camExtriQ.y, Catch::Matchers::WithinAbs(-0.0046989629f, 5e-5f));
+        REQUIRE_THAT(m.camExtriQ.z, Catch::Matchers::WithinAbs(-0.0110999774f, 5e-5f));
+    }
+
+    SECTION("A quaternion the camera wrote is never replaced") {
+        const Quaternion q{0.0026615f, 0.0019091f, -0.7056412f, 0.7085618f, true};
+        const Result<DewarpParams> rec = DjmdDecoder::decodeDewarp(makeDewarp(1061.9f, 1061.7f, 1917.0f, 1919.1f, true, q).span());
+        REQUIRE(rec.ok());
+        REQUIRE_FALSE(rec.value().camExtriQFromEuler);
+        REQUIRE(rec.value().present.test(28));
+        REQUIRE(rec.value().camExtriQ.w == q.w);
+        REQUIRE(rec.value().camExtriQ.z == q.z);
+    }
+
+    SECTION("A usable 4-float copy counts as written") {
+        Pb d = makeEulerDewarp(1041.0f, 1917.0f, 1919.0f, 0.066f, -179.6f, 90.2f, 0.06f);
+        d.packedFloats(21, {0.7037f, 0.7104f, -0.0047f, -0.0111f});  // a second field 21
+        const Result<DewarpParams> rec = DjmdDecoder::decodeDewarp(d.span());
+        REQUIRE(rec.ok());
+        // Repeated payloads of field 21 are appended, so q has eight floats:
+        // not a usable copy, and the angles build the quaternion.
+        REQUIRE(rec.value().q.size() == 8);
+        REQUIRE(rec.value().camExtriQFromEuler);
+        Pb clean;
+        clean.f32(1, 1041.0f).f32(2, 1041.0f).f32(3, 1917.0f).f32(4, 1919.0f).f32(10, 3840.0f).f32(11, 3840.0f);
+        clean.f32(12, -179.6f).f32(13, 90.2f).f32(14, 0.06f);
+        clean.packedFloats(21, {0.7037f, 0.7104f, -0.0047f, -0.0111f});
+        const Result<DewarpParams> viaCopy = DjmdDecoder::decodeDewarp(clean.span());
+        REQUIRE(viaCopy.ok());
+        REQUIRE_FALSE(viaCopy.value().camExtriQFromEuler);
+        REQUIRE_FALSE(viaCopy.value().camExtriQ.present);
+        REQUIRE(viaCopy.value().hasCore());  // through the copy, as before
+    }
+
+    SECTION("Without the three angles nothing is built") {
+        Pb d;
+        d.f32(1, 1041.0f).f32(2, 1041.0f).f32(3, 1917.0f).f32(4, 1919.0f).f32(10, 3840.0f).f32(11, 3840.0f);
+        d.f32(12, -179.6f).f32(13, 90.2f);  // no roll
+        d.packedFloats(21, {0.0f, 0.0f, 0.0f, 0.0f});
+        const Result<DewarpParams> rec = DjmdDecoder::decodeDewarp(d.span());
+        REQUIRE(rec.ok());
+        REQUIRE_FALSE(rec.value().camExtriQ.present);
+        REQUIRE_FALSE(rec.value().camExtriQFromEuler);
+        REQUIRE_FALSE(rec.value().hasCore());
+    }
+
+    SECTION("Angles without intrinsics build a quaternion but no core") {
+        const Result<DewarpParams> rec = DjmdDecoder::decodeDewarp(makeSparseDewarp(-179.489f, 90.159f, 0.334f).span());
+        REQUIRE(rec.ok());
+        REQUIRE(rec.value().camExtriQFromEuler);
+        REQUIRE_FALSE(rec.value().hasCore());
+        REQUIRE_FALSE(rec.value().isEmpty());
+    }
+}
+
 TEST_CASE("Quaternion decoding zero-fills missing components", "[meta][proto]") {
     Pb partial;
     partial.f32(1, 0.5f).f32(4, 0.25f);
@@ -941,7 +1054,14 @@ namespace {
 /// the same schema.  `colorWrapper` is StreamMeta 2.4's payload, or null to
 /// leave 2.4 out; `streamFirst` puts StreamMeta ahead of ClipMeta;
 /// `withClip` false leaves ClipMeta out (every sample after the first).
-Pb makeAvataSample(const char* proto, const Pb* colorWrapper, bool streamFirst = false, bool withClip = true) {
+/// `asRecorded` shapes the sample the way the aircraft's firmware 01.00.05 /
+/// 01.00.06 writes a clip: the lens records in native_refine_far (3/4) with
+/// their extrinsic as Euler angles only, native_refine (1/2) with a
+/// temperature and the angles but no intrinsics, no digital focal length
+/// and no per-frame camera_attitude / camera_acc (the fused IMU batch is
+/// the only attitude).
+Pb makeAvataSample(const char* proto, const Pb* colorWrapper, bool streamFirst = false, bool withClip = true,
+                   bool asRecorded = false) {
     const Quaternion qs{0.0026615f, 0.0019091f, -0.7056412f, 0.7085618f, true};
     const Quaternion qm{0.7036960f, 0.7103991f, -0.0046943f, -0.0110939f, true};
 
@@ -952,7 +1072,9 @@ Pb makeAvataSample(const char* proto, const Pb* colorWrapper, bool streamFirst =
     clip.msg(1, header);
     clip.msg(2, Pb().vint(1, 2).vint(2, 1));
     clip.msg(5, Pb().vint(1, 4));
-    clip.msg(6, Pb().f32(1, 1061.25f));              // digital_focal_length
+    if (!asRecorded) {
+        clip.msg(6, Pb().f32(1, 1061.25f));          // digital_focal_length
+    }
     clip.msg(7, Pb().vint(1, 0));                    // eis_status
     clip.msg(8, Pb().vint(1, 1000));                 // imu_sampling_rate (the Osmo's focal-length number)
     clip.msg(9, Pb().f32(1, 59.94f));                // sensor_fps
@@ -970,8 +1092,18 @@ Pb makeAvataSample(const char* proto, const Pb* colorWrapper, bool streamFirst =
     }
     camera.msg(5, Pb());
     Pb pano;
-    pano.msg(1, makeDewarp(1061.9f, 1061.7f, 1917.0f, 1919.1f, true, qs));
-    pano.msg(2, makeDewarp(1061.0f, 1060.9f, 1908.8f, 1918.7f, true, qm));
+    if (asRecorded) {
+        pano.msg(1, makeSparseDewarp(-179.489f, 90.159f, 0.334f));
+        pano.msg(2, makeSparseDewarp(0.326f, 90.126f, 1.342f));
+        pano.msg(3, makeEulerDewarp(1046.98f, 1906.92f, 1911.23f, 0.0674f, -179.489f, 90.159f, 0.334f));
+        pano.msg(4, makeEulerDewarp(1038.19f, 1926.75f, 1923.78f, 0.0910f, 0.326f, 90.126f, 1.342f));
+        for (std::uint32_t slot = 5; slot <= 24; ++slot) {
+            pano.msg(slot, makeEmptyDewarp());
+        }
+    } else {
+        pano.msg(1, makeDewarp(1061.9f, 1061.7f, 1917.0f, 1919.1f, true, qs));
+        pano.msg(2, makeDewarp(1061.0f, 1060.9f, 1908.8f, 1918.7f, true, qm));
+    }
     Pb stream;
     stream.msg(1, Pb().str(3, "video"));
     stream.msg(2, camera);
@@ -986,8 +1118,10 @@ Pb makeAvataSample(const char* proto, const Pb* colorWrapper, bool streamFirst =
     cameraFrame.msg(3, Pb().f32(1, 100.0f));     // iso
     cameraFrame.msg(12, Pb().f32(1, 41.5f));     // sensor_temperature
     cameraFrame.msg(15, Pb().f32(1, 1061.25f));  // per-frame digital_focal_length: dropped
-    cameraFrame.msg(22, Pb().f32(1, att.w).f32(2, att.x).f32(3, att.y).f32(4, att.z));  // camera_attitude
-    cameraFrame.msg(23, Pb().f32(2, 0.1f).f32(3, 9.7f).f32(4, -0.2f));                  // camera_acc
+    if (!asRecorded) {
+        cameraFrame.msg(22, Pb().f32(1, att.w).f32(2, att.x).f32(3, att.y).f32(4, att.z));  // camera_attitude
+        cameraFrame.msg(23, Pb().f32(2, 0.1f).f32(3, 9.7f).f32(4, -0.2f));                  // camera_acc
+    }
     cameraFrame.msg(24, Pb().f32(1, 3.0f));      // sharpness
     Pb single;  // IMU_single_attitude_after_fusion: the only attitude batch here
     single.vint(1, 1234).vint(2, 99);
@@ -1027,6 +1161,52 @@ TEST_CASE("The Avata 360 schema: calibration, focal length, colour mode and atti
     };
     const Pb dlogm = Pb().vint(1, 19);
     const Pb empty;
+
+    SECTION("A clip the way the aircraft records it stitches from native_refine_far") {
+        // Firmware 01.00.05 / 01.00.06: the records the clip was refused for
+        // ("no lens calibration") before the Euler extrinsic was read.
+        const ProductMeta p = decodeAll(makeAvataSample(kAvata360ProtoFile, &dlogm, false, true, true));
+        REQUIRE(p.schema == DjmdSchema::Avata360);
+        const StreamMeta& s = *p.stream;
+        // 1/2 hold angles and a temperature: not empty, not a calibration.
+        REQUIRE(s.dewarp.get(PanoDewarpParams::NativeRefineSlave) != nullptr);
+        REQUIRE_FALSE(s.dewarp.get(PanoDewarpParams::NativeRefineSlave)->hasCore());
+        // 3/4 are the lens records, their quaternion built from the angles.
+        const DewarpParams* slave = s.dewarp.get(PanoDewarpParams::NativeRefineFarSlave);
+        const DewarpParams* master = s.dewarp.get(PanoDewarpParams::NativeRefineFarMaster);
+        REQUIRE(slave != nullptr);
+        REQUIRE(master != nullptr);
+        REQUIRE(slave->hasCore());
+        REQUIRE(master->hasCore());
+        REQUIRE(slave->camExtriQFromEuler);
+        REQUIRE(master->camExtriQFromEuler);
+        // Close to the Osmo 360's own lens placement, as they should be.
+        REQUIRE_THAT(master->camExtriQ.w, Catch::Matchers::WithinAbs(0.7063f, 2e-3f));
+        REQUIRE_THAT(master->camExtriQ.x, Catch::Matchers::WithinAbs(0.7079f, 2e-3f));
+        REQUIRE_THAT(slave->camExtriQ.y, Catch::Matchers::WithinAbs(-0.7061f, 2e-3f));
+        REQUIRE_THAT(slave->camExtriQ.z, Catch::Matchers::WithinAbs(0.7081f, 2e-3f));
+        // One line says where the extrinsics came from; nothing else to say.
+        REQUIRE(p.warnings.size() == 1);
+        REQUIRE(p.warnings.front().find("Euler") != std::string::npos);
+        // The selector lands on 3/4 with a note, so the clip opens.
+        std::vector<std::string> notes;
+        const Result<CalibrationSet> set = CalibrationSelector::select(s, {}, &notes);
+        REQUIRE(set.ok());
+        REQUIRE(set.value().sourceSlave == "native_refine_far_slave");
+        REQUIRE(set.value().sourceMaster == "native_refine_far_master");
+        REQUIRE_THAT(set.value().slave.fx, WithinRel(1046.98f, 1e-6f));
+        // The sample records lens guards, so the first note is that fallback;
+        // the second is the walk down to native_refine_far.
+        REQUIRE(notes.size() == 2);
+        REQUIRE(notes.back().find("native_refine_far") != std::string::npos);
+        // No digital focal length (the stream is the calibration's 3840) and
+        // no per-frame attitude; the fused IMU batch is still there.
+        REQUIRE(p.clip->digitalFocalLength == 0.0f);
+        REQUIRE_FALSE(p.frame->camera.attitude.present);
+        REQUIRE_FALSE(p.frame->camera.accPresent);
+        REQUIRE(p.frame->imu.has_value());
+        REQUIRE(p.frame->imu->current.present);
+    }
 
     SECTION("Every message reads in the Avata numbering") {
         const ProductMeta p = decodeAll(makeAvataSample(kAvata360ProtoFile, &dlogm));

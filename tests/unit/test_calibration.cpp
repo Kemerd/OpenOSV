@@ -185,6 +185,62 @@ TEST_CASE("inventory tells absent, placeholder, partial and usable sets apart", 
     }
 }
 
+TEST_CASE("the native fallback reaches native_refine_far when the refined pair holds no intrinsics",
+          "[meta][calibration]") {
+    // The Avata 360: native_refine (1/2) carries a temperature and the Euler
+    // angles but no intrinsics, native_refine_far (3/4) the lens records,
+    // native (11/12) nothing at all.
+    using P = PanoDewarpParams;
+    StreamMeta s;
+    DewarpParams sparse;
+    sparse.temperature = 32.5f;
+    sparse.yaw = -179.5f;
+    sparse.pitch = 90.2f;
+    sparse.roll = 0.3f;
+    s.dewarp.byField[P::NativeRefineSlave] = sparse;
+    s.dewarp.byField[P::NativeRefineMaster] = sparse;
+    s.dewarp.byField[P::NativeRefineFarSlave] = lens(1046.98f, 1906.92f);
+    s.dewarp.byField[P::NativeRefineFarMaster] = lens(1038.19f, 1926.75f);
+    for (std::uint32_t slot = P::LensGuardsSlave; slot <= P::WaterUnderMaster; ++slot) {
+        s.dewarp.byField[slot] = placeholder();
+    }
+    s.extriLensMode = ExtriLensMode::Native;
+    s.present.set(6);
+
+    std::vector<std::string> notes;
+    const Result<CalibrationSet> set = CalibrationSelector::select(s, {}, &notes);
+    REQUIRE(set.ok());
+    CHECK(set.value().sourceSlave == "native_refine_far_slave");
+    CHECK(set.value().sourceMaster == "native_refine_far_master");
+    CHECK(set.value().slave.fx == 1046.98f);
+    REQUIRE(notes.size() == 1);
+    CHECK(notes.front().find("native_refine_far") != std::string::npos);
+
+    // The raw-first order takes the same road to the same records.
+    CalibrationSelector::Options rawFirst;
+    rawFirst.preferRefined = false;
+    notes.clear();
+    const Result<CalibrationSet> raw = CalibrationSelector::select(s, rawFirst, &notes);
+    REQUIRE(raw.ok());
+    CHECK(raw.value().sourceSlave == "native_refine_far_slave");
+    CHECK(notes.size() == 1);
+
+    // The inventory: refined partial, far usable and the reference, native absent.
+    const CalibrationInventory inv = CalibrationSelector::inventory(s);
+    CHECK(inv.at(CalibrationSetId::NativeRefine).state == CalibrationSetState::Partial);
+    CHECK(inv.at(CalibrationSetId::NativeRefineFar).state == CalibrationSetState::Usable);
+    CHECK(inv.at(CalibrationSetId::Native).state == CalibrationSetState::Absent);
+    REQUIRE(inv.nativeReference.has_value());
+    CHECK(*inv.nativeReference == CalibrationSetId::NativeRefineFar);
+
+    // The Osmo 360's shape never reaches it: its 3/4 are placeholders.
+    notes.clear();
+    const Result<CalibrationSet> osmo = CalibrationSelector::select(sampleLikeStream(), {}, &notes);
+    REQUIRE(osmo.ok());
+    CHECK(osmo.value().sourceSlave == "native_refine_slave");
+    CHECK(notes.empty());
+}
+
 TEST_CASE("compare measures rotation precisely and identity bit for bit", "[meta][calibration]") {
     CalibrationSet a;
     a.slave = lens(1043.0f);

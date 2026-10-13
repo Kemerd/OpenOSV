@@ -250,11 +250,35 @@ Mat3d levellingMount(const std::vector<Quatd>& worldFromBody, const Vec3d& world
     if (used == 0 || sumAbs / static_cast<double>(used) <= kVerticalLensAxisCos) {
         return Mat3d::identity();
     }
-    // A quarter turn about +X: columns (X, s*Z, -s*Y), right handed for either
-    // sign since X x (s*Z) = -s*Y.  With +Y up on average s = -1, giving
-    // (right +X, forward -Z, up +Y); with +Y down s = +1, giving (+X, +Z, -Y).
-    const double s = (sumSigned >= 0.0) ? -1.0 : 1.0;
-    return Mat3d::fromColumns(Vec3d{1.0, 0.0, 0.0}, Vec3d{0.0, 0.0, s}, Vec3d{0.0, -s, 0.0});
+    // +Y up on average: the quarter turn about +X, columns (right +X,
+    // forward -Z, up +Y).  +Y down on average - the Avata 360, whose master
+    // lens looks at the ground - is that frame turned half a turn about the
+    // vertical, (right -X, forward -Z, up -Y): the forward stays the body's
+    // -Z, the aircraft's nose (with +Z the view faced 179 deg away from DJI
+    // Studio's default view of a recorded clip).  Both are right handed:
+    // X x (-Z) = Y and (-X) x (-Z) = -Y.
+    if (sumSigned >= 0.0) {
+        return Mat3d::fromColumns(Vec3d{1.0, 0.0, 0.0}, Vec3d{0.0, 0.0, -1.0}, Vec3d{0.0, 1.0, 0.0});
+    }
+    return Mat3d::fromColumns(Vec3d{-1.0, 0.0, 0.0}, Vec3d{0.0, 0.0, -1.0}, Vec3d{0.0, -1.0, 0.0});
+}
+
+Mat3d productMount(meta::DjmdSchema schema) noexcept {
+    switch (schema) {
+    case meta::DjmdSchema::Avata360:
+        // Master lens (+Y) down, nose at -Z: the frame levellingMount
+        // returns for every clip the aircraft records in 360 mode.
+        return Mat3d::fromColumns(Vec3d{-1.0, 0.0, 0.0}, Vec3d{0.0, 0.0, -1.0}, Vec3d{0.0, -1.0, 0.0});
+    case meta::DjmdSchema::Osmo360:
+        break;
+    }
+    return Mat3d::identity();
+}
+
+bool attitudeReadingVerified(meta::DjmdSchema schema) noexcept {
+    // Only the Osmo 360's reading has been levelled against footage
+    // (the car and airborne clips).  An unknown value is unverified too.
+    return schema == meta::DjmdSchema::Osmo360;
 }
 
 // -----------------------------------------------------------------------------

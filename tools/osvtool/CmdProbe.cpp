@@ -50,6 +50,7 @@
 #include "Commands.h"
 
 #include "osv/container/OsvFile.h"
+#include "osv/core/ByteReader.h"
 #include "osv/core/Log.h"
 #include "osv/meta/CalibrationSelector.h"
 #include "osv/meta/DjmdDecoder.h"
@@ -301,6 +302,84 @@ void addStableKeys(json& doc, const osv::MovieInfo& movie, const osv::meta::Form
     std::string ext = input.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     doc["isLrf"] = (format && format->sideBySideProxy) || ext == ".lrf";
+}
+
+/// Print one schema-less tree node and its children, one line each, as
+/// `field: value` under two spaces of indent per level.  A fixed32 shows
+/// both readings (float and unsigned), a varint its unsigned value and, when
+/// the top bit of 32 is set, the int32 it would be; bytes show as a string
+/// when printable ASCII, else as hex (capped) and, when a whole number of
+/// floats, as those floats (capped), since packed float arrays are the
+/// schema's habit.  Everything is 7-bit ASCII so the output pastes anywhere.
+void printTreeNode(const osv::meta::ProtoNode& n, int depth) {
+    using namespace osv::meta;
+    const int indent = 2 + 2 * depth;
+    std::printf("%*s%u: ", indent, "", n.number);
+    switch (n.wire) {
+    case WireType::Varint:
+        std::printf("varint %llu", static_cast<unsigned long long>(n.varint));
+        if (n.varint >= 0x80000000ull && n.varint <= 0xFFFFFFFFull) {
+            std::printf(" (int32 %d)", static_cast<int>(static_cast<std::int32_t>(static_cast<std::uint32_t>(n.varint))));
+        }
+        std::printf("\n");
+        break;
+    case WireType::Fixed32: {
+        ProtoField tmp;
+        tmp.wire = WireType::Fixed32;
+        tmp.fixed32 = n.fixed32;
+        std::printf("fixed32 %.9g (u32 %u)\n", static_cast<double>(tmp.asFloat()), n.fixed32);
+        break;
+    }
+    case WireType::Fixed64: {
+        ProtoField tmp;
+        tmp.wire = WireType::Fixed64;
+        tmp.fixed64 = n.fixed64;
+        std::printf("fixed64 %.17g (u64 %llu)\n", tmp.asDouble(), static_cast<unsigned long long>(n.fixed64));
+        break;
+    }
+    case WireType::LengthDelimited:
+        if (n.isMessage) {
+            std::printf("message (%llu bytes, %llu fields)%s\n", static_cast<unsigned long long>(n.bytes.size()),
+                        static_cast<unsigned long long>(n.children.size()), n.truncated ? " TRUNCATED" : "");
+            if (n.truncated) {
+                std::printf("%*s  (%s)\n", indent, "", safe(n.failure).c_str());
+            }
+            for (const ProtoNode& child : n.children) {
+                printTreeNode(child, depth + 1);
+            }
+        } else if (n.isPrintableAscii()) {
+            std::printf("\"%s\"\n", safe(std::string(reinterpret_cast<const char*>(n.bytes.data()), n.bytes.size())).c_str());
+        } else {
+            static constexpr std::size_t kMaxHex = 64;
+            static constexpr std::size_t kMaxFloats = 32;
+            static constexpr char kDigits[] = "0123456789abcdef";
+            std::printf("%llu bytes", static_cast<unsigned long long>(n.bytes.size()));
+            const std::size_t count = n.bytes.size() < kMaxHex ? n.bytes.size() : kMaxHex;
+            if (count > 0) {
+                std::printf(" hex ");
+                for (std::size_t i = 0; i < count; ++i) {
+                    std::printf("%c%c", kDigits[n.bytes[i] >> 4], kDigits[n.bytes[i] & 0xF]);
+                }
+                if (n.bytes.size() > kMaxHex) {
+                    std::printf("...");
+                }
+            }
+            if (!n.bytes.empty() && n.bytes.size() % 4 == 0 && n.bytes.size() <= 4 * kMaxFloats) {
+                std::printf(" floats");
+                osv::ByteReader reader(osv::ByteSpan(n.bytes));
+                float f = 0.0f;
+                while (reader.f32le(f)) {
+                    std::printf(" %.9g", static_cast<double>(f));
+                }
+            }
+            std::printf("\n");
+        }
+        break;
+    case WireType::StartGroup:
+    case WireType::EndGroup:
+        std::printf("group\n");
+        break;
+    }
 }
 
 /// Options collected by CLI11 for the probe command.
@@ -874,6 +953,15 @@ int runProbe(const ProbeOptions& opt) {
             doc["rawSample0"] = toJson(tree);
             std::printf("raw: sample 0 decoded into %llu nodes%s\n", static_cast<unsigned long long>(tree.nodeCount),
                         tree.failed ? " (scan failed)" : "");
+            if (tree.failed) {
+                std::printf("  (%s)\n", safe(tree.failure).c_str());
+            }
+            // The tree itself, on the console: a report of a clip nobody
+            // here has needs the field numbers as the camera wrote them,
+            // and --json is one more step people skip.
+            for (const ProtoNode& n : tree.fields) {
+                printTreeNode(n, 0);
+            }
         }
     }
 
@@ -951,7 +1039,9 @@ void registerProbeCommand(CLI::App& app, CommandContext& ctx) {
                     "Write the full JSON document to this path, or to stdout (and nothing else) for '-'");
     sub->add_option("--frames", opt->frames, "Frames to include: all, N or a-b (default 0)")->capture_default_str();
     sub->add_option("--covers", opt->coversDir, "Extract the embedded JPEG cover images into this directory");
-    sub->add_flag("--raw", opt->raw, "Include the schema-less protobuf tree of the selected samples");
+    sub->add_flag("--raw", opt->raw,
+                  "Print the schema-less protobuf tree of sample 0 (every field as the camera wrote it) and "
+                  "include the selected samples' trees in --json");
     sub->add_flag("--imu", opt->imu, "Include every IMU quaternion of the selected frames");
     // The callback runs during parse; the exit code lands in the context.
     sub->callback([opt, &ctx]() { ctx.exitCode = runProbe(*opt); });

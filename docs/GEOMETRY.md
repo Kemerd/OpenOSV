@@ -178,5 +178,9 @@ within 35 degrees of the mean) it is logged as a warning. It never moves the
 levelling. An airborne clip measures its flight, not gravity, and is reported
 without a verdict. `--attitude-convention` still exposes the 16 plain
 readings (order x sense x up in {y, z, ny, nz}) and each with `-rig`; pitch
-and roll dynamics beyond a car's, and the Avata 360's lens-up mount, are not
-yet verified against image truth.
+and roll dynamics beyond a car's are not yet verified against image truth.
+The Avata 360's stored attitude has no verified reading at all (the default
+one levels its world upside down; `docs/FORMAT.md`), so `auto` and the
+plug-ins leave stabilisation off on it and place the view in the aircraft's
+frame (`productMount`) instead; an explicit `--attitude-convention` builds
+the track regardless.

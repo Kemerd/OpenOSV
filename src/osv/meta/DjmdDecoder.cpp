@@ -84,6 +84,24 @@ std::uint32_t dimensionU32(const ProtoField& field) noexcept {
     return field.asU32();
 }
 
+/// True when the 4-float copy of the lens extrinsic (DewarpParams.q, field
+/// 21) is a usable rotation: four finite values that are not all zero, the
+/// test DewarpParams::hasCore() applies to it.  The Avata 360 writes the
+/// field as four zeros.
+bool usableQuaternionCopy(const std::vector<float>& q) noexcept {
+    if (q.size() != 4) {
+        return false;
+    }
+    float norm2 = 0.0f;
+    for (const float v : q) {
+        if (!std::isfinite(v)) {
+            return false;
+        }
+        norm2 += v * v;
+    }
+    return norm2 >= 1e-6f;
+}
+
 /// Report a repeated-scalar helper failure (wrong wire type / partial value).
 void warnRepeated(bool ok, const char* context, const ProtoField& field, std::vector<std::string>* warnings) {
     if (!ok) {
@@ -620,6 +638,31 @@ Result<DewarpParams> DjmdDecoder::decodeDewarp(ByteSpan body, std::vector<std::s
     if (decoded == 0 && !clean) {
         return Error{ErrorCode::Malformed, "DewarpParams: no decodable field"};
     }
+
+    // ---- an extrinsic written only as Euler angles --------------------------------
+    // The Osmo 360 writes the lens extrinsic three times over: cam_extri_q
+    // (28), its 4-float copy q (21) and the Euler angles yaw / pitch / roll
+    // (12 / 13 / 14).  The Avata 360 writes no field 28 and four zeros in
+    // field 21: its records carry the rotation in the Euler fields alone, and
+    // without this step every one of them failed hasCore() and the clip was
+    // refused as carrying no calibration.  On the Osmo 360's own records
+    // qY(yaw) * qZ(roll) * qX(pitch), angles in degrees, reproduces
+    // cam_extri_q in every populated slot of the sample clip to better than
+    // 0.03 deg, so a record that has the angles and no usable quaternion gets
+    // its quaternion by that relation.  Nothing stored is overwritten: a
+    // quaternion the camera wrote always wins.
+    if (!d.camExtriQ.present && !usableQuaternionCopy(d.q) && d.present.test(12) && d.present.test(13) &&
+        d.present.test(14) && std::isfinite(d.yaw) && std::isfinite(d.pitch) && std::isfinite(d.roll)) {
+        const Quatd built = Quatd::fromAxisAngle(Vec3d{0.0, 1.0, 0.0}, deg2rad(static_cast<double>(d.yaw))) *
+                            Quatd::fromAxisAngle(Vec3d{0.0, 0.0, 1.0}, deg2rad(static_cast<double>(d.roll))) *
+                            Quatd::fromAxisAngle(Vec3d{1.0, 0.0, 0.0}, deg2rad(static_cast<double>(d.pitch)));
+        d.camExtriQ.w = static_cast<float>(built.w);
+        d.camExtriQ.x = static_cast<float>(built.x);
+        d.camExtriQ.y = static_cast<float>(built.y);
+        d.camExtriQ.z = static_cast<float>(built.z);
+        d.camExtriQ.present = true;
+        d.camExtriQFromEuler = true;
+    }
     return d;
 }
 
@@ -689,8 +732,9 @@ Result<StreamMeta> DjmdDecoder::decodeStreamMeta(ByteSpan body, std::vector<std:
         case 5:
             s.fovType = wrappedI32(f.bytes, "StreamMeta.fov_type", warnings);
             break;
-        case 6:
+        case 6: {
             // PanoDewarpParams: fields 1..24 are DewarpParams records.
+            std::size_t builtFromEuler = 0;
             scanMessage(f.bytes, "StreamMeta.pano_dewarp_params", warnings, [&](const ProtoField& g) {
                 if (g.number == 0 || g.number >= PanoDewarpParams::SlotCount) {
                     noteUnknown("StreamMeta.pano_dewarp_params", g);
@@ -705,9 +749,21 @@ Result<StreamMeta> DjmdDecoder::decodeStreamMeta(ByteSpan body, std::vector<std:
                                                      PanoDewarpParams::fieldName(g.number), rec.error().toString()));
                     return;
                 }
-                s.dewarp.byField[g.number] = std::move(rec).value();
+                DewarpParams record = std::move(rec).value();
+                if (record.camExtriQFromEuler) {
+                    ++builtFromEuler;
+                }
+                s.dewarp.byField[g.number] = std::move(record);
             });
+            // One line for the whole message, so a probe of an Avata 360 clip
+            // says where its extrinsics came from without a line per slot.
+            if (builtFromEuler > 0) {
+                addWarning(warnings, std::format("pano_dewarp_params: {} record(s) carry the lens extrinsic only as "
+                                                 "Euler angles (no cam_extri_q); the quaternion was built from them",
+                                                 builtFromEuler));
+            }
             break;
+        }
         case 7:
             s.extriLensMode = static_cast<ExtriLensMode>(wrappedI32(f.bytes, "StreamMeta.extri_lens_mode", warnings));
             break;

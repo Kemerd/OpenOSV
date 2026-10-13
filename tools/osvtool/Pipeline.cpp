@@ -420,6 +420,19 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
     } else if (stab != "off") {
         return Error{ErrorCode::InvalidArgument, "unknown --stab '" + options.stab + "'"};
     }
+    // The product's levelling frame until a track measures one (the identity
+    // on the Osmo 360); it is the whole correction while stabilisation is off.
+    p->stabParams.mount = geom::productMount(p->track.schema());
+    // A product whose stored attitude has no verified reading is not levelled
+    // by `auto`: the importer's rule.  An explicit --attitude-convention still
+    // builds the track, which is how a reading gets verified in the first place.
+    if (p->stabParams.mode != geom::StabilizationMode::Off && lower(options.attitudeConvention) == "auto" &&
+        !geom::attitudeReadingVerified(p->track.schema())) {
+        p->notes.push_back(std::string("stabilisation: the ") + meta::djmdSchemaName(p->track.schema()) +
+                           " attitude reading is unverified on footage; disabled (the view faces the product's "
+                           "forward with the sky up); pass --attitude-convention to try a reading");
+        p->stabParams.mode = geom::StabilizationMode::Off;
+    }
     if (p->stabParams.mode != geom::StabilizationMode::Off) {
         geom::AttitudeTrack::Options attOpt;
         if (lower(options.attitudeConvention) == "auto") {
@@ -529,8 +542,10 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
 }
 
 Mat3d Pipeline::stabilizationFor(std::uint32_t frameIndex) const {
+    // No attitude correction: the view is glued to the body in its product
+    // mount (the identity on the Osmo 360).
     if (!attitude || stabParams.mode == geom::StabilizationMode::Off) {
-        return Mat3d::identity();
+        return stabParams.mount;
     }
     // Frame time from the metadata track (falls back to nominal spacing).
     double tUs = attitude->beginUs();

@@ -930,15 +930,27 @@ TEST_CASE("A lens-up / lens-down rig levels with a steady heading", "[attitude][
     const Mat3d cs = stabilizationBodyFromWorld(clip[3], smoothLevel, upright, worldUp, clip[3]);
     REQUIRE((clip[3].toMatrix() * (cs * Vec3d{0.0, 0.0, 1.0}) - worldUp).norm() < 1e-9);
 
-    // The other lens up: up is the body's -Y, forward its +Z.
+    // The other lens up - the Avata 360, master lens (+Y) down: up is the
+    // body's -Y and the forward stays its -Z, the aircraft's nose, so the
+    // right is -X (the +Y-up frame turned half a turn about the vertical).
     std::vector<Quatd> flipped;
     for (const Quatd& q : clip) {
         flipped.push_back(q * Quatd::fromAxisAngle(Vec3d{1.0, 0.0, 0.0}, deg2rad(180.0)));
     }
     const Mat3d flippedMount = levellingMount(flipped, worldUp);
     REQUIRE((flippedMount.col(2) - Vec3d{0.0, -1.0, 0.0}).norm() < 1e-12);
-    REQUIRE((flippedMount.col(1) - Vec3d{0.0, 0.0, 1.0}).norm() < 1e-12);
+    REQUIRE((flippedMount.col(1) - Vec3d{0.0, 0.0, -1.0}).norm() < 1e-12);
+    REQUIRE((flippedMount.col(0) - Vec3d{-1.0, 0.0, 0.0}).norm() < 1e-12);
     REQUIRE_THAT(flippedMount.determinant(), Catch::Matchers::WithinAbs(1.0, 1e-12));
+    REQUIRE((mount.col(0) - Vec3d{1.0, 0.0, 0.0}).norm() < 1e-12);
+
+    // ... which is the frame the product is known to fly in before any
+    // attitude is read, while the Osmo 360's is the identity.
+    REQUIRE(flippedMount.distance(productMount(meta::DjmdSchema::Avata360)) < 1e-12);
+    REQUIRE(productMount(meta::DjmdSchema::Osmo360).distance(Mat3d::identity()) == 0.0);
+    // Only the Osmo 360's stored attitude has a verified reading.
+    REQUIRE(attitudeReadingVerified(meta::DjmdSchema::Osmo360));
+    REQUIRE_FALSE(attitudeReadingVerified(meta::DjmdSchema::Avata360));
 }
 
 TEST_CASE("A lenses-level rig keeps the unmounted levelling exactly", "[attitude][stab]") {
