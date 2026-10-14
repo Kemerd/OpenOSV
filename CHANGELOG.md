@@ -6,6 +6,29 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-10-13
+
+An edit in the Source Settings effect now stays made.
+
+### Fixed
+
+* **Changing a control in the OpenOSV Source Settings effect did nothing; the
+  controls snapped back to their previous values.** Reported on Premiere
+  2024, 2025 and 2026 (a colour output that would not change). Premiere
+  re-instantiates the effect right after an edit, and the effect answered
+  that by asking the importer what the clip was being decoded with and
+  writing the answer back into the controls. The importer had not been
+  handed the edit yet (it gets the translated block with the next frame
+  request), so its answer was the old settings, the edit was undone before
+  it was ever stored, and nothing changed. The effect now asks the importer
+  only for a clip whose controls are still untouched; controls that hold
+  settings are the clip's settings and are left alone.
+* **`Source Settings...` greyed out in the Project panel is Premiere's own
+  behaviour for a clip whose settings live in a Source Settings effect**
+  (its R3D importer has done the same since CC 2015), not a fault: the
+  settings are on the clip's **Source** tab in Effect Controls. The README
+  says so.
+
 ## [0.6.2] - 2026-10-13
 
 The Avata 360's lens calibration is read as the aircraft writes it.

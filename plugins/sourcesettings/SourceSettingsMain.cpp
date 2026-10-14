@@ -33,10 +33,17 @@
 //                                    clip settings effect and not a filter.
 //   PF_Cmd_PARAMS_SETUP              the twenty-six controls, each flagged
 //                                    PF_ParamFlag_CANNOT_TIME_VARY.
-//   PF_Cmd_SEQUENCE_SETUP            PerformSourceSettingsCommand(), which
+//   PF_Cmd_SEQUENCE_SETUP            for UNTOUCHED controls only (a clip
+//                                    that has never been given settings):
+//                                    PerformSourceSettingsCommand(), which
 //                                    round-trips a blob through the importer
 //                                    so the controls can be seeded from the
-//                                    media's own "as shot" settings.
+//                                    media's own "as shot" settings.  Sent
+//                                    for every instance the host creates -
+//                                    after an edit too - so controls that
+//                                    hold settings are left alone, or every
+//                                    edit would be undone by the importer's
+//                                    not-yet-updated answer.
 //   PF_Cmd_TRANSLATE_PARAMS_TO_PREFS the controls -> a 128-byte PrefsBlob
 //                                    written into the host's prefs buffer.
 //   PF_Cmd_USER_CHANGED_PARAM        [WP-DEFAULTS] the Defaults group's two
@@ -891,8 +898,10 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     return PF_Err_NONE;
 }
 
-/// PF_Cmd_SEQUENCE_SETUP: ask the importer what the media is currently being
-/// decoded with, and seed the controls from it.
+/// PF_Cmd_SEQUENCE_SETUP: for a clip whose controls are still untouched, ask
+/// the importer what the media is currently being decoded with, and seed the
+/// controls from it.  Controls that already hold settings are the clip's own
+/// and are left alone (see the early return in the body for why).
 ///
 /// PerformSourceSettingsCommand (PrSDKAESupport.h:1627-1630) hands a buffer
 /// to the matching importer's imPerformSourceSettingsCommand (selector 66),
@@ -937,18 +946,47 @@ PF_Err sequenceSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
     // untouched controls, on the user defaults seeded just below).
     PrefsBlob blob = prefsFromControls(readControls(params));
 
+    // Controls that say anything but the built-in defaults ARE the clip's
+    // settings, and the importer is not asked about them.
+    //
+    // Premiere sends this selector for every instance of the effect it
+    // creates for the clip - not only on import: each time the clip is
+    // selected, and (the case that matters) right after the user changes a
+    // control, when it re-instantiates the effect around the new values.
+    // At that moment the importer's live instance is still decoding with the
+    // OLD settings: it learns the new ones only when the host hands it the
+    // translated block with the next frame request.  Asking it here and
+    // writing its answer back therefore reverted every edit to what the
+    // clip was decoded with before, the next TRANSLATE_PARAMS_TO_PREFS put
+    // the reverted values into the block, and nothing ever changed - the
+    // controls looked "stuck" on their previous values (reported on 2024,
+    // 2025 and 2026 alike).  The controls are the host's own record of the
+    // clip's settings: the user edits them, the project stores them, and
+    // the importer is handed their translation with every frame.  Nothing
+    // the importer could answer is more current than they are, so they are
+    // left exactly as they are.
+    //
+    // Only UNTOUCHED controls - a clip that has never been given settings -
+    // have nothing to say, and those are seeded below: from the user
+    // defaults, then from whatever the importer's live instance is decoding
+    // with (its stored block, or the settings it was seeded with).
+    if (params && blob != PrefsBlob::defaults()) {
+        PluginLog::debug("source settings: the controls hold the clip's settings (colour {}, size {}, stab {}, "
+                         "exposure {:+.2f}); the importer is not asked",
+                         blob.colorOutput, blob.outputSize, blob.stabilization,
+                         static_cast<double>(blob.exposureStops));
+        return PF_Err_NONE;
+    }
+
     // [WP-DEFAULTS] A NEW clip starts from the user's saved defaults.
     //
     // The SDK guide is explicit that this selector is the new-clip moment:
     // "When a clip is first imported, the effect is called with
     // PF_Cmd_SEQUENCE_SETUP" (a saved project comes back through
-    // PF_Cmd_SEQUENCE_RESETUP).  Two more guards keep an existing clip's
-    // settings untouched even if a host ever sent this selector for one:
-    //
-    //   * only UNTOUCHED controls are replaced - controls that translate to
-    //     anything but PrefsBlob::defaults() are the clip's own settings;
-    //   * the importer still answers below, and a live instance holding the
-    //     clip's stored blob replaces this seed with it.
+    // PF_Cmd_SEQUENCE_RESETUP).  The controls are untouched here (the early
+    // return above), so this seed never replaces a clip's own settings; and
+    // the importer still answers below, so a live instance holding the
+    // clip's stored block replaces the seed with that.
     //
     // No defaults file (or a corrupt one) leaves the seed at the built-in
     // defaults, i.e. exactly what this code did before.

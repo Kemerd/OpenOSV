@@ -783,9 +783,43 @@ TEST_CASE("SEQUENCE_SETUP leaves the controls alone when the importer says nothi
 
     REQUIRE(fixture.send(PF_Cmd_SEQUENCE_SETUP, nullptr) == PF_Err_NONE);
 
-    CHECK(fixture.host().sourceSettingsCallCount(fixture.ref()) == 1u);
+    // Controls that hold settings are the clip's own: the importer is not
+    // even asked about them (see the test below for why).
+    CHECK(fixture.host().sourceSettingsCallCount(fixture.ref()) == 0u);
     CHECK(fixture.popup(kIndexOutputSize) == sizeBefore);
     CHECK(fixture.popup(kIndexColorOutput) == colorBefore);
+}
+
+TEST_CASE("SEQUENCE_SETUP keeps an edited control when the importer still answers with the old settings",
+          "[sourcesettings][sequence]") {
+    EffectFixture fixture;
+    REQUIRE(LoadedPlugin::instance().ok());
+
+    // The user's story: the clip is being decoded as PQ (the default), the
+    // user sets Colour Output to Rec. 709 in the Effect Controls panel, and
+    // Premiere re-instantiates the effect around the new value - which sends
+    // SEQUENCE_SETUP again BEFORE the importer has been handed the new block
+    // with a frame request.  The importer's live instance therefore still
+    // answers "PQ".  Writing that answer back reverted the edit, the next
+    // TRANSLATE_PARAMS_TO_PREFS carried the reverted value, and the control
+    // looked stuck on its old value no matter what the user chose.
+    PrefsBlob stale = PrefsBlob::defaults();
+    stale.colorOutput = static_cast<std::uint8_t>(PrefsColorOutput::PQ);
+    REQUIRE(stale.sanitise());
+    const char* raw = reinterpret_cast<const char*>(&stale);
+    fixture.host().setSourceSettingsReply(fixture.ref(), std::vector<char>(raw, raw + PrefsBlob::kSize));
+
+    const int edited = static_cast<int>(PrefsColorOutput::Rec709) + 1;
+    fixture.setPopup(kIndexColorOutput, edited);
+
+    REQUIRE(fixture.send(PF_Cmd_SEQUENCE_SETUP, nullptr) == PF_Err_NONE);
+
+    // The edit survives, the importer was not consulted, and the translation
+    // the host stores next carries the edit.
+    CHECK(fixture.host().sourceSettingsCallCount(fixture.ref()) == 0u);
+    CHECK(fixture.popup(kIndexColorOutput) == edited);
+    PrefsBuffer buffer;
+    CHECK(translate(fixture, buffer).colorOutput == static_cast<std::uint8_t>(PrefsColorOutput::Rec709));
 }
 
 TEST_CASE("SEQUENCE_SETUP ignores a failed host call", "[sourcesettings][sequence]") {

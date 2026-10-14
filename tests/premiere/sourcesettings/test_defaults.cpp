@@ -278,12 +278,11 @@ TEST_CASE("a clip with its own settings is never touched by the user defaults", 
         fixture.setPopup(kIndexStabilization, static_cast<int>(PrefsStabilization::Smooth) + 1);
         const PrefsBlob before = translated(fixture);
         REQUIRE(fixture.send(PF_Cmd_SEQUENCE_SETUP, nullptr) == PF_Err_NONE);
-        // Offered as they are, and kept as they are.
-        const std::vector<char> sent = fixture.host().sourceSettingsSentData(fixture.ref());
-        REQUIRE(sent.size() == PrefsBlob::kSize);
-        PrefsBlob outbound{};
-        std::memcpy(&outbound, sent.data(), PrefsBlob::kSize);
-        CHECK(outbound == before);
+        // Kept as they are - the importer is not asked about a clip whose
+        // controls already hold its settings (its answer could only be
+        // staler than the controls; see test_prefs.cpp, "keeps an edited
+        // control").
+        CHECK(fixture.host().sourceSettingsCallCount(fixture.ref()) == 0u);
         CHECK(translated(fixture) == before);
     }
 

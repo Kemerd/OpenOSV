@@ -415,8 +415,12 @@ Something off? `%LOCALAPPDATA%\OpenOSV\OpenOSVOfx.log` and
 ### OpenOSV Source Settings (the master clip, one setting per clip)
 
 Premiere attaches this effect to every OSV **master clip** by itself. It
-decides how the sphere is built and coloured, so it has no keyframes. The
-same settings are in the right-click **Source Settings** dialog.
+decides how the sphere is built and coloured, so it has no keyframes. Select
+the clip in the Project panel and open **Effect Controls**: the settings are
+on the clip's **Source** tab. The right-click **Source Settings...** item is
+greyed out for these clips, which is how Premiere treats every importer whose
+settings live in a Source Settings effect (its own R3D importer included),
+not a sign that anything is missing.
 
 <img src="img/source_options.png" alt="The OpenOSV Source Settings dialog: colour output, stabilisation, calibration, seam search, exposure match, sun ghost removal, sky seam fix, seam blend, parallax blend, near and far offsets, lens shading, HDR peak, parallax grid and lens alignment" width="400">
 

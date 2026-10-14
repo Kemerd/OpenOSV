@@ -1089,7 +1089,19 @@ ends up showing "2560 x 1280" while decoding at 6000 x 3000.
   degradation returning `PF_Err_NONE`, never an error: a plug-in that fails
   `GLOBAL_SETUP` is dropped entirely, and a panel that works minus the
   master-clip attachment is strictly better than no panel.
-* **`PF_Cmd_SEQUENCE_SETUP`** calls
+* **`PF_Cmd_SEQUENCE_SETUP`** first asks whether the controls are still
+  untouched (they translate to `PrefsBlob::defaults()`). If they are not,
+  they are the clip's settings and the selector ends there: the importer is
+  not asked. Premiere sends this selector for every instance of the effect
+  it creates for the clip, including the one it creates right after the user
+  changes a control, and at that moment the importer's live instance is
+  still decoding with the old settings (it is handed the translated block
+  only with the next frame request). Writing its answer back reverted every
+  edit, the next `TRANSLATE_PARAMS_TO_PREFS` stored the reverted values, and
+  the controls looked stuck on their previous values on every Premiere
+  version (the 0.6.x reports). The controls are the host's own record of the
+  clip's settings; nothing the importer could answer is more current.
+  For untouched controls only, the selector calls
   `PF_SourceSettingsSuite::PerformSourceSettingsCommand`, which the host
   routes to the importer's `imPerformSourceSettingsCommand` (selector 66).
   The payload is a `PrefsBlob`; the SDK's only rule is that both halves agree
