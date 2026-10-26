@@ -131,14 +131,20 @@ struct StabilizationParams {
 /// correction stabilisation Off applies.
 [[nodiscard]] Mat3d productMount(meta::DjmdSchema schema) noexcept;
 
-/// True when the default AttitudeConvention has been verified against
-/// recorded footage of this product, so a track built from its stored
-/// attitude levels the world.  The Osmo 360's reading is.  The Avata 360's
-/// is not: on the one clip measured against DJI Studio's output the default
-/// reading put up 141 deg from the true up and no component order or sign
-/// came within 36 deg, so a levelled view of it would be upside down and
-/// tilted.  Callers leave stabilisation off, with the product mount, for a
-/// product whose reading is unverified.
+/**
+ * @brief True when the default AttitudeConvention has been verified for this
+ *        product's djmd schema, so a track built from its stored attitude
+ *        levels the world.
+ *
+ * Both the Osmo 360 and the Avata 360 write their fused IMU attitude batches
+ * in the same library frame (`IMU_attitude_after_fusion`, relabelled into
+ * rig axes via `rigAxes = true` with world `+Z` up).  The earlier 141 deg /
+ * 36.7 deg discrepancy observed on an Avata 360 clip with a 37 deg yaw came
+ * from testing the 0.5.0 `rigAxes = false` conventions before `K: (x, y, z)
+ * -> (y, -z, -x)` was introduced; with `rigAxes = true` world `+Z` maps to
+ * IMU `-X` and IMU `+Z` maps to body `-Y` (the slave lens pointing up).
+ * An unknown schema value remains unverified.
+ */
 [[nodiscard]] bool attitudeReadingVerified(meta::DjmdSchema schema) noexcept;
 
 /// Quaternion logarithm: rotation vector (axis * angle) of a unit quaternion.

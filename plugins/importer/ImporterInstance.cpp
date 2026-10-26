@@ -456,9 +456,18 @@ void ensureGpuAnalyses() noexcept {
 //  Construction / destruction
 // ---------------------------------------------------------------------------
 
-ImporterInstance::ImporterInstance(std::filesystem::path path) : m_path(std::move(path)) {}
+ImporterInstance::ImporterInstance(std::filesystem::path path) : m_path(std::move(path)) {
+    // Register this live instance with the engine's instance table so that
+    // synchronous Source Settings translations (OsvEngine_PublishSourceSettings)
+    // can locate it immediately when the user edits a control in Effect Controls.
+    engineRegisterInstance(this);
+}
 
 ImporterInstance::~ImporterInstance() {
+    // Unregister from the live-instance table FIRST, before any member or
+    // decoder teardown begins, so no concurrent OsvEngine_PublishSourceSettings
+    // call can observe or dispatch to an instance mid-destruction.
+    engineUnregisterInstance(this);
     // releaseHeavy() closes the OS handle, tears the decoders down in the
     // right order (audio before video, reader before file mapping) and joins
     // the parallax worker - which must be gone before the members it reads
@@ -1768,10 +1777,50 @@ AudioDecoder* ImporterInstance::audioImpl() {
 
 void ImporterInstance::applyPrefs(const void* bytes, std::size_t length) {
     std::lock_guard<std::mutex> guard(m_mutex);
-    applyPrefsLocked(bytes, length);
+    applyPrefsImplLocked(bytes, length, /*fromSourceSettingsEffect=*/false);
+}
+
+void ImporterInstance::applyPrefsFromSourceSettings(const PrefsBlob& incoming) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    // A synchronous translation from OpenOSVSourceSettings.aex represents the
+    // newest control edit by the user.  Mark this instance as holding live
+    // Source Settings effect preferences, mint a fresh publisher token and
+    // clear m_settingsPublishedFromHost before delegating to
+    // applyPrefsImplLocked() so that:
+    //  1. This instance's publication supersedes any older lingering instance
+    //     of the same file in the direct-GPU engine registry;
+    //  2. Even when `incoming` equals this instance's previous `m_prefs` (for
+    //     example when resetting a control back to built-in defaults), it is
+    //     still republished with the new token so the engine registry adopts it;
+    //  3. Subsequent host selectors carrying a stale `rec->prefs` buffer (when
+    //     Premiere passed a null `extra->prefsPC` to TRANSLATE_PARAMS_TO_PREFS)
+    //     do not overwrite `m_prefs` back to the pre-edit blob.
+    m_hasSourceSettingsPrefs.store(true, std::memory_order_release);
+    m_settingsPublisher = engineNewPublisherToken();
+    m_settingsPublishedFromHost = false;
+    applyPrefsImplLocked(&incoming, PrefsBlob::kSize, /*fromSourceSettingsEffect=*/true);
 }
 
 void ImporterInstance::applyPrefsLocked(const void* bytes, std::size_t length) {
+    applyPrefsImplLocked(bytes, length, /*fromSourceSettingsEffect=*/false);
+}
+
+void ImporterInstance::applyPrefsImplLocked(const void* bytes, std::size_t length, bool fromSourceSettingsEffect) {
+    // When OpenOSV Source Settings has pushed live control values directly to
+    // this instance (`m_hasSourceSettingsPrefs`), a subsequent host selector
+    // passing a stale `rec->prefs` / `info->prefs` buffer (because Premiere
+    // called PF_Cmd_TRANSLATE_PARAMS_TO_PREFS with `extra->prefsPC == nullptr`)
+    // must not revert `m_prefs` back to the initial import-time settings.
+    if (!fromSourceSettingsEffect && m_hasSourceSettingsPrefs.load(std::memory_order_acquire)) {
+        if (!m_colorBuilt) {
+            rebuildColor();
+        }
+        if (!m_settingsPublishedFromHost) {
+            publishSettingsLocked(true);
+        }
+        return;
+    }
+
     // A selector that carries no prefs (or a blob written by something else)
     // leaves the current settings alone; fromBytes() already sanitises.
     //
@@ -2157,6 +2206,15 @@ const video::FramePair* ImporterInstance::anchorPairLocked(std::uint32_t bucket,
             return nullptr;  // not free: an Interactive frame does not wait for it
         }
         auto lease = m_analysisGpuDecoder->acquire(anchor);
+        if (!lease.ok() && !m_analysisFrames.empty()) {
+            // Every cache slot in a tight GPU decoder may be pinned by an
+            // earlier anchor in m_analysisFrames (plus the caller's lease on
+            // `index`).  Releasing the other cached anchor leases frees their
+            // VRAM slots so this anchor can be decoded without failing the
+            // bucket analysis or tripping the GPU failure counter.
+            m_analysisFrames.clear();
+            lease = m_analysisGpuDecoder->acquire(anchor);
+        }
         if (!lease.ok()) {
             return failed(lease.error().message);
         }

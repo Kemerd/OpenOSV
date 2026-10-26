@@ -243,6 +243,21 @@ Result<AttitudeTrack> AttitudeTrack::build(const meta::MetadataTrack& track, con
     clock.reserve(frameCount);
     std::size_t skipped = 0;
 
+    // Under the default rigAxes reading, worldFromBodyQuat() maps from the
+    // product's IMU-mounted RFU frame (right, forward, up) into the +Z-up
+    // world.  On the Osmo 360 that frame IS the camera body frame
+    // (productMount == identity).  On the Avata 360 the IMU lives in the
+    // aircraft frame while the lens extrinsics place the master lens (+Y)
+    // down and the nose at -Z (productMount: right -X, forward -Z, up -Y),
+    // so post-multiplying by productMount^T maps body -> mounted -> world.
+    const Quatd mountedFromBody =
+        options.conv.rigAxes ? Quatd::fromMatrix(productMount(track.schema()).transposed()).normalized()
+                             : Quatd::identity();
+    const auto decodeSampleQuat = [&](const meta::Quaternion& q) noexcept -> Quatd {
+        const Quatd wFromMounted = worldFromBodyQuat(q, options.conv);
+        return options.conv.rigAxes ? (wFromMounted * mountedFromBody).normalized() : wFromMounted;
+    };
+
     for (std::uint32_t i = 0; i < frameCount; ++i) {
         const Result<meta::FrameMeta> frameResult = track.frame(i);
         if (!frameResult.ok()) {
@@ -257,13 +272,17 @@ Result<AttitudeTrack> AttitudeTrack::build(const meta::MetadataTrack& track, con
             const meta::ImuBatch& batch = frame.imu->current;
             clock.push_back(ClockObservation{frameTs, static_cast<double>(batch.ts), batch.q.size()});
             if (dense) {
+                // A single-quaternion batch (IMU_single_attitude_after_fusion) is
+                // already anchored at the frame's exposure timestamp; a multi-sample
+                // batch aligns its exposure anchor at batchAnchorIndex.
+                const double anchor = (batch.q.size() == 1) ? 0.0 : static_cast<double>(options.batchAnchorIndex);
                 for (std::size_t s = 0; s < batch.q.size(); ++s) {
                     if (!batch.q[s].present) {
                         continue;
                     }
-                    const double t = frameTs + (static_cast<double>(s) - options.batchAnchorIndex) * samplePeriodUs +
+                    const double t = frameTs + (static_cast<double>(s) - anchor) * samplePeriodUs +
                                      options.extraOffsetUs;
-                    samples.push_back(Sample{t, worldFromBodyQuat(batch.q[s], options.conv)});
+                    samples.push_back(Sample{t, decodeSampleQuat(batch.q[s])});
                 }
                 continue;
             }
@@ -272,16 +291,37 @@ Result<AttitudeTrack> AttitudeTrack::build(const meta::MetadataTrack& track, con
             // the track has no hole.
             if (frame.camera.attitude.present) {
                 samples.push_back(Sample{frameTs + options.extraOffsetUs,
-                                         worldFromBodyQuat(frame.camera.attitude, options.conv)});
+                                         decodeSampleQuat(frame.camera.attitude)});
             } else {
                 ++skipped;
             }
             continue;
         }
 
-        // Sparse mode: one sample per frame at the frame timestamp.
+        // Sparse mode: one sample per frame at the frame timestamp.  When the
+        // camera writes no per-frame camera_attitude (Avata 360 firmware
+        // 01.00.02..01.00.06), take the exposure-anchor quaternion from the
+        // frame's fused IMU batch instead.
         if (frame.camera.attitude.present) {
-            samples.push_back(Sample{frameTs, worldFromBodyQuat(frame.camera.attitude, options.conv)});
+            samples.push_back(Sample{frameTs, decodeSampleQuat(frame.camera.attitude)});
+        } else if (frame.imu.has_value() && frame.imu->current.present && !frame.imu->current.q.empty()) {
+            const auto& qList = frame.imu->current.q;
+            const std::size_t anchorIdx =
+                std::min<std::size_t>(static_cast<std::size_t>(options.batchAnchorIndex), qList.size() - 1);
+            const meta::Quaternion* chosen = qList[anchorIdx].present ? &qList[anchorIdx] : nullptr;
+            if (!chosen) {
+                for (const meta::Quaternion& candidate : qList) {
+                    if (candidate.present) {
+                        chosen = &candidate;
+                        break;
+                    }
+                }
+            }
+            if (chosen) {
+                samples.push_back(Sample{frameTs, decodeSampleQuat(*chosen)});
+            } else {
+                ++skipped;
+            }
         } else {
             ++skipped;
         }

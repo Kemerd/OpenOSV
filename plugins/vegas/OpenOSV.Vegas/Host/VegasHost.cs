@@ -8,6 +8,7 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Threading;
 using System.Windows.Forms;
 using OpenOSV.Vegas.Core;
 using ScriptPortal.Vegas;
@@ -32,6 +33,20 @@ namespace OpenOSV.Vegas.Host
     {
         /// <summary>The VEGAS instance handed to the module (null before initialisation).</summary>
         public static ScriptPortal.Vegas.Vegas App { get; set; }
+
+        /// <summary>
+        /// Ensures the VEGAS main STA UI thread retains a valid
+        /// <see cref="WindowsFormsSynchronizationContext"/> and disables
+        /// <see cref="WindowsFormsSynchronizationContext.AutoInstall"/> so
+        /// WinForms modal dialog loops never downgrade the main thread's
+        /// synchronization context to a plain thread-pool context.
+        /// </summary>
+        public static void EnsureUiSynchronizationContext()
+        {
+            // Delegate to the module-level helper so startup and modal dialog
+            // boundaries enforce the exact same STA synchronization invariant.
+            OpenOsvModule.PinUiSynchronizationContext();
+        }
 
         /// <summary>The active project, or null.</summary>
         public static Project Project
@@ -446,14 +461,31 @@ namespace OpenOSV.Vegas.Host
         /// </summary>
         public static int? SkinColor(string colorName)
         {
+            // Never touch VEGAS's Apartment-threaded COM object from a background
+            // MTA worker thread; QueryInterface on IVegasCOM has no proxy/stub
+            // and would fail with E_NOINTERFACE (0x80004002).
+            if (string.IsNullOrEmpty(colorName) ||
+                Thread.CurrentThread.GetApartmentState() != ApartmentState.STA)
+            {
+                return null;
+            }
             try
             {
-                object com = App is null ? null : (object)ScriptPortal.Vegas.Vegas.COM;
+                // Resolve COM and IVegasCOM through the host's own ScriptPortal.Vegas
+                // assembly rather than a compile-time ComImport token.
+                Type vegasType = App?.GetType();
+                if (vegasType is null)
+                {
+                    return null;
+                }
+                PropertyInfo comProp = vegasType.GetProperty("COM", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                object com = comProp?.GetValue(null, null);
                 if (com is null)
                 {
                     return null;
                 }
-                MethodInfo m = typeof(IVegasCOM).GetMethod("GetAppSkinColor");
+                Type comInterface = vegasType.Assembly.GetType("ScriptPortal.Vegas.IVegasCOM", false);
+                MethodInfo m = comInterface?.GetMethod("GetAppSkinColor");
                 if (m is null)
                 {
                     return null;

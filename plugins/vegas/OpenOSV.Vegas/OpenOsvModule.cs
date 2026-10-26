@@ -21,6 +21,8 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Threading;
+using System.Windows.Forms;
 using OpenOSV.Vegas.Actions;
 using OpenOSV.Vegas.Core;
 using OpenOSV.Vegas.Host;
@@ -40,11 +42,60 @@ namespace OpenOSV.Vegas
 
         /// <summary>
         /// Runs before anything touches OpenOSV.Vegas.Core: installs the fallback
-        /// that finds Core beside this assembly (see <see cref="CoreResolver"/>).
+        /// that finds Core beside this assembly (see <see cref="CoreResolver"/>)
+        /// and pins a persistent <see cref="WindowsFormsSynchronizationContext"/>
+        /// on VEGAS's main STA thread so WinForms modal loops never replace it
+        /// with a thread-pool <see cref="SynchronizationContext"/>.
         /// </summary>
         static OpenOsvModule()
         {
+            // Install the assembly resolver first before any type referencing
+            // OpenOSV.Vegas.Core is JIT-compiled.
             CoreResolver.Install();
+
+            // Pin the WinForms UI SynchronizationContext on the main STA thread
+            // immediately at module load time so co-installed extensions (such
+            // as Vegasaur) never capture a plain thread-pool SynchronizationContext.
+            PinUiSynchronizationContext();
+        }
+
+        /// <summary>
+        /// Ensures the VEGAS main STA thread owns a permanent
+        /// <see cref="WindowsFormsSynchronizationContext"/> with
+        /// <see cref="WindowsFormsSynchronizationContext.AutoInstall"/> disabled.
+        /// </summary>
+        internal static void PinUiSynchronizationContext()
+        {
+            try
+            {
+                // Never install a WinForms marshaling context on a background MTA
+                // worker thread; only the host's main STA UI thread pumps messages.
+                if (Thread.CurrentThread.GetApartmentState() != ApartmentState.STA)
+                {
+                    return;
+                }
+
+                // Disable WinForms AutoInstall before creating or closing any modal
+                // Form. In a native host like VEGAS Pro (where Application.MessageLoop
+                // is false), ThreadContext.RunMessageLoopInner's finally block calls
+                // WindowsFormsSynchronizationContext.Uninstall(false) when AutoInstall
+                // is true, which replaces SynchronizationContext.Current with a plain
+                // System.Threading.SynchronizationContext whose Post() dispatches to
+                // ThreadPool MTA threads and breaks STA-only COM RCWs (IVegasCOM,
+                // IDockWindow) in extensions like Vegasaur.
+                WindowsFormsSynchronizationContext.AutoInstall = false;
+
+                // Install a genuine WindowsFormsSynchronizationContext if none is
+                // active or if a previous modal loop downgraded it to a base context.
+                if (!(SynchronizationContext.Current is WindowsFormsSynchronizationContext))
+                {
+                    SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
+                }
+            }
+            catch (Exception)
+            {
+                // Guard against any unexpected host threading state during startup.
+            }
         }
 
         /// <summary>Called by VEGAS once, at start-up.</summary>
@@ -52,6 +103,9 @@ namespace OpenOSV.Vegas
         {
             Guard.Quietly("initialising the OpenOSV extension", () =>
             {
+                // Re-verify that the main UI thread still holds its WinForms
+                // SynchronizationContext before touching any UI or theme helpers.
+                VegasHost.EnsureUiSynchronizationContext();
                 VegasHost.App = vegas;
                 Theme.Refresh();
                 Log.Info("OpenOSV for VEGAS " + typeof(OpenOsvModule).Assembly.GetName().Version + " loaded into " +

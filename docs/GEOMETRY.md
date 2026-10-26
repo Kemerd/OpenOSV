@@ -179,8 +179,11 @@ levelling. An airborne clip measures its flight, not gravity, and is reported
 without a verdict. `--attitude-convention` still exposes the 16 plain
 readings (order x sense x up in {y, z, ny, nz}) and each with `-rig`; pitch
 and roll dynamics beyond a car's are not yet verified against image truth.
-The Avata 360's stored attitude has no verified reading at all (the default
-one levels its world upside down; `docs/FORMAT.md`), so `auto` and the
-plug-ins leave stabilisation off on it and place the view in the aircraft's
-frame (`productMount`) instead; an explicit `--attitude-convention` builds
-the track regardless.
+On the Avata 360, the IMU records the aircraft frame (`world <- aircraft`)
+while the lens extrinsics are in the camera body frame (`aircraft <- body` is
+`productMount(Avata360)^T`, a 90° x 90° rotation that no pure axis-relabelling
+conjugation `K * R * K^T` can express, which is why testing the 16 conventions
+alone left up 141° or 36° off). `AttitudeTrack::build` right-multiplies by
+`productMount(schema)^T` when `rigAxes` is set (`R_wb = R_aircraft * M^T`), so
+`levellingMount` and all five stabilisation modes work with the aircraft's
+stored attitude (`docs/FORMAT.md`).

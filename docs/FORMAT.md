@@ -119,13 +119,14 @@ attitude track and levels about the body's horizontal axis instead
 looks at the ground and the aircraft's nose is the body's -Z (both measured
 against DJI Studio's default view of a recorded clip), so before any attitude
 is read the view is placed in that frame (`productMount`: right -X, forward
--Z, up -Y) and faces forward with the sky up. Its stored attitude has no
-verified reading yet: on the one clip measured, the default reading put up
-141 degrees from the true up and no component order or sign came within 36
-degrees, so the plug-ins and `osvtool`'s `auto` leave stabilisation off on it
-(`attitudeReadingVerified`) rather than level the world upside down.
-`osvtool --attitude-convention <reading>` still builds the track, which is how
-a reading gets verified.
+-Z, up -Y) and faces forward with the sky up. Because the aircraft's IMU
+records the attitude of the mounted aircraft frame (`world <- aircraft`) while
+the lens extrinsics live in the camera body frame (`aircraft <- body` is
+`productMount(Avata360)^T`), `AttitudeTrack::build` post-multiplies the stored
+rig-axes quaternion by `productMount(schema)^T` (`R_wb = R_aircraft * M^T`),
+which aligns `R_wb * M = R_aircraft` across all five stabilisation modes and
+keeps the body's up vector on `(0, -1, 0)` for `levellingMount` and scene-light
+sky sampling.
 
 ### Calibration sets and lens accessories
 

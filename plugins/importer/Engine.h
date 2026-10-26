@@ -27,6 +27,8 @@
 
 namespace osv::premiere {
 
+class ImporterInstance;
+
 // ---- [WP-SETTINGS] Source Settings publication ------------------------------
 
 /// Who is publishing a clip's Source Settings.
@@ -69,6 +71,31 @@ void enginePublishPrefs(const std::filesystem::path& path, const PrefsBlob& pref
 /// path, where nothing is kept).  A new .LRF proxy starts from its .OSV's
 /// settings this way, so switching to the proxy does not change the picture.
 [[nodiscard]] bool enginePublishedPrefs(const std::filesystem::path& path, PrefsBlob& out) noexcept;
+
+/// Return the Source Settings explicitly translated for `path` by OpenOSV
+/// Source Settings (`OsvEngine_PublishSourceSettings`) during this session,
+/// or false when only default/host-initialised settings have been published.
+/// When Premiere opens a second `ImporterInstance` of the same clip after a
+/// Source Settings edit or for export, `imOpenFile8` adopts these settings
+/// immediately so a missing or stale `info->prefs` block cannot revert the clip.
+[[nodiscard]] bool engineSourceSettingsPrefs(const std::filesystem::path& path, PrefsBlob& out) noexcept;
+
+/// Register a newly constructed ImporterInstance in the live-instance table
+/// so OsvEngine_PublishSourceSettings can locate it synchronously when the
+/// user changes a control in OpenOSV Source Settings.
+void engineRegisterInstance(ImporterInstance* instance) noexcept;
+
+/// Remove an ImporterInstance from the live-instance table on destruction.
+void engineUnregisterInstance(ImporterInstance* instance) noexcept;
+
+/// Record the opaque host prefs buffer pointer (`info->prefs`) associated
+/// with `instance` in `imGetInfo8` (`syncClipPrefsBlock`), and mark
+/// `instance` as the most recently active Source Settings clip instance.
+void engineBindPrefsBuffer(ImporterInstance* instance, const void* prefsPC) noexcept;
+
+/// Mark `instance` as the clip instance most recently queried by
+/// `imPerformSourceSettingsCommand` (`PF_Cmd_SEQUENCE_SETUP`).
+void engineNoteSourceSettingsInstance(ImporterInstance* instance) noexcept;
 
 // ---- [/WP-SETTINGS] ---------------------------------------------------------
 

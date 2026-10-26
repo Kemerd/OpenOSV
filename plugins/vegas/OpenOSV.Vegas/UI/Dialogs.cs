@@ -234,6 +234,10 @@ namespace OpenOSV.Vegas.UI
         /// <summary>Show a message, modal to VEGAS.  Never throws.</summary>
         public static void Show(IWin32Window owner, string title, string text, MessageKind kind)
         {
+            // Ensure the main STA thread keeps its WindowsFormsSynchronizationContext
+            // across the modal ShowDialog loop so co-installed extensions are not
+            // left with a plain System.Threading.SynchronizationContext.
+            OpenOsvModule.PinUiSynchronizationContext();
             try
             {
                 using (var dlg = new MessageDialog(title, text, kind))
@@ -254,6 +258,10 @@ namespace OpenOSV.Vegas.UI
                 {
                     // Nothing left to show it with; the log has it.
                 }
+            }
+            finally
+            {
+                OpenOsvModule.PinUiSynchronizationContext();
             }
         }
 
@@ -385,11 +393,19 @@ namespace OpenOSV.Vegas.UI
                 }
                 if (!done)
                 {
-                    using (var dlg = new ProgressDialog(title, progress, cancel))
+                    OpenOsvModule.PinUiSynchronizationContext();
+                    try
                     {
-                        dlg.CentreOn(owner);
-                        task.ContinueWith(_ => dlg.FinishFromWorker(), TaskScheduler.Default);
-                        dlg.ShowDialog(owner);
+                        using (var dlg = new ProgressDialog(title, progress, cancel))
+                        {
+                            dlg.CentreOn(owner);
+                            task.ContinueWith(_ => dlg.FinishFromWorker(), TaskScheduler.Default);
+                            dlg.ShowDialog(owner);
+                        }
+                    }
+                    finally
+                    {
+                        OpenOsvModule.PinUiSynchronizationContext();
                     }
                 }
                 try

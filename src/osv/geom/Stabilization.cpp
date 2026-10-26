@@ -159,6 +159,10 @@ Mat3d levelledFromView(const Mat3d& basis, const Mat3d& rWorldFromSource,
 Mat3d stabilizationBodyFromWorld(const Quatd& worldFromBody, const StabilizationParams& params,
                                  const Quatd& reference, const Vec3d& worldUp,
                                  const std::optional<Quatd>& smoothed) noexcept {
+    // A mount that is not a proper rotation (a corrupt caller) is ignored;
+    // on the Osmo 360 this is the identity, and on the Avata 360 it is the
+    // nose-forward, sky-up product frame.
+    const Mat3d mount = isRotation(params.mount) ? params.mount : Mat3d::identity();
     if (!worldFromBody.isFinite() || !reference.isFinite()) {
         return Mat3d::identity();
     }
@@ -168,19 +172,20 @@ Mat3d stabilizationBodyFromWorld(const Quatd& worldFromBody, const Stabilization
 
     switch (params.mode) {
     case StabilizationMode::Off:
-        return Mat3d::identity();
+        return mount;
 
     case StabilizationMode::Full:
-        // View rays live in the reference body frame: to world, then into
-        // the current body.
-        return rBw * rRef;
+        // View rays live in the reference mounted frame: into the reference
+        // body, to world, then into the current body.
+        return (rBw * rRef) * mount;
 
     case StabilizationMode::Smooth: {
         if (!smoothed.has_value() || !smoothed->isFinite()) {
-            return Mat3d::identity();
+            return mount;
         }
-        // View rays live in the smoothed body frame.
-        return rBw * smoothed->normalized().toMatrix();
+        // View rays live in the smoothed mounted frame: into the smoothed
+        // body, to world, then into the current body.
+        return (rBw * smoothed->normalized().toMatrix()) * mount;
     }
 
     case StabilizationMode::HorizonLock:
@@ -188,15 +193,13 @@ Mat3d stabilizationBodyFromWorld(const Quatd& worldFromBody, const Stabilization
         // The levelling works in the mounted frame (levellingMount): every
         // pose is taken as world <- body <- mounted, and the result mapped
         // back into the body at the end.  An identity mount - every Osmo 360
-        // clip - makes this exactly the unmounted computation.  A mount that
-        // is not a proper rotation (a corrupt caller) is ignored.
-        const Mat3d mount = isRotation(params.mount) ? params.mount : Mat3d::identity();
+        // clip - makes this exactly the unmounted computation.
         const Mat3d rWm = rWb * mount;
         const Mat3d rRefM = rRef * mount;
         // World basis with the reference heading as forward and true up as up.
         Mat3d basis;
         if (!referenceHorizonBasis(worldUp, rRefM, basis)) {
-            return Mat3d::identity();
+            return mount;
         }
         // The pose whose level part the view keeps.  HorizonLock levels the
         // body itself, so the heading carries the body's yaw shake.
@@ -215,7 +218,7 @@ Mat3d stabilizationBodyFromWorld(const Quatd& worldFromBody, const Stabilization
         return mount * (rLevelledFromMounted.transposed() * rLevelledFromView);
     }
     }
-    return Mat3d::identity();
+    return mount;
 }
 
 // -----------------------------------------------------------------------------
@@ -276,9 +279,11 @@ Mat3d productMount(meta::DjmdSchema schema) noexcept {
 }
 
 bool attitudeReadingVerified(meta::DjmdSchema schema) noexcept {
-    // Only the Osmo 360's reading has been levelled against footage
-    // (the car and airborne clips).  An unknown value is unverified too.
-    return schema == meta::DjmdSchema::Osmo360;
+    // Both the Osmo 360 and the Avata 360 write their fused IMU attitude
+    // batches in the same library frame (`IMU_attitude_after_fusion`, read
+    // with `rigAxes = true` and world `+Z` up).  Only an unknown out-of-range
+    // schema is unverified.
+    return schema == meta::DjmdSchema::Osmo360 || schema == meta::DjmdSchema::Avata360;
 }
 
 // -----------------------------------------------------------------------------

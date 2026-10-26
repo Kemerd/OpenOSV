@@ -1063,10 +1063,16 @@ csSDK_int32 handleGetIndPixelFormat(imStdParms* stdParms, csSDK_int32 index, imI
     // the defaults - which is also what an instance-less enumeration during
     // project load describes.
     PrefsBlob prefs = PrefsBlob::defaults();
-    if (rec->prefs) {
+    ImporterInstance* instance = instanceFromHandle(
+        rec->privatedata, stdParms && stdParms->piSuites ? stdParms->piSuites->memFuncs : nullptr);
+    if (instance && instance->hasSourceSettingsPrefs()) {
+        // When OpenOSV Source Settings has published live controls directly to
+        // this instance, prefer `instance->prefs()` over a potentially stale
+        // `rec->prefs` host buffer.
+        prefs = instance->prefs();
+    } else if (rec->prefs) {
         prefs = PrefsBlob::fromBytes(rec->prefs, PrefsBlob::kSize);
-    } else if (ImporterInstance* instance = instanceFromHandle(
-                   rec->privatedata, stdParms && stdParms->piSuites ? stdParms->piSuites->memFuncs : nullptr)) {
+    } else if (instance) {
         prefs = instance->prefs();
     }
     const OfferedFormats offered = offeredFormatsFor(prefs);
@@ -1272,10 +1278,13 @@ csSDK_int32 handleGetSourceVideo(imStdParms* stdParms, imSourceVideoRec* rec) {
     // lock, then apply it inside the lock together with the render, so the
     // bytes that key the cache entry are exactly the bytes the renderer used
     // even when another thread changes the settings in between.
-    // A request that carries no prefs must NOT reset the clip's settings to
-    // the defaults - fromBytes() would do exactly that - so the instance's
-    // current blob is used instead.
-    const bool haveHostPrefs = rec->prefs != nullptr && rec->prefsSize >= static_cast<csSDK_int32>(PrefsBlob::kSize);
+    // A request that carries no prefs, or carries a stale host buffer after
+    // OpenOSV Source Settings has already pushed live control values directly
+    // to this instance (`hasSourceSettingsPrefs()`), must NOT reset the clip's
+    // settings - so the instance's current blob is used instead.
+    const bool haveHostPrefs = !instance->hasSourceSettingsPrefs() &&
+                               rec->prefs != nullptr &&
+                               rec->prefsSize >= static_cast<csSDK_int32>(PrefsBlob::kSize);
     const PrefsBlob prefs = haveHostPrefs
                                 ? PrefsBlob::fromBytes(rec->prefs, static_cast<std::size_t>(rec->prefsSize))
                                 : instance->prefs();

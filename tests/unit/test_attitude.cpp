@@ -948,9 +948,11 @@ TEST_CASE("A lens-up / lens-down rig levels with a steady heading", "[attitude][
     // attitude is read, while the Osmo 360's is the identity.
     REQUIRE(flippedMount.distance(productMount(meta::DjmdSchema::Avata360)) < 1e-12);
     REQUIRE(productMount(meta::DjmdSchema::Osmo360).distance(Mat3d::identity()) == 0.0);
-    // Only the Osmo 360's stored attitude has a verified reading.
+    // Both the Osmo 360 and the Avata 360 share the verified rigAxes IMU reading;
+    // an unknown schema remains unverified.
     REQUIRE(attitudeReadingVerified(meta::DjmdSchema::Osmo360));
-    REQUIRE_FALSE(attitudeReadingVerified(meta::DjmdSchema::Avata360));
+    REQUIRE(attitudeReadingVerified(meta::DjmdSchema::Avata360));
+    REQUIRE_FALSE(attitudeReadingVerified(static_cast<meta::DjmdSchema>(99)));
 }
 
 TEST_CASE("A lenses-level rig keeps the unmounted levelling exactly", "[attitude][stab]") {

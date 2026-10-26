@@ -456,6 +456,10 @@ TEST_CASE("every stabilisation mode reaches the engine's frame, Smooth + Horizon
     // so a change of rule shows up in this mirror as well as in the engine.
     osv::geom::AttitudeTrack::Options attOpt;
     osv::geom::ConventionProbe::autoDetect(track.value()).applyTo(attOpt);
+    // Match ImporterInstance::rebuildStabilization(), which low-passes the
+    // 1 kHz IMU batches at kStabilisationVibrationCutoffHz (12 Hz) and smooths
+    // the per-frame orientation sequence.
+    attOpt.vibrationCutoffHz = osv::geom::kStabilisationVibrationCutoffHz;
     REQUIRE(attOpt.conv.rigAxes);
     REQUIRE(attOpt.conv.sense == osv::geom::AttitudeSense::WorldToBody);
     REQUIRE(attOpt.conv.up == osv::geom::WorldUp::Z);
@@ -465,10 +469,7 @@ TEST_CASE("every stabilisation mode reaches the engine's frame, Smooth + Horizon
     const osv::geom::AttitudeTrack& attitude = built.value();
     REQUIRE(attitude.sampleCount() > 0);
     const osv::Quatd reference = attitude.worldFromBody(attitude.beginUs());
-    std::vector<osv::Quatd> perSample;
-    for (const auto& s : attitude.samples()) {
-        perSample.push_back(s.worldFromBody);
-    }
+    const std::vector<osv::Quatd> perSample = attitude.perFrame(track.value());
     const std::vector<osv::Quatd> smoothed =
         osv::geom::Smoother(osv::geom::StabilizationParams{}.smoothSigmaFrames).smooth(perSample);
 

@@ -26,6 +26,7 @@
 #include "ImporterPlugin.h"
 
 #include "CalibrationUi.h"
+#include "Engine.h"
 #include "ImporterInstance.h"
 
 #include "HostUtf16.h"
@@ -1342,12 +1343,25 @@ void syncClipPrefsBlock(imStdParms* stdParms, imFileInfoRec8* info, ImporterInst
     // 128 bytes.  applyPrefs ignores a block that is not ours, such as the
     // zero-filled one of a clip with no settings yet.
     if (info->prefs) {
+        const bool validBlock = holdsOurBlob(info->prefs);
         // Logged on every call (debug): whether the host kept the block it
         // was handed is the one thing a session log has to show.
         PluginLog::debug("imGetInfo8: '{}': the host holds a settings block for the clip ({})",
                          clipNameForLog(instance),
-                         holdsOurBlob(info->prefs) ? "ours, applied" : "not ours, the clip keeps its settings");
-        instance.applyPrefs(info->prefs, PrefsBlob::kSize);
+                         validBlock ? "ours, applied" : "not ours, the clip keeps its settings");
+        // Bind the opaque host prefs buffer address to this instance so
+        // PF_Cmd_TRANSLATE_PARAMS_TO_PREFS (OsvEngine_PublishSourceSettings)
+        // can identify and update this clip synchronously.
+        engineBindPrefsBuffer(&instance, info->prefs);
+        if (instance.hasSourceSettingsPrefs() && validBlock) {
+            // OpenOSV Source Settings has pushed newer settings directly to
+            // this instance; mirror them back into the host's 128-byte block
+            // rather than letting a stale host buffer overwrite the instance.
+            const PrefsBlob current = instance.prefs();
+            std::memcpy(info->prefs, &current, PrefsBlob::kSize);
+        } else {
+            instance.applyPrefs(info->prefs, PrefsBlob::kSize);
+        }
         return;
     }
 
@@ -1356,6 +1370,7 @@ void syncClipPrefsBlock(imStdParms* stdParms, imFileInfoRec8* info, ImporterInst
     // =======================================================================
     // The clip decodes with what it was seeded with (the user defaults, or
     // its original's settings for a proxy) - unchanged from every release.
+    engineNoteSourceSettingsInstance(&instance);
     instance.applyPrefs(nullptr, 0u);
 
     // The SDK guide describes one way the block comes to exist: Premiere
@@ -1397,6 +1412,9 @@ void syncClipPrefsBlock(imStdParms* stdParms, imFileInfoRec8* info, ImporterInst
     std::memcpy(block, &current, PrefsBlob::kSize);
     // The host owns the block from here and frees it with the clip.
     info->prefs = block;
+    // Record the newly allocated block's opaque address on the instance so
+    // OsvEngine_PublishSourceSettings can match extra->prefsPC back to it.
+    engineBindPrefsBuffer(&instance, block);
     // Once per clip at info level (the line the morning check looks for) ...
     PluginLog::oncef("clip-prefs-block-" + clipNameForLog(instance), PluginLog::Level::Info,
                      "imGetInfo8: '{}' had no stored Source Settings; gave the host a {}-byte settings block holding "
@@ -1496,6 +1514,7 @@ csSDK_int32 handlePerformSourceSettingsCommand(imStdParms* stdParms, imFileAcces
     // There IS a live clip, and it is the only party that knows what the
     // media is actually being decoded with, so its blob wins.  This is what
     // makes the panel show "as shot" after a project reopen.
+    engineNoteSourceSettingsInstance(instance);
     const PrefsBlob current = instance->prefs();
     std::memcpy(rec->ioData, &current, PrefsBlob::kSize);
     // [WP-DEFAULTS] For a NEW clip that blob is the user defaults the

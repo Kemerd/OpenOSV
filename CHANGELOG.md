@@ -6,6 +6,18 @@ All notable changes to OpenOSV are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-10-25
+
+Fixes for VEGAS Pro third-party extensions, Avata 360 stabilisation, Source Settings live sync and 8K exports in Premiere Pro and DaVinci Resolve.
+
+### Fixed
+
+* **Third-party VEGAS Pro extensions such as Vegasaur no longer fail with `E_NOINTERFACE` (`IVegasCOM` / `IDockWindow`) when OpenOSV is installed (#10).** WinForms' default `WindowsFormsSynchronizationContext.AutoInstall` replaces the thread's `SynchronizationContext.Current` on `Control` construction and reverts it to a plain `System.Threading.SynchronizationContext` when a modal dialog loop exits, stranding STA COM Apartment marshaling for other extensions in the process. OpenOSV now pins the UI `SynchronizationContext` with `AutoInstall = false` across initialization, command callbacks and modal dialogs.
+* **Changing a control in the OpenOSV Source Settings effect updates the live clip and exports immediately, including when returning a control to its default (#9).** All value controls in `OpenOSVSourceSettings.aex` are now supervised and publish the translated `PrefsBlob` synchronously to the importer's live instances and direct-GPU engine via `OsvEngine_PublishSourceSettings` before Premiere re-instantiates the effect or opens a second importer instance for export.
+* **8K 50 fps exports and seam analysis no longer exhaust NVDEC's VRAM cache slots and fall back to software decoding (#8, #9).** Automatic VRAM budgets now reserve at least four dual-lens cache slots when free device memory allows, and `ImporterInstance::anchorPairLocked` releases older cached analysis frame leases before retrying when all slots are pinned by multi-bucket lookahead.
+* **OpenOSV Source in DaVinci Resolve now uses the NVDEC + CUDA own-GPU pipeline by default (#7, #8, #9).** Resolve's OpenFX generator host hands CPU output buffers even on CUDA timelines; enabling the own-GPU path for `HostProfile::Resolve` keeps decoding, stitching and reframing on the GPU and downloads only the finished output window.
+* **Stabilisation now works on DJI Avata 360 clips (#7).** The Avata 360's IMU records the attitude of the aircraft frame while its lens extrinsics sit in the camera body frame (`productMount(Avata360)^T`); `AttitudeTrack::build` now post-multiplies the stored rig-axes quaternion by `productMount(schema)^T` (`R_wb = R_aircraft * M^T`), `attitudeReadingVerified(Avata360)` is enabled, `stabilizationBodyFromWorld` applies the mount across all five stabilisation modes, and `CalibrationSelector::choose` counts `native_refine_far` as a native calibration set.
+
 ## [0.6.3] - 2026-10-13
 
 An edit in the Source Settings effect now stays made.

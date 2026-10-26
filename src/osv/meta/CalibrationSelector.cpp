@@ -528,8 +528,12 @@ Result<CalibrationSelection> CalibrationSelector::choose(const StreamMeta& strea
     sel.used = setIdOf(sel.set).value_or(CalibrationSetId::NativeRefine);
 
     // ---- did the wanted accessory set actually get used? ------------------
+    // NativeRefineFar is the Avata 360's only native set (slots 3/4), so
+    // falling back to it when an accessory was requested is still a fallback
+    // to native.
     const bool farPreset = sel.used >= CalibrationSetId::Far07;
-    const bool nativeUsed = sel.used == CalibrationSetId::NativeRefine || sel.used == CalibrationSetId::Native;
+    const bool nativeUsed = sel.used == CalibrationSetId::NativeRefine || sel.used == CalibrationSetId::Native ||
+                            sel.used == CalibrationSetId::NativeRefineFar;
     sel.fellBack = !farPreset && nativeUsed &&
                    (sel.wanted == ExtriLensMode::LensGuards || sel.wanted == ExtriLensMode::Underwater);
 

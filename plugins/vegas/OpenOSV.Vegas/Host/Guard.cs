@@ -39,6 +39,10 @@ namespace OpenOSV.Vegas.Host
             {
                 return;
             }
+            // Pin the WinForms SynchronizationContext before running any UI or
+            // modal dialog work, and restore it in finally in case a dialog loop
+            // attempted to uninstall it.
+            VegasHost.EnsureUiSynchronizationContext();
             try
             {
                 body();
@@ -56,6 +60,10 @@ namespace OpenOSV.Vegas.Host
                     Log.Error("showing the error dialog failed too", inner);
                 }
             }
+            finally
+            {
+                VegasHost.EnsureUiSynchronizationContext();
+            }
         }
 
         /// <summary>Run an event handler; any exception is only logged.</summary>
@@ -65,6 +73,7 @@ namespace OpenOSV.Vegas.Host
             {
                 return;
             }
+            VegasHost.EnsureUiSynchronizationContext();
             try
             {
                 body();
@@ -72,6 +81,10 @@ namespace OpenOSV.Vegas.Host
             catch (Exception ex)
             {
                 Log.Warn(what + " failed", ex);
+            }
+            finally
+            {
+                VegasHost.EnsureUiSynchronizationContext();
             }
         }
 

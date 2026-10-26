@@ -1652,6 +1652,16 @@ Result<std::unique_ptr<GpuClipDecoder>> GpuClipDecoder::open(const std::filesyst
             if (budget == 0) {
                 const double share = static_cast<double>(freeBytes) * kDefaultBudgetFreeShare;
                 budget = std::min(kDefaultBudgetCapBytes, static_cast<std::size_t>(share));
+                // An Exact render holds the current frame's lease while
+                // applyAnalyses() decodes up to two bucket anchors in the
+                // same call (bucket - 1 and bucket), so a cache with at least
+                // 4 slots avoids evicting and re-decoding an anchor between
+                // the mesh, carve, gain and photometric passes whenever free
+                // VRAM comfortably fits 4 slots (<= 50% of free VRAM).
+                const std::size_t minComfortBytes = 4u * s.slotBytes;
+                if (budget < minComfortBytes && freeBytes >= 2u * minComfortBytes) {
+                    budget = minComfortBytes;
+                }
             }
             s.budgetBytes = budget;
             std::size_t capacity = s.slotBytes > 0 ? budget / s.slotBytes : 0;

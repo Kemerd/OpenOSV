@@ -65,6 +65,30 @@ bool enginePublishedPrefs(const std::filesystem::path& path, PrefsBlob& out) noe
     return false;
 }
 
+bool engineSourceSettingsPrefs(const std::filesystem::path& path, PrefsBlob& out) noexcept {
+    (void)path;
+    (void)out;
+    return false;
+}
+
+void engineRegisterInstance(ImporterInstance* instance) noexcept {
+    // No OsvEngine_PublishSourceSettings export in this build.
+    (void)instance;
+}
+
+void engineUnregisterInstance(ImporterInstance* instance) noexcept {
+    (void)instance;
+}
+
+void engineBindPrefsBuffer(ImporterInstance* instance, const void* prefsPC) noexcept {
+    (void)instance;
+    (void)prefsPC;
+}
+
+void engineNoteSourceSettingsInstance(ImporterInstance* instance) noexcept {
+    (void)instance;
+}
+
 void engineShutdown() noexcept {
     // No engine clips, no decoders, no device memory: nothing to release.
 }

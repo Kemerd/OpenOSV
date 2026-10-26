@@ -38,6 +38,7 @@
 #include "ImporterHarness.h"
 #include "ImporterPlugin.h"
 #include "MockHost.h"
+#include "OsvEngineAbi.h"
 
 #include "PrefsBlob.h"
 #include "SourceSettingsIdentity.h"
@@ -438,4 +439,67 @@ TEST_CASE("the selectors Premiere sends while importing a clip are answered as b
 
     // The Source Settings effect's SEQUENCE_SETUP round trip.
     CHECK(askImporter(harness, clip).isValid());
+}
+
+TEST_CASE("OsvEngine_PublishSourceSettings immediately updates the live clip and the direct-GPU engine",
+          "[importer][prefs][sourcesettings][sample]") {
+    CLIP_PREFS_REQUIRE_SAMPLE_CLIP();
+    ImporterHarness harness;
+    REQUIRE(harness.loaded());
+
+    auto clip = harness.openClip(sampleClipPath());
+    REQUIRE(clip.open());
+
+    PlugMemoryFuncsPtr mem = hostMemory(harness);
+    REQUIRE(mem);
+    REQUIRE(mem->newPtr);
+    REQUIRE(mem->disposePtr);
+
+    // 1. Premiere imports the clip: imGetInfo8 binds the host's settings block.
+    char* block = mem->newPtr(static_cast<csSDK_uint32>(PrefsBlob::kSize));
+    REQUIRE(block);
+    const PrefsBlob initial = PrefsBlob::defaults();
+    std::memcpy(block, &initial, PrefsBlob::kSize);
+    imFileInfoRec8 info{};
+    REQUIRE(harness.getInfo8WithHostPrefs(clip, info, block) == imNoErr);
+    CHECK(askImporter(harness, clip) == initial);
+
+    const HMODULE importerModule = ::GetModuleHandleW(OSV_ENGINE_MODULE_NAME);
+    REQUIRE(importerModule != nullptr);
+    const auto publishFn = reinterpret_cast<OsvEnginePublishSourceSettingsFn>(
+        ::GetProcAddress(importerModule, OSV_ENGINE_SYM_PUBLISH_SOURCE_SETTINGS));
+    const auto queryFn = reinterpret_cast<OsvEngineQuerySettingsFn>(
+        ::GetProcAddress(importerModule, OSV_ENGINE_SYM_QUERY_SETTINGS));
+    REQUIRE(publishFn != nullptr);
+    REQUIRE(queryFn != nullptr);
+
+    // 2. The user edits controls in Effect Controls -> PF_Cmd_TRANSLATE_PARAMS_TO_PREFS
+    //    writes into `block` (extra->prefsPC) and calls OsvEngine_PublishSourceSettings,
+    //    followed 1 ms later by a cloned effect instance sending PF_Cmd_SEQUENCE_SETUP
+    //    -> imPerformSourceSettingsCommand (without imGetSourceVideo ever running).
+    const PrefsBlob edited = someStoredSettings();
+    std::memcpy(block, &edited, PrefsBlob::kSize);
+    REQUIRE(publishFn(block, &edited, static_cast<std::uint32_t>(PrefsBlob::kSize)) == OSV_ENGINE_OK);
+
+    // Both imPerformSourceSettingsCommand and OsvEngine_QuerySettings must
+    // immediately report the user's edited settings.
+    CHECK(askImporter(harness, clip) == edited);
+    OsvEngineClipSettings engineSettings{};
+    engineSettings.structSize = sizeof(engineSettings);
+    REQUIRE(queryFn(sampleClipPath().wstring().c_str(), &engineSettings, nullptr, 0) == OSV_ENGINE_OK);
+    CHECK(engineSettings.colorOutput == edited.colorOutput);
+    CHECK(engineSettings.stabilization == edited.stabilization);
+    CHECK(engineSettings.exposureStops == edited.exposureStops);
+
+    // 3. The user resets the controls back to built-in defaults: the reset must
+    //    also propagate immediately instead of reverting to `edited`.
+    std::memcpy(block, &initial, PrefsBlob::kSize);
+    REQUIRE(publishFn(block, &initial, static_cast<std::uint32_t>(PrefsBlob::kSize)) == OSV_ENGINE_OK);
+    CHECK(askImporter(harness, clip) == initial);
+    REQUIRE(queryFn(sampleClipPath().wstring().c_str(), &engineSettings, nullptr, 0) == OSV_ENGINE_OK);
+    CHECK(engineSettings.colorOutput == initial.colorOutput);
+    CHECK(engineSettings.stabilization == initial.stabilization);
+    CHECK(engineSettings.exposureStops == initial.exposureStops);
+
+    mem->disposePtr(block);
 }

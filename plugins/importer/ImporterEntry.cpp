@@ -330,9 +330,18 @@ csSDK_int32 doOpenFile8(imStdParms* stdParms, imFileRef* fileRef, imFileOpenRec8
         // attached proxy, and a proxy on other settings (another stabilisation,
         // another colour output) changes the picture whenever proxies are
         // switched on.
+        PrefsBlob effectPrefs;
         PrefsBlob originalPrefs;
         const std::filesystem::path original = ImporterInstance::proxyOriginalFor(std::filesystem::path(path));
-        if (!original.empty() && enginePublishedPrefs(original, originalPrefs)) {
+        if (engineSourceSettingsPrefs(std::filesystem::path(path), effectPrefs)) {
+            // Premiere opens a new ImporterInstance of the clip on every
+            // Source Settings change and for export; adopt the settings most
+            // recently translated by OpenOSV Source Settings for this file so
+            // a missing or stale info->prefs block cannot revert the clip.
+            instance->applyPrefsFromSourceSettings(effectPrefs);
+            PluginLog::info("open '{}': starts from the live Source Settings of this file",
+                            std::filesystem::path(path).filename().string());
+        } else if (!original.empty() && enginePublishedPrefs(original, originalPrefs)) {
             instance->seedStartingPrefs(originalPrefs, std::string());
             PluginLog::info("proxy: '{}' starts from the Source Settings of '{}'",
                             std::filesystem::path(path).filename().string(), original.filename().string());

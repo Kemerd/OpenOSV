@@ -43,10 +43,11 @@
 // ===========================================================================
 //  Who takes the frame (the policy)
 // ===========================================================================
-// By default the own-GPU path serves ONLY hostProfile() == HostProfile::Vegas;
-// under DaVinci Resolve and every other host the effects behave exactly as
-// before it existed (Resolve keeps its CUDA-image filter path and the CPU
-// framing).  The environment variable OPENOSV_OFX_GPU overrides that for
+// By default the own-GPU path serves HostProfile::Vegas and HostProfile::Resolve
+// whenever the host hands CPU images (in Resolve, OpenOSV Source always receives
+// CPU images because OpenFX 1.5 CUDA render is only used by the Reframe filter
+// when Resolve passes device buffers).  Under generic / mock hosts the effects
+// keep the CPU framing unless OPENOSV_OFX_GPU overrides that for
 // every host: "0" / "off" / "false" / "no" switch the path off everywhere,
 // "1" / "on" / "true" / "yes" switch it on everywhere (how the tests drive it
 // through the mock host).  It is read on every call, so a test - or a user

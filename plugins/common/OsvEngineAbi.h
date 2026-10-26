@@ -178,6 +178,24 @@ typedef int32_t (*OsvEngineQuerySettingsFn)(const wchar_t* path, OsvEngineClipSe
  *  falls back to the settings reported with each frame). */
 #define OSV_ENGINE_SYM_QUERY_SETTINGS "OsvEngine_QuerySettings"
 
+/** Publish a newly translated Source Settings blob from
+ *  OpenOSVSourceSettings.aex (`PF_Cmd_TRANSLATE_PARAMS_TO_PREFS`) directly to
+ *  the importer's live clip instance(s) and the direct-GPU engine registry.
+ *
+ *  @param prefsPC    Opaque host prefs buffer pointer (`extra->prefsPC`) that
+ *                    the effect just wrote `blobBytes` into; used only as an
+ *                    identity token to match the buffer seen in `imGetInfo8`
+ *                    (never dereferenced by the engine).
+ *  @param blobBytes  Pointer to the translated `PrefsBlob` bytes.
+ *  @param blobSize   Number of valid bytes at `blobBytes` (`PrefsBlob::kSize`).
+ *  @return OSV_ENGINE_OK when accepted (or when no live clip instance is
+ *          currently open), or OSV_ENGINE_ERR_ARGUMENT on invalid arguments. */
+typedef int32_t (*OsvEnginePublishSourceSettingsFn)(const void* prefsPC, const void* blobBytes,
+                                                    uint32_t blobSize);
+
+/** Exported name of the live Source Settings publication hook. */
+#define OSV_ENGINE_SYM_PUBLISH_SOURCE_SETTINGS "OsvEngine_PublishSourceSettings"
+
 /* ==== [/WP-SETTINGS] ====================================================== */
 
 /** What the effect asks for. */

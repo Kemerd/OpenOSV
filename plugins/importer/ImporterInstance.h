@@ -425,6 +425,24 @@ public:
     /// not carry prefs).  Takes lock() itself.
     void applyPrefs(const void* bytes, std::size_t length);
 
+    /// Adopt a newly translated prefs blob directly from OpenOSV Source
+    /// Settings (`PF_Cmd_TRANSLATE_PARAMS_TO_PREFS` or `PF_Cmd_SEQUENCE_SETUP`
+    /// via `OsvEngine_PublishSourceSettings`), minting a fresh publisher token
+    /// so this edit immediately supersedes any older lingering instance in the
+    /// direct-GPU engine registry and is returned by the next
+    /// `imPerformSourceSettingsCommand`.  Takes lock() itself.
+    void applyPrefsFromSourceSettings(const PrefsBlob& incoming);
+
+    /// True once `applyPrefsFromSourceSettings` has applied live settings from
+    /// the OpenOSV Source Settings effect to this instance.  While true, host
+    /// selectors that pass a stale `rec->prefs` / `info->prefs` buffer (when
+    /// Premiere invoked `PF_Cmd_TRANSLATE_PARAMS_TO_PREFS` with a null or
+    /// temporary `extra->prefsPC`) read `prefs()` instead of reverting the
+    /// instance back to the pre-edit host buffer.
+    [[nodiscard]] bool hasSourceSettingsPrefs() const noexcept {
+        return m_hasSourceSettingsPrefs.load(std::memory_order_acquire);
+    }
+
     /// The blob currently in force (defaults before the first applyPrefs()).
     /// Takes lock() itself.
     [[nodiscard]] PrefsBlob prefs() const;
@@ -675,6 +693,18 @@ public:
     /// Mark this instance as the engine's own (not one Premiere opened), so
     /// its prefs changes are not published back to the engine registry.
     void setEngineOwned(bool owned) noexcept { m_engineOwned = owned; }
+    [[nodiscard]] bool engineOwned() const noexcept { return m_engineOwned; }
+
+    /// Record or query the opaque host prefs buffer address (`info->prefs` in
+    /// `imGetInfo8`) associated with this clip instance.  Stored as an integer
+    /// token only (never dereferenced) so `OsvEngine_PublishSourceSettings`
+    /// can match `extra->prefsPC` to the owning clip instance.
+    void setHostPrefsBuffer(const void* prefsPC) noexcept {
+        m_hostPrefsBuffer.store(reinterpret_cast<std::uintptr_t>(prefsPC), std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uintptr_t hostPrefsBuffer() const noexcept {
+        return m_hostPrefsBuffer.load(std::memory_order_relaxed);
+    }
 
     // ---- [WP-DEFAULTS] the per-user defaults a new clip starts from --------
     /// Start this instance from `prefs` - the user's saved Source Settings
@@ -1135,6 +1165,18 @@ private:
     std::map<void*, std::unique_ptr<video::GpuClipDecoder>> m_gpuDecoders;
     /// True for the engine registry's own instance (see setEngineOwned).
     bool m_engineOwned = false;
+    /// Opaque address token of the host's settings block (`info->prefs`) for
+    /// this clip, used only for pointer-identity matching in
+    /// `OsvEngine_PublishSourceSettings`.
+    std::atomic<std::uintptr_t> m_hostPrefsBuffer{0};
+    /// True once `applyPrefsFromSourceSettings` has delivered authoritative
+    /// settings from OpenOSVSourceSettings.aex to this instance.
+    std::atomic<bool> m_hasSourceSettingsPrefs{false};
+
+    /// Shared body of `applyPrefsLocked` (`fromSourceSettingsEffect == false`)
+    /// and `applyPrefsFromSourceSettings` (`fromSourceSettingsEffect == true`).
+    /// Caller holds `m_mutex`.
+    void applyPrefsImplLocked(const void* bytes, std::size_t length, bool fromSourceSettingsEffect);
 
     // ---- [WP-SETTINGS] Source Settings publication (Engine.h) -------------
     /// This instance's publisher token, taken at its first publication

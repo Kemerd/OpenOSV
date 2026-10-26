@@ -317,6 +317,9 @@ struct PublishedSettings {
     /// False while the only publication is an instance's defaults (the host
     /// handed it no blob); any host blob then replaces it.
     bool fromHost = false;
+    /// True once OpenOSV Source Settings (`OsvEngine_PublishSourceSettings`)
+    /// has explicitly published translated control settings for this file.
+    bool fromSourceSettingsEffect = false;
     /// Bumped on every change of `prefs`; the first publication is 1.
     std::uint32_t generation = 0;
     /// Refused publications logged since the last change, bounded so a
@@ -712,6 +715,234 @@ bool enginePublishedPrefs(const std::filesystem::path& path, PrefsBlob& out) noe
     }
 }
 
+bool engineSourceSettingsPrefs(const std::filesystem::path& path, PrefsBlob& out) noexcept {
+    try {
+        // Return true only when OpenOSVSourceSettings.aex explicitly pushed a
+        // translated PrefsBlob for this file identity during this session.
+        PublishedSettings found;
+        if (!publishedPrefs(keyFor(path), found) || !found.fromSourceSettingsEffect) {
+            return false;
+        }
+        out = found.prefs;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+namespace {
+
+/// Process-wide table of live Premiere-opened ImporterInstance objects.
+///
+/// WHY THIS EXISTS.  When the user edits a control in Effect Controls,
+/// Premiere Pro sends PF_Cmd_TRANSLATE_PARAMS_TO_PREFS on the existing effect
+/// instance FIRST and then, ~1 ms later, re-instantiates OpenOSV Source
+/// Settings with default params[] and sends PF_Cmd_SEQUENCE_SETUP (which calls
+/// imPerformSourceSettingsCommand).  Furthermore, while Open 360 Reframe is on
+/// the clip (Direct GPU path), Premiere never calls imGetSourceVideo on the
+/// importer at all.  Without a synchronous notification from
+/// translateParamsToPrefs, the importer's live instance kept its old settings,
+/// answered PerformSourceSettingsCommand with the stale blob 1 ms later, and
+/// reverted the user's edit.
+///
+/// LOCK ORDER.  `dispatchMutex` is acquired ONLY at the outer boundary of
+/// OsvEngine_PublishSourceSettings and engineUnregisterInstance (never while
+/// ImporterInstance::m_mutex or Registry::mutex is held).  `tableMutex` is a
+/// leaf lock protecting `instances` and `lastActive` for a few instructions at
+/// a time and is never held across any call.  Therefore:
+///   dispatchMutex -> ImporterInstance::m_mutex -> Registry::mutex
+/// is strictly acyclic and no instance can finish ~ImporterInstance() while a
+/// synchronous Source Settings publication is dispatching to it.
+struct LiveInstanceTable {
+    std::recursive_mutex dispatchMutex;
+    std::mutex tableMutex;
+    std::vector<ImporterInstance*> instances;
+    ImporterInstance* lastActive = nullptr;
+};
+
+/// Created on first use and intentionally leaked at process exit, matching
+/// Registry and IdentityCache.
+[[nodiscard]] LiveInstanceTable& liveInstanceTable() {
+    static LiveInstanceTable* table = new LiveInstanceTable();
+    return *table;
+}
+
+}  // namespace
+
+void engineRegisterInstance(ImporterInstance* instance) noexcept {
+    if (!instance) {
+        return;
+    }
+    try {
+        // Leaf lock only: record the pointer if it is not already present.
+        LiveInstanceTable& table = liveInstanceTable();
+        std::lock_guard<std::mutex> lock(table.tableMutex);
+        if (std::find(table.instances.begin(), table.instances.end(), instance) == table.instances.end()) {
+            table.instances.push_back(instance);
+        }
+    } catch (...) {
+    }
+}
+
+void engineUnregisterInstance(ImporterInstance* instance) noexcept {
+    if (!instance) {
+        return;
+    }
+    try {
+        // Acquire dispatchMutex first so any in-flight OsvEngine_PublishSourceSettings
+        // call finishes before this instance's destructor tears down its members.
+        LiveInstanceTable& table = liveInstanceTable();
+        std::lock_guard<std::recursive_mutex> dispatchLock(table.dispatchMutex);
+        std::lock_guard<std::mutex> tableLock(table.tableMutex);
+        table.instances.erase(std::remove(table.instances.begin(), table.instances.end(), instance),
+                              table.instances.end());
+        if (table.lastActive == instance) {
+            table.lastActive = nullptr;
+        }
+    } catch (...) {
+    }
+}
+
+void engineBindPrefsBuffer(ImporterInstance* instance, const void* prefsPC) noexcept {
+    if (!instance || instance->engineOwned()) {
+        return;
+    }
+    try {
+        // Store the opaque buffer address on the instance (never dereferenced)
+        // so PF_Cmd_TRANSLATE_PARAMS_TO_PREFS can match extra->prefsPC back to it.
+        if (prefsPC) {
+            instance->setHostPrefsBuffer(prefsPC);
+        }
+        LiveInstanceTable& table = liveInstanceTable();
+        std::lock_guard<std::mutex> lock(table.tableMutex);
+        table.lastActive = instance;
+    } catch (...) {
+    }
+}
+
+void engineNoteSourceSettingsInstance(ImporterInstance* instance) noexcept {
+    if (!instance || instance->engineOwned()) {
+        return;
+    }
+    try {
+        // Record the instance most recently queried by imPerformSourceSettingsCommand
+        // or imGetInfo8 as the fallback when extra->prefsPC has not been bound yet.
+        LiveInstanceTable& table = liveInstanceTable();
+        std::lock_guard<std::mutex> lock(table.tableMutex);
+        table.lastActive = instance;
+    } catch (...) {
+    }
+}
+
+/// Apply a newly translated Source Settings blob to all live Premiere-opened
+/// instances of the target clip and publish it to the direct-GPU engine.
+[[nodiscard]] std::int32_t publishSourceSettingsFromEffect(const void* prefsPC, const void* blobBytes,
+                                                           std::uint32_t blobSize) noexcept {
+    if (!blobBytes || blobSize < PrefsBlob::kSize) {
+        return OSV_ENGINE_ERR_ARGUMENT;
+    }
+    PrefsBlob probe{};
+    std::memcpy(&probe, blobBytes, PrefsBlob::kSize);
+    if (!probe.isValid()) {
+        return OSV_ENGINE_ERR_ARGUMENT;
+    }
+    const PrefsBlob incoming = PrefsBlob::fromBytes(blobBytes, blobSize);
+    const std::uintptr_t prefsToken = reinterpret_cast<std::uintptr_t>(prefsPC);
+
+    // Hold dispatchMutex so no registered ImporterInstance can be destroyed
+    // while we inspect the candidates and push the new prefs into them.
+    LiveInstanceTable& table = liveInstanceTable();
+    std::lock_guard<std::recursive_mutex> dispatchLock(table.dispatchMutex);
+
+    std::vector<ImporterInstance*> candidates;
+    ImporterInstance* lastActive = nullptr;
+    {
+        std::lock_guard<std::mutex> tableLock(table.tableMutex);
+        candidates.reserve(table.instances.size());
+        for (ImporterInstance* inst : table.instances) {
+            if (inst && !inst->engineOwned()) {
+                candidates.push_back(inst);
+            }
+        }
+        lastActive = table.lastActive;
+    }
+    if (candidates.empty()) {
+        return OSV_ENGINE_OK;
+    }
+
+    // 1. Prefer an instance whose bound host prefs buffer address matches
+    //    `prefsPC` (set in imGetInfo8's syncClipPrefsBlock).
+    ImporterInstance* primary = nullptr;
+    if (prefsToken != 0) {
+        for (ImporterInstance* inst : candidates) {
+            if (inst->hostPrefsBuffer() == prefsToken) {
+                primary = inst;
+                break;
+            }
+        }
+    }
+
+    // 2. If Premiere passed a buffer address not yet bound in imGetInfo8,
+    //    prefer an unbound instance (starting with `lastActive`, then the
+    //    newest unbound clip) so a buffer belonging to a newly opened clip can
+    //    never overwrite an older clip that already bound a different buffer.
+    //    When `prefsPC` itself is null (`prefsToken == 0`), fall back to
+    //    `lastActive` or the newest live clip.
+    if (!primary) {
+        if (prefsToken != 0) {
+            if (lastActive && lastActive->hostPrefsBuffer() == 0 &&
+                std::find(candidates.begin(), candidates.end(), lastActive) != candidates.end()) {
+                primary = lastActive;
+            } else {
+                for (auto it = candidates.rbegin(); it != candidates.rend(); ++it) {
+                    if ((*it)->hostPrefsBuffer() == 0) {
+                        primary = *it;
+                        break;
+                    }
+                }
+            }
+            if (primary) {
+                primary->setHostPrefsBuffer(prefsPC);
+            }
+        } else {
+            if (lastActive && std::find(candidates.begin(), candidates.end(), lastActive) != candidates.end()) {
+                primary = lastActive;
+            } else {
+                primary = candidates.back();
+            }
+        }
+    }
+    if (!primary) {
+        return OSV_ENGINE_OK;
+    }
+
+    // 3. Apply the new settings to `primary` and to every other live
+    //    Premiere-opened instance of the same underlying media file on disk,
+    //    so imPerformSourceSettingsCommand, imGetIndColorSpace, imGetSourceVideo
+    //    and OsvEngine_QuerySettings / OsvEngine_AcquireFrame all agree at once.
+    const std::wstring targetKey = keyFor(primary->path());
+    for (ImporterInstance* inst : candidates) {
+        if (inst == primary ||
+            (prefsToken != 0 && inst->hostPrefsBuffer() == prefsToken) ||
+            keyFor(inst->path()) == targetKey) {
+            inst->applyPrefsFromSourceSettings(incoming);
+        }
+    }
+    try {
+        // Mark the file's published entry as originating from the Source
+        // Settings effect so any subsequent ImporterInstance Premiere opens
+        // for the same file inherits these settings immediately.
+        Registry& r = registry();
+        std::lock_guard<std::mutex> lock(r.mutex);
+        const auto it = r.prefs.find(targetKey);
+        if (it != r.prefs.end()) {
+            it->second.fromSourceSettingsEffect = true;
+        }
+    } catch (...) {
+    }
+    return OSV_ENGINE_OK;
+}
+
 void engineShutdown() noexcept {
     try {
         Registry& r = registry();
@@ -1066,6 +1297,19 @@ extern "C" __declspec(dllexport) std::int32_t OsvEngine_QuerySettings(const wcha
         return OSV_ENGINE_ERR_INTERNAL;
     } catch (...) {
         writeError(error, errorCapacity, "internal error");
+        return OSV_ENGINE_ERR_INTERNAL;
+    }
+}
+
+extern "C" __declspec(dllexport) std::int32_t OsvEngine_PublishSourceSettings(const void* prefsPC,
+                                                                               const void* blobBytes,
+                                                                               std::uint32_t blobSize) {
+    try {
+        // Called from OpenOSVSourceSettings.aex inside PF_Cmd_TRANSLATE_PARAMS_TO_PREFS
+        // to push a control edit immediately to the live ImporterInstance(s)
+        // and the direct-GPU engine registry.
+        return osv::premiere::publishSourceSettingsFromEffect(prefsPC, blobBytes, blobSize);
+    } catch (...) {
         return OSV_ENGINE_ERR_INTERNAL;
     }
 }

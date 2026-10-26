@@ -83,10 +83,21 @@
 #include "SourceSettingsMapping.h"
 #include "SourceSettingsParams.h"
 
+#include "OsvEngineAbi.h"
 #include "PluginExport.h"
 #include "PluginLog.h"
 #include "PrefsBlob.h"
 #include "UserDefaults.h"
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 // Adobe headers.  Everything of ours is declared before these open their
 // #pragma pack(push, 1) region, and nothing of ours is declared inside it.
@@ -629,9 +640,13 @@ PF_Err paramsSetup(PF_InData* in_data, PF_OutData* out_data) noexcept {
     }
     PF_ParamDef def{};
 
-    // The flag every control shares.  Named once so no control can be added
-    // later without it - the compiler does not check that, but a reader does.
-    constexpr A_long kStaticFlags = PF_ParamFlag_CANNOT_TIME_VARY;
+    // The flags every value control shares.  Named once so no control can be
+    // added later without them: PF_ParamFlag_CANNOT_TIME_VARY hides the
+    // stopwatch (PrefsBlob is a flat per-clip block), and
+    // PF_ParamFlag_SUPERVISE makes Premiere send PF_Cmd_USER_CHANGED_PARAM as
+    // soon as a control is edited, BEFORE re-instantiating the effect and
+    // sending PF_Cmd_SEQUENCE_SETUP.
+    constexpr A_long kStaticFlags = PF_ParamFlag_CANNOT_TIME_VARY | PF_ParamFlag_SUPERVISE;
 
     // ---- 1. Colour Output --------------------------------------------------
     AEFX_CLR_STRUCT(def);
@@ -1060,6 +1075,22 @@ void reportDefaultsAction(const PF_InData* in_data, PF_OutData* out_data, const 
     }
 }
 
+/// Publish a translated PrefsBlob to OpenOSVImporter.prm when loaded in the
+/// same process.  No-op outside Windows or when the importer is not loaded.
+void notifyImporterSourceSettings(const void* prefsPC, const PrefsBlob& blob) noexcept {
+#if defined(_WIN32)
+    if (const HMODULE importerModule = ::GetModuleHandleW(OSV_ENGINE_MODULE_NAME)) {
+        if (const auto publishFn = reinterpret_cast<OsvEnginePublishSourceSettingsFn>(
+                ::GetProcAddress(importerModule, OSV_ENGINE_SYM_PUBLISH_SOURCE_SETTINGS))) {
+            (void)publishFn(prefsPC, &blob, static_cast<std::uint32_t>(PrefsBlob::kSize));
+        }
+    }
+#else
+    (void)prefsPC;
+    (void)blob;
+#endif
+}
+
 /// [WP-DEFAULTS] PF_Cmd_USER_CHANGED_PARAM: the Defaults group's buttons.
 ///
 ///   Save as Default for New Clips - the controls as they stand, translated
@@ -1112,6 +1143,18 @@ PF_Err userChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
         }
         return PF_Err_NONE;
     }
+
+    if (which >= 1 && which < kIndexDefaultsTopic && params && params[kIndexColorOutput]) {
+        // When a user edits a value control in Premiere's Effect Controls ->
+        // Source tab, Premiere sends PF_Cmd_USER_CHANGED_PARAM for supervised
+        // controls BEFORE re-instantiating the effect and sending
+        // PF_Cmd_SEQUENCE_SETUP.  Publishing the translated PrefsBlob now
+        // ensures the active clip's ImporterInstance already holds the new
+        // settings even when the user's edit happens to return every control
+        // to PrefsBlob::defaults() (where sequenceSetup() asks the importer).
+        const PrefsBlob blob = prefsFromControls(readControls(params));
+        notifyImporterSourceSettings(nullptr, blob);
+    }
     return PF_Err_NONE;
 }
 
@@ -1145,6 +1188,12 @@ PF_Err userChangedParam(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* p
 PF_Err translateParamsToPrefs(PF_InData* in_data, PF_ParamDef* params[],
                               PF_TranslateParamsToPrefsExtra* extra) noexcept {
     (void)in_data;
+    const PrefsBlob blob = prefsFromControls(readControls(params));
+
+    if (params && params[kIndexColorOutput]) {
+        notifyImporterSourceSettings(extra ? extra->prefsPC : nullptr, blob);
+    }
+
     if (!extra || !extra->prefsPC) {
         // The host has no settings block for this clip.  Since 0.5.2 the
         // importer offers one in imGetInfo8 when the host has none; in the
@@ -1165,7 +1214,6 @@ PF_Err translateParamsToPrefs(PF_InData* in_data, PF_ParamDef* params[],
         return PF_Err_NONE;
     }
 
-    const PrefsBlob blob = prefsFromControls(readControls(params));
     // prefsPC is an opaque PF_ImporterPrefsDataPtr; the SDK's contract is
     // that the importer and the effect agree on the bytes behind it, so a
     // memcpy of exactly our struct size is the whole write.
@@ -1364,6 +1412,28 @@ extern "C" OSV_PLUGIN_EXPORT PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, P
             // have to leave the handle null.  SEQUENCE_SETUP is handled above
             // because it is the one that talks to the importer.
             case PF_Cmd_SEQUENCE_RESETUP:
+#if defined(_WIN32)
+                // Reopening a saved project calls PF_Cmd_SEQUENCE_RESETUP with
+                // the deserialised parameter array; publish non-default control
+                // values to OpenOSVImporter.prm so the importer and direct-GPU
+                // engine immediately adopt the project's saved settings.
+                if (params && params[kIndexColorOutput]) {
+                    const PrefsBlob resetupBlob = prefsFromControls(readControls(params));
+                    if (resetupBlob != PrefsBlob::defaults()) {
+                        if (const HMODULE importerModule = ::GetModuleHandleW(OSV_ENGINE_MODULE_NAME)) {
+                            if (const auto publishFn = reinterpret_cast<OsvEnginePublishSourceSettingsFn>(
+                                    ::GetProcAddress(importerModule, OSV_ENGINE_SYM_PUBLISH_SOURCE_SETTINGS))) {
+                                (void)publishFn(nullptr, &resetupBlob,
+                                                static_cast<std::uint32_t>(PrefsBlob::kSize));
+                            }
+                        }
+                    }
+                }
+#endif
+                if (out_data) {
+                    out_data->sequence_data = nullptr;
+                }
+                return PF_Err_NONE;
             case PF_Cmd_SEQUENCE_FLATTEN:
             case PF_Cmd_SEQUENCE_SETDOWN:
                 if (out_data) {

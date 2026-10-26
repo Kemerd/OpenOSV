@@ -303,12 +303,19 @@ bool ownGpuWanted(std::string* why) noexcept {
             break;
         }
         const HostProfile profile = hostProfile();
-        if (profile == HostProfile::Vegas) {
+        // Both VEGAS Pro and DaVinci Resolve benefit from the own-GPU path
+        // whenever the host supplies CPU images: OpenOSV Source always receives
+        // CPU images in Resolve, so enabling the own-GPU path here keeps 8K
+        // HEVC decoding on NVDEC (with its 12-frame VRAM cache for bucket
+        // anchors) and avoids reading back 288-460 MB equirect spheres to the
+        // host per frame.  OpenOSV 360 Reframe in Resolve still runs its native
+        // OpenFX 1.5 CUDA path first when Resolve hands device buffers.
+        if (profile == HostProfile::Vegas || profile == HostProfile::Resolve) {
             return true;
         }
         if (why) {
             *why = std::string("the host profile is '") + hostProfileName(profile) +
-                   "' (the own-GPU path serves VEGAS; OPENOSV_OFX_GPU=1 forces it)";
+                   "' (the own-GPU path serves VEGAS and Resolve; OPENOSV_OFX_GPU=1 forces it)";
         }
         return false;
     } catch (...) {
