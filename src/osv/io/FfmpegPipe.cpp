@@ -95,6 +95,23 @@ std::string narrow(const std::wstring& s) {
 #endif
 }
 
+/**
+ * @brief Convert a `std::filesystem::path` to UTF-8 without going through the Windows ANSI code page.
+ *
+ * On Windows, `std::filesystem::path::string()` encodes `wchar_t` through `CP_ACP`
+ * (e.g. Windows-1252), which `widen()` then decodes as `CP_UTF8` via
+ * `MultiByteToWideChar(CP_UTF8, ...)`, corrupting or dropping non-ASCII characters
+ * (such as `Pääkanava` -> `Pkanava`).  `u8string()` converts directly from UTF-16
+ * to UTF-8 on Windows and is a byte-preserving pass-through on POSIX.
+ *
+ * @param p  Filesystem path to encode as UTF-8.
+ * @return   UTF-8 byte string representation of `p`.
+ */
+std::string pathToUtf8(const std::filesystem::path& p) {
+    const std::u8string u8 = p.u8string();
+    return std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
+}
+
 #if !defined(_WIN32)
 /// Quote one argument the way a POSIX shell would read it back.  Only used
 /// for the logged command line; the child itself receives argv verbatim.
@@ -273,7 +290,9 @@ std::vector<std::string> buildFfmpegArgs(const FfmpegPipeOptions& o, const std::
             a.push_back(seekArgument(seekUs));
         }
         a.push_back("-i");
-        a.push_back(o.audioSource.string());
+        // Encode the audio source path as UTF-8 so `widen()` reconstructs the
+        // exact UTF-16 path on Windows even when it contains non-ASCII characters.
+        a.push_back(pathToUtf8(o.audioSource));
         a.push_back("-map");
         a.push_back("0:v:0");
         a.push_back("-map");
@@ -298,6 +317,17 @@ std::vector<std::string> buildFfmpegArgs(const FfmpegPipeOptions& o, const std::
         a.push_back("0");
         a.push_back("-profile:v");
         a.push_back("main10");
+    } else if (codec.find("amf") != std::string::npos) {
+        // AMD AMF encoders (hevc_amf, h264_amf, av1_amf) do not accept -crf and
+        // silently fall back to a low default bitrate (~25 Mbps at 8K) unless
+        // Constant QP rate control (-rc cqp) with explicit I/P quantizers is set.
+        const std::string qp = std::to_string(std::clamp(o.crf, 0, 51));
+        a.push_back("-rc");
+        a.push_back("cqp");
+        a.push_back("-qp_i");
+        a.push_back(qp);
+        a.push_back("-qp_p");
+        a.push_back(qp);
     } else if (codec == "libx265") {
         a.push_back("-crf");
         a.push_back(std::to_string(o.crf));
@@ -350,7 +380,8 @@ std::vector<std::string> buildFfmpegArgs(const FfmpegPipeOptions& o, const std::
     for (const std::string& extra : o.extraArgs) {
         a.push_back(extra);
     }
-    a.push_back(out.string());
+    // Encode the output path as UTF-8 so non-ASCII filenames survive `widen()`.
+    a.push_back(pathToUtf8(out));
     return a;
 }
 
@@ -613,11 +644,20 @@ std::filesystem::path FfmpegPipeWriter::resolveExecutable(const std::filesystem:
     if (!preferred.empty()) {
         return preferred;
     }
+#if defined(_WIN32)
+    // Read the wide environment variable on Windows so non-ASCII paths are preserved.
+    if (const wchar_t* wenv = _wgetenv(L"OSV_FFMPEG_EXE")) {
+        if (*wenv) {
+            return std::filesystem::path(wenv);
+        }
+    }
+#else
     if (const char* env = std::getenv("OSV_FFMPEG_EXE")) {
         if (*env) {
             return std::filesystem::path(env);
         }
     }
+#endif
 #if defined(_WIN32)
     wchar_t found[MAX_PATH] = {};
     if (SearchPathW(nullptr, L"ffmpeg", L".exe", MAX_PATH, found, nullptr) > 0) {
@@ -658,7 +698,7 @@ Result<FfmpegPipeWriter> FfmpegPipeWriter::open(const FfmpegPipeOptions& options
             return w;
         }
     }
-    return Error{ErrorCode::Io, "cannot start ffmpeg (" + exe.string() + "): " + error};
+    return Error{ErrorCode::Io, "cannot start ffmpeg (" + pathToUtf8(exe) + "): " + error};
 }
 
 Status FfmpegPipeWriter::writeFrame(const render::ImageRGBAf& image) {

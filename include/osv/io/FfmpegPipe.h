@@ -31,7 +31,7 @@ struct FfmpegPipeOptions {
     std::string fallbackCodec = "libx265"; ///< Used when the first one fails to start.
     std::string pixFmt = "yuv420p10le";
     PipeTransfer transfer = PipeTransfer::PQ;
-    int crf = 18;                          ///< Quality for software encoders (-crf) / nvenc (-cq).
+    int crf = 18;                          ///< Quality for software (-crf), nvenc (-cq), or amf (-rc cqp -qp_i/-qp_p).
     std::filesystem::path audioSource;     ///< Optional: copy the first audio stream of this file.
     /// Where in `audioSource` the copied audio starts, in seconds (>= 0).
     ///

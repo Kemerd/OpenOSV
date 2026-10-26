@@ -32,6 +32,11 @@ struct SphericalOptions {
     std::string out;    ///< Optional: write the tagged copy here instead.
 };
 
+/// Convert a UTF-8 command-line argument to `std::filesystem::path`.
+std::filesystem::path pathFromUtf8(const std::string& text) {
+    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(text.data()), text.size()));
+}
+
 /// Run the command; returns one of the kExit* codes.
 int runSpherical(const SphericalOptions& opt) {
     namespace fs = std::filesystem;
@@ -41,13 +46,13 @@ int runSpherical(const SphericalOptions& opt) {
         std::fprintf(stderr, "error: input file is required\n");
         return kExitUsage;
     }
-    const fs::path input(opt.input);
+    const fs::path input = pathFromUtf8(opt.input);
     std::error_code ec;
     if (!fs::is_regular_file(input, ec) || ec) {
         std::fprintf(stderr, "error: file not found: %s\n", osv::log::safe(opt.input).c_str());
         return kExitInput;
     }
-    const fs::path output = opt.out.empty() ? fs::path() : fs::path(opt.out);
+    const fs::path output = opt.out.empty() ? fs::path() : pathFromUtf8(opt.out);
 
     // ---- tag ------------------------------------------------------------------------
     const osv::Result<osv::io::SphericalInjectReport> tagged = osv::io::injectSphericalMetadata(input, output);

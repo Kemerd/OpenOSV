@@ -82,6 +82,7 @@ struct PipelineOptions {
     // Decode / render backends
     std::string hw = "none";                      ///< none | d3d11va | cuda | auto
     std::string device = "auto";                  ///< cpu | cuda | opencl | auto
+    std::string clDevice;                         ///< OpenCL device index or name substring (overrides OSV_CL_DEVICE)
     int threads = 0;
 
     /// True when a per-frame analysis (seam search, gain match, parallax)

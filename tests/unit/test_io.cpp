@@ -245,6 +245,34 @@ TEST_CASE("ffmpeg pipe arguments: the audio input is seeked to the first rendere
         CHECK(args[ss + 3] == audio);
         CHECK(indexOf(args, "hevc_nvenc") < args.size());
     }
+
+    SECTION("hevc_amf maps crf to -rc cqp -qp_i -qp_p instead of ignored -crf") {
+        opt.crf = 21;
+        const std::vector<std::string> args = io::buildFfmpegArgs(opt, "hevc_amf", out);
+        CHECK(indexOf(args, "-crf") == args.size());
+        const std::size_t rc = indexOf(args, "-rc");
+        REQUIRE(rc + 1 < args.size());
+        CHECK(args[rc + 1] == "cqp");
+        const std::size_t qpi = indexOf(args, "-qp_i");
+        REQUIRE(qpi + 1 < args.size());
+        CHECK(args[qpi + 1] == "21");
+        const std::size_t qpp = indexOf(args, "-qp_p");
+        REQUIRE(qpp + 1 < args.size());
+        CHECK(args[qpp + 1] == "21");
+    }
+
+    SECTION("non-ASCII audio source and output paths preserve UTF-8 without CP_ACP loss") {
+        // "Pääkanava/clip.OSV" in UTF-8 (\xC3\xA4 is 'ä').
+        const std::string utf8Audio = "P\xC3\xA4\xC3\xA4kanava/clip.OSV";
+        const std::string utf8Out = "P\xC3\xA4\xC3\xA4kanava/out.mp4";
+        opt.audioSource =
+            std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(utf8Audio.data()), utf8Audio.size()));
+        const std::filesystem::path unicodeOut(
+            std::u8string(reinterpret_cast<const char8_t*>(utf8Out.data()), utf8Out.size()));
+        const std::vector<std::string> args = io::buildFfmpegArgs(opt, opt.codec, unicodeOut);
+        CHECK(indexOf(args, utf8Audio) < args.size());
+        CHECK(args.back() == utf8Out);
+    }
 }
 
 TEST_CASE("ffmpeg pipe produces a tagged HEVC file", "[io][ffmpeg-exe]") {

@@ -104,7 +104,7 @@ int fail(const osv::Error& error) {
 /// command line to UTF-8; a plain std::filesystem::path(std::string) would
 /// read those bytes in the ANSI code page and miss any non-ASCII file name.
 std::filesystem::path pathFromUtf8(const std::string& text) {
-    return std::filesystem::path(std::u8string(text.begin(), text.end()));
+    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(text.data()), text.size()));
 }
 
 /// Lower-case file extension including the dot ("" when there is none).
@@ -251,10 +251,10 @@ int runAudioWav(const ExtractOptions& opt) {
 int runAudio(const ExtractOptions& opt) {
     // The extension picks the form: .wav is decoded PCM, anything else keeps
     // the ADTS behaviour.
-    if (lowerExtension(std::filesystem::path(opt.audioPath)) == ".wav") {
+    if (lowerExtension(pathFromUtf8(opt.audioPath)) == ".wav") {
         return runAudioWav(opt);
     }
-    auto stats = osv::video::writeAdtsAudio(opt.inputPath, 0, opt.audioPath);
+    auto stats = osv::video::writeAdtsAudio(pathFromUtf8(opt.inputPath), 0, pathFromUtf8(opt.audioPath));
     if (!stats.ok()) {
         return fail(stats.error());
     }
@@ -273,8 +273,8 @@ int runAudio(const ExtractOptions& opt) {
 //  --imu
 // -----------------------------------------------------------------------------
 int runImu(const ExtractOptions& opt) {
-    const osv::Status st = osv::video::writeImuCsv(std::filesystem::path(opt.inputPath),
-                                                   std::filesystem::path(opt.imuPath), opt.dense);
+    const osv::Status st =
+        osv::video::writeImuCsv(pathFromUtf8(opt.inputPath), pathFromUtf8(opt.imuPath), opt.dense);
     if (!st.ok()) {
         return fail(st.error());
     }
@@ -408,7 +408,7 @@ int runFrame(const ExtractOptions& opt) {
         frame = std::move(decoded).value();
         decoderNote = decoder.value().codecName() + " / " + osv::video::hwAccelName(decoder.value().activeHw());
     }
-    const osv::Status written = writePnm(std::filesystem::path(opt.framePath), frame);
+    const osv::Status written = writePnm(pathFromUtf8(opt.framePath), frame);
     if (!written.ok()) {
         return fail(written.error());
     }

@@ -140,7 +140,9 @@ int runLut(const LutOptions& opt) {
     }
 
     // --- write ---------------------------------------------------------------
-    const osv::Status st = writeCube(std::filesystem::path(opt.outPath), params, cube);
+    const std::filesystem::path outPath(
+        std::u8string(reinterpret_cast<const char8_t*>(opt.outPath.data()), opt.outPath.size()));
+    const osv::Status st = writeCube(outPath, params, cube);
     if (!st.ok()) {
         std::fprintf(stderr, "error: %s\n", osv::log::safe(st.error().toString()).c_str());
         return st.error().code == osv::ErrorCode::InvalidArgument ? kExitUsage : kExitRuntime;

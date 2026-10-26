@@ -85,21 +85,24 @@ Result<std::unique_ptr<IRenderer>> makeRenderer(const std::string& deviceIn, Thr
 #endif
     }
 
-    if (device == "opencl" || device == "auto") {
+    const bool isOpenClWithSelector = device.rfind("opencl:", 0) == 0;
+    if (device == "opencl" || isOpenClWithSelector || device == "auto") {
 #if defined(OSV_HAVE_OPENCL)
-        auto r = OpenClRenderer::create(0);
+        // Allow `--device opencl:<index|name>` as a shorthand in addition to `--cl-device`.
+        auto r = isOpenClWithSelector ? OpenClRenderer::create(std::string_view(deviceIn).substr(7))
+                                      : OpenClRenderer::create(0);
         if (r.ok()) {
             if (chosen) {
                 *chosen = "opencl";
             }
             return std::unique_ptr<IRenderer>(std::move(r).value());
         }
-        if (device == "opencl") {
+        if (device == "opencl" || isOpenClWithSelector) {
             return Error(r.error());
         }
         log::debug("auto renderer: OpenCL unavailable ({})", r.error().message);
 #else
-        if (device == "opencl") {
+        if (device == "opencl" || isOpenClWithSelector) {
             return Error{ErrorCode::Unsupported, "OpenCL backend not compiled in (OSV_ENABLE_OPENCL=OFF)"};
         }
 #endif

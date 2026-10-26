@@ -97,7 +97,13 @@ constexpr const char* kProbeSchema = "openosv.probe/1";
 /// command line to UTF-8; a plain std::filesystem::path(std::string) would
 /// read those bytes in the ANSI code page and miss any non-ASCII file name.
 std::filesystem::path pathFromUtf8(const std::string& text) {
-    return std::filesystem::path(std::u8string(text.begin(), text.end()));
+    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(text.data()), text.size()));
+}
+
+/// Encode a `std::filesystem::path` back to UTF-8 without touching `CP_ACP`.
+std::string pathToUtf8(const std::filesystem::path& path) {
+    const std::u8string u8 = path.u8string();
+    return std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
 }
 
 /// Keeps stdout clean for `--json -`.
@@ -832,13 +838,13 @@ int runProbe(ProbeOptions opt) {
         opt.raw = true;
         opt.imu = true;
         if (opt.jsonPath.empty()) {
-            const std::filesystem::path clip(opt.inputPath);
+            const std::filesystem::path clip = pathFromUtf8(opt.inputPath);
             std::filesystem::path beside = clip;
             beside += ".probe.json";
             std::error_code ec;
             const bool writable = !clip.has_parent_path() ||
                                   (std::filesystem::is_directory(clip.parent_path(), ec) && !ec);
-            opt.jsonPath = (writable ? beside : std::filesystem::path(clip.filename()) += ".probe.json").string();
+            opt.jsonPath = pathToUtf8(writable ? beside : (std::filesystem::path(clip.filename()) += ".probe.json"));
         }
     }
     using namespace osv;
@@ -1172,7 +1178,7 @@ int runProbe(ProbeOptions opt) {
 
     // ---- covers ---------------------------------------------------------------------------
     if (!opt.coversDir.empty()) {
-        const std::filesystem::path dir(opt.coversDir);
+        const std::filesystem::path dir = pathFromUtf8(opt.coversDir);
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
         if (ec) {
@@ -1218,7 +1224,7 @@ int runProbe(ProbeOptions opt) {
             return kExitRuntime;
         }
     } else if (!opt.jsonPath.empty()) {
-        std::ofstream out(std::filesystem::path(opt.jsonPath), std::ios::binary);
+        std::ofstream out(pathFromUtf8(opt.jsonPath), std::ios::binary);
         if (!out.good()) {
             std::fprintf(stderr, "error: cannot create %s\n", safe(opt.jsonPath).c_str());
             return kExitRuntime;

@@ -31,8 +31,15 @@
 #endif
 
 // The render module defines OSV_HD as `__host__ __device__ inline` for CUDA.
+// Under C99 / OpenCL C / Metal, `static inline` is required so the compiler
+// never emits an unresolved external call when it chooses not to inline a
+// helper function.
 #ifndef OSV_HD
+#if defined(__OPENCL_C_VERSION__) || defined(__OPENCL_VERSION__) || defined(__METAL_VERSION__) || !defined(__cplusplus)
+#define OSV_HD static inline
+#else
 #define OSV_HD inline
+#endif
 #endif
 
 // Pointers to per-pixel private data (parameter blocks, small arrays).  The

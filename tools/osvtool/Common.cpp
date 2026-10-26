@@ -7,6 +7,7 @@
 
 #include "Commands.h"
 
+#include "osv/core/Log.h"
 #include "osv/core/Version.h"
 #if defined(OSV_HAVE_VIDEO)
 #include "osv/video/Decoder.h"
@@ -113,9 +114,17 @@ void printBackendDiagnostics() {
     {
         std::string reason;
         if (osv::render::OpenClRenderer::available(&reason)) {
-            std::printf("  opencl  : %s\n", osv::render::OpenClRenderer::deviceName(0).c_str());
+            const int count = osv::render::OpenClRenderer::deviceCount();
+            for (int i = 0; i < count; ++i) {
+                if (count == 1) {
+                    std::printf("  opencl  : %s\n", osv::log::safe(osv::render::OpenClRenderer::deviceName(i)).c_str());
+                } else {
+                    std::printf("  opencl  : [%d] %s\n", i,
+                                osv::log::safe(osv::render::OpenClRenderer::deviceName(i)).c_str());
+                }
+            }
         } else {
-            std::printf("  opencl  : unavailable (%s)\n", reason.c_str());
+            std::printf("  opencl  : unavailable (%s)\n", osv::log::safe(reason).c_str());
         }
     }
 #endif

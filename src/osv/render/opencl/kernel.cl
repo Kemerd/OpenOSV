@@ -5,8 +5,16 @@
  * around osvShadePixelWSPL.  OpenCL cannot pass structs containing pointers as
  * kernel arguments, so the two planes arrive as separate buffers plus their
  * integer descriptors and are re-assembled into OsvPlane here.
+ *
+ * Parameter block delivery:
+ *   OsvRenderParams is ~3.3 KB, which exceeds CL_DEVICE_MAX_PARAMETER_SIZE on
+ *   Intel Arc / Iris OpenCL drivers (2048 bytes) as well as the OpenCL 1.2
+ *   minimum guarantee (1024 bytes).  We therefore pass the parameter block in
+ *   a __constant buffer (guaranteed >= 64 KB on every OpenCL 1.2 device) and
+ *   materialize a private copy per work-item after the bounds guard, matching
+ *   the Metal kernel wrapper (src/osv/render/metal/kernel.metal).
  */
-__kernel void osvReframe(const OsvRenderParams params,
+__kernel void osvReframe(__constant const OsvRenderParams* paramsBuf,
                          __global const ushort* y0, __global const ushort* u0, __global const ushort* v0,
                          int w0, int h0, int cw0, int ch0, int sy0, int sc0, int bs0, int il0,
                          __global const ushort* y1, __global const ushort* u1, __global const ushort* v1,
@@ -17,11 +25,19 @@ __kernel void osvReframe(const OsvRenderParams params,
                          __global const float* photo,
                          __global const float* seamLow,
                          __global float* out, int outPitchFloats) {
-    const int x = (int)get_global_id(0);
-    const int y = (int)get_global_id(1);
-    if (x >= params.outW || y >= params.outH) {
+    /* Guard against null constant or output buffers before touching coordinates. */
+    if (!paramsBuf || !out) {
         return;
     }
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= paramsBuf->outW || y >= paramsBuf->outH) {
+        return;
+    }
+    /* Copy the constant parameter block into private address space for the shared shader. */
+    const OsvRenderParams params = *paramsBuf;
+
+    /* Reconstruct the two per-lens plane descriptors from the bound buffers and strides. */
     OsvPlane planes[2];
     planes[0].y = y0; planes[0].u = u0; planes[0].v = il0 ? (u0 + 1) : v0;
     planes[0].w = w0; planes[0].h = h0; planes[0].cw = cw0; planes[0].ch = ch0;
@@ -46,19 +62,29 @@ __kernel void osvReframe(const OsvRenderParams params,
 }
 
 /* [WP-SEAMTOOLS] Seam low band, stage 1: one work item per low-band texel,
- * global id 2 = the lens.  Same plane arguments as osvReframe. */
-__kernel void osvSeamLowDecimate(const OsvRenderParams params,
+ * global id 2 = the lens.  Same plane arguments as osvReframe, with the
+ * parameter block passed in a __constant buffer to stay well below the
+ * 2048-byte kernel argument limit. */
+__kernel void osvSeamLowDecimate(__constant const OsvRenderParams* paramsBuf,
                                  __global const ushort* y0, __global const ushort* u0, __global const ushort* v0,
                                  int w0, int h0, int cw0, int ch0, int sy0, int sc0, int bs0, int il0,
                                  __global const ushort* y1, __global const ushort* u1, __global const ushort* v1,
                                  int w1, int h1, int cw1, int ch1, int sy1, int sc1, int bs1, int il1,
                                  __global float* dst) {
+    /* Guard against null constant or destination buffers. */
+    if (!paramsBuf || !dst) {
+        return;
+    }
     const int x = (int)get_global_id(0);
     const int y = (int)get_global_id(1);
     const int lens = (int)get_global_id(2);
-    if (x >= params.seamLowW || y >= params.seamLowH || lens > 1) {
+    if (x >= paramsBuf->seamLowW || y >= paramsBuf->seamLowH || lens > 1) {
         return;
     }
+    /* Copy the constant parameter block into private address space for the decimation helper. */
+    const OsvRenderParams params = *paramsBuf;
+
+    /* Reconstruct the two per-lens plane descriptors from the bound buffers and strides. */
     OsvPlane planes[2];
     planes[0].y = y0; planes[0].u = u0; planes[0].v = il0 ? (u0 + 1) : v0;
     planes[0].w = w0; planes[0].h = h0; planes[0].cw = cw0; planes[0].ch = ch0;
@@ -77,15 +103,24 @@ __kernel void osvSeamLowDecimate(const OsvRenderParams params,
     d[3] = texel[3];
 }
 
-/* [WP-SEAMTOOLS] Seam low band, stages 2 and 3: one separable blur pass. */
-__kernel void osvSeamLowBlur(const OsvRenderParams params, __global const float* src, __global float* dst,
-                             int horizontal) {
+/* [WP-SEAMTOOLS] Seam low band, stages 2 and 3: one separable blur pass.
+ * Takes OsvRenderParams via __constant buffer so all three OpenCL kernels
+ * share the same low-footprint parameter binding. */
+__kernel void osvSeamLowBlur(__constant const OsvRenderParams* paramsBuf, __global const float* src,
+                             __global float* dst, int horizontal) {
+    /* Guard against null constant, source or destination buffers. */
+    if (!paramsBuf || !src || !dst) {
+        return;
+    }
     const int x = (int)get_global_id(0);
     const int y = (int)get_global_id(1);
     const int lens = (int)get_global_id(2);
-    if (x >= params.seamLowW || y >= params.seamLowH || lens > 1) {
+    if (x >= paramsBuf->seamLowW || y >= paramsBuf->seamLowH || lens > 1) {
         return;
     }
+    /* Copy the constant parameter block into private address space for the blur helper. */
+    const OsvRenderParams params = *paramsBuf;
+
     float texel[4];
     osvSeamLowBlurPixel(&params, src, lens, x, y, horizontal, texel);
     __global float* d = dst + (((size_t)lens * (size_t)params.seamLowH + (size_t)y) * (size_t)params.seamLowW +

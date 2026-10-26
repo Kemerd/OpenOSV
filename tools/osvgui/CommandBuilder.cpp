@@ -560,6 +560,14 @@ std::vector<std::string> testEncodeArgs(const std::string& codec, int crf) {
         for (const char* v : {"-b:v", "0", "-profile:v", "main10"}) {
             a.emplace_back(v);
         }
+    } else if (codec.find("amf") != std::string::npos) {
+        // AMD AMF uses Constant QP (-rc cqp -qp_i/-qp_p) rather than -crf.
+        for (const char* v : {"-rc", "cqp", "-qp_i"}) {
+            a.emplace_back(v);
+        }
+        a.push_back(quality);
+        a.emplace_back("-qp_p");
+        a.push_back(quality);
     } else if (codec == "libx265") {
         a.emplace_back("-crf");
         a.push_back(quality);

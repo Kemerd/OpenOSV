@@ -423,6 +423,10 @@ TEST_CASE("gui: probe helpers", "[gui]") {
     REQUIRE(valueOf(test, "-pix_fmt") == "yuv420p10le");
     REQUIRE(valueOf(test, "-cq") == "18");
     REQUIRE(Args(test.end() - 3, test.end()) == Args{"-f", "null", "-"});
+    const std::vector<std::string> amfTest = testEncodeArgs("hevc_amf", 19);
+    REQUIRE(valueOf(amfTest, "-rc") == "cqp");
+    REQUIRE(valueOf(amfTest, "-qp_i") == "19");
+    REQUIRE(valueOf(amfTest, "-qp_p") == "19");
     REQUIRE(valueOf(testEncodeArgs("hevc_qsv", 20), "-crf") == "20");
 }
 

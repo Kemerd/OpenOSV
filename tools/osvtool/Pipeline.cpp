@@ -12,6 +12,9 @@
 #include "osv/meta/FormatDetector.h"
 #include "osv/render/ClipSteady.h"
 #include "osv/render/MountMask.h"
+#if defined(OSV_HAVE_OPENCL)
+#include "osv/render/OpenClRenderer.h"
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -185,6 +188,9 @@ void addPipelineOptions(CLI::App* sub, PipelineOptions& opt) {
 #else
     backendGroup->add_option("--device", opt.device, "Renderer: cpu|cuda|opencl|auto")->default_str("auto");
 #endif
+    backendGroup->add_option("--cl-device", opt.clDevice,
+                             "OpenCL device index (0, 1, ...) or name/vendor substring (e.g. 'arc', 'amd'); "
+                             "overrides OSV_CL_DEVICE");
     backendGroup->add_option("--threads", opt.threads, "CPU threads (0 = all)")->default_val(0);
 }
 
@@ -479,8 +485,15 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
 
     // ---- renderer ---------------------------------------------------------------------
     p->pool = std::make_unique<ThreadPool>(options.threads > 0 ? static_cast<unsigned>(options.threads) : 0u);
+#if defined(OSV_HAVE_OPENCL)
+    // Apply any explicit OpenCL device selector from `--cl-device` before creating the renderer.
+    render::OpenClRenderer::setPreferredDevice(options.clDevice);
+#endif
     if (needRenderer) {
-        OSV_TRY_ASSIGN(p->renderer, render::makeRenderer(options.device, *p->pool, &p->rendererName));
+        // When `--cl-device` is given without an explicit `--device`, target OpenCL directly.
+        const std::string effectiveDevice =
+            (!options.clDevice.empty() && lower(options.device) == "auto") ? std::string("opencl") : options.device;
+        OSV_TRY_ASSIGN(p->renderer, render::makeRenderer(effectiveDevice, *p->pool, &p->rendererName));
         p->notes.push_back("renderer: " + p->rendererName);
     }
 

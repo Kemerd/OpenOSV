@@ -189,6 +189,8 @@ void checkClip(const PipelineOptions& po) {
 #endif
 #if defined(OSV_HAVE_OPENCL)
     {
+        // Honour any `--cl-device` override before creating the OpenCL renderer.
+        render::OpenClRenderer::setPreferredDevice(po.clDevice);
         std::string reason;
         if (render::OpenClRenderer::available(&reason)) {
             auto r = render::OpenClRenderer::create(0);
@@ -196,7 +198,8 @@ void checkClip(const PipelineOptions& po) {
                 auto img = r.value()->render(job.value());
                 if (img.ok()) {
                     const auto stats = render::compareImages16(ref.value(), img.value());
-                    report("opencl parity PSNR >= 60 dB", stats.psnrDb >= 60.0, std::to_string(stats.psnrDb) + " dB");
+                    report("opencl parity PSNR >= 60 dB", stats.psnrDb >= 60.0,
+                           std::to_string(stats.psnrDb) + " dB (" + r.value()->activeDeviceName() + ")");
                 } else {
                     report("opencl render", false, img.error().toString());
                 }
@@ -250,6 +253,8 @@ void registerSelfcheckCommand(CLI::App& app, CommandContext& ctx) {
     sub->add_option("file", opt->pipeline.input, "Optional .OSV clip to test with")->each([opt](const std::string&) {
         opt->haveFile = true;
     });
+    sub->add_option("--cl-device", opt->pipeline.clDevice,
+                    "OpenCL device index (0, 1, ...) or name/vendor substring (overrides OSV_CL_DEVICE)");
     sub->callback([opt, &ctx]() { ctx.exitCode = runSelfcheck(*opt); });
 }
 

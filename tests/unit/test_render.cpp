@@ -720,7 +720,15 @@ TEST_CASE("OpenCL renderer matches the CPU reference", "[render][sample][opencl]
     if (!r.ok()) {
         FAIL("OpenCL renderer creation failed: " << r.error().message);
     }
+    CHECK_FALSE(r.value()->activeDeviceName().empty());
     checkParity(*r.value(), "opencl");
+
+    // Verify selector resolution by index and rejection of non-existent device names.
+    auto byIdx = render::OpenClRenderer::create(std::string_view("0"));
+    REQUIRE(byIdx.ok());
+    auto bogus = render::OpenClRenderer::create(std::string_view("nonexistent_opencl_gpu_xyz"));
+    REQUIRE_FALSE(bogus.ok());
+    CHECK(bogus.error().code == ErrorCode::InvalidArgument);
 }
 #endif
 

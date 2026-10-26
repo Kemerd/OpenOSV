@@ -8,7 +8,25 @@
  * f suffix, so this preamble maps one onto the other before the shared headers
  * are compiled.  It also pins the inline/address-space macros.
  */
-#define OSV_HD inline
+/*
+ * Disable floating-point multiply-add contraction so the OpenCL backend
+ * matches the CPU (/fp:precise) and CUDA (-fmad=false) reference pipelines.
+ * In OpenCL C (6.10.2), FP_CONTRACT defaults to ON unless explicitly disabled
+ * by pragma at the top of the translation unit.
+ */
+#pragma OPENCL FP_CONTRACT OFF
+
+/*
+ * Pin the function linkage and address-space qualifiers before any shared
+ * header is parsed.  In OpenCL C (which follows C99 6.7.4 inline semantics),
+ * a bare `inline` without `static` produces an inline-only definition with no
+ * external body emitted; if the device compiler declines to inline a large
+ * helper such as osvShadePixelWSPL, the linker (e.g. AMD comgr / ld.lld)
+ * fails with an undefined symbol error.  Marking every helper `static inline`
+ * gives each translation unit internal linkage and guarantees a local body
+ * whenever a call is not inlined.
+ */
+#define OSV_HD static inline
 #define OSV_GLOBAL __global
 
 #define sqrtf(x) sqrt((float)(x))

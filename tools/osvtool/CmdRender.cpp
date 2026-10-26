@@ -59,6 +59,9 @@
 #include "osv/render/SeamAnalysis.h"
 #include "osv/render/SceneLight.h"
 #include "osv/render/ClipSteady.h"
+#if defined(OSV_HAVE_OPENCL)
+#include "osv/render/OpenClRenderer.h"
+#endif
 #include "osv/video/ClipTimeline.h"
 
 // [WP-DEFAULTS] The Premiere plug-ins' own (SDK-free) reader of the defaults
@@ -350,15 +353,29 @@ void applyUserDefaults(RenderOptions& o, const CLI::App& sub) {
     }
 }
 
+/**
+ * @brief Convert a UTF-8 command-line string to `std::filesystem::path`.
+ *
+ * `wmain()` decodes Windows command-line arguments to UTF-8; passing a plain
+ * `std::string` to `std::filesystem::path` on Windows would interpret those
+ * bytes in the ANSI code page (`CP_ACP`) and corrupt non-ASCII characters.
+ *
+ * @param text  UTF-8 path string.
+ * @return      Filesystem path preserving all Unicode characters.
+ */
+std::filesystem::path pathFromUtf8(std::string_view text) {
+    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(text.data()), text.size()));
+}
+
 /// Expand an output pattern for a frame index: printf-style "%05d", or an
 /// "_00000" suffix inserted before the extension for multi-frame runs.
 std::filesystem::path outputPathFor(const std::string& pattern, std::uint32_t frame, bool multi) {
     if (pattern.find('%') != std::string::npos) {
         char buf[4096];
         std::snprintf(buf, sizeof(buf), pattern.c_str(), static_cast<int>(frame));
-        return std::filesystem::path(buf);
+        return pathFromUtf8(buf);
     }
-    std::filesystem::path p(pattern);
+    std::filesystem::path p = pathFromUtf8(pattern);
     if (!multi) {
         return p;
     }
@@ -574,8 +591,8 @@ public:
              bool multi, double audioStartSeconds) {
         m_out = o.out;
         m_multi = multi;
-        const bool toVideo = std::filesystem::path(o.out).extension() == ".mp4" ||
-                             std::filesystem::path(o.out).extension() == ".mov";
+        const std::filesystem::path outPath = pathFromUtf8(o.out);
+        const bool toVideo = outPath.extension() == ".mp4" || outPath.extension() == ".mov";
         m_tag.rec2020 = transfer != color::OutputTransfer::Rec709;
         switch (transfer) {
         case color::OutputTransfer::HLG: m_tag.transfer = io::ImageTransfer::HLG; break;
@@ -595,7 +612,7 @@ public:
                 return kExitUsage;
             }
             io::FfmpegPipeOptions fo;
-            fo.ffmpegExe = o.ffmpeg;
+            fo.ffmpegExe = pathFromUtf8(o.ffmpeg);
             fo.width = static_cast<std::uint32_t>(w);
             fo.height = static_cast<std::uint32_t>(h);
             fo.fps = fps;
@@ -615,7 +632,7 @@ public:
                               audioStartSeconds);
                 }
             }
-            auto pw = io::FfmpegPipeWriter::open(fo, o.out);
+            auto pw = io::FfmpegPipeWriter::open(fo, outPath);
             if (!pw.ok()) {
                 std::fprintf(stderr, "error: %s\n", log::safe(pw.error().toString()).c_str());
                 return kExitRuntime;
@@ -685,7 +702,7 @@ public:
         // Only a render that succeeded is tagged.  The rewrite goes through a
         // temporary file, so a failure leaves the finished video untouched.
         if (hadPipe && m_spherical && exitCode == kExitOk) {
-            const Result<io::SphericalInjectReport> tagged = io::injectSphericalMetadata(m_out);
+            const Result<io::SphericalInjectReport> tagged = io::injectSphericalMetadata(pathFromUtf8(m_out));
             if (!tagged.ok()) {
                 std::fprintf(stderr,
                              "error: 360 metadata: %s (the video itself is complete; osvtool spherical retries the "
@@ -1507,12 +1524,29 @@ int enginePrefs(const RenderOptions& o, const CLI::App& sub, premiere::PrefsBlob
         }
         out.setCalibrationChoice(static_cast<pr::PrefsCalibrationChoice>(index));
     }
+#if defined(OSV_HAVE_OPENCL)
+    // Apply any explicit OpenCL device selector (`--cl-device`) before the host context probes OpenCL.
+    render::OpenClRenderer::setPreferredDevice(o.pipeline.clDevice);
+#endif
     if (given("--device")) {
-        const int index = tokenIndex(kCliDevice, o.pipeline.device);
+        // Also accept `--device opencl:<index|name>` as a shorthand for `--device opencl --cl-device <index|name>`.
+        std::string devToken = o.pipeline.device;
+        if (devToken.size() > 7 && devToken.rfind("opencl:", 0) == 0) {
+#if defined(OSV_HAVE_OPENCL)
+            if (!given("--cl-device")) {
+                render::OpenClRenderer::setPreferredDevice(devToken.substr(7));
+            }
+#endif
+            devToken = "opencl";
+        }
+        const int index = tokenIndex(kCliDevice, devToken);
         if (index < 0) {
             return usage("unknown --device '" + o.pipeline.device + "' (" + tokenList(kCliDevice) + ")");
         }
         out.renderDevice = static_cast<std::uint8_t>(index);
+    } else if (given("--cl-device")) {
+        // An explicit `--cl-device` without `--device` selects the OpenCL backend.
+        out.renderDevice = static_cast<std::uint8_t>(pr::PrefsRenderDevice::OpenCl);
     }
 
     // ---- the stitch -------------------------------------------------------------------------

@@ -15,17 +15,67 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace osv::render {
 
+/**
+ * @brief Vendor-neutral OpenCL 1.2 GPU renderer backend.
+ *
+ * Compiles the shared shader sources (`preamble.cl`, `ColorMath.h`,
+ * `osv_kernel.h`, and `kernel.cl`) at runtime for the selected OpenCL device
+ * and executes `osvReframe`, `osvSeamLowDecimate`, and `osvSeamLowBlur`.
+ */
 class OpenClRenderer final : public IRenderer {
 public:
     ~OpenClRenderer() override;
 
-    /// Create a renderer on the `deviceIndex`-th GPU device (enumerated over
-    /// all platforms; CPU devices come last).  Fails with Gpu when no device
-    /// exists or the kernel does not compile (the build log is in the message).
+    /**
+     * @brief Create a renderer on the `deviceIndex`-th enumerated OpenCL device.
+     *
+     * Devices are enumerated across all platforms and ranked so discrete GPUs
+     * with larger dedicated memory come first, followed by integrated GPUs,
+     * translation layers (OpenCLOn12), and CPU devices last.
+     *
+     * When `deviceIndex == 0` and a preferred device selector has been set via
+     * `setPreferredDevice()` or the `OSV_CL_DEVICE` / `OSV_OPENCL_DEVICE`
+     * environment variable, that selector is honoured.  Otherwise, if device 0
+     * fails context creation or kernel compilation, `create(0)` automatically
+     * falls back to the remaining enumerated devices in ranked order before
+     * failing.
+     *
+     * @param deviceIndex  Zero-based index in the ranked device list.
+     * @return             Initialized OpenCL renderer or `ErrorCode::Gpu` / `ErrorCode::InvalidArgument`.
+     */
     static Result<std::unique_ptr<OpenClRenderer>> create(int deviceIndex = 0);
+
+    /**
+     * @brief Create a renderer matching an explicit index or name/vendor/platform substring.
+     *
+     * Accepts `"auto"` (or empty) for automatic ranked selection with fallback,
+     * a non-negative integer index (`"0"`, `"1"`, ...), or a case-insensitive
+     * substring matched against the device name, vendor, or platform name
+     * (e.g. `"arc"`, `"9070"`, `"amd"`, `"intel"`).
+     *
+     * @param deviceSelector  Index or case-insensitive substring selector.
+     * @return                Initialized OpenCL renderer or an error listing available devices.
+     */
+    static Result<std::unique_ptr<OpenClRenderer>> create(std::string_view deviceSelector);
+
+    /**
+     * @brief Set the process-wide preferred OpenCL device selector (from `--cl-device`).
+     *
+     * An empty string or `"auto"` clears the override so `OSV_CL_DEVICE` or
+     * automatic ranked device selection is used.
+     *
+     * @param deviceSelector  Device index or name/vendor/platform substring.
+     */
+    static void setPreferredDevice(std::string deviceSelector);
+
+    /**
+     * @brief Return the currently configured preferred OpenCL device selector.
+     */
+    [[nodiscard]] static std::string preferredDevice();
 
     /// True when at least one OpenCL device is present.
     static bool available(std::string* reason);
@@ -35,6 +85,9 @@ public:
 
     /// "Vendor Device (OpenCL 3.0)".
     static std::string deviceName(int deviceIndex);
+
+    /// Full display name of the OpenCL device this renderer instance is bound to.
+    [[nodiscard]] const std::string& activeDeviceName() const noexcept;
 
     Result<ImageRGBAf> render(const RenderJob& job) override;
     [[nodiscard]] const char* name() const noexcept override { return "opencl"; }
