@@ -75,6 +75,23 @@ const char* leaseSourceName(LeaseSource source) noexcept {
     return "unknown";
 }
 
+// The automatic frame-cache budget (see the header).  Pure arithmetic, so it
+// is the same function in a build without CUDA and can be tested on any host.
+std::size_t GpuClipDecoder::automaticBudgetBytes(std::size_t freeBytes, std::size_t slotBytes) noexcept {
+    if (slotBytes == 0) {
+        return 0;
+    }
+    // A fifth of what is free, never more than the cap.
+    const double share = static_cast<double>(freeBytes) * kDefaultBudgetFreeShare;
+    std::size_t budget = std::min(kDefaultBudgetCapBytes, static_cast<std::size_t>(share));
+    // The comfortable minimum, whenever it fits in half of the free memory.
+    const std::size_t comfortBytes = kComfortSlots * slotBytes;
+    if (budget < comfortBytes && freeBytes >= 2u * comfortBytes) {
+        budget = comfortBytes;
+    }
+    return budget;
+}
+
 #if defined(OSV_VIDEO_HAVE_CUDA)
 
 // =============================================================================
@@ -300,6 +317,7 @@ struct GpuFrameStore {
     std::size_t lensOffsetBytes = 0;     ///< Start of lens 1 within a slot.
     std::size_t slotBytes = 0;           ///< pitch * rows.
     std::size_t budgetBytes = 0;         ///< The budget the capacity came from.
+    bool automaticBudget = false;        ///< True when open() derived it from free VRAM (no caller budget).
 
     // ---- mutable state (under `mutex`) ------------------------------------
     mutable std::mutex mutex;
@@ -811,6 +829,52 @@ struct GpuClipDecoder::Impl {
                            [this](const detail::GpuSlot& slot) { return evictableLocked(slot, true); });
     }
 
+    /// May the cache take one more slot of VRAM right now?  (Engine owner,
+    /// no lock held.)
+    ///
+    /// A caller-given budget is the caller's word and is never second-guessed.
+    /// An automatic one was derived from the memory free when the clip was
+    /// opened; this asks the same rule with the memory free now plus what the
+    /// cache holds already.  A query that fails says nothing, so growth goes
+    /// on and the allocation itself decides, as it always did.
+    Status growthAffordable() const {
+        detail::GpuFrameStore& s = *store;
+        if (!s.automaticBudget || s.slotBytes == 0) {
+            return okStatus();
+        }
+        std::size_t held = 0;
+        std::uint32_t allocated = 0;
+        {
+            std::lock_guard<std::mutex> lock(s.mutex);
+            allocated = s.allocatedSlots;
+            held = static_cast<std::size_t>(allocated) * s.slotBytes;
+        }
+        std::size_t freeBytes = 0;
+        std::size_t totalBytes = 0;
+        {
+            ScopedContext ctx(s.context);
+            if (!ctx.ok() || cuMemGetInfo(&freeBytes, &totalBytes) != CUDA_SUCCESS) {
+                return okStatus();
+            }
+        }
+        const std::size_t budgetNow = GpuClipDecoder::automaticBudgetBytes(freeBytes + held, s.slotBytes);
+        if (held + s.slotBytes <= budgetNow) {
+            return okStatus();
+        }
+        // The working set of one Exact render - the current frame and its two
+        // bucket anchors - is worth more than the headroom: without it the
+        // frame cannot be made on the GPU at all and the clip falls back to
+        // software decoding.  Those slots are taken while the device really
+        // has them (the slot itself and as much again left over).
+        constexpr std::uint32_t kWorkingSlots = 3;
+        if (allocated < kWorkingSlots && freeBytes >= 2u * s.slotBytes) {
+            return okStatus();
+        }
+        return failStatus(ErrorCode::Gpu, "free VRAM fell to " + std::to_string(freeBytes >> 20) + " MiB of " +
+                                              std::to_string(totalBytes >> 20) +
+                                              " MiB since the clip was opened; the cache stays at what it holds");
+    }
+
     /// Allocate the VRAM and ready events of one slot (engine owner, no lock).
     Status allocateSlotMemory(CUdeviceptr& base, std::array<CUevent, 2>& ready) const {
         detail::GpuFrameStore& s = *store;
@@ -965,10 +1029,14 @@ struct GpuClipDecoder::Impl {
             if (slot < 0 || !needsAllocation) {
                 break;
             }
-            // First use of this slot: give it VRAM.
+            // First use of this slot: give it VRAM - when the device still
+            // has it to give (an automatic budget only; see the header).
             CUdeviceptr base = 0;
             std::array<CUevent, 2> ready{};
-            const Status allocated = allocateSlotMemory(base, ready);
+            Status allocated = growthAffordable();
+            if (allocated.ok()) {
+                allocated = allocateSlotMemory(base, ready);
+            }
             std::lock_guard<std::mutex> lock(s.mutex);
             detail::GpuSlot& fresh = s.slots[static_cast<std::size_t>(slot)];
             if (allocated.ok()) {
@@ -1649,19 +1717,11 @@ Result<std::unique_ptr<GpuClipDecoder>> GpuClipDecoder::open(const std::filesyst
             s.slotBytes = pitch * s.rows;
             // Budget and capacity.
             std::size_t budget = options.vramBudgetBytes;
-            if (budget == 0) {
-                const double share = static_cast<double>(freeBytes) * kDefaultBudgetFreeShare;
-                budget = std::min(kDefaultBudgetCapBytes, static_cast<std::size_t>(share));
-                // An Exact render holds the current frame's lease while
-                // applyAnalyses() decodes up to two bucket anchors in the
-                // same call (bucket - 1 and bucket), so a cache with at least
-                // 4 slots avoids evicting and re-decoding an anchor between
-                // the mesh, carve, gain and photometric passes whenever free
-                // VRAM comfortably fits 4 slots (<= 50% of free VRAM).
-                const std::size_t minComfortBytes = 4u * s.slotBytes;
-                if (budget < minComfortBytes && freeBytes >= 2u * minComfortBytes) {
-                    budget = minComfortBytes;
-                }
+            s.automaticBudget = budget == 0;
+            if (s.automaticBudget) {
+                // The share / cap / comfort rule; the cache asks it again
+                // each time it grows (growthAffordable).
+                budget = automaticBudgetBytes(freeBytes, s.slotBytes);
             }
             s.budgetBytes = budget;
             std::size_t capacity = s.slotBytes > 0 ? budget / s.slotBytes : 0;

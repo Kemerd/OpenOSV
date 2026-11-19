@@ -2031,9 +2031,13 @@ void ImporterInstance::rebuildStabilization() {
     geom::AttitudeTrack::Options attOpt;
     const geom::AutoConvention detected = geom::ConventionProbe::autoDetect(m_track);
     detected.applyTo(attOpt);
-    // The mount's vibration stays out of the counter-rotation: the track is
-    // built from the 1 kHz IMU batches and low-passed (see the constant).
-    attOpt.vibrationCutoffHz = geom::kStabilisationVibrationCutoffHz;
+    // The track is built from the 1 kHz IMU batches and low-passed over
+    // the span one frame takes to capture: rotation every row of a frame
+    // shares is removed, rotation that swings within the readout (a mount's
+    // vibration) stays out of the counter-rotation.  A clip that records no
+    // readout time keeps the fixed cutoff (see the constant).
+    attOpt.vibrationCutoffHz =
+        geom::captureMatchedCutoffHz(m_track.clip(), geom::kStabilisationVibrationCutoffHz);
     PluginLog::info("stabilisation: '{}': attitude reading {}: {}", m_path.filename().string(),
                     geom::attitudeConventionName(detected.conv), detected.reason);
 
@@ -2048,10 +2052,16 @@ void ImporterInstance::rebuildStabilization() {
     m_attitude = std::move(built).value();
     m_referenceAttitude = m_attitude->worldFromBody(m_attitude->beginUs());
     if (m_attitude->vibrationCutoffHz() > 0.0) {
+        const double readoutMs = geom::sensorReadoutUs(m_track.clip()) / 1000.0;
         PluginLog::info("stabilisation: '{}': {} IMU samples at {} Hz; rotation above {:.0f} Hz (the mount's "
-                        "vibration) is left in place, not counter-rotated",
+                        "vibration) is left in place, not counter-rotated; {}",
                         m_path.filename().string(), m_attitude->sampleCount(), m_track.clip().imuSamplingRate,
-                        m_attitude->vibrationCutoffHz());
+                        m_attitude->vibrationCutoffHz(),
+                        readoutMs > 0.0 ? std::format("each frame reads the attitude of its middle row (sensor "
+                                                      "readout {:.1f} ms)",
+                                                      readoutMs)
+                                        : std::string("the clip records no sensor readout time, so each frame "
+                                                      "reads the attitude at its timestamp"));
     } else {
         PluginLog::info("stabilisation: '{}': one attitude sample per frame ({} frames); no IMU batches to tell a "
                         "vibration from a shake",

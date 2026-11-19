@@ -367,7 +367,9 @@ Result<OsvRenderParams> RenderParamsBuilder::buildParams() const {
 
         // Occlusion polygon (optional, capped at the kernel's vertex budget).
         L.occlN = 0;
-        L.occlFeatherPx = static_cast<float>(m_blend.occlusionFeatherPx);
+        // In this stream's own pixels: an LRF proxy must not ramp 3.7x the
+        // angle its original does (geom::occlusionFeatherStreamPx).
+        L.occlFeatherPx = static_cast<float>(geom::occlusionFeatherStreamPx(rig, m_blend));
         if (m_blend.useOcclusionMask) {
             const auto& poly = rig.occlusionPolyStream[static_cast<std::size_t>(i)];
             if (poly.size() >= 3) {

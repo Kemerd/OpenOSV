@@ -9,9 +9,15 @@
 //               placed at the frame timestamp;
 //   * dense   : every quaternion of the per-frame IMU batches
 //               (FrameMeta.imu->current.q), sample i of frame k placed at
-//               frameTs_k + (i - batchAnchorIndex) * 1e6 / imuSamplingRate + extraOffsetUs.
-//               batchAnchorIndex = 4 because camera_attitude == batch[4] on
-//               the sample clip, i.e. entry 4 is the exposure-time sample.
+//               the moment it was measured (the batch's own stamp plus i
+//               sample periods), on a time axis where each frame's stamp
+//               reads the attitude of the middle of ITS picture - see
+//               "When a frame was really taken" below.  A clip that records
+//               no sensor readout time, or a batch whose stamp does not fit
+//               its frame, keeps the older rule: sample i at
+//               frameTs_k + (i - batchAnchorIndex) * 1e6 / imuSamplingRate
+//               (batchAnchorIndex = 4: camera_attitude == batch[4] on the
+//               6K sample clip).  extraOffsetUs is added either way.
 //
 // The quaternion interpretation (component order, rotation sense, which
 // world axis is up, and whether the IMU's axes are relabelled into the rig's)
@@ -91,6 +97,81 @@ struct AttitudeConvention {
 
 /// Interpret one stored quaternion as the matrix R_body_from_world.
 [[nodiscard]] Mat3d bodyFromWorldMatrix(const meta::Quaternion& q, const AttitudeConvention& convention) noexcept;
+
+// =============================================================================
+//  When a frame was really taken
+// =============================================================================
+//
+// A frame's metadata timestamp is the moment the sensor STARTS reading it
+// out.  The sensor is a rolling shutter: row y leaves it y * (line time)
+// later, and each row's light was gathered over the exposure before that.
+// So the middle of the picture was taken
+//
+//     frameTs + readout / 2 - exposure / 2
+//
+// after the stamp.  Measured against the pictures themselves (the gyro time
+// shift that best explains the far field's frame-to-frame motion, patch by
+// patch down the lens image):
+//
+//     clip                     readout      exposure   centre row, measured / rule
+//     8K 50, daylight          16.2 ms      1/2567 s   +8.08 ms / +7.92 ms
+//     8K 50, night             16.2 ms      1/100 s    +3.27 ms / +3.11 ms
+//     6K 59.94, airborne       13.2 ms      1/208 s    +4.33 ms / +4.18 ms
+//
+// and the row-to-row slope is the clip's own line time (ClipMeta::lro, in
+// nanoseconds per sensor line) to within 4 % on all three.  The 0.15 ms the
+// rule sits early by is under a sixth of one IMU sample.
+//
+// Why it matters: a stabiliser that counter-rotates by the attitude of the
+// WRONG moment leaves the difference in the picture, and for anything that
+// changes within a few milliseconds - a mount's vibration, a camera swinging
+// under a drone - it adds a second copy of the motion instead of removing
+// the first.
+
+/// @brief How long the sensor takes to read one frame's rows out.
+///
+/// ClipMeta::lro is the line time in nanoseconds and ClipMeta::sensorH the
+/// number of sensor lines, so the product is the time between the first and
+/// the last row of one picture.
+///
+/// @param clip  The clip's metadata.
+/// @return Microseconds; 0 when the clip does not record it or the product
+///         is not a believable readout (longer than 50 ms).
+[[nodiscard]] double sensorReadoutUs(const meta::ClipMeta& clip) noexcept;
+
+/// @brief When the middle row of a frame was taken, relative to its timestamp.
+///
+/// readout / 2 - exposure / 2 (see the block above).  The exposure is the
+/// frame's own (CameraFrame::exposureTime); a frame without a usable one is
+/// taken as an instant.
+///
+/// @param clip    The clip's metadata (line time, sensor lines).
+/// @param camera  The frame's camera metadata (exposure time).
+/// @return Microseconds after the frame timestamp; 0 when the clip records
+///         no readout time (nothing is known, nothing is shifted).
+[[nodiscard]] double captureCentreOffsetUs(const meta::ClipMeta& clip, const meta::CameraFrame& camera) noexcept;
+
+/// @brief The vibration cutoff matched to how long one frame takes to capture.
+///
+/// One rotation per frame can only be right for one moment, and the rows of
+/// a frame are spread over the readout.  The single rotation that is best
+/// for all of them is the attitude AVERAGED over that span: rotation slower
+/// than the readout is the same in every row and is removed, rotation that
+/// swings within it is different in every row and is better left alone.  A
+/// Gaussian of the readout window's own variance (sigma = readout / sqrt 12)
+/// is that average without the side lobes of a box, and its -3 dB point is
+/// 0.459 / readout: 28 Hz for the 8K mode's 16.2 ms, 35 Hz for 6K's 13.2 ms.
+///
+/// Measured far-field jerk left in the picture (px rms at the lens image's
+/// scale, no stabilisation / the old 12 Hz at the old moment / this):
+/// 1.47 / 1.38 / 1.04 by day at 8K, 2.17 / 1.58 / 0.82 at night, 1.45 / 1.23
+/// / 0.78 on the airborne 6K sample - whose 89 Hz engine line still passes
+/// at only 10 %, so its nacelle does not shake against the world.
+///
+/// @param clip        The clip's metadata.
+/// @param fallbackHz  The cutoff for a clip that records no readout time.
+/// @return Hz, never below `fallbackHz` and never above 60.
+[[nodiscard]] double captureMatchedCutoffHz(const meta::ClipMeta& clip, double fallbackHz) noexcept;
 
 /// Time-ordered orientation samples with slerp interpolation.
 class AttitudeTrack {

@@ -1279,6 +1279,72 @@ TEST_CASE("Blend weight: occlusion polygon geometry and feather", "[geom][blend]
     REQUIRE(lensWeightRef(rig, kMasterLens, 0.0, Vec2d{1500.0, 2900.0}, params) == 1.0);
 }
 
+TEST_CASE("Blend weight: the occlusion feather is the same angle on every stream", "[geom][blend][lrf]") {
+    // The defect: the ramp outside the mount's polygon was 24 px on EVERY
+    // stream.  On the 1024 px LRF half of a clip that is 5 deg, not the 1.7
+    // deg it is on the 6K stream: both lenses' ramps then crossed the seam
+    // plane, their weights summed to ~0.7 along the mount's meridian and the
+    // coverage alpha let the host's black through as a dark stripe.
+    const BlendParams params;
+
+    // ---- full-size streams keep the width exactly as given ----------------------
+    const LensRig rig6k = sampleRig();
+    REQUIRE(occlusionFeatherStreamPx(rig6k, params) == params.occlusionFeatherPx);
+    auto scale8k = StreamScaling::derive(3840, 3840, 3840, 3840, 1061.5823, 1040.6721);
+    REQUIRE(scale8k.ok());
+    auto rig8k = LensRig::build(sampleCalibration(), scale8k.value(), FocalSource::DigitalFocalLength, 1061.5823,
+                                ExtrinsicConvention{});
+    REQUIRE(rig8k.ok());
+    REQUIRE(occlusionFeatherStreamPx(rig8k.value(), params) == params.occlusionFeatherPx);
+    // The 3000 / 3776 prior sits a rounding below the verified 6K constant:
+    // still a full-size stream, still untouched.
+    LensRig prior = rig6k;
+    prior.scaling.scale = 3000.0 / 3776.0;
+    REQUIRE(occlusionFeatherStreamPx(prior, params) == params.occlusionFeatherPx);
+
+    // ---- the LRF proxy: the 6K stream's angle in its own, bigger pixels ----------
+    auto scaleLrf = StreamScaling::derive(1024, 1024, 3840, 3840, kDigitalFocal, 1043.445);
+    REQUIRE(scaleLrf.ok());
+    auto built = LensRig::build(sampleCalibration(), scaleLrf.value(), FocalSource::DigitalFocalLength, kDigitalFocal,
+                                ExtrinsicConvention{});
+    REQUIRE(built.ok());
+    const LensRig& rigLrf = built.value();
+    const double featherLrf = occlusionFeatherStreamPx(rigLrf, params);
+    INFO("LRF feather " << featherLrf << " px at scale " << rigLrf.scaling.scale);
+    REQUIRE(featherLrf > 0.0);
+    REQUIRE(featherLrf < 0.4 * params.occlusionFeatherPx);
+    // The same distance on the SENSOR as the 6K stream's 24 px.
+    REQUIRE_THAT(featherLrf / rigLrf.scaling.scale,
+                 Catch::Matchers::WithinRel(params.occlusionFeatherPx / rig6k.scaling.scale, 1e-9));
+
+    // The reference weight follows it: walking radially inward from the arc
+    // (see the test above), full weight is back after the LRF's own ramp -
+    // well inside the 24 px the old rule kept the lens dimmed for.
+    const std::vector<Vec2d>& poly = rigLrf.occlusionPolyStream[kSlaveLens];
+    REQUIRE(poly.size() == 26);
+    const KannalaBrandt5& slave = rigLrf.lens[kSlaveLens];
+    const Vec2d centre{slave.cx, slave.cy};
+    const Vec2d apex = poly[6];
+    const Vec2d inward = (centre - apex) * (1.0 / (centre - apex).norm());
+    REQUIRE(2.0 * featherLrf < params.occlusionFeatherPx);
+    REQUIRE(lensWeightRef(rigLrf, kSlaveLens, 0.0, apex + inward * (2.0 * featherLrf), params) == 1.0);
+    const double half = lensWeightRef(rigLrf, kSlaveLens, 0.0, apex + inward * (0.5 * featherLrf), params);
+    REQUIRE(half > 0.2);
+    REQUIRE(half < 0.8);
+
+    // ---- garbage in: a hard mask, or the width as given ---------------------------
+    BlendParams bad = params;
+    bad.occlusionFeatherPx = std::numeric_limits<double>::quiet_NaN();
+    REQUIRE(occlusionFeatherStreamPx(rigLrf, bad) == 0.0);
+    bad.occlusionFeatherPx = -3.0;
+    REQUIRE(occlusionFeatherStreamPx(rigLrf, bad) == 0.0);
+    LensRig noScale = rigLrf;
+    noScale.scaling.scale = 0.0;
+    REQUIRE(occlusionFeatherStreamPx(noScale, params) == params.occlusionFeatherPx);
+    noScale.scaling.scale = std::numeric_limits<double>::quiet_NaN();
+    REQUIRE(occlusionFeatherStreamPx(noScale, params) == params.occlusionFeatherPx);
+}
+
 // =============================================================================
 //  Hide Mount Auto: rebuilding an occlusion polygon per azimuth stretch
 // =============================================================================

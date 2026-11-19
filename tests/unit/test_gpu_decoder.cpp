@@ -82,6 +82,41 @@ meta::FormatInfo nativeFormat() {
 // =============================================================================
 //  Argument validation (no GPU needed: checked before the driver is touched)
 // =============================================================================
+TEST_CASE("The automatic frame-cache budget follows the free VRAM it is asked about", "[video][gpu][budget]") {
+    constexpr std::size_t kMiB = std::size_t{1} << 20;
+    constexpr std::size_t kGiB = std::size_t{1} << 30;
+    // One 8K frame pair: 2 x 3840 x 3840 P010 at a 7680 byte pitch.
+    constexpr std::size_t kSlot8k = std::size_t{7680} * 11520;
+    const auto slots = [&](std::size_t freeBytes) {
+        return GpuClipDecoder::automaticBudgetBytes(freeBytes, kSlot8k) / kSlot8k;
+    };
+
+    // A big card: a fifth of what is free, stopped by the 1.5 GiB cap.
+    CHECK(GpuClipDecoder::automaticBudgetBytes(24 * kGiB, kSlot8k) == GpuClipDecoder::kDefaultBudgetCapBytes);
+    CHECK(slots(24 * kGiB) == 18);
+    // A 6 GB card with 3.5 GiB left after the decoders: a fifth of it.
+    CHECK(slots(3 * kGiB + 512 * kMiB) == 8);
+    // Less than that, but four slots still fit in half of it: the comfortable four.
+    CHECK(slots(1 * kGiB) == GpuClipDecoder::kComfortSlots);
+    CHECK(slots(8 * kSlot8k) == GpuClipDecoder::kComfortSlots);
+    // Under eight slots of free memory the comfort no longer applies.
+    CHECK(slots(8 * kSlot8k - 1) < GpuClipDecoder::kComfortSlots);
+    CHECK(slots(500 * kMiB) == 1);
+    CHECK(slots(400 * kMiB) == 0);
+    CHECK(GpuClipDecoder::automaticBudgetBytes(0, kSlot8k) == 0);
+    CHECK(GpuClipDecoder::automaticBudgetBytes(24 * kGiB, 0) == 0);
+
+    // What growth asks: the memory free NOW plus what the cache already
+    // holds.  A cache of four slots on a card that has since filled up (300
+    // MiB left) may not take a fifth; with 3 GiB still free it may.
+    const std::size_t held = 4 * kSlot8k;
+    CHECK(held + kSlot8k > GpuClipDecoder::automaticBudgetBytes(300 * kMiB + held, kSlot8k));
+    CHECK(held + kSlot8k <= GpuClipDecoder::automaticBudgetBytes(3 * kGiB + held, kSlot8k));
+    // And never more than the capacity open() chose from the same card.
+    CHECK(GpuClipDecoder::automaticBudgetBytes(24 * kGiB + 17 * kSlot8k, kSlot8k) ==
+          GpuClipDecoder::kDefaultBudgetCapBytes);
+}
+
 #if defined(OSV_VIDEO_HAVE_CUDA)
 TEST_CASE("GpuClipDecoder::open rejects nonsense before touching the GPU", "[video][gpu]") {
     const meta::FormatInfo good = nativeFormat();

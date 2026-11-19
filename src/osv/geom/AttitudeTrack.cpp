@@ -98,6 +98,62 @@ Mat3d bodyFromWorldMatrix(const meta::Quaternion& q, const AttitudeConvention& c
 }
 
 // -----------------------------------------------------------------------------
+//  When a frame was really taken
+// -----------------------------------------------------------------------------
+double sensorReadoutUs(const meta::ClipMeta& clip) noexcept {
+    // Line time (ns) x sensor lines; both must be recorded.
+    if (clip.lro == 0 || clip.sensorH == 0) {
+        return 0.0;
+    }
+    const double readoutUs = static_cast<double>(clip.lro) * static_cast<double>(clip.sensorH) / 1000.0;
+    // A readout longer than any frame the camera makes is a field that means
+    // something else on this product: better unknown than believed.
+    constexpr double kLongestReadoutUs = 50000.0;
+    if (!std::isfinite(readoutUs) || readoutUs <= 0.0 || readoutUs > kLongestReadoutUs) {
+        return 0.0;
+    }
+    return readoutUs;
+}
+
+double captureCentreOffsetUs(const meta::ClipMeta& clip, const meta::CameraFrame& camera) noexcept {
+    const double readoutUs = sensorReadoutUs(clip);
+    if (!(readoutUs > 0.0)) {
+        return 0.0;  // nothing known: the frame stamp stands for the picture
+    }
+    // The frame's own exposure, [numerator, denominator] seconds.  A missing
+    // or absurd one (over a tenth of a second) is taken as an instant.
+    double exposureUs = 0.0;
+    if (camera.exposureTime.size() >= 2 && camera.exposureTime[0] > 0 && camera.exposureTime[1] > 0) {
+        const double seconds =
+            static_cast<double>(camera.exposureTime[0]) / static_cast<double>(camera.exposureTime[1]);
+        if (std::isfinite(seconds) && seconds > 0.0 && seconds <= 0.1) {
+            exposureUs = seconds * 1.0e6;
+        }
+    }
+    return 0.5 * readoutUs - 0.5 * exposureUs;
+}
+
+double captureMatchedCutoffHz(const meta::ClipMeta& clip, double fallbackHz) noexcept {
+    const double fallback = (std::isfinite(fallbackHz) && fallbackHz > 0.0) ? fallbackHz : 0.0;
+    const double readoutUs = sensorReadoutUs(clip);
+    if (!(readoutUs > 0.0)) {
+        return fallback;
+    }
+    // A Gaussian with the readout window's variance (sigma = readout /
+    // sqrt 12) has its -3 dB point at sqrt(ln sqrt 2) / (sqrt 2 pi sigma),
+    // the relation lowPass() uses the other way round.
+    const double sigmaSeconds = readoutUs * 1.0e-6 / std::sqrt(12.0);
+    const double matched = std::sqrt(std::log(std::sqrt(2.0))) / (std::sqrt(2.0) * kPi * sigmaSeconds);
+    // Never below the fallback (a slow readout must not hide a shake), never
+    // above 60 Hz (a readout far shorter than any seen so far).
+    constexpr double kHighestCutoffHz = 60.0;
+    if (!std::isfinite(matched)) {
+        return fallback;
+    }
+    return std::clamp(matched, std::min(fallback, kHighestCutoffHz), kHighestCutoffHz);
+}
+
+// -----------------------------------------------------------------------------
 //  Construction
 // -----------------------------------------------------------------------------
 namespace {
@@ -242,6 +298,11 @@ Result<AttitudeTrack> AttitudeTrack::build(const meta::MetadataTrack& track, con
     samples.reserve(dense ? frameCount * 17 : frameCount);
     clock.reserve(frameCount);
     std::size_t skipped = 0;
+    // Dense samples are placed by the stamps of their own batches when the
+    // clip says how long its sensor reads a frame ("When a frame was really
+    // taken" in the header); `stamped` counts the frames that were.
+    const bool captureTimed = dense && sensorReadoutUs(track.clip()) > 0.0;
+    std::size_t stamped = 0;
 
     // Under the default rigAxes reading, worldFromBodyQuat() maps from the
     // product's IMU-mounted RFU frame (right, forward, up) into the +Z-up
@@ -276,12 +337,33 @@ Result<AttitudeTrack> AttitudeTrack::build(const meta::MetadataTrack& track, con
                 // already anchored at the frame's exposure timestamp; a multi-sample
                 // batch aligns its exposure anchor at batchAnchorIndex.
                 const double anchor = (batch.q.size() == 1) ? 0.0 : static_cast<double>(options.batchAnchorIndex);
+                // The older rule: the first sample of the batch `anchor`
+                // periods before the frame stamp.
+                double firstSampleUs = frameTs - anchor * samplePeriodUs;
+                // The measured rule, for a clip that records the readout
+                // time of its sensor: the batch says itself when its first
+                // sample was taken (its stamp is the low 32 bits of the frame
+                // clock), and the frame stamp must read the attitude of the
+                // middle of the picture, which was taken centreOffset later
+                // - so every sample of this frame moves that much earlier on
+                // the time axis of the track.  A stamp further than
+                // kStampReachUs from its frame is not on that clock (another
+                // product, a damaged sample) and keeps the older rule.
+                if (captureTimed && batch.q.size() > 1) {
+                    const std::int32_t stampAfterFrame = static_cast<std::int32_t>(
+                        batch.ts - static_cast<std::uint32_t>(frame.timestampUs & 0xFFFFFFFFull));
+                    constexpr double kStampReachUs = 5000.0;
+                    if (std::abs(static_cast<double>(stampAfterFrame)) <= kStampReachUs) {
+                        firstSampleUs = frameTs + static_cast<double>(stampAfterFrame) -
+                                        captureCentreOffsetUs(track.clip(), frame.camera);
+                        ++stamped;
+                    }
+                }
                 for (std::size_t s = 0; s < batch.q.size(); ++s) {
                     if (!batch.q[s].present) {
                         continue;
                     }
-                    const double t = frameTs + (static_cast<double>(s) - anchor) * samplePeriodUs +
-                                     options.extraOffsetUs;
+                    const double t = firstSampleUs + static_cast<double>(s) * samplePeriodUs + options.extraOffsetUs;
                     samples.push_back(Sample{t, decodeSampleQuat(batch.q[s])});
                 }
                 continue;
@@ -329,6 +411,11 @@ Result<AttitudeTrack> AttitudeTrack::build(const meta::MetadataTrack& track, con
 
     if (skipped > 0) {
         log::debug("AttitudeTrack: {} of {} frames had no usable attitude", skipped, frameCount);
+    }
+    if (captureTimed) {
+        log::debug("AttitudeTrack: the IMU batches of {} of {} frames placed by their own stamps; each frame reads "
+                   "the attitude of its middle row (sensor readout {:.2f} ms)",
+                   stamped, frameCount, sensorReadoutUs(track.clip()) / 1000.0);
     }
     // ---- the vibration out of a dense track -------------------------------------
     // Only a dense track can be filtered: at one sample per frame a

@@ -689,10 +689,20 @@ the view's forward axis swings 0.87 deg in total from frame to frame over
 the clip, against 1.84 deg with Horizon Lock, which carries the body's
 heading shake.
 
+**The moment a frame was taken.** A frame's metadata timestamp is the start
+of the sensor's readout. The sensor is a rolling shutter, so the middle of
+the picture is taken half the readout later, less half the exposure: +8.1 ms
+at 8K 50 by day, +3.3 ms at night, +4.3 ms on the 6K sample, each measured
+against the far field's own motion. The IMU batches are placed by their own
+stamps and every frame reads the attitude of that moment
+(`captureCentreOffsetUs`). A clip that records no readout time
+(`ClipMeta::lro`) keeps the older fixed anchor.
+
 **Vibration is not shake.** Every mode reads the attitude from the clip's
-1 kHz IMU batches low-passed at 12 Hz (`kStabilisationVibrationCutoffHz`,
-`AttitudeTrack::Options::vibrationCutoffHz`), not from the one sample per
-frame. On the airborne sample the camera buzzes with the engine at 22 / 44 /
+1 kHz IMU batches low-passed over the span one frame takes to capture
+(`captureMatchedCutoffHz`: 28 Hz at 8K, 35 Hz at 6K; 12 Hz,
+`kStabilisationVibrationCutoffHz`, for a clip that records no readout time),
+not from the one sample per frame. On the airborne sample the camera buzzes with the engine at 22 / 44 /
 89 / 134 Hz (0.02-0.05 deg each); one sample per frame reads the 89 Hz line
 as a 0.2 deg sign flip every frame, and counter-rotating that held the world
 still while the engine nacelle - bolted to the wing the camera is bolted to -
@@ -702,8 +712,11 @@ the viewer wants steady; the real motion below it (a turn, a bank, hand
 shake under ~10 Hz) is removed as before. The nacelle's outline moves 0.1-0.4
 px per frame instead of about 1 px. A clip without IMU batches keeps the
 per-frame track, and the log says which it got ("1078 IMU samples at 1000
-Hz; rotation above 12 Hz ... left in place" or "one attitude sample per
-frame").
+Hz; rotation above 35 Hz ... left in place; each frame reads the attitude of
+its middle row" or "one attitude sample per frame"). What one rotation per
+frame cannot remove is the rolling shutter itself: the rows of a frame are
+taken over 13-16 ms, and rotation that swings within that span differs from
+row to row.
 
 #### Lens shading (ids 34-35)
 

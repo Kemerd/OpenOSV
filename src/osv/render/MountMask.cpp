@@ -85,12 +85,6 @@ using Clock = std::chrono::steady_clock;
     return std::max(L.fx, L.fy) * L.thetaD(thetaRad);
 }
 
-/// The occlusion feather of a blend in pixels (0 for a nonsensical value).
-[[nodiscard]] double featherPx(const geom::BlendParams& blend) noexcept {
-    return std::isfinite(blend.occlusionFeatherPx) && blend.occlusionFeatherPx > 0.0 ? blend.occlusionFeatherPx
-                                                                                      : 0.0;
-}
-
 /// One decoded sample: the frame actually measured and its pair.
 struct MountSample {
     std::uint32_t frame = 0;
@@ -811,7 +805,10 @@ Result<MountMaskApplied> applyMountMask(geom::LensRig& rig, const MountMask& mas
     }
     const std::uint32_t W = mask.columns;
     OSV_TRY_ASSIGN(MountArc arc, mountArcColumns(rig, W));
-    const double feather = featherPx(blend);
+    // The ramp the kernels apply, in this rig's own stream pixels (0 for a
+    // nonsensical value): the strip test and the clamp radii below must
+    // measure with the very width the render uses.
+    const double feather = geom::occlusionFeatherStreamPx(rig, blend);
 
     // ---- per column: does EITHER lens have full weight on the seam plane? ------------------
     // Where neither does, the coverage dips below 1 on the seam (both

@@ -454,8 +454,10 @@ Result<std::unique_ptr<Pipeline>> Pipeline::open(const PipelineOptions& options,
                          "unknown --attitude-convention '" + options.attitudeConvention + "'"};
         }
         // The mount's vibration stays out of the counter-rotation, exactly
-        // as the plug-ins' engine builds its track (Stabilization.h).
-        attOpt.vibrationCutoffHz = geom::kStabilisationVibrationCutoffHz;
+        // as the plug-ins' engine builds its track: the cutoff matched to
+        // the sensor's readout, the fixed one for a clip that records none.
+        attOpt.vibrationCutoffHz =
+            geom::captureMatchedCutoffHz(p->track.clip(), geom::kStabilisationVibrationCutoffHz);
         OSV_TRY_ASSIGN(geom::AttitudeTrack att, geom::AttitudeTrack::build(p->track, attOpt));
         p->attitude = std::move(att);
         if (p->attitude->sampleCount() == 0) {

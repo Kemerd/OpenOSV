@@ -65,8 +65,15 @@ enum class StabilizationMode {
     return mode == StabilizationMode::Smooth || mode == StabilizationMode::SmoothLevel;
 }
 
-/// The vibration cutoff every stabilisation mode builds its attitude track
-/// with (AttitudeTrack::Options::vibrationCutoffHz), in Hz.
+/// The vibration cutoff a stabilisation mode builds its attitude track with
+/// (AttitudeTrack::Options::vibrationCutoffHz) when the clip does not record
+/// its sensor's readout time, in Hz.  A clip that does - every Osmo 360 clip
+/// measured - takes the cutoff matched to that readout instead
+/// (captureMatchedCutoffHz in AttitudeTrack.h: 28 Hz at 8K, 35 Hz at 6K),
+/// and reads each frame's attitude at the moment its middle row was taken.
+/// The reasoning below is why a cutoff exists at all; 12 Hz was chosen while
+/// frames still read the attitude of the wrong moment, where counter-rotating
+/// anything faster added to the shake instead of removing it.
 ///
 /// Stabilisation counter-rotates the view by the camera's measured
 /// rotation.  Rotation faster than this is VIBRATION, not a shake a viewer

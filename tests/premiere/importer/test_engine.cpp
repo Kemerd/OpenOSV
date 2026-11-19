@@ -457,9 +457,11 @@ TEST_CASE("every stabilisation mode reaches the engine's frame, Smooth + Horizon
     osv::geom::AttitudeTrack::Options attOpt;
     osv::geom::ConventionProbe::autoDetect(track.value()).applyTo(attOpt);
     // Match ImporterInstance::rebuildStabilization(), which low-passes the
-    // 1 kHz IMU batches at kStabilisationVibrationCutoffHz (12 Hz) and smooths
-    // the per-frame orientation sequence.
-    attOpt.vibrationCutoffHz = osv::geom::kStabilisationVibrationCutoffHz;
+    // 1 kHz IMU batches at the cutoff matched to the sensor's readout
+    // (kStabilisationVibrationCutoffHz for a clip that records none) and
+    // smooths the per-frame orientation sequence.
+    attOpt.vibrationCutoffHz = osv::geom::captureMatchedCutoffHz(
+        track.value().clip(), osv::geom::kStabilisationVibrationCutoffHz);
     REQUIRE(attOpt.conv.rigAxes);
     REQUIRE(attOpt.conv.sense == osv::geom::AttitudeSense::WorldToBody);
     REQUIRE(attOpt.conv.up == osv::geom::WorldUp::Z);

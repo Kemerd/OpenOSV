@@ -237,6 +237,34 @@ public:
     /// The automatic budget's share of the free VRAM (20 %).
     static constexpr double kDefaultBudgetFreeShare = 0.20;
 
+    /// The cache an Exact render is comfortable with: it holds the current
+    /// frame's lease while the analyses decode up to two bucket anchors in
+    /// the same call, so four slots keep an anchor from being evicted and
+    /// decoded again between the mesh, carve, gain and photometric passes.
+    static constexpr std::size_t kComfortSlots = 4;
+
+    /// @brief The automatic frame-cache budget for a device with `freeBytes` free.
+    ///
+    /// kDefaultBudgetFreeShare of the free memory, at most
+    /// kDefaultBudgetCapBytes, and raised to kComfortSlots slots whenever
+    /// those fit in half of what is free.
+    ///
+    /// The rule is asked twice.  open() asks it for the capacity, with the
+    /// free memory left after the NVDEC decoders exist.  The cache then grows
+    /// one slot at a time as frames arrive, possibly minutes later, and each
+    /// step asks it again with the memory free AT THAT MOMENT plus what the
+    /// cache already holds: a card that has filled up since - a second clip,
+    /// the host's own frames, an encoder - stops the growth at the slots it
+    /// has instead of pushing the device into shared system memory, where
+    /// every kernel on it slows to a crawl.  A card with room never notices.
+    /// (The first three slots - one Exact render's working set - are still
+    /// taken while the device has twice a slot free: see growthAffordable.)
+    ///
+    /// @param freeBytes  Free device memory the cache may count on (bytes).
+    /// @param slotBytes  Size of one cache slot, a frame pair (bytes).
+    /// @return The budget in bytes; 0 for a zero slot size.
+    [[nodiscard]] static std::size_t automaticBudgetBytes(std::size_t freeBytes, std::size_t slotBytes) noexcept;
+
     /// Largest forward step between two requests that still counts as
     /// playing forward (a 59.94 clip in a 29.97 sequence steps by 2).
     static constexpr std::uint32_t kMaxSequentialStep = 4;

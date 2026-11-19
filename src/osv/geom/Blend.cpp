@@ -80,6 +80,29 @@ double signedDistanceToPolygon(const std::vector<Vec2d>& polygon, const Vec2d& p
     return pointInPolygon(polygon, p) ? -best : best;
 }
 
+double occlusionFeatherStreamPx(const LensRig& rig, const BlendParams& params) noexcept {
+    // A nonsensical width is a hard mask, as it always was.
+    const double fullSizePx = params.occlusionFeatherPx;
+    if (!std::isfinite(fullSizePx) || fullSizePx <= 0.0) {
+        return 0.0;
+    }
+    // A rig without a usable scale (hand-built in a test, a damaged clip)
+    // cannot say how big its pixels are: the width stays as given.
+    const double scale = rig.scaling.scale;
+    if (!std::isfinite(scale) || scale <= 0.0) {
+        return fullSizePx;
+    }
+    // Streams at or above the 6K scale are full size and keep the width as
+    // given.  The small tolerance takes in the 3000 / 3776 prior, which sits
+    // a rounding below the verified constant and must not move by a hair.
+    const double ratio = scale / StreamScaling::kVerifiedCropScale6K;
+    if (ratio >= 1.0 - 1e-4) {
+        return fullSizePx;
+    }
+    // A smaller stream (the LRF proxy): the same angle in its own pixels.
+    return fullSizePx * ratio;
+}
+
 double lensWeightRef(const LensRig& rig, int lens, double theta, const Vec2d& px, const BlendParams& params) noexcept {
     if (!LensRig::validIndex(lens) || !std::isfinite(theta) || theta < 0.0) {
         return 0.0;
@@ -111,9 +134,8 @@ double lensWeightRef(const LensRig& rig, int lens, double theta, const Vec2d& px
         const std::vector<Vec2d>& poly = rig.occlusionPolyStream[static_cast<std::size_t>(lens)];
         if (poly.size() >= 3) {
             const double sd = signedDistanceToPolygon(poly, px);
-            const double ramp = (std::isfinite(params.occlusionFeatherPx) && params.occlusionFeatherPx > 0.0)
-                                    ? params.occlusionFeatherPx
-                                    : 0.0;
+            // The ramp in THIS stream's pixels (the same angle on every stream).
+            const double ramp = occlusionFeatherStreamPx(rig, params);
             double occ = 1.0;
             if (ramp > 0.0) {
                 occ = clampd(sd / ramp, 0.0, 1.0);

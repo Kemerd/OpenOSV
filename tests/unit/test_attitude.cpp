@@ -1101,14 +1101,71 @@ TEST_CASE("AttitudeTrack sparse track reproduces the per-frame attitude", "[atti
     REQUIRE(track.worldFromBody(t0 + 0.5 * kFramePeriodUs).angleTo(track.worldFromBody(t0)) < deg2rad(0.5));
 }
 
-TEST_CASE("AttitudeTrack dense track: anchor 4 lands on the frame attitude", "[attitude][sample]") {
+TEST_CASE("Capture timing: readout, the middle row's moment and the matched cutoff", "[attitude][timing]") {
+    // The three modes measured against their own pictures (AttitudeTrack.h).
+    meta::ClipMeta k8;
+    k8.lro = 4226;  // ns per sensor line
+    k8.sensorH = 3840;
+    meta::ClipMeta k6;
+    k6.lro = 3429;
+    k6.sensorH = 3840;
+    REQUIRE_THAT(sensorReadoutUs(k8), Catch::Matchers::WithinAbs(16227.84, 0.01));
+    REQUIRE_THAT(sensorReadoutUs(k6), Catch::Matchers::WithinAbs(13167.36, 0.01));
+
+    // readout / 2 - exposure / 2, within a third of a millisecond of the
+    // moment the far field says each clip's middle row was taken.
+    const auto exposure = [](std::int32_t num, std::int32_t den) {
+        meta::CameraFrame camera;
+        camera.exposureTime = {num, den};
+        return camera;
+    };
+    REQUIRE_THAT(captureCentreOffsetUs(k8, exposure(1, 2567)), Catch::Matchers::WithinAbs(8080.0, 300.0));  // day
+    REQUIRE_THAT(captureCentreOffsetUs(k8, exposure(1, 100)), Catch::Matchers::WithinAbs(3270.0, 300.0));   // night
+    REQUIRE_THAT(captureCentreOffsetUs(k6, exposure(1, 208)), Catch::Matchers::WithinAbs(4330.0, 300.0));   // airborne
+    // A frame without a usable exposure is an instant: half the readout.
+    REQUIRE_THAT(captureCentreOffsetUs(k8, meta::CameraFrame{}), Catch::Matchers::WithinAbs(8113.92, 0.01));
+    REQUIRE_THAT(captureCentreOffsetUs(k8, exposure(1, 0)), Catch::Matchers::WithinAbs(8113.92, 0.01));
+    REQUIRE_THAT(captureCentreOffsetUs(k8, exposure(-1, 100)), Catch::Matchers::WithinAbs(8113.92, 0.01));
+    REQUIRE_THAT(captureCentreOffsetUs(k8, exposure(2, 1)), Catch::Matchers::WithinAbs(8113.92, 0.01));  // 2 s: absurd
+
+    // The cutoff follows the readout: 0.459 / readout.
+    REQUIRE_THAT(captureMatchedCutoffHz(k8, 12.0), Catch::Matchers::WithinAbs(28.3, 0.2));
+    REQUIRE_THAT(captureMatchedCutoffHz(k6, 12.0), Catch::Matchers::WithinAbs(34.9, 0.2));
+
+    // Nothing recorded, or nothing believable: no readout, no shift, the fallback.
+    meta::ClipMeta none;
+    REQUIRE(sensorReadoutUs(none) == 0.0);
+    REQUIRE(captureCentreOffsetUs(none, exposure(1, 100)) == 0.0);
+    REQUIRE(captureMatchedCutoffHz(none, 12.0) == 12.0);
+    meta::ClipMeta absurd;
+    absurd.lro = 4000000;  // 4 ms per line: 15 s per frame
+    absurd.sensorH = 3840;
+    REQUIRE(sensorReadoutUs(absurd) == 0.0);
+    REQUIRE(captureMatchedCutoffHz(absurd, 12.0) == 12.0);
+    // A slow readout never hides a shake below the fallback; a very fast one
+    // stops at 60 Hz; a nonsensical fallback is no cutoff.
+    meta::ClipMeta slow;
+    slow.lro = 12000;
+    slow.sensorH = 3840;  // 46 ms: matched cutoff 10 Hz
+    REQUIRE(captureMatchedCutoffHz(slow, 12.0) == 12.0);
+    meta::ClipMeta fast;
+    fast.lro = 500;
+    fast.sensorH = 3840;  // 1.9 ms: matched cutoff 239 Hz
+    REQUIRE(captureMatchedCutoffHz(fast, 12.0) == 60.0);
+    REQUIRE(captureMatchedCutoffHz(none, std::numeric_limits<double>::quiet_NaN()) == 0.0);
+    REQUIRE(captureMatchedCutoffHz(none, -5.0) == 0.0);
+}
+
+TEST_CASE("AttitudeTrack dense track: a frame's stamp reads the attitude of its middle row", "[attitude][sample]") {
     OSV_REQUIRE_SAMPLE();
     const std::unique_ptr<SampleMeta> sample = openSample();
     const SampleMeta& s = *sample;
+    // The sample clip records its sensor's readout: the measured rule applies.
+    REQUIRE(s.track.clip().imuSamplingRate == 1000);
+    REQUIRE(sensorReadoutUs(s.track.clip()) > 10000.0);
 
     AttitudeTrack::Options options;
     options.dense = true;
-    options.batchAnchorIndex = 4;
     auto built = AttitudeTrack::build(s.track, options);
     REQUIRE(built.ok());
     const AttitudeTrack& dense = built.value();
@@ -1116,18 +1173,43 @@ TEST_CASE("AttitudeTrack dense track: anchor 4 lands on the frame attitude", "[a
     REQUIRE(dense.sampleCount() >= 65u * 16u);
     REQUIRE(dense.sampleCount() <= 65u * 17u);
 
+    // Every frame, from its own batch alone: the batch says when its first
+    // sample was taken, the middle row was taken readout / 2 - exposure / 2
+    // after the frame stamp, and the track at the frame stamp must be the
+    // batch's attitude at exactly that moment.
+    double meanIndex = 0.0;
     for (std::uint32_t i = 0; i < s.track.frameCount(); ++i) {
         const auto frame = s.track.frame(i);
         REQUIRE(frame.ok());
         REQUIRE(frame.value().imu.has_value());
-        REQUIRE(frame.value().imu->current.q.size() > 4);
-        const Quatd expected = worldFromBodyQuat(frame.value().camera.attitude, options.conv);
+        const meta::ImuBatch& batch = frame.value().imu->current;
+        REQUIRE(batch.q.size() > 8);
+        const std::int32_t stampAfterFrame = static_cast<std::int32_t>(
+            batch.ts - static_cast<std::uint32_t>(frame.value().timestampUs & 0xFFFFFFFFull));
+        // The batch starts within a millisecond or so of its frame's stamp
+        // (-979 .. +26 us on the 8K clips measured, up to +168 us here).
+        REQUIRE(stampAfterFrame <= 1500);
+        REQUIRE(stampAfterFrame >= -1500);
+        const double centreUs = captureCentreOffsetUs(s.track.clip(), frame.value().camera);
+        REQUIRE(centreUs > 3000.0);
+        REQUIRE(centreUs < 6000.0);
+        const double index = (centreUs - static_cast<double>(stampAfterFrame)) / 1000.0;
+        meanIndex += index;
+        const std::size_t lo = static_cast<std::size_t>(std::floor(index));
+        REQUIRE(lo + 1 < batch.q.size());
+        const Quatd qa = worldFromBodyQuat(batch.q[lo], options.conv);
+        const Quatd qb = worldFromBodyQuat(batch.q[lo + 1], options.conv);
+        const Quatd expected = Quatd::slerp(qa, qb, index - static_cast<double>(lo));
         const Quatd got = dense.worldFromBody(static_cast<double>(frame.value().timestampUs));
-        INFO("frame " << i);
+        INFO("frame " << i << ": batch index " << index);
         REQUIRE(got.angleTo(expected) < 1e-4);
     }
-    // Dense mode needs the IMU rate.
-    REQUIRE(s.track.clip().imuSamplingRate == 1000);
+    // On this clip that is between samples 4 and 5 - the old fixed anchor
+    // was nearly right here, and nowhere else (8 at 8K by day).
+    meanIndex /= static_cast<double>(s.track.frameCount());
+    INFO("mean batch index of the middle row " << meanIndex);
+    REQUIRE(meanIndex > 4.0);
+    REQUIRE(meanIndex < 5.5);
 }
 
 // -----------------------------------------------------------------------------
